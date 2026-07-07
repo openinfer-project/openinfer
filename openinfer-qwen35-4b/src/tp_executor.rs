@@ -25,8 +25,8 @@ enum TpWorkerCommand {
     Ping {
         resp: mpsc::Sender<Result<TpWorkerReply>>,
     },
-    RunPrefillStep {
-        requests: Vec<PrefillStepItem>,
+    RunPrefillChunks {
+        chunks: Vec<TpPrefillChunkItem>,
         resp: mpsc::Sender<Result<TpWorkerReply>>,
     },
     RunDecodeStep {
@@ -54,6 +54,30 @@ pub struct Qwen35TpExecutor {
     workers: Vec<TpWorker>,
     world_size: usize,
     max_batch: usize,
+}
+
+#[derive(Clone)]
+pub struct TpPrefillChunkItem {
+    request_id: RequestId,
+    prompt_tokens: Vec<u32>,
+    logprobs: usize,
+    finish_prefill: bool,
+}
+
+impl TpPrefillChunkItem {
+    pub fn new(
+        request_id: RequestId,
+        prompt_tokens: Vec<u32>,
+        logprobs: usize,
+        finish_prefill: bool,
+    ) -> Self {
+        Self {
+            request_id,
+            prompt_tokens,
+            logprobs,
+            finish_prefill,
+        }
+    }
 }
 
 impl Qwen35TpExecutor {
@@ -133,12 +157,26 @@ impl Qwen35TpExecutor {
             !plan.requests.is_empty(),
             "Qwen3.5 TP prefill plan requires at least one request"
         );
-        let requests = plan.requests.to_vec();
+        let chunks: Vec<TpPrefillChunkItem> = plan
+            .requests
+            .iter()
+            .cloned()
+            .map(TpPrefillChunkItem::from)
+            .collect();
+        self.execute_prefill_chunks(&chunks)
+    }
+
+    pub fn execute_prefill_chunks(&self, chunks: &[TpPrefillChunkItem]) -> Result<PrefillResult> {
+        anyhow::ensure!(
+            !chunks.is_empty(),
+            "Qwen3.5 TP prefill chunk command requires at least one chunk"
+        );
+        let chunks = chunks.to_vec();
         let mut pending = Vec::with_capacity(self.workers.len());
         for worker in &self.workers {
             let (resp_tx, resp_rx) = mpsc::channel();
-            worker.send(TpWorkerCommand::RunPrefillStep {
-                requests: requests.clone(),
+            worker.send(TpWorkerCommand::RunPrefillChunks {
+                chunks: chunks.clone(),
                 resp: resp_tx,
             })?;
             pending.push(resp_rx);
@@ -165,8 +203,8 @@ impl Qwen35TpExecutor {
             let (resp_tx, resp_rx) = mpsc::channel();
             let command = match kind {
                 TpWorkerCommandKind::Ping => TpWorkerCommand::Ping { resp: resp_tx },
-                TpWorkerCommandKind::RunPrefillStep => TpWorkerCommand::RunPrefillStep {
-                    requests: Vec::new(),
+                TpWorkerCommandKind::RunPrefillChunks => TpWorkerCommand::RunPrefillChunks {
+                    chunks: Vec::new(),
                     resp: resp_tx,
                 },
                 TpWorkerCommandKind::RunDecodeStep => {
@@ -200,7 +238,7 @@ impl Drop for Qwen35TpExecutor {
 #[derive(Clone, Copy)]
 enum TpWorkerCommandKind {
     Ping,
-    RunPrefillStep,
+    RunPrefillChunks,
     RunDecodeStep,
     RunUnifiedStep,
 }
@@ -209,7 +247,7 @@ impl TpWorkerCommandKind {
     fn name(self) -> &'static str {
         match self {
             Self::Ping => "ping",
-            Self::RunPrefillStep => "prefill step",
+            Self::RunPrefillChunks => "prefill chunks",
             Self::RunDecodeStep => "decode step",
             Self::RunUnifiedStep => "unified step",
         }
@@ -277,17 +315,22 @@ struct TpWorkerState {
     _world_size: usize,
     max_batch: usize,
     model: Qwen35Model,
-    active: Vec<TpActiveRequest>,
+    requests: Vec<TpRequestState>,
     sample_scratch: openinfer_sample::SampleScratch,
     _cublas_guard: CublasThreadGuard,
 }
 
-struct TpActiveRequest {
+struct TpRequestState {
     request_id: RequestId,
-    #[allow(dead_code)]
+    phase: TpRequestPhase,
     kv: KvState,
-    #[allow(dead_code)]
     recurrent: RecurrentState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TpRequestPhase {
+    Prefilling,
+    Decoding,
 }
 
 impl TpWorkerState {
@@ -317,7 +360,7 @@ impl TpWorkerState {
             _world_size: world_size,
             max_batch,
             model,
-            active: Vec::new(),
+            requests: Vec::new(),
             sample_scratch,
             _cublas_guard: cublas_guard,
         })
@@ -329,8 +372,8 @@ impl TpWorkerState {
                 TpWorkerCommand::Ping { resp } => {
                     let _ = resp.send(Ok(TpWorkerReply::Ack));
                 }
-                TpWorkerCommand::RunPrefillStep { requests, resp } => {
-                    let result = self.execute_prefill(&requests);
+                TpWorkerCommand::RunPrefillChunks { chunks, resp } => {
+                    let result = self.execute_prefill_chunks(&chunks);
                     let _ = resp.send(result);
                 }
                 TpWorkerCommand::RunDecodeStep { resp }
@@ -349,109 +392,137 @@ impl TpWorkerState {
         }
     }
 
-    fn execute_prefill(&mut self, requests: &[PrefillStepItem]) -> Result<TpWorkerReply> {
+    fn execute_prefill_chunks(&mut self, chunks: &[TpPrefillChunkItem]) -> Result<TpWorkerReply> {
         anyhow::ensure!(
-            !requests.is_empty(),
-            "Qwen3.5 TP prefill plan requires at least one request"
+            !chunks.is_empty(),
+            "Qwen3.5 TP prefill chunk command requires at least one chunk"
         );
+        validate_prefill_chunks(chunks)?;
+        let new_requests = chunks
+            .iter()
+            .filter(|chunk| self.request_index(chunk.request_id).is_none())
+            .count();
         anyhow::ensure!(
-            self.active.len() + requests.len() <= self.max_batch,
-            "Qwen3.5 TP prefill would exceed worker capacity {}",
+            self.requests.len() + new_requests <= self.max_batch,
+            "Qwen3.5 TP prefill chunks would exceed worker capacity {}",
             self.max_batch
         );
-        let mut seen = HashSet::with_capacity(requests.len());
-        for req in requests {
-            anyhow::ensure!(
-                !req.prompt_tokens.is_empty(),
-                "Qwen3.5 TP prefill request {} has an empty prompt",
-                req.request_id.get()
-            );
-            anyhow::ensure!(
-                seen.insert(req.request_id),
-                "duplicate Qwen3.5 TP request id {} in prefill plan",
-                req.request_id.get()
-            );
-            anyhow::ensure!(
-                !self
-                    .active
-                    .iter()
-                    .any(|active| active.request_id == req.request_id),
-                "duplicate Qwen3.5 TP request id {}",
-                req.request_id.get()
-            );
-        }
 
-        let prompts: Vec<&[u32]> = requests
-            .iter()
-            .map(|req| req.prompt_tokens.as_slice())
-            .collect();
-        let mut kv_states: Vec<KvState> = requests.iter().map(|_| self.model.alloc_kv()).collect();
-        let mut recurrent_states: Vec<RecurrentState> = requests
-            .iter()
-            .map(|_| RecurrentState::new(self.model.device_ctx(), self.model.config()))
-            .collect::<Result<_>>()?;
-        let mut recurrent_refs: Vec<&mut RecurrentState> = recurrent_states.iter_mut().collect();
-        let logits =
-            self.model
-                .batch_prefill_logits(&prompts, &mut kv_states, &mut recurrent_refs)?;
+        let mut primary_results = Vec::new();
+        for chunk in chunks {
+            let state_idx = self.ensure_prefill_state(chunk.request_id)?;
+            let state = &mut self.requests[state_idx];
+            anyhow::ensure!(
+                state.phase == TpRequestPhase::Prefilling,
+                "Qwen3.5 TP request {} is already in decode state",
+                chunk.request_id.get()
+            );
 
-        if self.rank == 0 {
-            let requested_logprobs: Vec<usize> = requests.iter().map(|req| req.logprobs).collect();
-            let cpu_logits =
-                snapshot_requested_logprobs(self.model.device_ctx(), &logits, &requested_logprobs)?;
-            let params = vec![SamplingParams::default(); requests.len()];
-            let params_refs: Vec<&SamplingParams> = params.iter().collect();
-            let tokens = openinfer_sample::select_batch(
-                self.model.device_ctx(),
-                &logits,
-                &params_refs,
-                0,
-                &mut self.sample_scratch,
+            let prompt = [chunk.prompt_tokens.as_slice()];
+            let mut recurrent_refs = vec![&mut state.recurrent];
+            let logits = self.model.batch_prefill_logits(
+                &prompt,
+                std::slice::from_mut(&mut state.kv),
+                &mut recurrent_refs,
             )?;
 
-            let mut results = Vec::with_capacity(requests.len());
-            for (i, req) in requests.iter().enumerate() {
-                let first_token = tokens[i];
-                let first_token_logprob = cpu_logits[i].as_ref().and_then(|row| {
-                    openinfer_sample::token_logprob_from_row(row, first_token, req.logprobs)
-                });
-                results.push(PrefillRequestResult {
-                    request_id: req.request_id,
-                    first_token,
-                    first_token_logprob,
-                });
+            if chunk.finish_prefill {
+                if self.rank == 0 {
+                    let result = self.sample_final_prefill_chunk(chunk, &logits)?;
+                    primary_results.push(result);
+                }
+                self.requests[state_idx].phase = TpRequestPhase::Decoding;
             }
-            self.install_active_requests(requests, kv_states, recurrent_states);
-            Ok(TpWorkerReply::Prefill(PrefillResult { requests: results }))
+        }
+
+        if self.rank == 0 {
+            Ok(TpWorkerReply::Prefill(PrefillResult {
+                requests: primary_results,
+            }))
         } else {
-            self.install_active_requests(requests, kv_states, recurrent_states);
             Ok(TpWorkerReply::Ack)
         }
     }
 
-    fn install_active_requests(
+    fn sample_final_prefill_chunk(
         &mut self,
-        requests: &[PrefillStepItem],
-        kv_states: Vec<KvState>,
-        recurrent_states: Vec<RecurrentState>,
-    ) {
-        for ((req, kv), recurrent) in requests.iter().zip(kv_states).zip(recurrent_states) {
-            self.active.push(TpActiveRequest {
-                request_id: req.request_id,
-                kv,
-                recurrent,
-            });
+        chunk: &TpPrefillChunkItem,
+        logits: &openinfer_core::tensor::HiddenStates,
+    ) -> Result<PrefillRequestResult> {
+        let cpu_logits =
+            snapshot_requested_logprobs(self.model.device_ctx(), logits, &[chunk.logprobs])?;
+        let params = vec![SamplingParams::default()];
+        let params_refs: Vec<&SamplingParams> = params.iter().collect();
+        let tokens = openinfer_sample::select_batch(
+            self.model.device_ctx(),
+            logits,
+            &params_refs,
+            0,
+            &mut self.sample_scratch,
+        )?;
+        let first_token = tokens[0];
+        let first_token_logprob = cpu_logits[0].as_ref().and_then(|row| {
+            openinfer_sample::token_logprob_from_row(row, first_token, chunk.logprobs)
+        });
+        Ok(PrefillRequestResult {
+            request_id: chunk.request_id,
+            first_token,
+            first_token_logprob,
+        })
+    }
+
+    fn ensure_prefill_state(&mut self, request_id: RequestId) -> Result<usize> {
+        if let Some(idx) = self.request_index(request_id) {
+            return Ok(idx);
         }
+        let state = TpRequestState {
+            request_id,
+            phase: TpRequestPhase::Prefilling,
+            kv: self.model.alloc_kv(),
+            recurrent: RecurrentState::new(self.model.device_ctx(), self.model.config())?,
+        };
+        self.requests.push(state);
+        Ok(self.requests.len() - 1)
+    }
+
+    fn request_index(&self, request_id: RequestId) -> Option<usize> {
+        self.requests
+            .iter()
+            .position(|state| state.request_id == request_id)
     }
 
     fn drop_request(&mut self, request_id: RequestId) {
-        if let Some(idx) = self
-            .active
-            .iter()
-            .position(|active| active.request_id == request_id)
-        {
-            self.active.swap_remove(idx);
+        if let Some(idx) = self.request_index(request_id) {
+            self.requests.swap_remove(idx);
         }
+    }
+}
+
+fn validate_prefill_chunks(chunks: &[TpPrefillChunkItem]) -> Result<()> {
+    let mut seen = HashSet::with_capacity(chunks.len());
+    for chunk in chunks {
+        anyhow::ensure!(
+            !chunk.prompt_tokens.is_empty(),
+            "Qwen3.5 TP prefill chunk for request {} is empty",
+            chunk.request_id.get()
+        );
+        anyhow::ensure!(
+            seen.insert(chunk.request_id),
+            "duplicate Qwen3.5 TP request id {} in one prefill chunk command",
+            chunk.request_id.get()
+        );
+    }
+    Ok(())
+}
+
+impl From<PrefillStepItem> for TpPrefillChunkItem {
+    fn from(request: PrefillStepItem) -> Self {
+        Self::new(
+            request.request_id,
+            request.prompt_tokens,
+            request.logprobs,
+            true,
+        )
     }
 }
 
@@ -547,6 +618,20 @@ mod tests {
     }
 
     #[test]
+    fn validates_prefill_chunk_shape() {
+        let empty = [TpPrefillChunkItem::new(RequestId::new(1), vec![], 0, false)];
+        let err = validate_prefill_chunks(&empty).unwrap_err().to_string();
+        assert!(err.contains("is empty"));
+
+        let duplicate = [
+            TpPrefillChunkItem::new(RequestId::new(1), vec![151_646], 0, false),
+            TpPrefillChunkItem::new(RequestId::new(1), vec![9707], 0, true),
+        ];
+        let err = validate_prefill_chunks(&duplicate).unwrap_err().to_string();
+        assert!(err.contains("duplicate"));
+    }
+
+    #[test]
     #[ignore = "requires two CUDA devices and Qwen3.5 weights"]
     fn starts_tp2_workers_and_broadcasts_lifecycle_commands() {
         let model_path = std::env::var("OPENINFER_TEST_MODEL_PATH")
@@ -580,5 +665,31 @@ mod tests {
         executor
             .drop_request(request_id)
             .expect("drop prefetched request");
+    }
+
+    #[test]
+    #[ignore = "requires two CUDA devices and Qwen3.5 weights"]
+    fn tp2_chunked_prefill_advances_existing_request_state() {
+        let model_path = std::env::var("OPENINFER_TEST_MODEL_PATH")
+            .unwrap_or_else(|_| "/home/data/mgj/qwen35weights".to_string());
+        let executor = Qwen35TpExecutor::from_runtime_with_capacity(&model_path, false, &[0, 1], 1)
+            .expect("start TP2 executor");
+        let request_id = RequestId::new(13);
+        let first = TpPrefillChunkItem::new(request_id, vec![151_646], 0, false);
+        let first_result = executor
+            .execute_prefill_chunks(&[first])
+            .expect("run non-final TP2 prefill chunk");
+        assert!(first_result.requests.is_empty());
+
+        let final_chunk = TpPrefillChunkItem::new(request_id, vec![9707], 0, true);
+        let final_result = executor
+            .execute_prefill_chunks(&[final_chunk])
+            .expect("run final TP2 prefill chunk");
+        assert_eq!(final_result.requests.len(), 1);
+        assert_eq!(final_result.requests[0].request_id, request_id);
+
+        executor
+            .drop_request(request_id)
+            .expect("drop chunk-prefilled request");
     }
 }
