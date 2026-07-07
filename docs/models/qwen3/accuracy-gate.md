@@ -1,16 +1,16 @@
-# Qwen3-4B accuracy gate
+# Qwen3 accuracy gate
 
-**TL;DR**: Qwen3-4B's logits are guarded by `tests/hf_golden_gate.rs` — a tolerance check against a stored HuggingFace bf16 golden, *not* an exact-text or hash baseline. It teacher-forces 48 fixed sequences and asserts openinfer's logprobs stay at the bf16 noise floor of HF across bs=1 / batched eager / CUDA-graph. Strict guards: a structural **regret** check on the argmax + **mean** delta ≤ 0.06 nat + **p99** delta ≤ 0.20 nat; the absolute max is printed but not asserted (it is coverage-unstable). This is the reference implementation of the pattern in `subsystems/correctness/logits-golden-gate.md` — read that for the *why*; this doc is the Qwen3-4B *specifics*.
+**TL;DR**: Qwen3's logits are guarded (per committed size — 4B and 14B, keyed from config geometry) by `tests/hf_golden_gate.rs` — a tolerance check against stored HuggingFace bf16 goldens, *not* an exact-text or hash baseline. It teacher-forces 48 fixed sequences and asserts openinfer's logprobs stay at the bf16 noise floor of HF across bs=1 / batched eager, and through CUDA-graph when the model's GQA group is compiled (14B is group-5, uncompiled — it reroutes decode eager and skips the graph passes). Strict guards: a structural **regret** check on the argmax + **mean** delta ≤ 0.06 nat + **p99** delta ≤ 0.20 nat; the absolute max is printed but not asserted (it is coverage-unstable). This is the reference implementation of the pattern in `subsystems/correctness/logits-golden-gate.md` — read that for the *why*; this doc is the Qwen3 *specifics*.
 
-Last touched: 2026-05
+Last touched: 2026-07
 
-## The Qwen3-4B instance
+## The gate (size-keyed)
 
-The methodology (why HF, why a tolerance not a hash, why teacher-forcing, why regret + mean + p99 and not absolute max) lives in `subsystems/correctness/logits-golden-gate.md`. Concretely for Qwen3-4B:
+The methodology (why HF, why a tolerance not a hash, why teacher-forcing, why regret + mean + p99 and not absolute max) lives in `subsystems/correctness/logits-golden-gate.md`. Concretely (4B and 14B committed, keyed from config geometry):
 
 | Knob | Value | Where |
 |------|-------|-------|
-| Golden | `test_data/qwen3-4b-hf-golden.safetensors` (~435 KB) | dumped by `tools/accuracy/dump_qwen3_4b_hf_golden.py` |
+| Goldens (committed) | `qwen3-4b-hf-golden.safetensors` + `qwen3-14b-hf-golden.safetensors`; size-keyed from config `(hidden_size, num_hidden_layers)` via `COMMITTED_FIXTURE_SIZES` | dumped by `tools/accuracy/dump_qwen3_hf_golden.py` |
 | Sequences | 48 seed-fixed (`SEED=0x5EED604D`), prompt 1–256 tokens, 16 decode tokens | dumper constants |
 | Positions scored | 48 × (16+1) = **816** | `P-1 .. P+D-1` per sequence |
 | Reference top-K | HF bf16 top-64 logprobs per position | dumper |
@@ -19,7 +19,7 @@ The methodology (why HF, why a tolerance not a hash, why teacher-forcing, why re
 | Head tokens compared | top `HEAD_K` = 8 of openinfer's own picks | gate |
 | Graph-bucket straddles | `BUCKET_STRADDLES = [9, 5]` (9→bucket 16 = 7 pad; 5→bucket 8 = 3 pad) | gate, from `batch_decode.rs` buckets |
 
-Prompt lengths reach 256 tokens (up to 16 KV blocks at block_size 16) on purpose: the gate then exercises long-attention / KV-block indexing / high RoPE positions, not just short prompts.
+Prompt lengths reach 256 tokens (up to 16 KV blocks at block_size 16), exercising multi-block KV indexing and cross-block attention. It does **not** reach the 4096-position RoPE-cache boundary, so long-context (>4096) logits fidelity is uncovered here — qwen35's separate long golden (4097/8192) caught a real drift at that boundary (#250), so porting a long golden to the qwen3 sizes is a crate-level follow-up.
 
 ## The four replay passes
 
@@ -55,7 +55,7 @@ Tolerances were calibrated from this floor, strictly: `MEAN_TOL` 0.06 ≈ 2× th
 After a change that legitimately alters numerical output, recompute the golden on GPU through HuggingFace (bf16, `device_map=auto` so it scales to larger models), then re-run the gate:
 
 ```bash
-uv run --no-project python tools/accuracy/dump_qwen3_4b_hf_golden.py \
+uv run --no-project python tools/accuracy/dump_qwen3_hf_golden.py \
     --model-path /data/models/Qwen3-4B --out test_data/qwen3-4b-hf-golden.safetensors
 
 OPENINFER_TEST_MODEL_PATH=/data/models/Qwen3-4B \
@@ -72,4 +72,4 @@ The gate prints the full delta distribution and the worst position (`seq`, `pos`
 
 ## Next step
 
-Replicate this for the other model lines as they are cleaned up — see `subsystems/correctness/logits-golden-gate.md` for the portable pattern. Qwen3.5-4B now has its own HF logits gate; see `models/qwen35/accuracy.md` for its graph-only replay shape.
+The gate is size-keyed — 4B and 14B goldens are committed (14B added for the group-5 reroute path from #562; verified on GH200 sm_90, mean 0.029 / p99 0.102, within the same tolerances). Open follow-up: port qwen35's **long** golden (4097/8192) to the qwen3 sizes — qwen3 has no long-context logits coverage at any size yet, and qwen35's long fixture is what caught the #250 RoPE-boundary drift. See `subsystems/correctness/logits-golden-gate.md` for the portable pattern; `models/qwen35/accuracy.md` for the long-replay shape.

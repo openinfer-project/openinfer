@@ -1,5 +1,5 @@
-//! HuggingFace-golden logits gate for Qwen3-4B — the hardware-independent
-//! replacement for the old text-snapshot e2e and the bit-wise digest.
+//! HuggingFace-golden logits gate for Qwen3 (size-keyed: 4B, 14B, …) — the
+//! hardware-independent replacement for the old text-snapshot e2e and digest.
 //!
 //! HuggingFace is the numerical golden truth. A bit-wise check (exact text or a
 //! logprob hash) is fragile: bf16 GEMM kernels differ per GPU, so the low bits —
@@ -8,8 +8,8 @@
 //! noise floor* of a stored HF reference, which every numerically-correct GPU
 //! satisfies; only a real regression escapes the tolerance.
 //!
-//! The reference (`test_data/qwen3-4b-hf-golden.safetensors`, produced once by
-//! `tools/accuracy/dump_qwen3_4b_hf_golden.py`) pins a set of fixed token
+//! The reference (`test_data/qwen3-{size}-hf-golden.safetensors`, produced once
+//! by `tools/accuracy/dump_qwen3_hf_golden.py`) pins a set of fixed token
 //! sequences and HF's top-K next-token logprobs at each position. We replay the
 //! *same fixed sequences* through openinfer by teacher-forcing — prefill the
 //! prompt, then decode feeding the reference's own tail tokens — so every
@@ -41,15 +41,16 @@
 //!   * batched CUDA graph — the captured decode path pads the batch up to its
 //!     bucket, so this is where padding-slot leaks (and graph pointer/buffer
 //!     bugs) surface. Run the bucket straddles (9→16, 5→8) that maximise the
-//!     padding-slot count.
+//!     padding-slot count. Only for a compiled GQA group; an uncompiled group
+//!     (Qwen3-14B, group 5) reroutes decode eager and skips this pass.
 //!
 //! On a machine with ≥2 CUDA devices the eager replays additionally run under
 //! TP=2 (`device_ordinals = [0, 1]`) against the same golden and tolerances —
 //! sharding must not move logits beyond the single-GPU bf16 noise floor.
 //!
-//! Requires a CUDA GPU and Qwen3-4B weights; skips cleanly when the model is
-//! absent (point `OPENINFER_TEST_MODEL_PATH` at the weights to run it). The
-//! TP pass skips on single-GPU hosts.
+//! Requires a CUDA GPU and Qwen3 weights of a keyed size; skips cleanly when the
+//! model is absent (point `OPENINFER_TEST_MODEL_PATH` at the weights to run it).
+//! The TP pass skips on single-GPU hosts.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -62,10 +63,7 @@ use openinfer_qwen3::runtime::{
 use safetensors::{Dtype, SafeTensors};
 
 const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3-4B");
-const GOLDEN: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../test_data/qwen3-4b-hf-golden.safetensors"
-);
+const GOLDEN_ENV: &str = "OPENINFER_QWEN3_HF_GOLDEN";
 
 /// Ask the executor for as many logprobs as the golden stores so the top-K sets
 /// overlap; the comparison only leans on the head, but a wider request makes the
@@ -124,6 +122,60 @@ fn model_path_or_skip() -> Option<String> {
             None
         }
     }
+}
+
+fn config_json(model_path: &str) -> serde_json::Value {
+    let config_path = Path::new(model_path).join("config.json");
+    let raw = std::fs::read_to_string(&config_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", config_path.display()));
+    serde_json::from_str(&raw).unwrap_or_else(|e| panic!("parse {}: {e}", config_path.display()))
+}
+
+fn fixture_size_name(model_path: &str) -> Option<&'static str> {
+    let v = config_json(model_path);
+    let t = v.get("text_config").unwrap_or(&v);
+    let hidden = t.get("hidden_size").and_then(serde_json::Value::as_u64);
+    let layers = t
+        .get("num_hidden_layers")
+        .and_then(serde_json::Value::as_u64);
+    let (Some(hidden), Some(layers)) = (hidden, layers) else {
+        panic!("{model_path}/config.json has no hidden_size/num_hidden_layers");
+    };
+    match (hidden, layers) {
+        (2560, 36) => Some("4b"),
+        (4096, 36) => Some("8b"),
+        (5120, 40) => Some("14b"),
+        (5120, 64) => Some("32b"),
+        _ => None,
+    }
+}
+
+const COMMITTED_FIXTURE_SIZES: &[&str] = &["4b", "14b"];
+
+fn default_fixture_path(size: &str) -> String {
+    format!(
+        "{}/../test_data/qwen3-{size}-hf-golden.safetensors",
+        env!("CARGO_MANIFEST_DIR")
+    )
+}
+
+fn decode_group_compiled(model_path: &str) -> bool {
+    let v = config_json(model_path);
+    let t = v.get("text_config").unwrap_or(&v);
+    let heads = t
+        .get("num_attention_heads")
+        .and_then(serde_json::Value::as_u64);
+    let kv = t
+        .get("num_key_value_heads")
+        .and_then(serde_json::Value::as_u64);
+    let (Some(heads), Some(kv)) = (heads, kv) else {
+        panic!("{model_path}/config.json has no num_attention_heads/num_key_value_heads");
+    };
+    assert!(
+        kv > 0 && heads % kv == 0,
+        "invalid GQA head counts {heads}/{kv}"
+    );
+    openinfer_core::ops::SUPPORTED_GQA_GROUP_SIZES.contains(&((heads / kv) as usize))
 }
 
 fn as_i32(st: &SafeTensors, name: &str) -> (Vec<i32>, Vec<usize>) {
@@ -226,8 +278,40 @@ struct Golden {
 }
 
 impl Golden {
-    fn load() -> Golden {
-        let bytes = std::fs::read(GOLDEN).unwrap_or_else(|e| panic!("read {GOLDEN}: {e}"));
+    fn load_for(model_path: &str) -> Option<Golden> {
+        let Some(size) = fixture_size_name(model_path) else {
+            assert!(
+                std::env::var(GOLDEN_ENV).is_err(),
+                "{GOLDEN_ENV} is set but {model_path}/config.json geometry has no entry in the size table"
+            );
+            eprintln!(
+                "skipping qwen3 hf_golden_gate: unrecognized model geometry in \
+                 {model_path}/config.json; extend fixture_size_name to cover it"
+            );
+            return None;
+        };
+        let path = if let Ok(path) = std::env::var(GOLDEN_ENV) {
+            path
+        } else {
+            let path = default_fixture_path(size);
+            if !Path::new(&path).exists() {
+                assert!(
+                    !COMMITTED_FIXTURE_SIZES.contains(&size),
+                    "committed golden fixture missing at {path}"
+                );
+                eprintln!(
+                    "skipping qwen3 hf_golden_gate: no golden fixture for size {size} at {path}; \
+                     generate one with tools/accuracy/dump_qwen3_hf_golden.py"
+                );
+                return None;
+            }
+            path
+        };
+        Some(Self::load_path(&path))
+    }
+
+    fn load_path(path: &str) -> Golden {
+        let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
         let st = SafeTensors::deserialize(&bytes).expect("parse golden safetensors");
         let (prompt_tokens, _) = as_i32(&st, "prompt_tokens");
         let (prompt_lens, _) = as_i32(&st, "prompt_lens");
@@ -515,7 +599,9 @@ fn pega_logprobs_match_hf_golden_within_bf16_tolerance() {
     let Some(model_path) = model_path_or_skip() else {
         return;
     };
-    let golden = Golden::load();
+    let Some(golden) = Golden::load_for(&model_path) else {
+        return;
+    };
     let all: Vec<usize> = (0..golden.num_seqs).collect();
 
     // Debug knob: skip the single-GPU passes and run only the TP=2 suite.
@@ -541,7 +627,7 @@ fn pega_logprobs_match_hf_golden_within_bf16_tolerance() {
     // CUDA-graph decode is captured per bucket and pads the batch up to it, so
     // this path is where padding-slot leaks (and graph pointer/buffer bugs)
     // surface. Run the bucket straddles, which maximise the padding-slot count.
-    {
+    if decode_group_compiled(&model_path) {
         let mut ex = Qwen3Executor::from_runtime(&model_path, true, &[0])
             .expect("build cuda-graph executor");
         ex.set_prefix_cache_enabled(false);
@@ -560,6 +646,10 @@ fn pega_logprobs_match_hf_golden_within_bf16_tolerance() {
             "cuda-graph cached replay matched no prefix blocks"
         );
         report_and_assert(&format!("batched cuda-graph cached replay ({n})"), &cached);
+    } else {
+        eprintln!(
+            "hf_golden_gate: skipping CUDA-graph passes for {model_path} (uncompiled GQA group, reroutes to eager)"
+        );
     }
 
     // TP=2: the same eager suite sharded over two GPUs. Same golden, same
