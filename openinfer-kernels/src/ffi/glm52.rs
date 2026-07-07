@@ -335,7 +335,7 @@ unsafe extern "C" {
         layer_slot: i32,
         nranks: i32,
         myrank: i32,
-        span_owner: i32,
+        span_owner_dev: *const i32,
         grid_blocks: i32,
         stream: CUstream,
     ) -> CUresult;

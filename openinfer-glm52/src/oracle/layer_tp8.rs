@@ -97,7 +97,9 @@ fn layer_moe_tp8_span_matches_dp8() -> Result<()> {
                     let dp8_host = ctx.stream.clone_dtoh(&dp8_out)?;
 
                     // Span pass: pad rank. Row inputs are ignored by the
-                    // kernel; poison mlp_out to prove the zero-fill runs.
+                    // kernel (only the staged owner's are read); poison
+                    // mlp_out to prove the zero-fill runs.
+                    let dummy_rows = ctx.stream.alloc_zeros::<bf16>(TP_RANKS * HIDDEN)?;
                     let dummy_idx = ctx.stream.alloc_zeros::<i32>(TP_RANKS * 8)?;
                     let dummy_prob = ctx.stream.alloc_zeros::<f32>(TP_RANKS * 8)?;
                     let mut pad_out = ctx.stream.alloc_zeros::<bf16>(TP_RANKS * HIDDEN)?;
@@ -105,13 +107,13 @@ fn layer_moe_tp8_span_matches_dp8() -> Result<()> {
                         &vec![bf16::from_f32(f32::NAN); TP_RANKS * HIDDEN],
                         &mut pad_out,
                     )?;
+                    tp8.stage_span_owner(&ctx, 0)?;
                     tp8.advance_epoch(&ctx)?;
                     tp8.forward_span(
                         &ctx,
                         0,
-                        0,
                         &bank,
-                        &normed2,
+                        &dummy_rows,
                         &dummy_idx,
                         &dummy_prob,
                         &mut pad_out,
@@ -168,12 +170,12 @@ fn layer_moe_tp8_span_matches_dp8() -> Result<()> {
     tp8.forward(&ctx, 0, &bank, &row_buf, &router_scratch, &mut dp8_out)?;
     let dp8_row0 = ctx.stream.clone_dtoh(&dp8_out)?;
 
-    // Span pass: all 8 rows from rank 0.
+    // Span pass: all 8 rows from rank 0 (the staged owner).
     let mut span_out = ctx.stream.alloc_zeros::<bf16>(TP_RANKS * HIDDEN)?;
+    tp8.stage_span_owner(&ctx, 0)?;
     tp8.advance_epoch(&ctx)?;
     tp8.forward_span(
         &ctx,
-        0,
         0,
         &bank,
         &normed2_all,

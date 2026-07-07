@@ -386,6 +386,7 @@ pub(crate) struct Glm52MoeTp8State {
     peer_ag: [u64; RANKS],
     peer_rs: [u64; RANKS],
     epoch_dev: CudaSlice<u64>,
+    span_owner_dev: CudaSlice<i32>,
     xg: CudaSlice<bf16>,
     topk_all_idx: CudaSlice<i32>,
     topk_all_prob: CudaSlice<f32>,
@@ -451,6 +452,7 @@ impl Glm52MoeTp8State {
         // never match a live epoch.
         let mut epoch_dev = ctx.stream.alloc_zeros::<u64>(1)?;
         ctx.stream.memcpy_htod(&[1u64], &mut epoch_dev)?;
+        let span_owner_dev = ctx.stream.alloc_zeros::<i32>(1)?;
         let grid_blocks = glm52_moe_tp8_max_blocks()?;
         Ok(Self {
             rank,
@@ -462,6 +464,7 @@ impl Glm52MoeTp8State {
             peer_ag,
             peer_rs,
             epoch_dev,
+            span_owner_dev,
             xg: ctx.stream.alloc_zeros(RANKS * H)?,
             topk_all_idx: ctx.stream.alloc_zeros(RANKS * GLM52_TP8_TOPK)?,
             topk_all_prob: ctx.stream.alloc_zeros(RANKS * GLM52_TP8_TOPK)?,
@@ -479,6 +482,16 @@ impl Glm52MoeTp8State {
     /// layer's `forward` of that step (captured into the same graph).
     pub(crate) fn advance_epoch(&mut self, ctx: &DeviceContext) -> Result<()> {
         glm52_moe_tp8_epoch_advance(ctx, &mut self.epoch_dev)
+    }
+
+    /// Stage the span owner for this step's replay — once per span step,
+    /// BEFORE the graph launch (every span layer kernel reads it at run
+    /// time, so one captured span graph serves any owner).
+    pub(crate) fn stage_span_owner(&mut self, ctx: &DeviceContext, owner: usize) -> Result<()> {
+        ensure!(owner < RANKS, "TP8 span owner {owner} out of range");
+        ctx.stream
+            .memcpy_htod(&[owner as i32], &mut self.span_owner_dev)?;
+        Ok(())
     }
 
     /// One layer's TP8 MoE for this rank's single token (bucket-1 only): the
@@ -512,6 +525,7 @@ impl Glm52MoeTp8State {
             peer_ag: self.peer_ag,
             peer_rs: self.peer_rs,
             epoch_dev: &mut self.epoch_dev,
+            span_owner_dev: None,
         };
         glm52_moe_tp8_layer_launch(
             ctx,
@@ -532,16 +546,16 @@ impl Glm52MoeTp8State {
     }
 
     /// Span-mode layer forward: all 8 rows (1 committed + 7 drafts) belong
-    /// to `owner`. On the owner, `normed2`/`topk_idx`/`topk_prob` are 8-row
-    /// arrays and `mlp_out` receives 8 rows of routed + shared; on the other
-    /// ranks the row inputs are ignored (any valid device buffer) and the
-    /// 8-row `mlp_out` is zero-filled (pads never enter the MoE).
+    /// to the rank staged via [`Self::stage_span_owner`] (once per step,
+    /// before the first span layer). Every rank passes 8-row buffers: the
+    /// kernels read the inputs only on the owner, whose `mlp_out` receives
+    /// 8 rows of routed + shared; the other ranks' `mlp_out` is zero-filled
+    /// (pads never enter the MoE).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn forward_span(
         &mut self,
         ctx: &DeviceContext,
         slot: usize,
-        owner: usize,
         bank: &Glm52MoeTp8SliceBank,
         normed2: &CudaSlice<bf16>,
         topk_idx: &CudaSlice<i32>,
@@ -565,11 +579,12 @@ impl Glm52MoeTp8State {
             peer_ag: self.peer_ag,
             peer_rs: self.peer_rs,
             epoch_dev: &mut self.epoch_dev,
+            span_owner_dev: Some(&self.span_owner_dev),
         };
         glm52_moe_tp8_layer_launch(
             ctx,
             slot,
-            Glm52Tp8RowMap::Span { owner },
+            Glm52Tp8RowMap::Span,
             normed2,
             topk_idx,
             topk_prob,

@@ -163,6 +163,9 @@ pub struct Glm52MoeTp8Buffers<'a> {
     pub peer_ag: [u64; GLM52_TP8_RANKS],
     pub peer_rs: [u64; GLM52_TP8_RANKS],
     pub epoch_dev: &'a mut CudaSlice<u64>,
+    /// Span-mode owner rank, staged by the host before each span step;
+    /// `None` for [`Glm52Tp8RowMap::Dp8`].
+    pub span_owner_dev: Option<&'a CudaSlice<i32>>,
 }
 
 /// Row-to-owner mapping of one TP8 layer step (always 8 rows through the
@@ -172,11 +175,14 @@ pub enum Glm52Tp8RowMap {
     /// Row i is rank i's token (bucket-1 c8): `normed2`/`topk_*`/`mlp_out`
     /// hold this rank's single row.
     Dp8,
-    /// All 8 rows belong to `owner` (1 committed + 7 speculative drafts):
-    /// the owner's `normed2`/`topk_*`/`mlp_out` are 8-row arrays; the other
-    /// ranks' row inputs are ignored and their pad `mlp_out` (8 rows) is
-    /// zero-filled.
-    Span { owner: usize },
+    /// All 8 rows belong to one owner rank (1 committed + 7 speculative
+    /// drafts). The owner id is read from device memory
+    /// (`Glm52MoeTp8Buffers::span_owner_dev`, staged by the host before
+    /// replay — like the epoch), so one captured span graph serves any
+    /// owner. EVERY rank passes 8-row `normed2`/`topk_*`/`mlp_out`; the
+    /// kernels read the inputs only on the owner, and non-owners zero-fill
+    /// their pad `mlp_out`.
+    Span,
 }
 
 /// Launch one layer's TP8 MoE phase-kernel chain. `topk_idx`/`topk_prob` are
@@ -205,41 +211,32 @@ pub fn glm52_moe_tp8_layer_launch(
     const H: usize = GLM52_TP8_HIDDEN;
     const E: usize = GLM52_TP8_BANK_EXPERTS;
     ensure!(myrank < GLM52_TP8_RANKS, "TP8 myrank {myrank} out of range");
-    let span_owner: i32 = match row_map {
-        Glm52Tp8RowMap::Dp8 => -1,
-        Glm52Tp8RowMap::Span { owner } => {
+    // Any rank can be the (device-staged) owner in span mode, so every rank
+    // must pass full 8-row buffers there; dp8 rows are single.
+    let rows = match row_map {
+        Glm52Tp8RowMap::Dp8 => {
             ensure!(
-                owner < GLM52_TP8_RANKS,
-                "TP8 span owner {owner} out of range"
+                bufs.span_owner_dev.is_none(),
+                "TP8 dp8 mapping must not stage a span owner"
             );
-            owner as i32
+            1
         }
-    };
-    // Rows whose data flows through this rank's own arrays: the span owner
-    // reads/writes 8 rows, span non-owners still need 8 pad mlp_out rows.
-    let in_rows = match row_map {
-        Glm52Tp8RowMap::Dp8 => 1,
-        Glm52Tp8RowMap::Span { owner } => {
-            if owner == myrank {
-                GLM52_TP8_TOKENS
-            } else {
-                0
-            }
+        Glm52Tp8RowMap::Span => {
+            ensure!(
+                bufs.span_owner_dev.is_some_and(|d| !d.is_empty()),
+                "TP8 span mapping needs a staged span_owner_dev"
+            );
+            GLM52_TP8_TOKENS
         }
-    };
-    let out_rows = match row_map {
-        Glm52Tp8RowMap::Dp8 => 1,
-        Glm52Tp8RowMap::Span { .. } => GLM52_TP8_TOKENS,
     };
     ensure!(
-        normed2.len() >= in_rows.max(1) * H && mlp_out.len() >= out_rows * H,
+        normed2.len() >= rows * H && mlp_out.len() >= rows * H,
         "TP8 hidden buffers too small for {row_map:?}: normed2 {}, mlp_out {}",
         normed2.len(),
         mlp_out.len()
     );
     ensure!(
-        topk_idx.len() >= in_rows.max(1) * GLM52_TP8_TOPK
-            && topk_prob.len() >= in_rows.max(1) * GLM52_TP8_TOPK,
+        topk_idx.len() >= rows * GLM52_TP8_TOPK && topk_prob.len() >= rows * GLM52_TP8_TOPK,
         "TP8 topk buffers too small: idx {}, prob {}",
         topk_idx.len(),
         topk_prob.len()
@@ -297,6 +294,10 @@ pub fn glm52_moe_tp8_layer_launch(
     let (ug_ptr, _g16) = bufs.ug.device_ptr_mut(&ctx.stream);
     let (cpart_ptr, _g17) = bufs.cpart.device_ptr_mut(&ctx.stream);
     let (epoch_ptr, _g20) = bufs.epoch_dev.device_ptr_mut(&ctx.stream);
+    let owner_dev_guard = bufs.span_owner_dev.map(|dev| dev.device_ptr(&ctx.stream));
+    let owner_dev_ptr: *const i32 = owner_dev_guard
+        .as_ref()
+        .map_or(std::ptr::null(), |(p, _)| *p as *const i32);
     let peer_ag: [*const std::ffi::c_void; GLM52_TP8_RANKS] =
         bufs.peer_ag.map(|p| p as *const std::ffi::c_void);
     let peer_rs: [*const std::ffi::c_void; GLM52_TP8_RANKS] =
@@ -329,7 +330,7 @@ pub fn glm52_moe_tp8_layer_launch(
             layer_slot as i32,
             GLM52_TP8_RANKS as i32,
             myrank as i32,
-            span_owner,
+            owner_dev_ptr,
             grid_blocks as i32,
             ctx.stream.cu_stream(),
         )
