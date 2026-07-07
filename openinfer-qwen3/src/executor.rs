@@ -2928,7 +2928,10 @@ impl LocalQwen3Lane {
             }
             PrecapturePhase::Finalize => {
                 for (bucket_idx, &bucket) in BATCH_BUCKETS.iter().enumerate() {
-                    let path = BatchDecodeBuffers::attention_path(bucket);
+                    let path = BatchDecodeBuffers::attention_path(
+                        bucket,
+                        self.bufs.policy_at_construction,
+                    );
                     let graph_idx = BatchDecodeBuffers::graph_index(bucket_idx, path);
                     anyhow::ensure!(
                         self.bufs.graphs[graph_idx].is_captured(),
@@ -2966,7 +2969,8 @@ impl LocalQwen3Lane {
     fn dump_decode_graph_png(&mut self, png_path: &Path) -> Result<CudaGraphDumpSummary> {
         let bucket_idx = 0;
         let bucket = BATCH_BUCKETS[bucket_idx];
-        let attention_path = BatchDecodeBuffers::attention_path(bucket);
+        let attention_path =
+            BatchDecodeBuffers::attention_path(bucket, self.bufs.policy_at_construction);
         let graph_idx = BatchDecodeBuffers::graph_index(bucket_idx, attention_path);
         if !self.bufs.graphs[graph_idx].is_captured() {
             anyhow::ensure!(

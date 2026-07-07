@@ -1,6 +1,7 @@
 //! End-to-end prefill repro: pinning the projection GEMMs makes prompt_a's next-token top-K stop
 //! depending on its batch-mates in this tested prefill path. Scope is the GEMM-N reduction-order
-//! axis, not whole-model invariance — attention-path and decode-vs-unified residuals survive the pin.
+//! axis, not whole-model invariance — the decode-vs-unified residual survives the pin (the
+//! attention-path residual is closed by pinning SplitKv under `--batch-invariant`).
 //!
 //! prompt_a's top-K alone vs co-batched with a filler, under three policies: baseline (Tuned,
 //! drifts = the bug), pin (top-K bit-identical = the fix), per_token (oracle). Pass requires full
