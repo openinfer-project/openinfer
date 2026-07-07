@@ -29,9 +29,11 @@
 //     the ~100 s device timeout with a half-paired collective)
 //   - no block barrier inside thread-divergent LL branches (a __syncthreads
 //     there deadlocks against grid.sync — probe-proven)
+#include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cstdint>
+#include <mutex>
 
 namespace {
 
@@ -432,17 +434,26 @@ int glm52_moe_tp8_max_blocks_cuda(int* out_blocks) {
   return 0;
 }
 
-// LL buffers come from a dedicated per-device cudaMemPool whose access is
-// granted to the peer devices with cudaMemPoolSetAccess. This is deliberate:
-// cudaDeviceEnablePeerAccess is DEVICE-WIDE — it maps every current and
-// future allocation of this device into the peers' address spaces, and the
-// resulting page-table pressure measurably taxes the memory-bound expert
-// GEMMs on ALL layers (solo bucket-1 paid a flat ~0.8 ms/step for it on
-// 8xH200). Pool-scoped grants map only these few MB. NCCL/DeepEP never call
-// cudaDeviceEnablePeerAccess either (they map their windows explicitly).
+// LL buffers are CUDA VMM allocations (cuMemCreate + cuMemMap) with peer
+// access granted per-range via cuMemSetAccess — the same mechanism NCCL uses
+// for its symmetric windows. This is load-bearing: BOTH device-wide
+// cudaDeviceEnablePeerAccess AND pool-scoped cudaMemPoolSetAccess open a
+// device-wide peer channel under the hood, and its page-table side effect
+// taxes the memory-bound expert GEMMs on ALL layers — measured as a flat
+// ~0.85 ms/step on solo bucket-1 (8xH200), independent of what the kernel
+// does (an empty node with the grant present pays it; no grant, no tax).
+// VMM maps exactly these few MB and nothing else — the running DeepEP
+// windows are the existence proof that this form is tax-free.
 // Zeroed so no stale word matches a live epoch tag.
 namespace {
-cudaMemPool_t g_ll_pool[64] = {};
+struct LlVmmRecord {
+  CUdeviceptr va;
+  size_t size;
+  CUmemGenericAllocationHandle handle;
+};
+LlVmmRecord g_ll_vmm[64] = {};
+int g_ll_vmm_count = 0;
+std::mutex g_ll_vmm_mu;  // 8 rank threads allocate concurrently
 }
 
 int glm52_moe_tp8_alloc_ll_cuda(size_t bytes, const int* device_ordinals,
@@ -450,47 +461,66 @@ int glm52_moe_tp8_alloc_ll_cuda(size_t bytes, const int* device_ordinals,
   int dev = 0;
   cudaError_t e = cudaGetDevice(&dev);
   if (e != cudaSuccess) return (int)e;
-  if (dev < 0 || dev >= 64 || n_devices <= 0 || n_devices > 64) {
+  std::lock_guard<std::mutex> lock(g_ll_vmm_mu);
+  if (n_devices <= 0 || n_devices > 64 || g_ll_vmm_count >= 64) {
     return (int)cudaErrorInvalidValue;
   }
-  if (!g_ll_pool[dev]) {
-    cudaMemPoolProps props = {};
-    props.allocType = cudaMemAllocationTypePinned;
-    props.handleTypes = cudaMemHandleTypeNone;
-    props.location.type = cudaMemLocationTypeDevice;
-    props.location.id = dev;
-    cudaMemPool_t pool = nullptr;
-    e = cudaMemPoolCreate(&pool, &props);
-    if (e != cudaSuccess) return (int)e;
-    cudaMemAccessDesc desc[64];
-    int n = 0;
-    for (int i = 0; i < n_devices; ++i) {
-      if (device_ordinals[i] == dev) continue;
-      desc[n].location.type = cudaMemLocationTypeDevice;
-      desc[n].location.id = device_ordinals[i];
-      desc[n].flags = cudaMemAccessFlagsProtReadWrite;
-      ++n;
-    }
-    if (n > 0) {
-      e = cudaMemPoolSetAccess(pool, desc, n);
-      if (e != cudaSuccess) {
-        (void)cudaMemPoolDestroy(pool);
-        return (int)e;
-      }
-    }
-    g_ll_pool[dev] = pool;
+  CUmemAllocationProp prop = {};
+  prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+  prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+  prop.location.id = dev;
+  size_t gran = 0;
+  if (cuMemGetAllocationGranularity(&gran, &prop,
+                                    CU_MEM_ALLOC_GRANULARITY_MINIMUM) !=
+      CUDA_SUCCESS) {
+    return (int)cudaErrorUnknown;
   }
-  e = cudaMallocFromPoolAsync(out, bytes, g_ll_pool[dev], (cudaStream_t)0);
+  const size_t size = (bytes + gran - 1) / gran * gran;
+  CUdeviceptr va = 0;
+  CUmemGenericAllocationHandle handle = 0;
+  if (cuMemAddressReserve(&va, size, 0, 0, 0) != CUDA_SUCCESS) {
+    return (int)cudaErrorMemoryAllocation;
+  }
+  if (cuMemCreate(&handle, size, &prop, 0) != CUDA_SUCCESS) {
+    (void)cuMemAddressFree(va, size);
+    return (int)cudaErrorMemoryAllocation;
+  }
+  if (cuMemMap(va, size, 0, handle, 0) != CUDA_SUCCESS) {
+    (void)cuMemRelease(handle);
+    (void)cuMemAddressFree(va, size);
+    return (int)cudaErrorMemoryAllocation;
+  }
+  CUmemAccessDesc desc[64];
+  for (int i = 0; i < n_devices; ++i) {
+    desc[i].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    desc[i].location.id = device_ordinals[i];
+    desc[i].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+  }
+  if (cuMemSetAccess(va, size, desc, n_devices) != CUDA_SUCCESS) {
+    (void)cuMemUnmap(va, size);
+    (void)cuMemRelease(handle);
+    (void)cuMemAddressFree(va, size);
+    return (int)cudaErrorMemoryAllocation;
+  }
+  e = cudaMemset((void*)va, 0, size);
   if (e != cudaSuccess) return (int)e;
-  e = cudaMemsetAsync(*out, 0, bytes, (cudaStream_t)0);
-  if (e != cudaSuccess) return (int)e;
-  return (int)cudaStreamSynchronize((cudaStream_t)0);
+  g_ll_vmm[g_ll_vmm_count++] = {va, size, handle};
+  *out = (void*)va;
+  return 0;
 }
 
 int glm52_moe_tp8_free_ll_cuda(void* p) {
-  cudaError_t e = cudaFreeAsync(p, (cudaStream_t)0);
-  if (e != cudaSuccess) return (int)e;
-  return (int)cudaStreamSynchronize((cudaStream_t)0);
+  std::lock_guard<std::mutex> lock(g_ll_vmm_mu);
+  for (int i = 0; i < g_ll_vmm_count; ++i) {
+    if (g_ll_vmm[i].va == (CUdeviceptr)p) {
+      (void)cuMemUnmap(g_ll_vmm[i].va, g_ll_vmm[i].size);
+      (void)cuMemRelease(g_ll_vmm[i].handle);
+      (void)cuMemAddressFree(g_ll_vmm[i].va, g_ll_vmm[i].size);
+      g_ll_vmm[i] = g_ll_vmm[--g_ll_vmm_count];
+      return 0;
+    }
+  }
+  return (int)cudaErrorInvalidValue;
 }
 
 int glm52_moe_tp8_layer_launch_cuda(
