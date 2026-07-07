@@ -93,6 +93,9 @@ impl Qwen35Model {
         bufs: &mut BatchDecodeBuffers35,
     ) -> Result<()> {
         let eps = self.config.rms_norm_eps;
+        let tp = self.tensor_parallel;
+        let num_attention_heads = self.config.local_num_attention_heads(tp);
+        let num_key_value_heads = self.config.local_num_key_value_heads(tp);
 
         ops::gemm_into(&self.ctx, &attn.q_proj, &bufs.normed, &mut bufs.q_full);
         ops::gemm_into(&self.ctx, &attn.k_proj, &bufs.normed, &mut bufs.k_attn);
@@ -108,8 +111,8 @@ impl Qwen35Model {
             &self.cos_cache,
             &self.sin_cache,
             &bufs.positions_d,
-            self.config.num_attention_heads,
-            self.config.num_key_value_heads,
+            num_attention_heads,
+            num_key_value_heads,
             self.config.rotary_dim,
             eps,
         );
@@ -130,7 +133,7 @@ impl Qwen35Model {
             &bufs.kv_tile_indices_d,
             &bufs.kv_chunk_size_d,
             &mut bufs.attn_out_full,
-            self.config.num_attention_heads,
+            num_attention_heads,
             bs,
         )?;
 
@@ -140,7 +143,7 @@ impl Qwen35Model {
             crate::ffi::attention_gate_batch_hd256_cuda(
                 qf_ptr as *const crate::ffi::Half,
                 out_ptr as *mut crate::ffi::Half,
-                self.config.num_attention_heads as i32,
+                num_attention_heads as i32,
                 bs as i32,
                 self.ctx.stream.cu_stream(),
             );
@@ -220,7 +223,62 @@ impl Qwen35Model {
             &bufs.attn_out_full,
             &mut bufs.attn_results,
         );
+        self.all_reduce_hidden(&mut bufs.attn_results)?;
         Ok(())
+    }
+
+    /// Eager batch decode step.
+    ///
+    /// Unlike `batch_decode_graph`, this does not pad to a CUDA Graph bucket and
+    /// does not capture/replay. Recurrent state is supplied directly by the
+    /// caller, which is the shape TP workers need for rank-local request state.
+    pub(crate) fn batch_decode_eager_logits(
+        &self,
+        token_ids: &[u32],
+        kv_states: &mut [&mut KvState],
+        recurrent_states: &mut [&mut RecurrentState],
+        bufs: &mut BatchDecodeBuffers35,
+    ) -> Result<()> {
+        let bs = token_ids.len();
+        anyhow::ensure!(
+            bs > 0,
+            "batch_decode_eager_logits requires at least one request"
+        );
+        anyhow::ensure!(bs == kv_states.len(), "token_ids / kv_states len mismatch");
+        anyhow::ensure!(
+            bs == recurrent_states.len(),
+            "token_ids / recurrent_states len mismatch"
+        );
+        anyhow::ensure!(
+            bs <= bufs.max_batch_size,
+            "batch size {bs} exceeds eager decode buffer capacity {}",
+            bufs.max_batch_size
+        );
+
+        let mut positions = Vec::with_capacity(bs);
+        for (i, kv) in kv_states.iter_mut().enumerate() {
+            let pos = kv.seq_len();
+            self.ensure_rope_cache_covers(pos + 1)?;
+            kv.ensure_capacity(pos + 1)?;
+            kv.advance(1);
+            recurrent_states[i].seq_len += 1;
+            positions.push(pos as i32);
+        }
+
+        bufs.set_batch_size(bs);
+        self.ctx
+            .stream
+            .memcpy_htod(token_ids, &mut bufs.token_ids_d)?;
+        self.ctx
+            .stream
+            .memcpy_htod(&positions, &mut bufs.positions_d)?;
+
+        let kv_refs: Vec<&KvState> = kv_states.iter().map(|s| &**s).collect();
+        bufs.sync_paged_meta(&self.ctx, &kv_refs, bs)?;
+
+        let kv_buffer = kv_states[0].buffer();
+        let layout = *kv_states[0].layout();
+        self.batch_decode_kernels_graph(kv_buffer, &layout, bs, recurrent_states, bufs)
     }
 
     // =========================================================================
@@ -306,11 +364,13 @@ impl Qwen35Model {
         // Take graphs out of graph_state to avoid split-borrow in the closure.
         let mut graphs = std::mem::take(&mut graph_state.graphs);
         let result = graphs[bucket_idx].run_or_capture(&self.ctx, || {
+            let mut slot_refs: Vec<&mut RecurrentState> =
+                graph_state.slot_states.iter_mut().collect();
             self.batch_decode_kernels_graph(
                 kv_buffer,
                 &layout,
                 padded_bs,
-                &mut graph_state.slot_states,
+                &mut slot_refs,
                 &mut graph_state.buffers,
             )
         });
@@ -406,7 +466,7 @@ impl Qwen35Model {
         kv_buffer: &cudarc::driver::CudaSlice<half::bf16>,
         layout: &KvLayout,
         padded_bs: usize,
-        slot_states: &mut [RecurrentState],
+        slot_states: &mut [&mut RecurrentState],
         bufs: &mut BatchDecodeBuffers35,
     ) -> Result<()> {
         let eps = self.config.rms_norm_eps;
@@ -476,6 +536,7 @@ impl Qwen35Model {
                 &bufs.act_out,
                 &mut bufs.mlp_out,
             );
+            self.all_reduce_hidden(&mut bufs.mlp_out)?;
 
             ops::add_batch_into(&self.ctx, &bufs.hidden_mid, &bufs.mlp_out, &mut bufs.hidden)?;
         }
@@ -621,7 +682,7 @@ impl Qwen35Model {
     fn batch_decode_linear_attention_slots(
         &self,
         attn: &LinearAttentionLayer,
-        slot_states: &mut [RecurrentState],
+        slot_states: &mut [&mut RecurrentState],
         layer_idx: usize,
         padded_bs: usize,
         bufs: &mut BatchDecodeBuffers35,
@@ -632,6 +693,7 @@ impl Qwen35Model {
         ops::gemm_into(&self.ctx, &attn.in_proj_a, &bufs.normed, &mut bufs.a_proj);
 
         for (slot_idx, slot_state) in slot_states.iter_mut().enumerate().take(padded_bs) {
+            let slot_state = &mut **slot_state;
             let layer_state = &mut slot_state.layers[layer_idx];
 
             ops::extract_vec_into(&self.ctx, &bufs.qkv, slot_idx, &mut bufs.qkv_tmp)?;

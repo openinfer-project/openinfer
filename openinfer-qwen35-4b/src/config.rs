@@ -212,11 +212,6 @@ impl Config35 {
             .count()
     }
 
-    /// Total Q dimension for full attention (includes gate).
-    pub(crate) fn full_attn_q_proj_dim(&self) -> usize {
-        self.num_attention_heads * self.head_dim * 2
-    }
-
     /// Q dimension for full attention (without gate).
     pub(crate) fn full_attn_q_dim(&self) -> usize {
         self.num_attention_heads * self.head_dim

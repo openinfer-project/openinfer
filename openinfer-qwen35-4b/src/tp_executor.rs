@@ -1,7 +1,7 @@
 //! Tensor-parallel worker runtime for Qwen3.5.
 //!
-//! Phase 1 starts with eager dense TP prefill. Decode/unified execution still
-//! fails closed until the scheduler path can drive ordered worker commands.
+//! Phase 1 supports eager dense TP prefill and decode. Unified execution still
+//! fails closed until the scheduler path can drive ordered eager decode.
 
 use std::collections::HashSet;
 use std::sync::mpsc;
@@ -11,8 +11,10 @@ use anyhow::Result;
 
 use crate::batch_decode_graph::MAX_BATCH;
 use crate::config::TensorParallelConfig;
+use crate::decode_buffers::BatchDecodeBuffers35;
 use crate::executor::{
-    PrefillPlan, PrefillRequestResult, PrefillResult, PrefillStepItem, RequestId,
+    DecodePlan, DecodeRequestResult, DecodeResult, DecodeStepItem, PrefillPlan,
+    PrefillRequestResult, PrefillResult, PrefillStepItem, RequestId,
 };
 use crate::logprobs::snapshot_requested_logprobs;
 use crate::recurrent_state::RecurrentState;
@@ -30,6 +32,7 @@ enum TpWorkerCommand {
         resp: mpsc::Sender<Result<TpWorkerReply>>,
     },
     RunDecodeStep {
+        requests: Vec<DecodeStepItem>,
         resp: mpsc::Sender<Result<TpWorkerReply>>,
     },
     RunUnifiedStep {
@@ -46,6 +49,7 @@ enum TpWorkerCommand {
 enum TpWorkerReply {
     Ack,
     Prefill(PrefillResult),
+    Decode(DecodeResult),
 }
 
 /// TP executor. Rank 0 is the primary worker and returns scheduler-visible
@@ -184,6 +188,24 @@ impl Qwen35TpExecutor {
         wait_for_prefill(pending)
     }
 
+    pub fn execute_decode(&self, plan: DecodePlan<'_>) -> Result<DecodeResult> {
+        anyhow::ensure!(
+            !plan.requests.is_empty(),
+            "Qwen3.5 TP decode plan requires at least one request"
+        );
+        let requests = plan.requests.to_vec();
+        let mut pending = Vec::with_capacity(self.workers.len());
+        for worker in &self.workers {
+            let (resp_tx, resp_rx) = mpsc::channel();
+            worker.send(TpWorkerCommand::RunDecodeStep {
+                requests: requests.clone(),
+                resp: resp_tx,
+            })?;
+            pending.push(resp_rx);
+        }
+        wait_for_decode(pending)
+    }
+
     pub fn drop_request(&self, request_id: RequestId) -> Result<()> {
         let mut pending = Vec::with_capacity(self.workers.len());
         for worker in &self.workers {
@@ -207,9 +229,10 @@ impl Qwen35TpExecutor {
                     chunks: Vec::new(),
                     resp: resp_tx,
                 },
-                TpWorkerCommandKind::RunDecodeStep => {
-                    TpWorkerCommand::RunDecodeStep { resp: resp_tx }
-                }
+                TpWorkerCommandKind::RunDecodeStep => TpWorkerCommand::RunDecodeStep {
+                    requests: Vec::new(),
+                    resp: resp_tx,
+                },
                 TpWorkerCommandKind::RunUnifiedStep => {
                     TpWorkerCommand::RunUnifiedStep { resp: resp_tx }
                 }
@@ -316,6 +339,7 @@ struct TpWorkerState {
     max_batch: usize,
     model: Qwen35Model,
     requests: Vec<TpRequestState>,
+    decode_buffers: BatchDecodeBuffers35,
     sample_scratch: openinfer_sample::SampleScratch,
     _cublas_guard: CublasThreadGuard,
 }
@@ -350,6 +374,7 @@ impl TpWorkerState {
         )
         .map_err(|e| anyhow::anyhow!("failed to initialize Qwen3.5 TP NCCL rank {rank}: {e:?}"))?;
         model.attach_tp_comm(comm);
+        let decode_buffers = model.create_batch_decode_buffers_with_capacity(max_batch)?;
         let sample_scratch = openinfer_sample::SampleScratch::new(
             model.device_ctx(),
             model.config().vocab_size,
@@ -361,6 +386,7 @@ impl TpWorkerState {
             max_batch,
             model,
             requests: Vec::new(),
+            decode_buffers,
             sample_scratch,
             _cublas_guard: cublas_guard,
         })
@@ -376,10 +402,13 @@ impl TpWorkerState {
                     let result = self.execute_prefill_chunks(&chunks);
                     let _ = resp.send(result);
                 }
-                TpWorkerCommand::RunDecodeStep { resp }
-                | TpWorkerCommand::RunUnifiedStep { resp } => {
+                TpWorkerCommand::RunDecodeStep { requests, resp } => {
+                    let result = self.execute_decode(&requests);
+                    let _ = resp.send(result);
+                }
+                TpWorkerCommand::RunUnifiedStep { resp } => {
                     let _ = resp.send(Err(anyhow::anyhow!(
-                        "Qwen3.5 TP worker rank {} has no TP decode/unified implementation yet",
+                        "Qwen3.5 TP worker rank {} has no TP unified implementation yet",
                         self.rank
                     )));
                 }
@@ -471,6 +500,82 @@ impl TpWorkerState {
         })
     }
 
+    fn execute_decode(&mut self, requests: &[DecodeStepItem]) -> Result<TpWorkerReply> {
+        anyhow::ensure!(
+            !requests.is_empty(),
+            "Qwen3.5 TP decode command requires at least one request"
+        );
+        validate_decode_requests(requests)?;
+        anyhow::ensure!(
+            requests.len() <= self.max_batch,
+            "Qwen3.5 TP decode batch {} exceeds worker capacity {}",
+            requests.len(),
+            self.max_batch
+        );
+
+        let mut primary_results =
+            Vec::with_capacity(if self.rank == 0 { requests.len() } else { 0 });
+        for request in requests {
+            let state_idx = self.request_index(request.request_id).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Qwen3.5 TP decode request {} has no worker state",
+                    request.request_id.get()
+                )
+            })?;
+            anyhow::ensure!(
+                self.requests[state_idx].phase == TpRequestPhase::Decoding,
+                "Qwen3.5 TP request {} is not ready for decode",
+                request.request_id.get()
+            );
+
+            {
+                let state = &mut self.requests[state_idx];
+                let mut kv_refs = vec![&mut state.kv];
+                let mut recurrent_refs = vec![&mut state.recurrent];
+                self.model.batch_decode_eager_logits(
+                    &[request.token_id],
+                    &mut kv_refs,
+                    &mut recurrent_refs,
+                    &mut self.decode_buffers,
+                )?;
+            }
+
+            if self.rank == 0 {
+                let cpu_logits = snapshot_requested_logprobs(
+                    self.model.device_ctx(),
+                    &self.decode_buffers.logits,
+                    &[request.logprobs],
+                )?;
+                let params = vec![SamplingParams::default()];
+                let params_refs: Vec<&SamplingParams> = params.iter().collect();
+                let tokens = openinfer_sample::select_batch(
+                    self.model.device_ctx(),
+                    &self.decode_buffers.logits,
+                    &params_refs,
+                    0,
+                    &mut self.sample_scratch,
+                )?;
+                let token = tokens[0];
+                let logprob = cpu_logits[0].as_ref().and_then(|row| {
+                    openinfer_sample::token_logprob_from_row(row, token, request.logprobs)
+                });
+                primary_results.push(DecodeRequestResult {
+                    request_id: request.request_id,
+                    token,
+                    logprob,
+                });
+            }
+        }
+
+        if self.rank == 0 {
+            Ok(TpWorkerReply::Decode(DecodeResult {
+                requests: primary_results,
+            }))
+        } else {
+            Ok(TpWorkerReply::Ack)
+        }
+    }
+
     fn ensure_prefill_state(&mut self, request_id: RequestId) -> Result<usize> {
         if let Some(idx) = self.request_index(request_id) {
             return Ok(idx);
@@ -515,6 +620,18 @@ fn validate_prefill_chunks(chunks: &[TpPrefillChunkItem]) -> Result<()> {
     Ok(())
 }
 
+fn validate_decode_requests(requests: &[DecodeStepItem]) -> Result<()> {
+    let mut seen = HashSet::with_capacity(requests.len());
+    for request in requests {
+        anyhow::ensure!(
+            seen.insert(request.request_id),
+            "duplicate Qwen3.5 TP request id {} in one decode command",
+            request.request_id.get()
+        );
+    }
+    Ok(())
+}
+
 impl From<PrefillStepItem> for TpPrefillChunkItem {
     fn from(request: PrefillStepItem) -> Self {
         Self::new(
@@ -539,6 +656,9 @@ fn wait_for_acks(
             TpWorkerReply::Prefill(_) => {
                 anyhow::bail!("Qwen3.5 TP {op_name} unexpectedly returned prefill result")
             }
+            TpWorkerReply::Decode(_) => {
+                anyhow::bail!("Qwen3.5 TP {op_name} unexpectedly returned decode result")
+            }
         }
     }
     Ok(())
@@ -559,9 +679,35 @@ fn wait_for_prefill(pending: Vec<mpsc::Receiver<Result<TpWorkerReply>>>) -> Resu
                 );
                 result = Some(prefill);
             }
+            TpWorkerReply::Decode(_) => {
+                anyhow::bail!("Qwen3.5 TP prefill unexpectedly returned decode result")
+            }
         }
     }
     result.ok_or_else(|| anyhow::anyhow!("Qwen3.5 TP prefill returned no primary result"))
+}
+
+fn wait_for_decode(pending: Vec<mpsc::Receiver<Result<TpWorkerReply>>>) -> Result<DecodeResult> {
+    let mut result = None;
+    for (rank, recv) in pending.into_iter().enumerate() {
+        match recv
+            .recv()
+            .map_err(|_| anyhow::anyhow!("Qwen3.5 TP decode worker {rank} dropped"))??
+        {
+            TpWorkerReply::Ack => {}
+            TpWorkerReply::Decode(decode) => {
+                anyhow::ensure!(
+                    result.is_none(),
+                    "Qwen3.5 TP decode returned multiple primary results"
+                );
+                result = Some(decode);
+            }
+            TpWorkerReply::Prefill(_) => {
+                anyhow::bail!("Qwen3.5 TP decode unexpectedly returned prefill result")
+            }
+        }
+    }
+    result.ok_or_else(|| anyhow::anyhow!("Qwen3.5 TP decode returned no primary result"))
 }
 
 struct CublasThreadGuard;
@@ -632,6 +778,21 @@ mod tests {
     }
 
     #[test]
+    fn validates_decode_request_shape() {
+        validate_decode_requests(&[DecodeStepItem::new(RequestId::new(1), 9707, 0)])
+            .expect("single decode request is valid");
+
+        let duplicate = [
+            DecodeStepItem::new(RequestId::new(1), 9707, 0),
+            DecodeStepItem::new(RequestId::new(1), 560, 0),
+        ];
+        let err = validate_decode_requests(&duplicate)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("duplicate"));
+    }
+
+    #[test]
     #[ignore = "requires two CUDA devices and Qwen3.5 weights"]
     fn starts_tp2_workers_and_broadcasts_lifecycle_commands() {
         let model_path = std::env::var("OPENINFER_TEST_MODEL_PATH")
@@ -691,5 +852,36 @@ mod tests {
         executor
             .drop_request(request_id)
             .expect("drop chunk-prefilled request");
+    }
+
+    #[test]
+    #[ignore = "requires two CUDA devices and Qwen3.5 weights"]
+    fn tp2_decode_runs_after_prefill() {
+        let model_path = std::env::var("OPENINFER_TEST_MODEL_PATH")
+            .unwrap_or_else(|_| "/home/data/mgj/qwen35weights".to_string());
+        let executor = Qwen35TpExecutor::from_runtime_with_capacity(&model_path, false, &[0, 1], 1)
+            .expect("start TP2 executor");
+        let request_id = RequestId::new(17);
+        let request = PrefillStepItem::new(request_id, vec![151_646, 9707], 0);
+        let prefill = executor
+            .execute_prefill(PrefillPlan {
+                requests: &[request],
+            })
+            .expect("run TP2 prefill");
+        assert_eq!(prefill.requests.len(), 1);
+        assert_eq!(prefill.requests[0].request_id, request_id);
+
+        let decode_request = DecodeStepItem::new(request_id, prefill.requests[0].first_token, 0);
+        let decode = executor
+            .execute_decode(DecodePlan {
+                requests: &[decode_request],
+            })
+            .expect("run TP2 eager decode");
+        assert_eq!(decode.requests.len(), 1);
+        assert_eq!(decode.requests[0].request_id, request_id);
+
+        executor
+            .drop_request(request_id)
+            .expect("drop decoded request");
     }
 }

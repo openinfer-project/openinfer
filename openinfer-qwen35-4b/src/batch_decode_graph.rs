@@ -7,6 +7,7 @@ use openinfer_core::kv_pool::KvPool;
 use openinfer_core::tensor::DeviceContext;
 
 use super::config::Config35;
+use super::config::TensorParallelConfig;
 use super::decode_buffers::BatchDecodeBuffers35;
 use super::recurrent_state::RecurrentState;
 
@@ -59,14 +60,21 @@ impl BatchDecodeGraphState {
     pub(crate) fn with_capacity(
         ctx: &DeviceContext,
         config: &Config35,
+        tensor_parallel: TensorParallelConfig,
         kv_pool: &KvPool,
         max_batch: usize,
     ) -> Result<Self> {
         let padding_page_id = kv_pool.padding_page_id();
         let max_total_pages = kv_pool.capacity_pages();
 
-        let buffers =
-            BatchDecodeBuffers35::new(ctx, config, max_batch, max_total_pages, padding_page_id)?;
+        let buffers = BatchDecodeBuffers35::new(
+            ctx,
+            config,
+            tensor_parallel,
+            max_batch,
+            max_total_pages,
+            padding_page_id,
+        )?;
 
         let mut slot_states = Vec::with_capacity(max_batch);
         for _ in 0..max_batch {

@@ -691,11 +691,38 @@ impl Qwen35Model {
     pub(crate) fn create_batch_decode_graph_state(
         &self,
     ) -> anyhow::Result<super::batch_decode_graph::BatchDecodeGraphState> {
+        self.create_batch_decode_graph_state_with_capacity(self.reserved_decode_slots)
+    }
+
+    pub(crate) fn create_batch_decode_graph_state_with_capacity(
+        &self,
+        max_batch: usize,
+    ) -> anyhow::Result<super::batch_decode_graph::BatchDecodeGraphState> {
+        anyhow::ensure!(
+            max_batch <= self.reserved_decode_slots,
+            "requested graph capacity {max_batch} exceeds loaded capacity {}",
+            self.reserved_decode_slots
+        );
         super::batch_decode_graph::BatchDecodeGraphState::with_capacity(
             &self.ctx,
             &self.config,
+            self.tensor_parallel,
             &self.kv_pool,
-            self.reserved_decode_slots,
+            max_batch,
+        )
+    }
+
+    pub(crate) fn create_batch_decode_buffers_with_capacity(
+        &self,
+        max_batch: usize,
+    ) -> anyhow::Result<super::decode_buffers::BatchDecodeBuffers35> {
+        super::decode_buffers::BatchDecodeBuffers35::new(
+            &self.ctx,
+            &self.config,
+            self.tensor_parallel,
+            max_batch,
+            self.kv_pool.capacity_pages(),
+            self.kv_pool.padding_page_id(),
         )
     }
 

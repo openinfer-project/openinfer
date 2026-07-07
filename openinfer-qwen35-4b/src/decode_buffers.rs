@@ -4,7 +4,7 @@ use anyhow::Result;
 
 use cudarc::driver::CudaSlice;
 
-use super::config::Config35;
+use super::config::{Config35, TensorParallelConfig};
 use openinfer_core::kv_pool::KvState;
 use openinfer_core::tensor::{DeviceContext, DeviceVec, HiddenStates};
 
@@ -70,19 +70,21 @@ impl BatchDecodeBuffers35 {
     pub(crate) fn new(
         ctx: &DeviceContext,
         config: &Config35,
+        tensor_parallel: TensorParallelConfig,
         max_batch_size: usize,
         max_total_pages: usize,
         padding_page_id: i32,
     ) -> Result<Self> {
         let h = config.hidden_size;
         let bs = max_batch_size;
-        let q_proj_dim = config.full_attn_q_proj_dim();
-        let q_dim = config.full_attn_q_dim();
-        let kv_dim = config.full_attn_kv_dim();
+        let q_proj_dim = config.local_full_attn_gated_q_dim(tensor_parallel);
+        let q_dim = config.local_full_attn_q_dim(tensor_parallel);
+        let kv_dim = config.local_full_attn_kv_dim(tensor_parallel);
         let qkv_dim = config.linear_attn_qkv_dim();
         let z_dim = config.linear_attn_z_dim();
         let b_dim = config.linear_num_value_heads;
         let a_dim = b_dim;
+        let intermediate = config.local_intermediate_size(tensor_parallel);
 
         Ok(Self {
             max_batch_size: bs,
@@ -90,8 +92,8 @@ impl BatchDecodeBuffers35 {
             normed: HiddenStates::zeros(ctx, h, bs)?,
             attn_results: HiddenStates::zeros(ctx, h, bs)?,
             hidden_mid: HiddenStates::zeros(ctx, h, bs)?,
-            gate_up_out: HiddenStates::zeros(ctx, 2 * config.intermediate_size, bs)?,
-            act_out: HiddenStates::zeros(ctx, config.intermediate_size, bs)?,
+            gate_up_out: HiddenStates::zeros(ctx, 2 * intermediate, bs)?,
+            act_out: HiddenStates::zeros(ctx, intermediate, bs)?,
             mlp_out: HiddenStates::zeros(ctx, h, bs)?,
             logits: HiddenStates::zeros(ctx, config.selection_vocab, bs)?,
 
