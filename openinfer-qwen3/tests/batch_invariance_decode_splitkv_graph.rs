@@ -27,6 +27,10 @@ fn model_path_or_skip() -> Option<String> {
     Some(p)
 }
 
+// A_LEN/B_LEN exceed the pin's serve-N ceiling, so prefill chunked within the
+// verified envelope, as the scheduler does — the gate is about decode split-KV.
+const PREFILL_CHUNK: usize = 1024;
+
 fn pitem(id: RequestId, prompt: Vec<u32>) -> PrefillStepItem {
     PrefillStepItem::new(
         id,
@@ -36,6 +40,22 @@ fn pitem(id: RequestId, prompt: Vec<u32>) -> PrefillStepItem {
         LOGPROBS,
         false,
     )
+}
+
+fn prefill_chunked(ex: &mut Qwen3Executor, id: RequestId, prompt: &[u32]) -> u32 {
+    let item = pitem(id, prompt.to_vec()).with_chunk_budget(PREFILL_CHUNK);
+    loop {
+        let pr = ex
+            .execute_prefill(PrefillPlan {
+                sample_seed: 0,
+                requests: std::slice::from_ref(&item),
+                echo: false,
+            })
+            .expect("prefill chunk");
+        if pr.requests[0].completed {
+            break pr.requests[0].first_token;
+        }
+    }
 }
 
 fn filler(len: usize, stride: u32) -> Vec<u32> {
@@ -53,30 +73,12 @@ fn a_decode_cobatched_with(
     let id_a = RequestId::new(1);
     let id_b = RequestId::new(2);
     // Prefill A alone (batch 1); A's KV is identical regardless of B's length.
-    let pr_a = ex
-        .execute_prefill(PrefillPlan {
-            sample_seed: 0,
-            requests: &[pitem(id_a, a_prompt.to_vec())],
-            echo: false,
-        })
-        .expect("prefill A");
-    let a_first = pr_a.requests[0].first_token;
-    let pr_b = ex
-        .execute_prefill(PrefillPlan {
-            sample_seed: 0,
-            requests: &[pitem(id_b, b_prompt.to_vec())],
-            echo: false,
-        })
-        .expect("prefill B");
+    let a_first = prefill_chunked(ex, id_a, a_prompt);
+    let b_first = prefill_chunked(ex, id_b, b_prompt);
     // Decode A+B together (batch 2, A row 0); B's KV length sets the batch max_seq_len.
     let ditems = vec![
         DecodeStepItem::new(id_a, a_first, SamplingParams::default(), LOGPROBS),
-        DecodeStepItem::new(
-            id_b,
-            pr_b.requests[0].first_token,
-            SamplingParams::default(),
-            LOGPROBS,
-        ),
+        DecodeStepItem::new(id_b, b_first, SamplingParams::default(), LOGPROBS),
     ];
     let dr = ex
         .execute_decode(DecodePlan {

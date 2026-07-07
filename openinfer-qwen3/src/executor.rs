@@ -107,6 +107,14 @@ impl PrefillStepItem {
         self
     }
 
+    /// Cap the prompt tokens forwarded per `execute_prefill` call; re-issue the
+    /// item until its result is `completed` to prefill a long prompt in chunks.
+    #[must_use]
+    pub fn with_chunk_budget(mut self, chunk_budget: usize) -> Self {
+        self.chunk_budget = chunk_budget;
+        self
+    }
+
     /// Prompt tokens forwarded this step.
     fn as_slice(&self) -> &[u32] {
         &self.prompt_tokens[self.chunk_start..self.chunk_start + self.chunk_tokens]
