@@ -379,7 +379,10 @@ mod tests {
             decode_state.advance_span(&[20], EOS),
             commit(&[20], 1, None, 1)
         );
-        decode_state.set_drafts(vec![50, 51, 52]);
+        decode_state.set_drafts(
+            vec![50, 51, 52],
+            crate::scheduler::slot::GLM52_DSPARK_SPAN_DRAFTS,
+        );
         rank_slots[0] = Some(ActiveRequest {
             req: request(vec![10], sampled(0.8), 8),
             state: decode_state,

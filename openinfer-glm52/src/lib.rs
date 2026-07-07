@@ -162,11 +162,6 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
         "GLM5.2 --moe-tp8-pilot-layers is the EP8-topology dual-resident pilot; \
          under --moe-topo tp8 every MoE layer is already TP8-sharded"
     );
-    ensure!(
-        moe_topo == Glm52MoeTopo::Ep8 || dspark_draft_model_path.is_none(),
-        "GLM5.2 --moe-topo tp8 does not support the DSpark drafter yet (draft \
-         verify spans need buckets > 1)"
-    );
     start_engine(
         model_path,
         &Glm52LoadOptions {

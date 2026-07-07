@@ -139,6 +139,14 @@ pub(crate) fn run_dp8_coordinator(
         crate::Glm52MoeTopo::Ep8 => (GLM52_MAX_BATCH_PER_RANK, false),
         crate::Glm52MoeTopo::Tp8 => (1, true),
     };
+    // Verify-span draft budget: EP8 feeds 3 (the measured bucket-4 optimum);
+    // the tp8 span shape computes 8 rows at bucket-1 MoE cost, so it feeds
+    // the drafter's full proposal.
+    let span_drafts = if tp8_solo_span {
+        crate::dspark::GLM52_DSPARK_DRAFTS
+    } else {
+        slot::GLM52_DSPARK_SPAN_DRAFTS
+    };
     let offload: Option<Vec<offload::RankOffload>> =
         offload.map(|engines| engines.into_iter().map(offload::RankOffload::new).collect());
     // One KV page pool per rank: pool block ids index the rank's per-layer
@@ -330,6 +338,7 @@ pub(crate) fn run_dp8_coordinator(
                 &mut pending_resets,
                 rank_appends,
                 rank_proposals,
+                span_drafts,
             )
         {
             fail_step(&mut slots, &err);
@@ -873,6 +882,7 @@ fn run_draft_round(
     pending_resets: &mut [Vec<usize>],
     rank_appends: Vec<Vec<(usize, usize)>>,
     rank_proposals: Vec<Vec<(usize, u32, usize)>>,
+    span_drafts: usize,
 ) -> anyhow::Result<()> {
     let mut draft_joins = Vec::new();
     for (rank, (worker, (appends, proposals))) in workers
@@ -909,7 +919,7 @@ fn run_draft_round(
         }
         for (slot_id, span) in proposal_slots.into_iter().zip(spans) {
             if let Some(active) = slots[rank][slot_id].as_mut() {
-                active.state.set_drafts(span.to_vec());
+                active.state.set_drafts(span.to_vec(), span_drafts);
             }
         }
     }
