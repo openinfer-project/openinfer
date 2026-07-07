@@ -295,4 +295,37 @@ unsafe extern "C" {
         topk: i32,
         stream: CUstream,
     ) -> CUresult;
+
+    // --- TP8 low-latency MoE: whole-layer cooperative kernel + LL packets ----
+    pub fn glm52_moe_tp8_max_blocks_cuda(out_blocks: *mut i32) -> CUresult;
+
+    pub fn glm52_moe_tp8_layer_launch_cuda(
+        normed2: *const Half,
+        topk_idx: *const i32,
+        topk_prob: *const f32,
+        w13: *const u8,
+        w13_scale: *const f32,
+        w2: *const u8,
+        w2_scale: *const f32,
+        mlp_out: *mut Half,
+        xg: *mut Half,
+        topk_all_idx: *mut i32,
+        topk_all_prob: *mut f32,
+        guidx: *mut i32,
+        guprob: *mut f32,
+        gucnt: *mut i32,
+        gused: *mut i32,
+        bpart: *mut f32,
+        ug: *mut Half,
+        cpart: *mut f32,
+        ag_local: *mut std::ffi::c_void,
+        rs_local: *mut std::ffi::c_void,
+        peer_ag: *const *const std::ffi::c_void,
+        peer_rs: *const *const std::ffi::c_void,
+        epoch_dev: *mut u64,
+        nranks: i32,
+        myrank: i32,
+        grid_blocks: i32,
+        stream: CUstream,
+    ) -> CUresult;
 }
