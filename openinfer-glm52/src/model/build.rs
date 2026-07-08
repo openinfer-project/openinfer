@@ -57,15 +57,39 @@ pub(super) fn build_decoder_layer(
     w: &mut Glm52RankGpuWeights,
     layer: usize,
     moe_topo: crate::Glm52MoeTopo,
+    attn_shard: Option<usize>,
 ) -> Result<Glm52DecoderLayerWeights> {
     let p = format!("model.layers.{layer}");
 
-    let kv_b = take_proj(w, &format!("{p}.self_attn.kv_b_proj"), 28_672, 512)?;
+    let kv_b_full = take_proj(w, &format!("{p}.self_attn.kv_b_proj"), 28_672, 512)?;
+    let q_b_full = take_proj(w, &format!("{p}.self_attn.q_b_proj"), 16_384, 2048)?;
+    let o_proj_full = take_proj(w, &format!("{p}.self_attn.o_proj"), GLM52_HIDDEN, 16_384)?;
+    // Attention-TP head shard: rank r keeps q/v heads r*8..(r+1)*8 — q_b/kv_b
+    // output rows, o_proj input columns; `Glm52MlaLayerWeights` derives its
+    // head count from these shapes. The indexer is NOT sharded (its logits
+    // sum over all 32 index heads BEFORE the top-2048, so a shard would need
+    // a cross-rank logits reduction — the whole 21-layer indexer weight set
+    // is ~0.18 GB, replication is the right trade).
+    let (q_b, kv_b, o_proj) = match attn_shard {
+        Some(rank) => {
+            let heads = crate::config::GLM52_HEADS / 8;
+            let q_rows = heads * crate::config::GLM52_QK_HEAD_DIM;
+            let kv_rows =
+                heads * (crate::config::GLM52_QK_NOPE_HEAD_DIM + crate::config::GLM52_V_HEAD_DIM);
+            let o_cols = heads * crate::config::GLM52_V_HEAD_DIM;
+            (
+                q_b_full.slice_rows(ctx, rank * q_rows, q_rows)?,
+                kv_b_full.slice_rows(ctx, rank * kv_rows, kv_rows)?,
+                o_proj_full.slice_cols(ctx, rank * o_cols, o_cols)?,
+            )
+        }
+        None => (q_b_full, kv_b_full, o_proj_full),
+    };
     let mla = Glm52MlaLayerWeights::from_device(
         ctx,
         take_proj(w, &format!("{p}.self_attn.q_a_proj"), 2048, GLM52_HIDDEN)?,
         take_bf16_vec(ctx, w, &format!("{p}.self_attn.q_a_layernorm.weight"), 2048)?,
-        take_proj(w, &format!("{p}.self_attn.q_b_proj"), 16_384, 2048)?,
+        q_b,
         take_proj(
             w,
             &format!("{p}.self_attn.kv_a_proj_with_mqa"),
@@ -74,7 +98,7 @@ pub(super) fn build_decoder_layer(
         )?,
         take_bf16_vec(ctx, w, &format!("{p}.self_attn.kv_a_layernorm.weight"), 512)?,
         &kv_b,
-        take_proj(w, &format!("{p}.self_attn.o_proj"), GLM52_HIDDEN, 16_384)?,
+        o_proj,
     )?;
     // kv_b is only dequanted into the absorb factors, not stored — free the
     // fp8 blob before the indexer/MLP uploads below.

@@ -421,7 +421,7 @@ impl Glm52RankModel {
         let mut caches = Vec::with_capacity(GLM52_LAYERS);
         for layer in 0..GLM52_LAYERS {
             layers.push(
-                build::build_decoder_layer(ctx, w, layer, moe_topo)
+                build::build_decoder_layer(ctx, w, layer, moe_topo, None)
                     .with_context(|| format!("build GLM5.2 decoder layer {layer}"))?,
             );
             caches.push(Glm52LayerCaches {
