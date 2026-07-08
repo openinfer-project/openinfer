@@ -55,24 +55,31 @@ constexpr int kScaleGroups = 4;  // KvLora / 128
 // q_pe lives at `q_pe_base[q_pe_offset + h*q_pe_head_stride + ...]`: contiguous
 // [T,H,64] (offset 0, stride 64) when split out, or embedded in the q_b output
 // [T,H,256] (offset 192, stride 256) in the fused forward. The per-token q_pe
-// stride is kHeads * q_pe_head_stride in both layouts. cos/sin carry one [32]
-// row PER TOKEN (each token sits at its own position).
+// stride is num_q_heads * q_pe_head_stride in both layouts. cos/sin carry one
+// [32] row PER TOKEN (each token sits at its own position).
+//
+// num_q_heads may be a head-parallel shard (attention-TP: 8 of 64). The
+// ql_nope / q_pe inputs are COMPACT [T, num_q_heads, .]; the query output
+// stays FULL-WIDTH [T, kHeads, 576] — the FlashMLA sparse kernel only runs
+// its h_q % 64 == 0 shape, so shard heads occupy slots 0..num_q_heads and the
+// pad slots keep their zero fill (zero query -> uniform softmax -> finite
+// latent, discarded by the shard-sized W_UV batch downstream).
 __global__ void glm52_mla_query_assemble_kernel(
-    const __nv_bfloat16* __restrict__ ql_nope,    // [T, H, 512]
+    const __nv_bfloat16* __restrict__ ql_nope,    // [T, num_q_heads, 512]
     const __nv_bfloat16* __restrict__ q_pe_base,  // q_pe at offset/stride
-    int q_pe_offset, int q_pe_head_stride,
+    int q_pe_offset, int q_pe_head_stride, int num_q_heads,
     const __nv_bfloat16* __restrict__ cos,        // [T, 32]
     const __nv_bfloat16* __restrict__ sin,        // [T, 32]
-    __nv_bfloat16* __restrict__ query) {          // [T, H, 576]
+    __nv_bfloat16* __restrict__ query) {          // [T, kHeads, 576]
   const int h = blockIdx.x;
   const int t = blockIdx.y;
-  if (h >= kHeads) return;
+  if (h >= num_q_heads) return;
   const __nv_bfloat16* q_pe = q_pe_base + q_pe_offset +
-                              (size_t)t * kHeads * q_pe_head_stride +
+                              (size_t)t * num_q_heads * q_pe_head_stride +
                               h * q_pe_head_stride;
   const __nv_bfloat16* cos_t = cos + (size_t)t * kRopeHalf;
   const __nv_bfloat16* sin_t = sin + (size_t)t * kRopeHalf;
-  const __nv_bfloat16* ql_t = ql_nope + (size_t)t * kHeads * kQkNope;
+  const __nv_bfloat16* ql_t = ql_nope + (size_t)t * num_q_heads * kQkNope;
   __nv_bfloat16* query_t = query + (size_t)t * kHeads * kQueryDim;
   for (int i = threadIdx.x; i < kQueryDim; i += blockDim.x) {
     if (i < kQkNope) {
@@ -158,17 +165,20 @@ extern "C" {
 CUresult glm52_mla_query_assemble_cuda(const __nv_bfloat16* ql_nope,
                                        const __nv_bfloat16* q_pe_base,
                                        int q_pe_offset, int q_pe_head_stride,
+                                       int num_q_heads,
                                        const __nv_bfloat16* cos,
                                        const __nv_bfloat16* sin,
                                        __nv_bfloat16* query, int tokens,
                                        cudaStream_t stream) {
   if (ql_nope == nullptr || q_pe_base == nullptr || cos == nullptr ||
-      sin == nullptr || query == nullptr || tokens <= 0) {
+      sin == nullptr || query == nullptr || tokens <= 0 || num_q_heads <= 0 ||
+      num_q_heads > kHeads) {
     return CUDA_ERROR_INVALID_VALUE;
   }
-  const dim3 grid(kHeads, tokens, 1);
+  const dim3 grid(num_q_heads, tokens, 1);
   glm52_mla_query_assemble_kernel<<<grid, 192, 0, stream>>>(
-      ql_nope, q_pe_base, q_pe_offset, q_pe_head_stride, cos, sin, query);
+      ql_nope, q_pe_base, q_pe_offset, q_pe_head_stride, num_q_heads, cos, sin,
+      query);
   return consume_last_cuda_error();
 }
 

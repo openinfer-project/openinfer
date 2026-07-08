@@ -74,6 +74,7 @@ impl Glm52DecodeScratch {
         ctx: &DeviceContext,
         contract: &Glm52FlashMlaSparseDecode,
         mqa_shape: Glm52DeepGemmMqaLogitsShape,
+        mla_heads: usize,
     ) -> Result<Self> {
         let tokens = contract.batch_size;
         anyhow::ensure!(
@@ -82,8 +83,8 @@ impl Glm52DecodeScratch {
             mqa_shape.batch_size
         );
         Ok(Self {
-            mla_front: Glm52MlaFront::new(ctx, tokens)?,
-            mla_attend: Glm52MlaAttendScratch::new(ctx, contract)?,
+            mla_front: Glm52MlaFront::new(ctx, tokens, mla_heads)?,
+            mla_attend: Glm52MlaAttendScratch::new(ctx, contract, mla_heads)?,
             idx: Glm52IndexerScratch::new(ctx, mqa_shape)?,
             dense_mlp: Glm52MlpScratch::new(ctx, GLM52_DENSE_INTERMEDIATE, tokens)?,
             shared_mlp: Glm52MlpScratch::new(ctx, GLM52_SHARED_EXPERT_INTERMEDIATE, tokens)?,

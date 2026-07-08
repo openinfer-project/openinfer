@@ -508,7 +508,12 @@ impl Glm52RankModel {
                     Glm52MlaSchedMetadata::new(ctx, contract_rows)?,
                     Glm52MlaSchedMetadata::new(ctx, contract_rows_short)?,
                 ],
-                scratch: Glm52DecodeScratch::new(ctx, &contract_rows, mqa_shape)?,
+                scratch: Glm52DecodeScratch::new(
+                    ctx,
+                    &contract_rows,
+                    mqa_shape,
+                    crate::config::GLM52_HEADS,
+                )?,
                 graphs: [CudaGraphState::new(), CudaGraphState::new()],
                 block_table: bucket_table,
                 // Read only after a D2H lands in them (the write-combined

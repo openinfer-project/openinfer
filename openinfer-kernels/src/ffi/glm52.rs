@@ -90,6 +90,7 @@ unsafe extern "C" {
         q_pe_base: *const Half,
         q_pe_offset: i32,
         q_pe_head_stride: i32,
+        num_q_heads: i32,
         cos: *const Half,
         sin: *const Half,
         query: *mut Half,

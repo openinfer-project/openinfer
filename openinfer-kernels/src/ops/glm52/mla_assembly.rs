@@ -16,16 +16,22 @@ pub const GLM52_MLA_SCALE_GROUPS: usize = GLM52_MLA_KV_LORA / 128; // 4
 /// fp8_ds_mla token: 512 e4m3 ckv + 4 f32 scales + 64 bf16 rope-key.
 pub const GLM52_MLA_CACHE_BYTES: usize = 656;
 
-/// Assemble the FlashMLA sparse decode query `[H, 576]` = `[ql_nope(512) |
-/// rope(q_pe)(64)]` per head (bs=1 decode). `cos`/`sin` are the first
-/// `GLM52_MLA_ROPE_HALF` (=32) entries of the position's rotary table; RoPE is
-/// interleave-in / block-out. q_pe is read at `q_pe_base[q_pe_offset +
-/// h*q_pe_head_stride]`: pass `(0, 64)` for a contiguous `[H,64]` q_pe, or
-/// `(192, 256)` to read it in place from the `[H,256]` q_b output.
+/// Assemble the FlashMLA sparse decode query `[GLM52_MLA_HEADS, 576]` =
+/// `[ql_nope(512) | rope(q_pe)(64)]` per head (bs=1 decode). `num_q_heads`
+/// may be a head-parallel shard (attention-TP: 8 of 64): `ql_nope`/`q_pe`
+/// are COMPACT `[T, num_q_heads, .]`, while `query` stays full-width
+/// `[T, GLM52_MLA_HEADS, 576]` (the FlashMLA kernel only runs h_q=64; shard
+/// heads land in slots 0..num_q_heads, pad slots keep their zero fill).
+/// `cos`/`sin` are the first `GLM52_MLA_ROPE_HALF` (=32) entries of the
+/// position's rotary table; RoPE is interleave-in / block-out. q_pe is read
+/// at `q_pe_base[q_pe_offset + h*q_pe_head_stride]`: pass `(0, 64)` for a
+/// contiguous `[num_q_heads,64]` q_pe, or `(192, 256)` to read it in place
+/// from the `[num_q_heads,256]` q_b output.
 #[allow(clippy::too_many_arguments)]
 pub fn glm52_mla_query_assemble_launch(
     ctx: &DeviceContext,
     tokens: usize,
+    num_q_heads: usize,
     ql_nope: &CudaSlice<bf16>,
     q_pe_base: &CudaSlice<bf16>,
     q_pe_offset: usize,
@@ -36,14 +42,18 @@ pub fn glm52_mla_query_assemble_launch(
 ) -> Result<()> {
     ensure!(tokens > 0, "GLM5.2 MLA assemble tokens must be positive");
     ensure!(
-        ql_nope.len() >= tokens * GLM52_MLA_HEADS * GLM52_MLA_QK_NOPE,
+        num_q_heads >= 1 && num_q_heads <= GLM52_MLA_HEADS,
+        "GLM5.2 MLA assemble num_q_heads {num_q_heads} out of 1..={GLM52_MLA_HEADS}"
+    );
+    ensure!(
+        ql_nope.len() >= tokens * num_q_heads * GLM52_MLA_QK_NOPE,
         "GLM5.2 MLA assemble ql_nope too small: have {}, need {}",
         ql_nope.len(),
-        tokens * GLM52_MLA_HEADS * GLM52_MLA_QK_NOPE
+        tokens * num_q_heads * GLM52_MLA_QK_NOPE
     );
     ensure!(
         q_pe_base.len()
-            >= q_pe_offset + (tokens * GLM52_MLA_HEADS - 1) * q_pe_head_stride + GLM52_MLA_ROPE_DIM,
+            >= q_pe_offset + (tokens * num_q_heads - 1) * q_pe_head_stride + GLM52_MLA_ROPE_DIM,
         "GLM5.2 MLA assemble q_pe (offset {q_pe_offset}, stride {q_pe_head_stride}) overruns buffer of {}",
         q_pe_base.len()
     );
@@ -68,6 +78,7 @@ pub fn glm52_mla_query_assemble_launch(
             qpe_ptr as *const ffi::Half,
             q_pe_offset as i32,
             q_pe_head_stride as i32,
+            num_q_heads as i32,
             cos_ptr as *const ffi::Half,
             sin_ptr as *const ffi::Half,
             query_ptr as *mut ffi::Half,
