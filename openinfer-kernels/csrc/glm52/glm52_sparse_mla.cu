@@ -423,10 +423,11 @@ __global__ void __launch_bounds__(kThreads) glm52_sparse_mla_main_kernel(
 
 // Fixed-order split merge: deterministic by construction (split index
 // ascending, f32). A row/head whose every split saw only invalid tokens
-// (l == 0 across the board) produces zeros. The dim axis is spread over
-// grid.z (one thread per dim): with grid (b, heads) alone the launch is 64
-// CTAs of latency-bound strided reads — too few warps to hide the 16
-// split-strided loads (measured 9.7 us, long-scoreboard 11.3).
+// (l == 0 across the board) produces zeros. Each thread merges four dims
+// through float4 loads with the split loop unrolled — one-dim-per-thread
+// scalar reads left too few bytes in flight to cover the 256 KB split
+// stride (measured 8.9 us, long-scoreboard 9.0). The (m, l) pairs and the
+// derived weights are computed once per block instead of per thread.
 __global__ void glm52_sparse_mla_combine_kernel(
     const float* __restrict__ o_part,   // [32, b, 16, 512]
     const float* __restrict__ ml_part,  // [32, b, 16, 2]
@@ -434,35 +435,51 @@ __global__ void glm52_sparse_mla_combine_kernel(
     int batch) {
   const int row = blockIdx.x;
   const int h = blockIdx.y;
-  const int dim = blockIdx.z * blockDim.x + threadIdx.x;
 
-  float m_star = -INFINITY;
+  __shared__ float weights[kNumSplits];
+  __shared__ float inv_l;
+  if (threadIdx.x == 0) {
+    float m_star = -INFINITY;
+    float ml[kNumSplits][2];
 #pragma unroll
-  for (int s = 0; s < kNumSplits; ++s) {
-    const float* ml =
-        ml_part + ((static_cast<size_t>(s) * batch + row) * kHeadSlots + h) * 2;
-    if (ml[1] > 0.f) m_star = fmaxf(m_star, ml[0]);
-  }
-  float weights[kNumSplits];
-  float l_total = 0.f;
+    for (int s = 0; s < kNumSplits; ++s) {
+      const float2 pair = *reinterpret_cast<const float2*>(
+          ml_part +
+          ((static_cast<size_t>(s) * batch + row) * kHeadSlots + h) * 2);
+      ml[s][0] = pair.x;
+      ml[s][1] = pair.y;
+      if (pair.y > 0.f) m_star = fmaxf(m_star, pair.x);
+    }
+    float l_total = 0.f;
 #pragma unroll
-  for (int s = 0; s < kNumSplits; ++s) {
-    const float* ml =
-        ml_part + ((static_cast<size_t>(s) * batch + row) * kHeadSlots + h) * 2;
-    weights[s] = (ml[1] > 0.f) ? exp2f(ml[0] - m_star) : 0.f;
-    l_total += weights[s] * ml[1];
+    for (int s = 0; s < kNumSplits; ++s) {
+      const float w = (ml[s][1] > 0.f) ? exp2f(ml[s][0] - m_star) : 0.f;
+      weights[s] = w;
+      l_total += w * ml[s][1];
+    }
+    inv_l = (l_total > 0.f) ? 1.f / l_total : 0.f;
   }
-  const float inv = (l_total > 0.f) ? 1.f / l_total : 0.f;
+  __syncthreads();
 
-  __nv_bfloat16* out = latent + (static_cast<size_t>(row) * 64 + h) * kDv;
-  float v = 0.f;
+  const int dim = 4 * threadIdx.x;  // 128 threads x float4 = 512 dims
+  float4 v{0.f, 0.f, 0.f, 0.f};
 #pragma unroll
   for (int s = 0; s < kNumSplits; ++s) {
-    v += weights[s] *
-         o_part[((static_cast<size_t>(s) * batch + row) * kHeadSlots + h) *
-                    kDv + dim];
+    const float4 part = *reinterpret_cast<const float4*>(
+        o_part +
+        ((static_cast<size_t>(s) * batch + row) * kHeadSlots + h) * kDv + dim);
+    const float w = weights[s];
+    v.x += w * part.x;
+    v.y += w * part.y;
+    v.z += w * part.z;
+    v.w += w * part.w;
   }
-  out[dim] = __float2bfloat16(v * inv);
+  __nv_bfloat16* out = latent + (static_cast<size_t>(row) * 64 + h) * kDv + dim;
+  const float inv = inv_l;
+  out[0] = __float2bfloat16(v.x * inv);
+  out[1] = __float2bfloat16(v.y * inv);
+  out[2] = __float2bfloat16(v.z * inv);
+  out[3] = __float2bfloat16(v.w * inv);
 }
 
 // Naive f64 reference for the parity gate: same dequant semantics, flat
@@ -610,7 +627,7 @@ CUresult glm52_sparse_mla_decode_cuda(const void* q, const void* cache,
   }
   if (result != CUDA_SUCCESS) return result;
 
-  const dim3 grid(batch, heads, kDv / 128);
+  const dim3 grid(batch, heads);
   glm52_sparse_mla_combine_kernel<<<grid, 128, 0, stream>>>(
       o_part, ml_part, static_cast<__nv_bfloat16*>(latent), batch);
   return consume_last_cuda_error();
