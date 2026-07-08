@@ -71,8 +71,17 @@ struct ProbeBuffers {
 /// `valid_per_row` slots per row (rest -1); `segment` confines row r's slots
 /// to the pool's r-th eighth (the M5 locality shape).
 fn build_indices(rng: &mut XorShift, valid_per_row: usize, segment: bool) -> Vec<i32> {
+    build_indices_with_topk(rng, TOPK, valid_per_row, segment)
+}
+
+fn build_indices_with_topk(
+    rng: &mut XorShift,
+    topk: usize,
+    valid_per_row: usize,
+    segment: bool,
+) -> Vec<i32> {
     let total_slots = NUM_BLOCKS * GLM52_FLASHMLA_SPARSE_PAGE_SIZE;
-    let mut host = vec![-1i32; BATCH * TOPK];
+    let mut host = vec![-1i32; BATCH * topk];
     for row in 0..BATCH {
         let (base, range) = if segment {
             (row * total_slots / 8, total_slots / 8)
@@ -80,18 +89,22 @@ fn build_indices(rng: &mut XorShift, valid_per_row: usize, segment: bool) -> Vec
             (0, total_slots)
         };
         for k in 0..valid_per_row {
-            host[row * TOPK + k] = (base + rng.below(range)) as i32;
+            host[row * topk + k] = (base + rng.below(range)) as i32;
         }
     }
     host
 }
 
 fn alloc_probe(ctx: &DeviceContext) -> Result<ProbeBuffers> {
+    alloc_probe_with_topk(ctx, TOPK)
+}
+
+fn alloc_probe_with_topk(ctx: &DeviceContext, topk: usize) -> Result<ProbeBuffers> {
     let num_sm_parts = glm52_flashmla_sparse_decode_num_sm_parts()?;
     let contract = Glm52FlashMlaSparseDecode {
         batch_size: BATCH,
         num_blocks: NUM_BLOCKS,
-        topk: TOPK,
+        topk,
         num_sm_parts,
         sm_scale: 1.0 / (576f32).sqrt(),
     };
@@ -122,7 +135,7 @@ fn alloc_probe(ctx: &DeviceContext) -> Result<ProbeBuffers> {
     glm52_flashmla_sparse_decode_metadata_launch(
         ctx,
         BATCH,
-        TOPK,
+        topk,
         num_sm_parts,
         &mut sched,
         &mut num_splits,
@@ -152,6 +165,23 @@ fn stage_indices(
     bufs.indices.clear();
     for _ in 0..POOLS {
         let host = build_indices(&mut rng, valid_per_row, segment);
+        let mut dev = unsafe { ctx.stream.alloc::<i32>(host.len()) }?;
+        ctx.stream.memcpy_htod(&host, &mut dev)?;
+        bufs.indices.push(dev);
+    }
+    Ok(())
+}
+
+fn stage_indices_with_topk(
+    ctx: &DeviceContext,
+    bufs: &mut ProbeBuffers,
+    topk: usize,
+    valid_per_row: usize,
+) -> Result<()> {
+    let mut rng = XorShift(0x1dee_c0de_0000_0001 ^ (topk as u64) << 32 ^ valid_per_row as u64);
+    bufs.indices.clear();
+    for _ in 0..POOLS {
+        let host = build_indices_with_topk(&mut rng, topk, valid_per_row, false);
         let mut dev = unsafe { ctx.stream.alloc::<i32>(host.len()) }?;
         ctx.stream.memcpy_htod(&host, &mut dev)?;
         bufs.indices.push(dev);
@@ -201,6 +231,40 @@ fn time_variant(ctx: &DeviceContext, bufs: &mut ProbeBuffers, label: &str) -> Re
     let us_per_launch = t0.elapsed().as_secs_f64() * 1e6 / (REPLAYS * LAYERS) as f64;
     println!("{label:>18}: {us_per_launch:7.2} us/launch");
     Ok(us_per_launch)
+}
+
+/// Second question, after dilution was falsified (2026-07-08, idle H200:
+/// dregs-64 still 0.92x of full — the kernel does fixed work per padded index
+/// block): does shrinking the ACTUAL topk parameter scale? If time tracks
+/// topk with a small floor, M5 pivots to a strided 1/8 partition of the
+/// top-2048 list compacted into a topk=256 launch (KV is replicated, so any
+/// disjoint partition is valid for the lse-merge; stride-8 by rank id is
+/// perfectly balanced and needs no device staging at all).
+#[test]
+#[ignore = "requires one sm90a GPU (H200); synthetic buffers, no checkpoint"]
+fn splitkv_topk_scaling_probe() -> Result<()> {
+    let ctx = DeviceContext::new_with_device(0)?;
+    let mut results = Vec::new();
+    for topk in [2048usize, 1024, 512, 256, 128] {
+        let mut bufs = alloc_probe_with_topk(&ctx, topk)?;
+        stage_indices_with_topk(&ctx, &mut bufs, topk, topk)?;
+        let us = time_variant(&ctx, &mut bufs, &format!("topk-{topk}"))?;
+        results.push((topk, us));
+    }
+    let full = results[0].1;
+    for &(topk, us) in &results[1..] {
+        println!("topk {topk}: {:.2}x of topk-2048", us / full);
+    }
+    let quarter = results
+        .iter()
+        .find(|(t, _)| *t == 256)
+        .expect("256 in the sweep")
+        .1;
+    anyhow::ensure!(
+        quarter < 0.35 * full,
+        "M5 compaction route broken too: topk-256 launch {quarter:.2} us is not well below          topk-2048 {full:.2} us — the kernel does not scale with topk"
+    );
+    Ok(())
 }
 
 #[test]
