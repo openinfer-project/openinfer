@@ -1,8 +1,9 @@
 //! GLM5.2 right-sized sparse MLA decode parity gate (M5b).
 //!
-//! The new kernel is checked against a naive f64 attention over the same
-//! packed fp8_ds_mla cache (runs on any GPU — the local dev loop), and, on
-//! sm90, additionally against the FlashMLA sparse decode it replaces. The
+//! The TileLang main kernel is sm_90a-only, so this gate runs on sm90 only
+//! (elsewhere it prints a skip). There the new kernel is checked against a
+//! naive f64 attention over the same packed fp8_ds_mla cache and against
+//! the FlashMLA sparse decode it replaces. The
 //! primary assertion is the mean-normalized delta (max-norm on near-zero
 //! bf16 outputs is the wrong metric — M4 twin-gate lesson); the FlashMLA leg
 //! also requires the new kernel to sit no further from the f64 ground truth
@@ -294,11 +295,12 @@ impl Rig {
 }
 
 #[test]
-#[ignore = "requires GPU; sm90 adds the FlashMLA parity leg"]
+#[ignore = "requires an sm90 GPU (the TileLang main kernel is sm_90a-only)"]
 fn sparse_mla_parity_gate() -> Result<()> {
     let mut rig = Rig::new()?;
     if rig.flash_sm_parts.is_none() {
-        println!("(not sm90: FlashMLA leg skipped, gating on the f64 reference only)");
+        println!("(not sm90: TileLang main kernel is a NOT_SUPPORTED stub, skipping)");
+        return Ok(());
     }
 
     // Production shape: bucket-8, TP8 shard (8 real heads), full top-2048.
@@ -325,14 +327,15 @@ fn sparse_mla_parity_gate() -> Result<()> {
     rig.run_case("b8 h8 topk1024", 8, 8, 1024, &[1024; 8])?;
     rig.run_case("b4 h16 topk2048", 4, 16, 2048, &[2048; 4])?;
     rig.run_case("b1 h1 topk512", 1, 1, 512, &[512])?;
-    // Short-tier topk: 256 = 8 tokens/split (partial final stage), 320 = 10.
+    // Short-tier topk: 256 = 16 tokens/split, under the 32-token gather stage
+    // (bound-masked partial stage), here with -1 dilution on top.
     rig.run_case("b8 h8 topk256", 8, 8, 256, &[256; 8])?;
     rig.run_case(
-        "b8 h8 topk320",
+        "b8 h8 topk256 diluted",
         8,
         8,
-        320,
-        &[320, 320, 64, 320, 1, 320, 0, 320],
+        256,
+        &[256, 256, 64, 256, 1, 256, 0, 256],
     )?;
     Ok(())
 }

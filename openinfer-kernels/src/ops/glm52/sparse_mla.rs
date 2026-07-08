@@ -1,7 +1,7 @@
 //! Right-sized sparse MLA decode (M5b): the attention-TP replacement for the
-//! FlashMLA sparse decode launch. Fixed 32-split grid, 16-head-slot MMA tile,
-//! deterministic fixed-order combine. The EP8 (64-head) path stays on
-//! FlashMLA (`flashmla_sparse.rs`).
+//! FlashMLA sparse decode launch. TileLang-generated 16-split main kernel
+//! (sm_90a only, AOT-instantiated per topk) plus a deterministic fixed-order
+//! combine. The EP8 (64-head) path stays on FlashMLA (`flashmla_sparse.rs`).
 
 use anyhow::{Result, anyhow, ensure};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
@@ -12,15 +12,16 @@ use crate::tensor::DeviceContext;
 
 use super::flashmla_sparse::{
     GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN, GLM52_FLASHMLA_SPARSE_HEADS,
-    GLM52_FLASHMLA_SPARSE_PAGE_SIZE, GLM52_FLASHMLA_SPARSE_QK_HEAD_DIM, GLM52_FLASHMLA_SPARSE_TOPK,
+    GLM52_FLASHMLA_SPARSE_PAGE_SIZE, GLM52_FLASHMLA_SPARSE_QK_HEAD_DIM,
     GLM52_FLASHMLA_SPARSE_V_HEAD_DIM,
 };
 
-pub const GLM52_SPARSE_MLA_NUM_SPLITS: usize = 32;
+pub const GLM52_SPARSE_MLA_NUM_SPLITS: usize = 16;
 pub const GLM52_SPARSE_MLA_HEAD_SLOTS: usize = 16;
-/// Same alignment contract as FlashMLA (the DSA short tier runs topk 256);
-/// splits with a non-multiple token count mask their partial final stage.
-pub const GLM52_SPARSE_MLA_TOPK_ALIGN: usize = 64;
+/// The TileLang main kernel is AOT-instantiated per topk
+/// (`tools/tilelang/glm52/generate.py` `TOPKS`); the DSA tiers use 256 and
+/// 2048. Splits whose token count undershoots a gather stage mask the tail.
+pub const GLM52_SPARSE_MLA_TOPKS: [usize; 4] = [256, 512, 1024, 2048];
 
 /// Launch contract for the right-sized sparse MLA decode. `heads` is the real
 /// head count (attention-TP shard, <= 16); the query stays full-width
@@ -46,10 +47,8 @@ impl Glm52SparseMlaDecode {
             "GLM5.2 sparse MLA decode num_blocks must be positive"
         );
         ensure!(
-            self.topk > 0
-                && self.topk <= GLM52_FLASHMLA_SPARSE_TOPK
-                && self.topk.is_multiple_of(GLM52_SPARSE_MLA_TOPK_ALIGN),
-            "GLM5.2 sparse MLA decode topk must be a multiple of {GLM52_SPARSE_MLA_TOPK_ALIGN} in 1..={GLM52_FLASHMLA_SPARSE_TOPK}, got {}",
+            GLM52_SPARSE_MLA_TOPKS.contains(&self.topk),
+            "GLM5.2 sparse MLA decode topk must be one of {GLM52_SPARSE_MLA_TOPKS:?}, got {}",
             self.topk
         );
         ensure!(
