@@ -68,24 +68,51 @@ __device__ __forceinline__ void mma_bf16_16x8x16(float c[4], const uint32_t a[4]
       : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
 }
 
-__device__ __forceinline__ uint32_t pack_bf16(__nv_bfloat16 lo, __nv_bfloat16 hi) {
-  __nv_bfloat162 pair{lo, hi};
-  return *reinterpret_cast<const uint32_t*>(&pair);
+__device__ __forceinline__ uint32_t smem_u32addr(const void* p) {
+  return static_cast<uint32_t>(__cvta_generic_to_shared(p));
 }
 
-// Row-major bf16 tile load of the A fragment at (row0, col0): rows row0/row0+8,
-// cols col0 + {2t, 2t+1, 2t+8, 2t+9}. Callers keep col0 16-aligned so the
-// paired loads are 4-byte aligned.
-__device__ __forceinline__ void load_a_frag(uint32_t a[4], const __nv_bfloat16* tile,
-                                            int stride, int row0, int col0, int lane) {
-  const int g = lane >> 2;
-  const int t = lane & 3;
-  const __nv_bfloat16* r0 = tile + (row0 + g) * stride + col0 + 2 * t;
-  const __nv_bfloat16* r1 = r0 + 8 * stride;
-  a[0] = *reinterpret_cast<const uint32_t*>(r0);
-  a[1] = *reinterpret_cast<const uint32_t*>(r1);
-  a[2] = *reinterpret_cast<const uint32_t*>(r0 + 8);
-  a[3] = *reinterpret_cast<const uint32_t*>(r1 + 8);
+// A fragment (m16 x k16) from a row-major tile at (row0, col0): one
+// ldmatrix.x4, quadrants ordered (0,0),(8,0),(0,8),(8,8) to match the mma
+// register order. Rows and col0 must be 16-byte aligned (strides here are
+// x8-element multiples).
+__device__ __forceinline__ void ldmatrix_a(uint32_t a[4], const __nv_bfloat16* tile,
+                                           int stride, int row0, int col0, int lane) {
+  const int quad = lane >> 3;
+  const int r = lane & 7;
+  const __nv_bfloat16* addr =
+      tile + (row0 + r + (quad & 1) * 8) * stride + col0 + (quad >> 1) * 8;
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+               : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
+               : "r"(smem_u32addr(addr)));
+}
+
+// QK B fragment (k16=features x n8=tokens) from the [token][feature] tile:
+// the storage is exactly the col-major operand, so a plain ldmatrix.x2 over
+// 8 token rows x two 8-feature halves yields {B[2t][g], B[2t+1][g]} pairs.
+__device__ __forceinline__ void ldmatrix_b_qk(uint32_t b[2], const __nv_bfloat16* deq,
+                                              int stride, int tok0, int feat0,
+                                              int lane) {
+  const int r = lane & 7;
+  const int half = (lane >> 3) & 1;
+  const __nv_bfloat16* addr = deq + (tok0 + r) * stride + feat0 + half * 8;
+  asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
+               : "=r"(b[0]), "=r"(b[1])
+               : "r"(smem_u32addr(addr)));
+}
+
+// PV B fragment (k16=tokens x n8=dims) from the same [token][dim] tile:
+// .trans flips each 8x8 so lanes receive token-pairs per dim column —
+// replaces four 2-byte loads plus packing per mma.
+__device__ __forceinline__ void ldmatrix_b_pv(uint32_t b[2], const __nv_bfloat16* deq,
+                                              int stride, int tok0, int dim0,
+                                              int lane) {
+  const int r = lane & 7;
+  const int half = (lane >> 3) & 1;
+  const __nv_bfloat16* addr = deq + (tok0 + r + half * 8) * stride + dim0;
+  asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];\n"
+               : "=r"(b[0]), "=r"(b[1])
+               : "r"(smem_u32addr(addr)));
 }
 
 __device__ __forceinline__ void cp_async_16(void* smem_dst, const void* gmem_src) {
@@ -262,8 +289,11 @@ __global__ void __launch_bounds__(kThreads) glm52_sparse_mla_main_kernel(
   __nv_bfloat16* q_tile = MainSmem<BI>::q(smem);
   {
     const __nv_bfloat16* q_row = q + static_cast<size_t>(row) * 64 * kDqk;
-    for (int e = threadIdx.x; e < kHeadSlots * kDqk; e += kThreads) {
-      q_tile[(e / kDqk) * kQkStride + e % kDqk] = q_row[e];
+    for (int u = threadIdx.x; u < kHeadSlots * (kDqk / 8); u += kThreads) {
+      const int r = u / (kDqk / 8);
+      const int c = 8 * (u % (kDqk / 8));
+      *reinterpret_cast<uint4*>(q_tile + r * kQkStride + c) =
+          *reinterpret_cast<const uint4*>(q_row + r * kDqk + c);
     }
     if (threadIdx.x < kHeadSlots) {
       MainSmem<BI>::m_run(smem)[threadIdx.x] = -INFINITY;
@@ -302,12 +332,9 @@ __global__ void __launch_bounds__(kThreads) glm52_sparse_mla_main_kernel(
       for (int kc = ks * kQkChunksPerWarp; kc < (ks + 1) * kQkChunksPerWarp;
            ++kc) {
         uint32_t a[4];
-        load_a_frag(a, q_tile, kQkStride, 0, kc * 16, lane);
-        // B(k=feature, n=token): feature pairs are contiguous per token row.
-        const __nv_bfloat16* tok = deq + (nt * 8 + g) * kQkStride + kc * 16;
+        ldmatrix_a(a, q_tile, kQkStride, 0, kc * 16, lane);
         uint32_t b[2];
-        b[0] = *reinterpret_cast<const uint32_t*>(tok + 2 * t4);
-        b[1] = *reinterpret_cast<const uint32_t*>(tok + 2 * t4 + 8);
+        ldmatrix_b_qk(b, deq, kQkStride, nt * 8, kc * 16, lane);
         mma_bf16_16x8x16(c, a, b);
       }
       constexpr int kSStride = MainSmem<BI>::kSStride;
@@ -386,15 +413,11 @@ __global__ void __launch_bounds__(kThreads) glm52_sparse_mla_main_kernel(
       }
       for (int kc = 0; kc < BI / 16; ++kc) {
         uint32_t a[4];
-        load_a_frag(a, p, MainSmem<BI>::kPStride, 0, kc * 16, lane);
+        ldmatrix_a(a, p, MainSmem<BI>::kPStride, 0, kc * 16, lane);
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
-          // B(k=token, n=dim): token pairs stride kDqk in the deq tile.
-          const int dim = warp * 64 + j * 8 + g;
-          const __nv_bfloat16* col = deq + (kc * 16 + 2 * t4) * kQkStride + dim;
           uint32_t b[2];
-          b[0] = pack_bf16(col[0], col[kQkStride]);
-          b[1] = pack_bf16(col[8 * kQkStride], col[9 * kQkStride]);
+          ldmatrix_b_pv(b, deq, kQkStride, kc * 16, warp * 64 + j * 8, lane);
           mma_bf16_16x8x16(acc[j], a, b);
         }
       }
