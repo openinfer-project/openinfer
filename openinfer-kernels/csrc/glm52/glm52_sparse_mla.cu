@@ -43,6 +43,11 @@ constexpr int kKpeOffset = 528;
 constexpr int kThreads = 256;    // 8 warps
 constexpr int kChunksPerToken = kCacheBytes / 16;  // 41 x 16B cp.async
 constexpr float kLog2e = 1.4426950408889634f;
+// Padded row strides (elements). A 576-wide bf16 row is 1152 B = 9 x 128 B:
+// stepping one row lands on the same shared-memory bank, so the PV stage's
+// token-strided V reads (and the QK A-fragment's head-strided reads) serialize
+// 8-way. +8 elements shifts each row by 4 banks.
+constexpr int kQkStride = kDqk + 8;  // q and dequant tiles
 
 // ---------------------------------------------------------------------------
 // mma.sync m16n8k16 bf16 f32-accumulate. Fragment coordinates (g = lane>>2,
@@ -99,13 +104,16 @@ __device__ __forceinline__ void cp_async_wait() {
 // Dynamic shared memory layout for the main kernel (BI = tokens per stage).
 template <int BI>
 struct MainSmem {
-  static constexpr int kQBytes = kHeadSlots * kDqk * 2;
+  static constexpr int kRowPad = 8;            // bank-shift, see kQkStride
+  static constexpr int kSStride = BI + kRowPad;
+  static constexpr int kPStride = BI + kRowPad;
+  static constexpr int kQBytes = kHeadSlots * kQkStride * 2;
   static constexpr int kRawBytes = 2 * BI * kCacheBytes;
-  static constexpr int kDeqBytes = BI * kDqk * 2;
+  static constexpr int kDeqBytes = BI * kQkStride * 2;
   static constexpr int kNTiles = BI / 8;       // n8 tiles per score row
   static constexpr int kKSplits = 8 / kNTiles; // warps stacked on k
-  static constexpr int kPartialBytes = kKSplits * kHeadSlots * BI * 4;
-  static constexpr int kPBytes = kHeadSlots * BI * 2;
+  static constexpr int kPartialBytes = kKSplits * kHeadSlots * kSStride * 4;
+  static constexpr int kPBytes = kHeadSlots * kPStride * 2;
   static constexpr int kBytes = kQBytes + kRawBytes + kDeqBytes + kPartialBytes +
                                 kPBytes + 3 * kHeadSlots * 4 + 2 * BI;
 
@@ -123,7 +131,7 @@ struct MainSmem {
   // score tile.
   __device__ static float* s_partial(char* base, int ks) {
     return reinterpret_cast<float*>(base + kQBytes + kRawBytes + kDeqBytes) +
-           ks * kHeadSlots * BI;
+           ks * kHeadSlots * kSStride;
   }
   __device__ static __nv_bfloat16* p(char* base) {
     return reinterpret_cast<__nv_bfloat16*>(base + kQBytes + kRawBytes +
@@ -181,7 +189,7 @@ __device__ void dequant_stage(char* smem, int stage) {
   for (int i = 0; i < kTokensPerWarp; ++i) {
     const int t = warp * kTokensPerWarp + i;
     const unsigned char* token = raw + t * kCacheBytes;
-    __nv_bfloat16* out = deq + t * kDqk;
+    __nv_bfloat16* out = deq + t * kQkStride;
     if (!flags[t]) {
       for (int f = lane; f < kDqk; f += 32) out[f] = __nv_bfloat16(0.f);
       continue;
@@ -233,7 +241,7 @@ __global__ void __launch_bounds__(kThreads) glm52_sparse_mla_main_kernel(
   {
     const __nv_bfloat16* q_row = q + static_cast<size_t>(row) * 64 * kDqk;
     for (int e = threadIdx.x; e < kHeadSlots * kDqk; e += kThreads) {
-      q_tile[e] = q_row[e];
+      q_tile[(e / kDqk) * kQkStride + e % kDqk] = q_row[e];
     }
     if (threadIdx.x < kHeadSlots) {
       MainSmem<BI>::m_run(smem)[threadIdx.x] = -INFINITY;
@@ -272,28 +280,31 @@ __global__ void __launch_bounds__(kThreads) glm52_sparse_mla_main_kernel(
       for (int kc = ks * kQkChunksPerWarp; kc < (ks + 1) * kQkChunksPerWarp;
            ++kc) {
         uint32_t a[4];
-        load_a_frag(a, q_tile, kDqk, 0, kc * 16, lane);
+        load_a_frag(a, q_tile, kQkStride, 0, kc * 16, lane);
         // B(k=feature, n=token): feature pairs are contiguous per token row.
-        const __nv_bfloat16* tok = deq + (nt * 8 + g) * kDqk + kc * 16;
+        const __nv_bfloat16* tok = deq + (nt * 8 + g) * kQkStride + kc * 16;
         uint32_t b[2];
         b[0] = *reinterpret_cast<const uint32_t*>(tok + 2 * t4);
         b[1] = *reinterpret_cast<const uint32_t*>(tok + 2 * t4 + 8);
         mma_bf16_16x8x16(c, a, b);
       }
+      constexpr int kSStride = MainSmem<BI>::kSStride;
       float* part = MainSmem<BI>::s_partial(smem, ks);
-      part[g * BI + nt * 8 + 2 * t4] = c[0];
-      part[g * BI + nt * 8 + 2 * t4 + 1] = c[1];
-      part[(g + 8) * BI + nt * 8 + 2 * t4] = c[2];
-      part[(g + 8) * BI + nt * 8 + 2 * t4 + 1] = c[3];
+      part[g * kSStride + nt * 8 + 2 * t4] = c[0];
+      part[g * kSStride + nt * 8 + 2 * t4 + 1] = c[1];
+      part[(g + 8) * kSStride + nt * 8 + 2 * t4] = c[2];
+      part[(g + 8) * kSStride + nt * 8 + 2 * t4 + 1] = c[3];
     }
     __syncthreads();
     if (kKSplits > 1) {
+      constexpr int kSStride = MainSmem<BI>::kSStride;
       float* s0 = MainSmem<BI>::s_partial(smem, 0);
       for (int e = threadIdx.x; e < kHeadSlots * BI; e += kThreads) {
-        float v = s0[e];
+        const int i = (e / BI) * kSStride + e % BI;
+        float v = s0[i];
         for (int ks = 1; ks < kKSplits; ++ks)
-          v += MainSmem<BI>::s_partial(smem, ks)[e];
-        s0[e] = v;
+          v += MainSmem<BI>::s_partial(smem, ks)[i];
+        s0[i] = v;
       }
       __syncthreads();
     }
@@ -310,7 +321,7 @@ __global__ void __launch_bounds__(kThreads) glm52_sparse_mla_main_kernel(
       const int sub = lane & 15;
       float mx = -INFINITY;
       for (int ccol = sub; ccol < BI; ccol += 16) {
-        if (flags[ccol]) mx = fmaxf(mx, s0[r * BI + ccol] * scale_log2);
+        if (flags[ccol]) mx = fmaxf(mx, s0[r * MainSmem<BI>::kSStride + ccol] * scale_log2);
       }
 #pragma unroll
       for (int off = 8; off > 0; off >>= 1)
@@ -321,9 +332,9 @@ __global__ void __launch_bounds__(kThreads) glm52_sparse_mla_main_kernel(
       for (int ccol = sub; ccol < BI; ccol += 16) {
         float pv = 0.f;
         if (flags[ccol] && m_new != -INFINITY) {
-          pv = exp2f(s0[r * BI + ccol] * scale_log2 - m_new);
+          pv = exp2f(s0[r * MainSmem<BI>::kSStride + ccol] * scale_log2 - m_new);
         }
-        p[r * BI + ccol] = __float2bfloat16(pv);
+        p[r * MainSmem<BI>::kPStride + ccol] = __float2bfloat16(pv);
         sum += pv;
       }
 #pragma unroll
@@ -353,15 +364,15 @@ __global__ void __launch_bounds__(kThreads) glm52_sparse_mla_main_kernel(
       }
       for (int kc = 0; kc < BI / 16; ++kc) {
         uint32_t a[4];
-        load_a_frag(a, p, BI, 0, kc * 16, lane);
+        load_a_frag(a, p, MainSmem<BI>::kPStride, 0, kc * 16, lane);
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
           // B(k=token, n=dim): token pairs stride kDqk in the deq tile.
           const int dim = warp * 64 + j * 8 + g;
-          const __nv_bfloat16* col = deq + (kc * 16 + 2 * t4) * kDqk + dim;
+          const __nv_bfloat16* col = deq + (kc * 16 + 2 * t4) * kQkStride + dim;
           uint32_t b[2];
-          b[0] = pack_bf16(col[0], col[kDqk]);
-          b[1] = pack_bf16(col[8 * kDqk], col[9 * kDqk]);
+          b[0] = pack_bf16(col[0], col[kQkStride]);
+          b[1] = pack_bf16(col[8 * kQkStride], col[9 * kQkStride]);
           mma_bf16_16x8x16(acc[j], a, b);
         }
       }
@@ -390,7 +401,10 @@ __global__ void __launch_bounds__(kThreads) glm52_sparse_mla_main_kernel(
 
 // Fixed-order split merge: deterministic by construction (split index
 // ascending, f32). A row/head whose every split saw only invalid tokens
-// (l == 0 across the board) produces zeros.
+// (l == 0 across the board) produces zeros. The dim axis is spread over
+// grid.z (one thread per dim): with grid (b, heads) alone the launch is 64
+// CTAs of latency-bound strided reads — too few warps to hide the 16
+// split-strided loads (measured 9.7 us, long-scoreboard 11.3).
 __global__ void glm52_sparse_mla_combine_kernel(
     const float* __restrict__ o_part,   // [16, b, 16, 512]
     const float* __restrict__ ml_part,  // [16, b, 16, 2]
@@ -398,6 +412,7 @@ __global__ void glm52_sparse_mla_combine_kernel(
     int batch) {
   const int row = blockIdx.x;
   const int h = blockIdx.y;
+  const int dim = blockIdx.z * blockDim.x + threadIdx.x;
 
   float m_star = -INFINITY;
 #pragma unroll
@@ -418,16 +433,14 @@ __global__ void glm52_sparse_mla_combine_kernel(
   const float inv = (l_total > 0.f) ? 1.f / l_total : 0.f;
 
   __nv_bfloat16* out = latent + (static_cast<size_t>(row) * 64 + h) * kDv;
-  for (int d = threadIdx.x; d < kDv; d += blockDim.x) {
-    float v = 0.f;
+  float v = 0.f;
 #pragma unroll
-    for (int s = 0; s < kNumSplits; ++s) {
-      v += weights[s] *
-           o_part[((static_cast<size_t>(s) * batch + row) * kHeadSlots + h) *
-                      kDv + d];
-    }
-    out[d] = __float2bfloat16(v * inv);
+  for (int s = 0; s < kNumSplits; ++s) {
+    v += weights[s] *
+         o_part[((static_cast<size_t>(s) * batch + row) * kHeadSlots + h) *
+                    kDv + dim];
   }
+  out[dim] = __float2bfloat16(v * inv);
 }
 
 // Naive f64 reference for the parity gate: same dequant semantics, flat
@@ -575,7 +588,7 @@ CUresult glm52_sparse_mla_decode_cuda(const void* q, const void* cache,
   }
   if (result != CUDA_SUCCESS) return result;
 
-  const dim3 grid(batch, heads);
+  const dim3 grid(batch, heads, kDv / 128);
   glm52_sparse_mla_combine_kernel<<<grid, 128, 0, stream>>>(
       o_part, ml_part, static_cast<__nv_bfloat16*>(latent), batch);
   return consume_last_cuda_error();
