@@ -320,7 +320,13 @@ pub(crate) fn run_dp8_coordinator(
         // lever: the full bucket COULD verify several requests' spans at
         // once). Suppress the proposals (appends and resets still flow, so
         // the drafter's shadow KV stays fresh and proposals resume the
-        // round after the fleet drains back to solo).
+        // round after the fleet drains back to solo). Drafts already
+        // installed on the solo slot are deliberately left to drain: the one
+        // transition step verifies a prefix of them (spare rows split
+        // round-robin with the newcomer's prefill, every slot keeps its
+        // liveness row) and `advance_span` discards the rest — clearing them
+        // here would throw away paid-for speculation to speed one step of
+        // one prefill.
         if mirrored
             && slots
                 .iter()
