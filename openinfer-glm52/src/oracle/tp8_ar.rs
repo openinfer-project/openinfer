@@ -17,6 +17,7 @@ use std::time::Instant;
 
 use anyhow::{Result, ensure};
 use half::bf16;
+use openinfer_core::cuda_graph::CudaGraphState;
 use openinfer_kernels::ops::{
     GLM52_TP8_AR_CHUNK_PACKETS, GLM52_TP8_HIDDEN, GLM52_TP8_RANKS, GLM52_TP8_TOKENS,
     Glm52Tp8LlBuffer, glm52_moe_tp8_epoch_advance, glm52_tp8_ar_buffer_bytes, glm52_tp8_ar_launch,
@@ -112,44 +113,39 @@ fn tp8_ar_brick_gate() -> Result<()> {
                         barrier.wait();
                     }
 
-                    // --- perf: 78-slot chain per step, all ranks in
-                    // lockstep enqueue order.
+                    // --- perf: the 78-slot step chain captured into a CUDA
+                    // graph and replayed — the production shape. A
+                    // stream-launched loop measures HOST launch throughput
+                    // instead (8 rank threads x 235 launches/step hammering
+                    // the driver ≈ 10 us/layer of pure enqueue — the D7
+                    // lesson).
                     ctx.stream.synchronize()?;
                     barrier.wait();
+                    let mut graph = CudaGraphState::new();
                     for _ in 0..PERF_WARM_STEPS {
-                        glm52_moe_tp8_epoch_advance(&ctx, &mut epoch_dev)?;
-                        for slot in 0..SLOTS {
-                            glm52_tp8_ar_launch(
-                                &ctx,
-                                slot,
-                                GLM52_TP8_TOKENS,
-                                &partial,
-                                &mut out,
-                                ar_local,
-                                peer_ar,
-                                &epoch_dev,
-                                rank,
-                            )?;
-                        }
+                        graph.run_or_capture(&ctx, || {
+                            glm52_moe_tp8_epoch_advance(&ctx, &mut epoch_dev)?;
+                            for slot in 0..SLOTS {
+                                glm52_tp8_ar_launch(
+                                    &ctx,
+                                    slot,
+                                    GLM52_TP8_TOKENS,
+                                    &partial,
+                                    &mut out,
+                                    ar_local,
+                                    peer_ar,
+                                    &epoch_dev,
+                                    rank,
+                                )?;
+                            }
+                            Ok(())
+                        })?;
                     }
                     ctx.stream.synchronize()?;
                     barrier.wait();
                     let t0 = Instant::now();
                     for _ in 0..PERF_TIMED_STEPS {
-                        glm52_moe_tp8_epoch_advance(&ctx, &mut epoch_dev)?;
-                        for slot in 0..SLOTS {
-                            glm52_tp8_ar_launch(
-                                &ctx,
-                                slot,
-                                GLM52_TP8_TOKENS,
-                                &partial,
-                                &mut out,
-                                ar_local,
-                                peer_ar,
-                                &epoch_dev,
-                                rank,
-                            )?;
-                        }
+                        graph.launch_captured(&ctx)?;
                     }
                     ctx.stream.synchronize()?;
                     let us_per_layer =
