@@ -211,11 +211,51 @@ regression. Measurement trap for the record: one SSE event carries one verify ro
 committed text, so event counting understates tok/s by the accept factor — count
 completion tokens against stream wall time.
 
+## Round profile: where the 25 ms goes (nsys, jz-38, 2026-07-08)
+
+Two traces of solo tp8+dspark decode on merged main (c57481a), same probe prompts as
+the table above. Methodology: `--cuda-graph-trace=graph` for honest wall numbers
+(near-zero overhead re-confirmed: 183 tok/s traced vs 186 untraced; whole-graph rows
+land in the `CUPTI_ACTIVITY_KIND_GRAPH_TRACE` sqlite table, not `..._KERNEL`), then a
+separate `--cuda-graph-trace=node` run for composition **proportions only** (it
+inflates the round ~73%). Scripts: jz-38 `~/develop/xingming/tp8_mtp_profile.sh` +
+`tp8_round_pair.py` (round decomposition), `tp8_node_profile.sh` +
+`tp8_node_attrib.py` (verify-graph composition; draft windows carved out by
+dflash/markov anchor clustering).
+
+**Round decomposition (graph-trace, honest):**
+
+| component | code (p50/p99) | prose (p50/p99) |
+|---|---|---|
+| round wall | 26.2 / 29.1 ms | 25.5 / 30.5 ms |
+| verify span-8 graph replay (device) | **23.7 / 25.0 ms (90%)** | 22.9 / 24.2 ms |
+| draft window (replay end → next replay start) | 2.6 / 3.2 ms (10%) | 2.5 / 4.1 ms |
+
+The draft window itself: the drafter's 7 markov steps are already graph-replayed
+(7 × 205 µs = 1.4 ms device), plus ~60 µs eager dflash kernels (aux attention, rope,
+copies), plus ~0.7 ms host gaps between the 7 step replays, plus 0.5 ms
+last-draft-end → verify-start (the big graph's launch cost partially exposed).
+**Draft is not the lever**: a zero-cost draft would buy only ~11% tok/s.
+
+**Verify-graph composition (node-trace, read proportions only; per-step device-busy
+sums to ~24.9 ms inflated vs 23.7 honest):**
+
+| segment | share | note |
+|---|---|---|
+| MoE TP8 chain (`tp8_*` ×75 + router + quant) | **~45%** | includes cross-rank wait spun inside `rs_recv` (13%) / `ag_*` — the F-wall lives here, so this over-reads pure compute (M0 anchor: diverse m=8 ≈ 75 µs/layer ≈ 5.6 ms) |
+| FP8 weight-only batched GEMV (`glm52_gemv_batched_mma`, **360/step**) | **~30%** | all dense projections: MLA q/kv/o ×78 layers + indexer proj ×21 + dense-MLP ×3 — the single biggest non-MoE block |
+| MLA attention core (sparse flash + combine + pack/assemble) | ~14% | |
+| cuBLAS nvjet GEMMs + splitK | ~7% | |
+| norms / elementwise | ~3% | |
+
+Lever ranking this data supports: **M4 attention-TP first** — the FP8 GEMV block
+(~30%) plus MLA core (~14%) is the round's non-MoE majority and both split 8-way;
+draft-side work (adaptive span, draft-step host gaps) is capped at ~10% of the round.
+
 ## Next action
 
-TP8+MTP measured and gated (table above); toxic review, then the single PR for the
-`feat/glm52-tp8-mtp` branch. Next levers, in order of expected value: **M4
-attention-TP** (q/o head split ×8, MLA latent has no head dimension so the latent KV
-replicates; o_proj allreduce reuses the LL machinery — cuts the ~16 ms non-MoE share
-of the 25 ms round), M3 bucket decision for multi-user (masked grouped GEMM on TP
-slices at m=16/32/64), adaptive span.
+TP8+MTP measured, gated, merged (PR #610). Next levers, in order of expected value
+(profile section above): **M4 attention-TP** (q/o head split ×8, MLA latent has no
+head dimension so the latent KV replicates; o_proj allreduce reuses the LL machinery —
+targets the ~44% FP8-GEMV + MLA share of the verify graph), M3 bucket decision for
+multi-user (masked grouped GEMM on TP slices at m=16/32/64), adaptive span.
