@@ -490,10 +490,12 @@ impl Glm52MoeTp8State {
     /// the bucket are real, the rest are pads (the plan packs actives as a
     /// prefix). Host-side write OUTSIDE the graph — every rank must stage the
     /// same value before replay (pads skip the LL wire on all ranks alike).
+    /// Zero is the graph pre-capture shape (all rows pads): the kernels then
+    /// push nothing and wait on nothing, so capture pairs trivially.
     pub(crate) fn stage_active_rows(&mut self, ctx: &DeviceContext, active: usize) -> Result<()> {
         ensure!(
-            active >= 1 && active <= GLM52_TP8_TOKENS,
-            "TP8 active rows {active} out of 1..={GLM52_TP8_TOKENS}"
+            active <= GLM52_TP8_TOKENS,
+            "TP8 active rows {active} exceeds the bucket {GLM52_TP8_TOKENS}"
         );
         ctx.stream
             .memcpy_htod(&[active as i32], &mut self.active_rows_dev)?;
