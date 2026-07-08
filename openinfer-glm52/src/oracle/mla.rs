@@ -220,22 +220,6 @@ fn mla_oracle_gate() -> Result<()> {
     run_mla_oracle_gate(GLM52_FLASHMLA_SPARSE_TOPK, None)
 }
 
-/// The short-tier plan (topk 256, few SM parts) must land on the SAME oracle
-/// within the SAME tolerance: at ctx <= topk both tiers attend all tokens —
-/// only the padded index-walk length and the split/combine partition differ.
-#[test]
-#[ignore = "requires H200 + GLM-5.2-FP8 checkpoint"]
-fn mla_oracle_gate_short_tier() -> Result<()> {
-    ensure!(
-        ORACLE_CTX <= crate::model::GLM52_MLA_TOPK_SHORT,
-        "oracle ctx outgrew the short tier — bump the tier or the gate"
-    );
-    run_mla_oracle_gate(
-        crate::model::GLM52_MLA_TOPK_SHORT,
-        Some(crate::model::GLM52_MLA_TOPK_SHORT / 64),
-    )
-}
-
 fn run_mla_oracle_gate(topk: usize, sm_parts_cap: Option<usize>) -> Result<()> {
     let model_path = std::env::var_os("OPENINFER_TEST_MODEL_PATH")
         .map_or_else(|| PathBuf::from("models/GLM-5.2-FP8"), PathBuf::from);

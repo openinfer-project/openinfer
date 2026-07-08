@@ -379,7 +379,7 @@ pub(crate) fn glm52_indexer_forward_into(
         cache_block_stride_bytes: shape.kv_cache_stride_bytes,
     };
     // `topk` comes from the attend plan; its 1..=GLM52_INDEXER_TOPK range is
-    // pinned at compile time against both tier constants (model.rs const
+    // pinned at compile time against the attention topk (model.rs const
     // asserts).
 
     // ---- projections ----

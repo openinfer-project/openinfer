@@ -194,9 +194,10 @@ CUresult map_launcher_error(int rc) {
 
 bool supported_topk(int topk) {
   // The TileLang main kernel is AOT-instantiated per topk
-  // (tools/tilelang/glm52/generate.py TOPKS): the DSA tiers, 2048 full and
-  // 256 short.
-  return topk == 256 || topk == 2048;
+  // (tools/tilelang/glm52/generate.py TOPKS): production runs only the full
+  // DSA topk — the 256 short tier was dropped (see the generator's note for
+  // how to build it again).
+  return topk == 2048;
 }
 
 }  // namespace

@@ -7,10 +7,7 @@ use anyhow::{Result, ensure};
 use openinfer_kernels::ops::{embedding_rows_into, glm52_decode_feed_launch};
 use openinfer_kernels::tensor::DeviceContext;
 
-use super::{
-    GLM52_MAX_BATCH_PER_RANK, GLM52_MLA_TOPK_SHORT, GLM52_VOCAB, Glm52RankModel, Glm52StepShape,
-    TIER_FULL, TIER_SHORT,
-};
+use super::{GLM52_MAX_BATCH_PER_RANK, GLM52_VOCAB, Glm52RankModel, Glm52StepShape};
 
 /// A speculative next-step whole-graph replay already enqueued on the decode
 /// stream: the feed kernel advanced the device input buffers in place and
@@ -99,20 +96,10 @@ impl Glm52RankModel {
                      its page"
                 );
             }
-            let longest_next = self.device_positions[..batch]
-                .iter()
-                .map(|&position| position + 2)
-                .max()
-                .expect("decode buckets forward at least one row");
-            let tier = if longest_next <= GLM52_MLA_TOPK_SHORT {
-                TIER_SHORT
-            } else {
-                TIER_FULL
-            };
             ensure!(
-                bucket.graphs[tier].is_captured(),
-                "GLM5.2 launch-ahead lease granted before the (bucket {batch}, tier {tier}) graph \
-                 was captured — the startup pre-capture must cover every shape"
+                bucket.graph.is_captured(),
+                "GLM5.2 launch-ahead lease granted before the bucket-{batch} graph was captured \
+                 — the startup pre-capture must cover every shape"
             );
             // From the first enqueue below onward, a host-side failure
             // (launch error) leaves the other ranks' speculative collectives
@@ -130,7 +117,7 @@ impl Glm52RankModel {
             )?;
             embedding_rows_into(ctx, &self.cos_table, &self.positions, batch, &mut self.cos)?;
             embedding_rows_into(ctx, &self.sin_table, &self.positions, batch, &mut self.sin)?;
-            bucket.graphs[tier].launch_captured(ctx)?;
+            bucket.graph.launch_captured(ctx)?;
             for position in &mut self.device_positions[..batch] {
                 *position += 1;
             }

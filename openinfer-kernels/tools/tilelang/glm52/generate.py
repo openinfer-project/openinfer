@@ -63,8 +63,13 @@ from tilelang.env import CUTLASS_INCLUDE_DIR, TILELANG_TEMPLATE_PATH
 
 tilelang.set_log_level("WARNING")
 
-# The DSA tiers: 2048 full, 256 short. Nothing else exists in production.
-TOPKS = [256, 2048]
+# Production only runs topk 2048: the short-context tier (topk 256 while
+# every row's context fit in it) was dropped — agent traffic starts well past
+# 2048 tokens of context. To build the 256 instantiation again, add 256 here
+# and keep `GLM52_SPARSE_MLA_TOPKS` (src/ops/glm52/sparse_mla.rs) and
+# `supported_topk` (csrc/glm52/glm52_sparse_mla.cu) in sync; the kernel's
+# bound-masking already handles topk < one gather stage.
+TOPKS = [2048]
 NUM_SPLITS = 16
 HEAD_SLOTS_OUT = 16  # partial store width; pad slots past it are never read
 SM_SCALE = 0.0625  # GLM52_SM_SCALE, baked; the launcher-side entry validates
