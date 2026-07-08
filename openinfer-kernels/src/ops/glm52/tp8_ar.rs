@@ -15,13 +15,15 @@ use crate::tensor::DeviceContext;
 
 use super::moe_tp8::{GLM52_TP8_HIDDEN, GLM52_TP8_RANKS, GLM52_TP8_TOKENS};
 
-/// LL packets per (row, src): 4 bf16 of payload per 16 B packet.
-pub const GLM52_TP8_AR_ROW_PACKETS: usize = GLM52_TP8_HIDDEN / 4;
+/// LL packets per (row, src) hidden chunk: H/8 bf16 packed 6 (12 B) per
+/// packet. This is also the pre-offset unit for peer pointers.
+pub const GLM52_TP8_AR_CHUNK_PACKETS: usize = (GLM52_TP8_HIDDEN / GLM52_TP8_RANKS) * 2 / 12;
 
-/// One layer slot's AR region in packets: parity(2) x rows x src x row
-/// packets. Multiply by layer-slot count and 16 B for the buffer size.
+/// One layer slot's AR region in packets: parity(2) x stage(2: reduce-scatter
+/// + broadcast) x rows x src x chunk packets. Multiply by layer-slot count
+/// and 16 B for the buffer size.
 pub const GLM52_TP8_AR_SLOT_PACKETS: usize =
-    2 * GLM52_TP8_TOKENS * GLM52_TP8_RANKS * GLM52_TP8_AR_ROW_PACKETS;
+    2 * 2 * GLM52_TP8_TOKENS * GLM52_TP8_RANKS * GLM52_TP8_AR_CHUNK_PACKETS;
 
 /// AR LL buffer bytes for `layer_slots` layers (allocate via
 /// [`super::moe_tp8::Glm52Tp8LlBuffer::alloc`]).
@@ -29,11 +31,12 @@ pub const fn glm52_tp8_ar_buffer_bytes(layer_slots: usize) -> usize {
     layer_slots * GLM52_TP8_AR_SLOT_PACKETS * 16
 }
 
-/// Launch the AR push+recv pair for one layer. `partial` is this rank's
-/// partial output for `rows` bucket rows (`[rows][HIDDEN]` bf16); `out`
-/// receives the reduced result (identical on all ranks). `peer_ar[p]` is
-/// rank p's AR buffer VA pre-offset by `myrank * GLM52_TP8_AR_ROW_PACKETS`
-/// packets (this rank's src slot). Shares the step epoch with the MoE chain:
+/// Launch the two-shot AR chain (push, fused reduce+broadcast, recv) for one
+/// layer. `partial` is this rank's partial output for `rows` bucket rows
+/// (`[rows][HIDDEN]` bf16); `out` receives the reduced result, bit-identical
+/// on all ranks. `peer_ar[p]` is rank p's AR buffer VA pre-offset by
+/// `myrank * GLM52_TP8_AR_CHUNK_PACKETS` packets (this rank's src slot).
+/// Shares the step epoch with the MoE chain:
 /// [`super::moe_tp8::glm52_moe_tp8_epoch_advance`] once per step.
 #[allow(clippy::too_many_arguments)]
 pub fn glm52_tp8_ar_launch(

@@ -22,6 +22,15 @@ static __device__ __forceinline__ void glm52_tp8_st_ll(uint4* p, uint2 v,
                    "r"(v.x), "r"(v.y), "r"(0u), "r"(tag));
 }
 
+// 12 B payload variant: 3 data words + tag in one 16 B packet (the 8 B form
+// above wastes its third word). Same atomicity contract.
+static __device__ __forceinline__ void glm52_tp8_st_ll12(uint4* p, unsigned x,
+                                                         unsigned y, unsigned z,
+                                                         unsigned tag) {
+  asm volatile("st.volatile.global.v4.b32 [%0],{%1,%2,%3,%4};" ::"l"(p),
+                   "r"(x), "r"(y), "r"(z), "r"(tag));
+}
+
 static __device__ __forceinline__ uint4 glm52_tp8_ld_ll(const uint4* p) {
   uint4 q;
   asm volatile("ld.volatile.global.v4.b32 {%0,%1,%2,%3},[%4];"

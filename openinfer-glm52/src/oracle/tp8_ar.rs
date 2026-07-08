@@ -1,14 +1,16 @@
 //! TP8 attention-allreduce brick gate (M4 K1): 8 ranks push synthetic
-//! partials through the LL one-shot allreduce and every rank must get the
-//! bit-identical, exactly-predicted sum back. No model weights involved.
+//! partials through the LL two-shot allreduce (reduce-scatter + broadcast)
+//! and every rank must get the bit-identical, exactly-predicted sum back.
+//! No model weights involved.
 //!
 //! Covers: slot/parity addressing across steps (3 steps flip parity and
 //! revisit a region holding stale packets — the tag discipline must reject
 //! them), partial-row launches, cross-rank bit-identity (the
 //! replicated-activation topology relies on it), and a standalone timing
-//! loop against the R4 anchor (~5.8 us/layer marginal on 8xH200; the
-//! stream-enqueued standalone chain here is an upper bound — production
-//! rides the whole-step graph).
+//! loop (kill line 10 us/layer at 8 rows; the one-shot form measured 13.2
+//! here — byte-bound at 7x payload egress — which is why the brick is
+//! two-shot; the stream-enqueued standalone chain is an upper bound, since
+//! production rides the whole-step graph).
 
 use std::sync::{Arc, Barrier, Mutex};
 use std::time::Instant;
@@ -16,7 +18,7 @@ use std::time::Instant;
 use anyhow::{Result, ensure};
 use half::bf16;
 use openinfer_kernels::ops::{
-    GLM52_TP8_AR_ROW_PACKETS, GLM52_TP8_HIDDEN, GLM52_TP8_RANKS, GLM52_TP8_TOKENS,
+    GLM52_TP8_AR_CHUNK_PACKETS, GLM52_TP8_HIDDEN, GLM52_TP8_RANKS, GLM52_TP8_TOKENS,
     Glm52Tp8LlBuffer, glm52_moe_tp8_epoch_advance, glm52_tp8_ar_buffer_bytes, glm52_tp8_ar_launch,
 };
 use openinfer_kernels::tensor::DeviceContext;
@@ -70,7 +72,7 @@ fn tp8_ar_brick_gate() -> Result<()> {
                     let peer_ar: [u64; RANKS] = {
                         let published = vas.lock().unwrap();
                         std::array::from_fn(|dst| {
-                            published[dst][rank] + (rank * GLM52_TP8_AR_ROW_PACKETS * 16) as u64
+                            published[dst][rank] + (rank * GLM52_TP8_AR_CHUNK_PACKETS * 16) as u64
                         })
                     };
                     let ar_local = buf.addr_for(rank);
