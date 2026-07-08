@@ -57,7 +57,9 @@ struct Cli {
     /// full-load bucket sweep above. 0 = off.
     #[arg(long, default_value_t = 0)]
     ingest_tokens: usize,
-    /// MoE topology: ep8 (default, all buckets) or tp8 (bucket-1 only).
+    /// MoE topology: ep8 (default, all buckets) or tp8 (8 mirrored
+    /// executors — 8 concurrent streams fill the logical slots, so only
+    /// --buckets 1 keeps the 8x-streams arithmetic meaningful).
     #[arg(long, default_value = "ep8")]
     moe_topo: String,
 }
@@ -72,7 +74,8 @@ fn main() -> Result<()> {
     if moe_topo == openinfer_glm52::Glm52MoeTopo::Tp8 {
         ensure!(
             cli.buckets.iter().all(|&b| b == 1),
-            "--moe-topo tp8 serves bucket-1 only; pass --buckets 1"
+            "--moe-topo tp8 holds at most 8 concurrent requests (one logical rank); \
+             pass --buckets 1"
         );
     }
     ensure!(

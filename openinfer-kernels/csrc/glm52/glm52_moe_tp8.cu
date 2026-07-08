@@ -187,6 +187,12 @@ struct Glm52MoeTp8Args {
   const unsigned char* w2;       // [257, 6144, 256] fp8 slice
   const float* w2_scale;         // [257, 48, 2]
   __nv_bfloat16* mlp_out;        // [kTokens][H] all rows (routed + shared, no residual)
+  // Want-mask: leading-active row count, read from device memory at kernel
+  // time (staged identically on every rank by the host prologue — LL push/
+  // wait symmetry needs all ranks to agree). Rows >= *active_rows are pads:
+  // excluded from the union (their garbage routing never inflates UC),
+  // never pushed, and zero-filled in mlp_out. nullptr = all rows active.
+  const int* active_rows;
   // scratch arena (pointer-stable across capture/replay)
   int* guidx;                    // [72]
   float* guprob;                 // [72][8]
@@ -216,8 +222,12 @@ struct Glm52MoeTp8Args {
   const int GT = gridDim.x * kThreads;                                        \
   const unsigned long long ep = *a.epoch_dev;                                 \
   const unsigned tag = (unsigned)ep;                                          \
+  const int act = a.active_rows == nullptr                                    \
+                      ? kTokens                                               \
+                      : (*a.active_rows < kTokens ? *a.active_rows : kTokens);\
   const size_t rs_off =                                                       \
       ((size_t)a.layer_slot * 2 + (ep & 1)) * kTokens * kRanks * kHidden;     \
+  (void)act;                                                                  \
   (void)tag;                                                                  \
   (void)gt;                                                                   \
   (void)GT;                                                                   \
@@ -244,7 +254,7 @@ __global__ void __launch_bounds__(kThreads) tp8_union_kernel(
     a.gused[t] = 0;
     for (int i = t; i < kUnionMax * kTokens; i += kThreads) a.guprob[i] = 0.f;
     __syncthreads();
-    if (t < kTokens * kTopk) {
+    if (t < act * kTopk) {
       atomicOr(&a.gused[a.topk_idx[t]], 1);
     }
     __syncthreads();
@@ -266,7 +276,7 @@ __global__ void __launch_bounds__(kThreads) tp8_union_kernel(
       a.guidx[0] = kBankExperts - 1;  // shared expert bank index 256
     }
     __syncthreads();
-    if (t < kTokens) {
+    if (t < act) {
       a.guprob[(size_t)0 * kTokens + t] = 1.0f;
       for (int r = 0; r < kTopk; r++) {
         int e = a.topk_idx[t * kTopk + r];
@@ -368,7 +378,7 @@ __global__ void __launch_bounds__(kThreads) tp8_rs_push_kernel(
     Glm52MoeTp8Args a) {
   TP8_PREAMBLE
   const int UC = *a.gucnt;
-  for (int i = gt; i < kTokens * kHidden; i += GT) {
+  for (int i = gt; i < act * kHidden; i += GT) {
     int j = i / kHidden, h = i - j * kHidden;
     float s = 0;
     for (int u = 0; u < UC; ++u) {
@@ -393,6 +403,12 @@ __global__ void __launch_bounds__(kThreads) tp8_rs_recv_kernel(
   TP8_PREAMBLE
   for (int i = gt; i < kTokens * kHidden; i += GT) {
     const int j = i / kHidden, h = i - j * kHidden;
+    if (j >= act) {
+      // Pad rows never crossed the wire; zero-fill so no stale/NaN value
+      // rides the pad row's residual stream into the next layer.
+      a.mlp_out[(size_t)j * kHidden + h] = __float2bfloat16(0.f);
+      continue;
+    }
     float s = 0;
     for (int r = 0; r < a.nranks; r++) {
       uint4 q;
@@ -555,8 +571,8 @@ int glm52_moe_tp8_layer_launch_cuda(
     const void* w2_scale, void* mlp_out, void* guidx, void* guprob,
     void* gucnt, void* gused, void* bpart, void* ug, void* cpart,
     void* rs_local, const void* const* peer_rs, void* epoch_dev,
-    int layer_slot, int nranks, int myrank, int grid_blocks,
-    cudaStream_t stream) {
+    const void* active_rows, int layer_slot, int nranks, int myrank,
+    int grid_blocks, cudaStream_t stream) {
   if (nranks != kRanks || myrank < 0 || myrank >= nranks) {
     return (int)cudaErrorInvalidValue;
   }
@@ -581,6 +597,7 @@ int glm52_moe_tp8_layer_launch_cuda(
     a.peer_rs[p] = (uint4*)peer_rs[p];
   }
   a.epoch_dev = (unsigned long long*)epoch_dev;
+  a.active_rows = (const int*)active_rows;
   a.nranks = nranks;
   a.myrank = myrank;
   a.layer_slot = layer_slot;

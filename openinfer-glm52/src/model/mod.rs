@@ -784,7 +784,7 @@ impl Glm52RankModel {
         ctx: &DeviceContext,
         aux: &DeviceContext,
         ep8: &mut Glm52MoeEp8State,
-        tp8: Option<&mut Glm52MoeTp8Rank>,
+        mut tp8: Option<&mut Glm52MoeTp8Rank>,
         inputs: &[(u32, usize); GLM52_MAX_BATCH_PER_RANK],
         shape: Glm52StepShape,
         kv: &Glm52StepKv,
@@ -881,6 +881,17 @@ impl Glm52RankModel {
         // rows ride the padding page).
         ctx.stream
             .memcpy_htod(&kv.pages[..], &mut bucket.block_table)?;
+        // Want-mask for the TP8 kernels: pad rows (>= active_rows, a prefix
+        // by plan construction) skip the LL wire and shrink the expert union.
+        // Every rank stages the same value — the coordinator mirrors the
+        // step, and LL push/wait symmetry depends on it. A leased replay
+        // (consume path) skips this prologue, which is safe: the lease
+        // guarantees the identical shape, so the staged value still holds.
+        if let Some(rank) = tp8.as_deref_mut() {
+            if !rank.slices.is_empty() {
+                rank.state.stage_active_rows(ctx, shape.active_rows)?;
+            }
+        }
 
         // Attention tier: while EVERY forwarded row's context fits in the
         // short top-k, top-256 selects exactly the same tokens as top-2048

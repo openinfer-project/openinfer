@@ -5,9 +5,10 @@
 //!
 //! Covers: slot/parity addressing across steps (3 steps flip parity and
 //! revisit a region holding stale packets — the tag discipline must reject
-//! them), partial-row launches, cross-rank bit-identity (the
-//! replicated-activation topology relies on it), and a standalone timing
-//! loop (kill line 10 us/layer at 8 rows; the one-shot form measured 13.2
+//! them), the want-mask (full-capacity launch with a device active count of
+//! 3: pad rows must skip the wire and come back zero-filled over a NaN
+//! canary), cross-rank bit-identity (the replicated-activation topology
+//! relies on it), and a standalone timing loop (kill line 10 us/layer at 8 rows; the one-shot form measured 13.2
 //! here — byte-bound at 7x payload egress — which is why the brick is
 //! two-shot; the stream-enqueued standalone chain is an upper bound, since
 //! production rides the whole-step graph).
@@ -79,17 +80,21 @@ fn tp8_ar_brick_gate() -> Result<()> {
                     let ar_local = buf.addr_for(rank);
 
                     let mut epoch_dev = ctx.stream.alloc_zeros::<u64>(1)?;
+                    let mut active_dev = ctx.stream.alloc_zeros::<i32>(1)?;
                     let mut partial = ctx.stream.alloc_zeros::<bf16>(GLM52_TP8_TOKENS * H)?;
                     let mut out = ctx.stream.alloc_zeros::<bf16>(GLM52_TP8_TOKENS * H)?;
 
                     // --- correctness: 3 steps x 2 slots; step 3 re-enters
                     // step 1's parity region, which still holds tag-1
                     // packets — the recv must reject them and wait for
-                    // tag 3. Step 2 additionally runs a partial 3-row
-                    // launch on slot 1.
+                    // tag 3. Step 2 runs the production partial shape:
+                    // full-capacity launch, device want-mask active=3 —
+                    // pad rows must skip the wire and zero-fill the NaN
+                    // canary.
                     let mut results: Vec<Vec<bf16>> = Vec::new();
                     for step in 0..3 {
-                        let rows = if step == 1 { 3 } else { GLM52_TP8_TOKENS };
+                        let active = if step == 1 { 3 } else { GLM52_TP8_TOKENS };
+                        ctx.stream.memcpy_htod(&[active as i32], &mut active_dev)?;
                         let host: Vec<bf16> = (0..GLM52_TP8_TOKENS * H)
                             .map(|i| bf16::from_f32(partial_value(step, rank, i / H, i % H)))
                             .collect();
@@ -101,13 +106,21 @@ fn tp8_ar_brick_gate() -> Result<()> {
                         glm52_moe_tp8_epoch_advance(&ctx, &mut epoch_dev)?;
                         for slot in [0usize, 1] {
                             glm52_tp8_ar_launch(
-                                &ctx, slot, rows, &partial, &mut out, ar_local, peer_ar,
-                                &epoch_dev, rank,
+                                &ctx,
+                                slot,
+                                GLM52_TP8_TOKENS,
+                                &partial,
+                                &mut out,
+                                ar_local,
+                                peer_ar,
+                                &epoch_dev,
+                                Some(&active_dev),
+                                rank,
                             )?;
                         }
                         let got = ctx.stream.clone_dtoh(&out)?;
                         ctx.stream.synchronize()?;
-                        results.push(got[..rows * H].to_vec());
+                        results.push(got);
                         // Keep epoch sequences aligned before the region is
                         // revisited with a new tag.
                         barrier.wait();
@@ -135,6 +148,7 @@ fn tp8_ar_brick_gate() -> Result<()> {
                                     ar_local,
                                     peer_ar,
                                     &epoch_dev,
+                                    Some(&active_dev),
                                     rank,
                                 )?;
                             }
@@ -164,11 +178,14 @@ fn tp8_ar_brick_gate() -> Result<()> {
         all.push(h.join().expect("tp8 ar gate rank thread panicked")?);
     }
 
-    for (step, &rows) in [GLM52_TP8_TOKENS, 3, GLM52_TP8_TOKENS].iter().enumerate() {
-        let mut expected = Vec::with_capacity(rows * H);
-        for row in 0..rows {
+    for (step, &active) in [GLM52_TP8_TOKENS, 3, GLM52_TP8_TOKENS].iter().enumerate() {
+        let mut expected = Vec::with_capacity(GLM52_TP8_TOKENS * H);
+        for row in 0..active {
             expected.extend(expected_row(step, row));
         }
+        // Want-mask contract: pad rows come back zero-filled (NaN canary
+        // overwritten), not stale and not reduced.
+        expected.resize(GLM52_TP8_TOKENS * H, bf16::from_f32(0.0));
         for (rank, (results, _)) in all.iter().enumerate() {
             ensure!(
                 results[step] == expected,

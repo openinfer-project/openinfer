@@ -386,6 +386,12 @@ pub(crate) struct Glm52MoeTp8State {
     peer_rs: [u64; RANKS],
     peer_ar: [u64; RANKS],
     epoch_dev: CudaSlice<u64>,
+    // Want-mask: leading-active row count all TP8 kernels of a step read at
+    // replay time. Staged host-side once per step (like the old span-owner
+    // staging), identically on every rank — LL push/wait symmetry. Starts at
+    // the full bucket so graph capture (which executes the kernels once)
+    // pairs its cross-rank packets exactly like today.
+    active_rows_dev: CudaSlice<i32>,
     guidx: CudaSlice<i32>,
     guprob: CudaSlice<f32>,
     gucnt: CudaSlice<i32>,
@@ -449,6 +455,9 @@ impl Glm52MoeTp8State {
         // never match a live epoch.
         let mut epoch_dev = ctx.stream.alloc_zeros::<u64>(1)?;
         ctx.stream.memcpy_htod(&[1u64], &mut epoch_dev)?;
+        let mut active_rows_dev = ctx.stream.alloc_zeros::<i32>(1)?;
+        ctx.stream
+            .memcpy_htod(&[GLM52_TP8_TOKENS as i32], &mut active_rows_dev)?;
         let grid_blocks = glm52_moe_tp8_max_blocks()?;
         Ok(Self {
             rank,
@@ -460,6 +469,7 @@ impl Glm52MoeTp8State {
             peer_rs,
             peer_ar,
             epoch_dev,
+            active_rows_dev,
             guidx: ctx.stream.alloc_zeros(GLM52_TP8_UNION_MAX)?,
             guprob: ctx.stream.alloc_zeros(GLM52_TP8_UNION_MAX * RANKS)?,
             gucnt: ctx.stream.alloc_zeros(1)?,
@@ -474,6 +484,20 @@ impl Glm52MoeTp8State {
     /// layer's `forward` of that step (captured into the same graph).
     pub(crate) fn advance_epoch(&mut self, ctx: &DeviceContext) -> Result<()> {
         glm52_moe_tp8_epoch_advance(ctx, &mut self.epoch_dev)
+    }
+
+    /// Stage the want-mask for the next replayed step: rows `[0, active)` of
+    /// the bucket are real, the rest are pads (the plan packs actives as a
+    /// prefix). Host-side write OUTSIDE the graph — every rank must stage the
+    /// same value before replay (pads skip the LL wire on all ranks alike).
+    pub(crate) fn stage_active_rows(&mut self, ctx: &DeviceContext, active: usize) -> Result<()> {
+        ensure!(
+            active >= 1 && active <= GLM52_TP8_TOKENS,
+            "TP8 active rows {active} out of 1..={GLM52_TP8_TOKENS}"
+        );
+        ctx.stream
+            .memcpy_htod(&[active as i32], &mut self.active_rows_dev)?;
+        Ok(())
     }
 
     /// All-reduce `rows` rows of a head-sharded projection partial (the
@@ -498,6 +522,7 @@ impl Glm52MoeTp8State {
             self.ar_local,
             self.peer_ar,
             &self.epoch_dev,
+            Some(&self.active_rows_dev),
             self.rank,
         )
     }
@@ -532,6 +557,7 @@ impl Glm52MoeTp8State {
             rs_local: self.rs_local,
             peer_rs: self.peer_rs,
             epoch_dev: &mut self.epoch_dev,
+            active_rows: Some(&self.active_rows_dev),
         };
         glm52_moe_tp8_layer_launch(
             ctx,

@@ -150,6 +150,11 @@ pub struct Glm52MoeTp8Buffers<'a> {
     pub rs_local: u64,
     pub peer_rs: [u64; GLM52_TP8_RANKS],
     pub epoch_dev: &'a mut CudaSlice<u64>,
+    /// Want-mask: device i32 leading-active row count, staged identically on
+    /// every rank before the step (LL push/wait symmetry). `None` = all rows
+    /// active. Pad rows are excluded from the union, never cross the wire,
+    /// and come back zero-filled in `mlp_out`.
+    pub active_rows: Option<&'a CudaSlice<i32>>,
 }
 
 /// Launch one layer's TP8 MoE phase-kernel chain. Every rank passes ALL
@@ -236,6 +241,10 @@ pub fn glm52_moe_tp8_layer_launch(
     let (ug_ptr, _g16) = bufs.ug.device_ptr_mut(&ctx.stream);
     let (cpart_ptr, _g17) = bufs.cpart.device_ptr_mut(&ctx.stream);
     let (epoch_ptr, _g20) = bufs.epoch_dev.device_ptr_mut(&ctx.stream);
+    let active_ptr = match bufs.active_rows {
+        Some(active) => active.device_ptr(&ctx.stream).0 as *const i32,
+        None => std::ptr::null(),
+    };
     let peer_rs: [*const std::ffi::c_void; GLM52_TP8_RANKS] =
         bufs.peer_rs.map(|p| p as *const std::ffi::c_void);
     unsafe {
@@ -258,6 +267,7 @@ pub fn glm52_moe_tp8_layer_launch(
             bufs.rs_local as *mut std::ffi::c_void,
             peer_rs.as_ptr(),
             epoch_ptr as *mut u64,
+            active_ptr,
             layer_slot as i32,
             GLM52_TP8_RANKS as i32,
             myrank as i32,

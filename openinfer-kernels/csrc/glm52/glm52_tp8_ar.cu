@@ -39,7 +39,7 @@ namespace {
 
 constexpr int kHidden = 6144;
 constexpr int kRanks = 8;
-constexpr int kTokens = 8;  // max bucket rows; pads ride along (want-mask TBD)
+constexpr int kTokens = 8;  // max bucket rows
 constexpr int kThreads = 256;
 // One rank's hidden chunk per row, packed 6 bf16 (12 B) per packet.
 constexpr int kChunk = kHidden / kRanks;               // 768 bf16
@@ -54,6 +54,12 @@ struct Glm52Tp8ArArgs {
   uint4* ar_local;               // own AR buffer base
   uint4* peer_ar[kRanks];        // peer p's AR buffer + myrank*kChunkPk
   const unsigned long long* epoch_dev;
+  // Want-mask: leading-active row count, read from device memory at kernel
+  // time (staged by the host prologue like the step epoch, identically on
+  // every rank — the tag discipline needs push/wait symmetry). Pad rows
+  // (row >= *active_rows) push nothing, wait on nothing, and get zero-filled
+  // outputs. nullptr = all `rows` active (oracle gates without staging).
+  const int* active_rows;
   int layer_slot;
   int rows;
   int nranks, myrank;
@@ -64,6 +70,10 @@ struct Glm52Tp8ArArgs {
   const int GT = gridDim.x * kThreads;                                        \
   const unsigned long long ep = *a.epoch_dev;                                 \
   const unsigned tag = (unsigned)ep;                                          \
+  const int act = a.active_rows == nullptr                                    \
+                      ? a.rows                                                \
+                      : (*a.active_rows < a.rows ? *a.active_rows : a.rows);  \
+  (void)act;                                                                  \
   const size_t ar_off =                                                       \
       ((size_t)a.layer_slot * 2 + (ep & 1)) * 2 * kStageStride;
 
@@ -94,11 +104,12 @@ __device__ __forceinline__ unsigned f2bf(float lo, float hi) {
   return *reinterpret_cast<const unsigned*>(&p);
 }
 
-// Stage 0: land this rank's partial chunk c in rank c's reduce slots.
+// Stage 0: land this rank's partial chunk c in rank c's reduce slots
+// (active rows only).
 __global__ void __launch_bounds__(kThreads) tp8_ar_push_kernel(
     Glm52Tp8ArArgs a) {
   TP8_AR_PREAMBLE
-  for (int rp = gt; rp < a.rows * a.nranks * kChunkPk; rp += GT) {
+  for (int rp = gt; rp < act * a.nranks * kChunkPk; rp += GT) {
     const int row = rp / (a.nranks * kChunkPk);
     const int rem = rp % (a.nranks * kChunkPk);
     const int c = rem / kChunkPk, i = rem % kChunkPk;
@@ -116,7 +127,7 @@ __global__ void __launch_bounds__(kThreads) tp8_ar_push_kernel(
 __global__ void __launch_bounds__(kThreads) tp8_ar_reduce_bcast_kernel(
     Glm52Tp8ArArgs a) {
   TP8_AR_PREAMBLE
-  for (int rp = gt; rp < a.rows * kChunkPk; rp += GT) {
+  for (int rp = gt; rp < act * kChunkPk; rp += GT) {
     const int row = rp / kChunkPk, i = rp % kChunkPk;
     float2 a01 = make_float2(0.f, 0.f), a23 = a01, a45 = a01;
     for (int src = 0; src < a.nranks; ++src) {
@@ -142,6 +153,8 @@ __global__ void __launch_bounds__(kThreads) tp8_ar_reduce_bcast_kernel(
 }
 
 // Stage 2: assemble the full rows from the 8 chunk owners' broadcasts.
+// Pad rows never crossed the wire — zero-fill their output so no stale (or
+// NaN) value leaks into the next layer through a pad row's residual.
 __global__ void __launch_bounds__(kThreads) tp8_ar_recv_kernel(
     Glm52Tp8ArArgs a) {
   TP8_AR_PREAMBLE
@@ -149,6 +162,11 @@ __global__ void __launch_bounds__(kThreads) tp8_ar_recv_kernel(
     const int row = rp / (a.nranks * kChunkPk);
     const int rem = rp % (a.nranks * kChunkPk);
     const int c = rem / kChunkPk, i = rem % kChunkPk;
+    if (row >= act) {
+      st_payload12(a.out + (size_t)row * kHidden + (size_t)c * kChunk + i * 6,
+                   0u, 0u, 0u);
+      continue;
+    }
     uint4 q;
     glm52_tp8_ll_wait(
         a.ar_local + ar_off + kStageStride + (size_t)row * kRowStride +
@@ -163,8 +181,9 @@ __global__ void __launch_bounds__(kThreads) tp8_ar_recv_kernel(
 
 extern "C" int glm52_tp8_ar_launch_cuda(
     const void* partial, void* out, void* ar_local,
-    const void* const* peer_ar, const void* epoch_dev, int layer_slot,
-    int rows, int nranks, int myrank, cudaStream_t stream) {
+    const void* const* peer_ar, const void* epoch_dev,
+    const void* active_rows, int layer_slot, int rows, int nranks, int myrank,
+    cudaStream_t stream) {
   if (nranks != kRanks || myrank < 0 || myrank >= nranks || rows < 1 ||
       rows > kTokens || layer_slot < 0) {
     return (int)cudaErrorInvalidValue;
@@ -177,6 +196,7 @@ extern "C" int glm52_tp8_ar_launch_cuda(
     a.peer_ar[p] = (uint4*)peer_ar[p];
   }
   a.epoch_dev = (const unsigned long long*)epoch_dev;
+  a.active_rows = (const int*)active_rows;
   a.layer_slot = layer_slot;
   a.rows = rows;
   a.nranks = nranks;

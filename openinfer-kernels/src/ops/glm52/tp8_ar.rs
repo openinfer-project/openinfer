@@ -38,6 +38,9 @@ pub const fn glm52_tp8_ar_buffer_bytes(layer_slots: usize) -> usize {
 /// `myrank * GLM52_TP8_AR_CHUNK_PACKETS` packets (this rank's src slot).
 /// Shares the step epoch with the MoE chain:
 /// [`super::moe_tp8::glm52_moe_tp8_epoch_advance`] once per step.
+/// `active_rows` is the want-mask (device leading-active row count, staged
+/// identically on every rank): pad rows skip the wire and get zero-filled
+/// `out`. `None` = all `rows` active.
 #[allow(clippy::too_many_arguments)]
 pub fn glm52_tp8_ar_launch(
     ctx: &DeviceContext,
@@ -48,6 +51,7 @@ pub fn glm52_tp8_ar_launch(
     ar_local: u64,
     peer_ar: [u64; GLM52_TP8_RANKS],
     epoch_dev: &CudaSlice<u64>,
+    active_rows: Option<&CudaSlice<i32>>,
     myrank: usize,
 ) -> Result<()> {
     ensure!(myrank < GLM52_TP8_RANKS, "AR myrank {myrank} out of range");
@@ -70,6 +74,10 @@ pub fn glm52_tp8_ar_launch(
     let (partial_ptr, _g0) = partial.device_ptr(&ctx.stream);
     let (out_ptr, _g1) = out.device_ptr_mut(&ctx.stream);
     let (epoch_ptr, _g2) = epoch_dev.device_ptr(&ctx.stream);
+    let active_ptr = match active_rows {
+        Some(active) => active.device_ptr(&ctx.stream).0 as *const i32,
+        None => std::ptr::null(),
+    };
     let peer_ar: [*const std::ffi::c_void; GLM52_TP8_RANKS] =
         peer_ar.map(|p| p as *const std::ffi::c_void);
     unsafe {
@@ -79,6 +87,7 @@ pub fn glm52_tp8_ar_launch(
             ar_local as *mut std::ffi::c_void,
             peer_ar.as_ptr(),
             epoch_ptr as *const u64,
+            active_ptr,
             layer_slot as i32,
             rows as i32,
             GLM52_TP8_RANKS as i32,

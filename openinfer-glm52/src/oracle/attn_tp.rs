@@ -139,6 +139,7 @@ fn walk_positions(
                     *ar_local,
                     *peer_ar,
                     epoch_dev,
+                    None,
                     *rank,
                 )?;
                 ctx.stream.clone_dtoh(&reduced)?
