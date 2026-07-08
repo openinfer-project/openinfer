@@ -116,6 +116,93 @@ impl ProjWeight {
     }
 }
 
+impl ProjWeight {
+    /// n-side (output-row) shard: rows `[row_start, row_start + rows)` as a
+    /// fresh projection. Contiguous device copies. Both bounds must sit on
+    /// the 128-row scale-block grid — the per-block `weight_scale_inv` rows
+    /// travel with their weight rows (attention-TP head shards: q_b 8 heads
+    /// x 256 = 2048 rows, indexer wq_b 4 x 128 = 512, both aligned).
+    pub(crate) fn slice_rows(
+        &self,
+        ctx: &DeviceContext,
+        row_start: usize,
+        rows: usize,
+    ) -> Result<ProjWeight> {
+        ensure!(
+            row_start.is_multiple_of(FP8_BLOCK) && rows.is_multiple_of(FP8_BLOCK),
+            "GLM5.2 proj row slice [{row_start}, +{rows}) off the {FP8_BLOCK}-row scale grid"
+        );
+        ensure!(
+            row_start + rows <= self.n,
+            "GLM5.2 proj row slice [{row_start}, +{rows}) exceeds n {}",
+            self.n
+        );
+        let mut weight = ctx.stream.alloc_zeros::<u8>(rows * self.k)?;
+        ctx.stream.memcpy_dtod(
+            &self
+                .weight
+                .slice(row_start * self.k..(row_start + rows) * self.k),
+            &mut weight,
+        )?;
+        let scale_cols = self.k.div_ceil(FP8_BLOCK);
+        let mut scale = ctx
+            .stream
+            .alloc_zeros::<u8>((rows / FP8_BLOCK) * scale_cols * 4)?;
+        ctx.stream.memcpy_dtod(
+            &self.scale.slice(
+                (row_start / FP8_BLOCK) * scale_cols * 4
+                    ..((row_start + rows) / FP8_BLOCK) * scale_cols * 4,
+            ),
+            &mut scale,
+        )?;
+        ProjWeight::from_device(weight, scale, rows, self.k)
+    }
+
+    /// k-side (input-column) shard: columns `[col_start, col_start + cols)`
+    /// of every row (attention-TP o_proj, whose INPUT is head-major). The
+    /// gather is strided, so it bounces through the host once — load-time
+    /// only. Bounds must sit on the 128-column scale-block grid.
+    pub(crate) fn slice_cols(
+        &self,
+        ctx: &DeviceContext,
+        col_start: usize,
+        cols: usize,
+    ) -> Result<ProjWeight> {
+        ensure!(
+            col_start.is_multiple_of(FP8_BLOCK) && cols.is_multiple_of(FP8_BLOCK),
+            "GLM5.2 proj col slice [{col_start}, +{cols}) off the {FP8_BLOCK}-col scale grid"
+        );
+        ensure!(
+            col_start + cols <= self.k,
+            "GLM5.2 proj col slice [{col_start}, +{cols}) exceeds k {}",
+            self.k
+        );
+        let full_w = ctx.stream.clone_dtoh(&self.weight)?;
+        let mut w_host = vec![0u8; self.n * cols];
+        for row in 0..self.n {
+            w_host[row * cols..(row + 1) * cols].copy_from_slice(
+                &full_w[row * self.k + col_start..row * self.k + col_start + cols],
+            );
+        }
+        let full_s = ctx.stream.clone_dtoh(&self.scale)?;
+        let scale_rows = self.n.div_ceil(FP8_BLOCK);
+        let scale_cols = self.k.div_ceil(FP8_BLOCK);
+        let sliced_cols = cols / FP8_BLOCK;
+        let col_block = col_start / FP8_BLOCK;
+        let mut s_host = vec![0u8; scale_rows * sliced_cols * 4];
+        for row in 0..scale_rows {
+            let src = (row * scale_cols + col_block) * 4;
+            s_host[row * sliced_cols * 4..(row + 1) * sliced_cols * 4]
+                .copy_from_slice(&full_s[src..src + sliced_cols * 4]);
+        }
+        let mut weight = ctx.stream.alloc_zeros::<u8>(w_host.len())?;
+        ctx.stream.memcpy_htod(&w_host, &mut weight)?;
+        let mut scale = ctx.stream.alloc_zeros::<u8>(s_host.len())?;
+        ctx.stream.memcpy_htod(&s_host, &mut scale)?;
+        ProjWeight::from_device(weight, scale, self.n, cols)
+    }
+}
+
 /// Pack two fp8 projections that share the same input into one `[a.n + b.n, k]`
 /// projection (weight bytes and per-128-block scale rows concatenated along n).
 /// Requires `a.n` to be a multiple of 128 so `b`'s scale rows stay aligned to
@@ -290,4 +377,67 @@ pub(crate) fn fp8_mlp(
     let mut out = ctx.stream.alloc_zeros::<bf16>(down.n)?;
     fp8_mlp_into(ctx, gate_up, down, input, &mut s, &mut out)?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Byte-level geometry check for the attention-TP shard helpers: build a
+    /// projection whose every weight/scale byte encodes its own (row, col)
+    /// coordinate, slice, and compare against the host-computed reference.
+    #[test]
+    #[ignore = "requires a GPU"]
+    fn proj_slice_geometry() -> Result<()> {
+        let ctx = DeviceContext::new_with_device(0)?;
+        let (n, k) = (384, 256);
+        let weight: Vec<u8> = (0..n * k).map(|i| (i * 7 % 251) as u8).collect();
+        let scale_rows = n / FP8_BLOCK;
+        let scale_cols = k / FP8_BLOCK;
+        let scale: Vec<u8> = (0..scale_rows * scale_cols * 4)
+            .map(|i| (i * 13 % 241) as u8)
+            .collect();
+        let proj = ProjWeight::upload(
+            &ctx,
+            &Glm52ProjBytes {
+                weight: &weight,
+                scale: &scale,
+                n,
+                k,
+            },
+        )?;
+
+        // Rows [128, 384): weight rows + scale row-blocks 1..3 travel along.
+        let rows = proj.slice_rows(&ctx, FP8_BLOCK, 2 * FP8_BLOCK)?;
+        assert_eq!((rows.n, rows.k), (2 * FP8_BLOCK, k));
+        assert_eq!(
+            ctx.stream.clone_dtoh(&rows.weight)?,
+            weight[FP8_BLOCK * k..384 * k]
+        );
+        assert_eq!(
+            ctx.stream.clone_dtoh(&rows.scale)?,
+            scale[scale_cols * 4..3 * scale_cols * 4]
+        );
+
+        // Columns [128, 256): strided gather of every row's tail half.
+        let cols = proj.slice_cols(&ctx, FP8_BLOCK, FP8_BLOCK)?;
+        assert_eq!((cols.n, cols.k), (n, FP8_BLOCK));
+        let mut w_ref = Vec::with_capacity(n * FP8_BLOCK);
+        let mut s_ref = Vec::with_capacity(scale_rows * 4);
+        for row in 0..n {
+            w_ref.extend_from_slice(&weight[row * k + FP8_BLOCK..(row + 1) * k]);
+        }
+        for row in 0..scale_rows {
+            let src = (row * scale_cols + 1) * 4;
+            s_ref.extend_from_slice(&scale[src..src + 4]);
+        }
+        assert_eq!(ctx.stream.clone_dtoh(&cols.weight)?, w_ref);
+        assert_eq!(ctx.stream.clone_dtoh(&cols.scale)?, s_ref);
+
+        // Misaligned or out-of-range slices must refuse.
+        assert!(proj.slice_rows(&ctx, 64, FP8_BLOCK).is_err());
+        assert!(proj.slice_rows(&ctx, 0, n + FP8_BLOCK).is_err());
+        assert!(proj.slice_cols(&ctx, 64, FP8_BLOCK).is_err());
+        Ok(())
+    }
 }
