@@ -2,15 +2,13 @@
 ///
 /// Tests the Qwen3.5 reduced-capacity scheduler path (batch prefill +
 /// CUDA Graph decode) with sequential, concurrent, and consumer-drop requests.
-use std::collections::HashSet;
-use std::time::Instant;
+use std::{collections::HashSet, path::Path, time::Instant};
 
 use log::info;
 
-use openinfer_core::engine::FinishReason;
 use openinfer_core::engine::{
-    EngineHandle, EngineLoadOptions, GenerateRequest, TokenEvent, TokenLogprob, TokenSink,
-    TokenStreamReceiver,
+    EngineHandle, EngineLoadOptions, FinishReason, GenerateRequest, TokenEvent, TokenLogprob,
+    TokenSink, TokenStreamReceiver,
 };
 use openinfer_core::sampler::SamplingParams;
 use vllm_text::tokenizer::DynTokenizer;
@@ -321,33 +319,17 @@ fn assert_no_model_wide_collapse(collapses: &[(&str, Collapse)]) {
     }
 }
 
-#[test]
-fn test_e2e_qwen35_scheduler() {
+fn run_full_scheduler_e2e(
+    handle: &EngineHandle,
+    tokenizer: &DynTokenizer,
+    max_context_tokens: usize,
+    label: &str,
+) {
     // logging intentionally left to the test harness
-
-    let model_path = get_model_path();
-    let max_context_tokens = max_position_embeddings(&model_path);
-
-    info!("Loading Qwen3.5 model for scheduler test...");
-    let start = Instant::now();
-    let tokenizer = common::load_tokenizer(&model_path);
-    let handle = openinfer_qwen35_4b::start_engine(
-        std::path::Path::new(&model_path),
-        EngineLoadOptions {
-            enable_cuda_graph: true,
-            device_ordinals: vec![0],
-            seed: 42,
-            ..EngineLoadOptions::default()
-        },
-        8,
-        openinfer_qwen35_4b::DEFAULT_MAX_PREFILL_TOKENS,
-    )
-    .expect("Failed to start Qwen3.5 scheduler");
-    info!("scheduler loaded in {:.2?}", start.elapsed());
 
     // ── 0. Static context-window rejection ─────────────────────────────
     info!("=== Phase 0: Context-window rejection ===");
-    expect_context_window_rejection(&handle, max_context_tokens);
+    expect_context_window_rejection(handle, max_context_tokens);
     info!("  PASS: over-context request rejected before prefill");
 
     // ── 1. logprobs must not change greedy tokens ─────────────────────
@@ -355,9 +337,9 @@ fn test_e2e_qwen35_scheduler() {
     for case in CASES.iter().take(3) {
         let max_tokens = case.max_new_tokens.min(16);
         let no_logprobs =
-            generate_tokens_with_logprobs(&handle, &tokenizer, case.prompt, max_tokens, 0);
+            generate_tokens_with_logprobs(handle, tokenizer, case.prompt, max_tokens, 0);
         let with_logprobs =
-            generate_tokens_with_logprobs(&handle, &tokenizer, case.prompt, max_tokens, 1);
+            generate_tokens_with_logprobs(handle, tokenizer, case.prompt, max_tokens, 1);
         assert_eq!(no_logprobs.finish_reason, with_logprobs.finish_reason);
         assert_eq!(
             no_logprobs.tokens, with_logprobs.tokens,
@@ -392,7 +374,7 @@ fn test_e2e_qwen35_scheduler() {
         info!("--- {:?} ---", case.name);
         let start = Instant::now();
         let (tokens, finish_reason) =
-            generate_tokens(&handle, &tokenizer, case.prompt, case.max_new_tokens);
+            generate_tokens(handle, tokenizer, case.prompt, case.max_new_tokens);
         let elapsed = start.elapsed();
 
         let text = tokenizer.decode(&tokens, true).expect("decode failed");
@@ -419,7 +401,7 @@ fn test_e2e_qwen35_scheduler() {
     // ── 3. Multi-request (scheduler state reuse) ────────────────────────
     info!("=== Phase 3: Multi-request ===");
     for case in CASES {
-        let (tokens, _) = generate_tokens(&handle, &tokenizer, case.prompt, case.max_new_tokens);
+        let (tokens, _) = generate_tokens(handle, tokenizer, case.prompt, case.max_new_tokens);
         let text = tokenizer.decode(&tokens, true).expect("decode failed");
         assert!(
             !text.is_empty(),
@@ -539,10 +521,69 @@ fn test_e2e_qwen35_scheduler() {
     }
 
     // Verify scheduler survives
-    let (tokens, _) = generate_tokens(&handle, &tokenizer, "Hello", 5);
+    let (tokens, _) = generate_tokens(handle, tokenizer, "Hello", 5);
     let text = tokenizer.decode(&tokens, true).expect("decode failed");
     assert!(!text.is_empty(), "scheduler dead after consumer drop");
     info!("  PASS: scheduler survived consumer drop");
 
-    info!("All Qwen3.5 scheduler tests passed!");
+    info!("All Qwen3.5 scheduler tests passed for {label}!");
+}
+
+fn context_limit_for(handle: &EngineHandle, model_path: &str) -> usize {
+    handle
+        .servable_len()
+        .map(|len| len as usize)
+        .unwrap_or_else(|| max_position_embeddings(model_path))
+}
+
+#[test]
+fn test_e2e_qwen35_scheduler() {
+    let model_path = get_model_path();
+
+    info!("Loading Qwen3.5 model for scheduler test...");
+    let start = Instant::now();
+    let model =
+        openinfer_qwen35_4b::runtime::Qwen35Model::from_safetensors_with_options(&model_path, true)
+            .expect("Failed to load model");
+    let tokenizer = common::load_tokenizer(&model_path);
+    // Use reduced batch capacity (8) to fit on 16GB GPUs alongside the model.
+    let handle = openinfer_qwen35_4b::runtime::start_with_capacity(
+        model,
+        42,
+        8,
+        openinfer_qwen35_4b::DEFAULT_MAX_PREFILL_TOKENS,
+    )
+    .expect("Failed to start Qwen3.5 scheduler");
+    info!("scheduler loaded in {:.2?}", start.elapsed());
+
+    let max_context_tokens = context_limit_for(&handle, &model_path);
+    run_full_scheduler_e2e(&handle, &tokenizer, max_context_tokens, "TP1");
+}
+
+#[test]
+#[ignore = "requires two CUDA devices, NCCL, and Qwen3.5 weights"]
+fn test_e2e_qwen35_scheduler_tp2() {
+    let model_path = get_model_path();
+
+    info!("Loading Qwen3.5 TP2 model for scheduler test...");
+    let start = Instant::now();
+    let tokenizer = common::load_tokenizer(&model_path);
+    // TP Phase 1 is eager-only; CUDA Graph must stay disabled for multi-device startup.
+    let handle = openinfer_qwen35_4b::start_engine_with_capacity(
+        Path::new(&model_path),
+        EngineLoadOptions {
+            enable_cuda_graph: false,
+            enable_prefill_profile: false,
+            device_ordinals: common::tp2_device_ordinals(),
+            seed: 42,
+            ..EngineLoadOptions::default()
+        },
+        8,
+        openinfer_qwen35_4b::DEFAULT_MAX_PREFILL_TOKENS,
+    )
+    .expect("Failed to start Qwen3.5 TP2 scheduler");
+    info!("TP2 scheduler loaded in {:.2?}", start.elapsed());
+
+    let max_context_tokens = context_limit_for(&handle, &model_path);
+    run_full_scheduler_e2e(&handle, &tokenizer, max_context_tokens, "TP2");
 }

@@ -745,8 +745,7 @@ fn tune_if_nonempty(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct GatedQShardRange {
-    q_row_offset: usize,
-    gate_row_offset: usize,
+    row_offset: usize,
     rows: usize,
 }
 
@@ -754,11 +753,13 @@ fn full_attention_gated_q_shard_range(
     config: &Config35,
     tensor_parallel: TensorParallelConfig,
 ) -> GatedQShardRange {
-    let (q_row_offset, rows) = tensor_parallel.shard_range(config.full_attn_q_dim());
+    // HF/OpenInfer kernels interpret q_proj rows as per-head [q, gate] chunks.
+    // Keep each local head's q rows adjacent to its gate rows.
+    let local_heads = config.local_num_attention_heads(tensor_parallel);
+    let head_start = tensor_parallel.rank * local_heads;
     GatedQShardRange {
-        q_row_offset,
-        gate_row_offset: config.full_attn_q_dim() + q_row_offset,
-        rows,
+        row_offset: head_start * config.head_dim * 2,
+        rows: local_heads * config.head_dim * 2,
     }
 }
 
@@ -775,26 +776,7 @@ fn load_full_attention_gated_q_proj(
     }
 
     let range = full_attention_gated_q_shard_range(config, tensor_parallel);
-    let q_proj = load_tensor_2d_row_shard(
-        ctx,
-        shards,
-        weight_map,
-        name,
-        range.q_row_offset,
-        range.rows,
-    )?;
-    let gate_proj = load_tensor_2d_row_shard(
-        ctx,
-        shards,
-        weight_map,
-        name,
-        range.gate_row_offset,
-        range.rows,
-    )?;
-    let fused = DeviceMatrix::vstack(ctx, &[&q_proj, &gate_proj])?;
-    drop(q_proj);
-    drop(gate_proj);
-    Ok(fused)
+    load_tensor_2d_row_shard(ctx, shards, weight_map, name, range.row_offset, range.rows)
 }
 
 fn load_tensor_2d_row_shard_if_needed(
@@ -870,9 +852,8 @@ mod tests {
         assert_eq!(
             rank0,
             GatedQShardRange {
-                q_row_offset: 0,
-                gate_row_offset: 4096,
-                rows: 2048,
+                row_offset: 0,
+                rows: 4096,
             }
         );
 
@@ -886,9 +867,8 @@ mod tests {
         assert_eq!(
             rank1,
             GatedQShardRange {
-                q_row_offset: 2048,
-                gate_row_offset: 6144,
-                rows: 2048,
+                row_offset: 4096,
+                rows: 4096,
             }
         );
     }

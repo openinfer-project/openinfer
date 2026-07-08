@@ -17,10 +17,13 @@ use std::path::{Path, PathBuf};
 
 use openinfer_core::engine::TokenLogprob;
 use openinfer_qwen35_4b::runtime::{
-    DecodePlan, DecodeStepItem, PrefillPlan, PrefillStepItem, Qwen35Executor, RequestId,
+    DecodePlan, DecodeStepItem, PrefillPlan, PrefillStepItem, Qwen35Executor, Qwen35TpExecutor,
+    RequestId,
 };
 use safetensors::{Dtype, SafeTensors};
 use sha2::{Digest, Sha256};
+
+mod common;
 
 const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3.5-4B");
 const GOLDEN_ENV: &str = "OPENINFER_QWEN35_HF_GOLDEN";
@@ -514,6 +517,91 @@ fn run(g: &Golden, ex: &mut Qwen35Executor, seqs: &[usize], batched: bool) -> (S
     (stats, fingerprint)
 }
 
+fn run_tp(g: &Golden, ex: &Qwen35TpExecutor, seqs: &[usize], batched: bool) -> (Stats, Vec<f32>) {
+    let mut stats = Stats::default();
+    let mut fingerprint = Vec::new();
+    let mut fold = |stats: &mut Stats, seq, pos, pega: &[(u32, f32)]| {
+        fingerprint.push(pega[0].1);
+        check_position(stats, seq, pos, pega, &g.topk(seq, pos));
+    };
+
+    if batched {
+        let ids: Vec<RequestId> = seqs
+            .iter()
+            .map(|&seq| RequestId::new(10_000 + seq as u64))
+            .collect();
+        let items: Vec<PrefillStepItem> = seqs
+            .iter()
+            .zip(&ids)
+            .map(|(&seq, &id)| prefill_item(id, g.prompt(seq)))
+            .collect();
+        let pr = ex
+            .execute_prefill(PrefillPlan { requests: &items })
+            .expect("TP2 prefill");
+        for (i, &seq) in seqs.iter().enumerate() {
+            fold(
+                &mut stats,
+                seq,
+                0,
+                &top_logprobs(pr.requests[i].first_token_logprob.as_ref()),
+            );
+        }
+
+        for step in 0..g.decode_len {
+            let items: Vec<DecodeStepItem> = seqs
+                .iter()
+                .zip(&ids)
+                .map(|(&seq, &id)| decode_item(id, g.decode(seq, step)))
+                .collect();
+            let dr = ex
+                .execute_decode(DecodePlan { requests: &items })
+                .expect("TP2 decode");
+            for (i, &seq) in seqs.iter().enumerate() {
+                fold(
+                    &mut stats,
+                    seq,
+                    step + 1,
+                    &top_logprobs(dr.requests[i].logprob.as_ref()),
+                );
+            }
+        }
+
+        for &id in &ids {
+            ex.drop_request(id).expect("TP2 drop request");
+        }
+    } else {
+        for &seq in seqs {
+            let id = RequestId::new(20_000 + seq as u64);
+            let pr = ex
+                .execute_prefill(PrefillPlan {
+                    requests: &[prefill_item(id, g.prompt(seq))],
+                })
+                .expect("TP2 prefill");
+            fold(
+                &mut stats,
+                seq,
+                0,
+                &top_logprobs(pr.requests[0].first_token_logprob.as_ref()),
+            );
+            for step in 0..g.decode_len {
+                let dr = ex
+                    .execute_decode(DecodePlan {
+                        requests: &[decode_item(id, g.decode(seq, step))],
+                    })
+                    .expect("TP2 decode");
+                fold(
+                    &mut stats,
+                    seq,
+                    step + 1,
+                    &top_logprobs(dr.requests[0].logprob.as_ref()),
+                );
+            }
+            ex.drop_request(id).expect("TP2 drop request");
+        }
+    }
+    (stats, fingerprint)
+}
+
 fn prompt_lens_label(g: &Golden) -> String {
     (0..g.num_seqs)
         .map(|seq| format!("{seq}:{}", g.prompt_len(seq)))
@@ -658,6 +746,12 @@ fn build_executor(model_path: &str) -> Qwen35Executor {
         .expect("build Qwen3.5 logits executor")
 }
 
+fn build_tp2_executor(model_path: &str) -> Qwen35TpExecutor {
+    let devices = common::tp2_device_ordinals();
+    Qwen35TpExecutor::from_runtime_with_capacity(model_path, false, &devices, MAX_EXECUTOR_BATCH)
+        .expect("build Qwen3.5 TP2 logits executor")
+}
+
 #[test]
 fn pega_logprobs_match_hf_golden_within_qwen35_tolerance() {
     let Some(model_path) = model_path_or_skip() else {
@@ -742,5 +836,55 @@ fn pega_logprobs_match_hf_long_golden_within_qwen35_tolerance() {
     assert_eq!(
         fp1, fp2,
         "long sequential Qwen3.5 replay must reproduce identical logprobs"
+    );
+}
+
+#[test]
+#[ignore = "requires two CUDA devices, NCCL, and Qwen3.5 weights"]
+fn pega_logprobs_match_hf_golden_within_qwen35_tolerance_tp2() {
+    let Some(model_path) = model_path_or_skip() else {
+        return;
+    };
+    let golden = Golden::load();
+    if !check_fixture_metadata(&model_path, &golden.metadata) {
+        return;
+    }
+    report_fixture_shape(&golden);
+    let all: Vec<usize> = (0..golden.num_seqs).collect();
+
+    let ex = build_tp2_executor(&model_path);
+    let (stats, fp1) = run_tp(&golden, &ex, &all, false);
+    report_and_assert("TP2 sequential eager", &stats);
+    let (_, fp2) = run_tp(&golden, &ex, &all, false);
+    assert_eq!(
+        fp1, fp2,
+        "TP2 sequential Qwen3.5 replay must reproduce identical logprobs"
+    );
+
+    let batched_n = all.len().min(MAX_EXECUTOR_BATCH);
+    let (batched, _) = run_tp(&golden, &ex, &all[..batched_n], true);
+    report_and_assert("TP2 batched eager", &batched);
+}
+
+#[test]
+#[ignore = "requires two CUDA devices, NCCL, and Qwen3.5 weights"]
+fn pega_logprobs_match_hf_long_golden_within_qwen35_tolerance_tp2() {
+    let Some(model_path) = model_path_or_skip() else {
+        return;
+    };
+    let golden = Golden::load_path(LONG_GOLDEN);
+    if !check_fixture_metadata(&model_path, &golden.metadata) {
+        return;
+    }
+    report_fixture_shape(&golden);
+    let all: Vec<usize> = (0..golden.num_seqs).collect();
+
+    let ex = build_tp2_executor(&model_path);
+    let (stats, fp1) = run_tp(&golden, &ex, &all, false);
+    report_and_assert("TP2 long sequential eager", &stats);
+    let (_, fp2) = run_tp(&golden, &ex, &all, false);
+    assert_eq!(
+        fp1, fp2,
+        "TP2 long sequential Qwen3.5 replay must reproduce identical logprobs"
     );
 }
