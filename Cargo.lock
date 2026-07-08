@@ -3317,14 +3317,17 @@ dependencies = [
  "openinfer-core",
  "openinfer-kernels",
  "openinfer-sample",
+ "openinfer-vllm-frontend",
  "openinfer-vllm-support",
  "rand 0.10.1",
+ "reqwest",
  "safetensors",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "tempfile",
  "tokio",
+ "tokio-util",
  "vllm-text",
 ]
 

@@ -21,9 +21,13 @@ tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]
 criterion = { workspace = true }
+openinfer-vllm-frontend = { workspace = true }
 openinfer-vllm-support = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tokio-util = { workspace = true }
 vllm-text = { workspace = true }
 
 [features]
@@ -47,6 +51,10 @@ required-features = ["qwen35-4b"]
 
 [[test]]
 name = "chunked_prefill"
+required-features = ["qwen35-4b"]
+
+[[test]]
+name = "serving_tp2"
 required-features = ["qwen35-4b"]
 
 [[bench]]

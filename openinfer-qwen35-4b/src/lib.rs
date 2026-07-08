@@ -26,7 +26,7 @@ mod weights;
 use std::path::Path;
 
 use anyhow::{Result, anyhow};
-use openinfer_core::engine::{EngineHandle, EngineLoadOptions};
+use openinfer_core::engine::{EngineHandle, EngineLoadOptions, EpBackend};
 
 pub use kernel_plan::kernel_plan;
 pub use scheduler::DEFAULT_MAX_PREFILL_TOKENS;
@@ -53,8 +53,69 @@ pub mod runtime_ops {
     };
 }
 
-/// `max_batch` must be a decode bucket ({1,2,4,8,16,32,64}).
-pub fn start_engine(
+pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<EngineHandle> {
+    start_engine_with_capacity(
+        model_path,
+        options,
+        batch_decode_graph::MAX_BATCH,
+        DEFAULT_MAX_PREFILL_TOKENS,
+    )
+}
+
+#[derive(Clone, Debug)]
+pub struct Qwen35LaunchOptions {
+    /// CUDA device for single-GPU loads (ignored when `tp_size > 1`).
+    pub device_ordinal: usize,
+    /// Tensor-parallel world size; `> 1` uses devices `0..tp_size`.
+    pub tp_size: usize,
+    /// TP Phase 1 supports eager-only multi-GPU execution.
+    pub cuda_graph: bool,
+    pub max_prefill_tokens: usize,
+}
+
+/// Start the Qwen3.5 engine for the server. TP Phase 1 supports eager-only
+/// multi-GPU execution; single-GPU keeps the existing CUDA Graph-capable path.
+pub fn launch(
+    model_path: &Path,
+    device_ordinal: usize,
+    cuda_graph: bool,
+    max_prefill_tokens: usize,
+) -> Result<EngineHandle> {
+    launch_with_options(
+        model_path,
+        Qwen35LaunchOptions {
+            device_ordinal,
+            tp_size: 1,
+            cuda_graph,
+            max_prefill_tokens,
+        },
+    )
+}
+
+pub fn launch_with_options(
+    model_path: &Path,
+    options: Qwen35LaunchOptions,
+) -> Result<EngineHandle> {
+    let device_ordinals = if options.tp_size == 1 {
+        vec![options.device_ordinal]
+    } else {
+        (0..options.tp_size).collect()
+    };
+    start_engine_with_capacity(
+        model_path,
+        EngineLoadOptions {
+            enable_cuda_graph: options.cuda_graph,
+            device_ordinals,
+            parallel_config: None,
+            ep_backend: EpBackend::Nccl,
+            seed: 42,
+        },
+        batch_decode_graph::MAX_BATCH,
+        options.max_prefill_tokens,
+    )
+}
+
+pub fn start_engine_with_capacity(
     model_path: &Path,
     options: EngineLoadOptions,
     max_batch: usize,
