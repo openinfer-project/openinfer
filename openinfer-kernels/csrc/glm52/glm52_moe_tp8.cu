@@ -37,6 +37,8 @@
 #include <cstdint>
 #include <mutex>
 
+#include "glm52_tp8_ll.cuh"
+
 namespace {
 
 constexpr int kHidden = 6144;
@@ -57,35 +59,13 @@ static_assert(kHidden % (kKsplitB * 128) == 0, "w13 kslice must be 128-aligned")
 constexpr int kAgDataPackets = kHidden / 4;
 constexpr int kAgPackets = kAgDataPackets + 6;
 
-// LL packet contract: the tag rides in the 4th word of one 16 B aligned
-// vector store, and readers treat tag-match as "payload words are valid".
-// PTX only guarantees PER-ELEMENT atomicity for vector accesses; the
-// tag-guards-payload protocol additionally assumes the interconnect delivers
-// an aligned 16 B write as one observable unit. That holds on NVLink (the
-// same assumption NCCL's LL128 protocol makes — NCCL disables LL128 on PCIe
-// paths for exactly this reason) and is enforced at buffer alloc time via
-// CU_DEVICE_P2P_ATTRIBUTE_NATIVE_ATOMIC_SUPPORTED (the NVLink-vs-PCIe
-// discriminator): see glm52_moe_tp8_alloc_ll_cuda. On an unprobed PCIe P2P
-// topology a torn packet would be SILENT data corruption.
+// LL packet primitives + the 16 B atomicity contract live in
+// glm52_tp8_ll.cuh (shared with the attention allreduce kernels).
 __device__ __forceinline__ void st_ll(uint4* p, uint2 v, unsigned tag) {
-  asm volatile("st.volatile.global.v4.b32 [%0],{%1,%2,%3,%4};" ::"l"(p),
-                   "r"(v.x), "r"(v.y), "r"(0u), "r"(tag));
-}
-__device__ __forceinline__ uint4 ld_ll(const uint4* p) {
-  uint4 q;
-  asm volatile("ld.volatile.global.v4.b32 {%0,%1,%2,%3},[%4];"
-               : "=r"(q.x), "=r"(q.y), "=r"(q.z), "=r"(q.w)
-               : "l"(p));
-  return q;
+  glm52_tp8_st_ll(p, v, tag);
 }
 __device__ __forceinline__ void ll_wait(const uint4* p, unsigned tag, uint4* out) {
-  uint4 q;
-  long c = 0;
-  do {
-    q = ld_ll(p);
-    if (++c > 200000000L) __trap();
-  } while (q.w != tag);
-  *out = q;
+  glm52_tp8_ll_wait(p, tag, out);
 }
 
 // Phase ordering is kernel boundaries, deliberately: the layer runs as a

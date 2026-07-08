@@ -22,3 +22,4 @@ mod layer;
 mod layer_ep8;
 mod layer_tp8;
 mod mla;
+mod tp8_ar;

@@ -12,6 +12,7 @@ mod moe_route;
 mod moe_tp8;
 mod router;
 mod topk;
+mod tp8_ar;
 mod trtllm_grouped;
 
 pub use decode_feed::*;
@@ -28,4 +29,5 @@ pub use moe_route::*;
 pub use moe_tp8::*;
 pub use router::*;
 pub use topk::*;
+pub use tp8_ar::*;
 pub use trtllm_grouped::*;

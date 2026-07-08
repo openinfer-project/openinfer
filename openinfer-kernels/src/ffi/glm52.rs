@@ -344,4 +344,18 @@ unsafe extern "C" {
         epoch_dev: *mut std::ffi::c_void,
         stream: CUstream,
     ) -> CUresult;
+
+    // --- TP8 attention allreduce: o_proj/dense-down epilogue collective -----
+    pub fn glm52_tp8_ar_launch_cuda(
+        partial: *const Half,
+        out: *mut Half,
+        ar_local: *mut std::ffi::c_void,
+        peer_ar: *const *const std::ffi::c_void,
+        epoch_dev: *const u64,
+        layer_slot: i32,
+        rows: i32,
+        nranks: i32,
+        myrank: i32,
+        stream: CUstream,
+    ) -> CUresult;
 }
