@@ -1,6 +1,6 @@
 # GLM5.2 Serving Status & Remaining Work
 
-> **TL;DR:** Decode serving is feature-complete for its scope (whole-step graph buckets, DSpark speculation, paged KV + prefix cache, VRAM-derived max_model_len); sampling surface frozen at `temperature/top_p/top_k/min_p/seed`. Next up: pegaflow host-tier offload (M1 of `pegaflow-offload-pd.md`), then cross-engine P/D.
+> **TL;DR:** Decode serving is feature-complete for its scope (whole-step graph buckets, DSpark speculation, paged KV + prefix cache, VRAM-derived max_model_len, pegaflow host-tier offload behind `--kv-offload`); sampling surface frozen at `temperature/top_p/top_k/min_p/seed`. Low-latency arc: `--moe-topo tp8` (#609) + span MTP (#610) + attention-TP with replicated activations (`feat/glm52-attn-tp`, solo 13.75 ms / MTP code 221 tok/s — see `moe-tp8-low-latency.md`). Next up: pegaflow M2 cross-engine P/D.
 >
 > **Last touched:** 2026-07
 

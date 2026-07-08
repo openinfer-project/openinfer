@@ -18,7 +18,11 @@
 > TP8 layer oracle gate green** — landing within 0.1 ms of the 15.4 arithmetic
 > prediction. EP8 is *not* deleted: expert sharding is
 > chosen at load time (weights are repacked during H2D anyway), so EP8 remains the
-> high-throughput launch configuration while TP8 becomes the low-latency one. Inspired by
+> high-throughput launch configuration while TP8 becomes the low-latency one.
+> **M4 attention-TP (replicated activations over 8-head shards + o_proj LL allreduce
+> + pad want-mask) measured 2026-07-08: solo plain 15.27 → 13.75 ms (−10%), MTP code
+> 189 → 221 tok/s (+17%), MTP text lossless; c8 diverse regresses 20.6 → 22.7 ms
+> (KV-replication trade, still beats EP8's 24.6).** Inspired by
 > the latency-first executor design of TileRT (persistent kernels, communication as graph
 > nodes, no NCCL in the hot path); everything here is measured and implemented
 > independently in this repo.
@@ -252,10 +256,59 @@ Lever ranking this data supports: **M4 attention-TP first** — the FP8 GEMV blo
 (~30%) plus MLA core (~14%) is the round's non-MoE majority and both split 8-way;
 draft-side work (adaptive span, draft-step host gaps) is capped at ~10% of the round.
 
+## Attention-TP: replicated activations over head-sharded weights (M4)
+
+`feat/glm52-attn-tp` extends the TP topology from the MoE to the whole layer:
+q_b/kv_b/o_proj/indexer-q are head-sharded ×8 (8 heads/rank; W_UK/UV batch 64→8,
+o_proj input columns split), and instead of gathering activations, **every rank
+redundantly computes ALL bucket rows** — bit-identical across ranks, so the only
+wire traffic is two per-layer partial-sum collectives: the o_proj epilogue rides a
+new two-shot LL allreduce (`glm52_tp8_ar.cu`, 7.7 µs/layer graph-replayed), and the
+MoE RS becomes an all-reduce (push broadcasts every row to every rank). The AG phase
+— and with it the span/owner concept — is deleted: the scheduler runs one logical
+rank with eight mirrored executors (outputs asserted bit-identical at join), serving
+a single bucket-8 shape.
+
+FlashMLA stays untouched: `splitkv_mla.cuh` asserts `h_q % 64 == 0`, so query/latent
+keep the 64-wide layout with the 8 real heads in slots 0..8 and zero-query pads
+(zero query → uniform softmax → finite latent, discarded). The MLA kernel itself
+does not get cheaper from head sharding — and each rank now reads every request's
+KV (replicated latent), which is the structural cost at high concurrency (below).
+
+**Pad rows ride a device want-mask** (`active_rows`, staged per step like the
+epoch; actives are a bucket prefix by plan construction): pads are excluded from
+the expert union (solo union 17→9 entries — the B/C GEMMs nearly halve), skip both
+LL collectives entirely, and get zero-filled outputs. Zero is the pre-capture shape
+(push nothing, wait on nothing — capture pairs trivially).
+
+**Measured (jz-38 8×H200, same day, same client, branch f8677a8 vs main 2669bb6):**
+
+| workload | main tp8 | attn-TP | Δ |
+|---|---|---|---|
+| solo plain ITL p50 (p99) | 15.27 ms (15.38) | **13.75 ms** (13.85) | **−10%** |
+| solo MTP code tok/s ×2 | 186.1 / 188.6 | 197.3 / **220.9** | **+17%** |
+| solo MTP prose tok/s ×2 | 108.5 / 108.6 | 118.8 / 119.5 | **+10%** |
+| c8 diverse ITL p50 | 20.56 / 20.58 | 22.65 / 22.68 | **+10% (regression)** |
+| EP8+MTP code (regression) | 131–134 (historical) | 132.4 / 134.4 | untouched |
+
+The c8 regression is the structural trade: the old mapping attended 1 row × 64
+heads per rank against its own request's KV; replicated activations attend 8 rows
+× 8 heads (same head-row product) against **all eight requests' KV** (8× KV bytes
+per rank), plus the AR wire. Attention-TP still beats EP8 at c8 (22.7 vs 24.6 ms)
+and tp8 remains the ≤8-concurrency low-latency mode — but at c8 the pre-M4 tp8 was
+faster. Correctness: plain DET ×2, MTP DET, **MTP text byte-identical to plain**
+(the lossless contract end-to-end through 78 sharded layers + AR + replicated MoE),
+cross-rank bitwise identity in the twin/layer/AR oracle gates.
+
+Solo per-step attribution (node-traced, both sides equally inflated): GEMV family
+5158→3342 µs (the shard saving, realized), dense nvjet −516, AG deleted −730,
+versus flash MLA +1155 (the KV-replication tax), rs broadcast and AR wire mostly
+reclaimed by the want-mask. Net −1.5 ms/step solo.
+
 ## Next action
 
-TP8+MTP measured, gated, merged (PR #610). Next levers, in order of expected value
-(profile section above): **M4 attention-TP** (q/o head split ×8, MLA latent has no
-head dimension so the latent KV replicates; o_proj allreduce reuses the LL machinery —
-targets the ~44% FP8-GEMV + MLA share of the verify graph), M3 bucket decision for
-multi-user (masked grouped GEMM on TP slices at m=16/32/64), adaptive span.
+Attention-TP measured and gated (table above); single PR for `feat/glm52-attn-tp`.
+Remaining levers: the **flash MLA sharding tax** (+1.2 ms/step — each rank reads
+the full KV for 1/8 of the heads; unexplored: KV segmenting or head-group
+reordering), M3 bucket decision for multi-user (masked grouped GEMM on TP slices
+at m=16/32/64), adaptive span, tree drafts.
