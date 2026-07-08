@@ -1,9 +1,11 @@
-//! GLM5.2 bucket-1 TP8 MoE: one cooperative kernel per layer (gate/up + SiLU +
-//! down + LL reduce-scatter) over 1/8-intermediate slices of all 257 experts
-//! (shared expert folded in at bank index 256). Routing stays on the production
-//! router — the kernel consumes its (idx, prob) output, so expert selection is
-//! byte-identical to the EP8 path. See `csrc/glm52/glm52_moe_tp8.cu` and
-//! `docs/models/glm52/moe-tp8-low-latency.md`.
+//! GLM5.2 TP8 MoE: one phase-kernel chain per layer (union + gate/up + SiLU +
+//! down + LL all-reduce) over 1/8-intermediate slices of all 257 experts
+//! (shared expert folded in at bank index 256), with replicated activations —
+//! every rank passes all 8 rows' normed2/topk locally and receives all 8
+//! reduced rows back, bit-identical across ranks. Routing stays on the
+//! production router — the kernel consumes its (idx, prob) output, so expert
+//! selection is byte-identical to the EP8 path. See
+//! `csrc/glm52/glm52_moe_tp8.cu` and `docs/models/glm52/moe-tp8-low-latency.md`.
 
 use anyhow::{Result, anyhow, ensure};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
@@ -23,24 +25,15 @@ pub const GLM52_TP8_SLICE_ROWS: usize = 512;
 pub const GLM52_TP8_SLICE_I: usize = 256;
 /// Worst-case active-expert union: 8 tokens x (topk + shared).
 pub const GLM52_TP8_UNION_MAX: usize = GLM52_TP8_RANKS * (GLM52_TP8_TOPK + 1);
-/// Rows per TP8 layer step (= kTokens in the kernel): 8 in both mappings —
-/// dp8 gathers 1 row from each rank, span mode gathers 8 rows from the owner.
+/// Rows per TP8 layer step (= kTokens in the kernel): every rank passes all
+/// 8 global rows (replicated activations).
 pub const GLM52_TP8_TOKENS: usize = 8;
 /// gate/up k-split factor (kernel-side kKsplitB).
 pub const GLM52_TP8_KSPLIT_B: usize = 16;
-/// LL allgather packets per rank: H/4 data + 2 idx + 4 prob (16 B each).
-pub const GLM52_TP8_AG_PACKETS: usize = GLM52_TP8_HIDDEN / 4 + 6;
-
-/// LL allgather buffer length in u128 packets (parity-double-buffered).
-/// One layer slot's AG region (parity x src x packets); the buffer holds
-/// `slots` consecutive regions (tag = step epoch is shared by all layers of
-/// a step, so each layer needs its own region for parity to alternate).
-pub const GLM52_TP8_AG_SLOT_PACKETS: usize = 2 * GLM52_TP8_RANKS * GLM52_TP8_AG_PACKETS;
-/// LL reduce-scatter buffer length in u128 packets (parity-double-buffered).
-/// One layer slot's RS region (parity x row x src x hidden packets). The row
-/// dimension exists for span mode (all 8 rows' partials land on one owner
-/// rank); dp8 mode uses only the row == own-rank stripe. One layout for both
-/// mappings — no mode-dependent addressing.
+/// LL all-reduce buffer length in u128 packets (parity-double-buffered).
+/// One layer slot's region (parity x row x src x hidden packets) — the wire
+/// layout of the former reduce-scatter, now written by every rank for every
+/// row (the push broadcasts) and reduced by every rank for every row.
 pub const GLM52_TP8_RS_SLOT_PACKETS: usize =
     2 * GLM52_TP8_TOKENS * GLM52_TP8_RANKS * GLM52_TP8_HIDDEN;
 
@@ -145,9 +138,6 @@ pub fn glm52_moe_tp8_max_blocks() -> Result<usize> {
 /// reallocated); `peer_ag`/`peer_rs` are the 8 ranks' LL buffer device
 /// addresses, each pre-offset to THIS rank's slot.
 pub struct Glm52MoeTp8Buffers<'a> {
-    pub xg: &'a mut CudaSlice<bf16>,
-    pub topk_all_idx: &'a mut CudaSlice<i32>,
-    pub topk_all_prob: &'a mut CudaSlice<f32>,
     pub guidx: &'a mut CudaSlice<i32>,
     pub guprob: &'a mut CudaSlice<f32>,
     pub gucnt: &'a mut CudaSlice<i32>,
@@ -155,45 +145,25 @@ pub struct Glm52MoeTp8Buffers<'a> {
     pub bpart: &'a mut CudaSlice<f32>,
     pub ug: &'a mut CudaSlice<bf16>,
     pub cpart: &'a mut CudaSlice<f32>,
-    /// Own LL buffers (`Glm52Tp8LlBuffer` addresses; AG sized
-    /// slots x `GLM52_TP8_AG_SLOT_PACKETS`, RS slots x
-    /// `GLM52_TP8_RS_SLOT_PACKETS`, x 16 B).
-    pub ag_local: u64,
+    /// Own LL buffer (`Glm52Tp8LlBuffer` address; sized
+    /// slots x `GLM52_TP8_RS_SLOT_PACKETS` x 16 B).
     pub rs_local: u64,
-    pub peer_ag: [u64; GLM52_TP8_RANKS],
     pub peer_rs: [u64; GLM52_TP8_RANKS],
     pub epoch_dev: &'a mut CudaSlice<u64>,
 }
 
-/// Row-to-owner mapping of one TP8 layer step (always 8 rows through the
-/// compute phases; only where rows come from and where results go differs).
-/// The owner lives IN the variant so a span launch without a staged owner
-/// (or a dp8 launch with one) is unrepresentable.
-#[derive(Clone, Copy, Debug)]
-pub enum Glm52Tp8RowMap<'a> {
-    /// Row i is rank i's token (bucket-1 c8): `normed2`/`topk_*`/`mlp_out`
-    /// hold this rank's single row.
-    Dp8,
-    /// All 8 rows belong to one owner rank (1 committed + 7 speculative
-    /// drafts). The owner id is read from device memory (staged by the host
-    /// before replay — like the epoch), so one captured span graph serves
-    /// any owner. EVERY rank passes 8-row `normed2`/`topk_*`/`mlp_out`; the
-    /// kernels read the inputs only on the owner, and non-owners zero-fill
-    /// their pad `mlp_out`.
-    Span { owner_dev: &'a CudaSlice<i32> },
-}
-
-/// Launch one layer's TP8 MoE phase-kernel chain. `topk_idx`/`topk_prob` are
-/// the production router's output for the rows this rank owns under
-/// `row_map`; `mlp_out` receives routed + shared (no residual), like the EP8
-/// arm's combined-plus-shared sum. `layer_slot` selects this layer's LL
-/// buffer region; the step epoch must have been advanced once this step via
-/// [`glm52_moe_tp8_epoch_advance`].
+/// Launch one layer's TP8 MoE phase-kernel chain. Every rank passes ALL
+/// `GLM52_TP8_TOKENS` rows of `normed2`/`topk_*` (replicated activations —
+/// they must be bit-identical across ranks: the closing all-reduce mixes
+/// each rank's expert-slice partials computed from its LOCAL rows) and
+/// `mlp_out` receives all rows of routed + shared (no residual), like the
+/// EP8 arm's combined-plus-shared sum — bit-identical across ranks.
+/// `layer_slot` selects this layer's LL buffer region; the step epoch must
+/// have been advanced once this step via [`glm52_moe_tp8_epoch_advance`].
 #[allow(clippy::too_many_arguments)]
 pub fn glm52_moe_tp8_layer_launch(
     ctx: &DeviceContext,
     layer_slot: usize,
-    row_map: Glm52Tp8RowMap<'_>,
     normed2: &CudaSlice<bf16>,
     topk_idx: &CudaSlice<i32>,
     topk_prob: &CudaSlice<f32>,
@@ -209,18 +179,10 @@ pub fn glm52_moe_tp8_layer_launch(
     const H: usize = GLM52_TP8_HIDDEN;
     const E: usize = GLM52_TP8_BANK_EXPERTS;
     ensure!(myrank < GLM52_TP8_RANKS, "TP8 myrank {myrank} out of range");
-    // Any rank can be the (device-staged) owner in span mode, so every rank
-    // must pass full 8-row buffers there; dp8 rows are single.
-    let rows = match row_map {
-        Glm52Tp8RowMap::Dp8 => 1,
-        Glm52Tp8RowMap::Span { owner_dev } => {
-            ensure!(!owner_dev.is_empty(), "TP8 span owner_dev is empty");
-            GLM52_TP8_TOKENS
-        }
-    };
+    let rows = GLM52_TP8_TOKENS;
     ensure!(
         normed2.len() >= rows * H && mlp_out.len() >= rows * H,
-        "TP8 hidden buffers too small for {row_map:?}: normed2 {}, mlp_out {}",
+        "TP8 hidden buffers too small: normed2 {}, mlp_out {}",
         normed2.len(),
         mlp_out.len()
     );
@@ -242,10 +204,7 @@ pub fn glm52_moe_tp8_layer_launch(
         w2_scale.len()
     );
     ensure!(
-        bufs.xg.len() >= GLM52_TP8_RANKS * H
-            && bufs.topk_all_idx.len() >= GLM52_TP8_RANKS * GLM52_TP8_TOPK
-            && bufs.topk_all_prob.len() >= GLM52_TP8_RANKS * GLM52_TP8_TOPK
-            && bufs.guidx.len() >= GLM52_TP8_UNION_MAX
+        bufs.guidx.len() >= GLM52_TP8_UNION_MAX
             && bufs.guprob.len() >= GLM52_TP8_UNION_MAX * GLM52_TP8_RANKS
             && !bufs.gucnt.is_empty()
             && bufs.gused.len() >= 256
@@ -257,10 +216,7 @@ pub fn glm52_moe_tp8_layer_launch(
     );
     ensure!(grid_blocks > 0, "TP8 grid_blocks must be positive");
     ensure!(
-        bufs.ag_local != 0
-            && bufs.rs_local != 0
-            && bufs.peer_ag.iter().all(|&p| p != 0)
-            && bufs.peer_rs.iter().all(|&p| p != 0),
+        bufs.rs_local != 0 && bufs.peer_rs.iter().all(|&p| p != 0),
         "TP8 LL pointers not wired"
     );
 
@@ -272,9 +228,6 @@ pub fn glm52_moe_tp8_layer_launch(
     let (w2_ptr, _g5) = w2.device_ptr(&ctx.stream);
     let (w2s_ptr, _g6) = w2_scale.device_ptr(&ctx.stream);
     let (out_ptr, _g7) = mlp_out.device_ptr_mut(&ctx.stream);
-    let (xg_ptr, _g8) = bufs.xg.device_ptr_mut(&ctx.stream);
-    let (tai_ptr, _g9) = bufs.topk_all_idx.device_ptr_mut(&ctx.stream);
-    let (tap_ptr, _g10) = bufs.topk_all_prob.device_ptr_mut(&ctx.stream);
     let (guidx_ptr, _g11) = bufs.guidx.device_ptr_mut(&ctx.stream);
     let (guprob_ptr, _g12) = bufs.guprob.device_ptr_mut(&ctx.stream);
     let (gucnt_ptr, _g13) = bufs.gucnt.device_ptr_mut(&ctx.stream);
@@ -283,15 +236,6 @@ pub fn glm52_moe_tp8_layer_launch(
     let (ug_ptr, _g16) = bufs.ug.device_ptr_mut(&ctx.stream);
     let (cpart_ptr, _g17) = bufs.cpart.device_ptr_mut(&ctx.stream);
     let (epoch_ptr, _g20) = bufs.epoch_dev.device_ptr_mut(&ctx.stream);
-    let owner_dev_guard = match row_map {
-        Glm52Tp8RowMap::Dp8 => None,
-        Glm52Tp8RowMap::Span { owner_dev } => Some(owner_dev.device_ptr(&ctx.stream)),
-    };
-    let owner_dev_ptr: *const i32 = owner_dev_guard
-        .as_ref()
-        .map_or(std::ptr::null(), |(p, _)| *p as *const i32);
-    let peer_ag: [*const std::ffi::c_void; GLM52_TP8_RANKS] =
-        bufs.peer_ag.map(|p| p as *const std::ffi::c_void);
     let peer_rs: [*const std::ffi::c_void; GLM52_TP8_RANKS] =
         bufs.peer_rs.map(|p| p as *const std::ffi::c_void);
     unsafe {
@@ -304,9 +248,6 @@ pub fn glm52_moe_tp8_layer_launch(
             w2_ptr as *const u8,
             w2s_ptr as *const f32,
             out_ptr as *mut ffi::Half,
-            xg_ptr as *mut ffi::Half,
-            tai_ptr as *mut i32,
-            tap_ptr as *mut f32,
             guidx_ptr as *mut i32,
             guprob_ptr as *mut f32,
             gucnt_ptr as *mut i32,
@@ -314,15 +255,12 @@ pub fn glm52_moe_tp8_layer_launch(
             bpart_ptr as *mut f32,
             ug_ptr as *mut ffi::Half,
             cpart_ptr as *mut f32,
-            bufs.ag_local as *mut std::ffi::c_void,
             bufs.rs_local as *mut std::ffi::c_void,
-            peer_ag.as_ptr(),
             peer_rs.as_ptr(),
             epoch_ptr as *mut u64,
             layer_slot as i32,
             GLM52_TP8_RANKS as i32,
             myrank as i32,
-            owner_dev_ptr,
             grid_blocks as i32,
             ctx.stream.cu_stream(),
         )
