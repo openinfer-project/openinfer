@@ -608,24 +608,31 @@ CUresult consume_last_cuda_error() {
 
 // BI=32 (~103 KB) needs Hopper's smem opt-in and co-resides 2 CTAs/SM;
 // BI=16 (~66 KB) fits the 99 KB consumer-part ceiling for the local dev loop.
+// cudaFuncSetAttribute is per-device state: under TP8 every rank thread must
+// opt in on its own device (a process-wide once here left 7 of 8 ranks
+// launching 103 KB without the opt-in -> CUDA_ERROR_INVALID_VALUE).
 template <int BI>
 bool enable_main_smem() {
-  static std::once_flag once;
-  static bool ok = false;
-  std::call_once(once, [] {
-    int device = 0;
-    if (cudaGetDevice(&device) != cudaSuccess) return;
+  static std::mutex mu;
+  static signed char state[64] = {};  // per device: 0 unknown, 1 ok, -1 no
+  int device = 0;
+  if (cudaGetDevice(&device) != cudaSuccess || device < 0 || device >= 64) {
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(mu);
+  if (state[device] == 0) {
     int optin = 0;
-    if (cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin,
-                               device) != cudaSuccess) {
-      return;
-    }
-    if (optin < MainSmem<BI>::kBytes) return;
-    ok = cudaFuncSetAttribute(glm52_sparse_mla_main_kernel<BI>,
-                              cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              MainSmem<BI>::kBytes) == cudaSuccess;
-  });
-  return ok;
+    const bool ok =
+        cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                               device) == cudaSuccess &&
+        optin >= MainSmem<BI>::kBytes &&
+        cudaFuncSetAttribute(glm52_sparse_mla_main_kernel<BI>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             MainSmem<BI>::kBytes) == cudaSuccess;
+    state[device] = ok ? 1 : -1;
+    cudaGetLastError();  // clear any sticky-free probe error
+  }
+  return state[device] == 1;
 }
 
 template <int BI>
