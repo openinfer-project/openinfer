@@ -57,6 +57,63 @@ fn crate_root() -> PathBuf {
     PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"))
 }
 
+fn ensure_git_submodules_initialized(repo_root: &Path) {
+    if !repo_root.join(".git").exists() || !repo_root.join(".gitmodules").is_file() {
+        return;
+    }
+
+    println!(
+        "cargo:rerun-if-changed={}",
+        repo_root.join(".gitmodules").display()
+    );
+
+    let output = Command::new("git")
+        .args(["submodule", "status", "--recursive"])
+        .current_dir(repo_root)
+        .output()
+        .unwrap_or_else(|err| {
+            panic!(
+                "Failed to inspect git submodules from {}: {err}. \
+                 Install git or run `git submodule update --init --recursive` manually.",
+                repo_root.display()
+            )
+        });
+    assert!(
+        output.status.success(),
+        "Failed to inspect git submodules from {}. stdout: {} stderr: {}",
+        repo_root.display(),
+        String::from_utf8_lossy(&output.stdout).trim(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+
+    if !String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|line| line.starts_with('-'))
+    {
+        return;
+    }
+
+    println!("cargo:warning=Initializing missing git submodules for first build");
+    let output = Command::new("git")
+        .args(["submodule", "update", "--init", "--recursive"])
+        .current_dir(repo_root)
+        .output()
+        .unwrap_or_else(|err| {
+            panic!(
+                "Failed to initialize git submodules from {}: {err}. \
+                 Run `git submodule update --init --recursive` manually.",
+                repo_root.display()
+            )
+        });
+    assert!(
+        output.status.success(),
+        "Failed to initialize git submodules from {}. stdout: {} stderr: {}",
+        repo_root.display(),
+        String::from_utf8_lossy(&output.stdout).trim(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+}
+
 fn build_timing_enabled() -> bool {
     std::env::var("OPENINFER_BUILD_TIMING").is_ok_and(|value| {
         let value = value.trim().to_ascii_lowercase();
@@ -1251,6 +1308,8 @@ fn compile_triton_aot_kernels(cuda_include: &Path, out_dir: &Path, sm_targets: &
 }
 
 fn main() {
+    ensure_git_submodules_initialized(&workspace_root());
+
     let toolkit = openinfer_build::CudaToolkit::discover();
     let nvcc = toolkit.nvcc.to_string_lossy().into_owned();
     let cuda_include = toolkit
