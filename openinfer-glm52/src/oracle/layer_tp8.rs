@@ -79,7 +79,7 @@ fn layer_moe_tp8_oracle_gate() -> Result<()> {
                         rank,
                         MOE_ORACLE_LAYER,
                     )?;
-                    let mut tp8 = Glm52MoeTp8State::new(&ctx, rank, rank, &exchange, 1)?;
+                    let mut tp8 = Glm52MoeTp8State::new(&ctx, rank, rank, &exchange, 1, 1)?;
                     let outputs = run_layer_prefill_tp8(
                         &ctx,
                         &w,
@@ -103,7 +103,7 @@ fn layer_moe_tp8_oracle_gate() -> Result<()> {
         GateLayerMlp::MoeEp8Rank0,
     )?;
     let bank = load_tp8_slice_layer(&ctx, &model_path(), &manifest, 0, MOE_ORACLE_LAYER)?;
-    let mut tp8 = Glm52MoeTp8State::new(&ctx, 0, 0, &exchange, 1)?;
+    let mut tp8 = Glm52MoeTp8State::new(&ctx, 0, 0, &exchange, 1, 1)?;
     let outputs = run_layer_prefill_tp8(&ctx, &w, &mut tp8, &bank, &hidden_host, MOE_ORACLE_CTX);
     ctx.stream.synchronize()?;
 
@@ -250,6 +250,7 @@ fn run_layer_prefill_tp8(
             &mut carry_ready,
             0,
             true,
+            None,
         )?;
         // The production TP8 arm verbatim: router on the real path, then the
         // replicated kernel writes routed + shared into all 8 rows.

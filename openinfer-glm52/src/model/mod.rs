@@ -392,7 +392,13 @@ impl Glm52RankModel {
         w: &mut Glm52RankGpuWeights,
         max_model_len: usize,
         moe_topo: crate::Glm52MoeTopo,
+        attn_shard: Option<usize>,
     ) -> Result<Self> {
+        ensure!(
+            (moe_topo == crate::Glm52MoeTopo::Tp8) == attn_shard.is_some(),
+            "GLM5.2 attention-TP shard must ride the tp8 topology (topo {moe_topo:?}, \
+             shard {attn_shard:?})"
+        );
         ensure!(
             max_model_len > 0 && max_model_len.is_multiple_of(GLM52_MODEL_LEN_ALIGN),
             "GLM5.2 max_model_len {max_model_len} must be a positive multiple of \
@@ -420,7 +426,7 @@ impl Glm52RankModel {
         let mut caches = Vec::with_capacity(GLM52_LAYERS);
         for layer in 0..GLM52_LAYERS {
             layers.push(
-                build::build_decoder_layer(ctx, w, layer, moe_topo, None)
+                build::build_decoder_layer(ctx, w, layer, moe_topo, attn_shard)
                     .with_context(|| format!("build GLM5.2 decoder layer {layer}"))?,
             );
             caches.push(Glm52LayerCaches {
@@ -483,6 +489,13 @@ impl Glm52RankModel {
         // (num_blocks is cache geometry, not batch, so it carries over),
         // plans, scratch, and a zeroed block table (never read before the
         // first step prologue uploads the coordinator's page rows).
+        // Attention-TP: the shard keeps 8 of 64 heads per rank; every scratch
+        // buffer with a head dimension shrinks with it.
+        let mla_heads = if attn_shard.is_some() {
+            crate::config::GLM52_HEADS / 8
+        } else {
+            crate::config::GLM52_HEADS
+        };
         let mut buckets = Vec::with_capacity(GLM52_DECODE_BUCKETS.len());
         for rows in GLM52_DECODE_BUCKETS {
             let contract_rows = Glm52FlashMlaSparseDecode {
@@ -507,12 +520,7 @@ impl Glm52RankModel {
                     Glm52MlaSchedMetadata::new(ctx, contract_rows)?,
                     Glm52MlaSchedMetadata::new(ctx, contract_rows_short)?,
                 ],
-                scratch: Glm52DecodeScratch::new(
-                    ctx,
-                    &contract_rows,
-                    mqa_shape,
-                    crate::config::GLM52_HEADS,
-                )?,
+                scratch: Glm52DecodeScratch::new(ctx, &contract_rows, mqa_shape, mla_heads)?,
                 graphs: [CudaGraphState::new(), CudaGraphState::new()],
                 block_table: bucket_table,
                 // Read only after a D2H lands in them (the write-combined
@@ -996,6 +1004,16 @@ fn run_step_body(
     let mut carry_ready = false;
     for (layer, (weights, cache)) in layers.iter().zip(caches.iter_mut()).enumerate() {
         let parity = layer % 2;
+        // Attention-TP: a head-sharded layer's o_proj partial crosses the AR
+        // brick inside the attention half; the layer index is its AR slot.
+        let tp8_ar = if weights.mla.heads != crate::config::GLM52_HEADS {
+            let rank = tp8
+                .as_deref_mut()
+                .context("GLM5.2 sharded attention without TP8 state")?;
+            Some((&mut rank.state, layer))
+        } else {
+            None
+        };
         glm52_layer_attention_half(
             ctx,
             Some(aux),
@@ -1006,6 +1024,7 @@ fn run_step_body(
             &mut carry_ready,
             parity,
             layer == 0,
+            tp8_ar,
         )
         .with_context(|| format!("GLM5.2 layer {layer} attention half"))?;
         match &weights.mlp {

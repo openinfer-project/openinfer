@@ -241,6 +241,7 @@ fn run_layer_prefill_ep8(
             &mut carry_ready,
             0,
             true,
+            None,
         )?;
         let route = run_router(ctx, &moe.router, scratch.layer.normed2.data())?;
         let dispatched = glm52_moe_ep8_routed_forward(

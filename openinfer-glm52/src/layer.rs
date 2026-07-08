@@ -124,6 +124,9 @@ pub(crate) struct Glm52LayerScratch {
     pub(crate) normed2: Rows<GLM52_HIDDEN>,
     /// the MLP half's final contribution (dense out, or routed+shared sum).
     pub(crate) mlp_out: Rows<GLM52_HIDDEN>,
+    /// head-sharded o_proj partial, before the attention-TP all-reduce
+    /// (unused when the layer holds all 64 heads).
+    pub(crate) ar_partial: Rows<GLM52_HIDDEN>,
     /// MoE shared-expert contribution.
     pub(crate) shared_out: Rows<GLM52_HIDDEN>,
 }
@@ -135,6 +138,7 @@ impl Glm52LayerScratch {
             attn: [Rows::zeros(ctx, tokens)?, Rows::zeros(ctx, tokens)?],
             normed2: Rows::zeros(ctx, tokens)?,
             mlp_out: Rows::zeros(ctx, tokens)?,
+            ar_partial: Rows::zeros(ctx, tokens)?,
             shared_out: Rows::zeros(ctx, tokens)?,
         })
     }
@@ -152,6 +156,7 @@ impl Glm52LayerScratch {
 /// in-order full-stack walk refreshes the carry before any read, but a stale
 /// buffer from a previous step must not be silently accepted if a walk started
 /// at a `Shared` layer).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn glm52_layer_attention_half(
     ctx: &DeviceContext,
     aux: Option<&DeviceContext>,
@@ -162,7 +167,19 @@ pub(crate) fn glm52_layer_attention_half(
     carry_ready: &mut bool,
     parity: usize,
     first_layer: bool,
+    tp8_ar: Option<(&mut crate::moe_tp8::Glm52MoeTp8State, usize)>,
 ) -> Result<()> {
+    // Attention-TP: a head-sharded layer (8 of 64 heads) produces an o_proj
+    // PARTIAL that must cross the AR brick before the residual add; holding
+    // full heads with AR wiring (or a shard without it) is a build bug —
+    // crash here, not on silently-wrong hidden states.
+    let sharded = w.mla.heads != crate::config::GLM52_HEADS;
+    ensure!(
+        sharded == tp8_ar.is_some(),
+        "GLM5.2 attention-TP wiring mismatch: layer holds {} heads but AR is {}",
+        w.mla.heads,
+        if tp8_ar.is_some() { "wired" } else { "absent" }
+    );
     // `s.layer.normed` (this layer's input_layernorm output) is already
     // populated: by the previous layer's closing fused add+norm, or — for
     // the first layer — by the caller's standalone norm of the embedding.
@@ -232,19 +249,46 @@ pub(crate) fn glm52_layer_attention_half(
     } else {
         (&mut attn_hi[0], &attn_lo[0])
     };
-    glm52_mla_attend_into(
-        ctx,
-        &w.mla,
-        &s.mla_front,
-        step.mla_cos,
-        step.mla_sin,
-        &mut caches.mla_cache,
-        step.slot_mapping,
-        &s.idx.global_slots,
-        step.mla_sched,
-        &mut s.mla_attend,
-        attn_out,
-    )?;
+    match tp8_ar {
+        Some((tp8, layer_slot)) => {
+            // Sharded: attend lands the o_proj partial in `ar_partial`; the
+            // AR brick sums the 8 ranks' partials into `attn_out`
+            // (bit-identical on every rank, fixed source order).
+            glm52_mla_attend_into(
+                ctx,
+                &w.mla,
+                &s.mla_front,
+                step.mla_cos,
+                step.mla_sin,
+                &mut caches.mla_cache,
+                step.slot_mapping,
+                &s.idx.global_slots,
+                step.mla_sched,
+                &mut s.mla_attend,
+                &mut s.layer.ar_partial,
+            )?;
+            tp8.attn_ar_launch(
+                ctx,
+                layer_slot,
+                tokens,
+                s.layer.ar_partial.data(),
+                attn_out.data_mut(),
+            )?;
+        }
+        None => glm52_mla_attend_into(
+            ctx,
+            &w.mla,
+            &s.mla_front,
+            step.mla_cos,
+            step.mla_sin,
+            &mut caches.mla_cache,
+            step.slot_mapping,
+            &s.idx.global_slots,
+            step.mla_sched,
+            &mut s.mla_attend,
+            attn_out,
+        )?,
+    }
 
     // Fused add+norm at the post-attention boundary (bit-identical to separate
     // add + rms_norm — the `_round` variant rounds the sum to bf16 before the
@@ -336,7 +380,7 @@ pub(crate) fn glm52_decoder_layer_forward(
         tokens,
         s.layer.normed.data_mut(),
     )?;
-    glm52_layer_attention_half(ctx, None, w, caches, step, s, carry_ready, 0, true)?;
+    glm52_layer_attention_half(ctx, None, w, caches, step, s, carry_ready, 0, true, None)?;
     match &w.mlp {
         Glm52LayerMlp::Dense(dense) => glm52_dense_mlp_forward_into(
             ctx,

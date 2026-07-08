@@ -14,10 +14,11 @@ use anyhow::{Context, Result, bail, ensure};
 use cudarc::driver::CudaSlice;
 use half::bf16;
 use openinfer_kernels::ops::{
-    GLM52_TP8_BANK_EXPERTS, GLM52_TP8_BPART_LEN, GLM52_TP8_CPART_LEN, GLM52_TP8_HIDDEN,
-    GLM52_TP8_RANKS, GLM52_TP8_RS_SLOT_PACKETS, GLM52_TP8_SLICE_I, GLM52_TP8_SLICE_ROWS,
-    GLM52_TP8_TOKENS, GLM52_TP8_UG_LEN, GLM52_TP8_UNION_MAX, Glm52MoeTp8Buffers, Glm52Tp8LlBuffer,
-    glm52_moe_tp8_epoch_advance, glm52_moe_tp8_layer_launch, glm52_moe_tp8_max_blocks,
+    GLM52_TP8_AR_CHUNK_PACKETS, GLM52_TP8_BANK_EXPERTS, GLM52_TP8_BPART_LEN, GLM52_TP8_CPART_LEN,
+    GLM52_TP8_HIDDEN, GLM52_TP8_RANKS, GLM52_TP8_RS_SLOT_PACKETS, GLM52_TP8_SLICE_I,
+    GLM52_TP8_SLICE_ROWS, GLM52_TP8_TOKENS, GLM52_TP8_UG_LEN, GLM52_TP8_UNION_MAX,
+    Glm52MoeTp8Buffers, Glm52Tp8LlBuffer, glm52_moe_tp8_epoch_advance, glm52_moe_tp8_layer_launch,
+    glm52_moe_tp8_max_blocks, glm52_tp8_ar_buffer_bytes, glm52_tp8_ar_launch,
 };
 use openinfer_kernels::tensor::DeviceContext;
 
@@ -239,11 +240,13 @@ pub(crate) fn load_tp8_slice_layer(
     staging.upload(ctx)
 }
 
-/// One rank's published LL buffer mappings: the per-accessor VA table
-/// (indexed by fleet device ordinal) for its all-reduce buffer.
+/// One rank's published LL buffer mappings: per-accessor VA tables (indexed
+/// by fleet device ordinal) for its MoE all-reduce buffer and its attention
+/// (o_proj epilogue) all-reduce buffer.
 #[derive(Clone, Copy)]
 struct Glm52Tp8LlVas {
     rs: [u64; RANKS],
+    ar: [u64; RANKS],
 }
 
 /// Cross-rank rendezvous for LL buffer mappings: every rank publishes its
@@ -377,8 +380,11 @@ pub(crate) struct Glm52MoeTp8State {
     grid_blocks: usize,
     // LL buffers stay alive as long as peers may write into them.
     _rs: Glm52Tp8LlBuffer,
+    _ar: Glm52Tp8LlBuffer,
     rs_local: u64,
+    ar_local: u64,
     peer_rs: [u64; RANKS],
+    peer_ar: [u64; RANKS],
     epoch_dev: CudaSlice<u64>,
     guidx: CudaSlice<i32>,
     guprob: CudaSlice<f32>,
@@ -396,13 +402,17 @@ impl Glm52MoeTp8State {
         device_ordinal: usize,
         exchange: &Glm52Tp8Exchange,
         slots: usize,
+        ar_slots: usize,
     ) -> Result<Self> {
         // Everything fallible before the exchange runs inside this closure so
         // its error is PUBLISHED as the poison pill — a rank that bails
         // without publishing would hang the other 7 in the rendezvous.
-        let prep = (|| -> Result<Glm52Tp8LlBuffer> {
+        let prep = (|| -> Result<(Glm52Tp8LlBuffer, Glm52Tp8LlBuffer)> {
             ensure!(rank < RANKS, "TP8 rank {rank} out of range");
-            ensure!(slots > 0, "TP8 state needs at least one layer slot");
+            ensure!(
+                slots > 0 && ar_slots > 0,
+                "TP8 state needs at least one layer slot (moe {slots}, ar {ar_slots})"
+            );
             // GLM5.2's DP fleet is device ordinals 0..8 (enforced at launch),
             // so the per-accessor VA tables index directly by device ordinal.
             ensure!(
@@ -410,24 +420,31 @@ impl Glm52MoeTp8State {
                 "TP8 device ordinal {device_ordinal} outside the 0..8 fleet"
             );
             let fleet: Vec<usize> = (0..RANKS).collect();
-            Glm52Tp8LlBuffer::alloc(slots * GLM52_TP8_RS_SLOT_PACKETS * 16, &fleet)
+            let rs = Glm52Tp8LlBuffer::alloc(slots * GLM52_TP8_RS_SLOT_PACKETS * 16, &fleet)?;
+            let ar = Glm52Tp8LlBuffer::alloc(glm52_tp8_ar_buffer_bytes(ar_slots), &fleet)?;
+            Ok((rs, ar))
         })();
         let vas = prep
             .as_ref()
-            .map(|rs| Glm52Tp8LlVas {
+            .map(|(rs, ar)| Glm52Tp8LlVas {
                 rs: std::array::from_fn(|a| rs.addr_for(a)),
+                ar: std::array::from_fn(|a| ar.addr_for(a)),
             })
             .map_err(|err| format!("{err:#}"));
         let table = exchange.publish_and_wait(rank, vas)?;
-        let rs = prep.expect("own failure would have surfaced via publish_and_wait");
+        let (rs, ar) = prep.expect("own failure would have surfaced via publish_and_wait");
         // Peer pointers: THIS device's VA for peer p's buffer (per-accessor
         // mapping — see `Glm52Tp8LlBuffer`), pre-offset to this rank's
-        // source-rank slot. The region is [parity][row][src][hidden] (the
+        // source-rank slot. The MoE region is [parity][row][src][hidden] (the
         // kernel adds the parity and row strides itself), so the src stride
-        // is one hidden row of packets.
+        // is one hidden row of packets; the AR region's src stride is one
+        // chunk of packets (see `GLM52_TP8_AR_CHUNK_PACKETS`).
         let rs_slot = GLM52_TP8_HIDDEN * 16;
+        let ar_slot = GLM52_TP8_AR_CHUNK_PACKETS * 16;
         let peer_rs =
             std::array::from_fn(|p| table[p].rs[device_ordinal] + (rank * rs_slot) as u64);
+        let peer_ar =
+            std::array::from_fn(|p| table[p].ar[device_ordinal] + (rank * ar_slot) as u64);
         // Epoch starts at 1: the LL buffers are zeroed, and a zero tag must
         // never match a live epoch.
         let mut epoch_dev = ctx.stream.alloc_zeros::<u64>(1)?;
@@ -437,8 +454,11 @@ impl Glm52MoeTp8State {
             rank,
             grid_blocks,
             rs_local: rs.addr_for(device_ordinal),
+            ar_local: ar.addr_for(device_ordinal),
             _rs: rs,
+            _ar: ar,
             peer_rs,
+            peer_ar,
             epoch_dev,
             guidx: ctx.stream.alloc_zeros(GLM52_TP8_UNION_MAX)?,
             guprob: ctx.stream.alloc_zeros(GLM52_TP8_UNION_MAX * RANKS)?,
@@ -454,6 +474,32 @@ impl Glm52MoeTp8State {
     /// layer's `forward` of that step (captured into the same graph).
     pub(crate) fn advance_epoch(&mut self, ctx: &DeviceContext) -> Result<()> {
         glm52_moe_tp8_epoch_advance(ctx, &mut self.epoch_dev)
+    }
+
+    /// All-reduce `rows` rows of a head-sharded projection partial (the
+    /// attention o_proj epilogue): every rank contributes `partial` and ends
+    /// with the bit-identical sum in `out`. `layer_slot` is the decoder layer
+    /// index (each layer owns one AR slot region); shares the step epoch with
+    /// the MoE chain — [`Self::advance_epoch`] once per step covers both.
+    pub(crate) fn attn_ar_launch(
+        &mut self,
+        ctx: &DeviceContext,
+        layer_slot: usize,
+        rows: usize,
+        partial: &CudaSlice<bf16>,
+        out: &mut CudaSlice<bf16>,
+    ) -> Result<()> {
+        glm52_tp8_ar_launch(
+            ctx,
+            layer_slot,
+            rows,
+            partial,
+            out,
+            self.ar_local,
+            self.peer_ar,
+            &self.epoch_dev,
+            self.rank,
+        )
     }
 
     /// One layer's TP8 MoE over ALL `GLM52_TP8_TOKENS` rows (replicated

@@ -466,6 +466,7 @@ impl Glm52RankThreadState {
             &mut weights,
             max_model_len,
             moe_topo,
+            (moe_topo == crate::Glm52MoeTopo::Tp8).then_some(self.placement.rank),
         )?);
         ensure!(
             weights.expert_layers.is_empty(),
@@ -624,6 +625,7 @@ impl Glm52RankThreadState {
                 self.placement.device_ordinal,
                 exchange,
                 self.tp8_slices.len(),
+                crate::config::GLM52_LAYERS,
             )?;
             runtime.tp8 = Some(Glm52MoeTp8Rank {
                 state,
