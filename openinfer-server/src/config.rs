@@ -143,13 +143,6 @@ pub(crate) struct Args {
     #[arg(long)]
     pub max_model_len: Option<usize>,
 
-    /// GLM5.2 TP8 low-latency MoE pilot: the first N MoE layers additionally
-    /// load a 1/8-intermediate slice of ALL experts per rank (dual-resident
-    /// with the EP8 bank) and run bucket-1 decode through the whole-layer
-    /// cooperative kernel. 0 = off (pure EP8, today's behavior).
-    #[arg(long, default_value_t = 0)]
-    pub moe_tp8_pilot_layers: usize,
-
     /// GLM5.2 launch-time MoE sharding topology: `ep8` (default) is the
     /// high-throughput configuration (32 whole experts per rank, DeepEP
     /// dispatch/combine, buckets 1-8); `tp8` is the low-latency

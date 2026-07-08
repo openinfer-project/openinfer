@@ -989,13 +989,10 @@ fn run_step_body(
     let batch = step.mla_sched.batch();
     // TP8 step head: advance the shared LL epoch exactly once per replayed
     // step that runs TP8 kernels (all TP8 layers of the step share the tag;
-    // per-layer slot regions alternate parity across steps). bucket-1 covers
-    // both the tp8 topology and the pilot; a span step is bucket-8.
-    if batch == 1 || tp8_span {
-        if let Some(rank) = tp8.as_deref_mut() {
-            if !rank.slices.is_empty() {
-                rank.state.advance_epoch(ctx)?;
-            }
+    // per-layer slot regions alternate parity across steps).
+    if let Some(rank) = tp8.as_deref_mut() {
+        if !rank.slices.is_empty() {
+            rank.state.advance_epoch(ctx)?;
         }
     }
     glm52_embed_into(ctx, embed, token_ids, &mut s.hidden)?;
@@ -1035,34 +1032,8 @@ fn run_step_body(
                 s.layer.mlp_out.data_mut(),
             )?,
             Glm52LayerMlp::MoeEp8(moe) => {
-                // TP8 pilot: at bucket-1 a pilot layer takes the whole-layer
-                // cooperative kernel (allgather + all-expert slice mma +
-                // reduce-scatter, shared expert folded in) instead of the
-                // EP8 dispatch/combine chain. Same router, same `mlp_out`
-                // contract — larger buckets keep EP8 below.
-                let tp8_layer = if batch == 1 {
-                    tp8.as_deref_mut().and_then(|rank| rank.layer_bank(layer))
-                } else {
-                    None
-                };
-                if let Some((tp8_state, slot, bank)) = tp8_layer {
-                    run_router_into(ctx, &moe.router, s.layer.normed2.data(), &mut s.router)?;
-                    tp8_state
-                        .forward(
-                            ctx,
-                            slot,
-                            bank,
-                            s.layer.normed2.data(),
-                            &s.router,
-                            s.layer.mlp_out.data_mut(),
-                        )
-                        .with_context(|| format!("GLM5.2 layer {layer} TP8 MoE"))?;
-                    // `mlp_out` already holds routed + shared — fall through
-                    // to the closing add below the match.
-                } else {
-                    glm52_moe_ep8_layer(ctx, aux, ep8, moe, s, batch, global_tokens)
-                        .with_context(|| format!("GLM5.2 layer {layer} EP8 MoE"))?;
-                }
+                glm52_moe_ep8_layer(ctx, aux, ep8, moe, s, batch, global_tokens)
+                    .with_context(|| format!("GLM5.2 layer {layer} EP8 MoE"))?;
             }
             Glm52LayerMlp::MoeTp8(router) => {
                 // TP8 topology: every MoE layer runs the phase-kernel chain.

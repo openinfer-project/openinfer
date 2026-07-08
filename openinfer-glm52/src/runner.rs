@@ -99,11 +99,6 @@ pub(crate) struct Glm52RowSample {
 enum Glm52RankCommand {
     LoadWeights {
         model_path: PathBuf,
-        /// TP8 pilot: additionally load 1/8-I slice banks of ALL experts for
-        /// the first N MoE layers (second pass over the checkpoint; the dual
-        /// residency is charged before the context-cap probe reads free
-        /// VRAM). 0 = off.
-        tp8_pilot_layers: usize,
         moe_topo: crate::Glm52MoeTopo,
         resp: Sender<Result<Glm52RankWeightLoadReport>>,
     },
@@ -118,8 +113,8 @@ enum Glm52RankCommand {
         resp: Sender<Result<Vec<KvArena>>>,
     },
     /// Collective: create the DeepEP context (barriers across ranks). Issued
-    /// to every rank concurrently, only after all builds succeeded. When the
-    /// TP8 pilot is on, also allocates the LL buffers and rendezvouses peer
+    /// to every rank concurrently, only after all builds succeeded. Under the
+    /// TP8 topology, also allocates the LL buffers and rendezvouses peer
     /// pointers through `tp8_exchange`.
     SetupComm {
         unique_id: Box<[u8; 128]>,
@@ -218,14 +213,12 @@ impl Glm52RankWorker {
     pub(crate) fn load_weights_async(
         &self,
         model_path: &Path,
-        tp8_pilot_layers: usize,
         moe_topo: crate::Glm52MoeTopo,
     ) -> Result<Receiver<Result<Glm52RankWeightLoadReport>>> {
         let (resp_tx, resp_rx) = bounded(1);
         self.tx
             .send(Glm52RankCommand::LoadWeights {
                 model_path: model_path.to_path_buf(),
-                tp8_pilot_layers,
                 moe_topo,
                 resp: resp_tx,
             })
@@ -394,7 +387,7 @@ struct Glm52RankThreadState {
     ctx: Glm52RankGpuContext,
     bundle: Glm52RankLoadBundle,
     loaded: Option<Glm52RankGpuWeights>,
-    /// TP8 pilot slice banks (LoadWeights second pass), waiting for the
+    /// TP8-topology slice banks (loaded with the weights), waiting for the
     /// SetupComm rendezvous to assemble the runtime `Glm52MoeTp8Rank`.
     tp8_slices: BTreeMap<usize, Glm52MoeTp8SliceBank>,
     runtime: Option<Glm52RankRuntime>,
@@ -419,7 +412,6 @@ impl Glm52RankThreadState {
     fn load_weights(
         &mut self,
         model_path: &Path,
-        tp8_pilot_layers: usize,
         moe_topo: crate::Glm52MoeTopo,
     ) -> Result<Glm52RankWeightLoadReport> {
         let loaded = load_rank_weights_to_gpu(&self.ctx, model_path, &self.bundle)?;
@@ -429,26 +421,6 @@ impl Glm52RankThreadState {
             let manifest = Glm52WeightManifest::from_model_dir(model_path)?;
             let dev_ctx = self.ctx.device_context()?;
             for layer in crate::config::GLM52_DENSE_LAYERS..crate::config::GLM52_LAYERS {
-                let bank = load_tp8_slice_layer(
-                    &dev_ctx,
-                    model_path,
-                    &manifest,
-                    self.placement.rank,
-                    layer,
-                )?;
-                self.tp8_slices.insert(layer, bank);
-            }
-        }
-        if tp8_pilot_layers > 0 {
-            ensure!(
-                crate::config::GLM52_DENSE_LAYERS + tp8_pilot_layers <= crate::config::GLM52_LAYERS,
-                "GLM5.2 TP8 pilot layer count {tp8_pilot_layers} exceeds the MoE stack"
-            );
-            let manifest = Glm52WeightManifest::from_model_dir(model_path)?;
-            let dev_ctx = self.ctx.device_context()?;
-            for layer in crate::config::GLM52_DENSE_LAYERS
-                ..crate::config::GLM52_DENSE_LAYERS + tp8_pilot_layers
-            {
                 let bank = load_tp8_slice_layer(
                     &dev_ctx,
                     model_path,
@@ -728,11 +700,10 @@ fn rank_worker_loop(rx: &Receiver<Glm52RankCommand>, mut state: Glm52RankThreadS
         match cmd {
             Glm52RankCommand::LoadWeights {
                 model_path,
-                tp8_pilot_layers,
                 moe_topo,
                 resp,
             } => {
-                let _ = resp.send(state.load_weights(&model_path, tp8_pilot_layers, moe_topo));
+                let _ = resp.send(state.load_weights(&model_path, moe_topo));
             }
             Glm52RankCommand::BuildModel {
                 max_model_len,

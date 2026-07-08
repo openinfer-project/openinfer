@@ -57,9 +57,6 @@ struct Cli {
     /// full-load bucket sweep above. 0 = off.
     #[arg(long, default_value_t = 0)]
     ingest_tokens: usize,
-    /// TP8 low-latency MoE pilot layer count (bucket-1 A/B lever). 0 = off.
-    #[arg(long, default_value_t = 0)]
-    moe_tp8_pilot_layers: usize,
     /// MoE topology: ep8 (default, all buckets) or tp8 (bucket-1 only).
     #[arg(long, default_value = "ep8")]
     moe_topo: String,
@@ -95,7 +92,6 @@ fn main() -> Result<()> {
             max_model_len: None,
             no_prefix_cache: false,
             kv_offload: None,
-            moe_tp8_pilot_layers: cli.moe_tp8_pilot_layers,
             moe_topo,
         },
     )
