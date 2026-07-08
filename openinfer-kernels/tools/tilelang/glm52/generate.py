@@ -63,7 +63,8 @@ from tilelang.env import CUTLASS_INCLUDE_DIR, TILELANG_TEMPLATE_PATH
 
 tilelang.set_log_level("WARNING")
 
-TOPKS = [256, 512, 1024, 2048]
+# The DSA tiers: 2048 full, 256 short. Nothing else exists in production.
+TOPKS = [256, 2048]
 NUM_SPLITS = 16
 HEAD_SLOTS_OUT = 16  # partial store width; pad slots past it are never read
 SM_SCALE = 0.0625  # GLM52_SM_SCALE, baked; the launcher-side entry validates

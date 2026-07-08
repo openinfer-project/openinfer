@@ -323,10 +323,9 @@ fn sparse_mla_parity_gate() -> Result<()> {
         2048,
         &[2048, 0, 2048, 2048, 0, 2048, 2048, 2048],
     )?;
-    // Short-tier topk and head-count edges.
-    rig.run_case("b8 h8 topk1024", 8, 8, 1024, &[1024; 8])?;
+    // Head-count edges.
     rig.run_case("b4 h16 topk2048", 4, 16, 2048, &[2048; 4])?;
-    rig.run_case("b1 h1 topk512", 1, 1, 512, &[512])?;
+    rig.run_case("b1 h1 topk2048", 1, 1, 2048, &[2048])?;
     // Short-tier topk: 256 = 16 tokens/split, under the 32-token gather stage
     // (bound-masked partial stage), here with -1 dilution on top.
     rig.run_case("b8 h8 topk256", 8, 8, 256, &[256; 8])?;

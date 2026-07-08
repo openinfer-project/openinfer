@@ -19,9 +19,10 @@ use super::flashmla_sparse::{
 pub const GLM52_SPARSE_MLA_NUM_SPLITS: usize = 16;
 pub const GLM52_SPARSE_MLA_HEAD_SLOTS: usize = 16;
 /// The TileLang main kernel is AOT-instantiated per topk
-/// (`tools/tilelang/glm52/generate.py` `TOPKS`); the DSA tiers use 256 and
-/// 2048. Splits whose token count undershoots a gather stage mask the tail.
-pub const GLM52_SPARSE_MLA_TOPKS: [usize; 4] = [256, 512, 1024, 2048];
+/// (`tools/tilelang/glm52/generate.py` `TOPKS`): the DSA tiers, 2048 full and
+/// 256 short. Splits whose token count undershoots a gather stage mask the
+/// tail.
+pub const GLM52_SPARSE_MLA_TOPKS: [usize; 2] = [256, 2048];
 
 /// Launch contract for the right-sized sparse MLA decode. `heads` is the real
 /// head count (attention-TP shard, <= 16); the query stays full-width
