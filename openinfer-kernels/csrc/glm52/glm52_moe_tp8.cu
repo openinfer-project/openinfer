@@ -420,25 +420,28 @@ __global__ void __launch_bounds__(kThreads) tp8_rs_recv_kernel(
   }
 }
 
+// Occupancy-max grid for one phase kernel on the calling thread's device.
+cudaError_t tp8_occupancy_grid(const void* kernel_fn, int* out_blocks) {
+  int per_sm = 0, dev = 0, sms = 0;
+  cudaError_t e = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+      &per_sm, kernel_fn, kThreads, 0);
+  if (e == cudaSuccess) e = cudaGetDevice(&dev);
+  if (e == cudaSuccess)
+    e = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+  if (e != cudaSuccess) return e;
+  *out_blocks = sms * per_sm;
+  return cudaSuccess;
+}
+
 }  // namespace
 
 extern "C" {
 
-// Grid sizing default for the mma phase kernels (occupancy-derived;
-// no longer a correctness invariant — nothing grid-syncs anymore).
+// Grid sizing for gemm_b and silu (occupancy-derived; no longer a
+// correctness invariant — nothing grid-syncs anymore). gemm_c sizes itself
+// inside the layer launcher: its lower register count fits more CTAs/SM.
 int glm52_moe_tp8_max_blocks_cuda(int* out_blocks) {
-  int dev = 0;
-  cudaError_t e = cudaGetDevice(&dev);
-  if (e != cudaSuccess) return (int)e;
-  int sms = 0;
-  e = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
-  if (e != cudaSuccess) return (int)e;
-  int per_sm = 0;
-  e = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-      &per_sm, tp8_gemm_b_kernel, kThreads, 0);
-  if (e != cudaSuccess) return (int)e;
-  *out_blocks = sms * per_sm;
-  return 0;
+  return (int)tp8_occupancy_grid((const void*)tp8_gemm_b_kernel, out_blocks);
 }
 
 // LL buffers are CUDA VMM allocations in the NCCL-window mapping topology:
@@ -605,7 +608,20 @@ int glm52_moe_tp8_layer_launch_cuda(
   // One layer = a short chain of plain graph nodes; stream order is the only
   // cross-phase synchronization (see the phase-ordering note above). Spins
   // wait exclusively on cross-rank packets, so no grid size here is
-  // deadlock-capable; grid_blocks (occupancy-derived) sizes the mma kernels.
+  // deadlock-capable; grid_blocks (occupancy-derived) sizes gemm_b and silu.
+  //
+  // gemm_c gets its OWN occupancy grid: it needs ~48 registers vs gemm_b's
+  // 84, so 5 CTAs/SM fit where gemm_b caps at 2 — sizing it by grid_blocks
+  // (gemm_b's occupancy) leaves over half its warp slots empty. Measured on
+  // the 8-row verify bucket (H200, UC=58, cold L2): 40.6 -> 35.9 us/layer.
+  // Launches happen at graph-capture time only, so the occupancy query per
+  // call costs nothing on the replay path.
+  int gemm_c_blocks = 0;
+  {
+    cudaError_t e =
+        tp8_occupancy_grid((const void*)tp8_gemm_c_kernel, &gemm_c_blocks);
+    if (e != cudaSuccess) return (int)e;
+  }
   void* args[] = {&a};
   const int rs_blocks = (kHidden + kThreads - 1) / kThreads;
   struct Phase {
@@ -615,7 +631,7 @@ int glm52_moe_tp8_layer_launch_cuda(
       {(const void*)tp8_union_kernel, 1},
       {(const void*)tp8_gemm_b_kernel, grid_blocks},
       {(const void*)tp8_silu_kernel, grid_blocks},
-      {(const void*)tp8_gemm_c_kernel, grid_blocks},
+      {(const void*)tp8_gemm_c_kernel, gemm_c_blocks},
       {(const void*)tp8_rs_push_kernel, rs_blocks * kTokens},
       {(const void*)tp8_rs_recv_kernel, rs_blocks * kTokens},
   };
