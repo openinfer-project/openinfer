@@ -1,4 +1,4 @@
-// GLM5.2 TP8 attention allreduce: the o_proj (and dense-MLP down) epilogue
+// GLM5.2 TP8 attention allreduce: the o_proj epilogue
 // collective for the attention-TP topology (docs/models/glm52/
 // moe-tp8-low-latency.md, M4).
 //

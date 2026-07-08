@@ -388,9 +388,10 @@ pub(crate) struct Glm52MoeTp8State {
     epoch_dev: CudaSlice<u64>,
     // Want-mask: leading-active row count all TP8 kernels of a step read at
     // replay time. Staged host-side once per step (like the old span-owner
-    // staging), identically on every rank — LL push/wait symmetry. Starts at
-    // the full bucket so graph capture (which executes the kernels once)
-    // pairs its cross-rank packets exactly like today.
+    // staging), identically on every rank — LL push/wait symmetry. Production
+    // always stages before use (pre-capture stages 0: push nothing, wait on
+    // nothing); the full-bucket initial value serves the oracle gates, which
+    // launch these kernels without staging.
     active_rows_dev: CudaSlice<i32>,
     guidx: CudaSlice<i32>,
     guprob: CudaSlice<f32>,

@@ -1,4 +1,4 @@
-//! GLM5.2 TP8 attention allreduce: the o_proj (and dense-MLP down) epilogue
+//! GLM5.2 TP8 attention allreduce: the o_proj epilogue
 //! collective for the attention-TP topology. Every rank contributes a partial
 //! projection output for ALL bucket rows (its heads' share, full hidden
 //! width); the kernel pair sums the 8 partials in a fixed order so every rank
