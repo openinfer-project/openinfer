@@ -1,5 +1,5 @@
 //! Right-sized sparse MLA decode (M5b): the attention-TP replacement for the
-//! FlashMLA sparse decode launch. Fixed 16-split grid, 16-head-slot MMA tile,
+//! FlashMLA sparse decode launch. Fixed 32-split grid, 16-head-slot MMA tile,
 //! deterministic fixed-order combine. The EP8 (64-head) path stays on
 //! FlashMLA (`flashmla_sparse.rs`).
 
@@ -16,9 +16,9 @@ use super::flashmla_sparse::{
     GLM52_FLASHMLA_SPARSE_V_HEAD_DIM,
 };
 
-pub const GLM52_SPARSE_MLA_NUM_SPLITS: usize = 16;
+pub const GLM52_SPARSE_MLA_NUM_SPLITS: usize = 32;
 pub const GLM52_SPARSE_MLA_HEAD_SLOTS: usize = 16;
-/// topk must split evenly into 16 CTAs of 16-token stages.
+/// topk must split evenly into 32 CTAs of 16-token stages.
 pub const GLM52_SPARSE_MLA_TOPK_ALIGN: usize = GLM52_SPARSE_MLA_NUM_SPLITS * 16;
 
 /// Launch contract for the right-sized sparse MLA decode. `heads` is the real

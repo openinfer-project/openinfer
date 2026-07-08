@@ -6,8 +6,10 @@
 // prologue TMA/metadata, and a separate combine launch built for prefill-sized
 // work. Measured 22.6 us where the DRAM floor is ~3.2 us (8 rows x 2048
 // tokens x 656 B). This kernel is the split shape the work actually has:
-// grid (16 splits, batch), one CTA per (row, split), each CTA gathering
-// topk/16 tokens through a cp.async double buffer.
+// grid (32 splits, batch), one CTA per (row, split), each CTA gathering
+// topk/32 tokens through a cp.async double buffer. 32 splits x BI=32 keeps
+// dynamic smem ~103 KB so two CTAs co-reside per SM — at one CTA/SM the
+// kernel is issue-bound (8 warps can't hide the fragment-load latency).
 //
 // Cache token layout (fp8_ds_mla, 656 B, see glm52_mla_assembly.cu):
 //   [ 512 e4m3 ckv | 4 f32 group scales (dim/128) | 64 bf16 rope(k_pe) ]
@@ -33,7 +35,7 @@
 
 namespace {
 
-constexpr int kNumSplits = 16;
+constexpr int kNumSplits = 32;
 constexpr int kHeadSlots = 16;   // m16 MMA tile: real heads + zero pads
 constexpr int kDqk = 576;
 constexpr int kDv = 512;
@@ -191,17 +193,37 @@ __device__ void dequant_stage(char* smem, int stage) {
     const unsigned char* token = raw + t * kCacheBytes;
     __nv_bfloat16* out = deq + t * kQkStride;
     if (!flags[t]) {
-      for (int f = lane; f < kDqk; f += 32) out[f] = __nv_bfloat16(0.f);
+      for (int f = 4 * lane; f < kDqk; f += 128) {
+        *reinterpret_cast<uint2*>(out + f) = uint2{0u, 0u};
+      }
       continue;
     }
     const float* scales = reinterpret_cast<const float*>(token + kScaleOffset);
-    for (int f = lane; f < kDv; f += 32) {
-      const float v = __half2float(__nv_cvt_fp8_to_halfraw(token[f], __NV_E4M3));
-      out[f] = __float2bfloat16(v * scales[f >> 7]);
+    // 4 fp8 per u32 load, pairwise cvt, one 8-byte store (deq rows are
+    // 8-byte aligned: even stride, 4-element steps).
+    const uint32_t* quads = reinterpret_cast<const uint32_t*>(token);
+#pragma unroll
+    for (int u = lane; u < kDv / 4; u += 32) {
+      const uint32_t quad = quads[u];
+      const float scale = scales[u >> 5];  // 32 quads per 128-dim group
+      const __half2 h01 = __nv_cvt_fp8x2_to_halfraw2(
+          static_cast<__nv_fp8x2_storage_t>(quad & 0xffffu), __NV_E4M3);
+      const __half2 h23 = __nv_cvt_fp8x2_to_halfraw2(
+          static_cast<__nv_fp8x2_storage_t>(quad >> 16), __NV_E4M3);
+      const float2 f01 = __half22float2(h01);
+      const float2 f23 = __half22float2(h23);
+      __nv_bfloat162 b01{__float2bfloat16(f01.x * scale),
+                         __float2bfloat16(f01.y * scale)};
+      __nv_bfloat162 b23{__float2bfloat16(f23.x * scale),
+                         __float2bfloat16(f23.y * scale)};
+      uint2 packed{*reinterpret_cast<const uint32_t*>(&b01),
+                   *reinterpret_cast<const uint32_t*>(&b23)};
+      *reinterpret_cast<uint2*>(out + 4 * u) = packed;
     }
-    const __nv_bfloat16* kpe =
-        reinterpret_cast<const __nv_bfloat16*>(token + kKpeOffset);
-    for (int f = lane; f < kDqk - kDv; f += 32) out[kDv + f] = kpe[f];
+    const uint32_t* kpe = reinterpret_cast<const uint32_t*>(token + kKpeOffset);
+    if (lane < (kDqk - kDv) / 2) {
+      reinterpret_cast<uint32_t*>(out + kDv)[lane] = kpe[lane];
+    }
   }
 }
 
@@ -214,8 +236,8 @@ __global__ void __launch_bounds__(kThreads) glm52_sparse_mla_main_kernel(
     const __nv_bfloat16* __restrict__ q,       // [b, 64, 576]
     const unsigned char* __restrict__ cache,   // [max_slots, 656]
     const int* __restrict__ indices,           // [b, topk]
-    float* __restrict__ o_part,                // [16, b, 16, 512]
-    float* __restrict__ ml_part,               // [16, b, 16, 2]
+    float* __restrict__ o_part,                // [32, b, 16, 512]
+    float* __restrict__ ml_part,               // [32, b, 16, 2]
     long long max_slots, int topk, float scale_log2) {
   constexpr int kNTiles = MainSmem<BI>::kNTiles;
   constexpr int kKSplits = MainSmem<BI>::kKSplits;
@@ -406,8 +428,8 @@ __global__ void __launch_bounds__(kThreads) glm52_sparse_mla_main_kernel(
 // CTAs of latency-bound strided reads — too few warps to hide the 16
 // split-strided loads (measured 9.7 us, long-scoreboard 11.3).
 __global__ void glm52_sparse_mla_combine_kernel(
-    const float* __restrict__ o_part,   // [16, b, 16, 512]
-    const float* __restrict__ ml_part,  // [16, b, 16, 2]
+    const float* __restrict__ o_part,   // [32, b, 16, 512]
+    const float* __restrict__ ml_part,  // [32, b, 16, 2]
     __nv_bfloat16* __restrict__ latent, // [b, 64, 512]
     int batch) {
   const int row = blockIdx.x;
@@ -520,8 +542,8 @@ CUresult consume_last_cuda_error() {
   return CUDA_ERROR_LAUNCH_FAILED;
 }
 
-// BI=64 wants ~179 KB dynamic smem (Hopper's 227 KB opt-in); BI=16 fits the
-// 99 KB consumer-part ceiling for the local dev loop.
+// BI=32 (~103 KB) needs Hopper's smem opt-in and co-resides 2 CTAs/SM;
+// BI=16 (~66 KB) fits the 99 KB consumer-part ceiling for the local dev loop.
 template <int BI>
 bool enable_main_smem() {
   static std::once_flag once;
@@ -573,8 +595,8 @@ CUresult glm52_sparse_mla_decode_cuda(const void* q, const void* cache,
 
   const int tokens_per_cta = topk / kNumSplits;
   CUresult result;
-  if (tokens_per_cta % 64 == 0 && enable_main_smem<64>()) {
-    result = launch_main<64>(static_cast<const __nv_bfloat16*>(q),
+  if (tokens_per_cta % 32 == 0 && enable_main_smem<32>()) {
+    result = launch_main<32>(static_cast<const __nv_bfloat16*>(q),
                              static_cast<const unsigned char*>(cache), indices,
                              o_part, ml_part, batch, max_slots, topk, sm_scale,
                              stream);
