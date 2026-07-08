@@ -88,14 +88,12 @@ pub(super) fn admission_target(
     committed: &[usize],
     usable: &[usize],
     need_blocks: usize,
-    max_slots_per_rank: usize,
 ) -> Option<(usize, usize)> {
     let (rank, row) = occupied
         .iter()
         .enumerate()
         .filter(|(rank, row)| {
-            committed[*rank] + need_blocks <= usable[*rank]
-                && row.iter().filter(|&&o| o).count() < max_slots_per_rank
+            committed[*rank] + need_blocks <= usable[*rank] && row.iter().any(|&o| !o)
         })
         .min_by_key(|(rank, row)| (row.iter().filter(|&&o| o).count(), *rank))?;
     let slot = row.iter().position(|&o| !o)?;
@@ -193,7 +191,7 @@ mod tests {
     fn target(occupied: &[[bool; GLM52_MAX_BATCH_PER_RANK]]) -> Option<(usize, usize)> {
         let committed = vec![0usize; occupied.len()];
         let usable = vec![usize::MAX; occupied.len()];
-        admission_target(occupied, &committed, &usable, 1, GLM52_MAX_BATCH_PER_RANK)
+        admission_target(occupied, &committed, &usable, 1)
     }
 
     #[test]
@@ -218,34 +216,16 @@ mod tests {
         // loaded but with budget) takes the request. No rank fits → defer.
         let occupied = occ(&[1, 2]);
         assert_eq!(
-            admission_target(
-                &occupied,
-                &[90, 40],
-                &[100, 100],
-                20,
-                GLM52_MAX_BATCH_PER_RANK
-            ),
+            admission_target(&occupied, &[90, 40], &[100, 100], 20),
             Some((1, 2))
         );
         assert_eq!(
-            admission_target(
-                &occupied,
-                &[90, 90],
-                &[100, 100],
-                20,
-                GLM52_MAX_BATCH_PER_RANK
-            ),
+            admission_target(&occupied, &[90, 90], &[100, 100], 20),
             None
         );
         // Exact fit admits.
         assert_eq!(
-            admission_target(
-                &occupied,
-                &[80, 90],
-                &[100, 100],
-                20,
-                GLM52_MAX_BATCH_PER_RANK
-            ),
+            admission_target(&occupied, &[80, 90], &[100, 100], 20),
             Some((0, 1))
         );
     }

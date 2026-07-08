@@ -656,12 +656,6 @@ impl Glm52RankModel {
             "GLM5.2 sampling rows cannot ride a launch-ahead step (the speculation feeds the \
              argmax token, not the sampled one)"
         );
-        // Span steps change shape every round, so they can never be the
-        // repeated-shape speculation a launch-ahead lease promises.
-        ensure!(
-            flags.tp8_span_owner.is_none() || (!flags.consume && !flags.lease),
-            "GLM5.2 span step cannot ride a launch-ahead lease"
-        );
         let batch = shape.bucket;
         if flags.consume {
             // Launch-ahead fast path: the coordinator says this step IS the
@@ -693,16 +687,7 @@ impl Glm52RankModel {
             // a global grant), so the stale replay's collectives pair up and
             // it degrades to a harmless recompute the prologue overwrites.
             self.speculated = None;
-            self.decode_step_prologue_and_replay(
-                ctx,
-                aux,
-                ep8,
-                tp8,
-                inputs,
-                shape,
-                kv,
-                flags.tp8_span_owner,
-            )?;
+            self.decode_step_prologue_and_replay(ctx, aux, ep8, tp8, inputs, shape, kv)?;
         }
         let mut outputs = self.decode_step_harvest(ctx, inputs, shape, flags.lease)?;
         self.sample_rows_into(ctx, shape, sampling, seed, &mut outputs)?;
@@ -803,13 +788,7 @@ impl Glm52RankModel {
         inputs: &[(u32, usize); GLM52_MAX_BATCH_PER_RANK],
         shape: Glm52StepShape,
         kv: &Glm52StepKv,
-        span_owner: Option<u8>,
     ) -> Result<()> {
-        // Replicated activations: the TP8 topology has no row-to-owner
-        // mapping — every rank computes every row. The span-owner flag is
-        // legacy coordinator plumbing (retired with the scheduler flip);
-        // nothing here consumes it.
-        let _ = span_owner;
         // The bucket state's `rows` is the lookup key — an unknown bucket is
         // a coordinator bug and fails the step before touching the GPU.
         let bucket = self

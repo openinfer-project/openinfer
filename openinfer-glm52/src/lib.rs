@@ -81,10 +81,11 @@ pub struct Glm52LaunchOptions {
     /// Launch-time MoE sharding topology. `Ep8` (default) is the
     /// high-throughput configuration: 32 whole experts per rank, DeepEP
     /// dispatch/combine, buckets 1-8. `Tp8` is the low-latency
-    /// configuration: every rank holds a 1/8-intermediate slice of ALL
-    /// experts on every MoE layer, decode runs bucket-1 only (at most one
-    /// request per rank, prefill advances one token per step), and the MoE
-    /// path is the TP8 phase-kernel chain on all 75 layers.
+    /// configuration: replicated activations over head-sharded weights —
+    /// every rank holds a 1/8-intermediate slice of ALL experts plus 8 of
+    /// the 64 attention heads, all 8 workers mirror ONE logical rank (up to
+    /// 8 concurrent requests, single bucket-8 shape), and the MoE path is
+    /// the TP8 phase-kernel chain on all 75 layers.
     pub moe_topo: Glm52MoeTopo,
 }
 
@@ -148,6 +149,13 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
         kv_offload.is_none() || (dspark_draft_model_path.is_none() && !no_prefix_cache),
         "GLM5.2 --kv-offload requires the prefix cache: drop --no-prefix-cache and the \
          DSpark drafter (speculative decoding and prefix caching are mutually exclusive)"
+    );
+    // The tp8 topology mirrors KV on every rank; the host tier's restore leg
+    // H2Ds into ONE rank's arena, which would silently desync the other 7.
+    ensure!(
+        kv_offload.is_none() || moe_topo == Glm52MoeTopo::Ep8,
+        "GLM5.2 --kv-offload requires the EP8 topology (tp8 replicates KV on all ranks; \
+         a host-tier restore would land on one)"
     );
     start_engine(
         model_path,

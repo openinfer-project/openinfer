@@ -1,6 +1,10 @@
-//! DP8 lock-step continuous-batching scheduler: up to
+//! Lock-step continuous-batching scheduler. EP8 runs DP8: up to
 //! `GLM52_MAX_BATCH_PER_RANK` requests per rank, each owning one slot of the
-//! rank's decode batch. KV pages come from a per-rank [`BlockPool`]
+//! rank's decode batch. The TP8 replicated topology collapses to ONE logical
+//! rank driving 8 mirrored executors: admission, planning, and output
+//! application all happen on the single logical rank, every worker receives
+//! the identical step, and the joins assert bit-identical results (the
+//! replicated-activations contract). KV pages come from a per-logical-rank [`BlockPool`]
 //! (64-token pages, content-hashed blocks): admission reserves a request's
 //! full-lifetime page count up front (honor-or-reject — a request that can
 //! never fit is rejected, one that can't fit *now* stays queued), so decode
@@ -130,31 +134,29 @@ pub(crate) fn run_dp8_coordinator(
     offload: Option<Vec<OffloadEngine>>,
     moe_topo: crate::Glm52MoeTopo,
 ) {
-    // TP8 is the low-latency configuration: fleet concurrency is one slot
-    // per rank at bucket-1 — EXCEPT when the fleet holds exactly one active
-    // request, which may take the whole bucket-8 span shape (prefill spans
-    // and speculative verify rounds; all 8 rows on the owning rank through
-    // the span MoE mapping).
-    let (max_rows_per_rank, tp8_solo_span) = match moe_topo {
-        crate::Glm52MoeTopo::Ep8 => (GLM52_MAX_BATCH_PER_RANK, false),
-        crate::Glm52MoeTopo::Tp8 => (1, true),
-    };
+    // TP8 replicated topology: ONE logical rank drives 8 mirrored executors.
+    // Every worker receives the identical step (inputs, shape, KV, seed) and
+    // must return bit-identical outputs — the scheduler admits, plans, and
+    // applies on the single logical rank; the fan-out lives in the submit
+    // and draft joins.
+    let mirrored = moe_topo == crate::Glm52MoeTopo::Tp8;
+    let logical_ranks = if mirrored { 1 } else { workers.len() };
     // Verify-span draft budget: EP8 feeds 3 (the measured bucket-4 optimum);
-    // the tp8 span shape computes 8 rows at bucket-1 MoE cost, so it feeds
-    // the drafter's full proposal.
-    let span_drafts = if tp8_solo_span {
+    // the tp8 full-bucket shape always computes 8 rows, so it feeds the
+    // drafter's full proposal.
+    let span_drafts = if mirrored {
         crate::dspark::GLM52_DSPARK_DRAFTS
     } else {
         slot::GLM52_DSPARK_EP8_SPAN_DRAFTS
     };
     let offload: Option<Vec<offload::RankOffload>> =
         offload.map(|engines| engines.into_iter().map(offload::RankOffload::new).collect());
-    // One KV page pool per rank: pool block ids index the rank's per-layer
-    // MLA and index-K arenas directly (the arenas were built for
+    // One KV page pool per LOGICAL rank: pool block ids index the rank's
+    // per-layer MLA and index-K arenas directly (the arenas were built for
     // `glm52_pool_blocks` blocks). Block 0-equivalent is the reserved
-    // padding page.
-    let pools: Vec<BlockPool> = match workers
-        .iter()
+    // padding page. Under tp8 the single pool drives every executor — the
+    // mirrored steps write the identical block ids on all 8 arenas.
+    let pools: Vec<BlockPool> = match (0..logical_ranks)
         .map(|_| BlockPool::new(PAGE, glm52_pool_blocks(max_model_len)))
         .collect::<anyhow::Result<Vec<_>>>()
     {
@@ -181,14 +183,13 @@ pub(crate) fn run_dp8_coordinator(
     if dspark_enabled && !no_prefix_cache {
         log::info!("GLM5.2 prefix cache disabled: the DSpark drafter is on");
     }
-    let mut slots: Vec<RankSlots> = workers
-        .iter()
+    let mut slots: Vec<RankSlots> = (0..logical_ranks)
         .map(|_| std::array::from_fn(|_| None))
         .collect();
     // Slot draft states to clear on the next draft round (request left the
     // slot, or a new one was admitted into it). Flushed with each step's
     // Draft commands; the handler is idempotent, so duplicates are harmless.
-    let mut pending_resets: Vec<Vec<usize>> = workers.iter().map(|_| Vec::new()).collect();
+    let mut pending_resets: Vec<Vec<usize>> = (0..logical_ranks).map(|_| Vec::new()).collect();
     let mut pending = std::collections::VecDeque::<GenerateRequest>::new();
     let mut channel_open = true;
     let all_idle = |slots: &[RankSlots]| {
@@ -201,13 +202,7 @@ pub(crate) fn run_dp8_coordinator(
     // contexts already exist: on failure broadcast Shutdown before the
     // workers' sequential Drop joins them (the same collective-teardown
     // contract as the exit path).
-    if let Err(err) = precapture_step_graphs(
-        &workers,
-        &pools,
-        table_width,
-        max_rows_per_rank,
-        tp8_solo_span,
-    ) {
+    if let Err(err) = precapture_step_graphs(&workers, &pools, table_width, mirrored) {
         log::error!("GLM5.2 graph pre-capture failed: {err:#}");
         for worker in &workers {
             let _ = worker.request_shutdown();
@@ -258,7 +253,6 @@ pub(crate) fn run_dp8_coordinator(
             dspark_enabled,
             &mut pending_resets,
             &mut slots_changed,
-            max_rows_per_rank,
         ) {
             fail_step(&mut slots, &err);
             break 'serve;
@@ -271,8 +265,8 @@ pub(crate) fn run_dp8_coordinator(
         // active slot's span of consecutive next tokens, padding rows on the
         // free slots — and all responses are joined before any output is
         // interpreted.
-        let shapes = plan_step_shapes(&feed_wants(&slots), max_rows_per_rank, tp8_solo_span);
-        let mut flags = launch_ahead_flags(
+        let shapes = plan_step_shapes(&feed_wants(&slots), mirrored);
+        let flags = launch_ahead_flags(
             &shapes,
             leased_shapes.as_deref(),
             slots_changed,
@@ -282,15 +276,6 @@ pub(crate) fn run_dp8_coordinator(
             &slots,
             max_model_len,
         );
-        if tp8_solo_span && shapes[0].bucket == GLM52_MAX_BATCH_PER_RANK {
-            // The span shape only ever plans with exactly one active rank
-            // (see plan_step_shapes); every rank stages the same owner.
-            let owner = shapes
-                .iter()
-                .position(|shape| shape.active_rows > 0)
-                .expect("a span step has exactly one active rank");
-            flags.tp8_span_owner = Some(owner as u8);
-        }
         leased_shapes = flags.lease.then(|| shapes.clone());
         slots_changed = false;
         sample_step += 1;
@@ -329,12 +314,14 @@ pub(crate) fn run_dp8_coordinator(
                 break 'serve;
             }
         };
-        // TP8 clamps a concurrent fleet to bucket-1, where a verify span can
-        // never be fed — drafting there burns a drafter forward every step
-        // for zero accepted tokens. Suppress the proposals (appends and
-        // resets still flow, so the drafter's shadow KV stays fresh and
-        // proposals resume the round after the fleet drains back to solo).
-        if tp8_solo_span
+        // TP8 speculative policy: draft only when the fleet is solo — a
+        // concurrent fleet's bucket rows go to liveness first, and feeding
+        // partial verify spans there is unmeasured territory (a follow-up
+        // lever: the full bucket COULD verify several requests' spans at
+        // once). Suppress the proposals (appends and resets still flow, so
+        // the drafter's shadow KV stays fresh and proposals resume the
+        // round after the fleet drains back to solo).
+        if mirrored
             && slots
                 .iter()
                 .flat_map(|rank_slots| rank_slots.iter().flatten())
@@ -403,15 +390,11 @@ fn precapture_step_graphs(
     workers: &[Glm52RankWorker],
     pools: &[BlockPool],
     table_width: usize,
-    max_rows_per_rank: usize,
-    tp8_solo_span: bool,
+    mirrored: bool,
 ) -> anyhow::Result<()> {
-    // tp8 serves exactly two shapes: bucket-1 dp8 and the bucket-8 span
-    // (which needs a staged owner even for the warm capture run — rank 0's
-    // pad rows play the owner, every rank spins on real cross-rank packets).
-    let capture_bucket = |bucket: usize| {
-        bucket <= max_rows_per_rank || (tp8_solo_span && bucket == GLM52_MAX_BATCH_PER_RANK)
-    };
+    // tp8 serves exactly one shape (the full bucket, every worker mirrored);
+    // EP8 captures every bucket.
+    let capture_bucket = |bucket: usize| !mirrored || bucket == GLM52_MAX_BATCH_PER_RANK;
     for &bucket in GLM52_DECODE_BUCKETS
         .iter()
         .filter(|&&bucket| capture_bucket(bucket))
@@ -430,14 +413,12 @@ fn precapture_step_graphs(
             if full_tier {
                 inputs[0] = (GLM52_PADDING_STEP.token, GLM52_MLA_TOPK_SHORT);
             }
-            let mut flags = Glm52StepFlags::plain();
-            if tp8_solo_span && bucket == GLM52_MAX_BATCH_PER_RANK {
-                flags.tp8_span_owner = Some(0);
-            }
+            let flags = Glm52StepFlags::plain();
             let responses = workers
                 .iter()
-                .zip(pools)
-                .map(|(worker, pool)| {
+                .enumerate()
+                .map(|(rank, worker)| {
+                    let pool = &pools[if mirrored { 0 } else { rank }];
                     let kv = padding_step_kv(bucket, table_width, pool.padding_block_id(), &inputs);
                     worker.step_async(inputs, shape, kv, flags, Vec::new(), 0)
                 })
@@ -482,7 +463,6 @@ fn admit_from_queue(
     dspark_enabled: bool,
     pending_resets: &mut [Vec<usize>],
     slots_changed: &mut bool,
-    max_rows_per_rank: usize,
 ) -> anyhow::Result<()> {
     while let Some(front) = pending.front() {
         let need_blocks = lifetime_blocks(front.prompt_tokens.len(), front.max_tokens);
@@ -511,13 +491,9 @@ fn admit_from_queue(
                 .collect(),
             None => usable_blocks.to_vec(),
         };
-        let Some((rank, slot)) = admission_target(
-            &occupancy(slots),
-            &committed,
-            &usable,
-            need_blocks,
-            max_rows_per_rank,
-        ) else {
+        let Some((rank, slot)) =
+            admission_target(&occupancy(slots), &committed, &usable, need_blocks)
+        else {
             break;
         };
         let req = pending.pop_front().expect("checked non-empty");
@@ -600,15 +576,18 @@ fn submit_and_join_step(
     Vec<[u32; GLM52_MAX_BATCH_PER_RANK]>,
     Vec<[Option<SpanKind>; GLM52_MAX_BATCH_PER_RANK]>,
 )> {
-    let mut span_kinds: Vec<[Option<SpanKind>; GLM52_MAX_BATCH_PER_RANK]> = workers
+    // Logical-to-executor mapping: 1:1 under EP8, or the single logical
+    // rank's step mirrored onto every worker under the replicated tp8
+    // topology (identical inputs/KV/seed, bit-identical outputs asserted at
+    // the join).
+    let mirrored = slots.len() == 1 && workers.len() > 1;
+    let mut span_kinds: Vec<[Option<SpanKind>; GLM52_MAX_BATCH_PER_RANK]> = slots
         .iter()
         .map(|_| [None; GLM52_MAX_BATCH_PER_RANK])
         .collect();
     let mut responses = Vec::with_capacity(workers.len());
     let mut submit_err: Option<anyhow::Error> = None;
-    'submit: for (rank, ((rank_slots, worker), shape)) in
-        slots.iter_mut().zip(workers).zip(shapes).enumerate()
-    {
+    'submit: for (rank, (rank_slots, shape)) in slots.iter_mut().zip(shapes).enumerate() {
         let pool = &pools[rank];
         let padding_page = pool.padding_block_id();
         let sampling = collect_sampling_rows(shape, rank_slots);
@@ -697,11 +676,18 @@ fn submit_and_join_step(
             pages: pages.into_boxed_slice(),
             slot_mapping,
         };
-        match worker.step_async(inputs, *shape, kv, flags, sampling, seed) {
-            Ok(rx) => responses.push(rx),
-            Err(err) => {
-                submit_err = Some(err);
-                break 'submit;
+        let executors: &[Glm52RankWorker] = if mirrored {
+            workers
+        } else {
+            std::slice::from_ref(&workers[rank])
+        };
+        for worker in executors {
+            match worker.step_async(inputs, *shape, kv.clone(), flags, sampling.clone(), seed) {
+                Ok(rx) => responses.push(rx),
+                Err(err) => {
+                    submit_err = Some(err);
+                    break 'submit;
+                }
             }
         }
     }
@@ -731,6 +717,19 @@ fn submit_and_join_step(
     }
     if let Some(err) = step_err {
         return Err(err);
+    }
+    if mirrored {
+        // The replicated contract: every executor computed the identical
+        // step, so any divergence means the redundant compute desynced —
+        // serving on it would emit rank-dependent garbage. Crash early.
+        for (executor, out) in outputs.iter().enumerate().skip(1) {
+            anyhow::ensure!(
+                out == &outputs[0],
+                "GLM5.2 mirrored executor {executor} step outputs diverge from executor 0 \
+                 (the replicated bit-identity contract broke)"
+            );
+        }
+        outputs.truncate(1);
     }
     Ok((outputs, span_kinds))
 }
@@ -900,32 +899,60 @@ fn run_draft_round(
     rank_proposals: Vec<Vec<(usize, u32, usize)>>,
     span_drafts: usize,
 ) -> anyhow::Result<()> {
+    // Same logical-to-executor mapping as the step submit: under the
+    // mirrored tp8 topology every worker drafts from its own (identical)
+    // capture buffer and must propose the identical spans.
+    let mirrored = slots.len() == 1 && workers.len() > 1;
     let mut draft_joins = Vec::new();
-    for (rank, (worker, (appends, proposals))) in workers
-        .iter()
-        .zip(rank_appends.into_iter().zip(rank_proposals))
-        .enumerate()
-    {
+    for (rank, (appends, proposals)) in rank_appends.into_iter().zip(rank_proposals).enumerate() {
         let resets = std::mem::take(&mut pending_resets[rank]);
         if resets.is_empty() && appends.is_empty() && proposals.is_empty() {
             continue;
         }
         let proposal_slots: Vec<usize> = proposals.iter().map(|&(slot, _, _)| slot).collect();
-        let rx = worker.draft_async(shapes[rank].bucket, resets, appends, proposals)?;
-        draft_joins.push((rank, proposal_slots, rx));
-    }
-    for (rank, proposal_slots, rx) in draft_joins {
-        let result = rx
-            .recv()
-            .map_err(|_| anyhow::anyhow!("GLM5.2 rank {rank} dropped its draft response"))
-            .and_then(|r| r);
-        let spans = match result {
-            Ok(spans) => spans,
-            // A draft failure is rank-local, but it means the drafter's
-            // invariants broke — crash early rather than silently degrade
-            // to plain decode.
-            Err(err) => return Err(err.context(format!("GLM5.2 rank {rank} draft"))),
+        let executors: &[Glm52RankWorker] = if mirrored {
+            workers
+        } else {
+            std::slice::from_ref(&workers[rank])
         };
+        let rxs = executors
+            .iter()
+            .map(|worker| {
+                worker.draft_async(
+                    shapes[rank].bucket,
+                    resets.clone(),
+                    appends.clone(),
+                    proposals.clone(),
+                )
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        draft_joins.push((rank, proposal_slots, rxs));
+    }
+    for (rank, proposal_slots, rxs) in draft_joins {
+        let mut all_spans = Vec::with_capacity(rxs.len());
+        for (executor, rx) in rxs.into_iter().enumerate() {
+            let result = rx
+                .recv()
+                .map_err(|_| {
+                    anyhow::anyhow!("GLM5.2 executor {executor} dropped its draft response")
+                })
+                .and_then(|r| r);
+            match result {
+                Ok(spans) => all_spans.push(spans),
+                // A draft failure is rank-local, but it means the drafter's
+                // invariants broke — crash early rather than silently degrade
+                // to plain decode.
+                Err(err) => return Err(err.context(format!("GLM5.2 executor {executor} draft"))),
+            }
+        }
+        for (executor, spans) in all_spans.iter().enumerate().skip(1) {
+            anyhow::ensure!(
+                spans == &all_spans[0],
+                "GLM5.2 mirrored executor {executor} draft spans diverge from executor 0 \
+                 (the replicated bit-identity contract broke)"
+            );
+        }
+        let spans = all_spans.swap_remove(0);
         if spans.len() != proposal_slots.len() {
             return Err(anyhow::anyhow!(
                 "GLM5.2 rank {rank} draft returned {} spans for {} proposals",
