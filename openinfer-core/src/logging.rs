@@ -3,10 +3,12 @@
 use std::str::FromStr;
 use std::sync::Once;
 
-use colored::Color::{Green, Red, Yellow};
+use chrono::{DateTime, Local};
+use colored::Colorize;
 use logforth::diagnostic::ThreadLocalDiagnostic;
-use logforth::layout::TextLayout;
-use logforth::record::Level;
+use logforth::kv::{Key, Value, Visitor};
+use logforth::record::{Level, Record};
+use logforth::{Diagnostic, Error, Layout};
 
 static INIT: Once = Once::new();
 
@@ -22,6 +24,71 @@ impl Default for LoggingConfig {
             level: "info".to_string(),
             colored: true,
         }
+    }
+}
+
+/// `MM-dd HH:MM:SS.µs LEVEL crate file.rs:line message k=v ...`
+///
+/// The stock `TextLayout` prefix (full RFC3339 timestamp + full module path +
+/// file:line) is ~90 chars of mostly redundant text. Keep the crate name so
+/// `RUST_LOG` filters are discoverable, and file:line for jump-to-source.
+#[derive(Debug)]
+struct CompactLayout {
+    colored: bool,
+}
+
+impl CompactLayout {
+    fn level_text(&self, level: Level) -> String {
+        let text = format!("{level:>5}");
+        if !self.colored {
+            return text;
+        }
+        // Pad before colorizing so ANSI codes don't break alignment.
+        match level {
+            l if l >= Level::Error => text.red(),
+            l if l >= Level::Warn => text.yellow(),
+            l if l >= Level::Info => text.green(),
+            _ => return text,
+        }
+        .to_string()
+    }
+}
+
+struct KvWriter {
+    text: String,
+}
+
+impl Visitor for KvWriter {
+    fn visit(&mut self, key: Key, value: Value) -> Result<(), Error> {
+        use std::fmt::Write;
+
+        // Writing to a String cannot fail.
+        write!(&mut self.text, " {key}={value}").unwrap();
+        Ok(())
+    }
+}
+
+impl Layout for CompactLayout {
+    fn format(&self, record: &Record, diags: &[Box<dyn Diagnostic>]) -> Result<Vec<u8>, Error> {
+        let time = DateTime::<Local>::from(record.time());
+        let level = self.level_text(record.level());
+        let crate_name = record.target().split("::").next().unwrap_or_default();
+        let file = record.filename();
+        let line = record.line().unwrap_or_default();
+        let message = record.payload();
+
+        let mut visitor = KvWriter {
+            text: format!(
+                "{} {level} {crate_name} {file}:{line} {message}",
+                time.format("%m-%d %H:%M:%S%.6f"),
+            ),
+        };
+        record.key_values().visit(&mut visitor)?;
+        for d in diags {
+            d.visit(&mut visitor)?;
+        }
+
+        Ok(visitor.text.into_bytes())
     }
 }
 
@@ -94,26 +161,15 @@ fn init(config: LoggingConfig) {
         let filter_str = resolved_filter_string(level, std::env::var("RUST_LOG").ok());
         let filter = logforth::filter::env_filter::EnvFilterBuilder::from_spec(filter_str).build();
 
-        let mut builder = logforth::starter_log::builder();
-        if colored {
-            let layout = TextLayout::default()
-                .info_color(Green)
-                .warn_color(Yellow)
-                .error_color(Red);
-            builder = builder.dispatch(|d| {
+        logforth::starter_log::builder()
+            .dispatch(|d| {
                 d.filter(filter)
                     .diagnostic(ThreadLocalDiagnostic::default())
-                    .append(logforth::append::Stderr::default().with_layout(layout))
-            });
-        } else {
-            builder = builder.dispatch(|d| {
-                d.filter(filter)
-                    .diagnostic(ThreadLocalDiagnostic::default())
-                    .append(logforth::append::Stderr::default())
-            });
-        }
-
-        builder.apply();
+                    .append(
+                        logforth::append::Stderr::default().with_layout(CompactLayout { colored }),
+                    )
+            })
+            .apply();
     });
 }
 

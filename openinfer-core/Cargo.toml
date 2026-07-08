@@ -8,6 +8,7 @@ edition = "2024"
 openinfer-engine = { workspace = true }
 openinfer-kernels = { workspace = true }
 anyhow = { workspace = true }
+chrono = { workspace = true }
 colored = { workspace = true }
 cudarc = { workspace = true }
 half = { workspace = true }
