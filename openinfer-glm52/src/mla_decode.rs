@@ -20,10 +20,11 @@ use half::bf16;
 #[cfg(test)]
 use openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_PAGE_SIZE;
 use openinfer_kernels::ops::{
-    GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW, Glm52FlashMlaSparseDecode, Glm52MoeQuantShape,
-    gemm_strided_batched_bf16, glm52_flashmla_sparse_decode_launch,
-    glm52_flashmla_sparse_decode_metadata_launch, glm52_fp8_per_token_group_quant_bf16_launch,
-    glm52_mla_cache_pack_launch, glm52_mla_ckv_split_launch, glm52_mla_query_assemble_launch,
+    GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW, GLM52_SPARSE_MLA_HEAD_SLOTS, Glm52FlashMlaSparseDecode,
+    Glm52MoeQuantShape, Glm52SparseMlaDecode, gemm_strided_batched_bf16,
+    glm52_flashmla_sparse_decode_launch, glm52_flashmla_sparse_decode_metadata_launch,
+    glm52_fp8_per_token_group_quant_bf16_launch, glm52_mla_cache_pack_launch,
+    glm52_mla_ckv_split_launch, glm52_mla_query_assemble_launch, glm52_sparse_mla_decode_launch,
     rms_norm_rows_into,
 };
 use openinfer_kernels::tensor::{DeviceContext, DeviceVec};
@@ -384,24 +385,39 @@ pub(crate) fn glm52_mla_front_into(
     glm52_mla_front_rest_into(ctx, w, hidden, front)
 }
 
+/// Sparse-attention backend scratch. A head shard (attention-TP, <= 16 head
+/// slots) runs the right-sized sparse MLA kernel — fixed 16-split grid plus a
+/// deterministic combine; the 64-head EP8 path stays on FlashMLA with its
+/// tile-scheduler split accumulators.
+enum Glm52SparseAttend {
+    Rightsize {
+        // Unnormalized split partials + (m, l) pairs for the combine.
+        o_part: CudaSlice<f32>,
+        ml_part: CudaSlice<f32>,
+    },
+    Flash {
+        lse: CudaSlice<f32>,
+        lse_accum: CudaSlice<f32>,
+        o_accum: CudaSlice<f32>,
+    },
+}
+
 /// Persistent scratch for the MLA attend half: absorb/query-assemble/cache-
-/// pack intermediates and the FlashMLA output + split accumulators, sized for
-/// the contract's `batch_size` rows. Shared across all 78 layers, written in
-/// place every step.
+/// pack intermediates and the sparse-attention output + backend accumulators,
+/// sized for the contract's `batch_size` rows. Shared across all 78 layers,
+/// written in place every step.
 pub(crate) struct Glm52MlaAttendScratch {
     // Compact head-shard buffers ([T, heads, .]): the absorb GEMM output and
     // the W_UV output feeding o_proj.
     ql_nope: CudaSlice<bf16>,
     v: CudaSlice<bf16>,
-    // Full-width FlashMLA buffers ([T, 64, .]): the sparse kernel only runs
-    // its 64-head shape. Under a head shard the real heads occupy slots
-    // 0..heads and the pad slots keep this alloc's zero fill forever (zero
-    // query -> uniform softmax -> finite latent, never read back).
+    // Full-width sparse-attention buffers ([T, 64, .]): both backends keep
+    // the 64-slot query/latent shape. Under a head shard the real heads
+    // occupy slots 0..heads and the pad slots keep this alloc's zero fill
+    // forever (never read back).
     query: CudaSlice<bf16>,
     latent: CudaSlice<bf16>,
-    lse: CudaSlice<f32>,
-    lse_accum: CudaSlice<f32>,
-    o_accum: CudaSlice<f32>,
+    attend: Glm52SparseAttend,
     ckv_fp8: CudaSlice<u8>,
     ckv_scales: CudaSlice<f32>,
     heads: usize,
@@ -420,14 +436,26 @@ impl Glm52MlaAttendScratch {
             "GLM5.2 MLA attend heads {heads} out of 1..={HEADS}"
         );
         let t = contract.batch_size;
+        let attend = if heads <= GLM52_SPARSE_MLA_HEAD_SLOTS {
+            let rightsize = rightsize_contract(contract, heads);
+            rightsize.validate()?;
+            Glm52SparseAttend::Rightsize {
+                o_part: ctx.stream.alloc_zeros::<f32>(rightsize.o_part_len())?,
+                ml_part: ctx.stream.alloc_zeros::<f32>(rightsize.ml_part_len())?,
+            }
+        } else {
+            Glm52SparseAttend::Flash {
+                lse: ctx.stream.alloc_zeros::<f32>(contract.lse_len())?,
+                lse_accum: ctx.stream.alloc_zeros::<f32>(contract.lse_accum_len())?,
+                o_accum: ctx.stream.alloc_zeros::<f32>(contract.o_accum_len())?,
+            }
+        };
         Ok(Self {
             ql_nope: ctx.stream.alloc_zeros::<bf16>(t * heads * KV_LORA)?,
             v: ctx.stream.alloc_zeros::<bf16>(t * heads * V_HEAD)?,
             query: ctx.stream.alloc_zeros::<bf16>(t * HEADS * QUERY_DIM)?,
             latent: ctx.stream.alloc_zeros::<bf16>(contract.latent_len())?,
-            lse: ctx.stream.alloc_zeros::<f32>(contract.lse_len())?,
-            lse_accum: ctx.stream.alloc_zeros::<f32>(contract.lse_accum_len())?,
-            o_accum: ctx.stream.alloc_zeros::<f32>(contract.o_accum_len())?,
+            attend,
             ckv_fp8: ctx.stream.alloc_zeros::<u8>(t * KV_LORA)?,
             ckv_scales: ctx.stream.alloc_zeros::<f32>(t * (KV_LORA / FP8_BLOCK))?,
             heads,
@@ -435,6 +463,16 @@ impl Glm52MlaAttendScratch {
                 .stream
                 .alloc_zeros::<f32>(t * GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW)?,
         })
+    }
+}
+
+fn rightsize_contract(contract: &Glm52FlashMlaSparseDecode, heads: usize) -> Glm52SparseMlaDecode {
+    Glm52SparseMlaDecode {
+        batch_size: contract.batch_size,
+        num_blocks: contract.num_blocks,
+        topk: contract.topk,
+        heads,
+        sm_scale: contract.sm_scale,
     }
 }
 
@@ -641,20 +679,40 @@ pub(crate) fn glm52_mla_attend_into(
         slot_mapping,
     )?;
 
-    // ---- FlashMLA sparse decode -> latent[T,64,512] ----
-    glm52_flashmla_sparse_decode_launch(
-        ctx,
-        contract,
-        &s.query,
-        cache,
-        topk,
-        &sched.tile_scheduler_metadata,
-        &sched.num_splits,
-        &mut s.latent,
-        &mut s.lse,
-        &mut s.lse_accum,
-        &mut s.o_accum,
-    )?;
+    // ---- sparse decode -> latent[T,64,512] ----
+    match &mut s.attend {
+        Glm52SparseAttend::Rightsize { o_part, ml_part } => {
+            glm52_sparse_mla_decode_launch(
+                ctx,
+                rightsize_contract(&contract, heads),
+                &s.query,
+                cache,
+                topk,
+                o_part,
+                ml_part,
+                &mut s.latent,
+            )?;
+        }
+        Glm52SparseAttend::Flash {
+            lse,
+            lse_accum,
+            o_accum,
+        } => {
+            glm52_flashmla_sparse_decode_launch(
+                ctx,
+                contract,
+                &s.query,
+                cache,
+                topk,
+                &sched.tile_scheduler_metadata,
+                &sched.num_splits,
+                &mut s.latent,
+                lse,
+                lse_accum,
+                o_accum,
+            )?;
+        }
+    }
 
     // ---- back: v[T,heads,256] = latent @ W_UV, then o_proj ----
     // latent stays full-width [T,64,512] (FlashMLA output); the batch count

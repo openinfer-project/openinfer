@@ -3,6 +3,8 @@ use cudarc::driver::sys::{CUresult, CUstream};
 
 mod flashmla_sparse;
 pub use flashmla_sparse::*;
+mod sparse_mla;
+pub use sparse_mla::*;
 mod indexer;
 pub use indexer::*;
 mod indexer_rope;
