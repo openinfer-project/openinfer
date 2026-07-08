@@ -20,9 +20,10 @@
 > chosen at load time (weights are repacked during H2D anyway), so EP8 remains the
 > high-throughput launch configuration while TP8 becomes the low-latency one.
 > **M4 attention-TP (replicated activations over 8-head shards + o_proj LL allreduce
-> + pad want-mask) measured 2026-07-08: solo plain 15.27 → 13.75 ms (−10%), MTP code
-> 189 → 221 tok/s (+17%), MTP text lossless; c8 diverse regresses 20.6 → 22.7 ms
-> (KV-replication trade, still beats EP8's 24.6).** Inspired by
+> + pad want-mask) measured 2026-07-08, same-day A/B (table in the M4 section): solo
+> plain 15.27 → 13.75 ms (−10%), MTP code 188.6 → 220.9 tok/s (+17%, steady-state
+> run-2 pair; run 1: 186.1 → 197.3), MTP text lossless; c8 diverse regresses
+> 20.6 → 22.7 ms (KV-replication trade, still beats EP8's 24.6).** Inspired by
 > the latency-first executor design of TileRT (persistent kernels, communication as graph
 > nodes, no NCCL in the hot path); everything here is measured and implemented
 > independently in this repo.
