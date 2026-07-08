@@ -185,12 +185,19 @@ struct MainSmem {
 template <int BI>
 __device__ void issue_stage(char* smem, const unsigned char* cache,
                             const int* row_indices, long long max_slots,
-                            int token_base, int stage) {
+                            int token_base, int bound, int stage) {
   unsigned char* raw = MainSmem<BI>::raw(smem, stage);
   unsigned char* flags = MainSmem<BI>::flags(smem, stage);
   for (int c = threadIdx.x; c < BI * kChunksPerToken; c += kThreads) {
     const int t = c / kChunksPerToken;
     const int part = c % kChunksPerToken;
+    // Slots past the split's token count (short-tier topk leaves a partial
+    // final stage) behave exactly like -1 indices; the read itself must be
+    // skipped (it would cross into the next row's index list).
+    if (t >= bound) {
+      if (part == 0) flags[t] = 0;
+      continue;
+    }
     const int idx = row_indices[token_base + t];
     if (idx < 0) {
       if (part == 0) flags[t] = 0;
@@ -280,7 +287,7 @@ __global__ void __launch_bounds__(kThreads) glm52_sparse_mla_main_kernel(
   const int t4 = lane & 3;
 
   const int tokens_per_cta = topk / kNumSplits;
-  const int iters = tokens_per_cta / BI;
+  const int iters = (tokens_per_cta + BI - 1) / BI;
   const int* row_indices = indices + static_cast<size_t>(row) * topk;
   const int split_base = split * tokens_per_cta;
 
@@ -307,13 +314,15 @@ __global__ void __launch_bounds__(kThreads) glm52_sparse_mla_main_kernel(
 #pragma unroll
     for (int r = 0; r < 4; ++r) acc[j][r] = 0.f;
 
-  issue_stage<BI>(smem, cache, row_indices, max_slots, split_base, 0);
+  issue_stage<BI>(smem, cache, row_indices, max_slots, split_base,
+                  min(BI, tokens_per_cta), 0);
 
   for (int it = 0; it < iters; ++it) {
     const int stage = it & 1;
     if (it + 1 < iters) {
       issue_stage<BI>(smem, cache, row_indices, max_slots,
-                      split_base + (it + 1) * BI, (it + 1) & 1);
+                      split_base + (it + 1) * BI,
+                      min(BI, tokens_per_cta - (it + 1) * BI), (it + 1) & 1);
       cp_async_wait<1>();
     } else {
       cp_async_wait<0>();
@@ -329,13 +338,22 @@ __global__ void __launch_bounds__(kThreads) glm52_sparse_mla_main_kernel(
       const int ks = warp / kNTiles;
       const __nv_bfloat16* deq = MainSmem<BI>::deq(smem);
       float c[4] = {0.f, 0.f, 0.f, 0.f};
-      for (int kc = ks * kQkChunksPerWarp; kc < (ks + 1) * kQkChunksPerWarp;
-           ++kc) {
-        uint32_t a[4];
-        ldmatrix_a(a, q_tile, kQkStride, 0, kc * 16, lane);
-        uint32_t b[2];
-        ldmatrix_b_qk(b, deq, kQkStride, nt * 8, kc * 16, lane);
-        mma_bf16_16x8x16(c, a, b);
+      // Fragment double buffer: the next ldmatrix pair is in flight while the
+      // current mma runs (a bare load->mma chain stalls the warp per chunk).
+      const int kc0 = ks * kQkChunksPerWarp;
+      uint32_t a[2][4];
+      uint32_t b[2][2];
+      ldmatrix_a(a[0], q_tile, kQkStride, 0, kc0 * 16, lane);
+      ldmatrix_b_qk(b[0], deq, kQkStride, nt * 8, kc0 * 16, lane);
+#pragma unroll
+      for (int i = 0; i < kQkChunksPerWarp; ++i) {
+        const int cur = i & 1;
+        if (i + 1 < kQkChunksPerWarp) {
+          ldmatrix_a(a[cur ^ 1], q_tile, kQkStride, 0, (kc0 + i + 1) * 16, lane);
+          ldmatrix_b_qk(b[cur ^ 1], deq, kQkStride, nt * 8, (kc0 + i + 1) * 16,
+                        lane);
+        }
+        mma_bf16_16x8x16(c, a[cur], b[cur]);
       }
       constexpr int kSStride = MainSmem<BI>::kSStride;
       float* part = MainSmem<BI>::s_partial(smem, ks);
@@ -411,14 +429,20 @@ __global__ void __launch_bounds__(kThreads) glm52_sparse_mla_main_kernel(
         acc[j][2] *= alpha_hi;
         acc[j][3] *= alpha_hi;
       }
+#pragma unroll
       for (int kc = 0; kc < BI / 16; ++kc) {
         uint32_t a[4];
         ldmatrix_a(a, p, MainSmem<BI>::kPStride, 0, kc * 16, lane);
+        uint32_t b[2][2];
+        ldmatrix_b_pv(b[0], deq, kQkStride, kc * 16, warp * 64, lane);
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
-          uint32_t b[2];
-          ldmatrix_b_pv(b, deq, kQkStride, kc * 16, warp * 64 + j * 8, lane);
-          mma_bf16_16x8x16(acc[j], a, b);
+          const int cur = j & 1;
+          if (j + 1 < 8) {
+            ldmatrix_b_pv(b[cur ^ 1], deq, kQkStride, kc * 16,
+                          warp * 64 + (j + 1) * 8, lane);
+          }
+          mma_bf16_16x8x16(acc[j], a, b[cur]);
         }
       }
     }
@@ -461,26 +485,26 @@ __global__ void glm52_sparse_mla_combine_kernel(
 
   __shared__ float weights[kNumSplits];
   __shared__ float inv_l;
-  if (threadIdx.x == 0) {
-    float m_star = -INFINITY;
-    float ml[kNumSplits][2];
+  if (threadIdx.x < 32) {
+    // Lane s owns split s: one load each, two shuffle reductions. A single
+    // serial thread here left 127 threads barrier-stalled behind 32
+    // dependent global loads (measured 6.4 us, stalled_barrier 5.4).
+    const float2 pair = *reinterpret_cast<const float2*>(
+        ml_part +
+        ((static_cast<size_t>(threadIdx.x) * batch + row) * kHeadSlots + h) *
+            2);
+    float m_star = (pair.y > 0.f) ? pair.x : -INFINITY;
 #pragma unroll
-    for (int s = 0; s < kNumSplits; ++s) {
-      const float2 pair = *reinterpret_cast<const float2*>(
-          ml_part +
-          ((static_cast<size_t>(s) * batch + row) * kHeadSlots + h) * 2);
-      ml[s][0] = pair.x;
-      ml[s][1] = pair.y;
-      if (pair.y > 0.f) m_star = fmaxf(m_star, pair.x);
-    }
-    float l_total = 0.f;
+    for (int off = 16; off > 0; off >>= 1)
+      m_star = fmaxf(m_star, __shfl_xor_sync(0xffffffffu, m_star, off));
+    const float w =
+        (pair.y > 0.f && m_star != -INFINITY) ? exp2f(pair.x - m_star) : 0.f;
+    weights[threadIdx.x] = w;
+    float l_total = w * pair.y;
 #pragma unroll
-    for (int s = 0; s < kNumSplits; ++s) {
-      const float w = (ml[s][1] > 0.f) ? exp2f(ml[s][0] - m_star) : 0.f;
-      weights[s] = w;
-      l_total += w * ml[s][1];
-    }
-    inv_l = (l_total > 0.f) ? 1.f / l_total : 0.f;
+    for (int off = 16; off > 0; off >>= 1)
+      l_total += __shfl_xor_sync(0xffffffffu, l_total, off);
+    if (threadIdx.x == 0) inv_l = (l_total > 0.f) ? 1.f / l_total : 0.f;
   }
   __syncthreads();
 
@@ -629,13 +653,12 @@ CUresult glm52_sparse_mla_decode_cuda(const void* q, const void* cache,
   if (q == nullptr || cache == nullptr || indices == nullptr ||
       o_part == nullptr || ml_part == nullptr || latent == nullptr ||
       batch <= 0 || max_slots <= 0 || heads <= 0 || heads > kHeadSlots ||
-      topk <= 0 || topk % (kNumSplits * 16) != 0 || !(sm_scale > 0.f)) {
+      topk < 64 || topk % 64 != 0 || !(sm_scale > 0.f)) {
     return CUDA_ERROR_INVALID_VALUE;
   }
 
-  const int tokens_per_cta = topk / kNumSplits;
   CUresult result;
-  if (tokens_per_cta % 32 == 0 && enable_main_smem<32>()) {
+  if (enable_main_smem<32>()) {
     result = launch_main<32>(static_cast<const __nv_bfloat16*>(q),
                              static_cast<const unsigned char*>(cache), indices,
                              o_part, ml_part, batch, max_slots, topk, sm_scale,

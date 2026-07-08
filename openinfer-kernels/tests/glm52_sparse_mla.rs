@@ -325,5 +325,14 @@ fn sparse_mla_parity_gate() -> Result<()> {
     rig.run_case("b8 h8 topk1024", 8, 8, 1024, &[1024; 8])?;
     rig.run_case("b4 h16 topk2048", 4, 16, 2048, &[2048; 4])?;
     rig.run_case("b1 h1 topk512", 1, 1, 512, &[512])?;
+    // Short-tier topk: 256 = 8 tokens/split (partial final stage), 320 = 10.
+    rig.run_case("b8 h8 topk256", 8, 8, 256, &[256; 8])?;
+    rig.run_case(
+        "b8 h8 topk320",
+        8,
+        8,
+        320,
+        &[320, 320, 64, 320, 1, 320, 0, 320],
+    )?;
     Ok(())
 }

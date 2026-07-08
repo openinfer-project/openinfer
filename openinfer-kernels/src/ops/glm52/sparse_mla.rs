@@ -18,8 +18,9 @@ use super::flashmla_sparse::{
 
 pub const GLM52_SPARSE_MLA_NUM_SPLITS: usize = 32;
 pub const GLM52_SPARSE_MLA_HEAD_SLOTS: usize = 16;
-/// topk must split evenly into 32 CTAs of 16-token stages.
-pub const GLM52_SPARSE_MLA_TOPK_ALIGN: usize = GLM52_SPARSE_MLA_NUM_SPLITS * 16;
+/// Same alignment contract as FlashMLA (the DSA short tier runs topk 256);
+/// splits with a non-multiple token count mask their partial final stage.
+pub const GLM52_SPARSE_MLA_TOPK_ALIGN: usize = 64;
 
 /// Launch contract for the right-sized sparse MLA decode. `heads` is the real
 /// head count (attention-TP shard, <= 16); the query stays full-width
