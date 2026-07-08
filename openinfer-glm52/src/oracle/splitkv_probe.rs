@@ -267,6 +267,22 @@ fn splitkv_topk_scaling_probe() -> Result<()> {
     Ok(())
 }
 
+/// Isolated topk-256 run for nsys per-kernel attribution: the scaling sweep
+/// showed a ~12 us floor at topk<=256, and ncu attributed ~9.4 us of it to
+/// the trailing combine kernel under THIS probe's metadata (num_sm_parts =
+/// device query = 132 -> ~140 accum slots, latency-bound at grid 64).
+/// Production combine measures 2.1 us/layer. This test runs ONLY topk-256 so
+/// `nsys ... cuda_gpu_kern_sum` splits flash vs combine cleanly.
+#[test]
+#[ignore = "requires one sm90a GPU (H200); synthetic buffers, no checkpoint"]
+fn splitkv_topk256_floor_probe() -> Result<()> {
+    let ctx = DeviceContext::new_with_device(0)?;
+    let mut bufs = alloc_probe_with_topk(&ctx, 256)?;
+    stage_indices_with_topk(&ctx, &mut bufs, 256, 256)?;
+    time_variant(&ctx, &mut bufs, "topk-256-solo")?;
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires one sm90a GPU (H200); synthetic buffers, no checkpoint"]
 fn splitkv_dilution_probe() -> Result<()> {
