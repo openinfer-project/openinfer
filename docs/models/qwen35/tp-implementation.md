@@ -111,6 +111,12 @@ Known validation constraints:
 - Long TP2 HF replay is GPU-memory-sensitive; choose a sufficiently free device pair.
 - Qwen3.5 HF golden integration tests should run serially on memory-constrained hosts to avoid unrelated KV-capacity failures from concurrent model loads.
 
+Stable test knobs:
+
+- `OPENINFER_TEST_MODEL_PATH`: real Qwen3.5 weights path for HF, scheduler, and serving tests.
+- `OPENINFER_TEST_TP_DEVICES`: comma-separated TP2 CUDA ordinals. Defaults to `0,1`; examples: `1,2`, `2,3`. TP2 tests require exactly two distinct ordinals.
+- `OPENINFER_TEST_FRONTEND_MODEL_PATH`: optional tokenizer/config metadata path for HTTP serving tests. Defaults to `OPENINFER_TEST_MODEL_PATH` when unset.
+
 ## Follow-Up Work
 
 The exact Phase 2 split is not decided yet. The items below are retained as follow-up work that should be scoped in the design branch before implementation.
