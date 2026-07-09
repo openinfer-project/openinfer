@@ -173,7 +173,16 @@ impl Qwen35TpExecutor {
             .first()
             .ok_or_else(|| anyhow::anyhow!("Qwen3.5 TP executor loaded no models"))?;
         let page_size = first.kv_pool().layout().page_size;
-        let capacity_pages_for_requests = first.kv_pool().capacity_pages().saturating_sub(1);
+        let mut min_capacity_pages = usize::MAX;
+        for (rank, model) in models.iter().enumerate() {
+            let rank_page_size = model.kv_pool().layout().page_size;
+            anyhow::ensure!(
+                rank_page_size == page_size,
+                "Qwen3.5 TP rank {rank} KV page size {rank_page_size} does not match rank 0 page size {page_size}"
+            );
+            min_capacity_pages = min_capacity_pages.min(model.kv_pool().capacity_pages());
+        }
+        let capacity_pages_for_requests = min_capacity_pages.saturating_sub(1);
         let max_position_embeddings = first.config().max_position_embeddings;
         let eos_token_id = first.config().eos_token_id;
 
