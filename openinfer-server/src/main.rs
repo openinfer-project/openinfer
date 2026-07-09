@@ -246,6 +246,7 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
             args.cuda_graph,
             args.max_prefill_tokens
                 .unwrap_or(openinfer_qwen35_4b::DEFAULT_MAX_PREFILL_TOKENS),
+            args.dflash_draft_model_path.clone(),
         )
         .context("failed to start Qwen3.5 engine")?,
     };

@@ -10,6 +10,7 @@ mod batch_decode;
 pub(crate) mod batch_decode_graph;
 pub(crate) mod config;
 mod decode_buffers;
+mod dflash;
 mod executor;
 mod ffi;
 mod logprobs;
@@ -19,10 +20,12 @@ pub mod prefill_buffers;
 pub(crate) mod recurrent;
 pub(crate) mod recurrent_state;
 mod scheduler;
+pub mod speculative;
 mod unified_forward;
+mod verify_buffers;
 mod weights;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow};
 use openinfer_core::engine::{EngineHandle, EngineLoadOptions, EpBackend};
@@ -37,10 +40,14 @@ pub use scheduler::DEFAULT_MAX_PREFILL_TOKENS;
 pub mod runtime {
     pub use crate::batch_decode_graph::MAX_BATCH;
     pub use crate::executor::{
-        DecodePlan, DecodeRequestResult, DecodeResult, DecodeStepItem, PrefillPlan,
-        PrefillRequestResult, PrefillResult, PrefillStepItem, Qwen35Executor, RequestId,
+        DecodePlan, DecodeRequestResult, DecodeResult, DecodeStepItem, ExecutorStateSummary,
+        PrefillPlan, PrefillRequestResult, PrefillResult, PrefillStepItem, Qwen35Executor,
+        RequestId,
     };
     pub use crate::scheduler::start_with_capacity;
+    pub use crate::speculative::{
+        VerifiedToken, VerifyPlan, VerifyRequestResult, VerifyResult, VerifyStepItem,
+    };
     pub use crate::weights::Qwen35Model;
 }
 
@@ -68,8 +75,9 @@ pub fn launch(
     device_ordinal: usize,
     cuda_graph: bool,
     max_prefill_tokens: usize,
+    dflash_draft_model_path: Option<PathBuf>,
 ) -> Result<EngineHandle> {
-    start_engine_with_capacity(
+    start_engine_with_capacity_and_dflash(
         model_path,
         EngineLoadOptions {
             enable_cuda_graph: cuda_graph,
@@ -81,6 +89,7 @@ pub fn launch(
         },
         batch_decode_graph::MAX_BATCH,
         max_prefill_tokens,
+        dflash_draft_model_path,
     )
 }
 
@@ -89,6 +98,16 @@ pub fn start_engine_with_capacity(
     options: EngineLoadOptions,
     max_batch: usize,
     max_prefill_tokens: usize,
+) -> Result<EngineHandle> {
+    start_engine_with_capacity_and_dflash(model_path, options, max_batch, max_prefill_tokens, None)
+}
+
+pub fn start_engine_with_capacity_and_dflash(
+    model_path: &Path,
+    options: EngineLoadOptions,
+    max_batch: usize,
+    max_prefill_tokens: usize,
+    dflash_draft_model_path: Option<PathBuf>,
 ) -> Result<EngineHandle> {
     let EngineLoadOptions {
         enable_cuda_graph,
@@ -109,10 +128,27 @@ pub fn start_engine_with_capacity(
     let model_path = model_path
         .to_str()
         .ok_or_else(|| anyhow!("model path must be valid UTF-8"))?;
-    let model = weights::Qwen35Model::from_safetensors_with_device_options(
+    let dflash_path = dflash_draft_model_path
+        .as_ref()
+        .map(|path| {
+            path.to_str()
+                .ok_or_else(|| anyhow!("DFlash draft model path must be valid UTF-8"))
+        })
+        .transpose()?;
+    let dflash_reservation = dflash_path
+        .map(|path| dflash::DFlashMemoryReservation::from_path(path, max_batch))
+        .transpose()?;
+    let model = weights::Qwen35Model::from_safetensors_with_device_options_and_reservation(
         model_path,
         enable_cuda_graph,
         device_ordinal,
+        dflash_reservation.as_ref(),
     )?;
-    scheduler::start_with_capacity(model, seed, max_batch, max_prefill_tokens)
+    scheduler::start_with_capacity_and_dflash(
+        model,
+        seed,
+        max_batch,
+        max_prefill_tokens,
+        dflash_draft_model_path,
+    )
 }

@@ -294,7 +294,12 @@ fn consumed_args(model_type: ModelType) -> &'static [&'static str] {
             "dflash_draft_model_path",
         ],
         #[cfg(feature = "qwen35-4b")]
-        ModelType::Qwen35 => &["device_ordinal", "cuda_graph", "max_prefill_tokens"],
+        ModelType::Qwen35 => &[
+            "device_ordinal",
+            "cuda_graph",
+            "max_prefill_tokens",
+            "dflash_draft_model_path",
+        ],
     }
 }
 
@@ -384,6 +389,21 @@ impl Args {
         }
         if !matches!(self.decode_overlap, CliDecodeOverlap::Off) && self.tp_size > 1 {
             bail!("--decode-overlap is single-GPU only; tp_size>1 has no prefill/decode overlap");
+        }
+        #[cfg(feature = "qwen35-4b")]
+        if matches!(model_type, ModelType::Qwen35) && self.dflash_draft_model_path.is_some() {
+            if self.enable_lora {
+                bail!("--dflash-draft-model-path is not supported with --enable-lora");
+            }
+            if self.kv_offload {
+                bail!("--dflash-draft-model-path is not supported with --kv-offload");
+            }
+            if self.tp_size != 1 {
+                bail!("--dflash-draft-model-path currently requires --tp-size=1");
+            }
+            if !matches!(self.decode_overlap, CliDecodeOverlap::Off) {
+                bail!("--dflash-draft-model-path is not supported with --decode-overlap");
+            }
         }
         #[cfg(feature = "glm52")]
         if matches!(model_type, ModelType::Glm52) {
@@ -496,7 +516,7 @@ fn parse_lora_module_fields(name: &str, path: &str) -> Result<LoraModule, String
 mod tests {
     use super::*;
 
-    #[cfg(any(feature = "glm52", feature = "qwen3"))]
+    #[cfg(any(feature = "glm52", feature = "qwen3", feature = "qwen35-4b"))]
     fn parse_with_provided(argv: &[&str]) -> (Args, BTreeSet<String>) {
         use clap::FromArgMatches;
         let matches = Args::command()
@@ -641,6 +661,31 @@ mod tests {
 
         assert!(error.contains("--max-lora-rank must be one of"));
         assert!(error.contains("16"));
+    }
+
+    #[cfg(feature = "qwen35-4b")]
+    #[test]
+    fn qwen35_accepts_dflash_draft_model_path() {
+        let (args, provided) =
+            parse_with_provided(&["openinfer", "--dflash-draft-model-path", "/tmp/draft"]);
+        args.validate(ModelType::Qwen35, &provided)
+            .expect("Qwen3.5 should accept explicit DFlash draft model path");
+    }
+
+    #[cfg(feature = "qwen35-4b")]
+    #[test]
+    fn qwen35_dflash_rejects_decode_overlap() {
+        let (args, provided) = parse_with_provided(&[
+            "openinfer",
+            "--dflash-draft-model-path",
+            "/tmp/draft",
+            "--decode-overlap",
+            "stream",
+        ]);
+        let error = args
+            .validate(ModelType::Qwen35, &provided)
+            .expect_err("Qwen3.5 DFlash should reject decode overlap");
+        assert!(error.to_string().contains("--decode-overlap"));
     }
 
     #[cfg(feature = "glm52")]

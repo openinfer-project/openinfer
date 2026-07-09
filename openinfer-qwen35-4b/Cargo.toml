@@ -49,6 +49,10 @@ required-features = ["qwen35-4b"]
 name = "chunked_prefill"
 required-features = ["qwen35-4b"]
 
+[[test]]
+name = "dflash_speculative_gate"
+required-features = ["qwen35-4b"]
+
 [[bench]]
 name = "qwen35_ops"
 harness = false
