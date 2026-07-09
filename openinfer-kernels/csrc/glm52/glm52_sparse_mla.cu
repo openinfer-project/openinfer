@@ -35,6 +35,16 @@ extern "C" int glm52_tilelang_sparse_mla_decode(
 
 namespace {
 
+// 16 splits measured best at every serving regime. TP8 always launches the
+// full bucket (batch 8, idle rows padded with topk = -1), and pad rows are
+// NOT free: they run the whole compute pipeline (only invalid-masked) and
+// every CTA stages the full 64x576 Q tile, so raising splits multiplies
+// fixed cost across all rows. A 32-split A/B lost everywhere despite
+// halving the one real row's per-CTA gather (10k-ctx solo ITL p50
+// 14.00 -> 14.17 ms, c8 20.92 -> 22.34 ms). The remaining solo-long-context
+// gap vs FlashMLA (in-situ 28.5 us vs 18.0 at 10k ctx; flash's scheduler
+// metadata gives the one real row the whole grid) needs dynamic per-row
+// split planning, not a bigger static count.
 constexpr int kNumSplits = 16;
 constexpr int kHeadSlots = 16;  // partial store width: real heads + zero pads
 constexpr int kDqk = 576;
