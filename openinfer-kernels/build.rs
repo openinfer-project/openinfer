@@ -1117,19 +1117,26 @@ fn patch_triton_aot_per_device_handles(c_path: &Path) {
         .map(str::to_string)
         .expect("generated Triton C source should declare one CUfunction");
 
+    let device_table_define = "#define OPENINFER_TRITON_DEVICE_TABLE_SIZE 16\n\n";
+    let device_helper = "\n\nstatic CUresult openinfer_triton_current_device(CUdevice *dev) {\n  CUresult err = cuCtxGetDevice(dev);\n  if (err != CUDA_SUCCESS) {\n    return err;\n  }\n  if (*dev < 0 || *dev >= OPENINFER_TRITON_DEVICE_TABLE_SIZE) {\n    return CUDA_ERROR_INVALID_DEVICE;\n  }\n  return CUDA_SUCCESS;\n}";
+
     let patched = src
         .replace(
             &format!("CUmodule {module_name} = NULL;"),
-            &format!("CUmodule {module_name}[16] = {{0}};"),
+            &format!(
+                "{device_table_define}CUmodule {module_name}[OPENINFER_TRITON_DEVICE_TABLE_SIZE] = {{0}};"
+            ),
         )
         .replace(
             &format!("CUfunction {function_name} = NULL;"),
-            &format!("CUfunction {function_name}[16] = {{0}};"),
+            &format!(
+                "CUfunction {function_name}[OPENINFER_TRITON_DEVICE_TABLE_SIZE] = {{0}};{device_helper}"
+            ),
         )
         .replace(
             &format!("CUDA_CHECK(cuModuleUnload({module_name}));"),
             &format!(
-                "CUdevice dev = 0;\n    CUDA_CHECK(cuCtxGetDevice(&dev));\n    if ({module_name}[dev] != NULL) {{\n      CUDA_CHECK(cuModuleUnload({module_name}[dev]));\n      {module_name}[dev] = NULL;\n      {function_name}[dev] = NULL;\n    }}"
+                "CUdevice dev = 0;\n    CUDA_CHECK(openinfer_triton_current_device(&dev));\n    if ({module_name}[dev] != NULL) {{\n      CUDA_CHECK(cuModuleUnload({module_name}[dev]));\n      {module_name}[dev] = NULL;\n      {function_name}[dev] = NULL;\n    }}"
             ),
         );
     let patched = patched
@@ -1151,7 +1158,7 @@ fn patch_triton_aot_per_device_handles(c_path: &Path) {
         )
         .replace(
             &format!("if ({function_name} == NULL)\n       load_"),
-            &format!("int dev = 0;\n    CUDA_CHECK(cuCtxGetDevice(&dev));\n    if ({function_name}[dev] == NULL)\n       load_"),
+            &format!("CUdevice dev = 0;\n    CUDA_CHECK(openinfer_triton_current_device(&dev));\n    if ({function_name}[dev] == NULL)\n       load_"),
         )
         .replace(
             &format!("return cuLaunchKernel({function_name}, "),
@@ -1159,7 +1166,7 @@ fn patch_triton_aot_per_device_handles(c_path: &Path) {
         )
         .replace(
             "int dev = 0;\n    void *bin =",
-            "int dev = 0;\n    CUDA_CHECK(cuCtxGetDevice(&dev));\n    void *bin =",
+            "CUdevice dev = 0;\n    CUDA_CHECK(openinfer_triton_current_device(&dev));\n    void *bin =",
         );
 
     fs::write(c_path, patched).expect("failed to patch generated Triton C source");

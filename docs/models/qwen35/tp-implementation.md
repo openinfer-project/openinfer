@@ -70,6 +70,8 @@ Real TP2 prefill exposed that Qwen3.5 GDR Triton AOT C stubs could not cache `CU
 
 The generated stubs now cache module/function handles per CUDA device ordinal. This is an implementation constraint worth remembering for future multi-GPU users of generated Triton C stubs.
 
+Follow-up review tightened this path: the generated stubs now fail closed before indexing the fixed per-device handle tables if `cuCtxGetDevice` returns an ordinal outside the table size. This preserves the Phase 1 static-table implementation while avoiding out-of-bounds writes on high CUDA ordinals.
+
 ### Worker-local NCCL setup
 
 NCCL comms are initialized inside rank worker threads after each worker binds its CUDA context and initializes thread-local cuBLAS. Creating comms on the controller thread and moving them into workers led to invalid-handle symptoms and hangs.
