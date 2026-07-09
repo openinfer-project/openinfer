@@ -1489,6 +1489,18 @@ def build_regression_summary(
                 "trace_sha256",
             ),
         )
+        reasons.extend(structural_projection_reasons(
+            "direct_diagnostic_batch",
+            comparison["direct_diagnostic_batch"],
+        ))
+        reasons.extend(structural_projection_reasons(
+            "http_concurrency_pressure",
+            comparison["http_concurrency_pressure"],
+        ))
+        reasons.extend(structural_projection_reasons(
+            "openinfer_trace_pass",
+            comparison["openinfer_trace_pass"],
+        ))
         contract_reasons = comparability_reasons(summary, baseline)
         reasons.extend(contract_reasons)
     comparison["failed_setup_rows"] = compare_failed_setup(summary, baseline)
@@ -1656,6 +1668,14 @@ def compare_projection_maps(
         "changed": changed,
         "unchanged": sorted((current_keys & baseline_keys) - {row["key"] for row in changed}),
     }
+
+
+def structural_projection_reasons(section: str, comparison: dict[str, Any]) -> list[str]:
+    reasons = []
+    for direction in ("added", "missing"):
+        for key in comparison.get(direction, []) or []:
+            reasons.append(f"{section}_{direction}:{key}")
+    return reasons
 
 
 def comparability_reasons(summary: dict[str, Any], baseline: dict[str, Any]) -> list[str]:

@@ -893,6 +893,94 @@ class BenchDsv2LiteMatrixTests(unittest.TestCase):
         self.assertIn("current_noisy_http_cell:vllm-tp2/c1", regression["comparability"]["reasons"])
         self.assertEqual(regression["comparability"]["claim_marker"], "no directional claim")
 
+    def test_regression_summary_marks_missing_benchmark_rows_no_directional(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            current_path = root / "summary.json"
+            baseline_path = root / "baseline-summary.json"
+            current = self.minimal_summary()
+            baseline = self.minimal_summary()
+            baseline["direct_diagnostic_batch"].append({
+                "claim_bucket": bench_matrix.CLAIM_DIRECT,
+                "backend": "nccl",
+                "batch_size": 1,
+                "passed": True,
+                "token_sha256": "nccl-token-hash",
+                "text_sha256": "nccl-text-hash",
+                "tpot_ms": 1.5,
+                "output_tok_s": 2.5,
+            })
+            baseline["http_concurrency_pressure"].append({
+                "engine": "openinfer-nccl",
+                "claim_bucket": bench_matrix.CLAIM_HTTP,
+                "passed": True,
+                "cells": [],
+                "summary_by_concurrency": [
+                    {
+                        "concurrency": 1,
+                        "completed": [32],
+                        "failed": [0],
+                        "timeouts": [0],
+                        "output_text_sha256": ["nccl-hash"],
+                        "mean_tpot_ms": {
+                            "median": 12.0,
+                            "min": 12.0,
+                            "max": 12.0,
+                            "noisy": False,
+                        },
+                        "output_tok_s": {
+                            "median": 90.0,
+                            "min": 90.0,
+                            "max": 90.0,
+                            "noisy": False,
+                        },
+                        "noisy": False,
+                    }
+                ],
+            })
+            baseline["openinfer_trace_pass"].append({
+                "engine": "openinfer-nccl",
+                "claim_bucket": bench_matrix.CLAIM_HTTP,
+                "passed": True,
+                "cells": [
+                    {
+                        "concurrency": 1,
+                        "completed": 8,
+                        "failed": 0,
+                        "timeouts": 0,
+                        "missing_trace_count": 0,
+                        "trace": {"active_set_size_max": 1, "decode_batch_size_max": 1},
+                    }
+                ],
+            })
+            current_path.write_text(json.dumps(current), encoding="utf-8")
+            baseline_path.write_text(json.dumps(baseline), encoding="utf-8")
+
+            regression = bench_matrix.build_regression_summary(
+                current,
+                baseline,
+                current_summary_path=current_path,
+                baseline_summary_path=baseline_path,
+                noisy_threshold=0.05,
+            )
+
+        self.assertEqual(regression["direct_diagnostic_batch"]["missing"], ["nccl/batch1"])
+        self.assertEqual(regression["http_concurrency_pressure"]["missing"], ["openinfer-nccl/c1"])
+        self.assertEqual(regression["openinfer_trace_pass"]["missing"], ["openinfer-nccl/c1"])
+        self.assertIn(
+            "direct_diagnostic_batch_missing:nccl/batch1",
+            regression["comparability"]["reasons"],
+        )
+        self.assertIn(
+            "http_concurrency_pressure_missing:openinfer-nccl/c1",
+            regression["comparability"]["reasons"],
+        )
+        self.assertIn(
+            "openinfer_trace_pass_missing:openinfer-nccl/c1",
+            regression["comparability"]["reasons"],
+        )
+        self.assertEqual(regression["comparability"]["claim_marker"], "no directional claim")
+
     def test_summarize_existing_marks_warned_correctness_artifact_failed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
