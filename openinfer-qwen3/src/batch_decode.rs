@@ -306,7 +306,7 @@ impl Qwen3Model {
             &layer.attention.q_norm,
             &layer.attention.k_norm,
             &bufs.positions_d,
-        );
+        )?;
 
         // KV append + paged attention decode (FlashInfer, batched)
         dag.paged_decode_attention(

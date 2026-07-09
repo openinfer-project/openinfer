@@ -243,8 +243,9 @@ pub(crate) struct Args {
     #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..=99))]
     pub decode_sm_pct: u32,
 
-    /// Enable Qwen3 projection-GEMM and split-KV chunk-count batch-invariant
-    /// pinning. Off by default; does not cover path-selection residuals. Qwen3-only.
+    /// Pin Qwen3's projection GEMMs and split-KV chunk count, and route a unified step's decode
+    /// rows through the decode attention a pure decode step runs. Off by default. Qwen3-only,
+    /// single-GPU.
     #[arg(long, default_value_t = false)]
     pub batch_invariant: bool,
 }

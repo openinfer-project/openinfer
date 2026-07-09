@@ -661,13 +661,15 @@ pub fn prefill_attention_paged_into(
 
 /// Batched QK RMSNorm + RoPE for decode: per-request positions from GPU array.
 ///
-/// Q: HiddenStates [q_dim, batch_size], K: HiddenStates [kv_dim, batch_size].
-/// Both modified in-place.
+/// Q/K are modified in place over the row window `[row_offset, row_offset + num_rows)` — the decode
+/// rows of a unified step sit behind its prefill rows. `positions_d` is indexed from local row 0.
 #[allow(clippy::too_many_arguments)]
 pub fn qk_norm_rope_batch_decode_into(
     ctx: &DeviceContext,
     q: &mut HiddenStates,
     k: &mut HiddenStates,
+    row_offset: usize,
+    num_rows: usize,
     q_norm_weight: &DeviceVec,
     k_norm_weight: &DeviceVec,
     cos_cache: &DeviceVec,
@@ -677,12 +679,14 @@ pub fn qk_norm_rope_batch_decode_into(
     num_kv_heads: usize,
     head_dim: usize,
     rms_eps: f32,
-) {
-    let batch_size = q.seq_len;
-    assert_eq!(k.seq_len, batch_size);
+) -> Result<()> {
+    let q_byte_offset = checked_row_offset(q, row_offset, num_rows, "qk_norm_rope_batch_decode q")?;
+    let k_byte_offset = checked_row_offset(k, row_offset, num_rows, "qk_norm_rope_batch_decode k")?;
 
     let (q_ptr, _gq) = q.data.device_ptr_mut(&ctx.stream);
+    let q_ptr = q_ptr + q_byte_offset;
     let (k_ptr, _gk) = k.data.device_ptr_mut(&ctx.stream);
+    let k_ptr = k_ptr + k_byte_offset;
     let (qn_ptr, _gqn) = q_norm_weight.data.device_ptr(&ctx.stream);
     let (kn_ptr, _gkn) = k_norm_weight.data.device_ptr(&ctx.stream);
     let (cos_ptr, _gc) = cos_cache.data.device_ptr(&ctx.stream);
@@ -701,12 +705,13 @@ pub fn qk_norm_rope_batch_decode_into(
             num_q_heads as i32,
             num_kv_heads as i32,
             head_dim as i32,
-            batch_size as i32,
+            num_rows as i32,
             rms_eps,
             (cos_cache.data.len() / head_dim) as i32,
             crate::tensor::active_cu_stream(ctx),
         );
     }
+    Ok(())
 }
 
 /// QK RMSNorm + RoPE for one DFlash request's draft block.
@@ -1267,12 +1272,16 @@ pub fn paged_attention_batch_decode_into(
 ///
 /// This is intended for low-batch, long-context decode where the non-partition
 /// grid `(batch, kv_heads)` does not expose enough CTAs.
+///
+/// Q/K/V/output are read and written over `[row_offset, row_offset + batch_size)`; every paged and
+/// split-KV metadata array is indexed from local row 0.
 #[allow(clippy::too_many_arguments)]
 pub fn paged_attention_batch_decode_split_kv_into(
     ctx: &DeviceContext,
     q: &HiddenStates,
     k: &HiddenStates,
     v: &HiddenStates,
+    row_offset: usize,
     kv_buffer: &CudaSlice<bf16>,
     layout: &PagedKvLayout,
     layer: usize,
@@ -1293,6 +1302,31 @@ pub fn paged_attention_batch_decode_split_kv_into(
     num_qo_heads: usize,
     batch_size: usize,
 ) -> Result<()> {
+    let q_byte_offset = checked_row_offset(
+        q,
+        row_offset,
+        batch_size,
+        "paged_attention_batch_decode_split_kv q",
+    )?;
+    let k_byte_offset = checked_row_offset(
+        k,
+        row_offset,
+        batch_size,
+        "paged_attention_batch_decode_split_kv k",
+    )?;
+    let v_byte_offset = checked_row_offset(
+        v,
+        row_offset,
+        batch_size,
+        "paged_attention_batch_decode_split_kv v",
+    )?;
+    let out_byte_offset = checked_row_offset(
+        output,
+        row_offset,
+        batch_size,
+        "paged_attention_batch_decode_split_kv output",
+    )?;
+
     let num_kv_heads = layout.num_kv_heads;
     let head_dim = layout.head_dim;
     let page_size = layout.page_size;
@@ -1303,9 +1337,13 @@ pub fn paged_attention_batch_decode_split_kv_into(
 
     let (buf_ptr, _gbuf) = kv_buffer.device_ptr(&ctx.stream);
     let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
+    let q_ptr = q_ptr + q_byte_offset;
     let (k_ptr, _gk) = k.data.device_ptr(&ctx.stream);
+    let k_ptr = k_ptr + k_byte_offset;
     let (v_ptr, _gv) = v.data.device_ptr(&ctx.stream);
+    let v_ptr = v_ptr + v_byte_offset;
     let (out_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+    let out_ptr = out_ptr + out_byte_offset;
     let (pi_ptr, _gpi) = page_indices_d.device_ptr(&ctx.stream);
     let (pip_ptr, _gpip) = page_indptr_d.device_ptr(&ctx.stream);
     let (lpl_ptr, _glpl) = last_page_len_d.device_ptr(&ctx.stream);

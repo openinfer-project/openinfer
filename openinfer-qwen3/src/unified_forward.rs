@@ -1,9 +1,8 @@
 //! Unified forward pass: prefill + decode tokens in a single forward pass.
 //!
-//! GEMM ops (QKV proj, O proj, MLP) process all tokens together. Attention is
-//! one BatchPrefill varlen call covering both: each decode request enters the
-//! plan as a qo_len=1 row over its full KV history — the same shape a 1-token
-//! prefill chunk already exercises.
+//! GEMM ops process all tokens together. Tuned, and GQA groups with no compiled split-KV decode
+//! kernel, use BatchPrefill for every row; Pin/PerToken route decode rows through the decode
+//! attention ops, keeping a unified decode row on the same kernel path as a pure decode step.
 
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
@@ -19,6 +18,7 @@ use openinfer_core::ops;
 use openinfer_core::ops::PrefillPagedPlan;
 use openinfer_core::sampler::SamplingParams;
 use openinfer_core::tensor::HiddenStates;
+use openinfer_kernels::ops::{NumericPolicy, numeric_policy};
 use openinfer_kv_cache::{KvBuffer, KvView};
 
 impl Qwen3Model {
@@ -101,6 +101,7 @@ impl Qwen3Model {
             &decode_tokens,
             &decode_views,
             &decode_adapters,
+            decode_bufs,
             kv_buffer.buffer(),
             &layout,
             mark_peak,
@@ -136,6 +137,7 @@ impl Qwen3Model {
         decode_tokens: &[u32],
         decode_views: &[KvView],
         decode_lora_adapters: &[Option<&str>],
+        decode_bufs: &mut BatchDecodeBuffers,
         kv_buffer: &CudaSlice<bf16>,
         layout: &KvLayout,
     ) -> Result<HiddenStates> {
@@ -147,6 +149,7 @@ impl Qwen3Model {
             decode_tokens,
             decode_views,
             decode_lora_adapters,
+            decode_bufs,
             kv_buffer,
             layout,
             &mut mark_peak,
@@ -161,6 +164,7 @@ impl Qwen3Model {
         decode_tokens: &[u32],
         decode_views: &[KvView],
         decode_lora_adapters: &[Option<&str>],
+        decode_bufs: &mut BatchDecodeBuffers,
         kv_buffer: &CudaSlice<bf16>,
         layout: &KvLayout,
         mark_peak: &mut dyn FnMut() -> Result<()>,
@@ -215,40 +219,89 @@ impl Qwen3Model {
 
         // ── 3. Build metadata ─────────────────────────────────────────
 
-        // One attention plan over prefill requests + decode rows (qo_len=1,
-        // start at the decode position so the row attends its full history).
-        let page_indices: Vec<Vec<i32>> = prefill_views
-            .iter()
-            .chain(decode_views.iter())
-            .map(|v| v.page_indices().to_vec())
-            .collect();
-        let last_page_lens: Vec<usize> = prefill_views
-            .iter()
-            .chain(decode_views.iter())
-            .map(openinfer_kv_cache::KvView::last_page_len)
-            .collect();
-        let mut start_positions = prefill_start_positions;
-        start_positions.extend_from_slice(&decode_positions);
-        let mut seq_lens = prefill_seq_lens.clone();
-        seq_lens.extend(std::iter::repeat_n(1, num_decode_reqs));
-        let plan = PrefillPagedPlan::from_raw_batch_with_cta_tile_q(
-            &self.ctx,
-            &page_indices,
-            &last_page_lens,
-            &start_positions,
-            &seq_lens,
-            self.local_num_attention_heads(),
-            self.local_num_key_value_heads(),
-            self.config.head_dim,
-            PREFILL_ATTENTION_CTA_TILE_Q,
-        )?;
+        // Unconditional, as in `batch_decode`: the decode buffers' split workspace is sized for the
+        // construction policy, and for an uncompiled-group model this is the only decode path.
+        assert_eq!(
+            numeric_policy(),
+            decode_bufs.policy_at_construction,
+            "NumericPolicy changed after executor construction (policy-key-trap); build a fresh executor per policy"
+        );
+        let split_decode_attention = matches!(
+            numeric_policy(),
+            NumericPolicy::Pin | NumericPolicy::PerToken
+        ) && num_decode_reqs > 0
+            && self.config.decode_group_is_compiled();
+        let plan = if split_decode_attention {
+            let positions: Vec<i32> = decode_positions.iter().map(|&pos| pos as i32).collect();
+            self.ctx
+                .stream
+                .memcpy_htod(&positions, &mut decode_bufs.positions_d)?;
+            let decode_refs: Vec<&KvView> = decode_views.iter().collect();
+            decode_bufs.sync_paged_meta(&self.ctx, &decode_refs, num_decode_reqs)?;
+
+            if num_prefill_reqs > 0 {
+                let page_indices: Vec<Vec<i32>> = prefill_views
+                    .iter()
+                    .map(|v| v.page_indices().to_vec())
+                    .collect();
+                let last_page_lens: Vec<usize> = prefill_views
+                    .iter()
+                    .map(openinfer_kv_cache::KvView::last_page_len)
+                    .collect();
+                Some(PrefillPagedPlan::from_raw_batch_with_cta_tile_q(
+                    &self.ctx,
+                    &page_indices,
+                    &last_page_lens,
+                    &prefill_start_positions,
+                    &prefill_seq_lens,
+                    self.local_num_attention_heads(),
+                    self.local_num_key_value_heads(),
+                    self.config.head_dim,
+                    PREFILL_ATTENTION_CTA_TILE_Q,
+                )?)
+            } else {
+                None
+            }
+        } else {
+            // One attention plan over prefill requests + decode rows (qo_len=1,
+            // start at the decode position so the row attends its full history).
+            let page_indices: Vec<Vec<i32>> = prefill_views
+                .iter()
+                .chain(decode_views.iter())
+                .map(|v| v.page_indices().to_vec())
+                .collect();
+            let last_page_lens: Vec<usize> = prefill_views
+                .iter()
+                .chain(decode_views.iter())
+                .map(openinfer_kv_cache::KvView::last_page_len)
+                .collect();
+            let mut start_positions = prefill_start_positions;
+            start_positions.extend_from_slice(&decode_positions);
+            let mut seq_lens = prefill_seq_lens.clone();
+            seq_lens.extend(std::iter::repeat_n(1, num_decode_reqs));
+            Some(PrefillPagedPlan::from_raw_batch_with_cta_tile_q(
+                &self.ctx,
+                &page_indices,
+                &last_page_lens,
+                &start_positions,
+                &seq_lens,
+                self.local_num_attention_heads(),
+                self.local_num_key_value_heads(),
+                self.config.head_dim,
+                PREFILL_ATTENTION_CTA_TILE_Q,
+            )?)
+        };
         mark_peak()?;
 
         // ── 4. Process layers ─────────────────────────────────────────
         let hidden = self.unified_layers_with_peak(
             hidden,
             total_tokens,
-            &plan,
+            plan.as_ref(),
+            decode_bufs,
+            split_decode_attention,
+            total_prefill,
+            num_decode_reqs,
             &lora_groups,
             kv_buffer,
             layout,
@@ -276,7 +329,11 @@ impl Qwen3Model {
         &self,
         mut hidden: HiddenStates,
         total_tokens: usize,
-        plan: &PrefillPagedPlan,
+        plan: Option<&PrefillPagedPlan>,
+        decode_bufs: &mut BatchDecodeBuffers,
+        split_decode_attention: bool,
+        total_prefill: usize,
+        num_decode: usize,
         lora_groups: &[DeviceLoraTokenGroup<'_>],
         kv_buffer: &CudaSlice<bf16>,
         layout: &KvLayout,
@@ -303,6 +360,10 @@ impl Qwen3Model {
                 &mut hidden,
                 &mut bufs,
                 plan,
+                decode_bufs,
+                split_decode_attention,
+                total_prefill,
+                num_decode,
                 lora_groups,
                 kv_buffer,
                 layout,
@@ -320,7 +381,11 @@ impl Qwen3Model {
         layer: &TransformerBlock,
         hidden: &mut HiddenStates,
         bufs: &mut PrefillBuffers,
-        plan: &PrefillPagedPlan,
+        plan: Option<&PrefillPagedPlan>,
+        decode_bufs: &mut BatchDecodeBuffers,
+        split_decode_attention: bool,
+        total_prefill: usize,
+        num_decode: usize,
         lora_groups: &[DeviceLoraTokenGroup<'_>],
         kv_buffer: &CudaSlice<bf16>,
         layout: &KvLayout,
@@ -390,28 +455,72 @@ impl Qwen3Model {
             0,
         )?;
 
-        // ── 3. Paged prefill: norm+RoPE → append K/V to paged → batch
-        // attention. Positions and tile layout both come from the plan, so
-        // the kernel runs the exact tile size the plan was built for.
-        ops::prefill_attention_paged_into(
-            &self.ctx,
-            &mut bufs.q_batch,
-            &mut bufs.k_batch,
-            &bufs.v_batch,
-            &layer.attention.q_norm,
-            &layer.attention.k_norm,
-            &self.cos_cache,
-            &self.sin_cache,
-            kv_buffer,
-            layout,
-            layer_idx,
-            plan,
-            &mut bufs.attn_output,
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            self.config.rms_norm_eps,
-        )?;
+        // `plan` is prefill-only under split routing (None on a decode-only step), all-row otherwise.
+        if let Some(plan) = plan {
+            ops::prefill_attention_paged_into(
+                &self.ctx,
+                &mut bufs.q_batch,
+                &mut bufs.k_batch,
+                &bufs.v_batch,
+                &layer.attention.q_norm,
+                &layer.attention.k_norm,
+                &self.cos_cache,
+                &self.sin_cache,
+                kv_buffer,
+                layout,
+                layer_idx,
+                plan,
+                &mut bufs.attn_output,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                self.config.rms_norm_eps,
+            )?;
+        }
+        if split_decode_attention {
+            ops::qk_norm_rope_batch_decode_into(
+                &self.ctx,
+                &mut bufs.q_batch,
+                &mut bufs.k_batch,
+                total_prefill,
+                num_decode,
+                &layer.attention.q_norm,
+                &layer.attention.k_norm,
+                &self.cos_cache,
+                &self.sin_cache,
+                &decode_bufs.positions_d,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                self.config.rms_norm_eps,
+            )?;
+            ops::paged_attention_batch_decode_split_kv_into(
+                &self.ctx,
+                &bufs.q_batch,
+                &bufs.k_batch,
+                &bufs.v_batch,
+                total_prefill,
+                kv_buffer,
+                layout,
+                layer_idx,
+                &decode_bufs.page_indices_d,
+                &decode_bufs.page_indptr_d,
+                &decode_bufs.last_page_len_d,
+                &decode_bufs.positions_d,
+                &decode_bufs.request_indices_d,
+                &decode_bufs.split_request_indices_d,
+                &decode_bufs.split_kv_tile_indices_d,
+                &decode_bufs.split_kv_chunk_size_d,
+                &decode_bufs.split_o_indptr_d,
+                &decode_bufs.split_block_valid_mask_d,
+                &mut decode_bufs.split_tmp_v,
+                &mut decode_bufs.split_tmp_s,
+                decode_bufs.split_padded_slots,
+                &mut bufs.attn_output,
+                num_heads,
+                num_decode,
+            )?;
+        }
 
         // ── 6. O projection [all tokens] ─────────────────────────────
         ops::gemm_into(

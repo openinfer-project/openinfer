@@ -1304,7 +1304,6 @@ impl Qwen3Executor {
                 },
             )?);
         }
-
         // Profile each rank independently and use the minimum shared block
         // count. The logical scheduler uses one block budget for all ranks, but
         // free memory and worker-thread runtime allocations are per device.
@@ -3442,6 +3441,7 @@ impl LocalQwen3Lane {
             decode_tokens,
             decode_views,
             decode_lora_adapters,
+            &mut self.bufs,
             self.kv_buffer.buffer(),
             &self.layout,
         )
