@@ -425,6 +425,13 @@ fn collect_files_recursively(dir: &Path, out: &mut Vec<PathBuf>) {
 
     for entry in entries {
         let path = entry.path();
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("._"))
+        {
+            continue;
+        }
         if path.is_dir() {
             collect_files_recursively(&path, out);
         } else {

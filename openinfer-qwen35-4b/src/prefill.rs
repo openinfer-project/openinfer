@@ -4,9 +4,10 @@ use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 /// Sequence length used for conservative prefill scratch reservation.
 ///
 /// This is not an admission cap. Actual prompt admission is governed by the
-/// paged KV pool, RoPE cache coverage, and allocation success. Prompts longer
-/// than this are handled by chunking prefill at `PREFILL_CHUNK_LEN` rather than
-/// being rejected (see `prefill_chunk_forward_with_capture`).
+/// paged KV pool, RoPE cache coverage, and allocation success. Complete-prompt
+/// callers must split long prompts into windows no larger than
+/// `PREFILL_CHUNK_LEN`; the chunk forward helper intentionally processes only
+/// one already-bounded window.
 pub(crate) const SCRATCH_ESTIMATE_SEQ: usize = 20_000;
 
 /// Maximum number of tokens processed in a single prefill forward pass.
@@ -128,7 +129,7 @@ impl Qwen35Model {
         capture_layer_ids: Option<&[usize]>,
     ) -> Result<(HiddenStates, Option<HiddenStates>)> {
         let seq_len = token_ids.len();
-        debug_assert!(
+        anyhow::ensure!(
             seq_len > 0 && seq_len <= PREFILL_CHUNK_LEN,
             "prefill chunk length {seq_len} out of range 1..={PREFILL_CHUNK_LEN}"
         );

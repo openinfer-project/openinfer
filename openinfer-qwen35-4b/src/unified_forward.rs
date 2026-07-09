@@ -69,29 +69,34 @@ impl Qwen35Model {
         };
         let mut token_offset = 0usize;
         for i in 0..n {
-            let (hidden, captured) = self.prefill_chunk_forward_with_capture(
-                prompts[i],
-                &mut kv_states[i],
-                recurrent_states[i],
-                capture_layer_ids,
-            )?;
-            let last_hidden = ops::extract_vec(&self.ctx, &hidden, hidden.seq_len - 1)?;
+            let mut last_hidden = None;
+            for chunk in prompts[i].chunks(crate::prefill::PREFILL_CHUNK_LEN) {
+                let (hidden, captured) = self.prefill_chunk_forward_with_capture(
+                    chunk,
+                    &mut kv_states[i],
+                    recurrent_states[i],
+                    capture_layer_ids,
+                )?;
+                last_hidden = Some(ops::extract_vec(&self.ctx, &hidden, hidden.seq_len - 1)?);
+                if let (Some(captured), Some(out)) = (captured.as_ref(), captured_all.as_mut()) {
+                    ops::copy_hidden_token_range_into(
+                        &self.ctx,
+                        captured,
+                        0,
+                        out,
+                        token_offset,
+                        captured.seq_len,
+                    )?;
+                }
+                token_offset += chunk.len();
+            }
+            let last_hidden = last_hidden
+                .ok_or_else(|| anyhow::anyhow!("Qwen3.5 prefill prompt {i} is empty"))?;
             debug_assert_eq!(
                 last_hidden.len, self.config.hidden_size,
                 "Qwen3.5 prefill last hidden row must match request {i}"
             );
             last_hiddens.push(last_hidden);
-            if let (Some(captured), Some(out)) = (captured.as_ref(), captured_all.as_mut()) {
-                ops::copy_hidden_token_range_into(
-                    &self.ctx,
-                    captured,
-                    0,
-                    out,
-                    token_offset,
-                    captured.seq_len,
-                )?;
-            }
-            token_offset += prompts[i].len();
         }
         Ok((self.batch_last_hidden_logits(&last_hiddens)?, captured_all))
     }

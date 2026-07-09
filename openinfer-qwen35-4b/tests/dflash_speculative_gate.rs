@@ -1,6 +1,6 @@
 //! Scheduler-level Qwen3.5 DFlash gate coverage.
 //!
-//! This test keeps the PR1 contract narrow: DFlash is opt-in, single-active,
+//! This test keeps the initial DFlash contract narrow: opt-in, single-active,
 //! greedy-only, and lossless against the plain scheduler for the covered path.
 //! Multi-active requests are expected to fall back to normal target decode.
 

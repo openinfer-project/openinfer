@@ -369,14 +369,10 @@ impl Qwen35Model {
         let reserve_bytes = scratch_reserve.saturating_add(dflash_fixed_reserve);
         let available = free_bytes.saturating_sub(reserve_bytes);
         let kv_budget = (available as f64 * 0.85) as usize;
-        let dflash_pages = dflash_reservation.map_or(0, |r| {
-            r.kv_bytes_per_token
-                .saturating_mul(page_size)
-                .div_ceil(bytes_per_page)
-        });
-        let num_pages = (kv_budget / bytes_per_page)
-            .saturating_sub(dflash_pages)
-            .max(64);
+        let dflash_bytes_per_page =
+            dflash_reservation.map_or(0, |r| r.kv_bytes_per_token.saturating_mul(page_size));
+        let effective_bytes_per_page = bytes_per_page.saturating_add(dflash_bytes_per_page);
+        let num_pages = (kv_budget / effective_bytes_per_page).max(64);
         let kv_mb = num_pages * bytes_per_page / (1024 * 1024);
         let scratch_mb = scratch_reserve / (1024 * 1024);
         let dflash_mb = dflash_fixed_reserve / (1024 * 1024);

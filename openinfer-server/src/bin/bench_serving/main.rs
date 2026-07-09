@@ -20,7 +20,7 @@
     allow(unused_imports, unused_variables, dead_code)
 )]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -224,7 +224,8 @@ fn main() -> Result<()> {
                 .max_prefill_tokens
                 .filter(|&v| v > 0)
                 .unwrap_or(openinfer_qwen35_4b::DEFAULT_MAX_PREFILL_TOKENS);
-            let handle = openinfer_qwen35_4b::start_engine_with_capacity(
+            let dflash_draft_model_path = cli.dflash_draft_model_path.as_ref().map(PathBuf::from);
+            let handle = openinfer_qwen35_4b::start_engine_with_capacity_and_dflash(
                 Path::new(&cli.model_path),
                 EngineLoadOptions {
                     enable_cuda_graph: cli.cuda_graph,
@@ -236,6 +237,7 @@ fn main() -> Result<()> {
                 },
                 4,
                 max_prefill_tokens,
+                dflash_draft_model_path,
             )?;
             finish(handle, cli.cuda_graph)
         }

@@ -4,6 +4,7 @@ use openinfer_core::sampler::SamplingParams;
 
 use crate::executor::{Qwen35Executor, RequestId};
 use crate::logprobs::snapshot_requested_logprobs;
+use crate::prefill::PREFILL_CHUNK_LEN;
 use crate::recurrent_state::RecurrentState;
 use crate::verify_buffers::VerifyBuffers35;
 
@@ -102,6 +103,12 @@ impl Qwen35Executor {
                 req.token_ids.len() >= 2,
                 "Qwen3.5 speculative verify request {} needs [current, draft...]",
                 req.request_id.get()
+            );
+            anyhow::ensure!(
+                req.token_ids.len() <= PREFILL_CHUNK_LEN,
+                "Qwen3.5 speculative verify request {} span len {} exceeds max chunk {PREFILL_CHUNK_LEN}",
+                req.request_id.get(),
+                req.token_ids.len()
             );
         }
         Ok(())

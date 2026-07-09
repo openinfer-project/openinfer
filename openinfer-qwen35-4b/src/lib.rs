@@ -20,7 +20,7 @@ pub mod prefill_buffers;
 pub(crate) mod recurrent;
 pub(crate) mod recurrent_state;
 mod scheduler;
-pub mod speculative;
+mod speculative;
 mod unified_forward;
 mod verify_buffers;
 mod weights;

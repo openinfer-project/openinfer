@@ -431,7 +431,11 @@ fn scheduler_loop(
         // 5. Take this step's budgeted prefill chunk off the front of the queue,
         //    then dispatch by plan.
         let scheduled = take_prefill_chunks(&mut prefilling, prefill_budget);
-        let force_prefill_for_dflash = dflash.is_some()
+        // DFlash context capture is useful only for the current single-active
+        // verifier. Keep multi-active fallback on the normal unified path.
+        let can_capture_dflash_prefill =
+            dflash.is_some() && active.is_empty() && scheduled.len() == 1;
+        let force_prefill_for_dflash = can_capture_dflash_prefill
             && scheduled
                 .iter()
                 .any(|pending| should_capture_dflash_prefill_context(&pending.req));
@@ -456,6 +460,7 @@ fn scheduler_loop(
                     &mut graph_state,
                     &mut rng,
                     dflash.as_mut(),
+                    can_capture_dflash_prefill,
                 ),
                 ExecutionPlan::Decode => {
                     if !decode_step_speculative(
@@ -511,10 +516,12 @@ fn prefill_batch(
     graph_state: &mut BatchDecodeGraphState,
     rng: &mut StdRng,
     mut dflash: Option<&mut DFlashSchedulerState>,
+    can_capture_dflash_prefill: bool,
 ) {
     let mut chunk = ScheduledChunk::from(scheduled);
-    let should_capture_dflash =
-        dflash.is_some() && chunk.reqs.iter().any(should_capture_dflash_prefill_context);
+    let should_capture_dflash = can_capture_dflash_prefill
+        && dflash.is_some()
+        && chunk.reqs.iter().any(should_capture_dflash_prefill_context);
     let capture_layer_ids = dflash
         .as_ref()
         .filter(|_| should_capture_dflash)
@@ -1059,7 +1066,7 @@ fn verify_dflash_spans(
 ) -> Result<Vec<Vec<VerifiedToken>>> {
     anyhow::ensure!(
         active.len() == 1 && spans.len() == 1,
-        "Qwen3.5 DFlash PR1 only verifies one active request"
+        "Qwen3.5 DFlash currently verifies only one active request"
     );
     dflash.ensure_state_scratch(model.device_ctx(), model.config(), active.len())?;
     let original_seq_lens: Vec<usize> = active.iter().map(|req| req.kv.seq_len()).collect();
