@@ -440,6 +440,105 @@ class BenchHttpServingTests(unittest.TestCase):
         self.assertEqual(report["summary"]["output_tokens_total"], 16)
         self.assertAlmostEqual(report["summary"]["output_tokens_per_s"], 8.0)
 
+    def test_server_trace_summary_includes_decode_step_breakdown(self) -> None:
+        first = bench_http_serving.RequestResult(
+            index=0,
+            request_id="bench-0",
+            prompt_words=16,
+            max_tokens=4,
+            ok=True,
+            status=200,
+            error=None,
+            timed_out=False,
+            start_s=0.0,
+            start_wall_s=0.0,
+            first_token_s=0.1,
+            first_token_wall_s=0.1,
+            end_s=0.2,
+            end_wall_s=0.2,
+            latency_ms=200.0,
+            ttft_ms=100.0,
+            tpot_ms=30.0,
+            itl_ms=[30.0, 30.0, 30.0],
+            output_chunks=4,
+            output_chars=8,
+            output_hash="aaaa",
+            text_prefix="text",
+            sampling_label="greedy",
+            temperature=0.0,
+            top_k=-1,
+            top_p=1.0,
+            server_trace={
+                "active_set_size": 2,
+                "decode_batch_size_max": 2,
+                "queue_wait_ms": 10.0,
+                "prefill_ms": 20.0,
+                "first_decode_ms": 4.0,
+                "decode_mean_ms": 5.0,
+                "decode_total_ms": 10.0,
+                "scheduled_to_first_token_ms": 24.0,
+                "scheduled_to_terminal_ms": 60.0,
+                "decode_step_count": 2,
+                "batch_decode_steps": 1,
+                "singleton_decode_steps": 1,
+            },
+        )
+        second = bench_http_serving.RequestResult(
+            index=1,
+            request_id="bench-1",
+            prompt_words=16,
+            max_tokens=4,
+            ok=True,
+            status=200,
+            error=None,
+            timed_out=False,
+            start_s=0.0,
+            start_wall_s=0.0,
+            first_token_s=0.2,
+            first_token_wall_s=0.2,
+            end_s=0.4,
+            end_wall_s=0.4,
+            latency_ms=400.0,
+            ttft_ms=200.0,
+            tpot_ms=40.0,
+            itl_ms=[40.0, 40.0, 40.0],
+            output_chunks=4,
+            output_chars=8,
+            output_hash="bbbb",
+            text_prefix="more",
+            sampling_label="greedy",
+            temperature=0.0,
+            top_k=-1,
+            top_p=1.0,
+            server_trace={
+                "active_set_size": 4,
+                "decode_batch_size_max": 4,
+                "queue_wait_ms": 30.0,
+                "prefill_ms": 40.0,
+                "first_decode_ms": 6.0,
+                "decode_mean_ms": 7.0,
+                "decode_total_ms": 21.0,
+                "scheduled_to_first_token_ms": 46.0,
+                "scheduled_to_terminal_ms": 90.0,
+                "decode_step_count": 3,
+                "batch_decode_steps": 3,
+                "singleton_decode_steps": 0,
+            },
+        )
+
+        summary = bench_http_serving.summarize_trace_ms([first, second])
+
+        self.assertEqual(summary["active_set_size_max"], 4)
+        self.assertEqual(summary["decode_batch_size_max"], 4)
+        self.assertEqual(summary["phases_ms"]["queue_wait_ms"]["samples"], 2)
+        self.assertEqual(summary["phases_ms"]["decode_total_ms"]["max_ms"], 21.0)
+        self.assertEqual(summary["decode_steps"]["per_request"]["min"], 2)
+        self.assertEqual(summary["decode_steps"]["per_request"]["max"], 3)
+        self.assertEqual(summary["decode_steps"]["per_request"]["total"], 5)
+        self.assertEqual(summary["decode_steps"]["batched_total"], 4)
+        self.assertEqual(summary["decode_steps"]["singleton_total"], 1)
+        self.assertAlmostEqual(summary["decode_steps"]["batched_share"], 0.8)
+
 
 if __name__ == "__main__":
     unittest.main()

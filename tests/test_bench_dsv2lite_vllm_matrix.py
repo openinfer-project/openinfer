@@ -1259,6 +1259,22 @@ class BenchDsv2LiteMatrixTests(unittest.TestCase):
                         },
                         "server_trace": {
                             "decode_batch_size_max": 5,
+                            "active_set_size_max": 8,
+                            "decode_steps": {
+                                "batched_total": 40,
+                                "singleton_total": 8,
+                                "batched_share": 40 / 48,
+                            },
+                            "phases_ms": {
+                                "queue_wait_ms": {"p50_ms": 12.0},
+                                "prefill_ms": {"p50_ms": 30.0},
+                                "first_decode_ms": {"p50_ms": 4.0},
+                                "decode_mean_ms": {"p50_ms": 6.0},
+                                "decode_total_ms": {"p50_ms": 384.0},
+                                "scheduled_to_first_token_ms": {"p50_ms": 46.0},
+                                "scheduled_to_terminal_ms": {"p50_ms": 420.0},
+                                "stream_flush_ms": {"p50_ms": 2.0},
+                            },
                         },
                     }
                 ),
@@ -1288,6 +1304,11 @@ class BenchDsv2LiteMatrixTests(unittest.TestCase):
         self.assertEqual(trace_rows[0]["engine"], "openinfer-host-staged")
         self.assertTrue(trace_rows[0]["passed"])
         self.assertEqual(trace_rows[0]["cells"][0]["trace"]["decode_batch_size_max"], 5)
+        self.assertEqual(trace_rows[0]["cells"][0]["active_set_size_max"], 8)
+        self.assertEqual(trace_rows[0]["cells"][0]["decode_batch_size_max"], 5)
+        self.assertEqual(trace_rows[0]["cells"][0]["decode_steps"]["batched_total"], 40)
+        self.assertEqual(trace_rows[0]["cells"][0]["phase_ms"]["decode_total"]["p50_ms"], 384.0)
+        self.assertEqual(trace_rows[0]["cells"][0]["phase_ms"]["scheduled_to_terminal"]["p50_ms"], 420.0)
 
     def test_summarize_existing_preserves_unresolved_trace_failed_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

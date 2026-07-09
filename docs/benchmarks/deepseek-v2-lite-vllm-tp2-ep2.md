@@ -144,6 +144,8 @@ The trace pass uses `scripts/bench_http_serving.py` against OpenInfer host-stage
 
 This trace shows both OpenInfer paths formed live decode batches under this pressure shape: up to 5 for host-staged and up to 5 for NCCL. It does not say anything about vLLM internals.
 
+Later #464 work adds phase timing and batched-vs-singleton decode-step attribution to this OpenInfer trace path; keep this page as the retained 2026-06 snapshot and use `docs/models/deepseek-v2-lite/status.md` for the current trace-boundary summary.
+
 ## Reproduction Commands
 
 Print the matrix plan:

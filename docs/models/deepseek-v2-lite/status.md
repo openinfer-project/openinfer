@@ -1,6 +1,6 @@
 # DeepSeek-V2-Lite Status And Benchmark Ledger
 
-> **TL;DR:** DeepSeek-V2-Lite has an EP2 correctness contract across HF, host-staged, and NCCL. The retained HTTP gates now cover mixed-request serving, traceable scheduler lifecycle, and a replayable reliability runner for cancel/disconnect/reject/overload recovery. This is reliability evidence only, not a vLLM parity, production serving, sparse dispatch, multi-node, or throughput-optimization claim.
+> **TL;DR:** DeepSeek-V2-Lite has an EP2 correctness contract across HF, host-staged, and NCCL. The retained HTTP gates now cover mixed-request serving, phase-attributed scheduler traces, decode-step batching evidence, and a replayable reliability runner for cancel/disconnect/reject/overload recovery. This is reliability evidence only, not a vLLM parity, production serving, sparse dispatch, multi-node, or throughput-optimization claim.
 
 Last touched: 2026-07
 
@@ -21,7 +21,7 @@ Last touched: 2026-07
 | NCCL CUDA Graph readiness | Covered-shape diagnostic | Schema-2 `cuda_graph_readiness` now includes a fail-closed `full_decode_graph_probe`. The 2026-06-20 run reports capture, instantiate, replay, and verification success with `8/8` verified replays for the retained batch-1 NCCL decode step. |
 | First mixed-request serving gate | Available | Issue #281 adds greedy-only request admission, FCFS deferral, explicit request-local rejection/error/finish events, and one owned `DecodeCache` per active request. The 2026-06-23 2x RTX 5090 run passed HF / host-staged / NCCL exactness and the mixed-serving E2E for host-staged and NCCL. |
 | Long-shape NCCL collectives | Available | Issue #280 chunks large bf16 dense-exchange and f32 combine all-reduces. The 2026-06-24 2x RTX 5090 NCCL checks preserve HF / host-staged / NCCL exactness and complete 24/64/128-word direct long-shape probes. |
-| HTTP trace and position-subgroup decode batching | HTTP evidence | Issue #280 logs DeepSeek-V2-Lite `openinfer_http_trace` records and batches same-position decode subgroups while letting singleton or lagging positions decode independently. The 2026-06-24 2x RTX 5090 NCCL HTTP sweeps below complete short same-shape, 128-word smoke, and mixed 16/128-word cells with full trace coverage. |
+| HTTP trace and position-subgroup decode batching | HTTP evidence | Issue #280 logs DeepSeek-V2-Lite `openinfer_http_trace` records and batches same-position decode subgroups while letting singleton or lagging positions decode independently. Issue #464 extends the trace payload with queue wait, prefill, first-decode, decode mean/total, scheduled terminal latency, and batched-vs-singleton decode-step fields. |
 | HTTP reliability lifecycle gate | Available | Issue #453 adds `scripts/bench_dsv2lite_http_reliability.py`, which drives real streaming `/v1/completions` scenarios for client cancel/disconnect, unsupported params, active-cap overload, mixed short/long prompts with adjacent failures, and clean follow-up recovery. The 2026-07-04 2x RTX 5090 host-staged and NCCL runs both passed with terminal trace coverage, stable output hashes, active/pending/decode maxima, and healthy final scheduler baselines. |
 | Retained vLLM comparison matrix | Snapshot complete with clean failed setup rows and supplemental validation rows | The retained matrix for tracking issue #279 keeps HF/host/NCCL correctness, OpenInfer direct diagnostic batch, `vllm bench serve` HTTP pressure, OpenInfer trace rows, and failed setup rows separate. The 2026-06-28 clean full matrix passed HF / host-staged / NCCL correctness plus OpenInfer host-staged/NCCL direct, HTTP pressure, and trace rows; stock vLLM TP2 and TP2+EP2 failed during setup on the target FlashInfer SM120 path. A separate FlashInfer #3633-equivalent validation completed vLLM TP2 and TP2+EP2 under the same HTTP client/workload contract. |
 | vLLM production parity | Not claimed | The vLLM TP2 / TP2+EP2 rows are gap-finding evidence from a documented contract. The supplemental validation run is not serving parity or a stock-install claim. |
@@ -48,7 +48,7 @@ The Rust E2E accepts the known HF-confirmed RTX 5090 and A800 hash pairs for thi
 
 ### Retained vLLM TP2/EP2 Matrix
 
-The retained matrix lives in `docs/benchmarks/deepseek-v2-lite-vllm-tp2-ep2-2026-06.md` and tracks [#279](https://github.com/openinfer-project/openinfer/issues/279). It is the current source for OpenInfer host-staged/NCCL versus vLLM TP2/TP2+EP2 under the `64/64`, `num_prompts=32`, `max_concurrency=1/4/8`, `temperature=0`, `ignore_eos=true` HTTP pressure contract.
+The retained matrix lives in `docs/benchmarks/deepseek-v2-lite-vllm-tp2-ep2.md` and tracks [#279](https://github.com/openinfer-project/openinfer/issues/279). It is the current source for OpenInfer host-staged/NCCL versus vLLM TP2/TP2+EP2 under the `64/64`, `num_prompts=32`, `max_concurrency=1/4/8`, `temperature=0`, `ignore_eos=true` HTTP pressure contract.
 
 Latest 2026-06-28 result on 2x RTX 5090:
 
@@ -59,6 +59,17 @@ Latest 2026-06-28 result on 2x RTX 5090:
 | HTTP pressure | Clean OpenInfer host-staged and NCCL completed all `1/4/8` concurrency cells; host-staged c4, NCCL c4, and NCCL c8 were noisy. Clean vLLM TP2 and vLLM TP2+EP2 failed server startup on the target FlashInfer SM120 path. | `--max-concurrency` is client pressure, not true internal batch size by itself. |
 | Supplemental vLLM validation | A separate FlashInfer #3633-equivalent validation run completed vLLM TP2 and TP2+EP2 for all `1/4/8` concurrency cells. | Not a clean stock vLLM package-stack claim; it only shares the HTTP client/workload contract. |
 | Trace pass | OpenInfer host-staged showed `decode_batch_size_max=1/4/5` and NCCL showed `1/2/5` for concurrency `1/4/8`. | OpenInfer-only trace evidence; no vLLM internal claim. |
+
+### Issue #464 HTTP Trace Refresh
+
+Retained 2026-07-09 trace refresh for #464 used real `/v1/completions` traffic with `64/64`, `num_prompts=32`, concurrency `1/4/8`, `temperature=0`, `ignore_eos=true`, no warmup, and one repeat. Host-staged and NCCL both completed every cell with `completed=8`, `failed=0`, `timeouts=0`, and `missing_trace_count=0`.
+
+| Backend | c1 active/decode/mean | c4 active/decode/mean | c8 active/decode/mean | Decode-step signal |
+| --- | --- | --- | --- | --- |
+| host-staged | `1/1`, `25.1 ms` | `4/2`, `41.3 ms` | `8/7`, `169.4 ms` | batched share rose from `0.000` to `0.873` |
+| NCCL | `1/1`, `23.6 ms` | `4/2`, `39.1 ms` | `8/5`, `95.5 ms` | batched share rose from `0.000` to `0.871` |
+
+Conclusion: active sets and batched decode steps form under HTTP pressure, and the trace now separates queue wait, prefill, first decode, decode mean/total, scheduled terminal latency, and singleton versus batched decode steps. Decode mean and total latency still grow with active rows, so the next performance slice should use backend/kernel attribution rather than another scheduler-admission-only patch. This is trace/profiling evidence, not a throughput optimization or production-readiness claim.
 
 ### Direct Same-Prompt Diagnostic Batch
 
@@ -216,6 +227,7 @@ Scenario summaries:
 - direct same-prompt diagnostics show NCCL is still much slower than host-staged, although aggregate decode throughput improves with larger diagnostic batch size;
 - NCCL remains a correctness-first backend and is still significantly slower than host-staged;
 - the #280 HTTP trace proves active request sets and subgroup decode batches, but throughput still scales only weakly on NCCL EP2 and long prompts have high TTFT;
+- the #464 trace refresh closes the phase/decode-step observability gap for HTTP pressure: batching forms, while decode mean/total still grows with active rows;
 - the #453 runner and trace fields make failure isolation auditable; host-staged and NCCL live HTTP artifacts now prove cancel/disconnect/reject/overload/mixed-failure cleanup and clean follow-up recovery on the retained 2-GPU validation contract;
 - the 2026-06-28 clean matrix keeps stock vLLM startup failures visible because they are part of the reproducibility record;
 - the supplemental vLLM validation shows the HTTP contract can run after the FlashInfer SM120/CUDA 12.8 path is fixed, but it should stay separate from stock-package rows;
@@ -230,7 +242,7 @@ Use these labels consistently:
 | `direct single-row` | In-process batch `1` decode. | HTTP serving throughput. |
 | `direct same-prompt diagnostic batch` | Fixed same-prompt direct batch sizes `1/4/8`. | Production continuous batching or mixed-request scheduling. |
 | `first mixed-request serving gate` | Greedy-only EP2 scheduler path with explicit admission/rejection/deferral, per-request host-side decode `DecodeCache`, active cap `8`, and exact sequential-oracle E2E. | vLLM parity, sparse dispatch, production EP readiness, HTTP throughput scaling, non-greedy sampling, or logprobs support. |
-| `HTTP trace/subgroup evidence` | `/v1/completions` requests have per-request `openinfer_http_trace` rows, and HTTP sweeps show non-1 `active_set_size` and `decode_batch_size_max`. | Fair vLLM parity, long-prompt latency readiness, or a before/after percentage unless a paired baseline run is recorded. |
+| `HTTP trace/subgroup evidence` | `/v1/completions` requests have per-request `openinfer_http_trace` rows; HTTP sweeps show non-1 `active_set_size`, `decode_batch_size_max`, phase timing, and batched-vs-singleton decode-step counts. | Fair vLLM parity, long-prompt latency readiness, backend/kernel attribution, or a before/after percentage unless a paired baseline run is recorded. |
 | `HTTP reliability lifecycle gate` | `/v1/completions` cancel/disconnect/reject/overload/mixed-failure scenarios have terminal reason counts, trace coverage, active/pending/decode maxima, output hashes, and clean follow-up recovery evidence. | Production EP readiness, soak stability, SLO latency, vLLM parity, throughput improvement, sparse dispatch, or multi-node EP support. |
 | `covered NCCL decode graph probe` | Probe-only batch-1 `Hello` decode step captured, instantiated, replayed, and token-verified under CUDA Graph. | Default serving graph coverage, multi-step graph replay, batch `4/8` graph coverage, or performance improvement. |
 | `HTTP concurrency pressure` | `vllm bench serve --max-concurrency N` against an HTTP endpoint. | True OpenInfer batch size unless the engine path proves it. |

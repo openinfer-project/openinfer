@@ -164,12 +164,33 @@ def summarize(values: list[float]) -> dict[str, float | int | None]:
     }
 
 
+def summarize_counts(values: list[int]) -> dict[str, int | None]:
+    if not values:
+        return {
+            "min": None,
+            "max": None,
+            "total": None,
+            "samples": 0,
+        }
+    return {
+        "min": min(values),
+        "max": max(values),
+        "total": sum(values),
+        "samples": len(values),
+    }
+
+
 def summarize_trace_ms(measured: list[RequestResult]) -> dict[str, Any]:
     fields = [
         "frontend_to_queue_ms",
         "admission_queue_ms",
+        "queue_wait_ms",
         "prefill_ms",
         "first_decode_ms",
+        "decode_mean_ms",
+        "decode_total_ms",
+        "scheduled_to_first_token_ms",
+        "scheduled_to_terminal_ms",
         "stream_flush_ms",
     ]
     phase_summary: dict[str, Any] = {}
@@ -191,6 +212,24 @@ def summarize_trace_ms(measured: list[RequestResult]) -> dict[str, Any]:
         for result in traced
         if isinstance(result.server_trace.get("decode_batch_size_max"), int)
     ]
+    batch_decode_steps = [
+        int(result.server_trace["batch_decode_steps"])
+        for result in traced
+        if isinstance(result.server_trace.get("batch_decode_steps"), int)
+    ]
+    singleton_decode_steps = [
+        int(result.server_trace["singleton_decode_steps"])
+        for result in traced
+        if isinstance(result.server_trace.get("singleton_decode_steps"), int)
+    ]
+    decode_step_counts = [
+        int(result.server_trace["decode_step_count"])
+        for result in traced
+        if isinstance(result.server_trace.get("decode_step_count"), int)
+    ]
+    batched = sum(batch_decode_steps)
+    singleton = sum(singleton_decode_steps)
+    total_decode_steps = batched + singleton
     return {
         "source": "server log lines matching `openinfer_http_trace`; frontend_to_queue includes HTTP ingress, tokenization, and vLLM submit before engine queue",
         "traced_requests": len(traced),
@@ -198,6 +237,12 @@ def summarize_trace_ms(measured: list[RequestResult]) -> dict[str, Any]:
         "phases_ms": phase_summary,
         "active_set_size_max": max(active_set_sizes) if active_set_sizes else None,
         "decode_batch_size_max": max(decode_batch_sizes) if decode_batch_sizes else None,
+        "decode_steps": {
+            "per_request": summarize_counts(decode_step_counts),
+            "batched_total": batched,
+            "singleton_total": singleton,
+            "batched_share": (batched / total_decode_steps) if total_decode_steps else None,
+        },
     }
 
 

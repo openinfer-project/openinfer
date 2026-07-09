@@ -6,8 +6,12 @@ pub(super) struct RequestTrace {
     pub(super) scheduled_at_unix_s: f64,
     pub(super) prefill_done_unix_s: Option<f64>,
     pub(super) first_token_emit_unix_s: Option<f64>,
+    pub(super) terminal_unix_s: Option<f64>,
     pub(super) prefill_ms: Option<f64>,
     pub(super) first_decode_ms: Option<f64>,
+    pub(super) decode_total_ms: f64,
+    pub(super) decode_step_count: usize,
+    pub(super) singleton_decode_steps: usize,
     pub(super) active_set_size_max: usize,
     pub(super) pending_queue_size_max: usize,
     pub(super) active_set_size_at_terminal: usize,
@@ -34,8 +38,12 @@ impl RequestTrace {
             scheduled_at_unix_s,
             prefill_done_unix_s: Some(prefill_done_unix_s),
             first_token_emit_unix_s: None,
+            terminal_unix_s: None,
             prefill_ms: Some(prefill_ms),
             first_decode_ms: None,
+            decode_total_ms: 0.0,
+            decode_step_count: 0,
+            singleton_decode_steps: 0,
             active_set_size_max: 1,
             pending_queue_size_max: 0,
             active_set_size_at_terminal: 0,
@@ -51,8 +59,12 @@ impl RequestTrace {
             scheduled_at_unix_s,
             prefill_done_unix_s: None,
             first_token_emit_unix_s: None,
+            terminal_unix_s: None,
             prefill_ms: None,
             first_decode_ms: None,
+            decode_total_ms: 0.0,
+            decode_step_count: 0,
+            singleton_decode_steps: 0,
             active_set_size_max: 0,
             pending_queue_size_max: 0,
             active_set_size_at_terminal: 0,
@@ -77,9 +89,13 @@ impl RequestTrace {
 
     pub(super) fn note_decode_step(&mut self, batch_size: usize, decode_ms: f64) {
         self.first_decode_ms.get_or_insert(decode_ms);
+        self.decode_total_ms += decode_ms;
+        self.decode_step_count += 1;
         self.decode_batch_size_max = self.decode_batch_size_max.max(batch_size);
         if batch_size > 1 {
             self.batch_decode_steps += 1;
+        } else {
+            self.singleton_decode_steps += 1;
         }
     }
 
@@ -88,9 +104,28 @@ impl RequestTrace {
         active_set_size_at_terminal: usize,
         pending_queue_size_at_terminal: usize,
     ) {
+        self.terminal_unix_s = Some(openinfer_engine::engine::unix_now_s());
         self.active_set_size_at_terminal = active_set_size_at_terminal;
         self.pending_queue_size_at_terminal = pending_queue_size_at_terminal;
         self.note_scheduler_state(active_set_size_at_terminal, pending_queue_size_at_terminal);
+    }
+
+    fn queue_wait_ms(&self) -> f64 {
+        (self.scheduled_at_unix_s - self.queued_at_unix_s).max(0.0) * 1000.0
+    }
+
+    fn scheduled_to_first_token_ms(&self) -> Option<f64> {
+        self.first_token_emit_unix_s
+            .map(|first| (first - self.scheduled_at_unix_s).max(0.0) * 1000.0)
+    }
+
+    fn scheduled_to_terminal_ms(&self) -> Option<f64> {
+        self.terminal_unix_s
+            .map(|terminal| (terminal - self.scheduled_at_unix_s).max(0.0) * 1000.0)
+    }
+
+    fn decode_mean_ms(&self) -> Option<f64> {
+        (self.decode_step_count > 0).then(|| self.decode_total_ms / self.decode_step_count as f64)
     }
 }
 
@@ -108,8 +143,15 @@ pub(super) fn http_trace_payload(
         "scheduled_at_unix_s": trace.scheduled_at_unix_s,
         "prefill_done_unix_s": trace.prefill_done_unix_s,
         "first_token_emit_unix_s": trace.first_token_emit_unix_s,
+        "terminal_unix_s": trace.terminal_unix_s,
+        "queue_wait_ms": trace.queue_wait_ms(),
+        "scheduled_to_first_token_ms": trace.scheduled_to_first_token_ms(),
+        "scheduled_to_terminal_ms": trace.scheduled_to_terminal_ms(),
         "prefill_ms": trace.prefill_ms,
         "first_decode_ms": trace.first_decode_ms,
+        "decode_total_ms": trace.decode_total_ms,
+        "decode_mean_ms": trace.decode_mean_ms(),
+        "decode_step_count": trace.decode_step_count,
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "finish_reason": finish_reason_label(finish_reason),
@@ -123,6 +165,7 @@ pub(super) fn http_trace_payload(
             && trace.pending_queue_size_at_terminal == 0,
         "decode_batch_size_max": trace.decode_batch_size_max,
         "batch_decode_steps": trace.batch_decode_steps,
+        "singleton_decode_steps": trace.singleton_decode_steps,
     });
     if let Some(error) = error
         && let Some(object) = payload.as_object_mut()

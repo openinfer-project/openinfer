@@ -521,6 +521,42 @@ def trace_missing_count(trace: Any) -> int | None:
     return int(value) if isinstance(value, (int, float)) else None
 
 
+def trace_phase(trace: Any, field: str) -> Any:
+    if not isinstance(trace, dict):
+        return None
+    phases = trace.get("phases_ms")
+    if not isinstance(phases, dict):
+        return None
+    return phases.get(field)
+
+
+def trace_decode_steps(trace: Any) -> Any:
+    if not isinstance(trace, dict):
+        return None
+    return trace.get("decode_steps")
+
+
+def trace_summary_for_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    trace = payload.get("server_trace", {})
+    return {
+        "trace": trace,
+        "missing_trace_count": trace_missing_count(trace),
+        "active_set_size_max": trace.get("active_set_size_max") if isinstance(trace, dict) else None,
+        "decode_batch_size_max": trace.get("decode_batch_size_max") if isinstance(trace, dict) else None,
+        "decode_steps": trace_decode_steps(trace),
+        "phase_ms": {
+            "queue_wait": trace_phase(trace, "queue_wait_ms"),
+            "prefill": trace_phase(trace, "prefill_ms"),
+            "first_decode": trace_phase(trace, "first_decode_ms"),
+            "decode_mean": trace_phase(trace, "decode_mean_ms"),
+            "decode_total": trace_phase(trace, "decode_total_ms"),
+            "scheduled_to_first_token": trace_phase(trace, "scheduled_to_first_token_ms"),
+            "scheduled_to_terminal": trace_phase(trace, "scheduled_to_terminal_ms"),
+            "stream_flush": trace_phase(trace, "stream_flush_ms"),
+        },
+    }
+
+
 def correctness_passed(comparison: dict[str, Any]) -> bool:
     return (
         comparison.get("classification") == "all_token_text_exact"
@@ -1000,10 +1036,10 @@ def run_openinfer_trace_pass(args: argparse.Namespace, out_dir: Path) -> list[di
                         "artifact": display_path(out),
                         "completed": payload["summary"]["completed"],
                         "failed": payload["summary"]["failed"],
+                        "timeouts": payload["summary"]["timeouts"],
                         "output_tok_s": payload["summary"]["output_tokens_per_s"],
-                        "trace": payload.get("server_trace", {}),
                     }
-                    cell["missing_trace_count"] = trace_missing_count(cell["trace"])
+                    cell.update(trace_summary_for_payload(payload))
                     row["cells"].append(cell)
             row["passed"] = bool(row["cells"]) and all(
                 cell.get("failed", 0) == 0 for cell in row["cells"]
@@ -1187,9 +1223,8 @@ def summarize_existing(args: argparse.Namespace) -> dict[str, Any]:
                 "failed": payload.get("summary", {}).get("failed"),
                 "timeouts": payload.get("summary", {}).get("timeouts"),
                 "output_tok_s": payload.get("summary", {}).get("output_tokens_per_s"),
-                "trace": payload.get("server_trace", {}),
             }
-            cell["missing_trace_count"] = trace_missing_count(cell["trace"])
+            cell.update(trace_summary_for_payload(payload))
             row["cells"].append(cell)
         observed_concurrency = {
             cell.get("concurrency")
