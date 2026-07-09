@@ -53,6 +53,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | `models/qwen35/kernel-plan.md` | Qwen3.5-4B has a `openinfer_qwen35_4b::kernel_plan()` static descriptor mirroring the qwen3 module — enumerates every prefill/decode/unified op with its Rust call site, backend, and notes, so you can dump the active kernel mix without reading call sites. Pure refactor (issue #256), no kernel behavior change. |
 | `models/qwen35/batched-step-tail.md` | Qwen3.5 issue #353 implementation record: final prefill tail is batched, decode/unified sample from batched logits, host full-vocab copies are logprobs-only, HF + scheduler e2e pass, and final serving A/B supports only the first-token/short-output TTFT claim. |
 | `models/qwen35/tp-design.md` | Qwen3.5 TP design: Phase 1 is eager dense TP on Qwen3's controller/worker runtime; validate TP2 first, fail closed for indivisible degrees and TP+CUDA Graph, shard dense full-attention/MLP, and leave sharded linear/GDR state to follow-up. |
+| `models/qwen35/tp-implementation.md` | Qwen3.5 TP Phase 1 implementation record: eager dense TP2 worker/scheduler path, short/long HF logits gates, scheduler e2e, and real OpenAI-compatible HTTP smoke pass; remaining TP work is kept as follow-up, not a Phase 1 claim. |
 
 ## models / glm52
 
