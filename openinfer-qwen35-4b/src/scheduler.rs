@@ -436,9 +436,16 @@ fn scheduler_loop(
         let can_capture_dflash_prefill =
             dflash.is_some() && active.is_empty() && scheduled.len() == 1;
         let force_prefill_for_dflash = can_capture_dflash_prefill
-            && scheduled
-                .iter()
-                .any(|pending| should_capture_dflash_prefill_context(&pending.req));
+            && dflash.as_ref().is_some_and(|dflash| {
+                scheduled.iter().any(|pending| {
+                    can_capture_dflash_prefill_chunk(
+                        &pending.req,
+                        pending.local_id,
+                        pending.cursor,
+                        dflash,
+                    )
+                })
+            });
         if let Some(plan) =
             plan::build_next_plan(!active.is_empty() && !force_prefill_for_dflash, scheduled)
         {
@@ -520,8 +527,16 @@ fn prefill_batch(
 ) {
     let mut chunk = ScheduledChunk::from(scheduled);
     let should_capture_dflash = can_capture_dflash_prefill
-        && dflash.is_some()
-        && chunk.reqs.iter().any(should_capture_dflash_prefill_context);
+        && dflash.as_ref().is_some_and(|dflash| {
+            (0..chunk.reqs.len()).any(|i| {
+                can_capture_dflash_prefill_chunk(
+                    &chunk.reqs[i],
+                    chunk.local_ids[i],
+                    chunk_start(&chunk, i),
+                    dflash,
+                )
+            })
+        });
     let capture_layer_ids = dflash
         .as_ref()
         .filter(|_| should_capture_dflash)
@@ -552,8 +567,9 @@ fn prefill_batch(
                 record_dflash_prefill_context(model, &mut chunk, dflash, captured_hidden.as_ref())
             {
                 warn!("DFlash prefill context failed: {e}");
-                fail_chunk(chunk, &e.to_string());
-                return;
+                for local_id in &chunk.local_ids {
+                    dflash.drop_request(*local_id);
+                }
             }
         } else {
             for local_id in &chunk.local_ids {
@@ -1325,16 +1341,21 @@ fn record_dflash_prefill_context(
     let mut token_offset = 0usize;
     for (i, req) in chunk.reqs.iter().enumerate() {
         let local_id = chunk.local_ids[i];
-        let chunk_start = chunk.ends[i] - chunk.windows[i].len();
+        let chunk_start = chunk_start(chunk, i);
         if should_capture_dflash_prefill_context(req) {
             let max_cache_len =
                 (req.prompt_tokens.len() + req.max_tokens + dflash.model.block_size())
                     .min(dflash.model.max_position_embeddings());
             let mut state = match dflash.requests.remove(&local_id) {
                 Some(state) => state,
-                None => dflash
+                None if chunk_start == 0 => dflash
                     .model
                     .new_request_state(model.device_ctx(), max_cache_len)?,
+                None => {
+                    dflash.drop_request(local_id);
+                    token_offset += chunk.windows[i].len();
+                    continue;
+                }
             };
             let pending_len = state.pending_context_len().unwrap_or(0);
             anyhow::ensure!(
@@ -1357,8 +1378,22 @@ fn record_dflash_prefill_context(
     Ok(())
 }
 
+fn can_capture_dflash_prefill_chunk(
+    req: &SchedulerRequest,
+    local_id: usize,
+    chunk_start: usize,
+    dflash: &DFlashSchedulerState,
+) -> bool {
+    should_capture_dflash_prefill_context(req)
+        && (chunk_start == 0 || dflash.requests.contains_key(&local_id))
+}
+
 fn should_capture_dflash_prefill_context(req: &SchedulerRequest) -> bool {
-    req.logprobs == 0 && !req.echo && req.params.is_greedy()
+    req.lora_adapter.is_none() && req.logprobs == 0 && !req.echo && req.params.is_greedy()
+}
+
+fn chunk_start(chunk: &ScheduledChunk, idx: usize) -> usize {
+    chunk.ends[idx] - chunk.windows[idx].len()
 }
 
 /// Dispatch sampled decode tokens: send events, check EOS/limits, retire finished.
