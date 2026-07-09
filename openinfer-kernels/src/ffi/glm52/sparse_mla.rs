@@ -14,6 +14,8 @@ unsafe extern "C" {
         max_slots: i64,
         topk: i32,
         heads: i32,
+        num_splits: i32,
+        head_slots: i32,
         sm_scale: f32,
         stream: CUstream,
     ) -> CUresult;

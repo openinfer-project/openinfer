@@ -31,7 +31,8 @@
 // cudaError_t. Signature owned by tools/tilelang/glm52/generate.py.
 extern "C" int glm52_tilelang_sparse_mla_decode(
     const void* q, const void* cache, const int* indices, float* o_part,
-    float* ml, int batch, long long num_slots, int topk, cudaStream_t stream);
+    float* ml, int batch, long long num_slots, int topk, int num_splits,
+    int head_slots, cudaStream_t stream);
 
 namespace {
 
@@ -45,8 +46,17 @@ namespace {
 // gap vs FlashMLA (in-situ 28.5 us vs 18.0 at 10k ctx; flash's scheduler
 // metadata gives the one real row the whole grid) needs dynamic per-row
 // split planning, not a bigger static count.
+// Changing kNumSplits requires the same value in the generator
+// (generate.py NUM_SPLITS) and the Rust scratch sizing
+// (GLM52_SPARSE_MLA_NUM_SPLITS); the chain is runtime-validated end to end
+// (Rust -> entry -> generated launcher), so a lone edit fails loudly instead
+// of writing o_part out of bounds. Same for kHeadSlots.
 constexpr int kNumSplits = 16;
 constexpr int kHeadSlots = 16;  // partial store width: real heads + zero pads
+static_assert(kNumSplits >= 1 && kNumSplits <= 32,
+              "combine owns one lane per split within a single warp");
+constexpr unsigned kSplitLaneMask =
+    kNumSplits == 32 ? 0xffffffffu : ((1u << kNumSplits) - 1u);
 constexpr int kDqk = 576;
 constexpr int kDv = 512;
 constexpr int kCacheBytes = 656;
@@ -84,14 +94,14 @@ __global__ void glm52_sparse_mla_combine_kernel(
     float m_star = (pair.y > 0.f) ? pair.x : -INFINITY;
 #pragma unroll
     for (int off = kNumSplits / 2; off > 0; off >>= 1)
-      m_star = fmaxf(m_star, __shfl_xor_sync(0x0000ffffu, m_star, off));
+      m_star = fmaxf(m_star, __shfl_xor_sync(kSplitLaneMask, m_star, off));
     const float w =
         (pair.y > 0.f && m_star != -INFINITY) ? exp2f(pair.x - m_star) : 0.f;
     weights[threadIdx.x] = w;
     float l_total = w * pair.y;
 #pragma unroll
     for (int off = kNumSplits / 2; off > 0; off >>= 1)
-      l_total += __shfl_xor_sync(0x0000ffffu, l_total, off);
+      l_total += __shfl_xor_sync(kSplitLaneMask, l_total, off);
     if (threadIdx.x == 0) inv_l = (l_total > 0.f) ? 1.f / l_total : 0.f;
   }
   __syncthreads();
@@ -218,7 +228,15 @@ CUresult glm52_sparse_mla_decode_cuda(const void* q, const void* cache,
                                       const int* indices, float* o_part,
                                       float* ml_part, void* latent, int batch,
                                       long long max_slots, int topk, int heads,
+                                      int num_splits, int head_slots,
                                       float sm_scale, cudaStream_t stream) {
+  // num_splits / head_slots are the Rust scratch-sizing constants; they must
+  // match this file's combine layout AND the generated main kernel (which
+  // re-validates them) — a mismatch means o_part indexing disagrees across
+  // layers, so refuse to launch.
+  if (num_splits != kNumSplits || head_slots != kHeadSlots) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
   if (q == nullptr || cache == nullptr || indices == nullptr ||
       o_part == nullptr || ml_part == nullptr || latent == nullptr ||
       batch <= 0 || max_slots <= 0 || heads <= 0 || heads > kHeadSlots ||
@@ -227,7 +245,8 @@ CUresult glm52_sparse_mla_decode_cuda(const void* q, const void* cache,
   }
 
   const int rc = glm52_tilelang_sparse_mla_decode(
-      q, cache, indices, o_part, ml_part, batch, max_slots, topk, stream);
+      q, cache, indices, o_part, ml_part, batch, max_slots, topk, kNumSplits,
+      kHeadSlots, stream);
   if (rc != 0) return map_launcher_error(rc);
 
   const dim3 grid(batch, heads);

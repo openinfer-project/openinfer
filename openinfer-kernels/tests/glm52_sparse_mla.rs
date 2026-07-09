@@ -134,6 +134,7 @@ fn delta(a: &[bf16], b: &[bf16], batch: usize, heads: usize) -> Delta {
 struct Rig {
     ctx: DeviceContext,
     cache: cudarc::driver::CudaSlice<u8>,
+    is_sm90: bool,
     flash_sm_parts: Option<usize>,
 }
 
@@ -144,11 +145,18 @@ impl Rig {
         let cache_host = build_cache(&mut rng);
         let mut cache = ctx.stream.alloc_zeros::<u8>(cache_host.len())?;
         ctx.stream.memcpy_htod(&cache_host, &mut cache)?;
-        // FlashMLA is sm90-only; elsewhere the f64 reference alone gates.
-        let flash_sm_parts = glm52_flashmla_sparse_decode_num_sm_parts().ok();
+        let is_sm90 = ctx.ctx.attribute(
+            cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+        )? == 9;
+        // The FlashMLA leg only exists on sm90 — and there a failing
+        // sm_parts query is a real failure, not an architecture skip.
+        let flash_sm_parts = is_sm90
+            .then(glm52_flashmla_sparse_decode_num_sm_parts)
+            .transpose()?;
         Ok(Self {
             ctx,
             cache,
+            is_sm90,
             flash_sm_parts,
         })
     }
@@ -298,7 +306,7 @@ impl Rig {
 #[ignore = "requires an sm90 GPU (the TileLang main kernel is sm_90a-only)"]
 fn sparse_mla_parity_gate() -> Result<()> {
     let mut rig = Rig::new()?;
-    if rig.flash_sm_parts.is_none() {
+    if !rig.is_sm90 {
         println!("(not sm90: TileLang main kernel is a NOT_SUPPORTED stub, skipping)");
         return Ok(());
     }

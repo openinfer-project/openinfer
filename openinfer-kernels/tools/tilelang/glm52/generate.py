@@ -61,7 +61,29 @@ import tilelang.language as T
 from tilelang.env import CUTLASS_INCLUDE_DIR, TILELANG_TEMPLATE_PATH
 
 
+# TileLang releases change codegen in ways this generator depends on: 0.1.9
+# lowers dynamic smem WITHOUT the void*-offset declarations that
+# dynamic_smem_bytes() parses (zero regex matches -> loud failure), and the
+# kernel signature can drift too. Bumping requires revalidating
+# EXPECTED_PARAMS, the smem accounting, AND the H200 parity gate — don't
+# just widen this check.
+KNOWN_GOOD_TILELANG = "0.1.12"
+if tilelang.__version__ != KNOWN_GOOD_TILELANG:
+    raise RuntimeError(
+        f"tilelang {tilelang.__version__} is not the validated "
+        f"{KNOWN_GOOD_TILELANG}; point OPENINFER_TILELANG_PYTHON at an env "
+        "with the pinned version, or revalidate the codegen contract and "
+        "bump KNOWN_GOOD_TILELANG"
+    )
+
 tilelang.set_log_level("WARNING")
+
+# Lower for Hopper explicitly: the kernel is compiled by nvcc later, so
+# generation must not depend on the GPU in the build machine ("auto" target
+# fails on non-Hopper hosts even when cross-building with
+# OPENINFER_CUDA_SM=90). Dict form — 0.1.12 rejects attribute-carrying
+# target strings.
+SM90A_TARGET = {"kind": "cuda", "arch": "sm_90a"}
 
 # Production only runs topk 2048: the short-context tier (topk 256 while
 # every row's context fit in it) was dropped — agent traffic starts well past
@@ -102,7 +124,10 @@ SMEM_BUFFER_BYTES = {
 }
 
 
-@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True})
+@tilelang.jit(
+    target=SM90A_TARGET,
+    pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True},
+)
 def glm52_sparse_mla_tl(
     Q,
     KVBytes,
@@ -357,8 +382,12 @@ def glm52_sparse_mla_tl(
         elif tx >= 256:
             # producer: cp.async gather of packed 656B tokens through the
             # three aliased views; 16 threads per token, 8 tokens per round.
-            # Out-of-bound slots (short-tier partial stages) and -1 indices
-            # flag invalid but clamp to slot 0 and gather real bytes anyway.
+            # Stage-tail slots (tok >= TPC) and -1 indices flag invalid and
+            # clamp to slot 0, gathering slot 0's real bytes. An index
+            # >= num_slots is outside the indexer contract: the generated
+            # cp.async predicate zero-fills it while is_kv_valid stays TRUE
+            # (it attends with zero logits) — unlike the f64 reference,
+            # which __trap()s on it.
             T.set_max_nreg(104, 0)
             for i_i in T.serial(OUTER):
                 # ---- buffer 0 ----
@@ -555,6 +584,12 @@ def main() -> None:
 // each TP rank's device opted in (a process-wide once left 7 of 8 ranks
 // launching without the opt-in). Launches happen at graph-capture time only,
 // so the extra driver call never sits on the decode hot path.
+//
+// num_splits / head_slots are the caller's compile-time constants, validated
+// against the values baked into this instantiation: the split count and
+// partial store width live in three languages (this generator, the CUDA
+// combine, the Rust scratch sizing) and a silent mismatch is a device-side
+// OOB write into the o_part arena.
 extern "C" int glm52_tilelang_sparse_mla_decode(
     const void* q,
     const void* cache,
@@ -564,9 +599,14 @@ extern "C" int glm52_tilelang_sparse_mla_decode(
     int batch,
     long long num_slots,
     int topk,
+    int num_splits,
+    int head_slots,
     cudaStream_t stream) {{
   constexpr int kThreads = 384;
   constexpr int kSharedBytes = {smem_bytes};
+  if (num_splits != {NUM_SPLITS} || head_slots != {HEAD_SLOTS_OUT}) {{
+    return static_cast<int>(cudaErrorInvalidValue);
+  }}
   if (num_slots <= 0 || num_slots > 0x7fffffffLL) {{
     return static_cast<int>(cudaErrorInvalidValue);
   }}

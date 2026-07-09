@@ -16,8 +16,17 @@ use super::flashmla_sparse::{
     GLM52_FLASHMLA_SPARSE_V_HEAD_DIM,
 };
 
+/// Split count and partial store width of the kernel pair. Also baked into
+/// the TileLang generator (`NUM_SPLITS`/`HEAD_SLOTS_OUT`) and the CUDA
+/// combine (`kNumSplits`/`kHeadSlots`); the launch passes them down and both
+/// layers validate, so a lone edit fails at the first launch instead of
+/// writing `o_part` out of bounds.
 pub const GLM52_SPARSE_MLA_NUM_SPLITS: usize = 16;
 pub const GLM52_SPARSE_MLA_HEAD_SLOTS: usize = 16;
+/// GLM5.2's softmax scale, baked into the TileLang kernel at generation
+/// time. Validated here by name — the CUDA entry would only report a bare
+/// INVALID_VALUE.
+pub const GLM52_SPARSE_MLA_SM_SCALE: f32 = 0.0625;
 /// The TileLang main kernel is AOT-instantiated per topk
 /// (`tools/tilelang/glm52/generate.py` `TOPKS`); production runs only the
 /// full DSA topk (the 256 short tier was dropped — see the note there for
@@ -59,8 +68,10 @@ impl Glm52SparseMlaDecode {
             self.heads
         );
         ensure!(
-            self.sm_scale.is_finite() && self.sm_scale > 0.0,
-            "GLM5.2 sparse MLA decode sm_scale must be finite and positive"
+            self.sm_scale == GLM52_SPARSE_MLA_SM_SCALE,
+            "GLM5.2 sparse MLA decode sm_scale {} != {GLM52_SPARSE_MLA_SM_SCALE} \
+             (the TileLang kernel bakes the softmax scale at generation time)",
+            self.sm_scale
         );
         Ok(())
     }
@@ -139,6 +150,8 @@ pub fn glm52_sparse_mla_decode_launch(
             contract.max_slots() as i64,
             contract.topk as i32,
             contract.heads as i32,
+            GLM52_SPARSE_MLA_NUM_SPLITS as i32,
+            GLM52_SPARSE_MLA_HEAD_SLOTS as i32,
             contract.sm_scale,
             ctx.stream.cu_stream(),
         )

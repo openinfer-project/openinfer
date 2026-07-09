@@ -829,7 +829,7 @@ fn write_glm52_tilelang_stub(out_dir: &Path) -> PathBuf {
          #include <cuda_runtime.h>\n\
          extern \"C\" int glm52_tilelang_sparse_mla_decode(\n\
              const void*, const void*, const int*, float*, float*, int,\n\
-             long long, int, cudaStream_t) {\n\
+             long long, int, int, int, cudaStream_t) {\n\
            return static_cast<int>(cudaErrorNotSupported);\n\
          }\n",
     )
