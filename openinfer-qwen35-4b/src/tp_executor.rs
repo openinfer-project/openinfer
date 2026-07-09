@@ -561,6 +561,7 @@ impl TpWorkerState {
         );
 
         let mut primary_results = Vec::new();
+        let mut final_row_idx = 0usize;
         for chunk in chunks {
             let state_idx = self.ensure_prefill_state(chunk.request_id)?;
             let state = &mut self.requests[state_idx];
@@ -580,9 +581,14 @@ impl TpWorkerState {
 
             if chunk.finish_prefill {
                 if self.rank == 0 {
-                    let result = self.sample_final_prefill_chunk(chunk, &logits, sample_seed)?;
+                    // TP prefill samples final chunks one row at a time. Offset
+                    // by the final-row index so rows from the same command do
+                    // not reuse the same sampling stream.
+                    let row_seed = sample_seed.wrapping_add(final_row_idx as u64);
+                    let result = self.sample_final_prefill_chunk(chunk, &logits, row_seed)?;
                     primary_results.push(result);
                 }
+                final_row_idx += 1;
                 self.requests[state_idx].phase = TpRequestPhase::Decoding;
             }
         }
