@@ -1,4 +1,6 @@
-use anyhow::{Result, bail};
+use std::{collections::BTreeMap, env};
+
+use anyhow::{Context, Result, bail, ensure};
 use cudarc::driver::CudaSlice;
 use half::bf16;
 use openinfer_core::{
@@ -28,6 +30,122 @@ use crate::{
     },
     nccl_backend::NaiveNcclEp2Backend,
 };
+
+#[derive(Clone, Copy)]
+pub(super) struct HostStagedRouteWork {
+    pub(super) token: usize,
+    pub(super) global_expert: usize,
+    pub(super) owner_rank: usize,
+    pub(super) weight: f32,
+}
+
+impl HostStagedRouteWork {
+    pub(super) fn new(token: usize, global_expert: usize, owner_rank: usize, weight: f32) -> Self {
+        Self {
+            token,
+            global_expert,
+            owner_rank,
+            weight,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum HostStagedExpertBatchPolicy {
+    Batched,
+    Serial,
+}
+
+impl HostStagedExpertBatchPolicy {
+    pub(super) fn from_env_value(raw: Option<&str>) -> Self {
+        match raw.map(str::trim).filter(|value| !value.is_empty()) {
+            Some("0" | "false" | "off" | "serial" | "legacy") => Self::Serial,
+            _ => Self::Batched,
+        }
+    }
+
+    fn use_serial(self) -> bool {
+        self == Self::Serial
+    }
+}
+
+fn host_staged_expert_batch_policy() -> HostStagedExpertBatchPolicy {
+    HostStagedExpertBatchPolicy::from_env_value(
+        env::var("OPENINFER_DSV2_LITE_HOST_STAGED_EXPERT_BATCH")
+            .ok()
+            .as_deref(),
+    )
+}
+
+pub(super) fn scatter_host_staged_group_output(
+    route_outputs: &mut [Option<Vec<f32>>],
+    route_indices: &[usize],
+    out: Vec<f32>,
+    hidden_size: usize,
+) -> Result<()> {
+    ensure!(
+        hidden_size > 0,
+        "host-staged expert output requires nonzero hidden size"
+    );
+    let expected_len = route_indices
+        .len()
+        .checked_mul(hidden_size)
+        .context("host-staged expert output length overflow")?;
+    ensure!(
+        out.len() == expected_len,
+        "host-staged expert output len mismatch: got {}, expected {}",
+        out.len(),
+        expected_len
+    );
+    for (group_row, route_index) in route_indices.iter().copied().enumerate() {
+        ensure!(
+            route_index < route_outputs.len(),
+            "host-staged route index {route_index} exceeds output slots {}",
+            route_outputs.len()
+        );
+        ensure!(
+            route_outputs[route_index].is_none(),
+            "host-staged route output {route_index} was assigned more than once"
+        );
+        let begin = group_row * hidden_size;
+        let end = begin + hidden_size;
+        route_outputs[route_index] = Some(out[begin..end].to_vec());
+    }
+    Ok(())
+}
+
+pub(super) fn accumulate_host_staged_route_output(
+    dst: &mut [f32],
+    route: HostStagedRouteWork,
+    out: Vec<f32>,
+    hidden_size: usize,
+) -> Result<()> {
+    ensure!(
+        hidden_size > 0,
+        "host-staged route output requires nonzero hidden size"
+    );
+    ensure!(
+        out.len() == hidden_size,
+        "host-staged route output len mismatch: got {}, expected {hidden_size}",
+        out.len()
+    );
+    let token_end = route
+        .token
+        .checked_add(1)
+        .and_then(|tokens| tokens.checked_mul(hidden_size))
+        .context("host-staged route output offset overflow")?;
+    ensure!(
+        token_end <= dst.len(),
+        "host-staged route token {} exceeds contribution rows {}",
+        route.token,
+        dst.len() / hidden_size
+    );
+    let token_begin = token_end - hidden_size;
+    for (dst, value) in dst[token_begin..token_end].iter_mut().zip(out) {
+        *dst += route.weight * value;
+    }
+    Ok(())
+}
 
 pub(super) struct FixedTopologyMoeScratch {
     rank0_topk_weight: CudaSlice<f32>,
@@ -156,16 +274,74 @@ impl DeepSeekV2LiteEp2Generator {
                 }
             },
         )?;
-        let mut rank0_contrib = vec![0.0f32; input.seq_len * self.config.hidden_size];
-        let mut rank1_contrib = vec![0.0f32; rank0_contrib.len()];
+        let route_count = routes.iter().map(Vec::len).sum();
+        let mut route_work = Vec::with_capacity(route_count);
+        let mut route_groups: BTreeMap<(usize, usize), Vec<usize>> = BTreeMap::new();
         let mut local_routes = 0usize;
         let mut remote_routes = 0usize;
 
         for (token, token_routes) in routes.iter().enumerate() {
-            let token_input =
-                &input_host[token * self.config.hidden_size..(token + 1) * self.config.hidden_size];
             for &(global_expert, weight) in token_routes {
                 let owner_rank = self.rank0.layout.owner_rank(global_expert)?;
+                let route_index = route_work.len();
+                route_work.push(HostStagedRouteWork::new(
+                    token,
+                    global_expert,
+                    owner_rank,
+                    weight,
+                ));
+                route_groups
+                    .entry((owner_rank, global_expert))
+                    .or_default()
+                    .push(route_index);
+                if owner_rank == 0 {
+                    local_routes += 1;
+                } else {
+                    remote_routes += 1;
+                }
+            }
+        }
+
+        let mut route_outputs = vec![None; route_work.len()];
+        if host_staged_expert_batch_policy().use_serial() {
+            for (route_index, route) in route_work.iter().enumerate() {
+                let section = if route.owner_rank == 0 {
+                    "host_staged_local_expert"
+                } else {
+                    "host_staged_remote_dispatch"
+                };
+                let expert_ctx = if route.owner_rank == 0 {
+                    &self.rank0.ctx
+                } else {
+                    &self.rank1.ctx
+                };
+                let begin = route.token * self.config.hidden_size;
+                let end = begin + self.config.hidden_size;
+                let (out, is_remote) = attribution.record_gpu_result(
+                    expert_ctx,
+                    phase,
+                    section,
+                    || format!("layer.{layer_idx}.{section}"),
+                    Some(layer_idx),
+                    token_index,
+                    || {
+                        self.expert_forward_host_token(
+                            layer_idx,
+                            route.global_expert,
+                            &input_host[begin..end],
+                        )
+                    },
+                )?;
+                let expected_remote = route.owner_rank != 0;
+                ensure!(
+                    is_remote == expected_remote,
+                    "host-staged expert owner mismatch for expert {}: expected remote={expected_remote}, got {is_remote}",
+                    route.global_expert
+                );
+                route_outputs[route_index] = Some(out);
+            }
+        } else {
+            for ((owner_rank, global_expert), route_indices) in route_groups {
                 let section = if owner_rank == 0 {
                     "host_staged_local_expert"
                 } else {
@@ -176,43 +352,56 @@ impl DeepSeekV2LiteEp2Generator {
                 } else {
                     &self.rank1.ctx
                 };
-                let dst = if owner_rank == 0 {
-                    &mut rank0_contrib
-                } else {
-                    &mut rank1_contrib
-                };
                 let (out, is_remote) = attribution.record_gpu_result(
                     expert_ctx,
                     phase,
                     section,
-                    || format!("layer.{layer_idx}.{section}"),
-                    Some(layer_idx),
-                    token_index,
-                    || self.expert_forward_host(layer_idx, global_expert, token_input),
-                )?;
-                if is_remote {
-                    remote_routes += 1;
-                } else {
-                    local_routes += 1;
-                }
-                let offset = token * self.config.hidden_size;
-                attribution.record_result(
-                    phase,
-                    "host_staged_combine_accumulate",
-                    || format!("layer.{layer_idx}.host_staged.combine_accumulate"),
+                    || format!("layer.{layer_idx}.{section}.expert{global_expert}"),
                     Some(layer_idx),
                     token_index,
                     || {
-                        for (dst, value) in dst[offset..offset + self.config.hidden_size]
-                            .iter_mut()
-                            .zip(out)
-                        {
-                            *dst += weight * value;
-                        }
-                        Ok(())
+                        self.expert_forward_host_batch(
+                            layer_idx,
+                            global_expert,
+                            &input_host,
+                            &route_work,
+                            &route_indices,
+                        )
                     },
                 )?;
+                let expected_remote = owner_rank != 0;
+                ensure!(
+                    is_remote == expected_remote,
+                    "host-staged expert owner mismatch for expert {global_expert}: expected remote={expected_remote}, got {is_remote}"
+                );
+                scatter_host_staged_group_output(
+                    &mut route_outputs,
+                    &route_indices,
+                    out,
+                    self.config.hidden_size,
+                )?;
             }
+        }
+
+        let mut rank0_contrib = vec![0.0f32; input.seq_len * self.config.hidden_size];
+        let mut rank1_contrib = vec![0.0f32; rank0_contrib.len()];
+        for (route_index, route) in route_work.iter().enumerate() {
+            let dst = if route.owner_rank == 0 {
+                &mut rank0_contrib
+            } else {
+                &mut rank1_contrib
+            };
+            let out = route_outputs[route_index].take().with_context(|| {
+                format!("missing host-staged expert output for route {route_index}")
+            })?;
+            attribution.record_result(
+                phase,
+                "host_staged_combine_accumulate",
+                || format!("layer.{layer_idx}.host_staged.combine_accumulate"),
+                Some(layer_idx),
+                token_index,
+                || accumulate_host_staged_route_output(dst, *route, out, self.config.hidden_size),
+            )?;
         }
         let routed_accum: Vec<_> = rank0_contrib
             .into_iter()
@@ -464,7 +653,55 @@ impl DeepSeekV2LiteEp2Generator {
         ops::add_batch_into(&self.rank0.ctx, &scratch.routed, &scratch.shared.out, out)
     }
 
-    fn expert_forward_host(
+    fn expert_forward_host_batch(
+        &self,
+        layer_idx: usize,
+        global_expert: usize,
+        input_host: &[bf16],
+        route_work: &[HostStagedRouteWork],
+        route_indices: &[usize],
+    ) -> Result<(Vec<f32>, bool)> {
+        let owner_rank = self.rank0.layout.owner_rank(global_expert)?;
+        let (ctx, expert) = match owner_rank {
+            0 => (
+                &self.rank0.ctx,
+                self.rank0.routed_expert(layer_idx, global_expert)?,
+            ),
+            1 => (
+                &self.rank1.ctx,
+                self.rank1.routed_expert(layer_idx, global_expert)?,
+            ),
+            other => bail!("routed expert {global_expert} maps to unsupported EP rank {other}"),
+        };
+
+        ensure!(
+            !route_indices.is_empty(),
+            "host-staged expert batch requires at least one route"
+        );
+        let mut batch_input = Vec::with_capacity(route_indices.len() * self.config.hidden_size);
+        for &route_index in route_indices {
+            let route = route_work[route_index];
+            ensure!(
+                route.global_expert == global_expert && route.owner_rank == owner_rank,
+                "host-staged expert batch mixed route: expected expert {global_expert}/rank {owner_rank}, got expert {}/rank {}",
+                route.global_expert,
+                route.owner_rank
+            );
+            let begin = route.token * self.config.hidden_size;
+            let end = begin + self.config.hidden_size;
+            batch_input.extend_from_slice(&input_host[begin..end]);
+        }
+        let input = hidden_from_bf16_host(
+            ctx,
+            &batch_input,
+            self.config.hidden_size,
+            route_indices.len(),
+        )?;
+        let out = dense_mlp_forward_per_token(ctx, &expert.dense, &input)?;
+        Ok((hidden_to_f32(ctx, &out)?, owner_rank != 0))
+    }
+
+    fn expert_forward_host_token(
         &self,
         layer_idx: usize,
         global_expert: usize,

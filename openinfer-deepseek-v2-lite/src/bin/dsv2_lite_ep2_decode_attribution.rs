@@ -6,6 +6,10 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use openinfer_deepseek_v2_lite::{DecodeGraphReadinessReport, DeepSeekV2LiteEp2Generator};
 use openinfer_engine::engine::EngineLoadOptions;
+use openinfer_kernels::ops::{
+    NumericPolicy, numeric_policy, per_token_served, reset_numeric_policy_counters,
+    set_numeric_policy,
+};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use vllm_text::tokenizer::{HuggingFaceTokenizer, Tokenizer};
@@ -13,6 +17,7 @@ use vllm_text::tokenizer::{HuggingFaceTokenizer, Tokenizer};
 const PROMPT: &str = "Hello";
 const OUTPUT_LEN: usize = 16;
 const MAX_BATCH_SIZE: usize = 8;
+const NUMERIC_POLICY_ENV: &str = "OPENINFER_DSV2_LITE_NUMERIC_POLICY";
 const EXPECTED_OUTPUT_SHA256_PAIRS: &[(&str, &str, &str)] = &[
     (
         "4fb4c8825fe4d2c4a1d966da25c259abdf675f4de4548daa5d41aea7dfe30225",
@@ -29,6 +34,7 @@ const EXPECTED_OUTPUT_SHA256_PAIRS: &[(&str, &str, &str)] = &[
 struct Cli {
     model_path: String,
     batch_size: usize,
+    numeric_policy: NumericPolicy,
     nccl_graph_smoke: bool,
     full_decode_graph_probe: bool,
     out: Option<PathBuf>,
@@ -38,6 +44,7 @@ fn main() -> Result<()> {
     let Some(cli) = parse_cli()? else {
         return Ok(());
     };
+    set_numeric_policy(cli.numeric_policy);
     let model_path = resolve_model_path(&cli.model_path);
     ensure!(
         model_path.join("config.json").exists(),
@@ -69,6 +76,7 @@ fn main() -> Result<()> {
         },
     )?;
     trace_stage("generator loaded");
+    reset_numeric_policy_counters();
     let (report, probe_status, probe_ready) = if cli.batch_size == 1 {
         trace_stage("run batch=1 attribution oracle");
         let (result, attribution) =
@@ -204,12 +212,14 @@ fn single_report(
         "backend": &result.stats.ep_backend,
         "config": {
             "batch_size": 1,
+            "numeric_policy": numeric_policy_name(numeric_policy()),
             "prompt": PROMPT,
             "prompt_token_ids": &prompt_tokens,
             "output_len": OUTPUT_LEN,
             "ep_size": result.stats.ep_size,
             "device_ordinals": &result.stats.device_ordinals,
         },
+        "gemm_policy": gemm_policy_report(),
         "accuracy": {
             "generated_token_ids": &result.tokens,
             "generated_text": &generated_text,
@@ -300,6 +310,7 @@ fn batch_report(
         "backend": &result.stats.ep_backend,
         "config": {
             "batch_size": result.tokens.len(),
+            "numeric_policy": numeric_policy_name(numeric_policy()),
             "prompt": PROMPT,
             "prompt_token_ids": prompt_tokens,
             "output_len": OUTPUT_LEN,
@@ -307,6 +318,7 @@ fn batch_report(
             "ep_size": result.stats.ep_size,
             "device_ordinals": &result.stats.device_ordinals,
         },
+        "gemm_policy": gemm_policy_report(),
         "accuracy": {
             "generated_token_ids": &result.tokens[0],
             "generated_text": &generated_text_by_row[0],
@@ -361,6 +373,7 @@ fn batch_report(
 fn parse_cli() -> Result<Option<Cli>> {
     let mut model_path = "models/DeepSeek-V2-Lite".to_string();
     let mut batch_size = 1;
+    let mut numeric_policy = parse_numeric_policy_env()?;
     let mut nccl_graph_smoke = false;
     let mut full_decode_graph_probe = false;
     let mut out = None;
@@ -383,6 +396,13 @@ fn parse_cli() -> Result<Option<Cli>> {
                     "--batch-size must be in 1..={MAX_BATCH_SIZE}, got {batch_size}"
                 );
             }
+            "--numeric-policy" => {
+                numeric_policy = parse_numeric_policy(
+                    &args
+                        .next()
+                        .context("--numeric-policy requires tuned|per-token")?,
+                )?;
+            }
             "--out" => {
                 out = Some(PathBuf::from(
                     args.next().context("--out requires a path argument")?,
@@ -396,12 +416,12 @@ fn parse_cli() -> Result<Option<Cli>> {
             }
             "-h" | "--help" => {
                 println!(
-                    "DeepSeek-V2-Lite EP2 decode attribution gate\n\nUSAGE:\n  dsv2_lite_ep2_decode_attribution [--model-path PATH] [--batch-size N] [--nccl-graph-smoke] [--full-decode-graph-probe] [--out PATH]\n\nThe gate is intentionally fixed to prompt=Hello, output_len=16, with batch-size in 1..=8. Select NCCL with OPENINFER_DSV2_LITE_EP_BACKEND=nccl. Use --nccl-graph-smoke to run a preallocated f32 NCCL all-reduce CUDA Graph capture/replay smoke after attribution. Use --full-decode-graph-probe to request the fail-closed full decode graph readiness probe for the retained batch-size=1 NCCL shape."
+                    "DeepSeek-V2-Lite EP2 decode attribution gate\n\nUSAGE:\n  dsv2_lite_ep2_decode_attribution [--model-path PATH] [--batch-size N] [--numeric-policy tuned|per-token] [--nccl-graph-smoke] [--full-decode-graph-probe] [--out PATH]\n\nThe gate is intentionally fixed to prompt=Hello, output_len=16, with batch-size in 1..=8. Select NCCL with OPENINFER_DSV2_LITE_EP_BACKEND=nccl. OPENINFER_DSV2_LITE_NUMERIC_POLICY or --numeric-policy selects the supported shared projection GEMM policy. Pin is intentionally rejected until DSV2-Lite has complete shape warmup coverage. Use --nccl-graph-smoke to run a preallocated f32 NCCL all-reduce CUDA Graph capture/replay smoke after attribution. Use --full-decode-graph-probe to request the fail-closed full decode graph readiness probe for the retained batch-size=1 NCCL shape."
                 );
                 return Ok(None);
             }
             other => bail!(
-                "unsupported argument `{other}`; supported flags: --model-path PATH, --batch-size N, --nccl-graph-smoke, --full-decode-graph-probe, --out PATH"
+                "unsupported argument `{other}`; supported flags: --model-path PATH, --batch-size N, --numeric-policy tuned|per-token, --nccl-graph-smoke, --full-decode-graph-probe, --out PATH"
             ),
         }
     }
@@ -412,10 +432,46 @@ fn parse_cli() -> Result<Option<Cli>> {
     Ok(Some(Cli {
         model_path,
         batch_size,
+        numeric_policy,
         nccl_graph_smoke,
         full_decode_graph_probe,
         out,
     }))
+}
+
+fn parse_numeric_policy_env() -> Result<NumericPolicy> {
+    match env::var(NUMERIC_POLICY_ENV) {
+        Ok(raw) => parse_numeric_policy(&raw)
+            .with_context(|| format!("invalid {NUMERIC_POLICY_ENV}={raw:?}")),
+        Err(env::VarError::NotPresent) => Ok(NumericPolicy::Tuned),
+        Err(err) => Err(err).context(format!("read {NUMERIC_POLICY_ENV}")),
+    }
+}
+
+fn parse_numeric_policy(raw: &str) -> Result<NumericPolicy> {
+    match raw.trim() {
+        "" | "tuned" => Ok(NumericPolicy::Tuned),
+        "per-token" | "per_token" | "pertoken" => Ok(NumericPolicy::PerToken),
+        other => bail!(
+            "numeric policy must be tuned | per-token, got `{other}`; pin is unsupported until DSV2-Lite projection shapes are warmed"
+        ),
+    }
+}
+
+fn numeric_policy_name(policy: NumericPolicy) -> &'static str {
+    match policy {
+        NumericPolicy::Tuned => "tuned",
+        NumericPolicy::Pin => "pin",
+        NumericPolicy::PerToken => "per-token",
+    }
+}
+
+fn gemm_policy_report() -> Value {
+    json!({
+        "numeric_policy": numeric_policy_name(numeric_policy()),
+        "per_token_served": per_token_served(),
+        "source": "openinfer-kernels projection GEMM policy counter; nonzero per_token_served proves the selected policy reached the GEMM launch path",
+    })
 }
 
 fn ep_report(stats: &openinfer_deepseek_v2_lite::GenerationStats) -> Value {
@@ -675,5 +731,37 @@ mod tests {
         assert!(message.contains("--full-decode-graph-probe failed"));
         assert!(message.contains("status=blocked_preflight"));
         assert!(message.contains("target/probe.json"));
+    }
+
+    #[test]
+    fn numeric_policy_parser_defaults_to_tuned() {
+        assert_eq!(
+            parse_numeric_policy("").unwrap(),
+            openinfer_kernels::ops::NumericPolicy::Tuned
+        );
+        assert_eq!(
+            parse_numeric_policy("tuned").unwrap(),
+            openinfer_kernels::ops::NumericPolicy::Tuned
+        );
+    }
+
+    #[test]
+    fn numeric_policy_parser_accepts_per_token_aliases() {
+        assert_eq!(
+            parse_numeric_policy("per-token").unwrap(),
+            openinfer_kernels::ops::NumericPolicy::PerToken
+        );
+        assert_eq!(
+            parse_numeric_policy("per_token").unwrap(),
+            openinfer_kernels::ops::NumericPolicy::PerToken
+        );
+    }
+
+    #[test]
+    fn numeric_policy_parser_rejects_pin_and_unknown_values() {
+        for value in ["pin", "batch"] {
+            let err = parse_numeric_policy(value).unwrap_err();
+            assert!(err.to_string().contains("numeric policy must be"));
+        }
     }
 }
