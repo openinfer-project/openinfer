@@ -150,21 +150,59 @@ pub fn gemm_lt_tune(
 /// Mirrors the GEMM_LT_PIN_* sentinels in csrc/shared/linear.cu.
 const GEMM_LT_PIN_UNTUNED: i32 = -1;
 const GEMM_LT_PIN_UNSUPPORTED: i32 = -2;
+const GEMM_LT_PIN_NONDET: i32 = -3;
+
+#[derive(Clone, Copy, Debug)]
+pub struct PinAlgoConfig {
+    pub splitk: i32,
+    pub reduction_scheme: i32,
+}
+
+impl PinAlgoConfig {
+    pub fn reduction_scheme_name(self) -> &'static str {
+        match self.reduction_scheme {
+            0 => "none",
+            1 => "inplace",
+            2 => "compute_type",
+            4 => "output_type",
+            _ => "unknown",
+        }
+    }
+}
 
 /// Pin one cublasLt algo for `(num_rows, cols)`, selected by the heuristic at `rep_n` (shape-only),
 /// reused for every N. Run on the GEMM-issuing thread (the plan cache is thread-local).
-pub fn gemm_lt_pin_tune(num_rows: usize, rep_n: usize, cols: usize) -> Result<()> {
-    let status = unsafe { ffi::gemm_lt_pin_tune_cuda(num_rows as i32, rep_n as i32, cols as i32) };
-    if status != 0 {
-        bail!(
+pub fn gemm_lt_pin_tune(num_rows: usize, rep_n: usize, cols: usize) -> Result<PinAlgoConfig> {
+    let mut splitk = 0;
+    let mut reduction_scheme = 0;
+    let status = unsafe {
+        ffi::gemm_lt_pin_tune_cuda(
+            num_rows as i32,
+            rep_n as i32,
+            cols as i32,
+            &raw mut splitk,
+            &raw mut reduction_scheme,
+        )
+    };
+    match status {
+        0 => Ok(PinAlgoConfig {
+            splitk,
+            reduction_scheme,
+        }),
+        GEMM_LT_PIN_NONDET => bail!(
+            "cublasLt pin tuning selected an unknown reduction scheme: m={}, k={}, reduction_scheme={}",
+            num_rows,
+            cols,
+            reduction_scheme
+        ),
+        s => bail!(
             "cublasLt pin tuning failed: status={}, m={}, rep_n={}, k={}",
-            status,
+            s,
             num_rows,
             rep_n,
             cols
-        );
+        ),
     }
-    Ok(())
 }
 
 /// Run the pinned `(rows, cols)` algo at this N. `Ok(false)` = algo can't serve this N; bails if
@@ -571,6 +609,16 @@ pub fn numeric_policy() -> NumericPolicy {
     }
 }
 
+/// NUMERIC_POLICY defaults to Tuned; only qwen3 sets Pin/PerToken, so typed GEMM (kimi) never fires this.
+pub(crate) fn ensure_tuned_policy(m: usize, n: usize, k: usize) -> Result<()> {
+    let policy = numeric_policy();
+    ensure!(
+        policy == NumericPolicy::Tuned,
+        "typed GEMM is not covered by the batch-invariant pin: policy={policy:?}, m={m}, n={n}, k={k}"
+    );
+    Ok(())
+}
+
 /// Count of projection GEMMs served by the pinned algo: process-global, mixed across prefill +
 /// decode + unified and across TP ranks. Under `Pin` a GEMM either serves (counted here) or
 /// `launch_gemm_pin` bails — there is no silent per-token fallback. Decode counts the graph
@@ -596,7 +644,7 @@ pub fn reset_numeric_policy_counters() {
 const PIN_REP_N: i32 = 32;
 
 /// Pin one `(num_rows, cols)` algo at the canonical `PIN_REP_N`, reused for all N.
-pub fn gemm_lt_pin_warmup(num_rows: usize, cols: usize) -> Result<()> {
+pub fn gemm_lt_pin_warmup(num_rows: usize, cols: usize) -> Result<PinAlgoConfig> {
     gemm_lt_pin_tune(num_rows, PIN_REP_N as usize, cols)
 }
 

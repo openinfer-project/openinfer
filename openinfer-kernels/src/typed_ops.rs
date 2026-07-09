@@ -614,6 +614,7 @@ fn launch_gemm(
     graphsafe: bool,
     ctx: &DeviceContext,
 ) -> Result<()> {
+    crate::ops::ensure_tuned_policy(m, n, k)?;
     unsafe {
         let status = if graphsafe {
             ffi::gemm_graphsafe_cuda(
@@ -658,6 +659,7 @@ fn launch_gemm_per_token(
     k: usize,
     ctx: &DeviceContext,
 ) -> Result<()> {
+    crate::ops::ensure_tuned_policy(m, batch, k)?;
     unsafe {
         let status = ffi::gemm_per_token_cuda(
             w_ptr,

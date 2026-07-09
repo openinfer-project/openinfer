@@ -372,6 +372,9 @@ impl Args {
                 "--batch-invariant is not supported with DFlash speculative decoding; enable one at a time"
             );
         }
+        if self.batch_invariant && self.tp_size > 1 {
+            bail!("--batch-invariant is not supported with --tp-size > 1; enable one at a time");
+        }
         if provided.contains("decode_sm_pct")
             && !matches!(self.decode_overlap, CliDecodeOverlap::GreenCtx)
         {

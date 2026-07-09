@@ -4,6 +4,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <map>
 
 static constexpr int CUBLAS_STATUS_ERROR_OFFSET = 100000;
@@ -57,6 +58,7 @@ static constexpr int GEMM_LT_UNTUNED = -1;
 // Keyed on {M,K} only (g_lt_plans uses {M,N,K}): one cublasLt algo chosen at rep_n, reused for every N.
 static constexpr int GEMM_LT_PIN_UNTUNED = -1;     // no pinned plan for {M,K}
 static constexpr int GEMM_LT_PIN_UNSUPPORTED = -2; // pinned algo cannot serve this N
+static constexpr int GEMM_LT_PIN_NONDET = -3;      // reduction scheme outside cublasLtReductionScheme_t
 struct LtPinPlan {
   cublasLtMatmulDesc_t op = nullptr;
   cublasLtMatrixLayout_t a = nullptr; // [K, M], independent of N
@@ -529,7 +531,7 @@ int gemm_lt_tune_cuda(const __nv_bfloat16 *const *Ws, int num_ws, int M, int N, 
 }
 
 // Pin one cublasLt algo for (M,K) at rep_n (heuristic top, no timing → deterministic), keyed {M,K}.
-int gemm_lt_pin_tune_cuda(int M, int rep_n, int K) {
+int gemm_lt_pin_tune_cuda(int M, int rep_n, int K, int *out_splitk, int *out_reduction_scheme) {
   // Dropped before any check, so every failure below leaves {M,K} unpinned and lt_pin_run reports
   // PIN_UNTUNED instead of serving the plan this call was meant to replace.
   const std::array<int, 2> key{M, K};
@@ -538,9 +540,11 @@ int gemm_lt_pin_tune_cuda(int M, int rep_n, int K) {
     lt_pin_destroy(existing->second);
     g_lt_pin_plans.erase(existing);
   }
-  if (M <= 0 || rep_n <= 0 || K <= 0) {
+  if (M <= 0 || rep_n <= 0 || K <= 0 || out_splitk == nullptr || out_reduction_scheme == nullptr) {
     return static_cast<int>(cudaErrorInvalidValue);
   }
+  *out_splitk = 0;
+  *out_reduction_scheme = 0;
   int rc = ensure_lt_resources();
   if (rc == static_cast<int>(cudaSuccess)) {
     rc = ensure_lt_pin_workspace();
@@ -578,6 +582,30 @@ int gemm_lt_pin_tune_cuda(int M, int rep_n, int K) {
   }
 
   plan.algo = results[0].algo;
+  int32_t splitk = 0;
+  uint32_t reduction_scheme = 0;
+  size_t written = 0;
+  status = cublasLtMatmulAlgoConfigGetAttribute(
+      &plan.algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &splitk, sizeof(splitk), &written);
+  if (status == CUBLAS_STATUS_SUCCESS) {
+    status = cublasLtMatmulAlgoConfigGetAttribute(&plan.algo,
+                                                  CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME,
+                                                  &reduction_scheme, sizeof(reduction_scheme),
+                                                  &written);
+  }
+  *out_splitk = static_cast<int>(splitk);
+  *out_reduction_scheme = static_cast<int>(reduction_scheme);
+  if (status != CUBLAS_STATUS_SUCCESS) {
+    lt_pin_destroy(plan);
+    return cublas_status_to_error(status);
+  }
+  if (reduction_scheme != static_cast<uint32_t>(CUBLASLT_REDUCTION_SCHEME_NONE) &&
+      reduction_scheme != static_cast<uint32_t>(CUBLASLT_REDUCTION_SCHEME_INPLACE) &&
+      reduction_scheme != static_cast<uint32_t>(CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE) &&
+      reduction_scheme != static_cast<uint32_t>(CUBLASLT_REDUCTION_SCHEME_OUTPUT_TYPE)) {
+    lt_pin_destroy(plan);
+    return GEMM_LT_PIN_NONDET;
+  }
   g_lt_pin_plans.emplace(key, plan);
   return static_cast<int>(cudaSuccess);
 }
