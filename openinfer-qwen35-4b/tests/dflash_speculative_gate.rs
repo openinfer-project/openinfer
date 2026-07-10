@@ -16,37 +16,27 @@ mod common;
 
 const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3.5-4B");
 const SINGLE_ACTIVE_MAX_TOKENS: usize = 16;
-const CONCURRENT_MAX_TOKENS: usize = 8;
+const CONCURRENT_MAX_TOKENS: [usize; 3] = [2, 12, 5];
+const LONG_FALLBACK_PROMPT_TOKENS: usize = 2049;
 
-fn model_path_or_skip() -> Option<String> {
-    match std::env::var("OPENINFER_TEST_MODEL_PATH") {
-        Ok(path) => Some(path),
-        Err(_) if Path::new(MODEL_PATH).join("config.json").exists() => {
-            Some(MODEL_PATH.to_string())
-        }
-        Err(_) => {
-            eprintln!(
-                "skipping qwen35 dflash_speculative_gate: {MODEL_PATH}/config.json is missing; set OPENINFER_TEST_MODEL_PATH to run it"
-            );
-            None
-        }
-    }
+fn model_path() -> String {
+    let path =
+        std::env::var("OPENINFER_TEST_MODEL_PATH").unwrap_or_else(|_| MODEL_PATH.to_string());
+    assert!(
+        Path::new(&path).join("config.json").exists(),
+        "Qwen3.5 model is missing at {path}; set OPENINFER_TEST_MODEL_PATH"
+    );
+    path
 }
 
-fn draft_path_or_skip() -> Option<PathBuf> {
-    match std::env::var("OPENINFER_DFLASH_TEST_MODEL_PATH") {
-        Ok(path) if Path::new(&path).join("config.json").exists() => Some(PathBuf::from(path)),
-        Ok(path) => {
-            eprintln!("skipping qwen35 dflash_speculative_gate: {path}/config.json is missing");
-            None
-        }
-        Err(_) => {
-            eprintln!(
-                "skipping qwen35 dflash_speculative_gate: set OPENINFER_DFLASH_TEST_MODEL_PATH to run it"
-            );
-            None
-        }
-    }
+fn draft_path() -> PathBuf {
+    let path = std::env::var("OPENINFER_DFLASH_TEST_MODEL_PATH")
+        .expect("set OPENINFER_DFLASH_TEST_MODEL_PATH to run the Qwen3.5 DFlash GPU gate");
+    assert!(
+        Path::new(&path).join("config.json").exists(),
+        "Qwen3.5 DFlash model is missing at {path}"
+    );
+    PathBuf::from(path)
 }
 
 fn start_engine(model_path: &str, dflash_draft_model_path: Option<PathBuf>) -> EngineHandle {
@@ -122,6 +112,35 @@ fn collect(rx: &mut TokenStreamReceiver, name: &str) -> (Vec<u32>, FinishReason)
     }
 }
 
+fn generate_concurrent(
+    handle: &EngineHandle,
+    cases: &[(Vec<u32>, usize, usize)],
+    name_prefix: &str,
+) -> Vec<(Vec<u32>, FinishReason)> {
+    let mut receivers = Vec::with_capacity(cases.len());
+    for (idx, (prompt_tokens, max_tokens, logprobs)) in cases.iter().enumerate() {
+        let (token_tx, token_rx) = TokenSink::standalone();
+        handle
+            .submit(GenerateRequest {
+                request_id: Some(format!("{name_prefix}-{idx}")),
+                queued_at_unix_s: None,
+                prompt_tokens: prompt_tokens.clone(),
+                params: deterministic_params(),
+                max_tokens: *max_tokens,
+                lora_adapter: None,
+                token_tx,
+                logprobs: *logprobs,
+                echo: false,
+            })
+            .expect("submit failed");
+        receivers.push((idx, token_rx));
+    }
+    receivers
+        .into_iter()
+        .map(|(idx, mut rx)| collect(&mut rx, &format!("{name_prefix}-{idx}")))
+        .collect()
+}
+
 fn deterministic_params() -> SamplingParams {
     SamplingParams {
         ignore_eos: true,
@@ -130,13 +149,10 @@ fn deterministic_params() -> SamplingParams {
 }
 
 #[test]
+#[ignore = "requires Qwen3.5 target and DFlash weights on a CUDA GPU"]
 fn dflash_single_active_matches_plain_greedy_scheduler() {
-    let Some(model_path) = model_path_or_skip() else {
-        return;
-    };
-    let Some(draft_path) = draft_path_or_skip() else {
-        return;
-    };
+    let model_path = model_path();
+    let draft_path = draft_path();
     let tokenizer = common::load_tokenizer(&model_path);
     let prompt = concat!(
         "Explain how an inference scheduler preserves request state while doing ",
@@ -187,16 +203,12 @@ fn dflash_single_active_matches_plain_greedy_scheduler() {
 }
 
 #[test]
-fn dflash_multi_active_and_logprobs_fallback_finish() {
-    let Some(model_path) = model_path_or_skip() else {
-        return;
-    };
-    let Some(draft_path) = draft_path_or_skip() else {
-        return;
-    };
+#[ignore = "requires Qwen3.5 target and DFlash weights on a CUDA GPU"]
+fn dflash_multi_active_and_logprobs_fallback_matches_plain_scheduler() {
+    let model_path = model_path();
+    let draft_path = draft_path();
     let tokenizer = common::load_tokenizer(&model_path);
     set_require_spec(false);
-    let handle = start_engine(&model_path, Some(draft_path));
     let prompts = [
         concat!(
             "Summarize continuous batching with one example. Mention request slots, ",
@@ -211,33 +223,92 @@ fn dflash_multi_active_and_logprobs_fallback_finish() {
             "host copies, and deterministic greedy tokens."
         ),
     ];
-    let mut receivers = Vec::new();
-    for (idx, prompt) in prompts.iter().enumerate() {
-        let (token_tx, token_rx) = TokenSink::standalone();
-        let logprobs = usize::from(idx == 2);
-        handle
-            .submit(GenerateRequest {
-                request_id: Some(format!("dflash-fallback-{idx}")),
-                queued_at_unix_s: None,
-                prompt_tokens: tokenizer.encode(prompt, false).expect("encode failed"),
-                params: deterministic_params(),
-                max_tokens: CONCURRENT_MAX_TOKENS,
-                lora_adapter: None,
-                token_tx,
-                logprobs,
-                echo: false,
-            })
-            .expect("submit failed");
-        receivers.push((idx, token_rx));
-    }
+    let cases: Vec<_> = prompts
+        .iter()
+        .enumerate()
+        .map(|(idx, prompt)| {
+            (
+                tokenizer.encode(prompt, false).expect("encode failed"),
+                CONCURRENT_MAX_TOKENS[idx],
+                usize::from(idx == 2),
+            )
+        })
+        .collect();
 
-    for (idx, mut rx) in receivers {
-        let (tokens, finish) = collect(&mut rx, &format!("dflash-fallback-{idx}"));
-        assert_eq!(finish, FinishReason::Length);
+    let plain = {
+        let handle = start_engine(&model_path, None);
+        generate_concurrent(&handle, &cases, "plain-fallback")
+    };
+    let dflash = {
+        let handle = start_engine(&model_path, Some(draft_path));
+        generate_concurrent(&handle, &cases, "dflash-fallback")
+    };
+
+    for (idx, ((plain_tokens, plain_finish), (dflash_tokens, dflash_finish))) in
+        plain.into_iter().zip(dflash).enumerate()
+    {
+        assert_eq!(plain_finish, FinishReason::Length);
+        assert_eq!(dflash_finish, FinishReason::Length);
         assert_eq!(
-            tokens.len(),
-            CONCURRENT_MAX_TOKENS,
+            dflash_tokens.len(),
+            CONCURRENT_MAX_TOKENS[idx],
             "fallback request {idx} should finish through the normal scheduler path"
         );
+        assert_eq!(
+            dflash_tokens, plain_tokens,
+            "fallback request {idx} must remain lossless when the active batch shrinks"
+        );
     }
+}
+
+#[test]
+#[ignore = "requires Qwen3.5 target and DFlash weights on a CUDA GPU"]
+fn dflash_long_prompt_fallback_matches_plain_scheduler() {
+    let model_path = model_path();
+    let draft_path = draft_path();
+    let tokenizer = common::load_tokenizer(&model_path);
+    let mut prompt_tokens = tokenizer
+        .encode(&" state".repeat(LONG_FALLBACK_PROMPT_TOKENS + 32), false)
+        .expect("encode failed");
+    assert!(
+        prompt_tokens.len() >= LONG_FALLBACK_PROMPT_TOKENS,
+        "long fallback prompt did not tokenize to enough tokens"
+    );
+    prompt_tokens.truncate(LONG_FALLBACK_PROMPT_TOKENS);
+
+    let plain_tokens = {
+        let handle = start_engine(&model_path, None);
+        let (tokens, finish) = generate(
+            &handle,
+            prompt_tokens.clone(),
+            2,
+            deterministic_params(),
+            0,
+            "plain-long-fallback",
+        );
+        assert_eq!(finish, FinishReason::Length);
+        tokens
+    };
+
+    let dflash_tokens = {
+        set_require_spec(true);
+        let handle = start_engine(&model_path, Some(draft_path));
+        let (tokens, finish) = generate(
+            &handle,
+            prompt_tokens,
+            2,
+            deterministic_params(),
+            0,
+            "dflash-long-fallback",
+        );
+        assert_eq!(finish, FinishReason::Length);
+        set_require_spec(false);
+        tokens
+    };
+    set_require_spec(false);
+
+    assert_eq!(
+        dflash_tokens, plain_tokens,
+        "long-context DFlash fallback must match the plain scheduler"
+    );
 }

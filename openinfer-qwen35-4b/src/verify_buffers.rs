@@ -52,6 +52,63 @@ pub(crate) struct VerifyBuffers35 {
 }
 
 impl VerifyBuffers35 {
+    pub(crate) fn estimate_bytes(
+        config: &Config35,
+        max_batch: usize,
+        span: usize,
+        num_capture_layers: usize,
+        max_total_pages: usize,
+    ) -> usize {
+        let max_rows = max_batch.saturating_mul(span);
+        let hidden = config.hidden_size;
+        let q_proj_dim = config.full_attn_q_proj_dim();
+        let q_dim = config.full_attn_q_dim();
+        let kv_dim = config.full_attn_kv_dim();
+        let qkv_dim = config.linear_attn_qkv_dim();
+        let z_dim = config.linear_attn_z_dim();
+        let capture_dim = hidden.saturating_mul(num_capture_layers.max(1));
+        let row_bf16 = hidden
+            .saturating_mul(7)
+            .saturating_add(config.intermediate_size.saturating_mul(3))
+            .saturating_add(config.vocab_size)
+            .saturating_add(capture_dim)
+            .saturating_add(q_proj_dim)
+            .saturating_add(kv_dim.saturating_mul(2))
+            .saturating_add(q_dim.saturating_mul(2))
+            .saturating_add(qkv_dim.saturating_mul(2))
+            .saturating_add(z_dim.saturating_mul(3))
+            .saturating_add(config.linear_num_value_heads.saturating_mul(2));
+        let compact_bf16 = qkv_dim
+            .saturating_mul(2)
+            .saturating_add(z_dim)
+            .saturating_add(config.linear_num_value_heads.saturating_mul(2));
+        let group_size = config.num_attention_heads / config.num_key_value_heads;
+        let max_tiles = max_rows.saturating_mul(group_size.max(1));
+
+        max_rows
+            .saturating_mul(std::mem::size_of::<u32>())
+            .saturating_add(
+                max_rows
+                    .saturating_mul(row_bf16)
+                    .saturating_mul(std::mem::size_of::<half::bf16>()),
+            )
+            .saturating_add(
+                span.saturating_mul(compact_bf16)
+                    .saturating_mul(std::mem::size_of::<half::bf16>()),
+            )
+            .saturating_add(GdrChunkwiseScratch35::estimate_bytes(config, max_rows))
+            .saturating_add(PrefillPagedPlan::estimate_preallocated_bytes(
+                max_rows,
+                max_total_pages,
+                max_batch,
+                max_tiles,
+            ))
+            .saturating_add(openinfer_sample::SampleScratch::estimate_bytes(
+                config.vocab_size,
+                max_rows,
+            ))
+    }
+
     pub(crate) fn new(
         ctx: &DeviceContext,
         config: &Config35,

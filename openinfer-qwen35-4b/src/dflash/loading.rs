@@ -74,7 +74,6 @@ impl DFlashDraftModel {
             drop(up_proj);
 
             layers.push(DFlashBlock {
-                layer_type: config.layer_types[layer_idx],
                 input_layernorm: load_tensor_1d(
                     ctx,
                     &shards,

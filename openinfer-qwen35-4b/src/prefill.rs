@@ -78,49 +78,6 @@ impl Qwen35Model {
         Ok(logits)
     }
 
-    pub(crate) fn hidden_logits(&self, hidden_batch: &HiddenStates) -> Result<HiddenStates> {
-        anyhow::ensure!(
-            hidden_batch.seq_len > 0,
-            "Qwen3.5 hidden_logits requires at least one row"
-        );
-        let mut normed =
-            HiddenStates::zeros(&self.ctx, hidden_batch.hidden_dim, hidden_batch.seq_len)?;
-        ops::rms_norm_batch_offset_into(
-            &self.ctx,
-            hidden_batch,
-            &self.norm,
-            self.config.rms_norm_eps,
-            &mut normed,
-        )?;
-        ops::gemm(&self.ctx, self.output_projection(), &normed)
-    }
-
-    pub(crate) fn prefill_logits_all(
-        &self,
-        token_ids: &[u32],
-        kv_state: &mut KvState,
-        recurrent: &mut RecurrentState,
-    ) -> Result<HiddenStates> {
-        let hidden = self.prefill_chunk_forward(token_ids, kv_state, recurrent)?;
-        self.hidden_logits(&hidden)
-    }
-
-    /// Forward one prefill chunk through all layers, advancing the paged KV state
-    /// and the linear-attention recurrent/conv state in place.
-    ///
-    /// `token_ids.len()` must be in `1..=PREFILL_CHUNK_LEN` so the per-chunk GDR
-    /// scratch stays within the startup reservation. Returns the chunk's hidden
-    /// states for every token; only the final chunk's last token feeds the LM head.
-    fn prefill_chunk_forward(
-        &self,
-        token_ids: &[u32],
-        kv_state: &mut KvState,
-        recurrent: &mut RecurrentState,
-    ) -> Result<HiddenStates> {
-        self.prefill_chunk_forward_with_capture(token_ids, kv_state, recurrent, None)
-            .map(|(hidden, _)| hidden)
-    }
-
     pub(crate) fn prefill_chunk_forward_with_capture(
         &self,
         token_ids: &[u32],
@@ -266,8 +223,11 @@ impl Qwen35Model {
         );
         anyhow::ensure!(
             bufs.captured_hidden.hidden_dim
-                == self.config.hidden_size * capture_layer_ids.len().max(1),
-            "Qwen3.5 verify capture buffer dimension mismatch"
+                >= self.config.hidden_size * capture_layer_ids.len().max(1),
+            "Qwen3.5 verify capture buffer capacity is too small: buffer={}, hidden_size={}, capture_layers={}",
+            bufs.captured_hidden.hidden_dim,
+            self.config.hidden_size,
+            capture_layer_ids.len()
         );
         for span in spans {
             anyhow::ensure!(

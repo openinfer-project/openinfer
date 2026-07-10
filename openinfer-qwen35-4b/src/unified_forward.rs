@@ -54,9 +54,8 @@ impl Qwen35Model {
         );
 
         let mut last_hiddens = Vec::with_capacity(n);
-        let capture_hidden_dim = capture_layer_ids
-            .map(|ids| ids.len() * self.config.hidden_size)
-            .unwrap_or(0);
+        let capture_hidden_dim =
+            capture_layer_ids.map_or(0, |ids| ids.len() * self.config.hidden_size);
         let capture_tokens: usize = prompts.iter().map(|prompt| prompt.len()).sum();
         let mut captured_all = if capture_layer_ids.is_some() {
             Some(HiddenStates::zeros(

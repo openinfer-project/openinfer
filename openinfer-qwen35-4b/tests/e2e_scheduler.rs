@@ -196,7 +196,7 @@ fn collect_generation(
 }
 
 fn concurrent_params(case_idx: usize) -> SamplingParams {
-    if case_idx % 2 == 0 {
+    if case_idx.is_multiple_of(2) {
         SamplingParams::default()
     } else {
         SamplingParams {

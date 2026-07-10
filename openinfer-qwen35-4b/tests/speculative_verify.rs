@@ -31,19 +31,14 @@ struct CaseExpectation {
     draft_tokens: Vec<u32>,
 }
 
-fn model_path_or_skip() -> Option<String> {
-    match std::env::var("OPENINFER_TEST_MODEL_PATH") {
-        Ok(path) => Some(path),
-        Err(_) if Path::new(MODEL_PATH).join("config.json").exists() => {
-            Some(MODEL_PATH.to_string())
-        }
-        Err(_) => {
-            eprintln!(
-                "skipping qwen35 speculative_verify: {MODEL_PATH}/config.json is missing; set OPENINFER_TEST_MODEL_PATH to run it"
-            );
-            None
-        }
-    }
+fn model_path() -> String {
+    let path =
+        std::env::var("OPENINFER_TEST_MODEL_PATH").unwrap_or_else(|_| MODEL_PATH.to_string());
+    assert!(
+        Path::new(&path).join("config.json").exists(),
+        "Qwen3.5 model is missing at {path}; set OPENINFER_TEST_MODEL_PATH"
+    );
+    path
 }
 
 fn build_executor(model_path: &str, capacity: usize) -> Qwen35Executor {
@@ -242,7 +237,7 @@ fn build_expectations(model_path: &str, cases: &[CaseSpec]) -> Vec<CaseExpectati
             .collect();
         for (tokens, next) in generated
             .iter_mut()
-            .zip(decode_once(&mut exec, &fed, cases).into_iter())
+            .zip(decode_once(&mut exec, &fed, cases))
         {
             tokens.push(next);
         }
@@ -268,10 +263,10 @@ fn build_expectations(model_path: &str, cases: &[CaseSpec]) -> Vec<CaseExpectati
         .collect()
 }
 
-fn run_speculative_case(model_path: &str, cases: Vec<CaseSpec>) {
-    let expectations = build_expectations(model_path, &cases);
+fn run_speculative_case(model_path: &str, cases: &[CaseSpec]) {
+    let expectations = build_expectations(model_path, cases);
     let mut exec = build_executor(model_path, cases.len());
-    let first_tokens = prefill(&mut exec, &cases);
+    let first_tokens = prefill(&mut exec, cases);
     assert_eq!(
         first_tokens,
         expectations
@@ -315,12 +310,11 @@ fn run_speculative_case(model_path: &str, cases: Vec<CaseSpec>) {
             "speculative verify must commit at least one token for request {:?}",
             expect.request_id
         );
-        assert!(
-            row.matched_draft_tokens <= expect.draft_tokens.len(),
-            "matched_draft_tokens exceeds draft len for request {:?}: matched={}, drafts={:?}",
-            expect.request_id,
-            row.matched_draft_tokens,
-            expect.draft_tokens
+        let expected_matched = case.reject_at.unwrap_or(expect.draft_tokens.len());
+        assert_eq!(
+            row.matched_draft_tokens, expected_matched,
+            "speculative fixture did not execute its intended acceptance branch for request {:?}: expected matched={}, actual matched={}, drafts={:?}",
+            expect.request_id, expected_matched, row.matched_draft_tokens, expect.draft_tokens
         );
         assert_eq!(
             accepted_ids.len(),
@@ -343,16 +337,6 @@ fn run_speculative_case(model_path: &str, cases: Vec<CaseSpec>) {
             expect.first_token,
             expect.draft_tokens
         );
-        if let Some(reject_at) = case.reject_at {
-            assert!(
-                row.matched_draft_tokens <= reject_at,
-                "corrupted draft at index {reject_at} should stop acceptance for request {:?}: matched={}, drafts={:?}, actual_accepted={:?}",
-                expect.request_id,
-                row.matched_draft_tokens,
-                expect.draft_tokens,
-                accepted_ids
-            );
-        }
     }
     for ((before, after), row) in before_state
         .iter()
@@ -387,7 +371,7 @@ fn run_speculative_case(model_path: &str, cases: Vec<CaseSpec>) {
     let followup_reqs: Vec<_> = cases
         .iter()
         .zip(last_tokens.iter())
-        .map(|(case, &token)| DecodeStepItem::new(case.request_id, token, LOGPROBS))
+        .map(|(case, &token)| DecodeStepItem::new(case.request_id, token, DIAG_LOGPROBS))
         .collect();
     let followup = exec
         .execute_decode(DecodePlan {
@@ -395,17 +379,95 @@ fn run_speculative_case(model_path: &str, cases: Vec<CaseSpec>) {
         })
         .expect("post-spec followup")
         .requests;
-    for (actual, expect) in followup.iter().zip(expectations.iter()) {
-        assert_eq!(actual.request_id, expect.request_id);
+    let actual_followup: Vec<_> = followup
+        .iter()
+        .zip(expectations.iter())
+        .map(|(actual, expect)| {
+            assert_eq!(actual.request_id, expect.request_id);
+            TokenDiag {
+                token: actual.token,
+                top_logprobs: actual
+                    .logprob
+                    .as_ref()
+                    .map(|logprob| logprob.top_logprobs.clone())
+                    .unwrap_or_default(),
+            }
+        })
+        .collect();
+    assert_eq!(actual_followup.len(), cases.len());
+    drop(exec);
+
+    let oracle_cases: Vec<_> = cases
+        .iter()
+        .zip(expectations.iter())
+        .zip(accepted_rows.iter())
+        .map(|((case, expect), accepted)| {
+            let mut prompt_tokens = case.prompt_tokens.clone();
+            prompt_tokens.push(expect.first_token);
+            prompt_tokens.extend_from_slice(accepted);
+            CaseSpec {
+                request_id: case.request_id,
+                prompt_tokens,
+                draft_len: 0,
+                reject_at: None,
+            }
+        })
+        .collect();
+    let mut oracle_exec = build_executor(model_path, cases.len());
+    let oracle_followup = prefill_with_logprobs(&mut oracle_exec, &oracle_cases, DIAG_LOGPROBS);
+
+    let mut hard_mismatches = Vec::new();
+    let mut logprob_deltas = Vec::new();
+    for (idx, (actual, oracle)) in actual_followup
+        .iter()
+        .zip(oracle_followup.iter())
+        .enumerate()
+    {
+        if actual.token != oracle.token {
+            let actual_regret_for_oracle = regret(&actual.top_logprobs, oracle.token);
+            let oracle_regret_for_actual = regret(&oracle.top_logprobs, actual.token);
+            let within_actual = actual_regret_for_oracle.is_some_and(|regret| regret <= MARGIN_TOL);
+            let within_oracle = oracle_regret_for_actual.is_some_and(|regret| regret <= MARGIN_TOL);
+            if !within_actual && !within_oracle {
+                hard_mismatches.push(format!(
+                    "idx={idx} actual={} oracle={} actual_regret_for_oracle={actual_regret_for_oracle:?} oracle_regret_for_actual={oracle_regret_for_actual:?}",
+                    actual.token, oracle.token
+                ));
+            }
+        }
+        for (token, oracle_logprob) in &oracle.top_logprobs {
+            if let Some((_, actual_logprob)) = actual
+                .top_logprobs
+                .iter()
+                .find(|(actual_token, _)| actual_token == token)
+            {
+                logprob_deltas.push((actual_logprob - oracle_logprob).abs());
+            }
+        }
     }
-    assert_eq!(followup.len(), cases.len());
+    assert!(
+        hard_mismatches.is_empty(),
+        "Qwen3.5 speculative commit state diverged from a full-context replay:\n{}",
+        hard_mismatches.join("\n")
+    );
+    assert!(
+        !logprob_deltas.is_empty(),
+        "Qwen3.5 speculative commit oracle found no shared top-logprob entries"
+    );
+    logprob_deltas.sort_by(f32::total_cmp);
+    let mean_delta = logprob_deltas.iter().sum::<f32>() / logprob_deltas.len() as f32;
+    let p99_delta = logprob_deltas[(logprob_deltas.len() - 1) * 99 / 100];
+    assert!(
+        mean_delta <= 0.06 && p99_delta <= MARGIN_TOL,
+        "Qwen3.5 speculative commit logits exceed the bf16 envelope: mean={mean_delta:.6}, p99={p99_delta:.6}, samples={}",
+        logprob_deltas.len()
+    );
 }
 
 #[test]
+#[ignore = "requires Qwen3.5 weights on a CUDA GPU"]
 fn qwen35_speculative_verify_first_token_matches_decode_long_batch() {
-    let Some(model_path) = model_path_or_skip() else {
-        return;
-    };
+    let model_path = model_path();
     let batch = 8usize;
     let cases: Vec<_> = (0..batch)
         .map(|idx| CaseSpec {
@@ -489,10 +551,9 @@ fn qwen35_speculative_verify_first_token_matches_decode_long_batch() {
 }
 
 #[test]
+#[ignore = "requires Qwen3.5 weights on a CUDA GPU"]
 fn qwen35_speculative_verify_first_token_matches_decode_benchmark_c16() {
-    let Some(model_path) = model_path_or_skip() else {
-        return;
-    };
+    let model_path = model_path();
     let batch = 16usize;
     let cases: Vec<_> = (0..batch)
         .map(|idx| CaseSpec {
@@ -576,10 +637,9 @@ fn qwen35_speculative_verify_first_token_matches_decode_benchmark_c16() {
 }
 
 #[test]
+#[ignore = "requires Qwen3.5 weights on a CUDA GPU"]
 fn qwen35_speculative_verify_multitoken_span_matches_prefill_benchmark_c16() {
-    let Some(model_path) = model_path_or_skip() else {
-        return;
-    };
+    let model_path = model_path();
     let batch = 16usize;
     let verify_span = 5usize;
     let prompts: Vec<_> = (0..batch)
@@ -634,36 +694,35 @@ fn qwen35_speculative_verify_multitoken_span_matches_prefill_benchmark_c16() {
                     .unwrap_or_default(),
             })
             .collect::<Vec<_>>();
-        let first_mismatch = actual
-            .iter()
-            .zip(expected.iter())
-            .position(|(actual, expected)| actual.token != expected.token);
-        let Some(mismatch_idx) = first_mismatch.or_else(|| {
-            (actual.len() != expected.len()).then_some(actual.len().min(expected.len()))
-        }) else {
-            continue;
-        };
-        let actual_token = actual.get(mismatch_idx).map(|diag| diag.token);
-        let expected_token = expected.get(mismatch_idx).map(|diag| diag.token);
-        let oracle_regret = actual_token.and_then(|token| {
-            expected
-                .get(mismatch_idx)
-                .and_then(|diag| regret(&diag.top_logprobs, token))
-        });
-        let verify_regret = expected_token.and_then(|token| {
-            actual
-                .get(mismatch_idx)
-                .and_then(|diag| regret(&diag.top_logprobs, token))
-        });
-        let within_oracle = oracle_regret.is_some_and(|r| r <= MARGIN_TOL);
-        let within_verify = verify_regret.is_some_and(|r| r <= MARGIN_TOL);
-        if !within_oracle && !within_verify {
+        let mut saw_tie_divergence = false;
+        for (row_idx, (actual_diag, expected_diag)) in
+            actual.iter().zip(expected.iter()).enumerate()
+        {
+            if actual_diag.token == expected_diag.token {
+                continue;
+            }
+            let oracle_regret = regret(&expected_diag.top_logprobs, actual_diag.token);
+            let verify_regret = regret(&actual_diag.top_logprobs, expected_diag.token);
+            let within_oracle = oracle_regret.is_some_and(|regret| regret <= MARGIN_TOL);
+            let within_verify = verify_regret.is_some_and(|regret| regret <= MARGIN_TOL);
+            if within_oracle || within_verify {
+                saw_tie_divergence = true;
+            } else {
+                hard_mismatches.push(format!(
+                    "idx={idx} row={row_idx} accepted_len={} matched_drafts={} expected={} actual={} oracle_regret={oracle_regret:?} verify_regret={verify_regret:?}",
+                    actual.len(),
+                    result.matched_draft_tokens,
+                    expected_diag.token,
+                    actual_diag.token,
+                ));
+            }
+        }
+        if actual.len() != expected.len() && !saw_tie_divergence {
             hard_mismatches.push(format!(
-                "idx={idx} row={mismatch_idx} accepted_len={} matched_drafts={} expected={expected_token:?} actual={actual_token:?} oracle_regret={oracle_regret:?} verify_regret={verify_regret:?} expected_head={:?} actual_head={:?}",
+                "idx={idx} accepted_len={} expected_len={} matched_drafts={} without a bf16-tie divergence",
                 actual.len(),
+                expected.len(),
                 result.matched_draft_tokens,
-                expected.iter().map(|diag| diag.token).collect::<Vec<_>>(),
-                actual.iter().map(|diag| diag.token).collect::<Vec<_>>(),
             ));
         }
     }
@@ -676,13 +735,12 @@ fn qwen35_speculative_verify_multitoken_span_matches_prefill_benchmark_c16() {
 }
 
 #[test]
+#[ignore = "requires Qwen3.5 weights on a CUDA GPU"]
 fn qwen35_speculative_single_request_commits_transaction_state() {
-    let Some(model_path) = model_path_or_skip() else {
-        return;
-    };
+    let model_path = model_path();
     run_speculative_case(
         &model_path,
-        vec![CaseSpec {
+        &[CaseSpec {
             request_id: RequestId::new(1),
             prompt_tokens: vec![9707],
             draft_len: 3,
@@ -692,13 +750,12 @@ fn qwen35_speculative_single_request_commits_transaction_state() {
 }
 
 #[test]
+#[ignore = "requires Qwen3.5 weights on a CUDA GPU"]
 fn qwen35_speculative_accept_prefix_and_reject_first_transaction_state() {
-    let Some(model_path) = model_path_or_skip() else {
-        return;
-    };
+    let model_path = model_path();
     run_speculative_case(
         &model_path,
-        vec![
+        &[
             CaseSpec {
                 request_id: RequestId::new(1),
                 prompt_tokens: vec![3838, 374, 220, 17, 10, 17],
@@ -716,13 +773,12 @@ fn qwen35_speculative_accept_prefix_and_reject_first_transaction_state() {
 }
 
 #[test]
+#[ignore = "requires Qwen3.5 weights on a CUDA GPU"]
 fn qwen35_speculative_mixed_batch_commits_transaction_state() {
-    let Some(model_path) = model_path_or_skip() else {
-        return;
-    };
+    let model_path = model_path();
     run_speculative_case(
         &model_path,
-        vec![
+        &[
             CaseSpec {
                 request_id: RequestId::new(1),
                 prompt_tokens: vec![9707],

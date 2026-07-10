@@ -34,6 +34,33 @@ pub(crate) struct DFlashBatchScratch {
 }
 
 impl DFlashBatchScratch {
+    pub(crate) fn estimate_bytes(
+        config: &DFlashConfig,
+        max_decode_batch_size: usize,
+        max_tail_len: usize,
+    ) -> usize {
+        let batch_rows = config.block_size.saturating_mul(max_decode_batch_size);
+        let q_dim = config.num_attention_heads.saturating_mul(config.head_dim);
+        let kv_dim = config.num_key_value_heads.saturating_mul(config.head_dim);
+        let dense_bf16_per_row = config
+            .vocab_size
+            .saturating_add(config.hidden_size.saturating_mul(5))
+            .saturating_add(q_dim.saturating_mul(2))
+            .saturating_add(config.intermediate_size.saturating_mul(3));
+        batch_rows
+            .saturating_mul(std::mem::size_of::<u32>())
+            .saturating_add(
+                batch_rows
+                    .saturating_mul(dense_bf16_per_row)
+                    .saturating_mul(std::mem::size_of::<half::bf16>()),
+            )
+            .saturating_add(
+                max_tail_len
+                    .saturating_mul(config.hidden_size.saturating_add(kv_dim.saturating_mul(2)))
+                    .saturating_mul(std::mem::size_of::<half::bf16>()),
+            )
+    }
+
     pub(crate) fn new(
         ctx: &DeviceContext,
         config: &DFlashConfig,

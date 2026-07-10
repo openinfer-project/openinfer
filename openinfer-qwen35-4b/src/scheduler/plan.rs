@@ -159,14 +159,19 @@ pub(super) fn prefilling_future_pages(prefilling: &[PrefillKvBudget], page_size:
 
 /// Decide how many prompt tokens each FIFO-front prefilling request prefills this step
 /// return FIFO order with token budget
-pub(super) fn plan_prefill_chunks(remaining: &[usize], budget: usize) -> Vec<usize> {
+pub(super) fn plan_prefill_chunks(
+    remaining: &[usize],
+    budget: usize,
+    max_chunk: usize,
+) -> Vec<usize> {
+    assert!(max_chunk > 0, "prefill max_chunk must be positive");
     let mut chunks = Vec::new();
     let mut left = budget;
     for &rem in remaining {
         if left == 0 || rem == 0 {
             break;
         }
-        let take = rem.min(left);
+        let take = rem.min(left).min(max_chunk);
         chunks.push(take);
         left -= take;
         if take < rem {
@@ -677,21 +682,26 @@ mod tests {
     fn prefill_chunks_slice_long_prompt_and_stop_packing() {
         // One long prompt, budget smaller than its remaining work: take a
         // partial chunk and stop so it stays at the front next step.
-        assert_eq!(plan_prefill_chunks(&[5000], 512), vec![512]);
-        assert_eq!(plan_prefill_chunks(&[5000, 8], 512), vec![512]);
+        assert_eq!(plan_prefill_chunks(&[5000], 512, usize::MAX), vec![512]);
+        assert_eq!(plan_prefill_chunks(&[5000, 8], 512, usize::MAX), vec![512]);
+    }
+
+    #[test]
+    fn prefill_chunks_cap_each_request_below_large_step_budget() {
+        assert_eq!(plan_prefill_chunks(&[5000, 8], 4096, 1024), vec![1024]);
     }
 
     #[test]
     fn prefill_chunks_pack_short_prompts_up_to_budget() {
         // Several short prompts pack into one step until the budget runs out.
         assert_eq!(
-            plan_prefill_chunks(&[100, 100, 100], 512),
+            plan_prefill_chunks(&[100, 100, 100], 512, usize::MAX),
             vec![100, 100, 100]
         );
         // Third prompt only partially fits: 200 + 200 = 400 used, 112 left, the
         // 300-token prompt takes 112 and stops.
         assert_eq!(
-            plan_prefill_chunks(&[200, 200, 300], 512),
+            plan_prefill_chunks(&[200, 200, 300], 512, usize::MAX),
             vec![200, 200, 112]
         );
     }
@@ -699,7 +709,10 @@ mod tests {
     #[test]
     fn prefill_chunks_complete_then_continue_to_next() {
         // A prompt that exactly fits the budget completes; packing continues.
-        assert_eq!(plan_prefill_chunks(&[512, 8], 1024), vec![512, 8]);
+        assert_eq!(
+            plan_prefill_chunks(&[512, 8], 1024, usize::MAX),
+            vec![512, 8]
+        );
     }
 
     #[test]
@@ -707,14 +720,14 @@ mod tests {
         // The pre-#375 behaviour: a budget above total remaining work prefills
         // every prompt in a single step.
         assert_eq!(
-            plan_prefill_chunks(&[1000, 2000, 3000], usize::MAX),
+            plan_prefill_chunks(&[1000, 2000, 3000], usize::MAX, usize::MAX),
             vec![1000, 2000, 3000]
         );
     }
 
     #[test]
     fn prefill_chunks_empty_queue_schedules_nothing() {
-        assert!(plan_prefill_chunks(&[], 512).is_empty());
+        assert!(plan_prefill_chunks(&[], 512, usize::MAX).is_empty());
     }
 
     #[test]

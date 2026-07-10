@@ -135,9 +135,17 @@ pub fn start_engine_with_capacity_and_dflash(
                 .ok_or_else(|| anyhow!("DFlash draft model path must be valid UTF-8"))
         })
         .transpose()?;
-    let dflash_reservation = dflash_path
-        .map(|path| dflash::DFlashMemoryReservation::from_path(path, max_batch))
-        .transpose()?;
+    let dflash_reservation = match dflash_path {
+        Some(path) => {
+            let target_config = config::Config35::from_file(model_path)?;
+            Some(dflash::DFlashMemoryReservation::from_path(
+                path,
+                &target_config,
+                max_prefill_tokens,
+            )?)
+        }
+        None => None,
+    };
     let model = weights::Qwen35Model::from_safetensors_with_device_options_and_reservation(
         model_path,
         enable_cuda_graph,

@@ -153,11 +153,17 @@ impl DFlashConfig {
         anyhow::ensure!(
             self.num_attention_heads > 0
                 && self.num_key_value_heads > 0
-                && self.head_dim > 0
-                && self.num_attention_heads % self.num_key_value_heads == 0,
+                && self
+                    .num_attention_heads
+                    .is_multiple_of(self.num_key_value_heads),
             "Qwen3.5 DFlash attention geometry is invalid: heads={}, kv_heads={}, head_dim={}",
             self.num_attention_heads,
             self.num_key_value_heads,
+            self.head_dim
+        );
+        anyhow::ensure!(
+            self.head_dim == 128,
+            "Qwen3.5 DFlash attention requires head_dim=128, got {}",
             self.head_dim
         );
         anyhow::ensure!(
@@ -213,8 +219,7 @@ impl DFlashConfig {
         );
         if self
             .layer_types
-            .iter()
-            .any(|layer| *layer == DFlashLayerType::SlidingAttention)
+            .contains(&DFlashLayerType::SlidingAttention)
         {
             anyhow::ensure!(
                 self.sliding_window >= self.block_size,

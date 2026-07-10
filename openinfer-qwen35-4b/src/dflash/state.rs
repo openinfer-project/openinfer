@@ -14,13 +14,6 @@ pub(crate) struct DFlashRequestState {
     pub(super) max_cache_len: usize,
 }
 
-pub(crate) struct DFlashRequestBackup {
-    committed_len: usize,
-    pending_len: usize,
-    pending_buffer: HiddenStates,
-    pending_capacity: usize,
-}
-
 pub(super) struct DFlashLayerCache {
     pub(super) k: HiddenStates,
     pub(super) v: HiddenStates,
@@ -76,95 +69,9 @@ impl DFlashRequestState {
         (self.pending_context.len > 0).then_some(self.pending_context.len)
     }
 
-    pub(crate) fn backup_for_draft(
-        &mut self,
-        ctx: &DeviceContext,
-        backup: &mut DFlashRequestBackup,
-    ) -> Result<()> {
-        backup.copy_from_state(ctx, self)
-    }
-
-    pub(crate) fn restore_from_draft_backup(
-        &mut self,
-        ctx: &DeviceContext,
-        backup: &DFlashRequestBackup,
-    ) -> Result<()> {
-        self.committed_len = backup.committed_len;
-        self.pending_context.restore_from_backup(
-            ctx,
-            &backup.pending_buffer,
-            backup.pending_capacity,
-            backup.pending_len,
-        )?;
-        self.context.clear();
-        Ok(())
-    }
-}
-
-impl DFlashRequestBackup {
-    pub(crate) fn new(ctx: &DeviceContext, hidden_dim: usize, capacity: usize) -> Result<Self> {
-        anyhow::ensure!(
-            capacity > 0,
-            "DFlash request backup capacity must be non-zero"
-        );
-        let mut pending_buffer = HiddenStates::zeros(ctx, hidden_dim, capacity)?;
-        pending_buffer.seq_len = 0;
-        Ok(Self {
-            committed_len: 0,
-            pending_len: 0,
-            pending_buffer,
-            pending_capacity: capacity,
-        })
-    }
-
-    fn ensure_capacity(
-        &mut self,
-        ctx: &DeviceContext,
-        required_len: usize,
-        max_capacity: usize,
-    ) -> Result<()> {
-        if required_len <= self.pending_capacity {
-            return Ok(());
-        }
-        let doubled = self
-            .pending_capacity
-            .checked_mul(2)
-            .context("DFlash request backup capacity overflow")?;
-        let new_capacity = required_len.max(doubled).min(max_capacity);
-        anyhow::ensure!(
-            new_capacity >= required_len,
-            "DFlash request backup capacity {} cannot fit {} tokens",
-            new_capacity,
-            required_len
-        );
-        self.pending_buffer =
-            HiddenStates::zeros(ctx, self.pending_buffer.hidden_dim, new_capacity)?;
-        self.pending_capacity = new_capacity;
-        Ok(())
-    }
-
-    fn copy_from_state(
-        &mut self,
-        ctx: &DeviceContext,
-        state: &mut DFlashRequestState,
-    ) -> Result<()> {
-        self.committed_len = state.committed_len;
-        self.pending_len = state.pending_context.len;
-        self.ensure_capacity(ctx, self.pending_len, state.max_cache_len)?;
-        if self.pending_len > 0 {
-            state.pending_context.activate_for_read();
-            self.pending_buffer.seq_len = self.pending_capacity;
-            ops::copy_hidden_token_range_into(
-                ctx,
-                &state.pending_context.buffer,
-                0,
-                &mut self.pending_buffer,
-                0,
-                self.pending_len,
-            )?;
-        }
-        self.pending_buffer.seq_len = self.pending_len;
-        Ok(())
+    pub(crate) fn ready_for_draft(&self, min_initial_context: usize) -> bool {
+        self.pending_context.len > 0
+            && (self.committed_len > 0 || self.pending_context.len >= min_initial_context)
     }
 }
 
@@ -255,30 +162,6 @@ impl DFlashPendingContext {
         self.len = 0;
         self.buffer.seq_len = 0;
     }
-
-    fn restore_from_backup(
-        &mut self,
-        ctx: &DeviceContext,
-        backup_buffer: &HiddenStates,
-        backup_capacity: usize,
-        backup_len: usize,
-    ) -> Result<()> {
-        self.ensure_capacity(ctx, backup_len, backup_capacity)?;
-        if backup_len > 0 {
-            self.buffer.seq_len = self.capacity;
-            ops::copy_hidden_token_range_into(
-                ctx,
-                backup_buffer,
-                0,
-                &mut self.buffer,
-                0,
-                backup_len,
-            )?;
-        }
-        self.len = backup_len;
-        self.buffer.seq_len = backup_len;
-        Ok(())
-    }
 }
 
 impl DFlashContextScratch {
@@ -302,10 +185,5 @@ impl DFlashContextScratch {
         self.context_projected.seq_len = context_len;
         self.context_hidden.seq_len = context_len;
         Ok(())
-    }
-
-    fn clear(&mut self) {
-        self.context_projected.seq_len = 0;
-        self.context_hidden.seq_len = 0;
     }
 }

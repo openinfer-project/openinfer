@@ -28,6 +28,20 @@ pub(crate) struct RecurrentState {
 }
 
 impl RecurrentState {
+    pub(crate) fn estimate_bytes(config: &Config35) -> usize {
+        let num_linear_layers = config.num_hidden_layers - config.num_full_attention_layers();
+        let state_size = config
+            .linear_num_value_heads
+            .saturating_mul(config.linear_key_head_dim)
+            .saturating_mul(config.linear_value_head_dim)
+            .saturating_mul(std::mem::size_of::<f32>());
+        let conv_state_size = config
+            .linear_attn_qkv_dim()
+            .saturating_mul(config.linear_conv_kernel_dim.saturating_sub(1))
+            .saturating_mul(std::mem::size_of::<half::bf16>());
+        num_linear_layers.saturating_mul(state_size.saturating_add(conv_state_size))
+    }
+
     /// Allocate zeroed recurrent state for all linear attention layers.
     pub(crate) fn new(ctx: &DeviceContext, config: &Config35) -> Result<Self> {
         let num_linear_layers = config.num_hidden_layers - config.num_full_attention_layers();

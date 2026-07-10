@@ -5,7 +5,7 @@
 
 use anyhow::{Context, Result};
 
-use crate::dflash::config::{DFlashConfig, DFlashLayerType};
+use crate::dflash::config::DFlashConfig;
 use crate::dflash::state::DFlashContextScratch;
 use crate::weights::Qwen35Model;
 use openinfer_core::ops;
@@ -19,7 +19,10 @@ mod state;
 
 pub(crate) use reservation::DFlashMemoryReservation;
 pub(crate) use scratch::DFlashBatchScratch;
-pub(crate) use state::{DFlashRequestBackup, DFlashRequestState};
+pub(crate) use state::DFlashRequestState;
+
+pub(crate) const DFLASH_MAX_ACTIVE_REQUESTS: usize = 1;
+pub(crate) const DFLASH_MAX_VERIFIED_CONTEXT_TOKENS: usize = 2048;
 
 pub(crate) struct DFlashDraftModel {
     config: DFlashConfig,
@@ -44,7 +47,6 @@ pub(crate) struct DFlashMlp {
 }
 
 pub(crate) struct DFlashBlock {
-    pub(super) layer_type: DFlashLayerType,
     pub(super) input_layernorm: DeviceVec,
     pub(super) attention: DFlashAttention,
     pub(super) post_attention_layernorm: DeviceVec,
@@ -160,10 +162,6 @@ impl DFlashDraftModel {
             self.config.block_size,
             max_cache_len,
         )
-    }
-
-    pub(crate) fn new_request_backup(&self, ctx: &DeviceContext) -> Result<DFlashRequestBackup> {
-        DFlashRequestBackup::new(ctx, self.context_feature_dim(), self.config.block_size)
     }
 
     pub(crate) fn append_pending_context(
@@ -290,7 +288,7 @@ impl DFlashDraftModel {
                 .context
                 .ensure_capacity(ctx, self.config.hidden_size, context_len)?;
             state.pending_context.activate_for_read();
-            self.project_context_into(ctx, &state.pending_context.buffer, &mut state.context)?;
+            self.project_context_into(ctx, &state.pending_context.buffer, &mut state.context);
             state.pending_context.clear();
         }
 
@@ -405,43 +403,21 @@ impl DFlashDraftModel {
                     tail_len,
                 )?;
                 let cache_len = state.committed_len + tail_len;
-                match layer.layer_type {
-                    DFlashLayerType::FullAttention => {
-                        ops::single_prefill_nhd_noncausal_into(
-                            ctx,
-                            &scratch.q_batch,
-                            row_offset,
-                            block_size,
-                            &cache.k,
-                            &cache.v,
-                            &mut scratch.attn_output,
-                            self.config.num_attention_heads,
-                            self.config.num_key_value_heads,
-                            self.config.head_dim,
-                            cache_len,
-                        )?;
-                    }
-                    DFlashLayerType::SlidingAttention => {
-                        // The z-lab Qwen3.5 DFlash checkpoint is trained with the
-                        // draft block forwarded as non-causal (`is_causal=false`).
-                        // `layer_types=sliding_attention` is still a checkpoint
-                        // descriptor, but applying a causal sliding mask here
-                        // collapses acceptance against the reference drafter.
-                        ops::single_prefill_nhd_noncausal_into(
-                            ctx,
-                            &scratch.q_batch,
-                            row_offset,
-                            block_size,
-                            &cache.k,
-                            &cache.v,
-                            &mut scratch.attn_output,
-                            self.config.num_attention_heads,
-                            self.config.num_key_value_heads,
-                            self.config.head_dim,
-                            cache_len,
-                        )?;
-                    }
-                }
+                // The reference checkpoint forwards every draft block with
+                // `is_causal=false`; `layer_types` remains validated metadata.
+                ops::single_prefill_nhd_noncausal_into(
+                    ctx,
+                    &scratch.q_batch,
+                    row_offset,
+                    block_size,
+                    &cache.k,
+                    &cache.v,
+                    &mut scratch.attn_output,
+                    self.config.num_attention_heads,
+                    self.config.num_key_value_heads,
+                    self.config.head_dim,
+                    cache_len,
+                )?;
             }
 
             // Dense: o_proj + residual + post-attention norm + MLP over the batch.
@@ -500,7 +476,7 @@ impl DFlashDraftModel {
         for (i, state) in states.iter_mut().enumerate() {
             state.committed_len += context_lens[i];
         }
-        self.compute_logits_with_target_head_into(target, scratch)?;
+        self.compute_logits_with_target_head_into(target, scratch);
         Ok(&scratch.logits)
     }
 
@@ -513,7 +489,7 @@ impl DFlashDraftModel {
         ctx: &DeviceContext,
         context_features: &HiddenStates,
         context: &mut DFlashContextScratch,
-    ) -> Result<()> {
+    ) {
         ops::gemm_into(
             ctx,
             &self.fc,
@@ -527,14 +503,13 @@ impl DFlashDraftModel {
             self.config.rms_norm_eps,
             &mut context.context_hidden,
         );
-        Ok(())
     }
 
     fn compute_logits_with_target_head_into(
         &self,
         target: &Qwen35Model,
         scratch: &mut DFlashBatchScratch,
-    ) -> Result<()> {
+    ) {
         let ctx = target.device_ctx();
         ops::rms_norm_batch_into(
             ctx,
@@ -548,59 +523,6 @@ impl DFlashDraftModel {
             target.output_projection(),
             &scratch.logits_normed,
             &mut scratch.logits,
-        );
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn validate_dflash_config_for_target(
-    dflash_path: &str,
-    target_config: &crate::config::Config35,
-) -> Result<DFlashConfig> {
-    let config = DFlashConfig::from_file(dflash_path)?;
-    config.validate_for_target(target_config)?;
-    Ok(config)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::validate_dflash_config_for_target;
-    use crate::config::Config35;
-    use std::path::Path;
-
-    #[test]
-    fn env_dflash_config_matches_qwen35_target() {
-        let Ok(target_path) = std::env::var("OPENINFER_TEST_MODEL_PATH") else {
-            eprintln!("skipping DFlash config test; set OPENINFER_TEST_MODEL_PATH");
-            return;
-        };
-        let Ok(dflash_path) = std::env::var("OPENINFER_DFLASH_TEST_MODEL_PATH") else {
-            eprintln!("skipping DFlash config test; set OPENINFER_DFLASH_TEST_MODEL_PATH");
-            return;
-        };
-        if !Path::new(&target_path).join("config.json").exists()
-            || !Path::new(&dflash_path).join("config.json").exists()
-        {
-            eprintln!(
-                "skipping DFlash config test; set OPENINFER_TEST_MODEL_PATH and OPENINFER_DFLASH_TEST_MODEL_PATH"
-            );
-            return;
-        }
-
-        let target = Config35::from_file(&target_path).expect("target config");
-        let dflash = validate_dflash_config_for_target(&dflash_path, &target)
-            .expect("DFlash config should match target");
-
-        assert!(dflash.block_size >= 2);
-        assert!(dflash.mask_token_id < target.vocab_size as u32);
-        assert_eq!(dflash.target_layer_ids.len(), dflash.num_hidden_layers);
-
-        let reservation =
-            super::DFlashMemoryReservation::from_config(&dflash, /*max_decode_batch*/ 256);
-        assert!(
-            reservation.kv_bytes_per_token > 0 && reservation.fixed_bytes > 0,
-            "DFlash reservation must reserve both per-token and fixed memory"
         );
     }
 }

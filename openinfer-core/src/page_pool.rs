@@ -112,12 +112,12 @@ impl OwnedPagePermit {
     ///
     /// Prefix page order is preserved. Pages beyond `new_len` are returned to
     /// the same pool immediately, matching the drop-time LIFO reuse order.
-    pub fn truncate(&mut self, new_len: usize) {
-        debug_assert!(
+    pub(crate) fn truncate(&mut self, new_len: usize) {
+        assert!(
             new_len <= self.pages.len(),
             "cannot grow an OwnedPagePermit via truncate"
         );
-        if new_len >= self.pages.len() {
+        if new_len == self.pages.len() {
             return;
         }
 

@@ -37,6 +37,20 @@ pub struct PrefillPagedPlan {
 }
 
 impl PrefillPagedPlan {
+    pub fn estimate_preallocated_bytes(
+        max_total_tokens: usize,
+        max_total_pages: usize,
+        max_batch: usize,
+        max_tiles: usize,
+    ) -> usize {
+        let i32_elements = max_total_pages
+            .saturating_add(max_total_tokens.saturating_mul(2))
+            .saturating_add(max_tiles.saturating_mul(3))
+            .saturating_add(max_batch.saturating_mul(4))
+            .saturating_add(3);
+        i32_elements.saturating_mul(std::mem::size_of::<i32>())
+    }
+
     pub fn page_indices_d(&self) -> &CudaSlice<i32> {
         &self.page_indices_d
     }
@@ -854,70 +868,6 @@ pub fn single_prefill_nhd_noncausal_into(
             "single_prefill_nhd_noncausal_cuda failed with error {result}{}",
             crate::ops::ffi_exception_message(result)
         );
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn single_prefill_nhd_causal_window_into(
-    ctx: &DeviceContext,
-    q: &HiddenStates,
-    row_offset: usize,
-    q_seq_len: usize,
-    k_cache: &HiddenStates,
-    v_cache: &HiddenStates,
-    output: &mut HiddenStates,
-    num_q_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-    kv_len: usize,
-    window_left: usize,
-) -> Result<()> {
-    anyhow::ensure!(
-        head_dim == 128,
-        "single_prefill_nhd_causal_window_into supports head_dim=128, got {head_dim}"
-    );
-    assert_eq!(q.hidden_dim, num_q_heads * head_dim);
-    assert_eq!(output.hidden_dim, q.hidden_dim);
-    assert_eq!(output.seq_len, q.seq_len);
-    assert_eq!(k_cache.hidden_dim, num_kv_heads * head_dim);
-    assert_eq!(v_cache.hidden_dim, k_cache.hidden_dim);
-    assert_eq!(v_cache.seq_len, k_cache.seq_len);
-    assert!(kv_len <= k_cache.seq_len);
-    assert!(
-        row_offset + q_seq_len <= q.seq_len,
-        "single_prefill causal-window row range [{}..{}) exceeds seq_len {}",
-        row_offset,
-        row_offset + q_seq_len,
-        q.seq_len
-    );
-
-    let byte_offset = (row_offset * q.hidden_dim * std::mem::size_of::<bf16>()) as u64;
-    let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
-    let q_ptr = q_ptr + byte_offset;
-    let (k_ptr, _gk) = k_cache.data.device_ptr(&ctx.stream);
-    let (v_ptr, _gv) = v_cache.data.device_ptr(&ctx.stream);
-    let (out_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
-    let out_ptr = out_ptr + byte_offset;
-    let result = unsafe {
-        ffi::single_prefill_nhd_causal_window_cuda(
-            q_ptr as *const ffi::Half,
-            out_ptr as *mut ffi::Half,
-            k_ptr as *const ffi::Half,
-            v_ptr as *const ffi::Half,
-            num_q_heads as i32,
-            num_kv_heads as i32,
-            head_dim as i32,
-            q_seq_len as i32,
-            kv_len as i32,
-            k_cache.seq_len as i32,
-            window_left as i32,
-            1.0f32 / (head_dim as f32).sqrt(),
-            crate::tensor::active_cu_stream(ctx),
-        )
-    };
-    if result != 0 {
-        anyhow::bail!("single_prefill_nhd_causal_window_cuda failed with error {result}");
     }
     Ok(())
 }

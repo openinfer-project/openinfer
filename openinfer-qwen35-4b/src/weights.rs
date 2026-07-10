@@ -10,6 +10,8 @@ use openinfer_core::weight_loader::{
     mmap_shards, precompute_rope,
 };
 
+const MIN_KV_PAGES: usize = 64;
+
 /// Full attention layer weights (8 layers in Qwen3.5-4B).
 pub(super) struct FullAttentionLayer {
     /// Q projection including gate: [num_heads * head_dim * 2, hidden_size]
@@ -369,10 +371,21 @@ impl Qwen35Model {
         let reserve_bytes = scratch_reserve.saturating_add(dflash_fixed_reserve);
         let available = free_bytes.saturating_sub(reserve_bytes);
         let kv_budget = (available as f64 * 0.85) as usize;
-        let dflash_bytes_per_page =
-            dflash_reservation.map_or(0, |r| r.kv_bytes_per_token.saturating_mul(page_size));
-        let effective_bytes_per_page = bytes_per_page.saturating_add(dflash_bytes_per_page);
-        let num_pages = (kv_budget / effective_bytes_per_page).max(64);
+        let dflash_metadata_bytes_per_page =
+            dflash_reservation.map_or(0, |r| r.bytes_per_target_page);
+        let effective_bytes_per_page =
+            bytes_per_page.saturating_add(dflash_metadata_bytes_per_page);
+        let min_kv_budget = effective_bytes_per_page
+            .checked_mul(MIN_KV_PAGES)
+            .ok_or_else(|| anyhow::anyhow!("Qwen3.5 minimum KV budget overflow"))?;
+        anyhow::ensure!(
+            kv_budget >= min_kv_budget,
+            "insufficient GPU memory for Qwen3.5 minimum KV pool: need {} MB for {MIN_KV_PAGES} pages after fixed reserves, budgeted {} MB from {} MB free",
+            min_kv_budget / (1024 * 1024),
+            kv_budget / (1024 * 1024),
+            free_bytes / (1024 * 1024),
+        );
+        let num_pages = kv_budget / effective_bytes_per_page;
         let kv_mb = num_pages * bytes_per_page / (1024 * 1024);
         let scratch_mb = scratch_reserve / (1024 * 1024);
         let dflash_mb = dflash_fixed_reserve / (1024 * 1024);
