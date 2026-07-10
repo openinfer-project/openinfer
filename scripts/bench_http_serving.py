@@ -18,6 +18,7 @@ import socket
 import statistics
 import time
 import urllib.parse
+import uuid
 from dataclasses import asdict, dataclass
 from itertools import product
 from pathlib import Path
@@ -212,6 +213,11 @@ def summarize_trace_ms(measured: list[RequestResult]) -> dict[str, Any]:
         for result in traced
         if isinstance(result.server_trace.get("decode_batch_size_max"), int)
     ]
+    prompt_token_counts = [
+        int(result.server_trace["prompt_tokens"])
+        for result in traced
+        if isinstance(result.server_trace.get("prompt_tokens"), int)
+    ]
     decode_step_counts: list[int] = []
     decode_step_breakdowns: list[tuple[int, int] | None] = []
     saw_decode_step_fields = False
@@ -276,6 +282,7 @@ def summarize_trace_ms(measured: list[RequestResult]) -> dict[str, Any]:
         "source": "server log lines matching `openinfer_http_trace`; frontend_to_queue includes HTTP ingress, tokenization, and vLLM submit before engine queue",
         "traced_requests": len(traced),
         "missing_traces": [result.request_id for result in measured if result.server_trace is None],
+        "prompt_tokens": summarize_counts(prompt_token_counts),
         "phases_ms": phase_summary,
         "active_set_size_max": max(active_set_sizes) if active_set_sizes else None,
         "decode_batch_size_max": max(decode_batch_sizes) if decode_batch_sizes else None,
@@ -559,11 +566,26 @@ TRACE_RE = re.compile(r"openinfer_http_trace\s+(\{.*\})")
 STREAM_ERROR_RE = re.compile(r'request failed .*self\.request_id="([^"]+)"')
 
 
-def load_server_traces(path: Path | None) -> dict[str, dict[str, Any]]:
+def server_log_offset(path: Path | None) -> int:
+    if path is None or not path.exists():
+        return 0
+    return path.stat().st_size
+
+
+def load_server_traces(
+    path: Path | None,
+    *,
+    start_offset: int = 0,
+) -> dict[str, dict[str, Any]]:
     if path is None or not path.exists():
         return {}
+    if start_offset < 0:
+        raise ValueError("start_offset must be non-negative")
     traces: dict[str, dict[str, Any]] = {}
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+    with path.open("rb") as handle:
+        handle.seek(start_offset)
+        log_text = handle.read().decode("utf-8", errors="replace")
+    for line in log_text.splitlines():
         stream_error_match = STREAM_ERROR_RE.search(line)
         if stream_error_match:
             request_id = stream_error_match.group(1)
@@ -655,6 +677,10 @@ def run_batch(args: argparse.Namespace, measured: bool) -> tuple[list[RequestRes
     offset = args.warmup if measured else 0
     count = args.num_requests if measured else args.warmup
     label = "measured" if measured else "warmup"
+    request_id_prefix = arg_value(args, "request_id_prefix", None)
+    if request_id_prefix is None:
+        request_id_prefix = f"openinfer-bench-{uuid.uuid4().hex}"
+        args.request_id_prefix = request_id_prefix
     shapes = workload_shapes(args.prompt_words, args.max_tokens)
     workloads = []
     for idx in range(count):
@@ -675,7 +701,7 @@ def run_batch(args: argparse.Namespace, measured: bool) -> tuple[list[RequestRes
             pool.submit(
                 request_once,
                 idx,
-                f"openinfer-bench-{label}-{offset + idx}",
+                f"{request_id_prefix}-{label}-{offset + idx}",
                 url,
                 args.model,
                 prompt_words,
@@ -732,6 +758,7 @@ def build_report(args: argparse.Namespace, measured: list[RequestResult], wall_s
         "base_url": args.base_url,
         "model": args.model,
         "workload": {
+            "request_id_prefix": arg_value(args, "request_id_prefix", None),
             "num_requests": args.num_requests,
             "concurrency": args.concurrency,
             "warmup": args.warmup,
@@ -831,14 +858,19 @@ def main() -> None:
     if args.num_requests <= 0:
         raise SystemExit("--num-requests must be positive")
     validate_sampling_args(args)
+    args.request_id_prefix = f"openinfer-bench-{uuid.uuid4().hex}"
     if args.warmup > 0:
         warmup_results, _ = run_batch(args, measured=False)
         failed = [result for result in warmup_results if not result.ok]
         if failed:
             raise SystemExit(f"warmup failed: {failed[0].error}")
 
+    trace_log_offset = server_log_offset(args.server_log)
     measured, wall_s = run_batch(args, measured=True)
-    attach_server_traces(measured, load_server_traces(args.server_log))
+    attach_server_traces(
+        measured,
+        load_server_traces(args.server_log, start_offset=trace_log_offset),
+    )
     report = build_report(args, measured, wall_s)
     rendered = json.dumps(report, indent=2, sort_keys=True)
     if args.out:

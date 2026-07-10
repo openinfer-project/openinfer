@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import ctypes
 import hashlib
 import http.client
 import json
@@ -43,6 +44,7 @@ CLAIM_CORRECTNESS = "correctness"
 CLAIM_DIRECT = "direct_diagnostic_batch"
 CLAIM_HTTP = "http_pressure"
 CLAIM_FAILED = "failed_setup"
+HTTP_METADATA_PREFIX = "openinfer_contract_"
 
 
 @dataclass(frozen=True)
@@ -176,6 +178,146 @@ def try_command(cmd: list[str], timeout_s: float = 15.0) -> dict[str, Any]:
     }
 
 
+def decode_nccl_version_code(version_code: int) -> dict[str, Any] | None:
+    if isinstance(version_code, bool) or not isinstance(version_code, int) or version_code <= 0:
+        return None
+    scale = 1000 if version_code < 10000 else 10000
+    major = version_code // scale
+    minor = (version_code % scale) // 100
+    patch = version_code % 100
+    return {
+        "version_code": version_code,
+        "version": f"{major}.{minor}.{patch}",
+    }
+
+
+def nccl_version_from_library(library_name: str) -> dict[str, Any]:
+    try:
+        library = ctypes.CDLL(library_name)
+    except OSError as exc:
+        return {
+            "library": library_name,
+            "available": False,
+            "error": redact_text(str(exc)),
+        }
+    try:
+        get_version = library.ncclGetVersion
+        get_version.argtypes = [ctypes.POINTER(ctypes.c_int)]
+        get_version.restype = ctypes.c_int
+        version_code = ctypes.c_int()
+        exit_code = int(get_version(ctypes.byref(version_code)))
+    except Exception as exc:  # noqa: BLE001 - metadata probe should not fail the benchmark.
+        return {
+            "library": library_name,
+            "available": True,
+            "exit_code": 1,
+            "error": redact_text(str(exc)),
+        }
+    result: dict[str, Any] = {
+        "library": library_name,
+        "available": True,
+        "exit_code": exit_code,
+    }
+    if exit_code != 0:
+        return result
+    decoded = decode_nccl_version_code(version_code.value)
+    if decoded is None:
+        result["error"] = f"invalid NCCL version code: {version_code.value}"
+        return result
+    result.update(decoded)
+    return result
+
+
+def mapped_nccl_libraries(maps_text: str) -> list[str]:
+    libraries = []
+    seen = set()
+    for line in maps_text.splitlines():
+        parts = line.split(maxsplit=5)
+        if len(parts) < 6:
+            continue
+        mapped_path = parts[5].removesuffix(" (deleted)")
+        if not Path(mapped_path).name.startswith("libnccl.so"):
+            continue
+        if mapped_path not in seen:
+            libraries.append(mapped_path)
+            seen.add(mapped_path)
+    return libraries
+
+
+def process_group_pids(pid: int, proc_root: Path = Path("/proc")) -> tuple[int, list[int]]:
+    process_group_id = os.getpgid(pid)
+    members = []
+    for candidate in proc_root.iterdir():
+        if not candidate.name.isdigit():
+            continue
+        candidate_pid = int(candidate.name)
+        try:
+            if os.getpgid(candidate_pid) == process_group_id:
+                members.append(candidate_pid)
+        except (OSError, ProcessLookupError):
+            continue
+    return process_group_id, sorted(set(members))
+
+
+def process_nccl_runtime(pid: int, proc_root: Path = Path("/proc")) -> dict[str, Any]:
+    try:
+        process_group_id, members = process_group_pids(pid, proc_root)
+    except OSError as exc:
+        return {
+            "source": "server_process_group_maps",
+            "available": False,
+            "error": redact_text(str(exc)),
+        }
+    mapped_by_library: dict[str, list[int]] = {}
+    map_errors = []
+    for member_pid in members:
+        maps_path = proc_root / str(member_pid) / "maps"
+        try:
+            mapped = mapped_nccl_libraries(
+                maps_path.read_text(encoding="utf-8", errors="replace")
+            )
+        except OSError as exc:
+            map_errors.append({"pid": member_pid, "error": redact_text(str(exc))})
+            continue
+        for library in mapped:
+            mapped_by_library.setdefault(library, []).append(member_pid)
+    if map_errors:
+        return {
+            "source": "server_process_group_maps",
+            "available": False,
+            "process_group_id": process_group_id,
+            "process_group_pids": members,
+            "mapped_library_count": len(mapped_by_library),
+            "map_errors": map_errors,
+            "error": "unable to inspect every server process-group maps file",
+        }
+    if len(mapped_by_library) != 1:
+        return {
+            "source": "server_process_group_maps",
+            "available": False,
+            "process_group_id": process_group_id,
+            "process_group_pids": members,
+            "mapped_library_count": len(mapped_by_library),
+            "map_errors": map_errors,
+            "error": (
+                "expected exactly one NCCL library across the server process group, "
+                f"found {len(mapped_by_library)}"
+            ),
+        }
+    mapped_path, mapped_pids = next(iter(mapped_by_library.items()))
+    probe = nccl_version_from_library(mapped_path)
+    probe["source"] = "server_process_group_maps"
+    probe["process_group_id"] = process_group_id
+    probe["process_group_pids"] = members
+    probe["mapped_pids"] = mapped_pids
+    probe["map_errors"] = map_errors
+    probe["library"] = Path(mapped_path).name
+    probe["mapped_path_sha256"] = hashlib.sha256(
+        mapped_path.encode("utf-8")
+    ).hexdigest()
+    return probe
+
+
 def render_cmd(cmd: list[str]) -> str:
     return " ".join(shell_quote(part) for part in cmd)
 
@@ -268,6 +410,40 @@ def first_int(payload: dict[str, Any], *keys: str) -> int | None:
     return None if value is None else int(value)
 
 
+def parse_float_value(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        with contextlib.suppress(ValueError):
+            return float(value)
+    return None
+
+
+def parse_int_value(value: Any) -> int | None:
+    parsed = parse_float_value(value)
+    return None if parsed is None else int(parsed)
+
+
+def parse_bool_value(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    return None
+
+
+def normalize_request_rate(value: Any) -> str | float | None:
+    if isinstance(value, str) and value.strip().lower() in {"inf", "infinity"}:
+        return "inf"
+    return parse_float_value(value)
+
+
 def summarize_values(values: list[float], noisy_threshold: float) -> dict[str, Any]:
     cleaned = [float(value) for value in values if value is not None]
     if not cleaned:
@@ -303,7 +479,12 @@ def model_snapshot(model_path: Path) -> dict[str, Any]:
     }
 
 
-def metadata(args: argparse.Namespace, *, probe_versions: bool = True) -> dict[str, Any]:
+def metadata(
+    args: argparse.Namespace,
+    *,
+    probe_versions: bool = True,
+    nccl_runtime: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     git_head = run_capture(["git", "rev-parse", "HEAD"], check=False)
     git_status = run_capture(["git", "status", "--porcelain"], check=False)
     versions: dict[str, Any] = {
@@ -329,6 +510,11 @@ def metadata(args: argparse.Namespace, *, probe_versions: bool = True) -> dict[s
                 ),
                 "nvcc": try_command(["nvcc", "--version"]),
                 "nccl": try_command(["pkg-config", "--modversion", "nccl"]),
+                "nccl_runtime": nccl_runtime or {
+                    "source": "server_process_maps",
+                    "available": False,
+                    "not_observed": True,
+                },
                 "vllm": try_command([args.vllm_cmd, "--version"]),
             }
         )
@@ -348,6 +534,10 @@ def metadata(args: argparse.Namespace, *, probe_versions: bool = True) -> dict[s
                 },
                 "nvcc": {"command": ["nvcc", "--version"]},
                 "nccl": {"command": ["pkg-config", "--modversion", "nccl"]},
+                "nccl_runtime": {
+                    "source": "server_process_maps",
+                    "probe_skipped": True,
+                },
                 "vllm": {"command": redact_command([args.vllm_cmd, "--version"])},
             }
         )
@@ -532,10 +722,16 @@ def trace_missing_count(trace: Any) -> int | None:
     if not isinstance(trace, dict):
         return None
     missing = trace.get("missing_traces")
-    if isinstance(missing, list):
-        return len(missing)
     value = trace.get("missing_trace_count")
-    return int(value) if isinstance(value, (int, float)) else None
+    list_count = len(missing) if isinstance(missing, list) else None
+    field_count = (
+        value
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        else None
+    )
+    if list_count is not None and field_count is not None:
+        return max(list_count, field_count)
+    return list_count if list_count is not None else field_count
 
 
 def trace_phase(trace: Any, field: str) -> Any:
@@ -553,11 +749,53 @@ def trace_decode_steps(trace: Any) -> Any:
     return trace.get("decode_steps")
 
 
+def request_output_hash_summary(payload: dict[str, Any]) -> dict[str, Any]:
+    requests = payload.get("requests")
+    hashes = (
+        [
+            request["output_hash"]
+            for request in requests
+            if isinstance(request, dict)
+            and isinstance(request.get("output_hash"), str)
+            and request["output_hash"]
+        ]
+        if isinstance(requests, list)
+        else []
+    )
+    return {
+        "count": len(hashes),
+        "unique": len(set(hashes)),
+        "sha256": stable_json_sha256(sorted(hashes)) if hashes else None,
+    }
+
+
 def trace_summary_for_payload(payload: dict[str, Any]) -> dict[str, Any]:
     trace = payload.get("server_trace", {})
+    workload = payload.get("workload", {})
+    workload_contract = {
+        "model": payload.get("model"),
+        "num_requests": workload.get("num_requests") if isinstance(workload, dict) else None,
+        "concurrency": workload.get("concurrency") if isinstance(workload, dict) else None,
+        "warmup": workload.get("warmup") if isinstance(workload, dict) else None,
+        "prompt_words": workload.get("prompt_words") if isinstance(workload, dict) else None,
+        "max_tokens": workload.get("max_tokens") if isinstance(workload, dict) else None,
+        "mixed_shapes": workload.get("mixed_shapes") if isinstance(workload, dict) else None,
+        "temperature": workload.get("temperature") if isinstance(workload, dict) else None,
+        "top_k": workload.get("top_k") if isinstance(workload, dict) else None,
+        "top_p": workload.get("top_p") if isinstance(workload, dict) else None,
+        "sampling_mode": workload.get("sampling_mode") if isinstance(workload, dict) else None,
+        "sampling_counts": workload.get("sampling_counts") if isinstance(workload, dict) else None,
+        "ignore_eos": workload.get("ignore_eos") if isinstance(workload, dict) else None,
+    }
     return {
         "trace": trace,
+        "workload": workload_contract,
+        "num_requests": workload.get("num_requests") if isinstance(workload, dict) else None,
+        "prompt_words": workload.get("prompt_words") if isinstance(workload, dict) else None,
+        "traced_requests": trace.get("traced_requests") if isinstance(trace, dict) else None,
         "missing_trace_count": trace_missing_count(trace),
+        "output_hashes": request_output_hash_summary(payload),
+        "prompt_tokens": trace.get("prompt_tokens") if isinstance(trace, dict) else None,
         "active_set_size_max": trace.get("active_set_size_max") if isinstance(trace, dict) else None,
         "decode_batch_size_max": trace.get("decode_batch_size_max") if isinstance(trace, dict) else None,
         "decode_steps": trace_decode_steps(trace),
@@ -572,6 +810,118 @@ def trace_summary_for_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "stream_flush": trace_phase(trace, "stream_flush_ms"),
         },
     }
+
+
+def expected_trace_workload(
+    args: argparse.Namespace,
+    concurrency: int,
+) -> dict[str, Any]:
+    shape_key = f"prompt_words={args.input_len},max_tokens={args.output_len}"
+    return {
+        "model": args.model_id,
+        "num_requests": args.num_prompts,
+        "concurrency": concurrency,
+        "warmup": 0,
+        "prompt_words": args.input_len,
+        "max_tokens": args.output_len,
+        "mixed_shapes": {shape_key: args.num_prompts},
+        "temperature": args.temperature,
+        "top_k": -1,
+        "top_p": 1.0,
+        "sampling_mode": "single",
+        "sampling_counts": {"single": args.num_prompts},
+        "ignore_eos": args.ignore_eos,
+    }
+
+
+def expected_http_workload(
+    args: argparse.Namespace,
+    concurrency: int,
+    *,
+    num_prompts: int | None = None,
+) -> dict[str, Any]:
+    return {
+        "model": args.model_id,
+        "input_len": args.input_len,
+        "output_len": args.output_len,
+        "num_prompts": args.num_prompts if num_prompts is None else num_prompts,
+        "concurrency": concurrency,
+        "request_rate": normalize_request_rate(args.request_rate),
+        "temperature": float(args.temperature),
+        "ignore_eos": bool(args.ignore_eos),
+    }
+
+
+def http_artifact_workload(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "model": payload.get("model_id") or payload.get("model"),
+        "input_len": parse_int_value(payload.get(f"{HTTP_METADATA_PREFIX}input_len")),
+        "output_len": parse_int_value(payload.get(f"{HTTP_METADATA_PREFIX}output_len")),
+        "num_prompts": first_int(payload, "num_prompts"),
+        "concurrency": first_int(payload, "max_concurrency"),
+        "request_rate": normalize_request_rate(payload.get("request_rate")),
+        "temperature": parse_float_value(
+            payload.get(f"{HTTP_METADATA_PREFIX}temperature")
+        ),
+        "ignore_eos": parse_bool_value(
+            payload.get(f"{HTTP_METADATA_PREFIX}ignore_eos")
+        ),
+    }
+
+
+def prompt_tokens_valid(prompt_tokens: Any, expected_samples: int) -> bool:
+    if not isinstance(prompt_tokens, dict):
+        return False
+    minimum = prompt_tokens.get("min")
+    maximum = prompt_tokens.get("max")
+    total = prompt_tokens.get("total")
+    samples = prompt_tokens.get("samples")
+    return (
+        isinstance(minimum, int)
+        and not isinstance(minimum, bool)
+        and minimum > 0
+        and isinstance(maximum, int)
+        and not isinstance(maximum, bool)
+        and maximum >= minimum
+        and isinstance(total, int)
+        and not isinstance(total, bool)
+        and isinstance(samples, int)
+        and not isinstance(samples, bool)
+        and samples == expected_samples
+        and minimum * samples <= total <= maximum * samples
+    )
+
+
+def trace_cell_passed(
+    cell: dict[str, Any],
+    expected_workload: dict[str, Any],
+) -> bool:
+    expected_num_requests = expected_workload.get("num_requests")
+    completed = cell.get("completed")
+    num_requests = cell.get("num_requests")
+    traced_requests = cell.get("traced_requests")
+    output_hashes = cell.get("output_hashes")
+    output_hash_count = (
+        output_hashes.get("count") if isinstance(output_hashes, dict) else None
+    )
+    prompt_tokens = cell.get("prompt_tokens")
+    return (
+        isinstance(expected_num_requests, int)
+        and expected_num_requests > 0
+        and cell.get("workload") == expected_workload
+        and isinstance(completed, int)
+        and completed > 0
+        and isinstance(num_requests, int)
+        and num_requests > 0
+        and num_requests == expected_num_requests
+        and completed == expected_num_requests
+        and cell.get("failed") == 0
+        and cell.get("timeouts") == 0
+        and cell.get("missing_trace_count") == 0
+        and traced_requests == completed
+        and output_hash_count == completed
+        and prompt_tokens_valid(prompt_tokens, traced_requests)
+    )
 
 
 def correctness_passed(comparison: dict[str, Any]) -> bool:
@@ -628,6 +978,12 @@ class ManagedServer:
 
     def poll(self) -> int | None:
         return None if self.process is None else self.process.poll()
+
+    @property
+    def pid(self) -> int:
+        if self.process is None:
+            raise RuntimeError("server process has not started")
+        return self.process.pid
 
     def log_tail(self, limit: int = 4000) -> str:
         if self.log_handle is not None:
@@ -722,6 +1078,23 @@ def engine_env(args: argparse.Namespace, spec: EngineSpec) -> dict[str, str]:
     return env
 
 
+BENCHMARK_SERVER_ENV_KEYS = (
+    "OPENINFER_DSV2_LITE_EP_BACKEND",
+    "OPENINFER_DSV2_LITE_HOST_STAGED_EXPERT_BATCH",
+    "OPENINFER_DSV2_LITE_NCCL_EXPERT_BATCH",
+    "OPENINFER_DSV2_LITE_NCCL_ROUTER",
+    "CUDA_VISIBLE_DEVICES",
+)
+
+
+def benchmark_server_env(env: dict[str, str]) -> dict[str, str]:
+    return {
+        key: env[key]
+        for key in BENCHMARK_SERVER_ENV_KEYS
+        if key in env
+    }
+
+
 def vllm_bench_command(
     args: argparse.Namespace,
     *,
@@ -746,6 +1119,11 @@ def vllm_bench_command(
         "--max-concurrency", str(max_concurrency),
         "--request-rate", str(args.request_rate),
         "--temperature", str(args.temperature),
+        "--metadata",
+        f"{HTTP_METADATA_PREFIX}input_len={args.input_len}",
+        f"{HTTP_METADATA_PREFIX}output_len={args.output_len}",
+        f"{HTTP_METADATA_PREFIX}temperature={args.temperature}",
+        f"{HTTP_METADATA_PREFIX}ignore_eos={str(bool(args.ignore_eos)).lower()}",
     ]
     if args.ignore_eos:
         cmd.append("--ignore-eos")
@@ -777,16 +1155,18 @@ def run_http_matrix(args: argparse.Namespace, out_dir: Path) -> list[dict[str, A
             "claim_bucket": CLAIM_HTTP,
             "server_command": redact_command(cmd),
             "server_log": display_path(log_path),
-            "server_env": {
-                key: env[key]
-                for key in ("OPENINFER_DSV2_LITE_EP_BACKEND", "CUDA_VISIBLE_DEVICES")
-                if key in env
-            },
+            "server_env": benchmark_server_env(env),
             "cells": [],
         }
         try:
             with ManagedServer(cmd, env, log_path) as server:
                 wait_for_server(server, spec, port, args.model_id, args.server_ready_timeout_s)
+                if spec.ep_backend == "nccl":
+                    engine_row["nccl_runtime"] = process_nccl_runtime(server.pid)
+                    if engine_row["nccl_runtime"].get("version") is None:
+                        raise RuntimeError(
+                            "unable to identify the NCCL runtime loaded by the server process"
+                        )
                 for concurrency in args.concurrency:
                     for repeat in range(args.repeats):
                         cell = run_http_cell(args, out_dir, spec, port, concurrency, repeat)
@@ -800,6 +1180,11 @@ def run_http_matrix(args: argparse.Namespace, out_dir: Path) -> list[dict[str, A
                 engine_row.update({
                     "claim_bucket": CLAIM_FAILED,
                     "error": "no HTTP benchmark result artifacts found",
+                })
+            elif not engine_row["passed"]:
+                engine_row.update({
+                    "claim_bucket": CLAIM_FAILED,
+                    "error": "HTTP benchmark cells failed the workload or completion contract",
                 })
         except Exception as exc:  # noqa: BLE001
             engine_row.update({
@@ -863,13 +1248,21 @@ def run_http_cell(
         cell.update({"exit_code": completed.returncode})
         if not result_path.exists():
             raise FileNotFoundError(f"vLLM bench result not found: {result_path}")
-        cell.update(parse_vllm_bench_artifact(load_json(result_path)))
+        cell.update(
+            parse_vllm_bench_artifact(
+                load_json(result_path),
+                expected_http_workload(args, concurrency),
+            )
+        )
     except Exception as exc:  # noqa: BLE001
         cell.update({"passed": False, "claim_bucket": CLAIM_FAILED, "error": error_text(exc)})
     return cell
 
 
-def parse_vllm_bench_artifact(payload: dict[str, Any]) -> dict[str, Any]:
+def parse_vllm_bench_artifact(
+    payload: dict[str, Any],
+    expected_workload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     completed = first_int(payload, "completed", "num_completed_requests", "successful_requests")
     failed = first_int(
         payload,
@@ -886,9 +1279,33 @@ def parse_vllm_bench_artifact(payload: dict[str, Any]) -> dict[str, Any]:
     if output_tok_s is None and total_output_tokens is not None and duration:
         output_tok_s = total_output_tokens / duration
     output_hash = output_text_hash(payload)
-    passed = failed == 0 and timeouts == 0
-    if completed is not None:
-        passed = passed and completed > 0
+    detailed_outputs_valid = detailed_output_texts_valid(payload, completed)
+    workload = http_artifact_workload(payload)
+    workload_mismatches = (
+        []
+        if expected_workload is None
+        else [
+            key
+            for key, expected in expected_workload.items()
+            if workload.get(key) != expected
+        ]
+    )
+    passed = (
+        isinstance(completed, int)
+        and completed > 0
+        and failed == 0
+        and timeouts == 0
+        and not workload_mismatches
+    )
+    if expected_workload is not None:
+        passed = (
+            passed
+            and completed == expected_workload.get("num_prompts")
+            and detailed_outputs_valid
+            and output_hash["count"] == completed
+            and isinstance(output_hash["sha256"], str)
+            and bool(output_hash["sha256"])
+        )
     return {
         "claim_bucket": CLAIM_HTTP,
         "passed": passed,
@@ -908,7 +1325,21 @@ def parse_vllm_bench_artifact(payload: dict[str, Any]) -> dict[str, Any]:
         "median_itl_ms": first_number(payload, "median_itl_ms", "itl.median_ms"),
         "output_text_sha256": output_hash["sha256"],
         "output_text_count": output_hash["count"],
+        "detailed_outputs_valid": detailed_outputs_valid,
+        "workload": workload,
+        "workload_mismatches": workload_mismatches,
     }
+
+
+def detailed_output_texts_valid(payload: dict[str, Any], completed: Any) -> bool:
+    texts = payload.get("generated_texts")
+    return (
+        isinstance(completed, int)
+        and completed > 0
+        and isinstance(texts, list)
+        and len(texts) == completed
+        and all(isinstance(text, str) and bool(text) for text in texts)
+    )
 
 
 def output_text_hash(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1009,10 +1440,41 @@ def summarize_http_rows(engine_rows: list[dict[str, Any]], noisy_threshold: floa
     return summarized
 
 
+def openinfer_trace_command(
+    args: argparse.Namespace,
+    port: int,
+    concurrency: int,
+    out: Path,
+    log_path: Path,
+) -> list[str]:
+    cmd = [
+        sys.executable, "scripts/bench_http_serving.py",
+        "--base-url", f"http://127.0.0.1:{port}",
+        "--model", args.model_id,
+        "--num-requests", str(args.num_prompts),
+        "--concurrency", str(concurrency),
+        "--warmup", "0",
+        "--prompt-words", str(args.input_len),
+        "--max-tokens", str(args.output_len),
+        "--temperature", str(args.temperature),
+        "--timeout", str(args.command_timeout_s),
+        "--server-log", display_path(log_path),
+        "--out", display_path(out),
+    ]
+    if not args.ignore_eos:
+        cmd.append("--no-ignore-eos")
+    return cmd
+
+
+def trace_backend_selected(args: argparse.Namespace, spec: EngineSpec) -> bool:
+    selected = set(getattr(args, "trace_backend", []) or [])
+    return not selected or spec.ep_backend in selected
+
+
 def run_openinfer_trace_pass(args: argparse.Namespace, out_dir: Path) -> list[dict[str, Any]]:
     rows = []
     for spec in ENGINES:
-        if spec.family != "openinfer":
+        if spec.family != "openinfer" or not trace_backend_selected(args, spec):
             continue
         port = args.port + 20 + len(rows)
         log_path = out_dir / "trace_server_logs" / f"{spec.name}.log"
@@ -1023,29 +1485,23 @@ def run_openinfer_trace_pass(args: argparse.Namespace, out_dir: Path) -> list[di
             "claim_bucket": CLAIM_HTTP,
             "server_command": redact_command(cmd),
             "server_log": display_path(log_path),
+            "server_env": benchmark_server_env(env),
             "cells": [],
         }
         try:
             with ManagedServer(cmd, env, log_path) as server:
                 wait_for_server(server, spec, port, args.model_id, args.server_ready_timeout_s)
+                if spec.ep_backend == "nccl":
+                    row["nccl_runtime"] = process_nccl_runtime(server.pid)
+                    if row["nccl_runtime"].get("version") is None:
+                        raise RuntimeError(
+                            "unable to identify the NCCL runtime loaded by the server process"
+                        )
                 for concurrency in args.concurrency:
                     out = out_dir / "openinfer_trace" / spec.name / f"c{concurrency}.json"
-                    trace_cmd = [
-                        sys.executable, "scripts/bench_http_serving.py",
-                        "--base-url", f"http://127.0.0.1:{port}",
-                        "--model", args.model_id,
-                        "--num-requests", str(min(args.num_prompts, 8)),
-                        "--concurrency", str(concurrency),
-                        "--warmup", "0",
-                        "--prompt-words", str(args.input_len),
-                        "--max-tokens", str(args.output_len),
-                        "--temperature", str(args.temperature),
-                        "--timeout", str(args.command_timeout_s),
-                        "--server-log", display_path(log_path),
-                        "--out", display_path(out),
-                    ]
-                    if not args.ignore_eos:
-                        trace_cmd.append("--no-ignore-eos")
+                    trace_cmd = openinfer_trace_command(
+                        args, port, concurrency, out, log_path
+                    )
                     run_capture(trace_cmd, timeout=args.command_timeout_s)
                     payload = load_json(out)
                     cell = {
@@ -1057,14 +1513,26 @@ def run_openinfer_trace_pass(args: argparse.Namespace, out_dir: Path) -> list[di
                         "output_tok_s": payload["summary"]["output_tokens_per_s"],
                     }
                     cell.update(trace_summary_for_payload(payload))
+                    cell["passed"] = trace_cell_passed(
+                        cell,
+                        expected_trace_workload(args, concurrency),
+                    )
                     row["cells"].append(cell)
             row["passed"] = bool(row["cells"]) and all(
-                cell.get("failed", 0) == 0 for cell in row["cells"]
+                cell.get("passed") is True for cell in row["cells"]
             )
             if not row["cells"]:
                 row.update({
                     "claim_bucket": CLAIM_FAILED,
                     "error": "no OpenInfer trace result artifacts found",
+                })
+            elif not row["passed"]:
+                row.update({
+                    "claim_bucket": CLAIM_FAILED,
+                    "error": (
+                        "OpenInfer trace cells have request failures, timeouts, "
+                        "or incomplete trace coverage"
+                    ),
                 })
         except Exception as exc:  # noqa: BLE001
             row.update({"passed": False, "claim_bucket": CLAIM_FAILED, "error": error_text(exc)})
@@ -1077,11 +1545,41 @@ def run_openinfer_trace_pass(args: argparse.Namespace, out_dir: Path) -> list[di
     return rows
 
 
+def observed_nccl_runtime(sections: dict[str, Any]) -> dict[str, Any] | None:
+    probes = []
+    for section_name in ("http_concurrency_pressure", "openinfer_trace_pass"):
+        for row in sections.get(section_name, []) or []:
+            if (
+                isinstance(row, dict)
+                and row.get("engine") == "openinfer-nccl"
+                and isinstance(row.get("nccl_runtime"), dict)
+            ):
+                probes.append(row["nccl_runtime"])
+    if not probes:
+        return None
+    versions = {probe.get("version") for probe in probes}
+    if len(versions) != 1 or None in versions:
+        return {
+            "source": "server_process_maps",
+            "available": False,
+            "error": "conflicting or incomplete NCCL runtime observations",
+            "observed_versions": sorted(
+                version for version in versions if isinstance(version, str)
+            ),
+        }
+    result = dict(probes[0])
+    result["observation_count"] = len(probes)
+    return result
+
+
 def build_summary(args: argparse.Namespace, out_dir: Path, sections: dict[str, Any]) -> dict[str, Any]:
     return {
         "schema_version": 1,
         "kind": "deepseek_v2_lite_vllm_tp2_ep2_benchmark_matrix",
-        "metadata": metadata(args),
+        "metadata": metadata(
+            args,
+            nccl_runtime=observed_nccl_runtime(sections),
+        ),
         "artifacts_root": display_path(out_dir),
         "correctness_gate": sections.get("correctness_gate"),
         "direct_diagnostic_batch": sections.get("direct_diagnostic_batch", []),
@@ -1520,6 +2018,10 @@ def build_regression_summary(
                 "failed",
                 "timeouts",
                 "missing_trace_count",
+                "num_requests",
+                "workload_sha256",
+                "output_hash_sha256",
+                "prompt_tokens_sha256",
                 "active_set_size_max",
                 "decode_batch_size_max",
                 "trace_sha256",
@@ -1536,6 +2038,31 @@ def build_regression_summary(
         reasons.extend(structural_projection_reasons(
             "openinfer_trace_pass",
             comparison["openinfer_trace_pass"],
+        ))
+        reasons.extend(projection_field_change_reasons(
+            "direct_output_hash_changed",
+            comparison["direct_diagnostic_batch"],
+            {"token_sha256", "text_sha256"},
+        ))
+        reasons.extend(projection_field_change_reasons(
+            "http_output_hash_changed",
+            comparison["http_concurrency_pressure"],
+            {"output_text_sha256"},
+        ))
+        reasons.extend(projection_field_change_reasons(
+            "openinfer_trace_contract_changed",
+            comparison["openinfer_trace_pass"],
+            {"num_requests", "workload_sha256"},
+        ))
+        reasons.extend(projection_field_change_reasons(
+            "openinfer_trace_output_hash_changed",
+            comparison["openinfer_trace_pass"],
+            {"output_hash_sha256"},
+        ))
+        reasons.extend(projection_field_change_reasons(
+            "openinfer_trace_prompt_tokens_changed",
+            comparison["openinfer_trace_pass"],
+            {"prompt_tokens_sha256"},
         ))
         contract_reasons = comparability_reasons(summary, baseline)
         reasons.extend(contract_reasons)
@@ -1646,6 +2173,21 @@ def trace_projection_map(summary: dict[str, Any]) -> dict[str, dict[str, Any]]:
             if not isinstance(cell, dict):
                 continue
             trace = cell.get("trace") if isinstance(cell.get("trace"), dict) else {}
+            workload = (
+                cell.get("workload")
+                if isinstance(cell.get("workload"), dict)
+                else {}
+            )
+            output_hashes = (
+                cell.get("output_hashes")
+                if isinstance(cell.get("output_hashes"), dict)
+                else {}
+            )
+            prompt_tokens = (
+                cell.get("prompt_tokens")
+                if isinstance(cell.get("prompt_tokens"), dict)
+                else {}
+            )
             cells[f"{row.get('engine')}/c{cell.get('concurrency')}"] = {
                 "row_passed": row.get("passed"),
                 "claim_bucket": row.get("claim_bucket"),
@@ -1653,6 +2195,10 @@ def trace_projection_map(summary: dict[str, Any]) -> dict[str, dict[str, Any]]:
                 "failed": cell.get("failed"),
                 "timeouts": cell.get("timeouts"),
                 "missing_trace_count": cell.get("missing_trace_count"),
+                "num_requests": cell.get("num_requests"),
+                "workload_sha256": stable_json_sha256(workload),
+                "output_hash_sha256": output_hashes.get("sha256"),
+                "prompt_tokens_sha256": stable_json_sha256(prompt_tokens),
                 "active_set_size_max": trace.get("active_set_size_max"),
                 "decode_batch_size_max": trace.get("decode_batch_size_max"),
                 "trace_sha256": stable_json_sha256(trace),
@@ -1714,6 +2260,19 @@ def structural_projection_reasons(section: str, comparison: dict[str, Any]) -> l
     return reasons
 
 
+def projection_field_change_reasons(
+    label: str,
+    comparison: dict[str, Any],
+    fields: set[str],
+) -> list[str]:
+    reasons = []
+    for row in comparison.get("changed", []) or []:
+        changed_fields = set(row.get("changed_fields", []))
+        if changed_fields & fields:
+            reasons.append(f"{label}:{row.get('key')}")
+    return reasons
+
+
 def comparability_reasons(summary: dict[str, Any], baseline: dict[str, Any]) -> list[str]:
     reasons = []
     current_meta = summary.get("metadata") if isinstance(summary.get("metadata"), dict) else {}
@@ -1727,10 +2286,7 @@ def comparability_reasons(summary: dict[str, Any], baseline: dict[str, Any]) -> 
     ):
         if nested_get(current_meta, key_path) != nested_get(baseline_meta, key_path):
             reasons.append(label)
-    if version_probe_projection(current_meta, "nccl") != version_probe_projection(
-        baseline_meta,
-        "nccl",
-    ):
+    if nccl_version_projection(current_meta) != nccl_version_projection(baseline_meta):
         reasons.append("nccl_version_changed")
     if gpu_probe_projection(current_meta) != gpu_probe_projection(baseline_meta):
         reasons.append("gpu_probe_changed")
@@ -1746,6 +2302,27 @@ def version_probe_projection(metadata_payload: dict[str, Any], probe_name: str) 
         "available": probe.get("available"),
         "exit_code": probe.get("exit_code"),
         "stdout": probe.get("stdout"),
+    }
+
+
+def nccl_version_projection(metadata_payload: dict[str, Any]) -> Any:
+    versions = metadata_payload.get("versions") if isinstance(metadata_payload, dict) else {}
+    runtime = versions.get("nccl_runtime") if isinstance(versions, dict) else None
+    if isinstance(runtime, dict) and runtime.get("version") is not None:
+        return {
+            "version": runtime.get("version"),
+            "source": runtime.get("source"),
+            "process_observed": runtime.get("source")
+            in {"server_process_maps", "server_process_group_maps"},
+        }
+    pkg_config = version_probe_projection(metadata_payload, "nccl")
+    if not isinstance(pkg_config, dict):
+        return None
+    stdout = pkg_config.get("stdout")
+    return {
+        "version": stdout.strip() if isinstance(stdout, str) else None,
+        "source": "pkg_config",
+        "process_observed": False,
     }
 
 
@@ -1954,12 +2531,18 @@ def summarize_existing(args: argparse.Namespace) -> dict[str, Any]:
         }
         for artifact in sorted(engine_dir.glob("c*/r*/result.json")):
             payload = load_json(artifact)
+            concurrency = int(artifact.parents[1].name.removeprefix("c"))
             cell = {
                 "artifact": display_path(artifact),
-                "concurrency": int(artifact.parents[1].name.removeprefix("c")),
+                "concurrency": concurrency,
                 "repeat": int(artifact.parent.name.removeprefix("r")),
             }
-            cell.update(parse_vllm_bench_artifact(payload))
+            cell.update(
+                parse_vllm_bench_artifact(
+                    payload,
+                    expected_http_workload(args, concurrency),
+                )
+            )
             engine["cells"].append(cell)
         expected_cells = {
             (concurrency, repeat)
@@ -1988,6 +2571,11 @@ def summarize_existing(args: argparse.Namespace) -> dict[str, Any]:
             engine.update({
                 "claim_bucket": CLAIM_FAILED,
                 "error": "missing HTTP benchmark result artifacts",
+            })
+        elif not engine["passed"]:
+            engine.update({
+                "claim_bucket": CLAIM_FAILED,
+                "error": "HTTP benchmark cells failed the workload or completion contract",
             })
         http_rows.append(engine)
     http_rows.extend(infer_failed_http_rows_from_logs(out_dir, http_rows))
@@ -2022,6 +2610,10 @@ def summarize_existing(args: argparse.Namespace) -> dict[str, Any]:
                 "output_tok_s": payload.get("summary", {}).get("output_tokens_per_s"),
             }
             cell.update(trace_summary_for_payload(payload))
+            cell["passed"] = trace_cell_passed(
+                cell,
+                expected_trace_workload(args, cell["concurrency"]),
+            )
             row["cells"].append(cell)
         observed_concurrency = {
             cell.get("concurrency")
@@ -2030,7 +2622,7 @@ def summarize_existing(args: argparse.Namespace) -> dict[str, Any]:
         }
         missing_concurrency = sorted(set(args.concurrency) - observed_concurrency) if row["cells"] else []
         row["passed"] = bool(row["cells"]) and not missing_concurrency and all(
-            cell.get("failed", 0) == 0 for cell in row["cells"]
+            cell.get("passed") is True for cell in row["cells"]
         )
         if not row["cells"]:
             row.update({
@@ -2043,6 +2635,14 @@ def summarize_existing(args: argparse.Namespace) -> dict[str, Any]:
                 "claim_bucket": CLAIM_FAILED,
                 "error": "missing OpenInfer trace result artifacts",
             })
+        elif not row["passed"]:
+            row.update({
+                "claim_bucket": CLAIM_FAILED,
+                "error": (
+                    "OpenInfer trace cells have request failures, timeouts, "
+                    "or incomplete trace coverage"
+                ),
+            })
         trace_rows.append(row)
     trace_rows.extend(infer_failed_trace_rows_from_logs(out_dir, trace_rows))
     trace_rows = merge_preserved_failed_rows(
@@ -2050,7 +2650,7 @@ def summarize_existing(args: argparse.Namespace) -> dict[str, Any]:
             trace_rows,
             existing_summary.get("openinfer_trace_pass", []),
             ("engine",),
-            ("server_command", "server_log"),
+            ("server_command", "server_log", "server_env", "nccl_runtime"),
         ),
         preserved_failed_rows(existing_summary.get("openinfer_trace_pass", [])),
         ("engine",),
@@ -2058,7 +2658,33 @@ def summarize_existing(args: argparse.Namespace) -> dict[str, Any]:
     if trace_rows:
         sections["openinfer_trace_pass"] = trace_rows
     elif existing_summary.get("openinfer_trace_pass"):
-        sections["openinfer_trace_pass"] = existing_summary["openinfer_trace_pass"]
+        existing_trace_rows = existing_summary["openinfer_trace_pass"]
+        failed_rows = [
+            {
+                "engine": row.get("engine"),
+                "claim_bucket": CLAIM_FAILED,
+                "passed": False,
+                "cells": [],
+                "error": (
+                    "raw OpenInfer trace artifacts are missing; "
+                    "refusing to reuse the existing summary"
+                ),
+            }
+            for row in existing_trace_rows
+            if isinstance(row, dict)
+        ] if isinstance(existing_trace_rows, list) else []
+        sections["openinfer_trace_pass"] = failed_rows or [
+            {
+                "engine": "unknown",
+                "claim_bucket": CLAIM_FAILED,
+                "passed": False,
+                "cells": [],
+                "error": (
+                    "raw OpenInfer trace artifacts are missing; "
+                    "refusing to reuse the existing summary"
+                ),
+            }
+        ]
     summary = build_summary(args, out_dir, sections)
     if existing_summary.get("metadata"):
         summary["metadata"] = redact_payload(existing_summary["metadata"])
@@ -2312,6 +2938,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-direct", action="store_true")
     parser.add_argument("--skip-http", action="store_true")
     parser.add_argument("--openinfer-trace-pass", action="store_true")
+    parser.add_argument(
+        "--trace-backend",
+        action="append",
+        choices=["host-staged", "nccl"],
+        default=[],
+        help=(
+            "Limit --openinfer-trace-pass to one or more OpenInfer EP backends. "
+            "Repeat the option to select both; omit it to keep the default full pass."
+        ),
+    )
     parser.add_argument("--summarize-only", type=Path)
     parser.add_argument(
         "--baseline-summary",

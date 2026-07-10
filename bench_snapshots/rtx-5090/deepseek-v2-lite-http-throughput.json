@@ -1,0 +1,165 @@
+{
+  "claim_boundaries": [
+    "short fixed-shape HTTP evidence only",
+    "no vLLM parity claim",
+    "no production readiness claim",
+    "no mixed or long-prompt scaling claim",
+    "no multi-node claim"
+  ],
+  "contract": {
+    "backend_scope": [
+      "host-staged",
+      "nccl"
+    ],
+    "concurrency": [
+      1,
+      4,
+      8
+    ],
+    "gpu": "2x RTX 5090",
+    "ignore_eos": true,
+    "output_tokens": 64,
+    "prompt_words": 64,
+    "requests_per_cell": 32,
+    "temperature": 0.0,
+    "warmup": 0
+  },
+  "correctness": {
+    "cells": 24,
+    "failed": 0,
+    "missing_traces": 0,
+    "output_hash_sha256": "7a571c6f9dbeae75df92b4c72d5e4f8b6d1ab27c8fbfe67a71aede9565da3c2d",
+    "requests": 768,
+    "timeouts": 0
+  },
+  "host_staged": {
+    "pair": [
+      {
+        "baseline_output_tok_s": 20.731600059111077,
+        "change_pct": 14.390757752290373,
+        "concurrency": 1,
+        "optimized_output_tok_s": 23.715034401791442
+      },
+      {
+        "baseline_output_tok_s": 21.12969980735752,
+        "change_pct": 16.334587103804576,
+        "concurrency": 4,
+        "optimized_output_tok_s": 24.581149027162766
+      },
+      {
+        "baseline_output_tok_s": 21.407398535333577,
+        "change_pct": 18.271462894061564,
+        "concurrency": 8,
+        "optimized_output_tok_s": 25.31884341530093
+      }
+    ]
+  },
+  "kind": "deepseek_v2_lite_http_throughput_evidence",
+  "nccl": {
+    "aggregate": [
+      {
+        "concurrency": 1,
+        "max_change_pct": 24.331036420367113,
+        "median_change_pct": 23.38059593353936,
+        "min_change_pct": 13.34579426748097
+      },
+      {
+        "concurrency": 4,
+        "max_change_pct": 25.6486972221037,
+        "median_change_pct": 21.700537093271556,
+        "min_change_pct": 18.4520756186062
+      },
+      {
+        "concurrency": 8,
+        "max_change_pct": 30.790206934124996,
+        "median_change_pct": 29.54761383560549,
+        "min_change_pct": 26.609411811874416
+      }
+    ],
+    "pairs": [
+      {
+        "cells": [
+          {
+            "baseline_output_tok_s": 23.636573960465352,
+            "change_pct": 24.331036420367113,
+            "concurrency": 1,
+            "optimized_output_tok_s": 29.38759737931319
+          },
+          {
+            "baseline_output_tok_s": 24.54578719978256,
+            "change_pct": 21.700537093271556,
+            "concurrency": 4,
+            "optimized_output_tok_s": 29.872354855906874
+          },
+          {
+            "baseline_output_tok_s": 24.67998416433767,
+            "change_pct": 29.54761383560549,
+            "concurrency": 8,
+            "optimized_output_tok_s": 31.972330579904753
+          }
+        ],
+        "order": "baseline-optimized",
+        "pair": 1
+      },
+      {
+        "cells": [
+          {
+            "baseline_output_tok_s": 23.805233551326275,
+            "change_pct": 13.34579426748097,
+            "concurrency": 1,
+            "optimized_output_tok_s": 26.98223104597963
+          },
+          {
+            "baseline_output_tok_s": 24.726581484498382,
+            "change_pct": 18.4520756186062,
+            "concurrency": 4,
+            "optimized_output_tok_s": 29.289148997914303
+          },
+          {
+            "baseline_output_tok_s": 24.892815691921694,
+            "change_pct": 26.609411811874416,
+            "concurrency": 8,
+            "optimized_output_tok_s": 31.516647530956032
+          }
+        ],
+        "order": "optimized-baseline",
+        "pair": 2
+      },
+      {
+        "cells": [
+          {
+            "baseline_output_tok_s": 23.342232512569964,
+            "change_pct": 23.38059593353936,
+            "concurrency": 1,
+            "optimized_output_tok_s": 28.7997855782012
+          },
+          {
+            "baseline_output_tok_s": 23.787514126683067,
+            "change_pct": 25.6486972221037,
+            "concurrency": 4,
+            "optimized_output_tok_s": 29.888701601701154
+          },
+          {
+            "baseline_output_tok_s": 24.65091777480533,
+            "change_pct": 30.790206934124996,
+            "concurrency": 8,
+            "optimized_output_tok_s": 32.24098636882889
+          }
+        ],
+        "order": "baseline-optimized",
+        "pair": 3
+      }
+    ]
+  },
+  "observations": {
+    "actual_prompt_tokens": {
+      "max": 87,
+      "min": 84
+    }
+  },
+  "runtime": {
+    "nccl_source": "server_process_group_maps",
+    "nccl_version": "2.30.7"
+  },
+  "schema_version": 1
+}

@@ -13,6 +13,7 @@ import tempfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "bench_http_serving.py"
@@ -212,6 +213,75 @@ class BenchHttpServingTests(unittest.TestCase):
         self.assertAlmostEqual(result.server_trace["stream_flush_ms"], 50.0, places=3)
         self.assertAlmostEqual(result.server_trace["frontend_to_queue_ms"], 10.0, places=3)
 
+    def test_server_trace_loader_ignores_lines_before_measured_offset(self) -> None:
+        stale = (
+            'INFO openinfer_http_trace {"request_id":"cmpl-bench-0-stale",'
+            '"queued_at_unix_s":50.0}\\n'
+        )
+        current = (
+            'INFO openinfer_http_trace {"request_id":"cmpl-bench-0-current",'
+            '"queued_at_unix_s":100.0}\\n'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "server.log"
+            path.write_text(stale, encoding="utf-8")
+            offset = bench_http_serving.server_log_offset(path)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(current)
+            traces = bench_http_serving.load_server_traces(
+                path,
+                start_offset=offset,
+            )
+
+        self.assertNotIn("cmpl-bench-0-stale", traces)
+        self.assertIn("cmpl-bench-0-current", traces)
+
+    def test_run_batch_uses_unique_request_prefix_per_args_instance(self) -> None:
+        DoneOnlyHandler.response_body = (
+            b'data: {"choices":[{"text":"x","finish_reason":null}]}\n\n'
+            b"data: [DONE]\n\n"
+        )
+
+        def make_args() -> SimpleNamespace:
+            return SimpleNamespace(
+                base_url=f"http://{self.url.hostname}:{self.url.port}",
+                model="fake-model",
+                num_requests=1,
+                concurrency=1,
+                warmup=0,
+                prompt_words=[1],
+                max_tokens=[1],
+                temperature=0.0,
+                top_k=-1,
+                top_p=1.0,
+                sampling_mode="single",
+                ignore_eos=True,
+                timeout=5.0,
+            )
+
+        with mock.patch.object(bench_http_serving.uuid, "uuid4") as uuid4:
+            uuid4.side_effect = [
+                SimpleNamespace(hex="first"),
+                SimpleNamespace(hex="second"),
+            ]
+            first_results, _ = bench_http_serving.run_batch(
+                make_args(),
+                measured=True,
+            )
+            second_results, _ = bench_http_serving.run_batch(
+                make_args(),
+                measured=True,
+            )
+
+        self.assertEqual(
+            first_results[0].request_id,
+            "openinfer-bench-first-measured-0",
+        )
+        self.assertEqual(
+            second_results[0].request_id,
+            "openinfer-bench-second-measured-0",
+        )
+
     def test_server_stream_error_log_marks_request_failed(self) -> None:
         result = bench_http_serving.RequestResult(
             index=0,
@@ -378,6 +448,15 @@ class BenchHttpServingTests(unittest.TestCase):
         self.assertEqual(report["summary"]["output_tokens_total"], 12)
         self.assertAlmostEqual(report["summary"]["input_tokens_per_s"], 93.5)
         self.assertAlmostEqual(report["summary"]["output_tokens_per_s"], 6.0)
+        self.assertEqual(
+            report["server_trace"]["prompt_tokens"],
+            {
+                "min": 22,
+                "max": 165,
+                "total": 187,
+                "samples": 2,
+            },
+        )
         self.assertEqual(
             report["workload"]["mixed_shapes"],
             {

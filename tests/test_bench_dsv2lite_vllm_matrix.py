@@ -49,6 +49,26 @@ class BenchDsv2LiteMatrixTests(unittest.TestCase):
         values.update(overrides)
         return SimpleNamespace(**values)
 
+    def valid_http_payload(self, **overrides):
+        payload = {
+            "model_id": "DeepSeek-V2-Lite",
+            "num_prompts": 32,
+            "max_concurrency": 1,
+            "request_rate": "inf",
+            f"{bench_matrix.HTTP_METADATA_PREFIX}input_len": "64",
+            f"{bench_matrix.HTTP_METADATA_PREFIX}output_len": "64",
+            f"{bench_matrix.HTTP_METADATA_PREFIX}temperature": "0.0",
+            f"{bench_matrix.HTTP_METADATA_PREFIX}ignore_eos": "true",
+            "num_completed_requests": 32,
+            "num_failed_requests": 0,
+            "num_timeouts": 0,
+            "total_output_tokens": 2048,
+            "duration": 64.0,
+            "generated_texts": [f"output-{index}" for index in range(32)],
+        }
+        payload.update(overrides)
+        return payload
+
     def minimal_summary(self, *, noisy=False, http_failed=False):
         http_row = {
             "engine": "vllm-tp2",
@@ -132,6 +152,17 @@ class BenchDsv2LiteMatrixTests(unittest.TestCase):
                             "failed": 0,
                             "timeouts": 0,
                             "missing_trace_count": 0,
+                            "num_requests": 32,
+                            "workload": {
+                                "model": "DeepSeek-V2-Lite",
+                                "num_requests": 32,
+                                "concurrency": 1,
+                            },
+                            "output_hashes": {
+                                "count": 32,
+                                "unique": 4,
+                                "sha256": "trace-output-hash",
+                            },
                             "trace": {"active_set_size_max": 1, "decode_batch_size_max": 1},
                         }
                     ],
@@ -332,6 +363,141 @@ class BenchDsv2LiteMatrixTests(unittest.TestCase):
         )
         self.assertTrue(meta["versions"]["hf_python_explicit"])
 
+    def test_decode_nccl_version_code(self) -> None:
+        self.assertEqual(
+            bench_matrix.decode_nccl_version_code(23007),
+            {"version_code": 23007, "version": "2.30.7"},
+        )
+        self.assertEqual(
+            bench_matrix.decode_nccl_version_code(2804),
+            {"version_code": 2804, "version": "2.8.4"},
+        )
+        self.assertIsNone(bench_matrix.decode_nccl_version_code(0))
+        self.assertIsNone(bench_matrix.decode_nccl_version_code(True))
+
+    def test_nccl_version_from_library_queries_exact_path(self) -> None:
+        class FakeGetVersion:
+            def __call__(self, version_ptr):
+                version_ptr._obj.value = 23007
+                return 0
+
+        fake_library = SimpleNamespace(ncclGetVersion=FakeGetVersion())
+        with mock.patch.object(bench_matrix.ctypes, "CDLL", return_value=fake_library):
+            probe = bench_matrix.nccl_version_from_library("/wheel/lib/libnccl.so.2")
+
+        self.assertEqual(
+            probe,
+            {
+                "library": "/wheel/lib/libnccl.so.2",
+                "available": True,
+                "exit_code": 0,
+                "version_code": 23007,
+                "version": "2.30.7",
+            },
+        )
+
+    def test_process_nccl_runtime_uses_server_mapped_library(self) -> None:
+        maps = (
+            "7f00-7f10 r-xp 00000000 00:00 0 /wheel/lib/libnccl.so.2\n"
+            "7f10-7f20 r--p 00000000 00:00 0 /wheel/lib/libnccl.so.2\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            proc_root = Path(tmp)
+            (proc_root / "1234").mkdir()
+            (proc_root / "5678").mkdir()
+            (proc_root / "1234" / "maps").write_text("", encoding="utf-8")
+            (proc_root / "5678" / "maps").write_text(maps, encoding="utf-8")
+            with mock.patch.object(
+                bench_matrix.os,
+                "getpgid",
+                side_effect=lambda pid: 77 if pid in {1234, 5678} else 88,
+            ), mock.patch.object(
+                bench_matrix,
+                "nccl_version_from_library",
+                return_value={
+                    "library": "/wheel/lib/libnccl.so.2",
+                    "available": True,
+                    "exit_code": 0,
+                    "version_code": 23007,
+                    "version": "2.30.7",
+                },
+            ) as probe:
+                runtime = bench_matrix.process_nccl_runtime(1234, proc_root)
+
+        probe.assert_called_once_with("/wheel/lib/libnccl.so.2")
+        self.assertEqual(runtime["source"], "server_process_group_maps")
+        self.assertEqual(runtime["process_group_pids"], [1234, 5678])
+        self.assertEqual(runtime["mapped_pids"], [5678])
+        self.assertEqual(runtime["library"], "libnccl.so.2")
+        self.assertEqual(runtime["version"], "2.30.7")
+
+    def test_process_nccl_runtime_rejects_missing_library(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            proc_root = Path(tmp)
+            (proc_root / "1234").mkdir()
+            (proc_root / "1234" / "maps").write_text("", encoding="utf-8")
+            with mock.patch.object(bench_matrix.os, "getpgid", return_value=77):
+                runtime = bench_matrix.process_nccl_runtime(1234, proc_root)
+
+        self.assertFalse(runtime["available"])
+        self.assertEqual(runtime["mapped_library_count"], 0)
+        self.assertIn("expected exactly one NCCL library", runtime["error"])
+
+    def test_process_nccl_runtime_rejects_multiple_libraries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            proc_root = Path(tmp)
+            for pid, library in (
+                ("1234", "/wheel-a/lib/libnccl.so.2"),
+                ("5678", "/wheel-b/lib/libnccl.so.2"),
+            ):
+                (proc_root / pid).mkdir()
+                (proc_root / pid / "maps").write_text(
+                    f"7f00-7f10 r-xp 00000000 00:00 0 {library}\n",
+                    encoding="utf-8",
+                )
+            with mock.patch.object(bench_matrix.os, "getpgid", return_value=77):
+                runtime = bench_matrix.process_nccl_runtime(1234, proc_root)
+
+        self.assertFalse(runtime["available"])
+        self.assertEqual(runtime["mapped_library_count"], 2)
+        self.assertIn("found 2", runtime["error"])
+
+    def test_process_nccl_runtime_rejects_unreadable_maps(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            proc_root = Path(tmp)
+            (proc_root / "1234").mkdir()
+            with mock.patch.object(bench_matrix.os, "getpgid", return_value=77):
+                runtime = bench_matrix.process_nccl_runtime(1234, proc_root)
+
+        self.assertFalse(runtime["available"])
+        self.assertEqual(runtime["mapped_library_count"], 0)
+        self.assertEqual(len(runtime["map_errors"]), 1)
+
+    def test_process_nccl_runtime_rejects_partial_maps_visibility(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            proc_root = Path(tmp)
+            (proc_root / "1234").mkdir()
+            (proc_root / "5678").mkdir()
+            (proc_root / "1234" / "maps").write_text(
+                "7f00-7f10 r-xp 00000000 00:00 0 /wheel/lib/libnccl.so.2\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(
+                bench_matrix.os,
+                "getpgid",
+                return_value=77,
+            ), mock.patch.object(
+                bench_matrix,
+                "nccl_version_from_library",
+            ) as probe:
+                runtime = bench_matrix.process_nccl_runtime(1234, proc_root)
+
+        probe.assert_not_called()
+        self.assertFalse(runtime["available"])
+        self.assertEqual(runtime["mapped_library_count"], 1)
+        self.assertEqual(len(runtime["map_errors"]), 1)
+        self.assertIn("every server process-group maps file", runtime["error"])
+
     def test_metadata_records_hf_python_default_as_not_explicit(self) -> None:
         args = SimpleNamespace(
             model_path=Path("models/DeepSeek-V2-Lite"),
@@ -355,11 +521,20 @@ class BenchDsv2LiteMatrixTests(unittest.TestCase):
             "try_command",
             side_effect=lambda cmd: {"command": cmd, "available": False},
         ):
-            meta = bench_matrix.metadata(args)
+            meta = bench_matrix.metadata(
+                args,
+                nccl_runtime={
+                    "source": "server_process_maps",
+                    "available": True,
+                    "exit_code": 0,
+                    "version": "2.30.7",
+                },
+            )
 
         self.assertEqual(meta["versions"]["hf_python"]["command"], [sys.executable, "--version"])
         self.assertFalse(meta["versions"]["hf_python_explicit"])
         self.assertIn("--hf-python", meta["versions"]["hf_python_note"])
+        self.assertEqual(meta["versions"]["nccl_runtime"]["version"], "2.30.7")
 
     def test_try_command_records_redacted_error_without_raising(self) -> None:
         with mock.patch.object(bench_matrix.shutil, "which", return_value="/bin/tool"):
@@ -542,6 +717,77 @@ class BenchDsv2LiteMatrixTests(unittest.TestCase):
 
         self.assertFalse(parsed["passed"])
 
+    def test_parse_vllm_bench_artifact_rejects_empty_payload(self) -> None:
+        parsed = bench_matrix.parse_vllm_bench_artifact(
+            {},
+            bench_matrix.expected_http_workload(self.base_args(Path(".")), 1),
+        )
+
+        self.assertFalse(parsed["passed"])
+        self.assertIsNone(parsed["completed"])
+
+    def test_parse_vllm_bench_artifact_requires_full_completion_and_contract(self) -> None:
+        expected = bench_matrix.expected_http_workload(self.base_args(Path(".")), 1)
+        partial = bench_matrix.parse_vllm_bench_artifact(
+            self.valid_http_payload(num_completed_requests=31),
+            expected,
+        )
+        wrong_contract = bench_matrix.parse_vllm_bench_artifact(
+            self.valid_http_payload(
+                **{f"{bench_matrix.HTTP_METADATA_PREFIX}input_len": "32"}
+            ),
+            expected,
+        )
+
+        self.assertFalse(partial["passed"])
+        self.assertFalse(wrong_contract["passed"])
+        self.assertEqual(wrong_contract["workload_mismatches"], ["input_len"])
+
+    def test_parse_vllm_bench_artifact_requires_detailed_output_hashes(self) -> None:
+        expected = bench_matrix.expected_http_workload(self.base_args(Path(".")), 1)
+        payload = self.valid_http_payload()
+        payload.pop("generated_texts")
+
+        parsed = bench_matrix.parse_vllm_bench_artifact(payload, expected)
+
+        self.assertFalse(parsed["passed"])
+        self.assertEqual(parsed["output_text_count"], 0)
+        self.assertIsNone(parsed["output_text_sha256"])
+
+    def test_parse_vllm_bench_artifact_rejects_fabricated_output_coverage(self) -> None:
+        expected = bench_matrix.expected_http_workload(self.base_args(Path(".")), 1)
+        empty_outputs = bench_matrix.parse_vllm_bench_artifact(
+            self.valid_http_payload(generated_texts=[""] * 32),
+            expected,
+        )
+        details = [
+            {"response": {"choices": [{"text": f"output-{index}"}]}}
+            for index in range(30)
+        ]
+        details.append(
+            {
+                "response": {
+                    "choices": [
+                        {"text": "output-30"},
+                        {"text": "output-31"},
+                    ]
+                }
+            }
+        )
+        multi_choice_coverage = self.valid_http_payload(details=details)
+        multi_choice_coverage.pop("generated_texts")
+        flattened_outputs = bench_matrix.parse_vllm_bench_artifact(
+            multi_choice_coverage,
+            expected,
+        )
+
+        self.assertFalse(empty_outputs["passed"])
+        self.assertFalse(empty_outputs["detailed_outputs_valid"])
+        self.assertEqual(empty_outputs["output_text_count"], 32)
+        self.assertFalse(flattened_outputs["passed"])
+        self.assertFalse(flattened_outputs["detailed_outputs_valid"])
+        self.assertEqual(flattened_outputs["output_text_count"], 32)
+
     def test_output_text_hash_handles_openai_and_detail_shapes(self) -> None:
         parsed = bench_matrix.output_text_hash(
             {
@@ -587,6 +833,182 @@ class BenchDsv2LiteMatrixTests(unittest.TestCase):
             2,
         )
         self.assertEqual(bench_matrix.trace_missing_count({"missing_trace_count": 3}), 3)
+        self.assertEqual(
+            bench_matrix.trace_missing_count(
+                {"missing_traces": [], "missing_trace_count": 1}
+            ),
+            1,
+        )
+        self.assertEqual(
+            bench_matrix.trace_missing_count(
+                {"missing_traces": ["a", "b"], "missing_trace_count": 1}
+            ),
+            2,
+        )
+
+    def test_openinfer_trace_command_uses_full_matrix_workload(self) -> None:
+        args = SimpleNamespace(
+            model_id="DeepSeek-V2-Lite",
+            num_prompts=32,
+            input_len=64,
+            output_len=64,
+            temperature=0.0,
+            command_timeout_s=900.0,
+            ignore_eos=True,
+        )
+
+        cmd = bench_matrix.openinfer_trace_command(
+            args,
+            port=18180,
+            concurrency=8,
+            out=Path("target/trace.json"),
+            log_path=Path("target/server.log"),
+        )
+
+        self.assertEqual(cmd[cmd.index("--num-requests") + 1], "32")
+        self.assertEqual(cmd[cmd.index("--prompt-words") + 1], "64")
+        self.assertEqual(cmd[cmd.index("--max-tokens") + 1], "64")
+
+    def test_trace_backend_selection_defaults_to_all_and_supports_filter(self) -> None:
+        host = next(spec for spec in bench_matrix.ENGINES if spec.ep_backend == "host-staged")
+        nccl = next(spec for spec in bench_matrix.ENGINES if spec.ep_backend == "nccl")
+
+        self.assertTrue(
+            bench_matrix.trace_backend_selected(
+                SimpleNamespace(trace_backend=[]),
+                host,
+            )
+        )
+        self.assertTrue(
+            bench_matrix.trace_backend_selected(
+                SimpleNamespace(trace_backend=["nccl"]),
+                nccl,
+            )
+        )
+        self.assertFalse(
+            bench_matrix.trace_backend_selected(
+                SimpleNamespace(trace_backend=["nccl"]),
+                host,
+            )
+        )
+
+    def test_trace_cell_passed_requires_complete_request_and_trace_coverage(self) -> None:
+        expected_workload = {
+            "model": "DeepSeek-V2-Lite",
+            "num_requests": 32,
+            "concurrency": 8,
+            "warmup": 0,
+            "prompt_words": 64,
+            "max_tokens": 64,
+            "mixed_shapes": {"prompt_words=64,max_tokens=64": 32},
+            "temperature": 0.0,
+            "top_k": -1,
+            "top_p": 1.0,
+            "sampling_mode": "single",
+            "sampling_counts": {"single": 32},
+            "ignore_eos": True,
+        }
+        complete = {
+            "workload": expected_workload,
+            "num_requests": 32,
+            "completed": 32,
+            "failed": 0,
+            "timeouts": 0,
+            "missing_trace_count": 0,
+            "traced_requests": 32,
+            "output_hashes": {
+                "count": 32,
+                "unique": 24,
+                "sha256": "hash-summary",
+            },
+            "prompt_tokens": {
+                "min": 84,
+                "max": 87,
+                "total": 2729,
+                "samples": 32,
+            },
+        }
+
+        self.assertTrue(bench_matrix.trace_cell_passed(complete, expected_workload))
+        wrong_workload = dict(expected_workload)
+        wrong_workload["prompt_words"] = 1
+        self.assertFalse(bench_matrix.trace_cell_passed(complete, wrong_workload))
+        for field, value in (
+            ("failed", 1),
+            ("timeouts", 1),
+            ("missing_trace_count", 1),
+            ("traced_requests", 31),
+            ("num_requests", 31),
+        ):
+            incomplete = dict(complete)
+            incomplete[field] = value
+            self.assertFalse(
+                bench_matrix.trace_cell_passed(incomplete, expected_workload),
+                msg=f"{field}={value} must fail closed",
+            )
+        partial_prompt_tokens = dict(complete)
+        partial_prompt_tokens["prompt_tokens"] = {
+            "min": 84,
+            "max": 87,
+            "total": 2642,
+            "samples": 31,
+        }
+        self.assertFalse(
+            bench_matrix.trace_cell_passed(partial_prompt_tokens, expected_workload)
+        )
+        zero_prompt_tokens = dict(complete)
+        zero_prompt_tokens["prompt_tokens"] = {
+            "min": 0,
+            "max": 0,
+            "total": 0,
+            "samples": 32,
+        }
+        self.assertFalse(
+            bench_matrix.trace_cell_passed(zero_prompt_tokens, expected_workload)
+        )
+        inconsistent_prompt_tokens = dict(complete)
+        inconsistent_prompt_tokens["prompt_tokens"] = {
+            "min": 84,
+            "max": 87,
+            "total": 9999,
+            "samples": 32,
+        }
+        self.assertFalse(
+            bench_matrix.trace_cell_passed(
+                inconsistent_prompt_tokens,
+                expected_workload,
+            )
+        )
+        partial_output_hashes = dict(complete)
+        partial_output_hashes["output_hashes"] = {
+            "count": 31,
+            "unique": 24,
+            "sha256": "partial",
+        }
+        self.assertFalse(
+            bench_matrix.trace_cell_passed(partial_output_hashes, expected_workload)
+        )
+
+    def test_benchmark_server_env_keeps_only_auditable_switches(self) -> None:
+        selected = bench_matrix.benchmark_server_env(
+            {
+                "OPENINFER_DSV2_LITE_EP_BACKEND": "nccl",
+                "OPENINFER_DSV2_LITE_NCCL_EXPERT_BATCH": "serial",
+                "OPENINFER_DSV2_LITE_NCCL_ROUTER": "host",
+                "CUDA_VISIBLE_DEVICES": "0,1",
+                "HF_TOKEN": "secret",
+            }
+        )
+
+        self.assertEqual(
+            selected,
+            {
+                "OPENINFER_DSV2_LITE_EP_BACKEND": "nccl",
+                "OPENINFER_DSV2_LITE_NCCL_EXPERT_BATCH": "serial",
+                "OPENINFER_DSV2_LITE_NCCL_ROUTER": "host",
+                "CUDA_VISIBLE_DEVICES": "0,1",
+            },
+        )
 
     def test_correctness_passed_requires_exact_classification_without_warnings(self) -> None:
         self.assertTrue(
@@ -871,6 +1293,147 @@ class BenchDsv2LiteMatrixTests(unittest.TestCase):
 
         self.assertIn("nccl_version_changed", regression["comparability"]["reasons"])
         self.assertEqual(regression["comparability"]["claim_marker"], "no directional claim")
+
+    def test_regression_summary_prefers_nccl_runtime_version(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            current_path = root / "summary.json"
+            baseline_path = root / "baseline-summary.json"
+            current = self.minimal_summary()
+            baseline = self.minimal_summary()
+            current["metadata"]["versions"]["nccl"]["stdout"] = "unknown"
+            baseline["metadata"]["versions"]["nccl"]["stdout"] = "unknown"
+            current["metadata"]["versions"]["nccl_runtime"] = {
+                "available": True,
+                "exit_code": 0,
+                "version": "2.30.7",
+            }
+            baseline["metadata"]["versions"]["nccl_runtime"] = {
+                "available": True,
+                "exit_code": 0,
+                "version": "2.25.1",
+            }
+            current_path.write_text(json.dumps(current), encoding="utf-8")
+            baseline_path.write_text(json.dumps(baseline), encoding="utf-8")
+
+            regression = bench_matrix.build_regression_summary(
+                current,
+                baseline,
+                current_summary_path=current_path,
+                baseline_summary_path=baseline_path,
+                noisy_threshold=0.05,
+            )
+
+        self.assertIn("nccl_version_changed", regression["comparability"]["reasons"])
+        self.assertEqual(regression["comparability"]["claim_marker"], "no directional claim")
+
+    def test_regression_summary_rejects_runtime_vs_pkg_config_nccl_evidence(self) -> None:
+        current = self.minimal_summary()
+        baseline = self.minimal_summary()
+        current["metadata"]["versions"]["nccl_runtime"] = {
+            "source": "server_process_group_maps",
+            "available": True,
+            "exit_code": 0,
+            "version": "2.30.7",
+        }
+        current["metadata"]["versions"]["nccl"]["stdout"] = "unknown"
+        baseline["metadata"]["versions"]["nccl"].update(
+            {"available": True, "exit_code": 0, "stdout": "2.30.7"}
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            regression = bench_matrix.build_regression_summary(
+                current,
+                baseline,
+                current_summary_path=root / "summary.json",
+                baseline_summary_path=root / "baseline.json",
+                noisy_threshold=0.05,
+            )
+
+        self.assertNotEqual(
+            bench_matrix.nccl_version_projection(current["metadata"]),
+            bench_matrix.nccl_version_projection(baseline["metadata"]),
+        )
+        self.assertIn("nccl_version_changed", regression["comparability"]["reasons"])
+
+    def test_regression_summary_rejects_trace_workload_and_hash_changes(self) -> None:
+        current = self.minimal_summary()
+        baseline = self.minimal_summary()
+        current_cell = current["openinfer_trace_pass"][0]["cells"][0]
+        current_cell["num_requests"] = 16
+        current_cell["workload"]["num_requests"] = 16
+        current_cell["output_hashes"]["sha256"] = "changed-trace-output-hash"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            regression = bench_matrix.build_regression_summary(
+                current,
+                baseline,
+                current_summary_path=root / "summary.json",
+                baseline_summary_path=root / "baseline.json",
+                noisy_threshold=0.05,
+            )
+
+        reasons = regression["comparability"]["reasons"]
+        self.assertIn(
+            "openinfer_trace_contract_changed:openinfer-host-staged/c1",
+            reasons,
+        )
+        self.assertIn(
+            "openinfer_trace_output_hash_changed:openinfer-host-staged/c1",
+            reasons,
+        )
+
+    def test_regression_summary_rejects_all_output_and_prompt_token_drift(self) -> None:
+        current = self.minimal_summary()
+        baseline = self.minimal_summary()
+        current["direct_diagnostic_batch"][0]["token_sha256"] = "changed-token-hash"
+        current["http_concurrency_pressure"][0]["summary_by_concurrency"][0][
+            "output_text_sha256"
+        ] = ["changed-http-hash"]
+        baseline_trace = baseline["openinfer_trace_pass"][0]["cells"][0]
+        current_trace = current["openinfer_trace_pass"][0]["cells"][0]
+        baseline_trace["prompt_tokens"] = {
+            "min": 84,
+            "max": 87,
+            "total": 2729,
+            "samples": 32,
+        }
+        current_trace["prompt_tokens"] = {
+            "min": 84,
+            "max": 87,
+            "total": 2730,
+            "samples": 32,
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            regression = bench_matrix.build_regression_summary(
+                current,
+                baseline,
+                current_summary_path=root / "summary.json",
+                baseline_summary_path=root / "baseline.json",
+                noisy_threshold=0.05,
+            )
+
+        reasons = regression["comparability"]["reasons"]
+        self.assertIn(
+            "direct_output_hash_changed:host-staged/batch1",
+            reasons,
+        )
+        self.assertIn(
+            "http_output_hash_changed:vllm-tp2/c1",
+            reasons,
+        )
+        self.assertIn(
+            "openinfer_trace_prompt_tokens_changed:openinfer-host-staged/c1",
+            reasons,
+        )
+        self.assertEqual(
+            regression["comparability"]["claim_marker"],
+            "no directional claim",
+        )
 
     def test_regression_summary_marks_noisy_http_cell_no_directional(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1312,14 +1875,7 @@ class BenchDsv2LiteMatrixTests(unittest.TestCase):
             http = root / "http_raw" / "vllm-tp2" / "c1" / "r0" / "result.json"
             http.parent.mkdir(parents=True)
             http.write_text(
-                json.dumps(
-                    {
-                        "num_completed_requests": 32,
-                        "num_failed_requests": 0,
-                        "total_output_tokens": 2048,
-                        "duration": 64.0,
-                    }
-                ),
+                json.dumps(self.valid_http_payload()),
                 encoding="utf-8",
             )
             (root / "summary.json").write_text(
@@ -1662,13 +2218,42 @@ class BenchDsv2LiteMatrixTests(unittest.TestCase):
             trace.write_text(
                 json.dumps(
                     {
+                        "model": "DeepSeek-V2-Lite",
+                        "requests": [
+                            {"output_hash": f"hash-{index % 4}"}
+                            for index in range(32)
+                        ],
                         "summary": {
-                            "completed": 8,
+                            "completed": 32,
                             "failed": 0,
                             "timeouts": 0,
                             "output_tokens_per_s": 20.0,
                         },
+                        "workload": {
+                            "num_requests": 32,
+                            "concurrency": 8,
+                            "warmup": 0,
+                            "prompt_words": 64,
+                            "max_tokens": 64,
+                            "mixed_shapes": {
+                                "prompt_words=64,max_tokens=64": 32,
+                            },
+                            "temperature": 0.0,
+                            "top_k": -1,
+                            "top_p": 1.0,
+                            "sampling_mode": "single",
+                            "sampling_counts": {"single": 32},
+                            "ignore_eos": True,
+                        },
                         "server_trace": {
+                            "traced_requests": 32,
+                            "missing_traces": [],
+                            "prompt_tokens": {
+                                "min": 84,
+                                "max": 87,
+                                "total": 2729,
+                                "samples": 32,
+                            },
                             "decode_batch_size_max": 5,
                             "active_set_size_max": 8,
                             "decode_steps": {
@@ -1717,9 +2302,200 @@ class BenchDsv2LiteMatrixTests(unittest.TestCase):
         self.assertEqual(trace_rows[0]["cells"][0]["trace"]["decode_batch_size_max"], 5)
         self.assertEqual(trace_rows[0]["cells"][0]["active_set_size_max"], 8)
         self.assertEqual(trace_rows[0]["cells"][0]["decode_batch_size_max"], 5)
+        self.assertEqual(trace_rows[0]["cells"][0]["num_requests"], 32)
+        self.assertEqual(trace_rows[0]["cells"][0]["prompt_words"], 64)
+        self.assertEqual(trace_rows[0]["cells"][0]["traced_requests"], 32)
+        self.assertEqual(trace_rows[0]["cells"][0]["output_hashes"]["count"], 32)
+        self.assertEqual(trace_rows[0]["cells"][0]["prompt_tokens"]["min"], 84)
         self.assertEqual(trace_rows[0]["cells"][0]["decode_steps"]["batched_total"], 40)
         self.assertEqual(trace_rows[0]["cells"][0]["phase_ms"]["decode_total"]["p50_ms"], 384.0)
         self.assertEqual(trace_rows[0]["cells"][0]["phase_ms"]["scheduled_to_terminal"]["p50_ms"], 420.0)
+
+    def test_summarize_existing_fails_incomplete_trace_coverage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            trace = root / "openinfer_trace" / "openinfer-host-staged" / "c1.json"
+            trace.parent.mkdir(parents=True)
+            trace.write_text(
+                json.dumps(
+                    {
+                        "model": "DeepSeek-V2-Lite",
+                        "requests": [
+                            {"output_hash": f"hash-{index % 4}"}
+                            for index in range(32)
+                        ],
+                        "summary": {
+                            "completed": 32,
+                            "failed": 0,
+                            "timeouts": 0,
+                            "output_tokens_per_s": 20.0,
+                        },
+                        "workload": {
+                            "num_requests": 32,
+                            "concurrency": 1,
+                            "warmup": 0,
+                            "prompt_words": 64,
+                            "max_tokens": 64,
+                            "mixed_shapes": {
+                                "prompt_words=64,max_tokens=64": 32,
+                            },
+                            "temperature": 0.0,
+                            "top_k": -1,
+                            "top_p": 1.0,
+                            "sampling_mode": "single",
+                            "sampling_counts": {"single": 32},
+                            "ignore_eos": True,
+                        },
+                        "server_trace": {
+                            "traced_requests": 31,
+                            "missing_traces": ["bench-7"],
+                            "decode_batch_size_max": 1,
+                            "prompt_tokens": {
+                                "min": 84,
+                                "max": 87,
+                                "total": 2642,
+                                "samples": 31,
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            summary = self.summarize_existing_without_metadata_probe(
+                self.base_args(root, concurrency=[1])
+            )
+
+        row = summary["openinfer_trace_pass"][0]
+        self.assertFalse(row["passed"])
+        self.assertEqual(row["claim_bucket"], bench_matrix.CLAIM_FAILED)
+        self.assertFalse(row["cells"][0]["passed"])
+        self.assertIn("incomplete trace coverage", row["error"])
+
+    def test_summarize_existing_rejects_trace_below_expected_workload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            trace = root / "openinfer_trace" / "openinfer-host-staged" / "c1.json"
+            trace.parent.mkdir(parents=True)
+            trace.write_text(
+                json.dumps(
+                    {
+                        "model": "DeepSeek-V2-Lite",
+                        "requests": [
+                            {"output_hash": f"hash-{index % 4}"}
+                            for index in range(32)
+                        ],
+                        "summary": {
+                            "completed": 8,
+                            "failed": 0,
+                            "timeouts": 0,
+                            "output_tokens_per_s": 20.0,
+                        },
+                        "workload": {
+                            "num_requests": 8,
+                            "concurrency": 1,
+                            "warmup": 0,
+                            "prompt_words": 64,
+                            "max_tokens": 64,
+                            "mixed_shapes": {
+                                "prompt_words=64,max_tokens=64": 8,
+                            },
+                            "temperature": 0.0,
+                            "top_k": -1,
+                            "top_p": 1.0,
+                            "sampling_mode": "single",
+                            "sampling_counts": {"single": 8},
+                            "ignore_eos": True,
+                        },
+                        "server_trace": {
+                            "traced_requests": 8,
+                            "missing_traces": [],
+                            "decode_batch_size_max": 1,
+                            "prompt_tokens": {
+                                "min": 84,
+                                "max": 87,
+                                "total": 684,
+                                "samples": 8,
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            summary = self.summarize_existing_without_metadata_probe(
+                self.base_args(root, concurrency=[1], num_prompts=32)
+            )
+
+        row = summary["openinfer_trace_pass"][0]
+        cell = row["cells"][0]
+        self.assertFalse(row["passed"])
+        self.assertEqual(row["claim_bucket"], bench_matrix.CLAIM_FAILED)
+        self.assertFalse(cell["passed"])
+        self.assertEqual(cell["num_requests"], 8)
+        self.assertEqual(cell["completed"], 8)
+        self.assertIn("incomplete trace coverage", row["error"])
+
+    def test_summarize_existing_rejects_wrong_trace_workload_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            trace = root / "openinfer_trace" / "openinfer-host-staged" / "c1.json"
+            trace.parent.mkdir(parents=True)
+            trace.write_text(
+                json.dumps(
+                    {
+                        "model": "DeepSeek-V2-Lite",
+                        "requests": [
+                            {"output_hash": f"hash-{index % 4}"}
+                            for index in range(32)
+                        ],
+                        "summary": {
+                            "completed": 32,
+                            "failed": 0,
+                            "timeouts": 0,
+                            "output_tokens_per_s": 20.0,
+                        },
+                        "workload": {
+                            "num_requests": 32,
+                            "concurrency": 1,
+                            "warmup": 0,
+                            "prompt_words": 1,
+                            "max_tokens": 64,
+                            "mixed_shapes": {
+                                "prompt_words=1,max_tokens=64": 32,
+                            },
+                            "temperature": 0.0,
+                            "top_k": -1,
+                            "top_p": 1.0,
+                            "sampling_mode": "single",
+                            "sampling_counts": {"single": 32},
+                            "ignore_eos": True,
+                        },
+                        "server_trace": {
+                            "traced_requests": 32,
+                            "missing_traces": [],
+                            "decode_batch_size_max": 1,
+                            "prompt_tokens": {
+                                "min": 1,
+                                "max": 1,
+                                "total": 32,
+                                "samples": 32,
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            summary = self.summarize_existing_without_metadata_probe(
+                self.base_args(root, concurrency=[1], num_prompts=32)
+            )
+
+        row = summary["openinfer_trace_pass"][0]
+        self.assertFalse(row["passed"])
+        self.assertFalse(row["cells"][0]["passed"])
+        self.assertEqual(row["cells"][0]["workload"]["prompt_words"], 1)
+        self.assertIn("incomplete trace coverage", row["error"])
 
     def test_summarize_existing_preserves_unresolved_trace_failed_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1729,8 +2505,44 @@ class BenchDsv2LiteMatrixTests(unittest.TestCase):
             trace.write_text(
                 json.dumps(
                     {
-                        "summary": {"completed": 8, "failed": 0, "output_tokens_per_s": 20.0},
-                        "server_trace": {"decode_batch_size_max": 1, "missing_traces": []},
+                        "model": "DeepSeek-V2-Lite",
+                        "requests": [
+                            {"output_hash": f"hash-{index % 4}"}
+                            for index in range(32)
+                        ],
+                        "summary": {
+                            "completed": 32,
+                            "failed": 0,
+                            "timeouts": 0,
+                            "output_tokens_per_s": 20.0,
+                        },
+                        "workload": {
+                            "num_requests": 32,
+                            "concurrency": 1,
+                            "warmup": 0,
+                            "prompt_words": 64,
+                            "max_tokens": 64,
+                            "mixed_shapes": {
+                                "prompt_words=64,max_tokens=64": 32,
+                            },
+                            "temperature": 0.0,
+                            "top_k": -1,
+                            "top_p": 1.0,
+                            "sampling_mode": "single",
+                            "sampling_counts": {"single": 32},
+                            "ignore_eos": True,
+                        },
+                        "server_trace": {
+                            "traced_requests": 32,
+                            "decode_batch_size_max": 1,
+                            "missing_traces": [],
+                            "prompt_tokens": {
+                                "min": 84,
+                                "max": 87,
+                                "total": 2729,
+                                "samples": 32,
+                            },
+                        },
                     }
                 ),
                 encoding="utf-8",
@@ -1806,6 +2618,36 @@ class BenchDsv2LiteMatrixTests(unittest.TestCase):
         self.assertEqual(row["claim_bucket"], "failed_setup")
         self.assertIn("no OpenInfer trace result artifacts", row["error"])
 
+    def test_summarize_existing_rejects_summary_without_raw_trace_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "summary.json").write_text(
+                json.dumps(
+                    {
+                        "openinfer_trace_pass": [
+                            {
+                                "engine": "openinfer-host-staged",
+                                "claim_bucket": bench_matrix.CLAIM_HTTP,
+                                "passed": True,
+                                "cells": [{"concurrency": 1, "passed": True}],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            summary = self.summarize_existing_without_metadata_probe(
+                self.base_args(root, concurrency=[1])
+            )
+
+        row = summary["openinfer_trace_pass"][0]
+        self.assertEqual(row["engine"], "openinfer-host-staged")
+        self.assertFalse(row["passed"])
+        self.assertEqual(row["claim_bucket"], bench_matrix.CLAIM_FAILED)
+        self.assertEqual(row["cells"], [])
+        self.assertIn("raw OpenInfer trace artifacts are missing", row["error"])
+
     def test_summarize_existing_marks_missing_trace_concurrency_failed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1814,8 +2656,40 @@ class BenchDsv2LiteMatrixTests(unittest.TestCase):
             trace.write_text(
                 json.dumps(
                     {
-                        "summary": {"completed": 8, "failed": 0, "output_tokens_per_s": 20.0},
-                        "server_trace": {"decode_batch_size_max": 1, "missing_traces": []},
+                        "model": "DeepSeek-V2-Lite",
+                        "summary": {
+                            "completed": 32,
+                            "failed": 0,
+                            "timeouts": 0,
+                            "output_tokens_per_s": 20.0,
+                        },
+                        "workload": {
+                            "num_requests": 32,
+                            "concurrency": 1,
+                            "warmup": 0,
+                            "prompt_words": 64,
+                            "max_tokens": 64,
+                            "mixed_shapes": {
+                                "prompt_words=64,max_tokens=64": 32,
+                            },
+                            "temperature": 0.0,
+                            "top_k": -1,
+                            "top_p": 1.0,
+                            "sampling_mode": "single",
+                            "sampling_counts": {"single": 32},
+                            "ignore_eos": True,
+                        },
+                        "server_trace": {
+                            "traced_requests": 32,
+                            "decode_batch_size_max": 1,
+                            "missing_traces": [],
+                            "prompt_tokens": {
+                                "min": 84,
+                                "max": 87,
+                                "total": 2729,
+                                "samples": 32,
+                            },
+                        },
                     }
                 ),
                 encoding="utf-8",
