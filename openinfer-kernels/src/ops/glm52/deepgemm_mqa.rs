@@ -5,7 +5,6 @@ use crate::ffi;
 use crate::tensor::DeviceContext;
 
 pub const GLM52_DEEPGEMM_MQA_HEAD_DIM: usize = 128;
-pub const GLM52_DEEPGEMM_MQA_BLOCK_KV: usize = 128;
 pub const GLM52_DEEPGEMM_MQA_SPLIT_KV: usize = 256;
 pub const GLM52_DEEPGEMM_MQA_FP8_ELEM_SIZE: usize = 1;
 pub const GLM52_DEEPGEMM_MQA_BF16_ELEM_SIZE: usize = 2;

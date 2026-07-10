@@ -1,6 +1,8 @@
 // DeepEP elastic shim, Kimi-K2 instantiation (TP1/DP8/EP8, deepep_* symbols).
 // The parameterized body lives in deepep_shim_impl.cuh.
 
+#define DEEPEP_SHIM_HAS_PREFILL 1
+
 #include "deepep.h"
 #include "deepep_config.cuh"
 

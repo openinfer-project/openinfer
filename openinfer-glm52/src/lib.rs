@@ -669,7 +669,7 @@ fn validate_startup(
     );
 
     let manifest = Glm52WeightManifest::from_model_dir(model_path)?;
-    let rank_bundles = manifest.all_rank_load_bundles(moe_topo == Glm52MoeTopo::Ep8)?;
+    let rank_bundles = manifest.all_rank_load_bundles(moe_topo)?;
     let mut rank_tensor_counts = Vec::with_capacity(rank_bundles.len());
     let mut rank_expert_ranges = Vec::with_capacity(rank_bundles.len());
     for bundle in &rank_bundles {

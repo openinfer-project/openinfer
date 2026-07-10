@@ -2,6 +2,8 @@
 // Compiled only under the glm52 feature; the parameterized body lives in
 // deepep_shim_impl.cuh.
 
+#define DEEPEP_SHIM_HAS_PREFILL 0
+
 #include "deepep_glm52.h"
 #include "deepep_config_glm52.cuh"
 

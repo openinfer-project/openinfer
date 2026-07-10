@@ -15,7 +15,7 @@ use half::bf16;
 
 use openinfer_kernels::ops::{
     GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW, glm52_fp8_weight_only_gemv_launch,
-    glm52_silu_and_mul_weighted_bf16_launch,
+    glm52_silu_and_mul_bf16_launch,
 };
 use openinfer_kernels::tensor::DeviceContext;
 
@@ -346,14 +346,7 @@ pub(crate) fn fp8_mlp_into(
         &mut s.gate_up,
     )?;
     // bf16 SwiGLU (no route weight, no activation quant) -> bf16 down input.
-    glm52_silu_and_mul_weighted_bf16_launch(
-        ctx,
-        s.rows,
-        intermediate,
-        &s.gate_up,
-        None,
-        &mut s.silu_out,
-    )?;
+    glm52_silu_and_mul_bf16_launch(ctx, s.rows, intermediate, &s.gate_up, &mut s.silu_out)?;
     fp8_linear_into(
         ctx,
         down,
@@ -362,21 +355,6 @@ pub(crate) fn fp8_mlp_into(
         Some(&mut s.gemv_partial),
         out,
     )
-}
-
-/// Allocating convenience over [`fp8_mlp_into`] for the oracle-gate/test
-/// paths. Returns `[down.n]` bf16 (= `[HIDDEN]`).
-#[cfg(test)]
-pub(crate) fn fp8_mlp(
-    ctx: &DeviceContext,
-    gate_up: &ProjWeight,
-    down: &ProjWeight,
-    input: &CudaSlice<bf16>,
-) -> Result<CudaSlice<bf16>> {
-    let mut s = Glm52MlpScratch::new(ctx, gate_up.n / 2, 1)?;
-    let mut out = ctx.stream.alloc_zeros::<bf16>(down.n)?;
-    fp8_mlp_into(ctx, gate_up, down, input, &mut s, &mut out)?;
-    Ok(out)
 }
 
 #[cfg(test)]

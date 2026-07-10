@@ -49,25 +49,9 @@ impl Glm52IndexerCacheLayout {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Glm52IndexerScaleFormat {
-    F32,
-    Ue8m0RoundedF32,
-}
-
-impl Glm52IndexerScaleFormat {
-    fn as_ffi(self) -> i32 {
-        match self {
-            Self::F32 => 0,
-            Self::Ue8m0RoundedF32 => 1,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Glm52IndexerCacheInsert {
     pub tokens: usize,
     pub layout: Glm52IndexerCacheLayout,
-    pub scale_format: Glm52IndexerScaleFormat,
 }
 
 impl Glm52IndexerCacheInsert {
@@ -121,7 +105,6 @@ pub fn glm52_indexer_k_quant_and_cache_launch(
             GLM52_INDEXER_QUANT_BLOCK_SIZE as i32,
             contract.layout.cache_block_size as i32,
             contract.layout.cache_block_stride_bytes as i64,
-            contract.scale_format.as_ffi(),
             ctx.stream.cu_stream(),
         )
     };

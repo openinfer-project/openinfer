@@ -167,46 +167,4 @@ unsafe extern "C" {
         num_tokens: i32,
         combined_x: *mut c_void,
     ) -> c_int;
-
-    pub fn glm52_deepep_prefill_dispatch_send(
-        ctx: *mut Glm52DeepEpCtx,
-        stream: *mut c_void,
-        x: *const c_void,
-        topk_idx: *const i32,
-        topk_weights: *const f32,
-        num_tokens: i32,
-        rank_count_scratch: *mut i32,
-        dst_slot_scratch: *mut i32,
-        psum_rank: *mut i32,
-        psum_expert: *mut i32,
-    ) -> c_int;
-
-    pub fn glm52_deepep_prefill_wait_counts(
-        ctx: *mut Glm52DeepEpCtx,
-        num_recv_tokens: *mut i32,
-        num_expanded_tokens: *mut i32,
-    ) -> c_int;
-
-    pub fn glm52_deepep_prefill_dispatch_recv(
-        ctx: *mut Glm52DeepEpCtx,
-        stream: *mut c_void,
-        num_recv_tokens: i32,
-        psum_rank: *const i32,
-        psum_expert: *const i32,
-        recv_x: *mut c_void,
-        recv_topk_weights: *mut f32,
-        recv_src_metadata: *mut i32,
-    ) -> c_int;
-
-    pub fn glm52_deepep_prefill_combine(
-        ctx: *mut Glm52DeepEpCtx,
-        stream: *mut c_void,
-        x: *const c_void,
-        src_metadata: *const i32,
-        psum_rank: *const i32,
-        num_recv_tokens: i32,
-        combined_topk_idx: *const i32,
-        num_tokens: i32,
-        combined_x: *mut c_void,
-    ) -> c_int;
 }

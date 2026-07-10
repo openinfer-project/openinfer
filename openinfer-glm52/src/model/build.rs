@@ -138,13 +138,8 @@ pub(super) fn build_decoder_layer(
         )?))
     } else if moe_topo == crate::Glm52MoeTopo::Tp8 {
         // TP8 topology: the routed experts and the shared expert live in the
-        // rank's slice bank (shared folded at index 256); only the router is
-        // per-layer MLP weight. The shared-expert tensors were loaded as part
-        // of the non-expert set — drop this rank's copies here.
-        for proj in ["gate_proj", "up_proj", "down_proj"] {
-            drop(w.take_tensor(&format!("{mp}.shared_experts.{proj}.weight"))?);
-            drop(w.take_tensor(&format!("{mp}.shared_experts.{proj}.weight_scale_inv"))?);
-        }
+        // rank's slice bank (shared folded at index 256); the resident first
+        // pass therefore carries only the router for this layer.
         Glm52LayerMlp::MoeTp8(Box::new(Glm52MoeRouterWeights::new(
             w.take_tensor(&format!("{mp}.gate.weight"))?,
             w.take_tensor(&format!("{mp}.gate.e_score_correction_bias"))?,

@@ -102,7 +102,7 @@ fn walk_positions(
     let mut cache = ctx
         .stream
         .alloc_zeros::<u8>(contract.packed_kv_cache_len())?;
-    let sched = Glm52MlaSchedMetadata::new(ctx, contract)?;
+    let sched = Glm52MlaSchedMetadata::new(ctx, contract, w.heads)?;
     let mut reduced = ctx.stream.alloc_zeros::<bf16>(HIDDEN)?;
     let mut ar = ar;
     let mut outputs = Vec::with_capacity(CTX * HIDDEN);

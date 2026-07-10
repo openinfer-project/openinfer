@@ -59,33 +59,6 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    // --- TRTLLM FP8 block-scale grouped MoE (PR3, compiled now) ---------------
-    pub fn glm52_trtllm_grouped_fp8_workspace_size_cuda(
-        operand_kind: i32,
-        groups: i32,
-        m_capacity: i32,
-        n: i32,
-        k: i32,
-        workspace_bytes: *mut usize,
-    ) -> CUresult;
-
-    pub fn glm52_trtllm_grouped_fp8_launch_cuda(
-        operand_kind: i32,
-        a: *const u8,
-        a_scale_trtllm: *const f32,
-        b: *const u8,
-        b_scale: *const f32,
-        expert_offsets: *const i64,
-        out: *mut Half,
-        workspace: *mut std::ffi::c_void,
-        workspace_bytes: usize,
-        groups: i32,
-        m_capacity: i32,
-        n: i32,
-        k: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
     // --- MLA decode assembly (projections -> FlashMLA glue) -------------------
     pub fn glm52_mla_query_assemble_cuda(
         ql_nope: *const Half,
@@ -169,17 +142,6 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn glm52_silu_and_mul_weighted_per_token_group_quant_bf16_cuda(
-        input: *const Half,
-        topk_weights: *const f32,
-        output: *mut u8,
-        scales: *mut f32,
-        rows: i32,
-        hidden_size: i32,
-        group_size: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
     // --- MoE router (csrc/glm52/glm52_router.cu) ------------------------------
     pub fn glm52_router_noaux_tc_cuda(
         hidden: *const Half,
@@ -197,78 +159,6 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    // --- grouped activation-scale relayout (csrc/glm52/glm52_deepgemm_layout.cu)
-    pub fn glm52_deepgemm_grouped_offset_tma_aligned_f32_cuda(
-        input: *const f32,
-        expert_offsets: *const i64,
-        output: *mut f32,
-        m_capacity: i32,
-        scale_cols: i32,
-        groups: i32,
-        padded_rows: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    // --- bs=1 MoE route: offsets/scatter/combine (csrc/glm52/glm52_moe_route.cu)
-    pub fn glm52_moe_route_offsets_cuda(
-        topk_idx: *const i32,
-        expert_offsets: *mut i64,
-        n_experts: i32,
-        topk: i32,
-        alignment: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn glm52_moe_route_scatter_cuda(
-        hidden_fp8: *const u8,
-        hidden_scale: *const f32,
-        topk_idx: *const i32,
-        topk_weight: *const f32,
-        expert_offsets: *const i64,
-        act: *mut u8,
-        act_scale: *mut f32,
-        row_weight: *mut f32,
-        topk: i32,
-        k: i32,
-        scale_cols: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn glm52_moe_combine_cuda(
-        w2_out: *const Half,
-        topk_idx: *const i32,
-        expert_offsets: *const i64,
-        routed: *mut Half,
-        n: i32,
-        topk: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    // --- bs=1 weight-only FP8 GEMV path (csrc/glm52/glm52_moe_gemv.cu) ---------
-    pub fn glm52_moe_fp8_weight_only_gemv_cuda(
-        operand_kind: i32,
-        activation: *const Half,
-        act_row_stride: i32,
-        topk_idx: *const i32,
-        weight: *const u8,
-        weight_scale: *const f32,
-        out: *mut Half,
-        topk: i32,
-        n: i32,
-        k: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn glm52_fp8_weight_only_gemv_cuda(
-        activation: *const Half,
-        weight: *const u8,
-        weight_scale: *const f32,
-        out: *mut Half,
-        n: i32,
-        k: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
     pub fn glm52_fp8_weight_only_gemv_batched_cuda(
         activation: *const Half,
         weight: *const u8,
@@ -282,20 +172,11 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn glm52_silu_and_mul_weighted_bf16_cuda(
+    pub fn glm52_silu_and_mul_bf16_cuda(
         input: *const Half,
-        topk_weights: *const f32,
         output: *mut Half,
         rows: i32,
         inter: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn glm52_moe_combine_slots_cuda(
-        w2_out: *const Half,
-        routed: *mut Half,
-        n: i32,
-        topk: i32,
         stream: CUstream,
     ) -> CUresult;
 

@@ -1481,7 +1481,7 @@ fn main() {
             "-I".to_string(),
             csrc_dir.to_string_lossy().to_string(),
         ];
-        if stem == "glm52_flashmla_sparse" || stem == "glm52_trtllm_grouped_fp8" {
+        if stem == "glm52_flashmla_sparse" {
             nvcc_args.extend(glm52_flashmla_arch_args(&nvcc_sm_targets, &nvcc));
         } else if stem == "glm52_deepgemm_mqa" || stem == "glm52_deepgemm_grouped" {
             if let Some(sm90a_args) = glm52_sm90a_only_arch_args(&nvcc_sm_targets, &nvcc) {
@@ -1623,58 +1623,6 @@ fn main() {
                 flashinfer.cutlass.to_string_lossy().to_string(),
                 "-I".to_string(),
                 flashinfer.cutlass_util.to_string_lossy().to_string(),
-            ]);
-        } else if stem == "glm52_trtllm_grouped_fp8" {
-            let flashmla = root.join("third_party/FlashMLA/csrc");
-            for dir in &flashinfer.cccl {
-                nvcc_args.extend(["-I".to_string(), dir.to_string_lossy().to_string()]);
-            }
-            nvcc_args.extend([
-                "--std=c++17".to_string(),
-                "--expt-relaxed-constexpr".to_string(),
-                "--expt-extended-lambda".to_string(),
-                "-DENABLE_FP8".to_string(),
-                "-DENABLE_BF16".to_string(),
-                "-DENABLE_FP8_BLOCK_SCALE".to_string(),
-                "-DCOMPILE_HOPPER_TMA_GEMMS".to_string(),
-                "-I".to_string(),
-                flashinfer.include.to_string_lossy().to_string(),
-                "-I".to_string(),
-                flashinfer.csrc.to_string_lossy().to_string(),
-                "-I".to_string(),
-                flashinfer
-                    .csrc
-                    .join("nv_internal")
-                    .to_string_lossy()
-                    .to_string(),
-                "-I".to_string(),
-                flashinfer
-                    .csrc
-                    .join("nv_internal/include")
-                    .to_string_lossy()
-                    .to_string(),
-                "-I".to_string(),
-                flashinfer
-                    .csrc
-                    .join("nv_internal/tensorrt_llm/cutlass_extensions/include")
-                    .to_string_lossy()
-                    .to_string(),
-                "-I".to_string(),
-                flashmla
-                    .join("cutlass/include")
-                    .to_string_lossy()
-                    .to_string(),
-                "-I".to_string(),
-                flashmla
-                    .join("cutlass/tools/util/include")
-                    .to_string_lossy()
-                    .to_string(),
-                "-I".to_string(),
-                flashinfer.cutlass.to_string_lossy().to_string(),
-                "-I".to_string(),
-                flashinfer.cutlass_util.to_string_lossy().to_string(),
-                "-I".to_string(),
-                flashinfer.spdlog.to_string_lossy().to_string(),
             ]);
         } else if stem == "glm52_deepgemm_mqa" || stem == "glm52_deepgemm_grouped" {
             // DeepGEMM paged MQA + masked grouped GEMM kernels,

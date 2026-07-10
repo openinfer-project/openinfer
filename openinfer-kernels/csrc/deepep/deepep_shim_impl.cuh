@@ -19,9 +19,15 @@
 // Warp counts and capacities come from the config namespace; ctx_create
 // runtime-asserts the constexpr mirrors against the real layout classes.
 
+#ifndef DEEPEP_SHIM_HAS_PREFILL
+#error "instantiation must define DEEPEP_SHIM_HAS_PREFILL"
+#endif
+
 #include <algorithm>
+#if DEEPEP_SHIM_HAS_PREFILL
 #include <atomic>
 #include <chrono>
+#endif
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -193,7 +199,9 @@ struct PathKernels {
 };
 
 using Decode = PathKernels<cfg::kDecodeMaxTokens, cfg::kDecodeNumSms, /*kCpuSync=*/false>;
+#if DEEPEP_SHIM_HAS_PREFILL
 using Prefill = PathKernels<cfg::kPrefillMaxTokens, cfg::kPrefillNumSms, /*kCpuSync=*/true>;
+#endif
 
 const void* barrier_kernel() {
     return reinterpret_cast<const void*>(
@@ -232,10 +240,12 @@ int64_t aligned_workspace_bytes() {
 
 int64_t data_buffer_bytes() {
     int64_t bytes = 0;
-    for (const int max_tokens : {cfg::kDecodeMaxTokens, cfg::kPrefillMaxTokens}) {
-        bytes = std::max(bytes, dispatch_buffer_bytes(max_tokens));
-        bytes = std::max(bytes, combine_buffer_bytes(max_tokens));
-    }
+    bytes = std::max(bytes, dispatch_buffer_bytes(cfg::kDecodeMaxTokens));
+    bytes = std::max(bytes, combine_buffer_bytes(cfg::kDecodeMaxTokens));
+#if DEEPEP_SHIM_HAS_PREFILL
+    bytes = std::max(bytes, dispatch_buffer_bytes(cfg::kPrefillMaxTokens));
+    bytes = std::max(bytes, combine_buffer_bytes(cfg::kPrefillMaxTokens));
+#endif
     return math::align<int64_t>(bytes, kSymAlignment);
 }
 
@@ -257,8 +267,10 @@ struct DEEPEP_SHIM_CTX {
     void* workspace = nullptr;  // LSA-mapped pointers into the window
     void* buffer = nullptr;
 
-    void* host_workspace = nullptr;  // pinned, mapped (CPU-sync counters)
-    void* mapped_host_workspace = nullptr;
+#if DEEPEP_SHIM_HAS_PREFILL
+    void* host_workspace = nullptr;         // pinned CPU-sync counters
+    void* mapped_host_workspace = nullptr;  // device mapping of host_workspace
+#endif
 };
 
 namespace {
@@ -272,10 +284,12 @@ void launch_barrier_on(DEEPEP_SHIM_CTX* ctx, cudaStream_t stream) {
            /*cluster=*/1, /*cooperative=*/true, /*pdl=*/false, stream, args);
 }
 
+#if DEEPEP_SHIM_HAS_PREFILL
 layout::WorkspaceLayout host_workspace_layout(DEEPEP_SHIM_CTX* ctx) {
     return layout::WorkspaceLayout(ctx->host_workspace, /*num_scaleout_ranks=*/1,
                                    cfg::kNumRanks, cfg::kNumExperts);
 }
+#endif
 
 // Shared dispatch-side launch sequence: deterministic slot prologue, then the
 // dispatch kernel. The copy epilogue differs between decode (fixed worst case)
@@ -308,6 +322,11 @@ void dispatch_send_impl(DEEPEP_SHIM_CTX* ctx, cudaStream_t stream, const void* x
         int* cumulative_stats = nullptr;
         int sf_token_stride = 0, sf_hidden_stride = 0;
         int rank_idx = ctx->rank_idx;
+#if DEEPEP_SHIM_HAS_PREFILL
+        void* mapped_host_workspace = ctx->mapped_host_workspace;
+#else
+        void* mapped_host_workspace = nullptr;  // unused when Path::kCpuSync is false
+#endif
         void* args[] = {&px,
                         &sf,
                         &tk,
@@ -324,7 +343,7 @@ void dispatch_send_impl(DEEPEP_SHIM_CTX* ctx, cudaStream_t stream, const void* x
                         &ctx->window,
                         &ctx->buffer,
                         &ctx->workspace,
-                        &ctx->mapped_host_workspace,
+                        &mapped_host_workspace,
                         &rank_idx};
         launch(Path::dispatch(), Path::kGridSms, Path::kDispatchThreads, cfg::kSmemBytes,
                Path::kClusterDim, /*cooperative=*/true, /*pdl=*/false, stream, args);
@@ -429,8 +448,13 @@ void DEEPEP_SHIM_FN(info)(DeepEpInfo* out) {
     out->decode_max_tokens_per_rank = cfg::kDecodeMaxTokens;
     out->decode_worst_recv_tokens = cfg::kDecodeWorstRecvTokens;
     out->decode_worst_expanded_tokens = cfg::kDecodeWorstExpandedTokens;
+#if DEEPEP_SHIM_HAS_PREFILL
     out->prefill_max_tokens_per_rank = cfg::kPrefillMaxTokens;
     out->prefill_worst_recv_tokens = cfg::kPrefillWorstRecvTokens;
+#else
+    out->prefill_max_tokens_per_rank = 0;
+    out->prefill_worst_recv_tokens = 0;
+#endif
     out->prologue_rank_count_len = cfg::kDeviceSms * cfg::kNumRanks;
     out->buffer_bytes = data_buffer_bytes();
     out->workspace_bytes = aligned_workspace_bytes();
@@ -534,6 +558,7 @@ int DEEPEP_SHIM_FN(ctx_create)(const uint8_t unique_id[128], int32_t num_ranks,
     ctx->buffer = static_cast<uint8_t*>(mapped) + workspace_bytes;
     check_cuda(cudaMemset(ctx->workspace, 0, workspace_bytes), "workspace memset");
 
+#if DEEPEP_SHIM_HAS_PREFILL
     // Pinned host workspace for the CPU-sync counters (prefill path).
     check_cuda(cudaMallocHost(&ctx->host_workspace, layout::WorkspaceLayout::get_num_bytes(),
                               cudaHostAllocMapped),
@@ -541,6 +566,7 @@ int DEEPEP_SHIM_FN(ctx_create)(const uint8_t unique_id[128], int32_t num_ranks,
     check_cuda(cudaHostGetDevicePointer(&ctx->mapped_host_workspace, ctx->host_workspace, 0),
                "cudaHostGetDevicePointer");
     std::memset(ctx->host_workspace, 0, layout::WorkspaceLayout::get_num_bytes());
+#endif
 
     // Workspace zeroing must be visible to peers before any dispatch; the
     // window registration above already barriered after the memset's
@@ -559,7 +585,9 @@ int DEEPEP_SHIM_FN(ctx_destroy)(DEEPEP_SHIM_CTX* ctx) {
     launch_barrier_on(ctx, /*stream=*/nullptr);
     check_cuda(cudaDeviceSynchronize(), "ctx_destroy barrier sync");
 
+#if DEEPEP_SHIM_HAS_PREFILL
     check_cuda(cudaFreeHost(ctx->host_workspace), "cudaFreeHost");
+#endif
     check_nccl(ncclCommWindowDeregister(ctx->comm, ctx->window), "ncclCommWindowDeregister");
     check_nccl(ncclDevCommDestroy(ctx->comm, &ctx->dev_comm), "ncclDevCommDestroy");
     check_nccl(ncclMemFree(ctx->sym_base), "ncclMemFree");
@@ -597,6 +625,7 @@ int DEEPEP_SHIM_FN(decode_combine)(DEEPEP_SHIM_CTX* ctx, void* stream, const voi
     SHIM_API_END
 }
 
+#if DEEPEP_SHIM_HAS_PREFILL
 int DEEPEP_SHIM_FN(prefill_dispatch_send)(DEEPEP_SHIM_CTX* ctx, void* stream, const void* x,
                                           const int32_t* topk_idx, const float* topk_weights,
                                           int32_t num_tokens, int32_t* rank_count_scratch,
@@ -683,5 +712,6 @@ int DEEPEP_SHIM_FN(prefill_combine)(DEEPEP_SHIM_CTX* ctx, void* stream, const vo
                                combined_x);
     SHIM_API_END
 }
+#endif
 
 }  // extern "C"

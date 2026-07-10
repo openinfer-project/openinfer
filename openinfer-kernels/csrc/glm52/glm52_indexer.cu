@@ -33,7 +33,7 @@ __global__ void indexer_k_quant_and_cache_kernel(
     const __nv_bfloat16* __restrict__ k,
     unsigned char* __restrict__ indexer_cache,
     const int64_t* __restrict__ slot_mapping, int tokens, int cache_block_size,
-    int64_t cache_block_stride_bytes, bool use_ue8m0_scale) {
+    int64_t cache_block_stride_bytes) {
   constexpr int kVecSize = 4;
   const int64_t token_idx = blockIdx.x;
   const int64_t head_dim_idx =
@@ -62,9 +62,6 @@ __global__ void indexer_k_quant_and_cache_kernel(
   }
 
   float scale = fmaxf(amax, kFp8ScaleEps) / kFp8ScaleDivisor;
-  if (use_ue8m0_scale) {
-    scale = exp2f(ceilf(log2f(scale)));
-  }
 
   // vLLM cache_kernels.cu::indexer_k_quant_and_cache_kernel stores a block as:
   // [block_size * 128 fp8 values][block_size * 4 f32-scale bytes].
@@ -192,8 +189,7 @@ extern "C" {
 CUresult glm52_indexer_k_quant_and_cache_cuda(
     const __nv_bfloat16* k, unsigned char* indexer_cache,
     const int64_t* slot_mapping, int tokens, int head_dim, int quant_block_size,
-    int cache_block_size, int64_t cache_block_stride_bytes,
-    int use_ue8m0_scale, cudaStream_t stream) {
+    int cache_block_size, int64_t cache_block_stride_bytes, cudaStream_t stream) {
   if (k == nullptr || indexer_cache == nullptr || slot_mapping == nullptr) {
     return CUDA_ERROR_INVALID_VALUE;
   }
@@ -210,7 +206,7 @@ CUresult glm52_indexer_k_quant_and_cache_cuda(
   dim3 block(32, kVecSize);
   indexer_k_quant_and_cache_kernel<<<grid, block, 0, stream>>>(
       k, indexer_cache, slot_mapping, tokens, cache_block_size,
-      cache_block_stride_bytes, use_ue8m0_scale != 0);
+      cache_block_stride_bytes);
   return consume_last_cuda_error();
 }
 

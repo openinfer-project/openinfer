@@ -11,7 +11,6 @@ unsafe extern "C" {
         quant_block_size: i32,
         cache_block_size: i32,
         cache_block_stride_bytes: i64,
-        use_ue8m0_scale: i32,
         stream: CUstream,
     ) -> CUresult;
 

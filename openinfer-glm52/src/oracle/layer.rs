@@ -8,12 +8,9 @@
 //! decode, real DSA indexer — at ctx <= 2048 its top-k equals full top-k) and
 //! assert the outputs land on the probes.
 //!
-//! Two layers, chosen by what they exercise:
-//! - layer 0: dense MLP + full indexer (the residual/norm wiring around the
-//!   already-gated MLA brick, plus `fp8_mlp` at intermediate 12288).
-//! - layer 6: routed+shared MoE + full indexer (router, expert-major grouped
-//!   FP8 GEMM chain, weighted-SwiGLU fold, combine). The MoE gate runs BOTH
-//!   expert paths (Grouped and Gemv) against the same probes.
+//! Layer 0 exercises the dense MLP and full indexer. Layer 6's generated
+//! probes are shared by the EP8 and TP8 topology gates in the sibling modules;
+//! the obsolete EP1 local-MoE implementation is not retained here.
 //!
 //! Run (H200 + checkpoint + DeepGEMM env):
 //! ```text
@@ -48,7 +45,7 @@ use crate::layer::{
 };
 use crate::mla_decode::{Glm52MlaLayerWeights, Glm52MlaSchedMetadata};
 use crate::model::{INDEX_CACHE_BLOCK, NUM_SMS, rope_tables};
-use crate::moe_decode::{Glm52MoeExpertPath, Glm52MoeLayerWeights, Glm52MoeRoutedExpertBytes};
+use crate::moe_decode::Glm52MoeRoutedExpertBytes;
 use crate::scratch::Glm52DecodeScratch;
 
 // ---- BEGIN GENERATED: glm52_oracle layer probes (dense, layer 0) ----
@@ -213,19 +210,6 @@ pub(crate) const MOE_ORACLE_LAYER_PROBES: &[(usize, f32)] = &[
     (1216021, 4.052734375e-02),
     (1218315, 3.173828125e-02),
 ];
-// Router selection of the LAST position: (expert_id, normalized x2.5 weight),
-// sorted by expert id. NOT asserted — the engine does not expose its router
-// picks to the gate; this is a hand-comparison aid when layer probes fail.
-const MOE_ORACLE_ROUTER_LAST: &[(i32, f32)] = &[
-    (20, 3.342877328e-01),
-    (30, 3.071641624e-01),
-    (46, 2.911965847e-01),
-    (71, 3.105072975e-01),
-    (73, 3.114154637e-01),
-    (75, 3.002892137e-01),
-    (169, 3.048956990e-01),
-    (216, 3.402439058e-01),
-];
 // ---- END GENERATED ----
 
 const HIDDEN: usize = 6144;
@@ -310,13 +294,10 @@ impl LayerTensors {
     }
 }
 
-/// Which MLP half the gate loads: dense, the EP1 all-256 MoE, or the EP8
-/// rank-0 MoE (router + shared + experts 0..32 — the collective driver runs
-/// the expert math).
+/// Which live MLP half the gate loads.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GateLayerMlp {
     Dense,
-    Moe,
     MoeEp8Rank0,
 }
 
@@ -424,39 +405,6 @@ pub(crate) fn load_decoder_layer(
                 bank: load_rank_expert_bank(ctx, &t, layer, 0)?,
             }))
         }
-        GateLayerMlp::Moe => {
-            let experts: Vec<Glm52MoeRoutedExpertBytes<'_>> = (0..EXPERTS)
-                .map(|e| {
-                    let ep = format!("{mp}.experts.{e}");
-                    Ok(Glm52MoeRoutedExpertBytes {
-                        gate: t.proj(&format!("{ep}.gate_proj"), MOE_INTERMEDIATE, HIDDEN)?,
-                        up: t.proj(&format!("{ep}.up_proj"), MOE_INTERMEDIATE, HIDDEN)?,
-                        down: t.proj(&format!("{ep}.down_proj"), HIDDEN, MOE_INTERMEDIATE)?,
-                    })
-                })
-                .collect::<Result<_>>()?;
-            Glm52LayerMlp::Moe(Box::new(Glm52MoeLayerWeights::from_host(
-                ctx,
-                t.bytes(&format!("{mp}.gate.weight"))?,
-                t.bytes(&format!("{mp}.gate.e_score_correction_bias"))?,
-                &experts,
-                &t.proj(
-                    &format!("{mp}.shared_experts.gate_proj"),
-                    MOE_INTERMEDIATE,
-                    HIDDEN,
-                )?,
-                &t.proj(
-                    &format!("{mp}.shared_experts.up_proj"),
-                    MOE_INTERMEDIATE,
-                    HIDDEN,
-                )?,
-                &t.proj(
-                    &format!("{mp}.shared_experts.down_proj"),
-                    HIDDEN,
-                    MOE_INTERMEDIATE,
-                )?,
-            )?))
-        }
     };
 
     Ok(Glm52DecoderLayerWeights {
@@ -481,7 +429,6 @@ fn run_layer_prefill(
     w: &Glm52DecoderLayerWeights,
     hidden_host: &[bf16],
     oracle_ctx: usize,
-    moe_path: Glm52MoeExpertPath,
 ) -> Result<Vec<f32>> {
     let contract = Glm52FlashMlaSparseDecode {
         batch_size: 1,
@@ -514,7 +461,7 @@ fn run_layer_prefill(
     let mut seq_lens = ctx.stream.alloc_zeros::<i32>(1)?;
     let mut cos = ctx.stream.alloc_zeros::<bf16>(GLM52_ROPE_HALF)?;
     let mut sin = ctx.stream.alloc_zeros::<bf16>(GLM52_ROPE_HALF)?;
-    let mla_sched = Glm52MlaSchedMetadata::new(ctx, contract)?;
+    let mla_sched = Glm52MlaSchedMetadata::new(ctx, contract, w.mla.heads)?;
 
     let mqa_shape =
         Glm52IndexerScratch::decode_shape(1, index_cache_layout, index_blocks, NUM_SMS, oracle_ctx);
@@ -546,15 +493,7 @@ fn run_layer_prefill(
             seq_lens: &seq_lens,
         };
         let mut carry_ready = false;
-        glm52_decoder_layer_forward(
-            ctx,
-            w,
-            &mut caches,
-            &step,
-            moe_path,
-            &mut scratch,
-            &mut carry_ready,
-        )?;
+        glm52_decoder_layer_forward(ctx, w, &mut caches, &step, &mut scratch, &mut carry_ready)?;
         let out_host = ctx.stream.clone_dtoh(scratch.hidden.data())?;
         outputs.extend(out_host.iter().map(|v| v.to_f32()));
     }
@@ -651,13 +590,7 @@ fn layer_dense_oracle_gate() -> Result<()> {
     )?;
     let ctx = DeviceContext::new()?;
     let w = load_decoder_layer(&ctx, &model_path(), DENSE_ORACLE_LAYER, GateLayerMlp::Dense)?;
-    let outputs = run_layer_prefill(
-        &ctx,
-        &w,
-        &hidden_host,
-        DENSE_ORACLE_CTX,
-        Glm52MoeExpertPath::Grouped,
-    )?;
+    let outputs = run_layer_prefill(&ctx, &w, &hidden_host, DENSE_ORACLE_CTX)?;
     assert_layer_probes(
         "layer0/dense",
         &outputs,
@@ -665,41 +598,5 @@ fn layer_dense_oracle_gate() -> Result<()> {
         DENSE_ORACLE_LAYER_TOL,
         0,
     );
-    Ok(())
-}
-
-#[test]
-#[ignore = "requires H200 + GLM-5.2-FP8 checkpoint + DeepGEMM env"]
-fn layer_moe_oracle_gate() -> Result<()> {
-    let hidden_host = checked_hidden(
-        MOE_ORACLE_SEED,
-        MOE_ORACLE_CTX,
-        MOE_ORACLE_INPUT_SCALE,
-        MOE_ORACLE_HIDDEN_DIGEST,
-    )?;
-    let ctx = DeviceContext::new()?;
-    let w = load_decoder_layer(&ctx, &model_path(), MOE_ORACLE_LAYER, GateLayerMlp::Moe)?;
-
-    // Grouped is the DeepEP-shaped spine; Gemv is the measured bs=1 alternative.
-    // Both must land on the same oracle probes.
-    for (label, path) in [
-        ("layer6/moe/grouped", Glm52MoeExpertPath::Grouped),
-        ("layer6/moe/gemv", Glm52MoeExpertPath::Gemv),
-    ] {
-        let outputs = run_layer_prefill(&ctx, &w, &hidden_host, MOE_ORACLE_CTX, path)?;
-        assert_layer_probes(
-            label,
-            &outputs,
-            MOE_ORACLE_LAYER_PROBES,
-            MOE_ORACLE_LAYER_TOL,
-            4,
-        );
-    }
-    if !MOE_ORACLE_ROUTER_LAST.is_empty() {
-        println!(
-            "router reference (last position, debugging aid): {} experts",
-            MOE_ORACLE_ROUTER_LAST.len()
-        );
-    }
     Ok(())
 }
