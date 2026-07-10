@@ -7,6 +7,7 @@ pub mod batch_decode_trace;
 mod config;
 mod dflash;
 mod dspark;
+mod eagle3;
 mod executor;
 pub(crate) mod green_ctx;
 pub mod kernel_bench;
