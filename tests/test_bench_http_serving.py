@@ -12,6 +12,7 @@ import urllib.parse
 import tempfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 
 
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "bench_http_serving.py"
@@ -538,6 +539,33 @@ class BenchHttpServingTests(unittest.TestCase):
         self.assertEqual(summary["decode_steps"]["batched_total"], 4)
         self.assertEqual(summary["decode_steps"]["singleton_total"], 1)
         self.assertAlmostEqual(summary["decode_steps"]["batched_share"], 0.8)
+
+    def test_server_trace_summary_marks_partial_decode_breakdown_unknown(self) -> None:
+        legacy = SimpleNamespace(
+            request_id="legacy",
+            server_trace={"batch_decode_steps": 4},
+        )
+
+        summary = bench_http_serving.summarize_trace_ms([legacy])
+
+        self.assertIsNone(summary["decode_steps"]["batched_total"])
+        self.assertIsNone(summary["decode_steps"]["singleton_total"])
+        self.assertIsNone(summary["decode_steps"]["batched_share"])
+
+    def test_server_trace_summary_infers_singleton_steps_from_total(self) -> None:
+        trace = SimpleNamespace(
+            request_id="with-total",
+            server_trace={
+                "decode_step_count": 5,
+                "batch_decode_steps": 3,
+            },
+        )
+
+        summary = bench_http_serving.summarize_trace_ms([trace])
+
+        self.assertEqual(summary["decode_steps"]["batched_total"], 3)
+        self.assertEqual(summary["decode_steps"]["singleton_total"], 2)
+        self.assertAlmostEqual(summary["decode_steps"]["batched_share"], 0.6)
 
 
 if __name__ == "__main__":

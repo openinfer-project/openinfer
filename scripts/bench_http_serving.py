@@ -212,24 +212,66 @@ def summarize_trace_ms(measured: list[RequestResult]) -> dict[str, Any]:
         for result in traced
         if isinstance(result.server_trace.get("decode_batch_size_max"), int)
     ]
-    batch_decode_steps = [
-        int(result.server_trace["batch_decode_steps"])
-        for result in traced
-        if isinstance(result.server_trace.get("batch_decode_steps"), int)
+    decode_step_counts: list[int] = []
+    decode_step_breakdowns: list[tuple[int, int] | None] = []
+    saw_decode_step_fields = False
+    for result in traced:
+        trace = result.server_trace
+        assert trace is not None
+        count = (
+            int(trace["decode_step_count"])
+            if isinstance(trace.get("decode_step_count"), int)
+            else None
+        )
+        batched = (
+            int(trace["batch_decode_steps"])
+            if isinstance(trace.get("batch_decode_steps"), int)
+            else None
+        )
+        singleton = (
+            int(trace["singleton_decode_steps"])
+            if isinstance(trace.get("singleton_decode_steps"), int)
+            else None
+        )
+        if count is not None:
+            decode_step_counts.append(count)
+        if count is None and batched is None and singleton is None:
+            decode_step_breakdowns.append(None)
+            continue
+
+        saw_decode_step_fields = True
+        if batched is None and count is not None and singleton is not None:
+            batched = count - singleton
+        if singleton is None and count is not None and batched is not None:
+            singleton = count - batched
+        if (
+            batched is not None
+            and singleton is not None
+            and batched >= 0
+            and singleton >= 0
+            and (count is None or batched + singleton == count)
+        ):
+            decode_step_breakdowns.append((batched, singleton))
+        else:
+            decode_step_breakdowns.append(None)
+
+    complete_breakdowns = [
+        breakdown for breakdown in decode_step_breakdowns if breakdown is not None
     ]
-    singleton_decode_steps = [
-        int(result.server_trace["singleton_decode_steps"])
-        for result in traced
-        if isinstance(result.server_trace.get("singleton_decode_steps"), int)
-    ]
-    decode_step_counts = [
-        int(result.server_trace["decode_step_count"])
-        for result in traced
-        if isinstance(result.server_trace.get("decode_step_count"), int)
-    ]
-    batched = sum(batch_decode_steps)
-    singleton = sum(singleton_decode_steps)
-    total_decode_steps = batched + singleton
+    breakdown_complete = (
+        saw_decode_step_fields and len(complete_breakdowns) == len(traced)
+    )
+    if breakdown_complete:
+        batched_total = sum(batched for batched, _ in complete_breakdowns)
+        singleton_total = sum(singleton for _, singleton in complete_breakdowns)
+        total_decode_steps = batched_total + singleton_total
+        batched_share = (
+            batched_total / total_decode_steps if total_decode_steps else None
+        )
+    else:
+        batched_total = None
+        singleton_total = None
+        batched_share = None
     return {
         "source": "server log lines matching `openinfer_http_trace`; frontend_to_queue includes HTTP ingress, tokenization, and vLLM submit before engine queue",
         "traced_requests": len(traced),
@@ -239,9 +281,9 @@ def summarize_trace_ms(measured: list[RequestResult]) -> dict[str, Any]:
         "decode_batch_size_max": max(decode_batch_sizes) if decode_batch_sizes else None,
         "decode_steps": {
             "per_request": summarize_counts(decode_step_counts),
-            "batched_total": batched,
-            "singleton_total": singleton,
-            "batched_share": (batched / total_decode_steps) if total_decode_steps else None,
+            "batched_total": batched_total,
+            "singleton_total": singleton_total,
+            "batched_share": batched_share,
         },
     }
 
