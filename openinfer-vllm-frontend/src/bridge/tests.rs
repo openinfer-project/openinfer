@@ -489,7 +489,7 @@ async fn load_snapshots_become_stats_only_batches() {
     };
     let stats = batch.scheduler_stats.expect("scheduler stats");
     assert_eq!(stats.num_running_reqs, 0);
-    assert_eq!(stats.kv_cache_usage, 0.0);
+    assert_eq!(stats.kv_cache_usage.to_bits(), 0.0_f64.to_bits());
 
     shutdown.cancel();
     task.await.expect("stats task exits on shutdown");

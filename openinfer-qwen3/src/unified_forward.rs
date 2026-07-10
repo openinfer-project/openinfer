@@ -227,7 +227,7 @@ impl Qwen3Model {
             .chain(decode_views.iter())
             .map(openinfer_kv_cache::KvView::last_page_len)
             .collect();
-        let mut start_positions = prefill_start_positions.clone();
+        let mut start_positions = prefill_start_positions;
         start_positions.extend_from_slice(&decode_positions);
         let mut seq_lens = prefill_seq_lens.clone();
         seq_lens.extend(std::iter::repeat_n(1, num_decode_reqs));

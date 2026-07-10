@@ -490,7 +490,7 @@ fn execute_step_on_lane(
                 let mut event: cudarc::driver::sys::CUevent = std::ptr::null_mut();
                 unsafe {
                     cudarc::driver::sys::cuEventCreate(
-                        &mut event,
+                        &raw mut event,
                         cudarc::driver::sys::CUevent_flags_enum::CU_EVENT_DISABLE_TIMING as u32,
                     );
                     cudarc::driver::sys::cuEventRecord(event, prefill_stream.0);
@@ -577,6 +577,8 @@ fn tune_decode_gemm_algos(
     max_prefill_tokens: usize,
     run_envelope_check: bool,
 ) -> Result<()> {
+    use openinfer_kernels::ops::{NumericPolicy, numeric_policy};
+
     let ctx = model.device_ctx();
     let hidden = model.config().hidden_size;
     let vocab = model.config().vocab_size;
@@ -584,7 +586,6 @@ fn tune_decode_gemm_algos(
     let kv_dim = model.local_kv_dim();
     let intermediate = model.local_intermediate_size();
 
-    use openinfer_kernels::ops::{NumericPolicy, numeric_policy};
     if numeric_policy() == NumericPolicy::Pin {
         // Eager pin before capture: the lazy pin-workspace alloc is illegal mid-capture.
         crate::batch_decode_buffers::warmup_decode_projection_pins(
@@ -1118,6 +1119,10 @@ impl Qwen3Executor {
         )
     }
 
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "executor construction is a one-shot ownership boundary"
+    )]
     pub fn from_runtime_with_lora_options(
         model_path: &str,
         enable_cuda_graph: bool,
@@ -1466,9 +1471,8 @@ impl Qwen3Executor {
         // engine-entry guard. launch_gemm_pin also bails on the resulting stream override, but only mid
         // graph-capture/replay (a hot-path failure) — rejecting here moves it to a safe point.
         anyhow::ensure!(
-            !(openinfer_kernels::ops::numeric_policy()
-                == openinfer_kernels::ops::NumericPolicy::Pin
-                && !matches!(overlap, crate::DecodeOverlap::Off)),
+            openinfer_kernels::ops::numeric_policy() != openinfer_kernels::ops::NumericPolicy::Pin
+                || matches!(overlap, crate::DecodeOverlap::Off),
             "--batch-invariant (NumericPolicy::Pin) is not compatible with decode-overlap: the stream override would force the pinned GEMM to bail at runtime"
         );
         // Overlap's split-concurrent decode stream uses the group-limited decode
@@ -2729,13 +2733,11 @@ impl ModelExecutor for Qwen3Executor {
         }
 
         // Ask worker to sync + sample the prefill result.
-        let rx = match self.primary.resolve_prefill() {
-            Ok(rx) => rx,
-            Err(_) => return None,
+        let Ok(rx) = self.primary.resolve_prefill() else {
+            return None;
         };
-        let result = match rx.recv() {
-            Ok(Ok(r)) => r,
-            _ => return None,
+        let Ok(Ok(result)) = rx.recv() else {
+            return None;
         };
 
         // Apply prefill results (KV commit)

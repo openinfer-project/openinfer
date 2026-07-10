@@ -49,6 +49,7 @@ impl VerifyStepItem {
     }
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct VerifyPlan<'a> {
     pub requests: &'a [VerifyStepItem],
 }
@@ -88,6 +89,7 @@ impl DraftStepItem {
     }
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct DraftPlan<'a> {
     pub requests: &'a [DraftStepItem],
 }

@@ -15,12 +15,25 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 use vllm_text::tokenizer::DynTokenizer;
 
-use crate::cli::*;
-use crate::exec::*;
-use crate::metrics::*;
-use crate::prompt::*;
-use crate::render::*;
-use crate::report::*;
+use crate::cli::{Cli, Command, CurveArgs, MatrixArgs, OutputFormat, RequestArgs, RunArgs};
+use crate::exec::{BenchModel, GenTimings};
+use crate::metrics::{
+    aggregate_tok_s, dur_ms, generated_token_trace, summarize_counts, summarize_durations,
+};
+use crate::prompt::{
+    SYNTHETIC_PATTERN, SYNTHETIC_TOKEN_HI, SYNTHETIC_TOKEN_LO, resolve_prompt_input,
+    synthetic_prompt_tokens, synthetic_random_prompt,
+};
+use crate::render::{
+    push_table, render_curve_meta, render_curve_table, render_decode_meta, render_decode_table,
+    render_duration_table, render_matrix_meta, render_matrix_table, render_mixed_text,
+    render_prefill_meta, render_prefill_table, render_request_meta, render_request_summary,
+};
+use crate::report::{
+    BenchReport, CurveReport, CurveWindow, CurveWorkload, GeneratedTokenTrace, MatrixCell,
+    MatrixReport, MatrixWorkload, RequestIterationTiming, RequestMetrics, RequestReport,
+    RequestWorkload, RunInfo,
+};
 
 pub(crate) const DEFAULT_REQUEST_PROMPT: &str = "Tell me a story";
 pub(crate) const DEFAULT_CURVE_PROMPT_LEN: usize = 512;

@@ -10,29 +10,248 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  cpu-checks:
-    name: CPU checks
+  rust-format:
+    name: Rust formatting
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: nightly
-          components: rustfmt, clippy
-
-      - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+          toolchain: nightly-2026-07-10
+          components: rustfmt
 
       - name: Check formatting
         run: cargo fmt --all --check
 
+  cargo-metadata:
+    name: Locked Cargo metadata
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-07-10
+
       - name: Check locked Cargo metadata
         run: cargo metadata --locked --no-deps --format-version 1
 
-      - name: Run simulated frontend e2e tests
-        run: cargo test --release -p openinfer-sim --test frontend_e2e
+  cpu-unit-tests:
+    name: CPU unit tests (${{ matrix.package }})
+    runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: openinfer-build
+            needs_protobuf: false
+          - package: openinfer-engine
+            needs_protobuf: false
+          - package: openinfer-vllm-support
+            needs_protobuf: false
+          - package: openinfer-vllm-frontend
+            needs_protobuf: true
+          - package: openinfer-sim
+            needs_protobuf: true
+          - package: kvbm-logical
+            needs_protobuf: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-07-10
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+        with:
+          version: "v0.16.0"
+
+      - name: Install protobuf compiler
+        if: matrix.needs_protobuf
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Run unit tests
+        run: cargo test --release --locked -p ${{ matrix.package }} --lib
+
+  cpu-clippy:
+    name: CPU Clippy
+    runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-07-10
+          components: clippy
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+        with:
+          version: "v0.16.0"
+
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Run CPU Clippy
+        run: >-
+          cargo clippy --release --locked
+          -p openinfer-build
+          -p openinfer-engine
+          -p openinfer-vllm-support
+          -p openinfer-vllm-frontend
+          -p openinfer-sim
+          -p kvbm-logical
+          --all-targets -- -D warnings
+
+  simulated-frontend-e2e:
+    name: Simulated frontend E2E
+    runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-07-10
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+        with:
+          version: "v0.16.0"
+
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Run simulated frontend E2E tests
+        run: cargo test --release --locked -p openinfer-sim --test frontend_e2e
+
+  qwen3-cuda-compile:
+    name: Qwen3 CUDA compile (sm_80)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-07-10
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+        with:
+          version: "v0.16.0"
+
+      - name: Install CUDA toolkit
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: "13.0.2"
+          linux-local-args: '["--toolkit"]'
+          method: network
+          sub-packages: '["nvcc", "nvrtc-dev", "cudart-dev"]'
+          non-cuda-sub-packages: '["libcublas-dev", "libcurand-dev"]'
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libibverbs-dev
+
+      - name: Compile default Qwen3 targets
+        run: cargo check --release --locked -p openinfer-server --all-targets
+        env:
+          CUDA_PATH: /usr/local/cuda
+          OPENINFER_CUDA_SM: "80"
+          OPENINFER_NVCC_JOBS: "2"
+
+  qwen3-cuda-clippy:
+    name: Qwen3 CUDA Clippy (sm_80)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-07-10
+          components: clippy
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+        with:
+          version: "v0.16.0"
+
+      - name: Install CUDA toolkit
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: "13.0.2"
+          linux-local-args: '["--toolkit"]'
+          method: network
+          sub-packages: '["nvcc", "nvrtc-dev", "cudart-dev"]'
+          non-cuda-sub-packages: '["libcublas-dev", "libcurand-dev"]'
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libibverbs-dev
+
+      - name: Run Qwen3 CUDA Clippy
+        run: cargo clippy --release --locked -p openinfer-server --all-targets -- -D warnings
+        env:
+          CUDA_PATH: /usr/local/cuda
+          OPENINFER_CUDA_SM: "80"
+          OPENINFER_NVCC_JOBS: "2"

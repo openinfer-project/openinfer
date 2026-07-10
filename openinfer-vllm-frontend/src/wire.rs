@@ -190,7 +190,7 @@ mod tests {
 
         // Greedy lowering zeroes min_p along with the rest.
         params.temperature = 0.0;
-        assert_eq!(convert_sampling(&params).min_p, 0.0);
+        assert_eq!(convert_sampling(&params).min_p.to_bits(), 0.0_f32.to_bits());
     }
 
     #[test]

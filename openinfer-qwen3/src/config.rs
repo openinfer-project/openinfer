@@ -38,13 +38,13 @@ pub(crate) struct Config {
     pub(crate) stop_token_ids: Vec<u32>,
 }
 
-/// Resolved drafter config, shared by DFlash and DSpark (DSpark = DFlash backbone
-/// + a Markov head + an optional confidence head). `markov_rank == 0` is plain
-/// DFlash. Two on-disk schemas are normalized into this in `from_file`:
-/// our `Qwen3-4B-DFlash-b16` nests `dflash_config: {mask_token_id,
-/// target_layer_ids}` and puts `rope_theta` at the top level; DeepSpec's
-/// `dflash_/dspark_*_block7` put those fields flat and nest `rope_theta` under
-/// `rope_parameters`.
+/// Resolved drafter config shared by DFlash and DSpark. DSpark extends the
+/// DFlash backbone with a Markov head and an optional confidence head;
+/// `markov_rank == 0` is plain DFlash. Two on-disk schemas are normalized into
+/// this in `from_file`: our `Qwen3-4B-DFlash-b16` nests
+/// `dflash_config: {mask_token_id, target_layer_ids}` and puts `rope_theta` at
+/// the top level, while DeepSpec's `dflash_/dspark_*_block7` put those fields
+/// flat and nest `rope_theta` under `rope_parameters`.
 #[derive(Clone, Debug)]
 pub(crate) struct DFlashConfig {
     pub(crate) hidden_size: usize,
@@ -322,7 +322,7 @@ impl DFlashConfig {
             target.vocab_size
         );
         anyhow::ensure!(
-            self.rope_theta == target.rope_theta,
+            self.rope_theta.to_bits() == target.rope_theta.to_bits(),
             "DFlash rope_theta {} does not match target {}",
             self.rope_theta,
             target.rope_theta

@@ -173,7 +173,7 @@ impl Qwen3Executor {
     /// via RAII); the reverse order here just mirrors schedule order and is
     /// cosmetic.
     fn revert_speculative_schedules(&mut self, request_ids: &[RequestId]) {
-        for request_id in request_ids.iter().rev().copied() {
+        for &request_id in request_ids.iter().rev() {
             let Some(rkv) = self.request_kvs.get_mut(&request_id) else {
                 log::warn!(
                     "missing RequestKv while reverting speculative schedule for {request_id:?}"

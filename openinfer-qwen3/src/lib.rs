@@ -198,6 +198,10 @@ pub fn probe_model(model_path: &Path) -> Result<Option<ModelInfo>> {
 /// exclusion — and dispatches to the right low-level entry.
 /// That policy lives with the model instead of leaking into the server.
 #[derive(Clone, Debug)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "these launch flags are independent server options, not states"
+)]
 pub struct Qwen3LaunchOptions {
     /// CUDA device for single-GPU loads (ignored when `tp_size > 1`).
     pub device_ordinal: usize,
@@ -225,6 +229,10 @@ pub struct Qwen3LaunchOptions {
 }
 
 /// Start the Qwen3 engine from server-facing [`Qwen3LaunchOptions`].
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "launch is a one-shot ownership boundary used by external worker threads"
+)]
 pub fn launch(model_path: &Path, options: Qwen3LaunchOptions) -> Result<EngineHandle> {
     let device_ordinals = if options.tp_size == 1 {
         vec![options.device_ordinal]
@@ -267,8 +275,8 @@ pub fn launch(model_path: &Path, options: Qwen3LaunchOptions) -> Result<EngineHa
         "DFlash speculative decoding cannot be combined with LoRA serving"
     );
     anyhow::ensure!(
-        !(options.dflash_draft_model_path.is_some()
-            && !matches!(options.decode_overlap, DecodeOverlap::Off)),
+        options.dflash_draft_model_path.is_none()
+            || matches!(options.decode_overlap, DecodeOverlap::Off),
         "DFlash speculative decoding cannot be combined with decode overlap \
          (--decode-overlap): the speculative path never takes the unified overlap \
          route, so the overlap streams would only waste VRAM the drafter needs"

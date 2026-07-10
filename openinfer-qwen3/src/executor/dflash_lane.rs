@@ -307,7 +307,7 @@ impl LocalQwen3Lane {
             // already predict the first draft, giving all `block_size` drafts —
             // a one-token-longer span. This is a checkpoint property, not a markov
             // one: a `markov_rank == 0` DeepSpec checkpoint is still anchor-first.
-            let drafts_start = if model.anchor_first() { 0 } else { 1 };
+            let drafts_start = usize::from(!model.anchor_first());
             let mut outputs = Vec::with_capacity(requests.len());
             for (i, req) in requests.iter().enumerate() {
                 let block = &sampled[i * block_size..(i + 1) * block_size];

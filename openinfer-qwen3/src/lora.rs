@@ -632,7 +632,9 @@ fn tensor_to_bf16(tensor: &TensorView<'_>, name: &str) -> Result<Vec<bf16>> {
             );
             Ok(tensor
                 .data()
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|bytes| bf16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])))
                 .collect())
         }
@@ -643,7 +645,9 @@ fn tensor_to_bf16(tensor: &TensorView<'_>, name: &str) -> Result<Vec<bf16>> {
             );
             Ok(tensor
                 .data()
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|bytes| {
                     let value = f16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]]));
                     bf16::from_f32(value.to_f32())
@@ -657,7 +661,9 @@ fn tensor_to_bf16(tensor: &TensorView<'_>, name: &str) -> Result<Vec<bf16>> {
             );
             Ok(tensor
                 .data()
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|bytes| {
                     bf16::from_f32(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
                 })
