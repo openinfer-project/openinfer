@@ -612,6 +612,7 @@ fn run_mixed_serving_generation(model_path: &Path, model_path_label: &str) -> Re
         let req = GenerateRequest {
             request_id: Some(id.clone()),
             queued_at_unix_s: None,
+            data_parallel_rank: None,
             prompt_tokens,
             params: SamplingParams {
                 ignore_eos,
@@ -687,6 +688,7 @@ fn run_mixed_serving_position_fallback(
         let req = GenerateRequest {
             request_id: Some(id.clone()),
             queued_at_unix_s: None,
+            data_parallel_rank: None,
             prompt_tokens,
             params: SamplingParams {
                 ignore_eos,
@@ -755,6 +757,7 @@ fn run_mixed_serving_rejection_isolation(
     let invalid_req = GenerateRequest {
         request_id: Some("mixed-invalid-logprobs".to_string()),
         queued_at_unix_s: None,
+        data_parallel_rank: None,
         prompt_tokens: vec![1, 2, 3],
         params: SamplingParams::default(),
         max_tokens: 4,
@@ -768,6 +771,7 @@ fn run_mixed_serving_rejection_isolation(
     let valid_req = GenerateRequest {
         request_id: Some(valid_id.to_string()),
         queued_at_unix_s: None,
+        data_parallel_rank: None,
         prompt_tokens: valid_prompt_tokens,
         params: SamplingParams::default(),
         max_tokens: 6,

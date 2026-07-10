@@ -70,6 +70,7 @@ fn in_window_prompt_past_old_rope_table_is_served() {
         .submit(GenerateRequest {
             request_id: None,
             queued_at_unix_s: None,
+            data_parallel_rank: None,
             prompt_tokens,
             params: SamplingParams::default(),
             max_tokens: 1,

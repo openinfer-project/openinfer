@@ -44,6 +44,7 @@ fn run_and_capture_cached(handle: &EngineHandle, prompt_tokens: Vec<u32>) -> usi
         .submit(GenerateRequest {
             request_id: None,
             queued_at_unix_s: None,
+            data_parallel_rank: None,
             prompt_tokens,
             params: SamplingParams::default(),
             max_tokens: 4,

@@ -35,14 +35,14 @@ use std::{collections::BTreeSet, path::Path, time::Instant};
 
 use anyhow::{Result, ensure};
 use bytesize::ByteSize;
-use openinfer_core::engine::EngineHandle;
+use openinfer_core::engine::{EngineHandle, KvCapacity, LoadSnapshot};
 use openinfer_kv_offload::{HostConfig, KvArena, OffloadEngine, OffloadHost};
 use runner::{Glm52RankPlacement, Glm52RankWorker};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use weights::{GLM52_EP_RANKS, Glm52RankLoadBundle, Glm52WeightManifest};
 
 use crate::config::GLM52_MAX_CONTEXT;
-use crate::model::{GLM52_MODEL_LEN_ALIGN, glm52_arena_bytes};
+use crate::model::{GLM52_MODEL_LEN_ALIGN, glm52_arena_bytes, glm52_pool_blocks};
 
 pub use config::{
     GLM52_DENSE_LAYERS, GLM52_HIDDEN, GLM52_INDEX_TOPK, GLM52_LAYERS, GLM52_MOE_LAYERS,
@@ -429,6 +429,20 @@ fn start_engine(
             return Err(err);
         }
     };
+    let logical_ranks = if moe_topo == Glm52MoeTopo::Tp8 {
+        1
+    } else {
+        loaded.workers.len()
+    };
+    let kv_total_blocks = glm52_pool_blocks(max_model_len) - 1;
+    let (load_txs, load_rxs): (Vec<_>, Vec<_>) = (0..logical_ranks)
+        .map(|_| {
+            watch::channel(LoadSnapshot {
+                kv_total_blocks: kv_total_blocks as u64,
+                ..LoadSnapshot::default()
+            })
+        })
+        .unzip();
     let (submit_tx, submit_rx) = mpsc::unbounded_channel();
     let coord_handle = std::thread::Builder::new()
         .name("glm52-coord".into())
@@ -442,6 +456,7 @@ fn start_engine(
                 no_prefix_cache,
                 offload,
                 moe_topo,
+                load_txs,
             );
         })
         .map_err(|err| anyhow::anyhow!("failed to spawn GLM5.2 coordinator: {err}"))?;
@@ -450,7 +465,13 @@ fn start_engine(
     // requests the scheduler would reject (same contract as qwen3/dsv2-lite).
     let servable_len = u32::try_from(max_model_len)
         .expect("max_model_len is bounded by GLM52_MAX_CONTEXT and fits u32");
-    Ok(EngineHandle::new_with_join_handle(submit_tx, coord_handle).with_servable_len(servable_len))
+    Ok(EngineHandle::new_with_join_handle(submit_tx, coord_handle)
+        .with_servable_len(servable_len)
+        .with_kv_capacity(KvCapacity {
+            total_blocks: kv_total_blocks,
+            block_size: GLM52_MODEL_LEN_ALIGN,
+        })
+        .with_load_watches(load_rxs))
 }
 
 /// Load the DSpark drafter on every rank (rank-local, ~3.8 GB bf16 each —

@@ -83,6 +83,7 @@ fn timed_generate(handle: &EngineHandle, prompt_tokens: Vec<u32>) -> (usize, Dur
         .submit(GenerateRequest {
             request_id: None,
             queued_at_unix_s: None,
+            data_parallel_rank: None,
             prompt_tokens,
             params: SamplingParams {
                 ignore_eos: true,

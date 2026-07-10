@@ -125,6 +125,7 @@ fn generate_tokens_with_logprobs(
         .submit(GenerateRequest {
             request_id: None,
             queued_at_unix_s: None,
+            data_parallel_rank: None,
             prompt_tokens,
             params: SamplingParams::default(),
             max_tokens,
@@ -214,6 +215,7 @@ fn expect_context_window_rejection(handle: &EngineHandle, max_context_tokens: us
         .submit(GenerateRequest {
             request_id: Some("over-context-window".to_string()),
             queued_at_unix_s: None,
+            data_parallel_rank: None,
             prompt_tokens: vec![1; max_context_tokens],
             params: SamplingParams::default(),
             max_tokens: 1,
@@ -439,6 +441,7 @@ fn test_e2e_qwen35_scheduler() {
                 .submit(GenerateRequest {
                     request_id: None,
                     queued_at_unix_s: None,
+                    data_parallel_rank: None,
                     prompt_tokens,
                     params: concurrent_params(case_idx),
                     max_tokens: case.max_new_tokens,
@@ -478,6 +481,7 @@ fn test_e2e_qwen35_scheduler() {
                 .submit(GenerateRequest {
                     request_id: Some(name.to_string()),
                     queued_at_unix_s: None,
+                    data_parallel_rank: None,
                     prompt_tokens,
                     params: SamplingParams::default(),
                     max_tokens: 8,
@@ -518,6 +522,7 @@ fn test_e2e_qwen35_scheduler() {
             .submit(GenerateRequest {
                 request_id: None,
                 queued_at_unix_s: None,
+                data_parallel_rank: None,
                 prompt_tokens,
                 params: SamplingParams::default(),
                 max_tokens: 10,

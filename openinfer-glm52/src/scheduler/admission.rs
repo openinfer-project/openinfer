@@ -1,11 +1,12 @@
 //! Request intake and slot placement: [`validate_request`] fast-rejects at
 //! the door (past it, a bad value only surfaces inside a collective and tears
-//! the engine down), [`admission_target`] picks the least-loaded rank with
-//! pool budget for the request's full [`lifetime_blocks`] reservation.
+//! the engine down), then binds every request to one rank queue. HTTP requests
+//! arrive with the vLLM frontend's DP choice; direct requests are placed once
+//! using the same waiting-weighted least-load policy.
+
+use std::collections::VecDeque;
 
 use openinfer_core::engine::{GenerateRequest, TokenEvent, unix_now_s};
-
-use crate::model::GLM52_MAX_BATCH_PER_RANK;
 
 use super::PAGE;
 
@@ -70,66 +71,71 @@ pub(super) fn lifetime_blocks(prompt_tokens: usize, max_tokens: usize) -> usize 
     (prompt_tokens + max_tokens).div_ceil(PAGE)
 }
 
-/// Where the next queued request goes: among the ranks with a free slot AND
-/// enough unreserved pool pages for the request's full lifetime, the
-/// least-loaded one (ties → lowest rank id), its lowest free slot. `None`
-/// when no rank can take it — the queue holds (a request that fits the pool
-/// geometry always fits an EMPTY rank, so FCFS deferral never livelocks).
-/// Least-loaded-first keeps occupancy balanced, which keeps the fleet in the
-/// cheap 1-row bucket until concurrency exceeds the rank count.
-///
-/// `committed[rank]` = Σ active requests' [`lifetime_blocks`];
-/// `usable[rank]` = pool blocks minus the reserved padding page. The
-/// reservation is conservative: prefix-cache hits share pages between
-/// requests, but each holder reserves them in full — over-reserving can only
-/// defer admission, never strand a decode.
-pub(super) fn admission_target(
-    occupied: &[[bool; GLM52_MAX_BATCH_PER_RANK]],
-    committed: &[usize],
-    usable: &[usize],
-    need_blocks: usize,
-) -> Option<(usize, usize)> {
-    let (rank, row) = occupied
+/// Pick a rank for a direct, unbound request. Waiting carries the same 4x
+/// weight as vLLM's DP load balancer; ties go to the lowest rank. Frontend
+/// requests bypass this function because their selected engine index is the
+/// rank assignment.
+fn least_loaded_rank(running: &[usize], pending: &[VecDeque<GenerateRequest>]) -> usize {
+    assert_eq!(running.len(), pending.len());
+    running
         .iter()
         .enumerate()
-        .filter(|(rank, row)| {
-            committed[*rank] + need_blocks <= usable[*rank] && row.iter().any(|&o| !o)
-        })
-        .min_by_key(|(rank, row)| (row.iter().filter(|&&o| o).count(), *rank))?;
-    let slot = row.iter().position(|&o| !o)?;
-    Some((rank, slot))
+        .min_by_key(|&(rank, &running)| (running + pending[rank].len() * 4, rank))
+        .map(|(rank, _)| rank)
+        .expect("GLM5.2 must expose at least one logical rank")
 }
 
-/// Fast-reject invalid requests at intake (Scheduled → Rejected, the same
-/// event order the bs=1 coordinator emitted); valid ones queue for a rank.
+fn reject(req: &GenerateRequest, message: String) {
+    let prompt_tokens = req.prompt_tokens.len();
+    let queued_at_unix_s = req.queued_at_unix_s.unwrap_or_else(unix_now_s);
+    let _ = req.token_tx.send(TokenEvent::Scheduled {
+        queued_at_unix_s,
+        scheduled_at_unix_s: unix_now_s(),
+        prompt_tokens,
+        cached_tokens: 0,
+    });
+    let _ = req.token_tx.send(TokenEvent::Rejected {
+        message,
+        prompt_tokens,
+        completion_tokens: 0,
+    });
+}
+
+/// Fast-reject invalid requests at intake (Scheduled → Rejected), otherwise
+/// bind the request to exactly one rank queue. The binding is permanent so
+/// frontend `engine_index`, metrics labels, and actual KV ownership agree.
 pub(super) fn intake(
     req: GenerateRequest,
-    pending: &mut std::collections::VecDeque<GenerateRequest>,
+    pending: &mut [VecDeque<GenerateRequest>],
+    running: &[usize],
     max_model_len: usize,
 ) {
     if let Err(message) = validate_request(&req, max_model_len) {
-        let prompt_tokens = req.prompt_tokens.len();
-        let queued_at_unix_s = req.queued_at_unix_s.unwrap_or_else(unix_now_s);
-        let _ = req.token_tx.send(TokenEvent::Scheduled {
-            queued_at_unix_s,
-            scheduled_at_unix_s: unix_now_s(),
-            prompt_tokens,
-            cached_tokens: 0,
-        });
-        let _ = req.token_tx.send(TokenEvent::Rejected {
-            message,
-            prompt_tokens,
-            completion_tokens: 0,
-        });
+        reject(&req, message);
         return;
     }
-    pending.push_back(req);
+    let rank = match req.data_parallel_rank {
+        Some(rank) if rank < pending.len() => rank,
+        Some(rank) => {
+            reject(
+                &req,
+                format!(
+                    "GLM5.2 data_parallel_rank {rank} is outside 0..{}",
+                    pending.len()
+                ),
+            );
+            return;
+        }
+        None => least_loaded_rank(running, pending),
+    };
+    pending[rank].push_back(req);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::scheduler::testkit::{request, sampled};
+    use openinfer_sample::SamplingParams;
 
     #[test]
     fn malformed_sampling_params_die_at_intake() {
@@ -179,54 +185,40 @@ mod tests {
         assert!(validate_request(&req, 4096).is_ok());
     }
 
-    fn occ(counts: &[usize]) -> Vec<[bool; GLM52_MAX_BATCH_PER_RANK]> {
-        counts
-            .iter()
-            .map(|&c| std::array::from_fn(|slot| slot < c))
-            .collect()
-    }
-
-    /// `admission_target` with an unconstrained pool budget — the pure
-    /// occupancy-placement behavior.
-    fn target(occupied: &[[bool; GLM52_MAX_BATCH_PER_RANK]]) -> Option<(usize, usize)> {
-        let committed = vec![0usize; occupied.len()];
-        let usable = vec![usize::MAX; occupied.len()];
-        admission_target(occupied, &committed, &usable, 1)
-    }
-
     #[test]
-    fn admission_prefers_least_loaded_rank_then_lowest_slot() {
-        // Empty fleet: rank 0, slot 0.
-        assert_eq!(target(&occ(&[0, 0, 0])), Some((0, 0)));
-        // Rank 1 is the least loaded.
-        assert_eq!(target(&occ(&[2, 1, 2])), Some((1, 1)));
-        // Tie between ranks 0 and 2 → lowest rank id.
-        assert_eq!(target(&occ(&[1, 2, 1])), Some((0, 1)));
-        // A hole in the middle of a rank's slots is reused first.
-        let mut holey = occ(&[3, 3]);
-        holey[1][1] = false;
-        assert_eq!(target(&holey), Some((1, 1)));
-        // Full fleet: no target.
-        assert_eq!(target(&occ(&[GLM52_MAX_BATCH_PER_RANK; 2])), None);
-    }
+    fn intake_keeps_frontend_binding_and_load_balances_direct_requests() {
+        let mut pending: Vec<VecDeque<GenerateRequest>> = (0..3).map(|_| VecDeque::new()).collect();
 
-    #[test]
-    fn admission_respects_the_pool_budget() {
-        // Rank 0 has free slots but its pool is fully reserved; rank 1 (more
-        // loaded but with budget) takes the request. No rank fits → defer.
-        let occupied = occ(&[1, 2]);
+        let mut bound = request(vec![10], SamplingParams::default(), 4);
+        bound.data_parallel_rank = Some(2);
+        intake(bound, &mut pending, &[0, 0, 0], 4096);
         assert_eq!(
-            admission_target(&occupied, &[90, 40], &[100, 100], 20),
-            Some((1, 2))
+            pending.iter().map(VecDeque::len).collect::<Vec<_>>(),
+            [0, 0, 1]
+        );
+
+        intake(
+            request(vec![11], SamplingParams::default(), 4),
+            &mut pending,
+            &[2, 1, 2],
+            4096,
         );
         assert_eq!(
-            admission_target(&occupied, &[90, 90], &[100, 100], 20),
-            None
+            pending.iter().map(VecDeque::len).collect::<Vec<_>>(),
+            [0, 1, 1]
         );
-        // Exact fit admits.
+
+        // Rank 1's queued request adds a 4x waiting penalty, so the next
+        // direct request goes to the lower-rank member of the 2/2 tie.
+        intake(
+            request(vec![12], SamplingParams::default(), 4),
+            &mut pending,
+            &[2, 1, 2],
+            4096,
+        );
         assert_eq!(
-            admission_target(&occupied, &[80, 90], &[100, 100], 20),
-            Some((0, 1))
+            pending.iter().map(VecDeque::len).collect::<Vec<_>>(),
+            [1, 1, 1]
         );
     }
 

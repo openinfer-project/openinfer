@@ -35,13 +35,14 @@ use crate::wire::{
     to_wire_position_logprobs,
 };
 
-const ENGINE_INDEX: u32 = 0;
-
 pub(crate) struct LocalEngineBridge {
     pub(crate) input_address: String,
     pub(crate) output_address: String,
     pub(crate) handle: EngineHandle,
     pub(crate) max_model_len: u32,
+    pub(crate) engine_index: u32,
+    pub(crate) data_parallel_size: u32,
+    pub(crate) load_watch: Option<watch::Receiver<LoadSnapshot>>,
 }
 
 impl LocalEngineBridge {
@@ -49,7 +50,7 @@ impl LocalEngineBridge {
         wait_for_ipc_endpoint(&self.input_address, &shutdown).await?;
         wait_for_ipc_endpoint(&self.output_address, &shutdown).await?;
 
-        let engine_id = EngineId::from_engine_index(ENGINE_INDEX);
+        let engine_id = EngineId::from_engine_index(self.engine_index);
         let mut socket_options = SocketOptions::default();
         socket_options.peer_identity(PeerIdentity::try_from(engine_id)?);
 
@@ -85,14 +86,15 @@ impl LocalEngineBridge {
             dtype: ModelDtype::BFloat16,
             vllm_version: "openinfer-local-bridge".to_string(),
             world_size: 1,
-            data_parallel_size: 1,
+            data_parallel_size: u64::from(self.data_parallel_size),
             kv_cache_size_tokens,
             kv_cache_max_concurrency,
         };
         info!(
-            "local engine KV capacity: {kv_capacity:?} -> \
+            "local engine {} KV capacity: {kv_capacity:?} -> \
              kv_cache_size_tokens={kv_cache_size_tokens:?} \
-             kv_cache_max_concurrency={kv_cache_max_concurrency:?}"
+             kv_cache_max_concurrency={kv_cache_max_concurrency:?}",
+            self.engine_index
         );
         input
             .send(ZmqMessage::from(encode_msgpack(&ready)?))
@@ -111,7 +113,8 @@ impl LocalEngineBridge {
             })?;
 
         let (output_tx, output_rx) = mpsc::unbounded_channel();
-        let output_task = tokio::spawn(output_loop(output, output_rx));
+        let mut child_tasks = tokio::task::JoinSet::new();
+        child_tasks.spawn(async move { ("output sender", output_loop(output, output_rx).await) });
 
         // Republish the scheduler's load snapshots as stats-only output
         // batches so the frontend's Prometheus gauges (scheduler_running,
@@ -120,13 +123,18 @@ impl LocalEngineBridge {
         // scheduler publishes a final drained snapshot before parking idle, so
         // the gauges settle to zero instead of freezing at the last busy
         // value. Engines without a load watch simply publish no stats.
-        let stats_task = self.handle.load_watch().map(|load_rx| {
-            tokio::spawn(publish_scheduler_stats(
-                load_rx,
-                output_tx.clone(),
-                shutdown.clone(),
-            ))
-        });
+        if let Some(load_rx) = self.load_watch.clone() {
+            let engine_index = self.engine_index;
+            let stats_output_tx = output_tx.clone();
+            let stats_shutdown = shutdown.clone();
+            child_tasks.spawn(async move {
+                (
+                    "scheduler stats publisher",
+                    publish_scheduler_stats(engine_index, load_rx, stats_output_tx, stats_shutdown)
+                        .await,
+                )
+            });
+        }
 
         // One shared channel carries every request's token events, tagged by
         // request id; this loop is the sole consumer. Per-request state lives
@@ -136,33 +144,59 @@ impl LocalEngineBridge {
         let mut streams: HashMap<RequestTag, RequestStreamState> = HashMap::new();
 
         info!(
-            "local vLLM engine bridge connected: input={}, output={}, max_model_len={}",
-            self.input_address, self.output_address, self.max_model_len
+            "local vLLM engine {} bridge connected: input={}, output={}, max_model_len={}",
+            self.engine_index, self.input_address, self.output_address, self.max_model_len
         );
 
-        loop {
+        let run_result = loop {
             tokio::select! {
-                () = shutdown.cancelled() => break,
+                biased;
+                () = shutdown.cancelled() => break Ok(()),
+                joined = child_tasks.join_next(), if !child_tasks.is_empty() => {
+                    if shutdown.is_cancelled() {
+                        break Ok(());
+                    }
+                    break match joined {
+                        Some(Ok((name, Ok(())))) => {
+                            Err(anyhow::anyhow!("local engine {name} exited unexpectedly"))
+                        }
+                        Some(Ok((name, Err(error)))) => {
+                            Err(error).with_context(|| format!("local engine {name} failed"))
+                        }
+                        Some(Err(error)) => {
+                            Err(anyhow::anyhow!("local engine child task panicked: {error}"))
+                        }
+                        None => Err(anyhow::anyhow!("local engine child task set became empty")),
+                    };
+                }
                 Some(first) = event_rx.recv() => {
-                    if let Err(error) =
-                        dispatch_burst(first, &mut event_rx, &mut streams, &output_tx)
+                    if let Err(error) = dispatch_burst(
+                        self.engine_index,
+                        first,
+                        &mut event_rx,
+                        &mut streams,
+                        &output_tx,
+                    )
                     {
-                        warn!("local engine bridge output failed: {error:#}");
+                        break Err(error).context("failed to dispatch local engine output");
                     }
                 }
                 recv = input.recv() => {
-                    let message = recv.context("failed to receive local engine request")?;
+                    let message = match recv.context("failed to receive local engine request") {
+                        Ok(message) => message,
+                        Err(error) => break Err(error),
+                    };
                     if let Err(error) = self.handle_message(
                         message,
                         &event_tx,
                         &output_tx,
                         &mut streams,
                     ) {
-                        warn!("local engine bridge request failed: {error:#}");
+                        break Err(error).context("failed to handle local engine request");
                     }
                 }
             }
-        }
+        };
 
         // Cancel every in-flight request so the scheduler retires them on its
         // next emit instead of pushing into a channel no one drains.
@@ -170,12 +204,10 @@ impl LocalEngineBridge {
             state.abort(RequestAbortReason::Cancelled);
         }
         drop(output_tx);
-        if let Some(task) = stats_task {
-            task.abort();
-        }
-        output_task.abort();
+        child_tasks.abort_all();
+        while child_tasks.join_next().await.is_some() {}
 
-        Ok(())
+        run_result
     }
 
     fn handle_message(
@@ -231,7 +263,7 @@ impl LocalEngineBridge {
                     String,
                     rmpv::Value,
                 ) = rmp_serde::from_slice(&frames[1])?;
-                send_utility_response(output_tx, call_id, &method_name)
+                send_utility_response(self.engine_index, output_tx, call_id, &method_name)
             }
             other => bail!("unsupported local engine request type frame: {other:?}"),
         }
@@ -253,6 +285,7 @@ impl LocalEngineBridge {
         let Some(prompt_tokens) = prompt_token_ids else {
             warn!("request {request_id} dropped: missing prompt_token_ids");
             send_terminal_output(
+                self.engine_index,
                 output_tx,
                 request_id,
                 EngineCoreFinishReason::Error,
@@ -265,6 +298,7 @@ impl LocalEngineBridge {
         let Some(sampling_params) = sampling_params else {
             warn!("request {request_id} dropped: missing sampling_params");
             send_terminal_output(
+                self.engine_index,
                 output_tx,
                 request_id,
                 EngineCoreFinishReason::Error,
@@ -281,6 +315,7 @@ impl LocalEngineBridge {
         if let Some(unsupported) = crate::wire::unsupported_sampling(&sampling_params) {
             warn!("request {request_id} rejected: unsupported sampling params: {unsupported}");
             send_terminal_output(
+                self.engine_index,
                 output_tx,
                 request_id,
                 EngineCoreFinishReason::Error,
@@ -290,6 +325,23 @@ impl LocalEngineBridge {
             )?;
             return Ok(());
         }
+        let lora_adapter = match lora_adapter_from_sampling_params(&sampling_params) {
+            Ok(adapter) => adapter,
+            Err(error) => {
+                let message = error.to_string();
+                warn!("request {request_id} rejected: {message}");
+                send_terminal_output(
+                    self.engine_index,
+                    output_tx,
+                    request_id,
+                    EngineCoreFinishReason::Error,
+                    Some(StopReason::Text(message)),
+                    None,
+                    None,
+                )?;
+                return Ok(());
+            }
+        };
 
         let tag: RequestTag = Arc::from(request_id.as_str());
         let abort_reason = Arc::new(AtomicU8::new(RequestAbortReason::None as u8));
@@ -298,10 +350,11 @@ impl LocalEngineBridge {
             .submit(GenerateRequest {
                 request_id: Some(request_id),
                 queued_at_unix_s: Some(request.arrival_time),
+                data_parallel_rank: Some(self.engine_index as usize),
                 prompt_tokens,
                 params: convert_sampling(&sampling_params),
                 max_tokens: sampling_params.max_tokens as usize,
-                lora_adapter: lora_adapter_from_sampling_params(&sampling_params)?,
+                lora_adapter,
                 token_tx,
                 logprobs: requested_logprobs(&sampling_params),
                 echo: false,
@@ -346,6 +399,7 @@ impl RequestStreamState {
 /// whole burst as a single `EngineCoreOutputs` — collapsing what used to be N
 /// per-request ZMQ messages per step into one.
 fn dispatch_burst(
+    engine_index: u32,
     first: (RequestTag, TokenEvent),
     event_rx: &mut TokenStreamReceiver,
     streams: &mut HashMap<RequestTag, RequestStreamState>,
@@ -396,7 +450,7 @@ fn dispatch_burst(
     send_outputs(
         output_tx,
         RequestBatchOutputs {
-            engine_index: ENGINE_INDEX,
+            engine_index,
             outputs,
             finished_requests: (!finished_requests.is_empty()).then_some(finished_requests),
             timestamp: now_secs_f64(),
@@ -510,12 +564,15 @@ fn reduce_request(
 /// Forward every scheduler load snapshot as a stats-only output batch; the
 /// frontend records it into the shared Prometheus registry. Sends the current
 /// snapshot up front so the gauges initialize before the first step, then one
-/// message per watch change until shutdown or either channel closes.
+/// message per watch change until shutdown. Losing either output or scheduler
+/// load feed is fatal because keeping that engine registered would leave stale
+/// metrics and a request-routing black hole.
 async fn publish_scheduler_stats(
+    engine_index: u32,
     mut load_rx: watch::Receiver<LoadSnapshot>,
     output_tx: mpsc::UnboundedSender<EngineCoreOutputs>,
     shutdown: CancellationToken,
-) {
+) -> Result<()> {
     loop {
         let snapshot = *load_rx.borrow_and_update();
         let stats = SchedulerStats {
@@ -529,21 +586,18 @@ async fn publish_scheduler_stats(
             ..SchedulerStats::default()
         };
         let outputs = RequestBatchOutputs {
-            engine_index: ENGINE_INDEX,
+            engine_index,
             scheduler_stats: Some(Box::new(stats)),
             timestamp: now_secs_f64(),
             ..Default::default()
         }
         .into();
-        if send_outputs(&output_tx, outputs).is_err() {
-            return;
-        }
+        send_outputs(&output_tx, outputs).context("failed to publish scheduler stats")?;
         tokio::select! {
-            () = shutdown.cancelled() => return,
+            biased;
+            () = shutdown.cancelled() => return Ok(()),
             changed = load_rx.changed() => {
-                if changed.is_err() {
-                    return;
-                }
+                changed.context("scheduler load feed closed")?;
             }
         }
     }
@@ -563,6 +617,7 @@ async fn output_loop(
 }
 
 fn send_terminal_output(
+    engine_index: u32,
     output_tx: &mpsc::UnboundedSender<EngineCoreOutputs>,
     request_id: String,
     finish_reason: EngineCoreFinishReason,
@@ -573,7 +628,7 @@ fn send_terminal_output(
     send_outputs(
         output_tx,
         RequestBatchOutputs {
-            engine_index: ENGINE_INDEX,
+            engine_index,
             outputs: vec![engine_output(
                 request_id.clone(),
                 Vec::new(),
@@ -592,6 +647,7 @@ fn send_terminal_output(
 }
 
 fn send_utility_response(
+    engine_index: u32,
     output_tx: &mpsc::UnboundedSender<EngineCoreOutputs>,
     call_id: UtilityCallId,
     method_name: &str,
@@ -607,7 +663,7 @@ fn send_utility_response(
     send_outputs(
         output_tx,
         UtilityCallOutput {
-            engine_index: ENGINE_INDEX,
+            engine_index,
             timestamp: now_secs_f64(),
             output: UtilityOutput {
                 call_id,

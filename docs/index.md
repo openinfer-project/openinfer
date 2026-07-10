@@ -57,6 +57,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 
 | Path | TL;DR |
 | --- | --- |
+| `models/glm52/dp-scheduler-metrics.md` | GLM5.2 maps logical scheduler partitions onto vLLM EngineCore identities: 8 rank-local running/waiting/KV series for EP8/DP8, 1 for TP8; 8x H200 endpoint gates and matched serving A/B passed without an upstream vLLM change. |
 | `models/glm52/moe-tp8-low-latency.md` | `--moe-topo tp8`: bucket-1 decode MoE runs TP8-sharded phase-split kernels + LL packet AG/RS instead of the EP8 DeepEP chain — measured solo ITL 19.23 → 15.27 ms (1.26×), 8-concurrent 1.17×, on 8×H200. TP8+MTP span mapping on top: solo DSpark span-8 rides the bucket-8 shape — code 186 tok/s (2.5–2.9× over both baselines), prose 106, ~25 ms rounds; solo prefill 8 tok/step. Launch-time config; EP8 stays the high-throughput default. |
 | `models/glm52/vllm-speculative-pd-audit.md` | For model-based speculators with their own KV (including EAGLE/EAGLE3 and DFlash/DSpark), vLLM NIXL P/D runs the drafter on P and transfers draft KV with target KV; on a full hit D restores both and replays only the last prompt token. EAGLE3/MTP gates exist, but DSpark/GLM5.2 P/D is untested. |
 | `models/glm52/pegaflow-offload-pd.md` | GLM5.2 target-only P/D uses the existing 99 target arenas plus vLLM hash/layout compatibility. Stateful speculative P/D is separate: vLLM transfers drafter KV too; OpenInfer must measure explicit DSpark suffix cold-start against an 80-KiB/token draft-KV handoff. Pins pegaflow-core v0.23.2 rev d46fd16. |

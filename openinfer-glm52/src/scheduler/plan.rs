@@ -7,11 +7,29 @@
 use openinfer_sample::SamplingParams;
 
 use crate::config::GLM52_VOCAB;
-use crate::model::{GLM52_DECODE_BUCKETS, GLM52_MAX_BATCH_PER_RANK, Glm52StepShape};
+use crate::model::{GLM52_DECODE_BUCKETS, GLM52_MAX_BATCH_PER_RANK, Glm52StepKv, Glm52StepShape};
 use crate::runner::{Glm52RowSample, Glm52StepFlags};
 
 use super::slot::Glm52SlotState;
 use super::{PAGE, RankSlots};
+
+/// Build the all-padding step KV used while pre-capturing graph buckets.
+pub(super) fn padding_step_kv(
+    bucket: usize,
+    table_width: usize,
+    padding_page: i32,
+    inputs: &[(u32, usize); GLM52_MAX_BATCH_PER_RANK],
+) -> Glm52StepKv {
+    let pages = vec![padding_page; bucket * table_width].into_boxed_slice();
+    let mut slot_mapping = [0i64; GLM52_MAX_BATCH_PER_RANK];
+    for (row, slot) in slot_mapping.iter_mut().enumerate().take(bucket) {
+        *slot = padding_page as i64 * PAGE as i64 + (inputs[row].1 % PAGE) as i64;
+    }
+    Glm52StepKv {
+        pages,
+        slot_mapping,
+    }
+}
 
 /// Every rank's forward shape for one step, decided together from the same
 /// feed-want snapshot (`wants[rank][slot]` = rows that slot can usefully
@@ -216,13 +234,6 @@ pub(super) fn feed_wants(slots: &[RankSlots]) -> Vec<[usize; GLM52_MAX_BATCH_PER
                     .map_or(0, |active| active.state.feed_want())
             })
         })
-        .collect()
-}
-
-pub(super) fn occupancy(slots: &[RankSlots]) -> Vec<[bool; GLM52_MAX_BATCH_PER_RANK]> {
-    slots
-        .iter()
-        .map(|rank_slots| std::array::from_fn(|slot| rank_slots[slot].is_some()))
         .collect()
 }
 

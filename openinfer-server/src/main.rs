@@ -50,6 +50,11 @@ async fn main() -> anyhow::Result<()> {
     let lora_modules = args.lora_modules.clone();
     let enable_lora = args.enable_lora;
     let port = args.port;
+    let frontend_engine_count = match model_type {
+        #[cfg(feature = "glm52")]
+        ModelType::Glm52 if args.moe_topo != "tp8" => args.dp_size.unwrap_or(8),
+        _ => 1,
+    };
     let engine_load = tokio::task::spawn_blocking(move || -> anyhow::Result<EngineHandle> {
         load_engine(&args, model_type)
     });
@@ -89,12 +94,13 @@ async fn main() -> anyhow::Result<()> {
                 anyhow::Ok(handle)
             }
         };
-        openinfer::vllm_frontend::serve(
+        openinfer::vllm_frontend::serve_with_engine_count(
             engine,
             &model_path,
             served_model_name.into_iter().collect(),
             port,
             None,
+            frontend_engine_count,
             shutdown,
         )
         .await

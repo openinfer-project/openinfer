@@ -284,6 +284,7 @@ impl LLMEngine for OpeninferBackend {
         let req = GenerateRequest {
             request_id: Some(ctx.id().to_string()),
             queued_at_unix_s: request.request_timestamp_ms.map(|ms| ms / 1000.0),
+            data_parallel_rank: None,
             prompt_tokens: request.token_ids,
             params,
             max_tokens,

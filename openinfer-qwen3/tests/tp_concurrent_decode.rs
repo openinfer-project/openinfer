@@ -120,6 +120,7 @@ fn tp2_graph_dump_when_available_and_concurrent_decode_complete() {
                 .submit(GenerateRequest {
                     request_id: None,
                     queued_at_unix_s: None,
+                    data_parallel_rank: None,
                     prompt_tokens,
                     params: SamplingParams::default(),
                     max_tokens: 24 + (i % 4) * 24,

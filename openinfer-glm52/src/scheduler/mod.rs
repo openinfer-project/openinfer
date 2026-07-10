@@ -21,13 +21,13 @@
 //! `GLM52_DECODE_BUCKETS` covering the hungriest rank's row demand, so the
 //! fleet pays for prefill only while someone is prefilling and returns to the
 //! cheap 1-row bucket for pure decode. Requests join and leave slots at step
-//! boundaries (continuous batching) — admission is least-loaded rank first,
-//! so decode-only fleets leave the 1-row bucket only past `GLM52_EP_RANKS`
-//! concurrent requests.
+//! boundaries (continuous batching). The vLLM frontend assigns HTTP requests
+//! least-load-first to rank-owned queues, so decode-only fleets leave the
+//! 1-row bucket only past `GLM52_EP_RANKS` concurrent requests.
 //!
 //! The per-request decisions (what to feed next, what a step's output means)
 //! live in [`Glm52SlotState`] as pure data transitions, and the
-//! admission/step-shape decisions in [`admission_target`] /
+//! admission/step-shape decisions in [`intake`] /
 //! [`plan_step_shapes`] as pure functions over the occupancy and feed wants;
 //! the coordinator is a thin shell that moves tokens between channels and the
 //! rank workers.
@@ -35,19 +35,22 @@
 mod admission;
 #[cfg(test)]
 mod contract_tests;
+mod load;
 mod offload;
 mod plan;
 mod slot;
 #[cfg(test)]
 mod testkit;
 
+use std::collections::VecDeque;
+
 use anyhow::Context as _;
 
-use openinfer_core::engine::{GenerateRequest, TokenEvent, unix_now_s};
+use openinfer_core::engine::{GenerateRequest, LoadSnapshot, TokenEvent, unix_now_s};
 use openinfer_kv_cache::{BlockPool, RequestKv};
 use openinfer_kv_offload::OffloadEngine;
 use openinfer_sample::mix_seed;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::model::{
     GLM52_DECODE_BUCKETS, GLM52_MAX_BATCH_PER_RANK, GLM52_MODEL_LEN_ALIGN, Glm52StepKv,
@@ -55,8 +58,11 @@ use crate::model::{
 };
 use crate::runner::{Glm52RankWorker, Glm52StepFlags};
 
-use admission::{admission_target, intake, lifetime_blocks};
-use plan::{collect_sampling_rows, feed_wants, launch_ahead_flags, occupancy, plan_step_shapes};
+use admission::{intake, lifetime_blocks};
+use load::{pending_is_empty, publish_load, running_counts};
+use plan::{
+    collect_sampling_rows, feed_wants, launch_ahead_flags, padding_step_kv, plan_step_shapes,
+};
 use slot::{GLM52_PADDING_STEP, Glm52SlotState, Glm52StepOutcome};
 
 /// The KV page size (== the FlashMLA page / index-K block / model-len
@@ -95,26 +101,6 @@ enum SpanKind {
     Speculative,
 }
 
-/// The all-padding-rows step KV: every page-table entry is the pool's
-/// padding page, every write slot points into it (padding rows sit at
-/// position 0, inside the page).
-fn padding_step_kv(
-    bucket: usize,
-    table_width: usize,
-    padding_page: i32,
-    inputs: &[(u32, usize); GLM52_MAX_BATCH_PER_RANK],
-) -> Glm52StepKv {
-    let pages = vec![padding_page; bucket * table_width].into_boxed_slice();
-    let mut slot_mapping = [0i64; GLM52_MAX_BATCH_PER_RANK];
-    for (row, slot) in slot_mapping.iter_mut().enumerate().take(bucket) {
-        *slot = padding_page as i64 * PAGE as i64 + (inputs[row].1 % PAGE) as i64;
-    }
-    Glm52StepKv {
-        pages,
-        slot_mapping,
-    }
-}
-
 /// DP8 coordinator: admits up to `GLM52_MAX_BATCH_PER_RANK` requests per rank
 /// (least-loaded rank with pool budget first) and drives all ranks in
 /// lock-step. Consumes the workers — and the offload engines: they hold the
@@ -132,6 +118,7 @@ pub(crate) fn run_dp8_coordinator(
     no_prefix_cache: bool,
     offload: Option<Vec<OffloadEngine>>,
     moe_topo: crate::Glm52MoeTopo,
+    load_txs: Vec<watch::Sender<LoadSnapshot>>,
 ) {
     // TP8 replicated topology: ONE logical rank drives 8 mirrored executors.
     // Every worker receives the identical step (inputs, shape, KV, seed) and
@@ -140,6 +127,11 @@ pub(crate) fn run_dp8_coordinator(
     // and draft joins.
     let mirrored = moe_topo == crate::Glm52MoeTopo::Tp8;
     let logical_ranks = if mirrored { 1 } else { workers.len() };
+    assert_eq!(
+        load_txs.len(),
+        logical_ranks,
+        "one GLM5.2 load feed is required per logical rank"
+    );
     // Verify-span draft budget: EP8 feeds 3 (the measured bucket-4 optimum);
     // the tp8 full-bucket shape always computes 8 rows, so it feeds the
     // drafter's full proposal.
@@ -189,7 +181,8 @@ pub(crate) fn run_dp8_coordinator(
     // slot, or a new one was admitted into it). Flushed with each step's
     // Draft commands; the handler is idempotent, so duplicates are harmless.
     let mut pending_resets: Vec<Vec<usize>> = (0..logical_ranks).map(|_| Vec::new()).collect();
-    let mut pending = std::collections::VecDeque::<GenerateRequest>::new();
+    let mut pending: Vec<VecDeque<GenerateRequest>> =
+        (0..logical_ranks).map(|_| VecDeque::new()).collect();
     let mut channel_open = true;
     let all_idle = |slots: &[RankSlots]| {
         slots
@@ -222,20 +215,21 @@ pub(crate) fn run_dp8_coordinator(
 
     'serve: loop {
         // Intake: block when fully idle, otherwise drain what's queued.
-        if channel_open && all_idle(&slots) && pending.is_empty() {
+        if channel_open && all_idle(&slots) && pending_is_empty(&pending) {
+            publish_load(&load_txs, &pools, &slots, &pending);
             match submit_rx.blocking_recv() {
-                Some(req) => intake(req, &mut pending, max_model_len),
+                Some(req) => intake(req, &mut pending, &running_counts(&slots), max_model_len),
                 None => channel_open = false,
             }
         }
         while channel_open {
             match submit_rx.try_recv() {
-                Ok(req) => intake(req, &mut pending, max_model_len),
+                Ok(req) => intake(req, &mut pending, &running_counts(&slots), max_model_len),
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => channel_open = false,
             }
         }
-        if !channel_open && all_idle(&slots) && pending.is_empty() {
+        if !channel_open && all_idle(&slots) && pending_is_empty(&pending) {
             break;
         }
 
@@ -256,6 +250,7 @@ pub(crate) fn run_dp8_coordinator(
             fail_step(&mut slots, &err);
             break 'serve;
         }
+        publish_load(&load_txs, &pools, &slots, &pending);
         if all_idle(&slots) {
             continue;
         }
@@ -269,7 +264,7 @@ pub(crate) fn run_dp8_coordinator(
             &shapes,
             leased_shapes.as_deref(),
             slots_changed,
-            pending.is_empty(),
+            pending_is_empty(&pending),
             dspark_enabled,
             offload.is_some(),
             &slots,
@@ -355,7 +350,7 @@ pub(crate) fn run_dp8_coordinator(
     }
 
     // Also fail whatever never got a slot.
-    for req in pending {
+    for req in pending.into_iter().flatten() {
         let _ = req.token_tx.send(TokenEvent::Error {
             message: "GLM5.2 engine shut down before the request was scheduled".to_owned(),
             prompt_tokens: req.prompt_tokens.len(),
@@ -443,14 +438,15 @@ fn precapture_step_graphs(
     Ok(())
 }
 
-/// Admission: fill free slots from the queue, least-loaded rank (with pool
-/// budget for the request's full lifetime) first. New requests join the
-/// lock-step at the next step boundary (their prefill rides decode alongside
-/// everyone else's rows). An `Err` is a kvbm invariant break — the caller
-/// fails the step (the affected request was already answered here).
+/// Admission: fill each rank's free slots from its own FIFO queue while its
+/// full-lifetime KV budget permits. The frontend already selected the rank;
+/// admission must never move the request or its metrics/KV ownership diverge.
+/// New requests join the lock-step at the next step boundary. An `Err` is a
+/// kvbm invariant break — the caller fails the step (the affected request was
+/// already answered here).
 #[allow(clippy::too_many_arguments)]
 fn admit_from_queue(
-    pending: &mut std::collections::VecDeque<GenerateRequest>,
+    pending: &mut [VecDeque<GenerateRequest>],
     slots: &mut [RankSlots],
     pools: &[BlockPool],
     usable_blocks: &[usize],
@@ -460,93 +456,98 @@ fn admit_from_queue(
     pending_resets: &mut [Vec<usize>],
     slots_changed: &mut bool,
 ) -> anyhow::Result<()> {
-    while let Some(front) = pending.front() {
-        let need_blocks = lifetime_blocks(front.prompt_tokens.len(), front.max_tokens);
-        let committed: Vec<usize> = slots
-            .iter()
-            .map(|rank_slots| {
-                rank_slots
-                    .iter()
-                    .flatten()
-                    .map(|active| {
-                        lifetime_blocks(active.req.prompt_tokens.len(), active.req.max_tokens)
-                    })
-                    .sum()
-            })
-            .collect();
-        // Pages pinned by in-flight release saves are physically
-        // unallocatable until their D2H lands — hide them from the
-        // full-lifetime budget so admission defers instead of promising
-        // pages a later `schedule_prefill` cannot get (which would
-        // fail_step the whole engine).
-        let usable: Vec<usize> = match offload {
-            Some(offload) => usable_blocks
+    assert_eq!(pending.len(), slots.len());
+    let mut committed: Vec<usize> = slots
+        .iter()
+        .map(|rank_slots| {
+            rank_slots
                 .iter()
-                .zip(offload)
-                .map(|(&usable, rank)| usable.saturating_sub(rank.pinned_blocks()))
-                .collect(),
-            None => usable_blocks.to_vec(),
-        };
-        let Some((rank, slot)) =
-            admission_target(&occupancy(slots), &committed, &usable, need_blocks)
-        else {
-            break;
-        };
-        let req = pending.pop_front().expect("checked non-empty");
-        // The client left while the request sat in the queue — admitting
-        // it would burn a slot (and whole global steps) on a dead sink.
-        if req.token_tx.is_closed() {
-            continue;
-        }
-        let mut kv = pools[rank].new_request(req.prompt_tokens.clone(), req.max_tokens, None);
-        // Host-tier restore first, so the single GPU prefix match below sees
-        // the union of HBM-resident and freshly-restored blocks. The probe
-        // stays alive across the match: it holds the committed blocks, and
-        // dropping it earlier would open an eviction window between commit
-        // and re-match.
-        let _restored_hold = offload.filter(|_| prefix_cache_enabled).map(|offload| {
-            offload::restore_host_prefix(&offload[rank].engine, &pools[rank], &req.prompt_tokens)
-        });
-        let cached_tokens = if prefix_cache_enabled {
-            match kv.match_and_add_prefix(&pools[rank]) {
-                Ok(cached) => cached,
-                Err(err) => {
-                    // A fresh request failing to match is a kvbm state
-                    // invariant break — crash early, don't serve on a
-                    // pool whose bookkeeping already lied once. This
-                    // request is already out of `pending` and never
-                    // reaches a slot, so fail it explicitly (fail_step
-                    // and the shutdown sweep can't see it).
-                    let err = err.context("GLM5.2 prefix match at admission");
-                    let _ = req.token_tx.send(TokenEvent::Error {
-                        message: format!("{err:#}"),
-                        prompt_tokens: req.prompt_tokens.len(),
-                        completion_tokens: 0,
-                    });
-                    return Err(err);
-                }
+                .flatten()
+                .map(|active| {
+                    lifetime_blocks(active.req.prompt_tokens.len(), active.req.max_tokens)
+                })
+                .sum()
+        })
+        .collect();
+    // Pages pinned by in-flight release saves are physically unallocatable
+    // until their D2H lands. Hide them from each rank's full-lifetime budget
+    // so admission defers instead of promising pages a later schedule cannot
+    // get (which would fail the whole engine).
+    let usable: Vec<usize> = match offload {
+        Some(offload) => usable_blocks
+            .iter()
+            .zip(offload)
+            .map(|(&usable, rank)| usable.saturating_sub(rank.pinned_blocks()))
+            .collect(),
+        None => usable_blocks.to_vec(),
+    };
+
+    for rank in 0..slots.len() {
+        while let Some(slot) = slots[rank].iter().position(Option::is_none) {
+            let Some(front) = pending[rank].front() else {
+                break;
+            };
+            let need_blocks = lifetime_blocks(front.prompt_tokens.len(), front.max_tokens);
+            if committed[rank] + need_blocks > usable[rank] {
+                break;
             }
-        } else {
-            0
-        };
-        let queued_at_unix_s = req.queued_at_unix_s.unwrap_or_else(unix_now_s);
-        let _ = req.token_tx.send(TokenEvent::Scheduled {
-            queued_at_unix_s,
-            scheduled_at_unix_s: unix_now_s(),
-            prompt_tokens: req.prompt_tokens.len(),
-            cached_tokens,
-        });
-        let state = Glm52SlotState::new(
-            req.prompt_tokens.clone(),
-            req.max_tokens,
-            req.params.ignore_eos,
-            cached_tokens,
-        );
-        if dspark_enabled {
-            pending_resets[rank].push(slot);
+
+            let req = pending[rank].pop_front().expect("checked non-empty");
+            // The client left while the request sat in the queue — admitting
+            // it would burn a slot (and whole global steps) on a dead sink.
+            if req.token_tx.is_closed() {
+                continue;
+            }
+            let mut kv = pools[rank].new_request(req.prompt_tokens.clone(), req.max_tokens, None);
+            // Host-tier restore first, so the GPU prefix match sees the union
+            // of HBM-resident and freshly-restored blocks. The probe stays
+            // alive across the match to close the eviction window.
+            let _restored_hold = offload.filter(|_| prefix_cache_enabled).map(|offload| {
+                offload::restore_host_prefix(
+                    &offload[rank].engine,
+                    &pools[rank],
+                    &req.prompt_tokens,
+                )
+            });
+            let cached_tokens = if prefix_cache_enabled {
+                match kv.match_and_add_prefix(&pools[rank]) {
+                    Ok(cached) => cached,
+                    Err(err) => {
+                        // The request is already out of `pending` and never
+                        // reaches a slot, so fail it explicitly before the
+                        // engine-fatal invariant error propagates.
+                        let err = err.context("GLM5.2 prefix match at admission");
+                        let _ = req.token_tx.send(TokenEvent::Error {
+                            message: format!("{err:#}"),
+                            prompt_tokens: req.prompt_tokens.len(),
+                            completion_tokens: 0,
+                        });
+                        return Err(err);
+                    }
+                }
+            } else {
+                0
+            };
+            let queued_at_unix_s = req.queued_at_unix_s.unwrap_or_else(unix_now_s);
+            let _ = req.token_tx.send(TokenEvent::Scheduled {
+                queued_at_unix_s,
+                scheduled_at_unix_s: unix_now_s(),
+                prompt_tokens: req.prompt_tokens.len(),
+                cached_tokens,
+            });
+            let state = Glm52SlotState::new(
+                req.prompt_tokens.clone(),
+                req.max_tokens,
+                req.params.ignore_eos,
+                cached_tokens,
+            );
+            if dspark_enabled {
+                pending_resets[rank].push(slot);
+            }
+            slots[rank][slot] = Some(ActiveRequest { req, state, kv });
+            committed[rank] += need_blocks;
+            *slots_changed = true;
         }
-        slots[rank][slot] = Some(ActiveRequest { req, state, kv });
-        *slots_changed = true;
     }
     Ok(())
 }

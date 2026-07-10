@@ -280,6 +280,7 @@ fn measure_decode_stream(
         .submit(SchedulerRequest {
             request_id: Some(request_id),
             queued_at_unix_s: None,
+            data_parallel_rank: None,
             prompt_tokens,
             params,
             max_tokens,
