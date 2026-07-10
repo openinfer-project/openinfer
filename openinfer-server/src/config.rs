@@ -249,9 +249,9 @@ pub(crate) struct Args {
     #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..=99))]
     pub decode_sm_pct: u32,
 
-    /// Pin Qwen3's projection GEMMs and split-KV chunk count, and route a unified step's decode
-    /// rows through the decode attention a pure decode step runs. Off by default. Qwen3-only,
-    /// single-GPU.
+    /// Enable single-GPU Qwen3 batch-invariant serving by pinning the numeric paths and cutting
+    /// each prompt's prefill chunks on its own grid. Off by default. Requires `--no-prefix-cache`;
+    /// incompatible with `--kv-offload`, which keeps prefix matching on regardless.
     #[arg(long, default_value_t = false)]
     pub batch_invariant: bool,
 }
@@ -440,6 +440,13 @@ impl Args {
                 "--batch-invariant is not compatible with --decode-overlap; the stream override would force the pinned GEMM to bail at runtime"
             );
         }
+        if self.batch_invariant && self.kv_offload {
+            bail!(
+                "--batch-invariant is not supported with --kv-offload: offload keeps prefix matching \
+                 on (--no-prefix-cache only disables HBM retention there), and a host-tier prefix hit \
+                 shifts a prompt's chunk boundaries off the request-local grid"
+            );
+        }
         if self.batch_invariant && self.dflash_draft_model_path.is_some() {
             bail!(
                 "--batch-invariant is not supported with DFlash speculative decoding; enable one at a time"
@@ -447,6 +454,12 @@ impl Args {
         }
         if self.batch_invariant && self.tp_size > 1 {
             bail!("--batch-invariant is not supported with --tp-size > 1; enable one at a time");
+        }
+        if self.batch_invariant && !self.no_prefix_cache {
+            bail!(
+                "--batch-invariant requires --no-prefix-cache; prefix-cache hits move a prompt's chunk \
+                 boundaries off the request-local grid, so batch-invariant prefill cannot be provided"
+            );
         }
         if provided.contains("decode_sm_pct")
             && !matches!(self.decode_overlap, CliDecodeOverlap::GreenCtx)

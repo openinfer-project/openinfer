@@ -446,12 +446,15 @@ fn start_engine_with_offload_inner(
     let model_path = model_path
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("model path must be valid UTF-8"))?;
-    ensure_batch_invariant_supported(
-        decode_overlap,
-        batch_invariant,
-        dflash_draft_model_path.is_some(),
-        device_ordinals.len(),
-    )?;
+    if batch_invariant {
+        ensure_batch_invariant_supported(
+            decode_overlap,
+            no_prefix_cache,
+            offload_options.enabled,
+            dflash_draft_model_path.is_some(),
+            device_ordinals.len(),
+        )?;
+    }
     apply_batch_invariant_policy(batch_invariant);
     let dflash_draft_model_path = dflash_draft_model_path
         .map(|path| {
@@ -495,12 +498,6 @@ pub fn start_engine_with_lora_control(
     let model_path = model_path
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("model path must be valid UTF-8"))?;
-    ensure_batch_invariant_supported(
-        decode_overlap,
-        batch_invariant,
-        false,
-        device_ordinals.len(),
-    )?;
     if batch_invariant {
         anyhow::bail!(
             "--batch-invariant is not supported with LoRA: the decode-GEMM pin warms and self-checks \
@@ -536,25 +533,39 @@ fn apply_batch_invariant_policy(batch_invariant: bool) {
 
 fn ensure_batch_invariant_supported(
     decode_overlap: DecodeOverlap,
-    batch_invariant: bool,
+    no_prefix_cache: bool,
+    offload: bool,
     dflash: bool,
     world_size: usize,
 ) -> Result<()> {
-    if batch_invariant && !matches!(decode_overlap, DecodeOverlap::Off) {
+    if !matches!(decode_overlap, DecodeOverlap::Off) {
         anyhow::bail!(
             "--batch-invariant is not compatible with --decode-overlap; the stream override would force the pinned GEMM to bail at runtime"
         );
     }
-    if batch_invariant && world_size > 1 {
+    if offload {
+        anyhow::bail!(
+            "--batch-invariant is not supported with KV offload: offload keeps prefix matching on \
+             (--no-prefix-cache only disables HBM retention there), and a host-tier prefix hit \
+             shifts a prompt's chunk boundaries off the request-local grid"
+        );
+    }
+    if world_size > 1 {
         anyhow::bail!(
             "--batch-invariant is not supported with tensor parallelism: world_size={world_size} has unverified cross-rank reduction order"
         );
     }
-    if batch_invariant && dflash {
+    if dflash {
         anyhow::bail!(
             "--batch-invariant is not supported with DFlash speculative decoding: the decode-GEMM \
              pin warms and self-checks only the base projections, so the drafter's fc/MLP GEMMs \
              are not pinned and would bail at the GEMM boundary under Pin"
+        );
+    }
+    if !no_prefix_cache {
+        anyhow::bail!(
+            "--batch-invariant requires --no-prefix-cache; prefix-cache hits move a prompt's chunk \
+             boundaries off the request-local grid, so batch-invariant prefill cannot be provided"
         );
     }
     Ok(())

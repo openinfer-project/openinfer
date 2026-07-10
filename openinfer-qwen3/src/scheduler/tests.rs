@@ -444,7 +444,7 @@ fn prefill_chunking_caps_step_tokens_and_keeps_fifo_progress() {
     // A prompt larger than the budget is split: the head request gets a
     // budget-sized chunk and everyone behind it waits.
     let mut prefilling = vec![mk(1, 64, 1), mk(2, 16, 1)];
-    let taken = take_prefill_chunks(&mut prefilling, 32);
+    let taken = take_prefill_chunks(&mut prefilling, 32, false);
     assert_eq!(taken.len(), 1);
     assert_eq!(taken[0].request_id, RequestId(1));
     assert_eq!(taken[0].step_chunk, 32, "chunk is capped at the budget");
@@ -457,7 +457,7 @@ fn prefill_chunking_caps_step_tokens_and_keeps_fifo_progress() {
     // Requests pack until the budget is filled exactly; the overflow stays
     // queued in arrival order.
     let mut prefilling = vec![mk(3, 16, 1), mk(4, 16, 1), mk(5, 16, 1)];
-    let taken = take_prefill_chunks(&mut prefilling, 32);
+    let taken = take_prefill_chunks(&mut prefilling, 32, false);
     assert_eq!(
         taken.iter().map(|r| r.step_chunk).collect::<Vec<_>>(),
         vec![16, 16],
@@ -469,13 +469,53 @@ fn prefill_chunking_caps_step_tokens_and_keeps_fifo_progress() {
     let mut head = mk(6, 64, 1);
     head.prefill_pos = 48;
     let mut prefilling = vec![head, mk(7, 16, 1)];
-    let taken = take_prefill_chunks(&mut prefilling, 32);
+    let taken = take_prefill_chunks(&mut prefilling, 32, false);
     assert_eq!(
         taken.iter().map(|r| r.step_chunk).collect::<Vec<_>>(),
         vec![16, 16],
         "remainder of the chunked head + the next request share the step"
     );
     assert!(prefilling.is_empty());
+}
+
+// TokenEvent does not expose per-step chunk assignments, so gate them here.
+#[test]
+fn request_local_chunks_are_independent_of_earlier_requests() {
+    let mk = |id: u64, prompt_len| {
+        PendingRequest::from_scheduler_request(RequestId(id), request(prompt_len, 1).0)
+    };
+    let simulate = |mut prefilling: Vec<PendingRequest>, request_local: bool| {
+        let mut target_chunks = Vec::new();
+        while prefilling.iter().any(|req| req.request_id == RequestId(3)) {
+            let taken = take_prefill_chunks(&mut prefilling, 32, request_local);
+            let mut continued = Vec::new();
+            for mut req in taken {
+                if req.request_id == RequestId(3) {
+                    target_chunks.push(req.step_chunk);
+                }
+                req.prefill_pos += req.step_chunk;
+                if req.remaining_prompt_tokens() > 0 {
+                    continued.push(req);
+                }
+            }
+            prefilling.splice(0..0, continued);
+        }
+        target_chunks
+    };
+    let alone = || vec![mk(3, 80)];
+    let behind_others = || vec![mk(1, 24), mk(2, 16), mk(3, 80)];
+
+    assert_eq!(simulate(alone(), true), vec![32, 32, 16]);
+    assert_eq!(simulate(behind_others(), true), vec![32, 32, 16]);
+
+    // Without request-local chunking the same request is cut differently once it queues behind
+    // others — the drift this pins. Its absence would make the two asserts above vacuous.
+    assert_eq!(simulate(alone(), false), vec![32, 32, 16]);
+    assert_ne!(
+        simulate(behind_others(), false),
+        vec![32, 32, 16],
+        "shared-budget chunking must still be batch-dependent, or the request-local asserts prove nothing"
+    );
 }
 
 #[test]
@@ -494,7 +534,7 @@ fn echo_requests_run_only_when_their_prompt_fits_the_prefill_bound() {
     // admission, the chunk picker must still keep it out of the profiled
     // prefill shape instead of running it whole.
     let mut prefilling = vec![mk_echo(1, 64), mk(2, 16)];
-    let taken = take_prefill_chunks(&mut prefilling, 32);
+    let taken = take_prefill_chunks(&mut prefilling, 32, false);
     assert_eq!(taken.len(), 1);
     assert_eq!(taken[0].request_id, RequestId(2));
     assert_eq!(taken[0].step_chunk, 16);
@@ -508,7 +548,7 @@ fn echo_requests_run_only_when_their_prompt_fits_the_prefill_bound() {
     // later requests may still fill the leftover budget, and the step set
     // stays sorted by request id.
     let mut prefilling = vec![mk(3, 24), mk_echo(4, 16), mk(5, 8)];
-    let taken = take_prefill_chunks(&mut prefilling, 32);
+    let taken = take_prefill_chunks(&mut prefilling, 32, false);
     assert_eq!(
         taken
             .iter()

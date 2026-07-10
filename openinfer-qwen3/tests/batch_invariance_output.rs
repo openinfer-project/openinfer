@@ -468,17 +468,6 @@ fn output_sequence_batch_invariant_under_pin() {
     harness.barrier();
     phase_two(&mut harness, &baseline);
     harness.barrier();
-}
-
-#[test]
-#[ignore = "chunked-prefill composition drifts per-token logprobs under Pin"]
-fn chunked_prefill_drifts_output_logprobs() {
-    let Some(model_path) = model_path_or_skip() else {
-        return;
-    };
-    let _guard = POLICY_LOCK.lock().unwrap();
-    let handle = start_pin_engine(&model_path);
-    let mut harness = Harness::new(handle);
     phase_three(&mut harness);
     harness.barrier();
 }
