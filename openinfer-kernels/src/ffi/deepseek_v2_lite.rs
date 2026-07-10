@@ -4,6 +4,16 @@ use cudarc::driver::sys::{CUresult, CUstream};
 // DeepSeek-V2-Lite private kernels (feature `deepseek-v2-lite`).
 // Sources: csrc/deepseek_v2_lite/*.cu.
 unsafe extern "C" {
+    pub fn dsv2_lite_router_logits_cuda(
+        hidden: *const Half,
+        gate_weight: *const Half,
+        logits: *mut f32,
+        seq_len: i32,
+        hidden_dim: i32,
+        n_experts: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn dsv2_lite_router_softmax_topk_cuda(
         hidden: *const Half,
         gate_weight: *const Half,

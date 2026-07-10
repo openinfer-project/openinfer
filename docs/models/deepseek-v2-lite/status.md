@@ -1,6 +1,6 @@
 # DeepSeek-V2-Lite Status And Benchmark Ledger
 
-> **TL;DR:** DeepSeek-V2-Lite has an EP2 correctness contract across HF, host-staged, and NCCL. Issue #464 adds phase-attributed HTTP traces and a narrow host-staged MoE route-batching optimization that preserves the exact HF token hash and improves the retained `64/64` HTTP run. This is not a vLLM parity, production serving, sparse dispatch, multi-node, or NCCL-throughput claim.
+> **TL;DR:** DeepSeek-V2-Lite has an EP2 correctness contract across HF, host-staged, and NCCL. Issue #464 proves scheduler batching forms, then removes two measured MoE bottlenecks: repeated per-route expert replay on host-staged/NCCL and the NCCL CPU gate GEMM. Exact token/text hashes are preserved; three paired NCCL HTTP runs improve output throughput by `18.6%/25.7%/30.6%` at concurrency `1/4/8`. This is not a vLLM parity, production serving, sparse dispatch, multi-node, or broad-workload claim.
 
 Last touched: 2026-07
 
@@ -21,7 +21,7 @@ Last touched: 2026-07
 | NCCL CUDA Graph readiness | Covered-shape diagnostic | Schema-2 `cuda_graph_readiness` now includes a fail-closed `full_decode_graph_probe`. The 2026-06-20 run reports capture, instantiate, replay, and verification success with `8/8` verified replays for the retained batch-1 NCCL decode step. |
 | First mixed-request serving gate | Available | Issue #281 adds greedy-only request admission, FCFS deferral, explicit request-local rejection/error/finish events, and one owned `DecodeCache` per active request. The 2026-06-23 2x RTX 5090 run passed HF / host-staged / NCCL exactness and the mixed-serving E2E for host-staged and NCCL. |
 | Long-shape NCCL collectives | Available | Issue #280 chunks large bf16 dense-exchange and f32 combine all-reduces. The 2026-06-24 2x RTX 5090 NCCL checks preserve HF / host-staged / NCCL exactness and complete 24/64/128-word direct long-shape probes. |
-| HTTP trace, position-subgroup decode, and host-staged MoE route batching | HTTP and direct evidence | Issue #280 logs DeepSeek-V2-Lite `openinfer_http_trace` records and batches same-position decode subgroups. Issue #464 extends phase/decode-step attribution, then groups host-staged routes by `(rank, expert)` to reduce repeated outer expert replays and transfer/synchronization overhead while preserving route combine order and the exact HF token hash. |
+| HTTP trace and measured MoE throughput optimization | HTTP and direct evidence | Issue #280 logs DeepSeek-V2-Lite `openinfer_http_trace` records and batches same-position decode subgroups. Issue #464 extends phase/decode-step attribution, groups host-staged and NCCL routes by stable `(owner_rank, global_expert)`, and moves the NCCL gate GEMM to a bitwise-matched CUDA logits kernel while keeping host top-k/softmax. Serial/host rollback switches remain available. |
 | HTTP reliability lifecycle gate | Available | Issue #453 adds `scripts/bench_dsv2lite_http_reliability.py`, which drives real streaming `/v1/completions` scenarios for client cancel/disconnect, unsupported params, active-cap overload, mixed short/long prompts with adjacent failures, and clean follow-up recovery. The 2026-07-04 2x RTX 5090 host-staged and NCCL runs both passed with terminal trace coverage, stable output hashes, active/pending/decode maxima, and healthy final scheduler baselines. |
 | Retained vLLM comparison matrix | Snapshot complete with clean failed setup rows and supplemental validation rows | The retained matrix for tracking issue #279 keeps HF/host/NCCL correctness, OpenInfer direct diagnostic batch, `vllm bench serve` HTTP pressure, OpenInfer trace rows, and failed setup rows separate. The 2026-06-28 clean full matrix passed HF / host-staged / NCCL correctness plus OpenInfer host-staged/NCCL direct, HTTP pressure, and trace rows; stock vLLM TP2 and TP2+EP2 failed during setup on the target FlashInfer SM120 path. A separate FlashInfer #3633-equivalent validation completed vLLM TP2 and TP2+EP2 under the same HTTP client/workload contract. |
 | vLLM production parity | Not claimed | The vLLM TP2 / TP2+EP2 rows are gap-finding evidence from a documented contract. The supplemental validation run is not serving parity or a stock-install claim. |
@@ -71,11 +71,16 @@ Retained 2026-07-09 trace refresh for #464 used real `/v1/completions` traffic w
 
 Conclusion: active sets and batched decode steps form under HTTP pressure, and the trace separates queue wait, prefill, first decode, decode mean/total, scheduled terminal latency, and singleton versus batched decode steps. Decode mean and total latency still grow with active rows, which ruled out scheduler admission as the final bottleneck and moved #464 to backend attribution.
 
-### Issue #464 Host-Staged MoE Route Batching
+### Issue #464 MoE Replay And NCCL Router Optimization
 
-Backend attribution identified repeated host-staged expert replay as one concrete throughput limiter: each token route invoked a separate outer H2D / expert / D2H path even when several active rows selected the same `(owner_rank, global_expert)`. The optimized path groups those routes in stable order, performs one grouped transfer and activation path per group, splits the outputs, and combines them in the original route order. The expert MLP still issues per-row GEMM internally; a direct batch-GEMM candidate was rejected after it changed the retained token hash.
+Backend attribution found two concrete throughput limiters:
 
-Direct `Hello` / 16-token attribution on 2x RTX 5090 kept the exact HF-confirmed token hash:
+- host-staged and NCCL replayed one outer expert path per token route, even when several active rows selected the same `(owner_rank, global_expert)`;
+- NCCL copied the full hidden state to the host and ran the gate GEMM on the CPU before top-k routing.
+
+The optimized paths group routes by stable `(owner_rank, global_expert)`, gather device rows, execute one expert group, and accumulate contributions in the original token-major route order. The NCCL router now computes logits on the GPU with explicit round-to-nearest multiply/add operations that match the retained host gate bitwise, then copies only logits for the existing host top-k/softmax rule. Expert inputs and outputs remain alive until combine completes. The expert MLP still issues per-row GEMM internally; a direct batch-GEMM candidate was rejected after it changed the retained token hash.
+
+The host-staged paired result remains:
 
 | Batch | Serial mean decode step | Route-batched mean decode step | Outer replay call change |
 | ---: | ---: | ---: | --- |
@@ -91,7 +96,29 @@ The paired host-staged HTTP trace run used the same `64/64`, `num_prompts=32`, c
 | 4 | `21.52` | `24.72` |
 | 8 | `21.79` | `25.42` |
 
-This is one retained host-staged optimization result. It does not cover the NCCL backend, mixed/long-prompt throughput, soak behavior, SLO tails, or vLLM parity. Route construction and attention still include host-side work and remain candidates for further profiling.
+NCCL direct attribution isolated the two changes:
+
+| Batch | Serial experts | Grouped experts | Host router | Device logits router |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | `22.571 ms` | `22.733 ms` | `22.462 ms` | `22.175 ms` |
+| 4 | `69.937 ms` | `57.440 ms` | `57.565 ms` | `47.722 ms` |
+| 8 | `132.617 ms` | `101.055 ms` | `100.780 ms` | `81.824 ms` |
+
+The final default direct path measured `22.113/47.267/81.284 ms` at batch `1/4/8`, with exact retained token and text hashes in every row.
+
+Three paired NCCL HTTP runs used `64/64`, `num_prompts=32`, concurrency `1/4/8`, `temperature=0`, `ignore_eos=true`, and no warmup:
+
+| Concurrency | Baseline output tok/s | Optimized output tok/s | Change | Decode mean |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | `25.369` | `30.089` | `+18.6%` | `+3.1%`; no c1 decode-speed claim |
+| 4 | `24.486` | `30.782` | `+25.7%` | `-42.25%` |
+| 8 | `24.723` | `32.286` | `+30.6%` | `-30.06%` |
+
+All `18` cells and `144` requests completed with `failed=0`, `timeouts=0`, and `missing_trace=0`; every paired run preserved the same eight-prompt hash set. The retained public artifact basename is `issue464-http-nccl-three-pair-summary.json`.
+
+The final batch-8 attribution shows NCCL exchange plus combine at about `2.3%` of CPU-attributed time and `4.8%` of selected GPU-section time, so collectives are not the primary limiter for this shape. The largest remaining measured section is `attention_host_path` at about `46.0%` of CPU-attributed time. Moving KV/cache attention fully device-side changes cache ownership, long-context capacity, and graph semantics; it needs a separate design and validation contract.
+
+These results cover the retained direct and short HTTP shapes only. They do not prove mixed/long-prompt scaling, soak behavior, SLO tails, production readiness, or vLLM parity.
 
 ### Direct Same-Prompt Diagnostic Batch
 
@@ -246,12 +273,12 @@ Scenario summaries:
 
 ### Interpretation
 
-- direct same-prompt diagnostics show NCCL is still much slower than host-staged, although aggregate decode throughput improves with larger diagnostic batch size;
-- NCCL remains a correctness-first backend and is still significantly slower than host-staged;
+- older direct same-prompt snapshots showed NCCL behind host-staged; the #464 paired runs supersede that conclusion for the retained `Hello/16`, batch `1/4/8` shape only;
 - the #280 HTTP trace proves active request sets and subgroup decode batches, but throughput still scales only weakly on NCCL EP2 and long prompts have high TTFT;
 - the #464 trace refresh closes the phase/decode-step observability gap: batching forms, while decode mean/total grows with active rows, so scheduler admission is not the final throughput blocker;
-- the #464 host-staged route-batching slice reduces repeated outer expert replays plus H2D/D2H and synchronization overhead, and improves the paired retained HTTP rows from `22.45/21.52/21.79` to `26.06/24.72/25.42` output tok/s at concurrency `1/4/8`;
-- host-side route construction and attention work remain visible, and NCCL needs a separate optimization path before any broader throughput claim;
+- the #464 host-staged and NCCL route grouping reduces repeated expert replay; the NCCL device logits router also removes the CPU gate GEMM and full-hidden D2H copy;
+- three paired NCCL HTTP runs improve retained output throughput by `18.6%/25.7%/30.6%` at concurrency `1/4/8`, while c1 decode mean remains slightly slower and is not claimed as a decode acceleration;
+- NCCL collectives are a small fraction of the measured batch-8 path; host attention is now the largest attributed section and requires a separate cache/ownership design;
 - the #453 runner and trace fields make failure isolation auditable; host-staged and NCCL live HTTP artifacts now prove cancel/disconnect/reject/overload/mixed-failure cleanup and clean follow-up recovery on the retained 2-GPU validation contract;
 - the 2026-06-28 clean matrix keeps stock vLLM startup failures visible because they are part of the reproducibility record;
 - the supplemental vLLM validation shows the HTTP contract can run after the FlashInfer SM120/CUDA 12.8 path is fixed, but it should stay separate from stock-package rows;
@@ -267,7 +294,8 @@ Use these labels consistently:
 | `direct same-prompt diagnostic batch` | Fixed same-prompt direct batch sizes `1/4/8`. | Production continuous batching or mixed-request scheduling. |
 | `first mixed-request serving gate` | Greedy-only EP2 scheduler path with explicit admission/rejection/deferral, per-request host-side decode `DecodeCache`, active cap `8`, and exact sequential-oracle E2E. | vLLM parity, sparse dispatch, production EP readiness, HTTP throughput scaling, non-greedy sampling, or logprobs support. |
 | `HTTP trace/subgroup evidence` | `/v1/completions` requests have per-request `openinfer_http_trace` rows; HTTP sweeps show non-1 `active_set_size`, `decode_batch_size_max`, phase timing, and batched-vs-singleton decode-step counts. | Fair vLLM parity, long-prompt latency readiness, backend/kernel attribution, or a before/after percentage unless a paired baseline run is recorded. |
-| `host-staged route-batched MoE slice` | Paired serial/default direct and HTTP A/B for the retained #464 shapes, with exact token-hash preservation and fewer outer expert replay/transfer/synchronization calls. | Fewer per-row GEMM launches, NCCL improvement, broad workload scaling, soak/SLO readiness, production EP readiness, or vLLM parity. |
+| `route-grouped MoE slice` | Separate paired host-staged and NCCL direct/HTTP A/B for the retained #464 shapes, with exact token/text hashes and contribution accumulation in original route order. | Fewer per-row GEMM launches, broad workload scaling, soak/SLO readiness, production EP readiness, or vLLM parity. |
+| `NCCL device logits router slice` | The gate GEMM runs on CUDA with bitwise host-logit coverage; existing host top-k/softmax builds the route plan. | Fully device-resident routing, no routing D2H, general numerical equivalence, or non-NCCL improvement. |
 | `HTTP reliability lifecycle gate` | `/v1/completions` cancel/disconnect/reject/overload/mixed-failure scenarios have terminal reason counts, trace coverage, active/pending/decode maxima, output hashes, and clean follow-up recovery evidence. | Production EP readiness, soak stability, SLO latency, vLLM parity, throughput improvement, sparse dispatch, or multi-node EP support. |
 | `covered NCCL decode graph probe` | Probe-only batch-1 `Hello` decode step captured, instantiated, replayed, and token-verified under CUDA Graph. | Default serving graph coverage, multi-step graph replay, batch `4/8` graph coverage, or performance improvement. |
 | `HTTP concurrency pressure` | `vllm bench serve --max-concurrency N` against an HTTP endpoint. | True OpenInfer batch size unless the engine path proves it. |
@@ -308,14 +336,14 @@ The next implementation should be chosen from measured evidence:
    - vLLM TP2.
    - vLLM TP2+EP2 when supported.
    - default vLLM configuration plus a controlled configuration with cache/flag choices recorded.
-   - keep host-staged and NCCL optimization claims separate until both have paired evidence.
+   - keep host-staged and NCCL measurements separately attributable even when one PR changes both.
 
 4. Widen the first mixed-request serving gate before broader throughput claims.
    - keep the fixed EP2 path and exact sequential oracle until a wider oracle replaces it;
    - keep greedy-only admission explicit until sampling/logprobs have their own gate;
    - keep direct same-prompt batch labeled diagnostic;
    - reduce long-prompt prefill and admission-queue TTFT before claiming long-prompt serving readiness;
-   - require paired baseline runs for every future percentage speedup; the #464 host-staged route-batching slice is the first retained paired result.
+   - require paired baseline runs for every future percentage speedup; #464 retains separate host-staged and NCCL paired results.
 
 5. Keep the #453 HTTP reliability evidence retained.
    - rerun the reliability runner for host-staged and NCCL when scheduler or HTTP lifecycle code changes;
@@ -325,3 +353,9 @@ The next implementation should be chosen from measured evidence:
 6. Keep MoE internals readable.
    - routing, dispatch, expert execution, and combine should remain distinguishable in code and attribution;
    - avoid introducing a generic EP framework before the DeepSeek-V2-Lite EP2 path has a measured reason to need it.
+
+7. Design the remaining attention optimization as a separate change.
+   - preserve explicit KV/cache ownership and request retirement semantics;
+   - prove long-context capacity before replacing the host path;
+   - define CUDA Graph pointer-stability and replay behavior before enabling it;
+   - keep exact HF / host-staged / NCCL gates and paired direct/HTTP evidence.

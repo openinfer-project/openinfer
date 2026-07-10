@@ -10,6 +10,47 @@ pub struct Dsv2LiteRouterOutput<'a> {
     pub topk_idx: &'a mut CudaSlice<i32>,
 }
 
+pub fn dsv2_lite_router_logits_into(
+    ctx: &DeviceContext,
+    hidden: &HiddenStates,
+    gate_weight: &DeviceMatrix,
+    logits: &mut CudaSlice<f32>,
+) -> Result<()> {
+    ensure!(
+        hidden.hidden_dim == gate_weight.cols,
+        "DSV2-Lite router hidden_dim {} must match gate cols {}",
+        hidden.hidden_dim,
+        gate_weight.cols
+    );
+    let logits_elems = hidden
+        .seq_len
+        .checked_mul(gate_weight.rows)
+        .ok_or_else(|| anyhow!("DSV2-Lite router logits element count overflow"))?;
+    ensure!(
+        logits.len() >= logits_elems,
+        "DSV2-Lite router logits output too small: have {}, need {logits_elems}",
+        logits.len()
+    );
+
+    let (hidden_ptr, _hidden_guard) = hidden.data.device_ptr(&ctx.stream);
+    let (gate_ptr, _gate_guard) = gate_weight.data.device_ptr(&ctx.stream);
+    let (logits_ptr, _logits_guard) = logits.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::dsv2_lite_router_logits_cuda(
+            hidden_ptr as *const ffi::Half,
+            gate_ptr as *const ffi::Half,
+            logits_ptr as *mut f32,
+            hidden.seq_len as i32,
+            hidden.hidden_dim as i32,
+            gate_weight.rows as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result
+        .result()
+        .map_err(|err| anyhow!("DSV2-Lite router logits CUDA launch failed: {err}"))
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Dsv2LiteAttentionConfig {
     pub num_heads: usize,

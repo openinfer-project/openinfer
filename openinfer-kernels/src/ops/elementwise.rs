@@ -502,14 +502,32 @@ pub fn accumulate_bf16_token_scaled_to_f32_into(
     seq_len: usize,
     out: &mut CudaSlice<f32>,
 ) -> Result<()> {
-    assert!(
-        scale.is_finite(),
-        "accumulate_bf16_token_scaled_to_f32_into scale must be finite"
-    );
     assert_eq!(
         token.seq_len, 1,
         "accumulate_bf16_token_scaled_to_f32_into expects one token, got seq_len={}",
         token.seq_len
+    );
+    accumulate_bf16_row_scaled_to_f32_into(ctx, token.as_ref(), 0, scale, token_idx, seq_len, out)
+}
+
+pub fn accumulate_bf16_row_scaled_to_f32_into(
+    ctx: &DeviceContext,
+    rows: HiddenStatesRef<'_>,
+    source_token_idx: usize,
+    scale: f32,
+    token_idx: usize,
+    seq_len: usize,
+    out: &mut CudaSlice<f32>,
+) -> Result<()> {
+    assert!(
+        scale.is_finite(),
+        "accumulate_bf16_row_scaled_to_f32_into scale must be finite"
+    );
+    assert!(
+        source_token_idx < rows.seq_len,
+        "accumulate source_token_idx {} exceeds source seq_len {}",
+        source_token_idx,
+        rows.seq_len
     );
     assert!(
         token_idx < seq_len,
@@ -518,20 +536,23 @@ pub fn accumulate_bf16_token_scaled_to_f32_into(
         seq_len
     );
     assert!(
-        out.len() >= token.hidden_dim * seq_len,
+        out.len() >= rows.hidden_dim * seq_len,
         "f32 output len {} < hidden_dim {} * seq_len {}",
         out.len(),
-        token.hidden_dim,
+        rows.hidden_dim,
         seq_len
     );
-    let (token_ptr, _gt) = token.data.device_ptr(&ctx.stream);
+    let (rows_ptr, _gr) = rows.data.device_ptr(&ctx.stream);
     let (out_ptr, _go) = out.device_ptr_mut(&ctx.stream);
+    let source_offset = source_token_idx
+        .checked_mul(rows.hidden_dim)
+        .expect("accumulate source row offset overflow");
     let result = unsafe {
         ffi::accumulate_bf16_token_scaled_to_f32_cuda(
-            token_ptr as *const ffi::Half,
+            (rows_ptr as *const ffi::Half).add(source_offset),
             scale,
             out_ptr as *mut f32,
-            token.hidden_dim as i32,
+            rows.hidden_dim as i32,
             token_idx as i32,
             seq_len as i32,
             crate::tensor::active_cu_stream(ctx),
@@ -862,6 +883,30 @@ mod tests {
             err.to_string().contains("out of bounds"),
             "unexpected error: {err}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn accumulate_bf16_row_scaled_to_f32_selects_source_row() -> Result<()> {
+        let ctx = DeviceContext::new()?;
+        let rows = hidden_from_host(
+            &ctx,
+            &[
+                bf16::from_f32(1.0),
+                bf16::from_f32(2.0),
+                bf16::from_f32(3.0),
+                bf16::from_f32(4.0),
+            ],
+            2,
+            2,
+        )?;
+        let mut out = ctx.stream.alloc_zeros::<f32>(4)?;
+
+        accumulate_bf16_row_scaled_to_f32_into(&ctx, rows.as_ref(), 1, 0.5, 0, 2, &mut out)?;
+
+        let actual = ctx.stream.clone_dtoh(&out)?;
+        ctx.sync()?;
+        assert_eq!(actual, vec![1.5, 2.0, 0.0, 0.0]);
         Ok(())
     }
 }

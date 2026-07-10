@@ -26,7 +26,9 @@ use openinfer_core::{
     ffi as core_ffi, ops,
     tensor::{DeviceContext, HiddenStates, HiddenStatesRef},
 };
-use openinfer_kernels::ops::dsv2_lite_accumulate_fixed_expert_into;
+use openinfer_kernels::ops::{
+    accumulate_bf16_row_scaled_to_f32_into, dsv2_lite_accumulate_fixed_expert_into,
+};
 use serde::Serialize;
 
 use crate::device::{activate, activate_graph_capture, graph_capture_activation_guard};
@@ -430,17 +432,34 @@ impl NaiveNcclEp2Backend {
         seq_len: usize,
         weight: f32,
     ) -> Result<()> {
-        ensure!(
-            expert_output.seq_len == 1,
-            "DeepSeek-V2-Lite NCCL device combine expects one-token expert output, got seq_len={}",
-            expert_output.seq_len
-        );
+        self.accumulate_device_contribution_row(
+            rank,
+            ctx,
+            expert_output,
+            0,
+            token_idx,
+            seq_len,
+            weight,
+        )
+    }
+
+    pub(crate) fn accumulate_device_contribution_row(
+        &self,
+        rank: usize,
+        ctx: &DeviceContext,
+        expert_output: &HiddenStates,
+        output_row: usize,
+        token_idx: usize,
+        seq_len: usize,
+        weight: f32,
+    ) -> Result<()> {
         let mut scratch = self.combine_scratch()?;
         scratch.ensure_shape(expert_output.hidden_dim, seq_len)?;
         activate(ctx)?;
-        ops::accumulate_bf16_token_scaled_to_f32_into(
+        accumulate_bf16_row_scaled_to_f32_into(
             ctx,
-            expert_output,
+            expert_output.as_ref(),
+            output_row,
             weight,
             token_idx,
             seq_len,

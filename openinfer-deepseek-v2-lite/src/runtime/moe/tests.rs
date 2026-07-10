@@ -1,7 +1,7 @@
 use half::bf16;
 use openinfer_core::tensor::{DeviceContext, DeviceMatrix, HiddenStates};
 use openinfer_kernels::ops::{
-    Dsv2LiteRouterOutput, dsv2_lite_accumulate_fixed_expert_into,
+    Dsv2LiteRouterOutput, dsv2_lite_accumulate_fixed_expert_into, dsv2_lite_router_logits_into,
     dsv2_lite_router_softmax_topk_into,
 };
 
@@ -67,6 +67,48 @@ fn device_router_matches_host_softmax_topk_rule() {
             assert_eq!(got_idx[offset], expected_idx as i32);
             assert_close(got_weight[offset], expected_weight, 1.0e-6);
         }
+    }
+}
+
+#[test]
+fn device_router_logits_match_host_accumulation_bitwise() {
+    let ctx = DeviceContext::new().expect("create CUDA context");
+    let mut config = test_lite_config();
+    config.hidden_size = 4;
+    config.n_routed_experts = 8;
+
+    let hidden_host = bf16_vec(&[1.0, -2.0, 0.5, 3.0, -1.0, 0.25, 2.0, -0.5]);
+    let gate_host = router_gate_fixture();
+    let hidden = HiddenStates {
+        data: ctx.stream.clone_htod(&hidden_host).expect("hidden H2D"),
+        hidden_dim: config.hidden_size,
+        seq_len: 2,
+    };
+    let gate = DeviceMatrix::from_host(
+        &ctx,
+        &gate_host,
+        config.n_routed_experts,
+        config.hidden_size,
+    )
+    .expect("gate H2D");
+    let mut logits = ctx
+        .stream
+        .alloc_zeros::<f32>(hidden.seq_len * config.n_routed_experts)
+        .expect("router logits");
+
+    dsv2_lite_router_logits_into(&ctx, &hidden, &gate, &mut logits).expect("device logits");
+    let got = ctx.stream.clone_dtoh(&logits).expect("logits D2H");
+    ctx.sync().expect("sync logits");
+
+    let gate_host_f32: Vec<_> = gate_host.iter().map(|value| value.to_f32()).collect();
+    let expected = gate_logits_host(&config, &hidden_host, &gate_host_f32);
+    assert_eq!(got.len(), expected.len());
+    for (idx, (got, expected)) in got.iter().zip(expected).enumerate() {
+        assert_eq!(
+            got.to_bits(),
+            expected.to_bits(),
+            "router logits mismatch at index {idx}: got={got} expected={expected}"
+        );
     }
 }
 

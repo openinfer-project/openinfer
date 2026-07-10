@@ -2,9 +2,11 @@ use super::{
     backend::{EpBackendKind, parse_backend, validate_backend_and_devices},
     helpers::{append_generated_token, ensure_same_prompt_batch_rows_match},
     moe::{
-        HostStagedExpertBatchPolicy, HostStagedRouteWork, accumulate_host_staged_route_output,
+        HostStagedExpertBatchPolicy, HostStagedRouteWork, NcclExpertBatchPolicy, NcclRouterPolicy,
+        accumulate_host_staged_route_output, group_nccl_route_indices,
         scatter_host_staged_group_output,
     },
+    routing::MoeRouteEntry,
 };
 use openinfer_engine::engine::FinishReason;
 
@@ -91,6 +93,86 @@ fn host_staged_expert_batch_policy_can_replay_serial_path() {
 }
 
 #[test]
+fn nccl_expert_batch_policy_defaults_to_grouped() {
+    assert_eq!(
+        NcclExpertBatchPolicy::from_env_value(None),
+        NcclExpertBatchPolicy::Grouped
+    );
+    assert_eq!(
+        NcclExpertBatchPolicy::from_env_value(Some("")),
+        NcclExpertBatchPolicy::Grouped
+    );
+    assert_eq!(
+        NcclExpertBatchPolicy::from_env_value(Some("unexpected")),
+        NcclExpertBatchPolicy::Grouped
+    );
+}
+
+#[test]
+fn nccl_expert_batch_policy_can_replay_serial_path() {
+    for value in ["0", "false", "off", "serial", "legacy"] {
+        assert_eq!(
+            NcclExpertBatchPolicy::from_env_value(Some(value)),
+            NcclExpertBatchPolicy::Serial
+        );
+    }
+}
+
+#[test]
+fn nccl_router_policy_defaults_to_device() {
+    assert_eq!(
+        NcclRouterPolicy::from_env_value(None),
+        NcclRouterPolicy::Device
+    );
+    assert_eq!(
+        NcclRouterPolicy::from_env_value(Some("")),
+        NcclRouterPolicy::Device
+    );
+    assert_eq!(
+        NcclRouterPolicy::from_env_value(Some("unexpected")),
+        NcclRouterPolicy::Device
+    );
+}
+
+#[test]
+fn nccl_router_policy_can_replay_host_path() {
+    for value in ["0", "false", "off", "host", "cpu", "legacy"] {
+        assert_eq!(
+            NcclRouterPolicy::from_env_value(Some(value)),
+            NcclRouterPolicy::Host
+        );
+    }
+}
+
+#[test]
+fn nccl_route_groups_are_stable_by_rank_and_expert() {
+    let routes = vec![
+        MoeRouteEntry {
+            token: 0,
+            global_expert: 35,
+            owner_rank: 1,
+            weight: 0.6,
+        },
+        MoeRouteEntry {
+            token: 0,
+            global_expert: 3,
+            owner_rank: 0,
+            weight: 0.4,
+        },
+        MoeRouteEntry {
+            token: 1,
+            global_expert: 35,
+            owner_rank: 1,
+            weight: 0.7,
+        },
+    ];
+
+    let groups: Vec<_> = group_nccl_route_indices(&routes).into_iter().collect();
+
+    assert_eq!(groups, vec![((0, 3), vec![1]), ((1, 35), vec![0, 2])]);
+}
+
+#[test]
 fn host_staged_group_scatter_matches_serial_for_distinct_rows() {
     let route_work = vec![
         HostStagedRouteWork::new(0, 7, 0, 0.5),
@@ -103,14 +185,9 @@ fn host_staged_group_scatter_matches_serial_for_distinct_rows() {
         Some(vec![30.0, 31.0]),
     ];
     let mut grouped_outputs = vec![None; route_work.len()];
-    scatter_host_staged_group_output(
-        &mut grouped_outputs,
-        &[1, 0],
-        vec![20.0, 21.0, 10.0, 11.0],
-        2,
-    )
-    .unwrap();
-    scatter_host_staged_group_output(&mut grouped_outputs, &[2], vec![30.0, 31.0], 2).unwrap();
+    scatter_host_staged_group_output(&mut grouped_outputs, &[1, 0], &[20.0, 21.0, 10.0, 11.0], 2)
+        .unwrap();
+    scatter_host_staged_group_output(&mut grouped_outputs, &[2], &[30.0, 31.0], 2).unwrap();
 
     fn combine(
         route_work: &[HostStagedRouteWork],

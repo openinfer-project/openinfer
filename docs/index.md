@@ -94,7 +94,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 
 | Path | TL;DR |
 | --- | --- |
-| `models/deepseek-v2-lite/status.md` | DeepSeek-V2-Lite EP2 status ledger: HF/host-staged/NCCL exactness, mixed-request serving, #464 phase/decode-step traces plus a paired host-staged route-batched MoE throughput slice, reliability gates, and retained vLLM TP2/EP2 boundaries; no vLLM parity or production serving claim. |
+| `models/deepseek-v2-lite/status.md` | DeepSeek-V2-Lite EP2 status ledger: HF/host-staged/NCCL exactness, mixed-request serving, #464 trace attribution plus host-staged/NCCL route grouping and NCCL device-router evidence, reliability gates, and retained vLLM boundaries; no broad-workload, parity, or production claim. |
 | `models/deepseek-v2-lite/benchmark-artifact-manifest.md` | Issue #467 implemented: the retained DeepSeek-V2-Lite benchmark matrix emits `artifact_manifest.json` and `regression_summary.json`, with CPU-only summarize-only tests. |
 | `models/deepseek-v2-lite/hf-accuracy-gate.md` | DeepSeek-V2-Lite EP2 HF accuracy gate after PR #149/#150/#274: HF `generate(use_cache=true)`, host-staged EP2, and NCCL EP2 are compared across the committed small case set. |
 | `models/deepseek-v2-lite/decode-attribution-gate.md` | DeepSeek-V2-Lite EP2 decode attribution gate for `Hello`/16-token batch sizes 1/4/8: structured JSON with accuracy hashes, timing/counters, separated NCCL all-reduce smoke, and fail-closed full-decode graph probe evidence for the retained batch-1 shape. |

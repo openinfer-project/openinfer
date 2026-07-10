@@ -8,7 +8,7 @@ use openinfer_core::{
     tensor::{HiddenStates, HiddenStatesRef},
 };
 use openinfer_kernels::ops::{
-    Dsv2LiteRouterOutput, dsv2_lite_router_softmax_topk_into,
+    Dsv2LiteRouterOutput, dsv2_lite_router_logits_into, dsv2_lite_router_softmax_topk_into,
     dsv2_lite_router_softmax_topk_ref_into,
 };
 
@@ -77,10 +77,74 @@ fn host_staged_expert_batch_policy() -> HostStagedExpertBatchPolicy {
     )
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum NcclExpertBatchPolicy {
+    Grouped,
+    Serial,
+}
+
+impl NcclExpertBatchPolicy {
+    pub(super) fn from_env_value(raw: Option<&str>) -> Self {
+        match raw.map(str::trim).filter(|value| !value.is_empty()) {
+            Some("0" | "false" | "off" | "serial" | "legacy") => Self::Serial,
+            _ => Self::Grouped,
+        }
+    }
+
+    fn use_serial(self) -> bool {
+        self == Self::Serial
+    }
+}
+
+fn nccl_expert_batch_policy() -> NcclExpertBatchPolicy {
+    NcclExpertBatchPolicy::from_env_value(
+        env::var("OPENINFER_DSV2_LITE_NCCL_EXPERT_BATCH")
+            .ok()
+            .as_deref(),
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum NcclRouterPolicy {
+    Host,
+    Device,
+}
+
+impl NcclRouterPolicy {
+    pub(super) fn from_env_value(raw: Option<&str>) -> Self {
+        match raw.map(str::trim).filter(|value| !value.is_empty()) {
+            Some("0" | "false" | "off" | "host" | "cpu" | "legacy") => Self::Host,
+            _ => Self::Device,
+        }
+    }
+}
+
+fn nccl_router_policy() -> NcclRouterPolicy {
+    NcclRouterPolicy::from_env_value(env::var("OPENINFER_DSV2_LITE_NCCL_ROUTER").ok().as_deref())
+}
+
+pub(super) fn group_nccl_route_indices(
+    routes: &[MoeRouteEntry],
+) -> BTreeMap<(usize, usize), Vec<usize>> {
+    let mut groups = BTreeMap::new();
+    for (route_index, route) in routes.iter().enumerate() {
+        groups
+            .entry((route.owner_rank, route.global_expert))
+            .or_insert_with(Vec::new)
+            .push(route_index);
+    }
+    groups
+}
+
+struct NcclRouteReplayBuffers {
+    _inputs: Vec<HiddenStates>,
+    _outputs: Vec<HiddenStates>,
+}
+
 pub(super) fn scatter_host_staged_group_output(
     route_outputs: &mut [Option<Vec<f32>>],
     route_indices: &[usize],
-    out: Vec<f32>,
+    out: &[f32],
     hidden_size: usize,
 ) -> Result<()> {
     ensure!(
@@ -377,7 +441,7 @@ impl DeepSeekV2LiteEp2Generator {
                 scatter_host_staged_group_output(
                     &mut route_outputs,
                     &route_indices,
-                    out,
+                    &out,
                     self.config.hidden_size,
                 )?;
             }
@@ -450,17 +514,29 @@ impl DeepSeekV2LiteEp2Generator {
         shared_per_token_gemm: bool,
     ) -> Result<(HiddenStates, usize, usize)> {
         activate(&self.rank0.ctx)?;
+        let router_policy = nccl_router_policy();
+        let route_section = match router_policy {
+            NcclRouterPolicy::Host => "ep_route_host",
+            NcclRouterPolicy::Device => "ep_route_device",
+        };
         let route_plan = attribution.record_result(
             phase,
-            "ep_route_host",
+            route_section,
             || format!("layer.{layer_idx}.nccl.route"),
             Some(layer_idx),
             token_index,
-            || {
-                let input_host = hidden_to_bf16(&self.rank0.ctx, input)?;
-                let route_logits_host = gate_logits_host(&self.config, &input_host, &moe.gate_host);
-                let routes = topk_softmax_routes(&self.config, &route_logits_host, input.seq_len);
-                MoeRoutePlan::from_topk_routes(&routes, &self.rank0.layout)
+            || match router_policy {
+                NcclRouterPolicy::Host => {
+                    let input_host = hidden_to_bf16(&self.rank0.ctx, input)?;
+                    let route_logits_host =
+                        gate_logits_host(&self.config, &input_host, &moe.gate_host);
+                    let routes =
+                        topk_softmax_routes(&self.config, &route_logits_host, input.seq_len);
+                    MoeRoutePlan::from_topk_routes(&routes, &self.rank0.layout)
+                }
+                NcclRouterPolicy::Device => {
+                    self.build_nccl_route_plan_device(input, &moe.gate_device)
+                }
             },
         )?;
 
@@ -551,6 +627,24 @@ impl DeepSeekV2LiteEp2Generator {
             route_plan.local_routes(),
             route_plan.remote_routes(),
         ))
+    }
+
+    fn build_nccl_route_plan_device(
+        &self,
+        input: &HiddenStates,
+        gate_device: &openinfer_core::tensor::DeviceMatrix,
+    ) -> Result<MoeRoutePlan> {
+        activate(&self.rank0.ctx)?;
+        let logits_elems = input
+            .seq_len
+            .checked_mul(self.config.n_routed_experts)
+            .context("NCCL device router logits element count overflow")?;
+        let mut route_logits = self.rank0.ctx.stream.alloc_zeros::<f32>(logits_elems)?;
+        dsv2_lite_router_logits_into(&self.rank0.ctx, input, gate_device, &mut route_logits)?;
+        let route_logits = self.rank0.ctx.stream.clone_dtoh(&route_logits)?;
+        self.rank0.ctx.sync()?;
+        let routes = topk_softmax_routes(&self.config, &route_logits, input.seq_len);
+        MoeRoutePlan::from_topk_routes(&routes, &self.rank0.layout)
     }
 
     pub(super) fn moe_forward_nccl_fixed_topology_preallocated_into(
@@ -735,7 +829,42 @@ impl DeepSeekV2LiteEp2Generator {
         attribution: &mut DecodeAttributionProfile,
         phase: &'static str,
         token_index: Option<usize>,
-    ) -> Result<Vec<HiddenStates>> {
+    ) -> Result<NcclRouteReplayBuffers> {
+        if nccl_expert_batch_policy().use_serial() {
+            return self.replay_nccl_route_plan_serial(
+                nccl,
+                layer_idx,
+                input,
+                rank1_hidden,
+                route_plan,
+                attribution,
+                phase,
+                token_index,
+            );
+        }
+        self.replay_nccl_route_plan_grouped(
+            nccl,
+            layer_idx,
+            input,
+            rank1_hidden,
+            route_plan,
+            attribution,
+            phase,
+            token_index,
+        )
+    }
+
+    fn replay_nccl_route_plan_serial(
+        &self,
+        nccl: &NaiveNcclEp2Backend,
+        layer_idx: usize,
+        input: &HiddenStates,
+        rank1_hidden: HiddenStatesRef<'_>,
+        route_plan: &MoeRoutePlan,
+        attribution: &mut DecodeAttributionProfile,
+        phase: &'static str,
+        token_index: Option<usize>,
+    ) -> Result<NcclRouteReplayBuffers> {
         let mut live_expert_outputs = Vec::with_capacity(route_plan.route_count());
         for route in route_plan.entries() {
             let out = self.forward_nccl_route(
@@ -775,7 +904,110 @@ impl DeepSeekV2LiteEp2Generator {
             )?;
             live_expert_outputs.push(out);
         }
-        Ok(live_expert_outputs)
+        Ok(NcclRouteReplayBuffers {
+            _inputs: Vec::new(),
+            _outputs: live_expert_outputs,
+        })
+    }
+
+    fn replay_nccl_route_plan_grouped(
+        &self,
+        nccl: &NaiveNcclEp2Backend,
+        layer_idx: usize,
+        input: &HiddenStates,
+        rank1_hidden: HiddenStatesRef<'_>,
+        route_plan: &MoeRoutePlan,
+        attribution: &mut DecodeAttributionProfile,
+        phase: &'static str,
+        token_index: Option<usize>,
+    ) -> Result<NcclRouteReplayBuffers> {
+        let route_groups = group_nccl_route_indices(route_plan.entries());
+        let mut group_inputs = Vec::with_capacity(route_groups.len());
+        let mut group_outputs = Vec::with_capacity(route_groups.len());
+        let mut route_locations = vec![None; route_plan.route_count()];
+
+        for ((owner_rank, global_expert), route_indices) in route_groups {
+            let (ctx, source_hidden, expert, section) = match owner_rank {
+                0 => (
+                    &self.rank0.ctx,
+                    input.as_ref(),
+                    self.rank0.routed_expert(layer_idx, global_expert)?,
+                    "nccl_local_expert",
+                ),
+                1 => (
+                    &self.rank1.ctx,
+                    rank1_hidden,
+                    self.rank1.routed_expert(layer_idx, global_expert)?,
+                    "nccl_remote_expert",
+                ),
+                other => {
+                    bail!("routed expert {global_expert} maps to unsupported EP rank {other}")
+                }
+            };
+            ensure!(
+                !route_indices.is_empty(),
+                "NCCL expert group requires at least one route"
+            );
+            let group_input =
+                gather_nccl_route_group(ctx, source_hidden, route_plan.entries(), &route_indices)?;
+            let group_output = attribution.record_gpu_result(
+                ctx,
+                phase,
+                section,
+                || format!("layer.{layer_idx}.nccl.expert{global_expert}"),
+                Some(layer_idx),
+                token_index,
+                || dense_mlp_forward_per_token(ctx, &expert.dense, &group_input),
+            )?;
+            let group_index = group_outputs.len();
+            for (group_row, route_index) in route_indices.into_iter().enumerate() {
+                ensure!(
+                    route_locations[route_index]
+                        .replace((group_index, group_row))
+                        .is_none(),
+                    "NCCL route {route_index} was assigned to more than one expert group"
+                );
+            }
+            group_inputs.push(group_input);
+            group_outputs.push(group_output);
+        }
+
+        for (route_index, route) in route_plan.entries().iter().enumerate() {
+            let (group_index, output_row) = route_locations[route_index]
+                .with_context(|| format!("missing NCCL expert output for route {route_index}"))?;
+            let expert_ctx = match route.owner_rank {
+                0 => &self.rank0.ctx,
+                1 => &self.rank1.ctx,
+                other => bail!(
+                    "routed expert {} maps to unsupported EP rank {other}",
+                    route.global_expert
+                ),
+            };
+            attribution.record_gpu_result(
+                expert_ctx,
+                phase,
+                "nccl_contribution_accumulate_device",
+                || format!("layer.{layer_idx}.nccl.contribution_accumulate_device"),
+                Some(layer_idx),
+                token_index,
+                || {
+                    nccl.accumulate_device_contribution_row(
+                        route.owner_rank,
+                        expert_ctx,
+                        &group_outputs[group_index],
+                        output_row,
+                        route.token,
+                        input.seq_len,
+                        route.weight,
+                    )
+                },
+            )?;
+        }
+
+        Ok(NcclRouteReplayBuffers {
+            _inputs: group_inputs,
+            _outputs: group_outputs,
+        })
     }
 
     fn forward_nccl_route(
@@ -835,6 +1067,41 @@ fn expert_forward_device(
         data: token.data,
     };
     dense_mlp_forward(ctx, &expert.dense, &token_hidden)
+}
+
+fn gather_nccl_route_group(
+    ctx: &openinfer_core::tensor::DeviceContext,
+    input: HiddenStatesRef<'_>,
+    routes: &[MoeRouteEntry],
+    route_indices: &[usize],
+) -> Result<HiddenStates> {
+    ensure!(
+        !route_indices.is_empty(),
+        "NCCL route gather requires at least one route"
+    );
+    activate(ctx)?;
+    let mut gathered = HiddenStates::zeros(ctx, input.hidden_dim, route_indices.len())?;
+    for (group_row, route_index) in route_indices.iter().copied().enumerate() {
+        let route = routes
+            .get(route_index)
+            .with_context(|| format!("NCCL route index {route_index} is out of bounds"))?;
+        ensure!(
+            route.token < input.seq_len,
+            "NCCL route token {} exceeds input seq_len {}",
+            route.token,
+            input.seq_len
+        );
+        let src_begin = route.token * input.hidden_dim;
+        let dst_begin = group_row * input.hidden_dim;
+        let src = input.data.slice(src_begin..src_begin + input.hidden_dim);
+        let mut dst = gathered
+            .data
+            .slice_mut(dst_begin..dst_begin + input.hidden_dim);
+        ctx.stream
+            .memcpy_dtod(&src, &mut dst)
+            .context("gather NCCL route input row")?;
+    }
+    Ok(gathered)
 }
 
 #[cfg(test)]
