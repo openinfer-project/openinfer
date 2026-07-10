@@ -127,7 +127,7 @@ impl VerifyGraphBuffers {
             graphs: BATCH_BUCKETS
                 .iter()
                 .map(|_| {
-                    (0..model.config().num_hidden_layers + 1)
+                    (0..=model.config().num_hidden_layers)
                         .map(|_| CudaGraphState::new())
                         .collect()
                 })
@@ -290,8 +290,8 @@ impl Qwen3Model {
                 let result = (|| -> Result<()> {
                     segs[0].run_or_capture(ctx, || self.verify_seg_embed_pre(bufs))?;
                     self.verify_attn(0, kv_buffer, layout, bufs)?;
-                    for i in 1..num_layers {
-                        segs[i].run_or_capture(ctx, || {
+                    for (i, segment) in segs.iter_mut().enumerate().take(num_layers).skip(1) {
+                        segment.run_or_capture(ctx, || {
                             self.verify_seg_post_pre(i, capture_layer_ids, bufs)
                         })?;
                         self.verify_attn(i, kv_buffer, layout, bufs)?;

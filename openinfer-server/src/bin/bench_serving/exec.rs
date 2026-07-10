@@ -172,7 +172,7 @@ impl BenchModel for SchedulerBenchModel {
         _rng: &mut StdRng,
     ) -> GenTimings {
         run_timed(prompt_tokens, max_new_tokens, |toks, n, cb| {
-            run_scheduler_stream(&self.handle, None, toks.to_vec(), *sampling, n, |id| cb(id))?;
+            run_scheduler_stream(&self.handle, None, toks.to_vec(), *sampling, n, &mut *cb)?;
             Ok(())
         })
     }
@@ -197,7 +197,7 @@ impl BenchModel for SchedulerBenchModel {
                         toks.to_vec(),
                         sampling,
                         n,
-                        |id| cb(id),
+                        &mut *cb,
                     )?;
                     Ok(())
                 })

@@ -926,10 +926,10 @@ impl Qwen3Model {
     #[cfg(feature = "kernel-call-trace")]
     pub(crate) fn kv_budget(&self) -> KvBudget {
         let geometry = self.kv_budget_geometry(DEFAULT_KV_PAGE_SIZE);
-        let bytes_per_block = self.kv_bytes_per_block(&geometry);
+        let bytes_per_block = Self::kv_bytes_per_block(&geometry);
         let (free_bytes, _) = cudarc::driver::result::mem_get_info().expect("cuMemGetInfo failed");
         let kv_budget_bytes = (free_bytes as f64 * 0.85) as usize;
-        self.kv_budget_from_bytes(
+        Self::kv_budget_from_bytes(
             geometry,
             bytes_per_block,
             0,
@@ -948,7 +948,7 @@ impl Qwen3Model {
     ) -> Result<KvBudget> {
         let memory_options = memory_options.validate()?;
         let geometry = self.kv_budget_geometry(memory_options.page_size);
-        let bytes_per_block = self.kv_bytes_per_block(&geometry);
+        let bytes_per_block = Self::kv_bytes_per_block(&geometry);
         let (initial_free_bytes, total_bytes) = mem_info_bytes()?;
         let requested_bytes =
             (total_bytes as f64 * memory_options.gpu_memory_utilization).ceil() as usize;
@@ -1063,7 +1063,7 @@ impl Qwen3Model {
             memory_options.kv_cache_memory_margin_bytes / (1024 * 1024),
             kv_budget_bytes / (1024 * 1024),
         );
-        Ok(self.kv_budget_from_bytes(
+        Ok(Self::kv_budget_from_bytes(
             geometry,
             bytes_per_block,
             dflash_kv_bytes_per_token,
@@ -1084,7 +1084,7 @@ impl Qwen3Model {
         }
     }
 
-    fn kv_bytes_per_block(&self, geometry: &KvBudget) -> usize {
+    fn kv_bytes_per_block(geometry: &KvBudget) -> usize {
         let layout = openinfer_kv_cache::KvLayout::new(
             geometry.num_layers,
             geometry.num_kv_heads,
@@ -1095,7 +1095,6 @@ impl Qwen3Model {
     }
 
     fn kv_budget_from_bytes(
-        &self,
         mut geometry: KvBudget,
         bytes_per_block: usize,
         dflash_kv_bytes_per_token: usize,

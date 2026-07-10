@@ -10,12 +10,12 @@ use comfy_table::{Cell, CellAlignment};
 use log::info;
 use openinfer::server_engine::ModelType;
 
-use crate::cli::*;
-use crate::exec::*;
-use crate::prompt::*;
-use crate::render::*;
-use crate::report::*;
-use crate::runners::*;
+use crate::cli::{Cli, CompareArgs, MixedArgs, RunArgs, SnapshotArgs};
+use crate::exec::BenchModel;
+use crate::prompt::synthetic_prompt_tokens;
+use crate::render::{key_cell, new_table, numeric_cell, push_table};
+use crate::report::{BenchReport, SnapshotMixedItl, SnapshotProfile, SnapshotReport};
+use crate::runners::{build_request_metrics, measure_timings};
 
 pub(crate) const SNAPSHOT_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../bench_snapshots");
 pub(crate) const SNAPSHOT_PREFILL_OUTPUT_LEN: usize = 1;
@@ -404,7 +404,9 @@ pub(crate) fn render_comparison(
     }
 
     if let (Some(cm), Some(bm)) = (&current.mixed_itl, &baseline.mixed_itl) {
-        if cm.config.inj_prompt_len == bm.config.inj_prompt_len && cm.config.qps == bm.config.qps {
+        if cm.config.inj_prompt_len == bm.config.inj_prompt_len
+            && cm.config.qps.to_bits() == bm.config.qps.to_bits()
+        {
             let ml = format!("(inj {}@{})", cm.config.inj_prompt_len, cm.config.qps);
             for (stat, cur, base) in [
                 ("p50", cm.itl.all.p50_ms, bm.itl.all.p50_ms),

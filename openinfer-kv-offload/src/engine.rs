@@ -829,7 +829,7 @@ impl OffloadEngine {
         let (done_tx, done_rx) = oneshot::channel();
         let (handles, prev_done) = {
             let mut barrier = self.write_barrier.lock().expect("write_barrier poisoned");
-            let handles: Vec<JoinHandle<()>> = barrier.pending_saves.drain(..).collect();
+            let handles = std::mem::take(&mut barrier.pending_saves);
             let prev_done = barrier.prev_flush_done.replace(done_rx);
             (handles, prev_done)
         };

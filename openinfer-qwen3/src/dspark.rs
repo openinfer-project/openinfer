@@ -138,10 +138,11 @@ impl MarkovHead {
     /// Bytes occupied by the Markov head weights + sample scratch, for the memory
     /// reservation. `0` when the head is disabled.
     pub(crate) fn reservation_bytes(config: &DFlashConfig, max_decode_batch_size: usize) -> usize {
+        const BF16: usize = 2;
+
         if !config.uses_markov_head() {
             return 0;
         }
-        const BF16: usize = 2;
         let vocab = config.vocab_size;
         let rank = config.markov_rank;
         let weights = 2 * vocab * rank * BF16;

@@ -78,7 +78,7 @@ fn query_total_sm(device: CUdevice) -> Result<u32> {
         unsafe {
             sys::cuDeviceGetDevResource(
                 device,
-                &mut sm_res,
+                &raw mut sm_res,
                 sys::CUdevResourceType::CU_DEV_RESOURCE_TYPE_SM,
             )
         },
@@ -93,7 +93,7 @@ fn create_primary_stream() -> Result<CUstream> {
     check_cu(
         unsafe {
             sys::cuStreamCreate(
-                &mut stream,
+                &raw mut stream,
                 sys::CUstream_flags::CU_STREAM_NON_BLOCKING as u32,
             )
         },
@@ -137,7 +137,7 @@ impl OverlapStreams {
             unsafe {
                 sys::cuDeviceGetDevResource(
                     device,
-                    &mut sm_res,
+                    &raw mut sm_res,
                     sys::CUdevResourceType::CU_DEV_RESOURCE_TYPE_SM,
                 )
             },
@@ -151,10 +151,10 @@ impl OverlapStreams {
         check_cu(
             unsafe {
                 sys::cuDevSmResourceSplitByCount(
-                    &mut probe_grp,
-                    &mut nb,
-                    &sm_res,
-                    &mut probe_rem,
+                    &raw mut probe_grp,
+                    &raw mut nb,
+                    &raw const sm_res,
+                    &raw mut probe_rem,
                     0,
                     1,
                 )
@@ -179,10 +179,10 @@ impl OverlapStreams {
         check_cu(
             unsafe {
                 sys::cuDevSmResourceSplitByCount(
-                    &mut grp_decode,
-                    &mut nb,
-                    &sm_res,
-                    &mut grp_prefill,
+                    &raw mut grp_decode,
+                    &raw mut nb,
+                    &raw const sm_res,
+                    &raw mut grp_prefill,
                     0,
                     sm_for_decode,
                 )
@@ -196,11 +196,13 @@ impl OverlapStreams {
         let mut desc_decode: sys::CUdevResourceDesc = ptr::null_mut();
         let mut desc_prefill: sys::CUdevResourceDesc = ptr::null_mut();
         check_cu(
-            unsafe { sys::cuDevResourceGenerateDesc(&mut desc_decode, &mut grp_decode, 1) },
+            unsafe { sys::cuDevResourceGenerateDesc(&raw mut desc_decode, &raw mut grp_decode, 1) },
             "cuDevResourceGenerateDesc (decode)",
         )?;
         check_cu(
-            unsafe { sys::cuDevResourceGenerateDesc(&mut desc_prefill, &mut grp_prefill, 1) },
+            unsafe {
+                sys::cuDevResourceGenerateDesc(&raw mut desc_prefill, &raw mut grp_prefill, 1)
+            },
             "cuDevResourceGenerateDesc (prefill)",
         )?;
 
@@ -209,7 +211,7 @@ impl OverlapStreams {
         check_cu(
             unsafe {
                 sys::cuGreenCtxCreate(
-                    &mut gctx_decode,
+                    &raw mut gctx_decode,
                     desc_decode,
                     device,
                     sys::CUgreenCtxCreate_flags::CU_GREEN_CTX_DEFAULT_STREAM as u32,
@@ -220,7 +222,7 @@ impl OverlapStreams {
         check_cu(
             unsafe {
                 sys::cuGreenCtxCreate(
-                    &mut gctx_prefill,
+                    &raw mut gctx_prefill,
                     desc_prefill,
                     device,
                     sys::CUgreenCtxCreate_flags::CU_GREEN_CTX_DEFAULT_STREAM as u32,
@@ -232,11 +234,11 @@ impl OverlapStreams {
         let mut ctx_decode: sys::CUcontext = ptr::null_mut();
         let mut ctx_prefill: sys::CUcontext = ptr::null_mut();
         check_cu(
-            unsafe { sys::cuCtxFromGreenCtx(&mut ctx_decode, gctx_decode) },
+            unsafe { sys::cuCtxFromGreenCtx(&raw mut ctx_decode, gctx_decode) },
             "cuCtxFromGreenCtx (decode)",
         )?;
         check_cu(
-            unsafe { sys::cuCtxFromGreenCtx(&mut ctx_prefill, gctx_prefill) },
+            unsafe { sys::cuCtxFromGreenCtx(&raw mut ctx_prefill, gctx_prefill) },
             "cuCtxFromGreenCtx (prefill)",
         )?;
 
@@ -251,7 +253,7 @@ impl OverlapStreams {
         let mut prefill_stream: CUstream = ptr::null_mut();
         let r1 = unsafe {
             sys::cuGreenCtxStreamCreate(
-                &mut decode_stream,
+                &raw mut decode_stream,
                 gctx_decode,
                 sys::CUstream_flags::CU_STREAM_NON_BLOCKING as u32,
                 0,
@@ -259,7 +261,7 @@ impl OverlapStreams {
         };
         let r2 = unsafe {
             sys::cuGreenCtxStreamCreate(
-                &mut prefill_stream,
+                &raw mut prefill_stream,
                 gctx_prefill,
                 sys::CUstream_flags::CU_STREAM_NON_BLOCKING as u32,
                 0,

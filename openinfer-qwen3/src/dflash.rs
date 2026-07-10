@@ -567,7 +567,7 @@ impl DFlashDraftModel {
                 .context
                 .ensure_capacity(ctx, self.config.hidden_size, context_len)?;
             state.pending_context.activate_for_read();
-            self.project_context_into(ctx, &state.pending_context.buffer, &mut state.context)?;
+            self.project_context_into(ctx, &state.pending_context.buffer, &mut state.context);
             state.pending_context.clear();
         }
 
@@ -752,7 +752,7 @@ impl DFlashDraftModel {
         for (i, state) in states.iter_mut().enumerate() {
             state.committed_len += context_lens[i];
         }
-        self.compute_logits_with_target_head_into(target, scratch)?;
+        self.compute_logits_with_target_head_into(target, scratch);
         Ok(&scratch.logits)
     }
 
@@ -798,7 +798,7 @@ impl DFlashDraftModel {
         ctx: &DeviceContext,
         context_features: &HiddenStates,
         context: &mut DFlashContextScratch,
-    ) -> Result<()> {
+    ) {
         ops::gemm_into(
             ctx,
             &self.fc,
@@ -812,14 +812,13 @@ impl DFlashDraftModel {
             self.config.rms_norm_eps,
             &mut context.context_hidden,
         );
-        Ok(())
     }
 
     fn compute_logits_with_target_head_into(
         &self,
         target: &Qwen3Model,
         scratch: &mut DFlashBatchScratch,
-    ) -> Result<()> {
+    ) {
         let ctx = target.device_ctx();
         ops::rms_norm_batch_into(
             ctx,
@@ -834,7 +833,6 @@ impl DFlashDraftModel {
             &scratch.logits_normed,
             &mut scratch.logits,
         );
-        Ok(())
     }
 }
 

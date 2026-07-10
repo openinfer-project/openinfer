@@ -46,11 +46,11 @@ mod render;
 mod report;
 mod runners;
 mod snapshot;
-use cli::*;
-use exec::*;
-use metrics::*;
-use runners::*;
-use snapshot::*;
+use cli::{Cli, Command};
+use exec::{BenchModel, SchedulerBenchModel};
+use metrics::dur_ms;
+use runners::{emit_report, run_command};
+use snapshot::{run_compare, run_snapshot};
 
 fn command_seed(cli: &Cli) -> u64 {
     match &cli.command {
