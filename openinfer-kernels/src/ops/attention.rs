@@ -805,6 +805,16 @@ pub fn eagle3_rope_into(
         q_row_offset + q_seq_len,
         q.seq_len
     );
+    // The kernel indexes both caches with the same `pos * head_dim + d`, and
+    // `cos_max_pos` is derived from `cos_cache` alone; a shorter `sin_cache`
+    // would let the kernel read out of bounds.
+    assert_eq!(
+        sin_cache.data.len(),
+        cos_cache.data.len(),
+        "eagle3_rope sin_cache len {} != cos_cache len {}",
+        sin_cache.data.len(),
+        cos_cache.data.len()
+    );
 
     let (q_ptr, _gq) = q.data.device_ptr_mut(&ctx.stream);
     let q_ptr = q_ptr + (q_row_offset * q.hidden_dim * std::mem::size_of::<bf16>()) as u64;
@@ -966,7 +976,10 @@ pub fn single_decode_nhd_into(
         )
     };
     if result != 0 {
-        anyhow::bail!("single_decode_nhd_cuda failed with error {result}");
+        anyhow::bail!(
+            "single_decode_nhd_cuda failed with error {result}{}",
+            crate::ops::ffi_exception_message(result)
+        );
     }
     Ok(())
 }
@@ -1030,7 +1043,10 @@ pub fn single_prefill_nhd_causal_into(
         )
     };
     if result != 0 {
-        anyhow::bail!("single_prefill_nhd_causal_cuda failed with error {result}");
+        anyhow::bail!(
+            "single_prefill_nhd_causal_cuda failed with error {result}{}",
+            crate::ops::ffi_exception_message(result)
+        );
     }
     Ok(())
 }

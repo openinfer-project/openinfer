@@ -777,8 +777,10 @@ int single_prefill_nhd_causal_cuda(
     float    sm_scale,
     void*    stream)
 {
+  OPENINFER_FFI_GUARD_BEGIN
     if (q == nullptr || output == nullptr || k_cache == nullptr || v_cache == nullptr ||
         num_qo_heads <= 0 || num_kv_heads <= 0 || head_dim != 128 ||
+        num_qo_heads % num_kv_heads != 0 ||
         seq_len <= 0 || kv_len <= 0 || max_seq_len < kv_len || seq_len > kv_len) {
         return static_cast<int>(cudaErrorInvalidValue);
     }
@@ -823,6 +825,7 @@ int single_prefill_nhd_causal_cuda(
             params,
             /*tmp=*/nullptr,
             reinterpret_cast<cudaStream_t>(stream)));
+  OPENINFER_FFI_GUARD_END(-1)
 }
 
 // ---------------------------------------------------------------------------
@@ -853,8 +856,10 @@ int single_decode_nhd_cuda(
     float    sm_scale,
     void*    stream)
 {
+  OPENINFER_FFI_GUARD_BEGIN
     if (q == nullptr || output == nullptr || k_cache == nullptr || v_cache == nullptr ||
         num_qo_heads <= 0 || num_kv_heads <= 0 || head_dim != 128 ||
+        num_qo_heads % num_kv_heads != 0 ||
         kv_len <= 0 || max_seq_len < kv_len) {
         return static_cast<int>(cudaErrorInvalidValue);
     }
@@ -885,6 +890,7 @@ int single_decode_nhd_cuda(
             params,
             /*tmp=*/nullptr,
             reinterpret_cast<cudaStream_t>(stream)));
+  OPENINFER_FFI_GUARD_END(-1)
 }
 
 // ---------------------------------------------------------------------------
