@@ -20,7 +20,9 @@
     allow(unused_imports, unused_variables, dead_code)
 )]
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(feature = "qwen35-4b")]
+use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
