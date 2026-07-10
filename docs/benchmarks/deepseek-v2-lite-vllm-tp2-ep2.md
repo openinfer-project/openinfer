@@ -60,6 +60,30 @@ The supplemental vLLM run applied a FlashInfer #3633-equivalent fix for SM120 / 
 
 Summaries must be rebuilt from the script's retained artifact directory, not from per-cell child JSON files alone. Server-start failures can exist only in server logs and command metadata, so the summarizer treats those logs as part of the raw evidence and keeps failed setup rows in the final `summary.json`.
 
+## Artifact Manifest And Regression Summary
+
+Every fresh matrix run and every `--summarize-only` rebuild now writes three sibling files in the artifact directory:
+
+| File | Purpose |
+| --- | --- |
+| `summary.json` | Human-facing matrix summary, preserving correctness, direct diagnostic, HTTP pressure, trace, and failed setup buckets. |
+| `artifact_manifest.json` | Audit manifest for the run: commit/dirty state, model config/tokenizer hashes, benchmark contract, version probes, backend commands, claim rows, raw artifact paths, artifact sha256 values, summary sha256, regression-summary sha256, and an artifact-bundle sha256 over the listed files. |
+| `regression_summary.json` | Compact comparison against an optional previous `summary.json`, or a `no directional claim` record when no baseline is supplied. |
+
+Manifest paths are either relative to the artifact bundle or relative to the repo. External absolute model paths are reduced to a basename-only `<external>/...` label, and command/env/log payloads pass through the script redaction helpers before they are written. The manifest is meant to answer which commit, model snapshot, toolchain probes, backend flags, workload contract, and raw artifacts produced the run without publishing private machine paths.
+
+Read `regression_summary.json` by bucket:
+
+| Bucket | What changed means |
+| --- | --- |
+| `correctness` | HF / host-staged / NCCL comparison pass state, classification, or warnings changed. |
+| `direct_diagnostic_batch` | A backend/batch row was added, went missing, or changed pass/hash/timing fields. |
+| `http_concurrency_pressure` | An engine/concurrency cell was added, went missing, changed completion/failure/timeout/hash/metric fields, or is noisy. |
+| `openinfer_trace_pass` | A trace cell was added, went missing, or changed trace coverage / active-set / decode-batch fields. |
+| `failed_setup_rows` | Failed setup rows were added, resolved, or preserved. |
+
+The `comparability` block is the gate for claims. `claim_marker: "no directional claim"` means the script found no baseline, a setup/contract/version difference, noisy HTTP cells, or changed failed-setup rows. In that case the summary is still useful audit evidence, but it should not be quoted as a speedup or regression direction.
+
 ## Correctness Gate
 
 The correctness gate ran before performance rows in the clean full matrix. Final bucket: `correctness`.
@@ -176,6 +200,7 @@ python3 scripts/bench_dsv2lite_vllm_matrix.py \
 ```
 
 The script writes `summary.json` and keeps raw child artifacts. Summaries are derived from JSON artifacts and server logs, so failed setup rows remain visible even when a server never produced per-cell JSON.
+Pass `--baseline-summary` with a previous `summary.json` when you want `regression_summary.json` to classify changed, missing, resolved, preserved, and noisy rows instead of emitting a no-baseline comparison.
 
 ## Claim Boundaries
 

@@ -27,6 +27,118 @@ class BenchDsv2LiteMatrixTests(unittest.TestCase):
         with mock.patch.object(bench_matrix, "metadata", return_value={"test": True}):
             return bench_matrix.summarize_existing(args)
 
+    def base_args(self, root: Path, **overrides):
+        values = {
+            "summarize_only": root,
+            "baseline_summary": None,
+            "noisy_threshold": 0.05,
+            "model_path": Path("models/DeepSeek-V2-Lite"),
+            "model_id": "DeepSeek-V2-Lite",
+            "input_len": 64,
+            "output_len": 64,
+            "num_prompts": 32,
+            "num_warmups": 4,
+            "concurrency": [1],
+            "request_rate": "inf",
+            "temperature": 0.0,
+            "ignore_eos": True,
+            "repeats": 1,
+            "hf_python": sys.executable,
+            "vllm_cmd": "vllm",
+        }
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    def minimal_summary(self, *, noisy=False, http_failed=False):
+        http_row = {
+            "engine": "vllm-tp2",
+            "claim_bucket": bench_matrix.CLAIM_FAILED,
+            "passed": False,
+            "error": "server_start_failed: old setup failure",
+            "startup_failure": "server_start_failed: old setup failure",
+            "cells": [],
+        } if http_failed else {
+            "engine": "vllm-tp2",
+            "claim_bucket": bench_matrix.CLAIM_HTTP,
+            "passed": True,
+            "cells": [],
+            "summary_by_concurrency": [
+                {
+                    "concurrency": 1,
+                    "completed": [32],
+                    "failed": [0],
+                    "timeouts": [0],
+                    "output_text_sha256": ["hash-a"],
+                    "mean_tpot_ms": {
+                        "values": [10.0],
+                        "median": 10.0,
+                        "min": 10.0,
+                        "max": 10.0,
+                        "spread_ratio": 0.0,
+                        "noisy": False,
+                    },
+                    "output_tok_s": {
+                        "values": [100.0],
+                        "median": 100.0,
+                        "min": 100.0,
+                        "max": 100.0,
+                        "spread_ratio": 0.0,
+                        "noisy": False,
+                    },
+                    "noisy": noisy,
+                }
+            ],
+        }
+        return {
+            "schema_version": 1,
+            "kind": "deepseek_v2_lite_vllm_tp2_ep2_benchmark_matrix",
+            "metadata": {
+                "benchmark_contract": {"input_len": 64, "output_len": 64, "num_prompts": 32},
+                "model": {"path": "models/DeepSeek-V2-Lite", "config_sha256": "cfg", "tokenizer_sha256": "tok"},
+                "versions": {
+                    "nvidia_smi": {"stdout": "NVIDIA GPU, 580.95.05, 12.0"},
+                    "nvcc": {"stdout": "Cuda compilation tools, release 12.8"},
+                    "nccl": {"available": True, "exit_code": 0, "stdout": "2.30.4"},
+                    "vllm": {"stdout": "vllm 0.23.0"},
+                },
+            },
+            "correctness_gate": {
+                "claim_bucket": bench_matrix.CLAIM_CORRECTNESS,
+                "passed": True,
+                "comparison": {"classification": "all_token_text_exact", "warnings": []},
+            },
+            "direct_diagnostic_batch": [
+                {
+                    "claim_bucket": bench_matrix.CLAIM_DIRECT,
+                    "backend": "host-staged",
+                    "batch_size": 1,
+                    "passed": True,
+                    "token_sha256": "token-hash",
+                    "text_sha256": "text-hash",
+                    "tpot_ms": 1.0,
+                    "output_tok_s": 2.0,
+                }
+            ],
+            "http_concurrency_pressure": [http_row],
+            "openinfer_trace_pass": [
+                {
+                    "engine": "openinfer-host-staged",
+                    "claim_bucket": bench_matrix.CLAIM_HTTP,
+                    "passed": True,
+                    "cells": [
+                        {
+                            "concurrency": 1,
+                            "completed": 8,
+                            "failed": 0,
+                            "timeouts": 0,
+                            "missing_trace_count": 0,
+                            "trace": {"active_set_size_max": 1, "decode_batch_size_max": 1},
+                        }
+                    ],
+                }
+            ],
+        }
+
     def test_display_path_keeps_symlinked_target_repo_relative(self) -> None:
         path = bench_matrix.REPO_ROOT / "target" / "benchmarks" / "deepseek-v2-lite-vllm-tp2-ep2"
 
@@ -105,6 +217,14 @@ class BenchDsv2LiteMatrixTests(unittest.TestCase):
         self.assertEqual(
             bench_matrix.redact_payload(payload),
             {"command": ["~/venv/bin/python", "--version"], "nested": {"path": "~/project"}},
+        )
+
+    def test_public_path_hides_external_absolute_model_path(self) -> None:
+        path = Path("/private/machines/user/models/DeepSeek-V2-Lite")
+
+        self.assertEqual(
+            bench_matrix.public_path(path),
+            "<external>/DeepSeek-V2-Lite",
         )
 
     def test_openinfer_server_command_keeps_default_features(self) -> None:
@@ -569,6 +689,297 @@ class BenchDsv2LiteMatrixTests(unittest.TestCase):
             summary["http_concurrency_pressure"][0]["summary_by_concurrency"][0]["output_tok_s"]["median"],
             192.0,
         )
+
+    def test_summarize_existing_writes_manifest_and_regression_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            direct = root / "direct_diagnostic_batch" / "host-staged" / "batch1.json"
+            direct.parent.mkdir(parents=True)
+            direct.write_text(
+                json.dumps(
+                    {
+                        "backend": "host-staged",
+                        "config": {"batch_size": 1},
+                        "timing": {"per_token_decode_stats": {"mean_us": 2500}},
+                        "accuracy": {"token_sha256": "tok", "text_sha256": "txt"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            http = root / "http_raw" / "vllm-tp2" / "c1" / "r0" / "result.json"
+            http.parent.mkdir(parents=True)
+            http.write_text(
+                json.dumps(
+                    {
+                        "num_completed_requests": 32,
+                        "num_failed_requests": 0,
+                        "total_output_tokens": 2048,
+                        "duration": 64.0,
+                        "mean_tpot_ms": 40.0,
+                        "mean_ttft_ms": 120.0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            self.summarize_existing_without_metadata_probe(self.base_args(root))
+
+            manifest = bench_matrix.load_json(root / "artifact_manifest.json")
+            regression = bench_matrix.load_json(root / "regression_summary.json")
+
+        self.assertEqual(manifest["kind"], "deepseek_v2_lite_benchmark_artifact_manifest")
+        self.assertIn("artifact_bundle_sha256", manifest)
+        direct_records = [
+            row for row in manifest["artifact_paths"]
+            if row["kind"] == "direct_diagnostic_batch"
+        ]
+        self.assertEqual(direct_records[0]["path"], "direct_diagnostic_batch/host-staged/batch1.json")
+        self.assertEqual(direct_records[0]["path_root"], "artifact_bundle")
+        self.assertIsNotNone(direct_records[0]["sha256"])
+        self.assertEqual(
+            regression["comparability"]["claim_marker"],
+            "no directional claim",
+        )
+        self.assertIn("baseline_missing", regression["comparability"]["reasons"])
+        self.assertIn("no directional claim", regression["docs_summary"])
+
+    def test_regression_summary_reports_resolved_failed_setup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            current_path = root / "summary.json"
+            baseline_path = root / "baseline-summary.json"
+            current = self.minimal_summary(http_failed=False)
+            baseline = self.minimal_summary(http_failed=True)
+            current_path.write_text(json.dumps(current), encoding="utf-8")
+            baseline_path.write_text(json.dumps(baseline), encoding="utf-8")
+
+            regression = bench_matrix.build_regression_summary(
+                current,
+                baseline,
+                current_summary_path=current_path,
+                baseline_summary_path=baseline_path,
+                noisy_threshold=0.05,
+            )
+
+        self.assertEqual(
+            regression["failed_setup_rows"]["resolved"][0]["key"],
+            "http_concurrency_pressure:vllm-tp2",
+        )
+        self.assertIn("failed_setup_rows_changed", regression["comparability"]["reasons"])
+        self.assertTrue(regression["comparability"]["no_directional_claim"])
+
+    def test_regression_summary_marks_preserved_failed_setup_no_directional(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            current_path = root / "summary.json"
+            baseline_path = root / "baseline-summary.json"
+            current = self.minimal_summary(http_failed=True)
+            baseline = self.minimal_summary(http_failed=True)
+            current_path.write_text(json.dumps(current), encoding="utf-8")
+            baseline_path.write_text(json.dumps(baseline), encoding="utf-8")
+
+            regression = bench_matrix.build_regression_summary(
+                current,
+                baseline,
+                current_summary_path=current_path,
+                baseline_summary_path=baseline_path,
+                noisy_threshold=0.05,
+            )
+
+        self.assertEqual(
+            regression["failed_setup_rows"]["preserved"][0]["key"],
+            "http_concurrency_pressure:vllm-tp2",
+        )
+        self.assertIn("failed_setup_rows_preserved", regression["comparability"]["reasons"])
+        self.assertEqual(regression["comparability"]["claim_marker"], "no directional claim")
+
+    def test_regression_summary_ignores_dynamic_gpu_probe_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            current_path = root / "summary.json"
+            baseline_path = root / "baseline-summary.json"
+            current = self.minimal_summary()
+            baseline = self.minimal_summary()
+            current["metadata"]["versions"]["nvidia_smi"]["stdout"] = (
+                "NVIDIA GeForce RTX 5090, 580.95.05, 12.0, 63, 2550\n"
+                "NVIDIA GeForce RTX 5090, 580.95.05, 12.0, 61, 2490"
+            )
+            baseline["metadata"]["versions"]["nvidia_smi"]["stdout"] = (
+                "NVIDIA GeForce RTX 5090, 580.95.05, 12.0, 42, 2100\n"
+                "NVIDIA GeForce RTX 5090, 580.95.05, 12.0, 40, 1980"
+            )
+            current_path.write_text(json.dumps(current), encoding="utf-8")
+            baseline_path.write_text(json.dumps(baseline), encoding="utf-8")
+
+            regression = bench_matrix.build_regression_summary(
+                current,
+                baseline,
+                current_summary_path=current_path,
+                baseline_summary_path=baseline_path,
+                noisy_threshold=0.05,
+            )
+
+        self.assertNotIn("gpu_probe_changed", regression["comparability"]["reasons"])
+        self.assertEqual(regression["comparability"]["claim_marker"], "directional comparison allowed")
+
+    def test_regression_summary_detects_stable_gpu_probe_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            current_path = root / "summary.json"
+            baseline_path = root / "baseline-summary.json"
+            current = self.minimal_summary()
+            baseline = self.minimal_summary()
+            current["metadata"]["versions"]["nvidia_smi"]["stdout"] = (
+                "NVIDIA GeForce RTX 5090, 580.95.05, 12.0, 63, 2550"
+            )
+            baseline["metadata"]["versions"]["nvidia_smi"]["stdout"] = (
+                "NVIDIA GeForce RTX 4090, 580.95.05, 8.9, 42, 2100"
+            )
+            current_path.write_text(json.dumps(current), encoding="utf-8")
+            baseline_path.write_text(json.dumps(baseline), encoding="utf-8")
+
+            regression = bench_matrix.build_regression_summary(
+                current,
+                baseline,
+                current_summary_path=current_path,
+                baseline_summary_path=baseline_path,
+                noisy_threshold=0.05,
+            )
+
+        self.assertIn("gpu_probe_changed", regression["comparability"]["reasons"])
+        self.assertEqual(regression["comparability"]["claim_marker"], "no directional claim")
+
+    def test_regression_summary_detects_nccl_version_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            current_path = root / "summary.json"
+            baseline_path = root / "baseline-summary.json"
+            current = self.minimal_summary()
+            baseline = self.minimal_summary()
+            current["metadata"]["versions"]["nccl"]["stdout"] = "2.31.0"
+            baseline["metadata"]["versions"]["nccl"]["stdout"] = "2.30.4"
+            current_path.write_text(json.dumps(current), encoding="utf-8")
+            baseline_path.write_text(json.dumps(baseline), encoding="utf-8")
+
+            regression = bench_matrix.build_regression_summary(
+                current,
+                baseline,
+                current_summary_path=current_path,
+                baseline_summary_path=baseline_path,
+                noisy_threshold=0.05,
+            )
+
+        self.assertIn("nccl_version_changed", regression["comparability"]["reasons"])
+        self.assertEqual(regression["comparability"]["claim_marker"], "no directional claim")
+
+    def test_regression_summary_marks_noisy_http_cell_no_directional(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            current_path = root / "summary.json"
+            baseline_path = root / "baseline-summary.json"
+            current = self.minimal_summary(noisy=True)
+            baseline = self.minimal_summary(noisy=False)
+            current_path.write_text(json.dumps(current), encoding="utf-8")
+            baseline_path.write_text(json.dumps(baseline), encoding="utf-8")
+
+            regression = bench_matrix.build_regression_summary(
+                current,
+                baseline,
+                current_summary_path=current_path,
+                baseline_summary_path=baseline_path,
+                noisy_threshold=0.05,
+            )
+
+        self.assertIn("current_noisy_http_cell:vllm-tp2/c1", regression["comparability"]["reasons"])
+        self.assertEqual(regression["comparability"]["claim_marker"], "no directional claim")
+
+    def test_regression_summary_marks_missing_benchmark_rows_no_directional(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            current_path = root / "summary.json"
+            baseline_path = root / "baseline-summary.json"
+            current = self.minimal_summary()
+            baseline = self.minimal_summary()
+            baseline["direct_diagnostic_batch"].append({
+                "claim_bucket": bench_matrix.CLAIM_DIRECT,
+                "backend": "nccl",
+                "batch_size": 1,
+                "passed": True,
+                "token_sha256": "nccl-token-hash",
+                "text_sha256": "nccl-text-hash",
+                "tpot_ms": 1.5,
+                "output_tok_s": 2.5,
+            })
+            baseline["http_concurrency_pressure"].append({
+                "engine": "openinfer-nccl",
+                "claim_bucket": bench_matrix.CLAIM_HTTP,
+                "passed": True,
+                "cells": [],
+                "summary_by_concurrency": [
+                    {
+                        "concurrency": 1,
+                        "completed": [32],
+                        "failed": [0],
+                        "timeouts": [0],
+                        "output_text_sha256": ["nccl-hash"],
+                        "mean_tpot_ms": {
+                            "median": 12.0,
+                            "min": 12.0,
+                            "max": 12.0,
+                            "noisy": False,
+                        },
+                        "output_tok_s": {
+                            "median": 90.0,
+                            "min": 90.0,
+                            "max": 90.0,
+                            "noisy": False,
+                        },
+                        "noisy": False,
+                    }
+                ],
+            })
+            baseline["openinfer_trace_pass"].append({
+                "engine": "openinfer-nccl",
+                "claim_bucket": bench_matrix.CLAIM_HTTP,
+                "passed": True,
+                "cells": [
+                    {
+                        "concurrency": 1,
+                        "completed": 8,
+                        "failed": 0,
+                        "timeouts": 0,
+                        "missing_trace_count": 0,
+                        "trace": {"active_set_size_max": 1, "decode_batch_size_max": 1},
+                    }
+                ],
+            })
+            current_path.write_text(json.dumps(current), encoding="utf-8")
+            baseline_path.write_text(json.dumps(baseline), encoding="utf-8")
+
+            regression = bench_matrix.build_regression_summary(
+                current,
+                baseline,
+                current_summary_path=current_path,
+                baseline_summary_path=baseline_path,
+                noisy_threshold=0.05,
+            )
+
+        self.assertEqual(regression["direct_diagnostic_batch"]["missing"], ["nccl/batch1"])
+        self.assertEqual(regression["http_concurrency_pressure"]["missing"], ["openinfer-nccl/c1"])
+        self.assertEqual(regression["openinfer_trace_pass"]["missing"], ["openinfer-nccl/c1"])
+        self.assertIn(
+            "direct_diagnostic_batch_missing:nccl/batch1",
+            regression["comparability"]["reasons"],
+        )
+        self.assertIn(
+            "http_concurrency_pressure_missing:openinfer-nccl/c1",
+            regression["comparability"]["reasons"],
+        )
+        self.assertIn(
+            "openinfer_trace_pass_missing:openinfer-nccl/c1",
+            regression["comparability"]["reasons"],
+        )
+        self.assertEqual(regression["comparability"]["claim_marker"], "no directional claim")
 
     def test_summarize_existing_marks_warned_correctness_artifact_failed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

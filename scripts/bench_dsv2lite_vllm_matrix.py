@@ -102,6 +102,17 @@ def display_path(path: Path) -> str:
         return str(path)
 
 
+def public_path(path: Path) -> str:
+    """Return a repo-relative or basename-only path for public benchmark metadata."""
+    if not path.is_absolute():
+        return str(path)
+    try:
+        return str(path.absolute().relative_to(REPO_ROOT.absolute()))
+    except ValueError:
+        name = path.name or "path"
+        return f"<external>/{name}"
+
+
 def unix_s() -> int:
     return int(time.time())
 
@@ -194,6 +205,11 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
             tmp_path.unlink()
 
 
+def stable_json_sha256(payload: Any) -> str:
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
 def redact_text(text: str) -> str:
     text = text.replace(str(REPO_ROOT.absolute()), "<repo>")
     home = Path.home()
@@ -280,7 +296,7 @@ def summarize_values(values: list[float], noisy_threshold: float) -> dict[str, A
 def model_snapshot(model_path: Path) -> dict[str, Any]:
     resolved = repo_path(model_path)
     return {
-        "path": str(model_path),
+        "path": public_path(model_path),
         "exists": resolved.exists(),
         "config_sha256": sha256_file(resolved / "config.json"),
         "tokenizer_sha256": sha256_file(resolved / "tokenizer.json"),
@@ -312,6 +328,7 @@ def metadata(args: argparse.Namespace, *, probe_versions: bool = True) -> dict[s
                     ]
                 ),
                 "nvcc": try_command(["nvcc", "--version"]),
+                "nccl": try_command(["pkg-config", "--modversion", "nccl"]),
                 "vllm": try_command([args.vllm_cmd, "--version"]),
             }
         )
@@ -330,12 +347,12 @@ def metadata(args: argparse.Namespace, *, probe_versions: bool = True) -> dict[s
                     ]
                 },
                 "nvcc": {"command": ["nvcc", "--version"]},
+                "nccl": {"command": ["pkg-config", "--modversion", "nccl"]},
                 "vllm": {"command": redact_command([args.vllm_cmd, "--version"])},
             }
         )
     return {
         "schema_version": 1,
-        "issue": "openinfer-project/openinfer#279",
         "created_unix_s": unix_s(),
         "repo": {
             "worktree": REPO_ROOT.name,
@@ -1078,6 +1095,785 @@ def build_summary(args: argparse.Namespace, out_dir: Path, sections: dict[str, A
     }
 
 
+def emit_benchmark_artifacts(args: argparse.Namespace, out_dir: Path, summary: dict[str, Any]) -> None:
+    summary_path = out_dir / "summary.json"
+    baseline_summary, baseline_path = load_baseline_summary(args)
+    regression_path = out_dir / "regression_summary.json"
+    regression = build_regression_summary(
+        summary,
+        baseline_summary,
+        current_summary_path=summary_path,
+        baseline_summary_path=baseline_path,
+        noisy_threshold=args.noisy_threshold,
+    )
+    write_json(regression_path, regression)
+    manifest = build_artifact_manifest(summary, out_dir, summary_path, regression_path)
+    write_json(out_dir / "artifact_manifest.json", manifest)
+
+
+def load_baseline_summary(args: argparse.Namespace) -> tuple[dict[str, Any] | None, Path | None]:
+    baseline_arg = getattr(args, "baseline_summary", None)
+    if baseline_arg is None:
+        return None, None
+    path = baseline_arg if isinstance(baseline_arg, Path) else Path(str(baseline_arg))
+    path = path if path.is_absolute() else repo_path(path)
+    return load_json(path), path
+
+
+def build_artifact_manifest(
+    summary: dict[str, Any],
+    out_dir: Path,
+    summary_path: Path,
+    regression_path: Path,
+) -> dict[str, Any]:
+    artifacts = collect_manifest_artifacts(summary, out_dir)
+    rows = collect_claim_rows(summary)
+    commands = collect_manifest_commands(summary)
+    summary_artifacts = [
+        manifest_artifact_record(out_dir, summary_path, kind="summary", claim_bucket="summary"),
+        manifest_artifact_record(
+            out_dir,
+            regression_path,
+            kind="regression_summary",
+            claim_bucket="regression_summary",
+        ),
+    ]
+    return {
+        "schema_version": 1,
+        "kind": "deepseek_v2_lite_benchmark_artifact_manifest",
+        "generated_unix_s": unix_s(),
+        "artifacts_root": artifact_path_label(out_dir, out_dir)["path"],
+        "metadata": redact_payload(summary.get("metadata", {})),
+        "benchmark_contract": redact_payload(
+            summary.get("metadata", {}).get("benchmark_contract", {})
+            if isinstance(summary.get("metadata"), dict) else {}
+        ),
+        "model": redact_payload(
+            summary.get("metadata", {}).get("model", {}) if isinstance(summary.get("metadata"), dict) else {}
+        ),
+        "artifact_paths": artifacts,
+        "summary_artifacts": summary_artifacts,
+        "summary_sha256": summary_artifacts[0]["sha256"],
+        "regression_summary_sha256": summary_artifacts[1]["sha256"],
+        "artifact_bundle_sha256": stable_json_sha256([
+            {
+                "path": artifact.get("path"),
+                "path_root": artifact.get("path_root"),
+                "sha256": artifact.get("sha256"),
+                "bytes": artifact.get("bytes"),
+            }
+            for artifact in artifacts + summary_artifacts
+        ]),
+        "claim_rows": rows,
+        "backend_commands": commands,
+        "claim_boundary": summary.get("claim_boundary"),
+    }
+
+
+def collect_manifest_artifacts(summary: dict[str, Any], out_dir: Path) -> list[dict[str, Any]]:
+    artifacts: list[dict[str, Any]] = []
+    gate = summary.get("correctness_gate")
+    if isinstance(gate, dict):
+        for label, path_value in sorted((gate.get("artifacts") or {}).items()):
+            append_manifest_artifact(
+                artifacts,
+                out_dir,
+                path_value,
+                kind=f"correctness_{label}",
+                claim_bucket=gate.get("claim_bucket", CLAIM_CORRECTNESS),
+                label=label,
+            )
+    for row in summary.get("direct_diagnostic_batch", []) or []:
+        if not isinstance(row, dict):
+            continue
+        append_manifest_artifact(
+            artifacts,
+            out_dir,
+            row.get("artifact"),
+            kind="direct_diagnostic_batch",
+            claim_bucket=row.get("claim_bucket", CLAIM_DIRECT),
+            backend=row.get("backend"),
+            batch_size=row.get("batch_size"),
+        )
+    for row in summary.get("http_concurrency_pressure", []) or []:
+        if not isinstance(row, dict):
+            continue
+        append_manifest_artifact(
+            artifacts,
+            out_dir,
+            row.get("server_log"),
+            kind="http_server_log",
+            claim_bucket=row.get("claim_bucket", CLAIM_HTTP),
+            engine=row.get("engine"),
+        )
+        for cell in row.get("cells", []) or []:
+            if not isinstance(cell, dict):
+                continue
+            append_manifest_artifact(
+                artifacts,
+                out_dir,
+                cell.get("artifact"),
+                kind="http_bench_result",
+                claim_bucket=cell.get("claim_bucket", row.get("claim_bucket", CLAIM_HTTP)),
+                engine=row.get("engine"),
+                concurrency=cell.get("concurrency"),
+                repeat=cell.get("repeat"),
+            )
+    for row in summary.get("openinfer_trace_pass", []) or []:
+        if not isinstance(row, dict):
+            continue
+        append_manifest_artifact(
+            artifacts,
+            out_dir,
+            row.get("server_log"),
+            kind="trace_server_log",
+            claim_bucket=row.get("claim_bucket", CLAIM_HTTP),
+            engine=row.get("engine"),
+        )
+        for cell in row.get("cells", []) or []:
+            if not isinstance(cell, dict):
+                continue
+            append_manifest_artifact(
+                artifacts,
+                out_dir,
+                cell.get("artifact"),
+                kind="openinfer_trace_result",
+                claim_bucket=cell.get("claim_bucket", row.get("claim_bucket", CLAIM_HTTP)),
+                engine=row.get("engine"),
+                concurrency=cell.get("concurrency"),
+            )
+    artifacts.sort(key=lambda item: (str(item.get("path_root")), str(item.get("path")), str(item.get("kind"))))
+    return artifacts
+
+
+def append_manifest_artifact(
+    artifacts: list[dict[str, Any]],
+    out_dir: Path,
+    path_value: Any,
+    *,
+    kind: str,
+    claim_bucket: Any,
+    **identity: Any,
+) -> None:
+    if not isinstance(path_value, str) or not path_value:
+        return
+    path = resolve_reported_path(path_value, out_dir)
+    record = manifest_artifact_record(out_dir, path, kind=kind, claim_bucket=claim_bucket)
+    for key, value in identity.items():
+        if value is not None:
+            record[key] = redact_payload(value)
+    artifacts.append(record)
+
+
+def manifest_artifact_record(
+    out_dir: Path,
+    path: Path,
+    *,
+    kind: str,
+    claim_bucket: Any,
+) -> dict[str, Any]:
+    label = artifact_path_label(path, out_dir)
+    exists = path.exists()
+    return {
+        "kind": kind,
+        "claim_bucket": claim_bucket,
+        "path": label["path"],
+        "path_root": label["path_root"],
+        "exists": exists,
+        "sha256": sha256_file(path),
+        "bytes": path.stat().st_size if exists and path.is_file() else None,
+    }
+
+
+def resolve_reported_path(path_value: str, out_dir: Path) -> Path:
+    path = Path(path_value)
+    if path.is_absolute():
+        return path
+    repo_candidate = REPO_ROOT / path
+    if repo_candidate.exists():
+        return repo_candidate
+    bundle_candidate = out_dir / path
+    if bundle_candidate.exists():
+        return bundle_candidate
+    return repo_candidate
+
+
+def artifact_path_label(path: Path, out_dir: Path) -> dict[str, str]:
+    absolute = path.absolute()
+    try:
+        return {"path": str(absolute.relative_to(out_dir.absolute())), "path_root": "artifact_bundle"}
+    except ValueError:
+        pass
+    try:
+        return {"path": str(absolute.relative_to(REPO_ROOT.absolute())), "path_root": "repo"}
+    except ValueError:
+        pass
+    return {"path": public_path(absolute), "path_root": "external"}
+
+
+def collect_manifest_commands(summary: dict[str, Any]) -> list[dict[str, Any]]:
+    commands: list[dict[str, Any]] = []
+    gate = summary.get("correctness_gate")
+    if isinstance(gate, dict):
+        for command in gate.get("commands", []) or []:
+            if isinstance(command, dict):
+                commands.append({
+                    "section": "correctness_gate",
+                    "claim_bucket": command.get("claim_bucket", gate.get("claim_bucket", CLAIM_CORRECTNESS)),
+                    "command": redact_payload(command),
+                })
+    for row in summary.get("direct_diagnostic_batch", []) or []:
+        if isinstance(row, dict) and "command" in row:
+            commands.append({
+                "section": "direct_diagnostic_batch",
+                "claim_bucket": row.get("claim_bucket", CLAIM_DIRECT),
+                "backend": row.get("backend"),
+                "batch_size": row.get("batch_size"),
+                "command": redact_payload(row.get("command")),
+                "env": redact_payload(row.get("env", [])),
+            })
+    for section in ("http_concurrency_pressure", "openinfer_trace_pass"):
+        for row in summary.get(section, []) or []:
+            if not isinstance(row, dict):
+                continue
+            if "server_command" in row:
+                commands.append({
+                    "section": section,
+                    "claim_bucket": row.get("claim_bucket", CLAIM_HTTP),
+                    "engine": row.get("engine"),
+                    "command": redact_payload(row.get("server_command")),
+                    "env": redact_payload(row.get("server_env", {})),
+                })
+            for cell in row.get("cells", []) or []:
+                if not isinstance(cell, dict) or "command" not in cell:
+                    continue
+                commands.append({
+                    "section": section,
+                    "claim_bucket": cell.get("claim_bucket", row.get("claim_bucket", CLAIM_HTTP)),
+                    "engine": row.get("engine"),
+                    "concurrency": cell.get("concurrency"),
+                    "repeat": cell.get("repeat"),
+                    "command": redact_payload(cell.get("command")),
+                    "warmup_command": redact_payload(cell.get("warmup_command")),
+                })
+    return commands
+
+
+def collect_claim_rows(summary: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    gate = summary.get("correctness_gate")
+    if isinstance(gate, dict):
+        comparison = gate.get("comparison") if isinstance(gate.get("comparison"), dict) else {}
+        rows.append({
+            "section": "correctness_gate",
+            "claim_bucket": gate.get("claim_bucket", CLAIM_CORRECTNESS),
+            "passed": gate.get("passed"),
+            "classification": comparison.get("classification"),
+            "warning_count": len(comparison.get("warnings", [])) if isinstance(comparison.get("warnings"), list) else None,
+        })
+    for row in summary.get("direct_diagnostic_batch", []) or []:
+        if not isinstance(row, dict):
+            continue
+        rows.append({
+            "section": "direct_diagnostic_batch",
+            "claim_bucket": row.get("claim_bucket", CLAIM_DIRECT),
+            "backend": row.get("backend"),
+            "batch_size": row.get("batch_size"),
+            "passed": row.get("passed"),
+            "token_sha256": row.get("token_sha256"),
+            "text_sha256": row.get("text_sha256"),
+            "tpot_ms": row.get("tpot_ms"),
+            "output_tok_s": row.get("output_tok_s"),
+        })
+    for row in summary.get("http_concurrency_pressure", []) or []:
+        if not isinstance(row, dict):
+            continue
+        for cell_summary in row.get("summary_by_concurrency", []) or []:
+            if not isinstance(cell_summary, dict):
+                continue
+            rows.append({
+                "section": "http_concurrency_pressure",
+                "claim_bucket": row.get("claim_bucket", CLAIM_HTTP),
+                "engine": row.get("engine"),
+                "passed": row.get("passed"),
+                "concurrency": cell_summary.get("concurrency"),
+                "completed": cell_summary.get("completed"),
+                "failed": cell_summary.get("failed"),
+                "timeouts": cell_summary.get("timeouts"),
+                "output_text_sha256": cell_summary.get("output_text_sha256"),
+                "noisy": cell_summary.get("noisy"),
+                "mean_tpot_ms": metric_triplet(cell_summary.get("mean_tpot_ms")),
+                "output_tok_s": metric_triplet(cell_summary.get("output_tok_s")),
+            })
+        if not row.get("summary_by_concurrency"):
+            rows.append({
+                "section": "http_concurrency_pressure",
+                "claim_bucket": row.get("claim_bucket", CLAIM_HTTP),
+                "engine": row.get("engine"),
+                "passed": row.get("passed"),
+                "error": row.get("error"),
+                "startup_failure": row.get("startup_failure"),
+            })
+    for row in summary.get("openinfer_trace_pass", []) or []:
+        if not isinstance(row, dict):
+            continue
+        for cell in row.get("cells", []) or []:
+            if not isinstance(cell, dict):
+                continue
+            trace = cell.get("trace") if isinstance(cell.get("trace"), dict) else {}
+            rows.append({
+                "section": "openinfer_trace_pass",
+                "claim_bucket": row.get("claim_bucket", CLAIM_HTTP),
+                "engine": row.get("engine"),
+                "passed": row.get("passed"),
+                "concurrency": cell.get("concurrency"),
+                "completed": cell.get("completed"),
+                "failed": cell.get("failed"),
+                "timeouts": cell.get("timeouts"),
+                "output_tok_s": cell.get("output_tok_s"),
+                "missing_trace_count": cell.get("missing_trace_count"),
+                "active_set_size_max": trace.get("active_set_size_max"),
+                "decode_batch_size_max": trace.get("decode_batch_size_max"),
+            })
+        if not row.get("cells"):
+            rows.append({
+                "section": "openinfer_trace_pass",
+                "claim_bucket": row.get("claim_bucket", CLAIM_HTTP),
+                "engine": row.get("engine"),
+                "passed": row.get("passed"),
+                "error": row.get("error"),
+                "startup_failure": row.get("startup_failure"),
+            })
+    return rows
+
+
+def metric_triplet(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    return {
+        "median": value.get("median"),
+        "min": value.get("min"),
+        "max": value.get("max"),
+        "noisy": value.get("noisy"),
+    }
+
+
+def build_regression_summary(
+    summary: dict[str, Any],
+    baseline: dict[str, Any] | None,
+    *,
+    current_summary_path: Path,
+    baseline_summary_path: Path | None,
+    noisy_threshold: float,
+) -> dict[str, Any]:
+    current_sha = sha256_file(current_summary_path)
+    baseline_sha = sha256_file(baseline_summary_path) if baseline_summary_path else None
+    comparison: dict[str, Any] = {
+        "schema_version": 1,
+        "kind": "deepseek_v2_lite_benchmark_regression_summary",
+        "generated_unix_s": unix_s(),
+        "current_summary": {
+            "path": artifact_path_label(current_summary_path, current_summary_path.parent)["path"],
+            "sha256": current_sha,
+        },
+        "baseline_summary": None if baseline_summary_path is None else {
+            "path": public_path(baseline_summary_path.absolute()),
+            "sha256": baseline_sha,
+        },
+        "noisy_threshold": noisy_threshold,
+    }
+    reasons: list[str] = []
+    if baseline is None:
+        reasons.append("baseline_missing")
+        comparison.update(no_baseline_regression_sections(summary))
+    else:
+        comparison["correctness"] = compare_single_projection(
+            correctness_projection(summary),
+            correctness_projection(baseline),
+            ("passed", "classification", "warnings"),
+        )
+        comparison["direct_diagnostic_batch"] = compare_projection_maps(
+            direct_projection_map(summary),
+            direct_projection_map(baseline),
+            ("passed", "token_sha256", "text_sha256", "tpot_ms", "output_tok_s"),
+        )
+        comparison["http_concurrency_pressure"] = compare_projection_maps(
+            http_projection_map(summary),
+            http_projection_map(baseline),
+            (
+                "row_passed",
+                "completed",
+                "failed",
+                "timeouts",
+                "output_text_sha256",
+                "noisy",
+                "mean_tpot_ms",
+                "output_tok_s",
+            ),
+        )
+        comparison["openinfer_trace_pass"] = compare_projection_maps(
+            trace_projection_map(summary),
+            trace_projection_map(baseline),
+            (
+                "row_passed",
+                "completed",
+                "failed",
+                "timeouts",
+                "missing_trace_count",
+                "active_set_size_max",
+                "decode_batch_size_max",
+                "trace_sha256",
+            ),
+        )
+        reasons.extend(structural_projection_reasons(
+            "direct_diagnostic_batch",
+            comparison["direct_diagnostic_batch"],
+        ))
+        reasons.extend(structural_projection_reasons(
+            "http_concurrency_pressure",
+            comparison["http_concurrency_pressure"],
+        ))
+        reasons.extend(structural_projection_reasons(
+            "openinfer_trace_pass",
+            comparison["openinfer_trace_pass"],
+        ))
+        contract_reasons = comparability_reasons(summary, baseline)
+        reasons.extend(contract_reasons)
+    comparison["failed_setup_rows"] = compare_failed_setup(summary, baseline)
+    reasons.extend(noise_reasons(summary, "current"))
+    if baseline is not None:
+        reasons.extend(noise_reasons(baseline, "baseline"))
+    setup_changes = comparison["failed_setup_rows"]
+    if setup_changes["added"] or setup_changes["resolved"]:
+        reasons.append("failed_setup_rows_changed")
+    if setup_changes["preserved"]:
+        reasons.append("failed_setup_rows_preserved")
+    no_directional_claim = bool(reasons)
+    comparison["comparability"] = {
+        "comparable": not no_directional_claim,
+        "no_directional_claim": no_directional_claim,
+        "claim_marker": "no directional claim" if no_directional_claim else "directional comparison allowed",
+        "reasons": sorted(set(reasons)),
+    }
+    comparison["docs_summary"] = regression_docs_summary(comparison)
+    return comparison
+
+
+def no_baseline_regression_sections(summary: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "correctness": {"state": "no_baseline", "current": correctness_projection(summary)},
+        "direct_diagnostic_batch": {"state": "no_baseline", "current_rows": sorted(direct_projection_map(summary))},
+        "http_concurrency_pressure": {"state": "no_baseline", "current_cells": sorted(http_projection_map(summary))},
+        "openinfer_trace_pass": {"state": "no_baseline", "current_cells": sorted(trace_projection_map(summary))},
+    }
+
+
+def correctness_projection(summary: dict[str, Any]) -> dict[str, Any]:
+    gate = summary.get("correctness_gate")
+    if not isinstance(gate, dict):
+        return {"missing": True}
+    comparison = gate.get("comparison") if isinstance(gate.get("comparison"), dict) else {}
+    return {
+        "missing": False,
+        "passed": gate.get("passed"),
+        "classification": comparison.get("classification"),
+        "warnings": comparison.get("warnings", []),
+    }
+
+
+def direct_projection_map(summary: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    rows = {}
+    for row in summary.get("direct_diagnostic_batch", []) or []:
+        if not isinstance(row, dict):
+            continue
+        key = f"{row.get('backend')}/batch{row.get('batch_size')}"
+        rows[key] = {
+            "passed": row.get("passed"),
+            "claim_bucket": row.get("claim_bucket"),
+            "token_sha256": row.get("token_sha256"),
+            "text_sha256": row.get("text_sha256"),
+            "tpot_ms": row.get("tpot_ms"),
+            "output_tok_s": row.get("output_tok_s"),
+            "error": row.get("error"),
+        }
+    return rows
+
+
+def http_projection_map(summary: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    cells = {}
+    for row in summary.get("http_concurrency_pressure", []) or []:
+        if not isinstance(row, dict):
+            continue
+        if not row.get("summary_by_concurrency"):
+            cells[f"{row.get('engine')}/setup"] = {
+                "row_passed": row.get("passed"),
+                "claim_bucket": row.get("claim_bucket"),
+                "error": row.get("error"),
+                "startup_failure": row.get("startup_failure"),
+            }
+            continue
+        for cell in row.get("summary_by_concurrency", []) or []:
+            if not isinstance(cell, dict):
+                continue
+            cells[f"{row.get('engine')}/c{cell.get('concurrency')}"] = {
+                "row_passed": row.get("passed"),
+                "claim_bucket": row.get("claim_bucket"),
+                "completed": cell.get("completed"),
+                "failed": cell.get("failed"),
+                "timeouts": cell.get("timeouts"),
+                "output_text_sha256": sorted(str(value) for value in cell.get("output_text_sha256", [])),
+                "noisy": cell.get("noisy"),
+                "mean_tpot_ms": metric_triplet(cell.get("mean_tpot_ms")),
+                "output_tok_s": metric_triplet(cell.get("output_tok_s")),
+            }
+    return cells
+
+
+def trace_projection_map(summary: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    cells = {}
+    for row in summary.get("openinfer_trace_pass", []) or []:
+        if not isinstance(row, dict):
+            continue
+        if not row.get("cells"):
+            cells[f"{row.get('engine')}/setup"] = {
+                "row_passed": row.get("passed"),
+                "claim_bucket": row.get("claim_bucket"),
+                "error": row.get("error"),
+                "startup_failure": row.get("startup_failure"),
+            }
+            continue
+        for cell in row.get("cells", []) or []:
+            if not isinstance(cell, dict):
+                continue
+            trace = cell.get("trace") if isinstance(cell.get("trace"), dict) else {}
+            cells[f"{row.get('engine')}/c{cell.get('concurrency')}"] = {
+                "row_passed": row.get("passed"),
+                "claim_bucket": row.get("claim_bucket"),
+                "completed": cell.get("completed"),
+                "failed": cell.get("failed"),
+                "timeouts": cell.get("timeouts"),
+                "missing_trace_count": cell.get("missing_trace_count"),
+                "active_set_size_max": trace.get("active_set_size_max"),
+                "decode_batch_size_max": trace.get("decode_batch_size_max"),
+                "trace_sha256": stable_json_sha256(trace),
+            }
+    return cells
+
+
+def compare_single_projection(
+    current: dict[str, Any],
+    baseline: dict[str, Any],
+    fields: tuple[str, ...],
+) -> dict[str, Any]:
+    if current.get("missing") and baseline.get("missing"):
+        return {"state": "missing_both", "changed_fields": []}
+    if current.get("missing"):
+        return {"state": "missing_current", "changed_fields": list(fields), "baseline": baseline}
+    if baseline.get("missing"):
+        return {"state": "missing_baseline", "changed_fields": list(fields), "current": current}
+    changed = [field for field in fields if current.get(field) != baseline.get(field)]
+    return {
+        "state": "changed" if changed else "unchanged",
+        "changed_fields": changed,
+        "current": current,
+        "baseline": baseline,
+    }
+
+
+def compare_projection_maps(
+    current: dict[str, dict[str, Any]],
+    baseline: dict[str, dict[str, Any]],
+    fields: tuple[str, ...],
+) -> dict[str, Any]:
+    current_keys = set(current)
+    baseline_keys = set(baseline)
+    changed = []
+    for key in sorted(current_keys & baseline_keys):
+        changed_fields = [field for field in fields if current[key].get(field) != baseline[key].get(field)]
+        if changed_fields:
+            changed.append({
+                "key": key,
+                "changed_fields": changed_fields,
+                "current": current[key],
+                "baseline": baseline[key],
+            })
+    return {
+        "state": "changed" if changed or current_keys != baseline_keys else "unchanged",
+        "added": sorted(current_keys - baseline_keys),
+        "missing": sorted(baseline_keys - current_keys),
+        "changed": changed,
+        "unchanged": sorted((current_keys & baseline_keys) - {row["key"] for row in changed}),
+    }
+
+
+def structural_projection_reasons(section: str, comparison: dict[str, Any]) -> list[str]:
+    reasons = []
+    for direction in ("added", "missing"):
+        for key in comparison.get(direction, []) or []:
+            reasons.append(f"{section}_{direction}:{key}")
+    return reasons
+
+
+def comparability_reasons(summary: dict[str, Any], baseline: dict[str, Any]) -> list[str]:
+    reasons = []
+    current_meta = summary.get("metadata") if isinstance(summary.get("metadata"), dict) else {}
+    baseline_meta = baseline.get("metadata") if isinstance(baseline.get("metadata"), dict) else {}
+    for label, key_path in (
+        ("benchmark_contract_changed", ("benchmark_contract",)),
+        ("model_snapshot_changed", ("model", "config_sha256")),
+        ("tokenizer_snapshot_changed", ("model", "tokenizer_sha256")),
+        ("cuda_probe_changed", ("versions", "nvcc", "stdout")),
+        ("vllm_version_changed", ("versions", "vllm", "stdout")),
+    ):
+        if nested_get(current_meta, key_path) != nested_get(baseline_meta, key_path):
+            reasons.append(label)
+    if version_probe_projection(current_meta, "nccl") != version_probe_projection(
+        baseline_meta,
+        "nccl",
+    ):
+        reasons.append("nccl_version_changed")
+    if gpu_probe_projection(current_meta) != gpu_probe_projection(baseline_meta):
+        reasons.append("gpu_probe_changed")
+    return reasons
+
+
+def version_probe_projection(metadata_payload: dict[str, Any], probe_name: str) -> Any:
+    versions = metadata_payload.get("versions") if isinstance(metadata_payload, dict) else {}
+    probe = versions.get(probe_name) if isinstance(versions, dict) else None
+    if not isinstance(probe, dict):
+        return None
+    return {
+        "available": probe.get("available"),
+        "exit_code": probe.get("exit_code"),
+        "stdout": probe.get("stdout"),
+    }
+
+
+def gpu_probe_projection(metadata_payload: dict[str, Any]) -> Any:
+    versions = metadata_payload.get("versions") if isinstance(metadata_payload, dict) else {}
+    probe = versions.get("nvidia_smi") if isinstance(versions, dict) else None
+    if not isinstance(probe, dict):
+        return None
+    if probe.get("available") is False:
+        return {"available": False}
+    stdout = probe.get("stdout")
+    if not isinstance(stdout, str):
+        return None
+    rows = []
+    for line in stdout.splitlines():
+        if not line.strip():
+            continue
+        cells = [cell.strip() for cell in line.split(",")]
+        if len(cells) >= 3:
+            rows.append({
+                "name": cells[0],
+                "driver_version": cells[1],
+                "compute_cap": cells[2],
+            })
+        else:
+            rows.append({"raw": line.strip()})
+    if rows:
+        return rows
+    return stdout.strip()
+
+
+def nested_get(payload: dict[str, Any], path: tuple[str, ...]) -> Any:
+    value: Any = payload
+    for key in path:
+        if not isinstance(value, dict):
+            return None
+        value = value.get(key)
+    return value
+
+
+def noise_reasons(summary: dict[str, Any], label: str) -> list[str]:
+    reasons = []
+    for key, row in http_projection_map(summary).items():
+        if row.get("noisy"):
+            reasons.append(f"{label}_noisy_http_cell:{key}")
+    return reasons
+
+
+def compare_failed_setup(
+    summary: dict[str, Any],
+    baseline: dict[str, Any] | None,
+) -> dict[str, Any]:
+    current = failed_setup_map(summary)
+    previous = failed_setup_map(baseline or {})
+    added = sorted(set(current) - set(previous))
+    resolved = sorted(set(previous) - set(current))
+    preserved = sorted(set(current) & set(previous))
+    return {
+        "added": [{"key": key, **current[key]} for key in added],
+        "resolved": [{"key": key, **previous[key]} for key in resolved],
+        "preserved": [{"key": key, **current[key]} for key in preserved],
+    }
+
+
+def failed_setup_map(summary: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    rows: dict[str, dict[str, Any]] = {}
+    gate = summary.get("correctness_gate")
+    if isinstance(gate, dict) and (gate.get("claim_bucket") == CLAIM_FAILED or gate.get("passed") is False):
+        rows["correctness_gate"] = {"section": "correctness_gate", "error": gate.get("error")}
+    for row in summary.get("direct_diagnostic_batch", []) or []:
+        if isinstance(row, dict) and (row.get("claim_bucket") == CLAIM_FAILED or row.get("passed") is False):
+            key = f"direct:{row.get('backend')}/batch{row.get('batch_size')}"
+            rows[key] = {
+                "section": "direct_diagnostic_batch",
+                "error": row.get("error"),
+                "claim_bucket": row.get("claim_bucket"),
+            }
+    for section in ("http_concurrency_pressure", "openinfer_trace_pass"):
+        for row in summary.get(section, []) or []:
+            if isinstance(row, dict) and (row.get("claim_bucket") == CLAIM_FAILED or row.get("passed") is False):
+                key = f"{section}:{row.get('engine')}"
+                rows[key] = {
+                    "section": section,
+                    "error": row.get("error"),
+                    "startup_failure": row.get("startup_failure"),
+                    "claim_bucket": row.get("claim_bucket"),
+                }
+    return rows
+
+
+def regression_docs_summary(regression: dict[str, Any]) -> list[str]:
+    lines = []
+    correctness = regression.get("correctness", {})
+    lines.append(f"correctness: {correctness.get('state', 'unknown')}")
+    direct = regression.get("direct_diagnostic_batch", {})
+    lines.append(
+        "direct diagnostics: "
+        f"{len(direct.get('changed', []))} changed, "
+        f"{len(direct.get('missing', []))} missing, "
+        f"{len(direct.get('added', []))} added"
+    )
+    http = regression.get("http_concurrency_pressure", {})
+    lines.append(
+        "HTTP pressure: "
+        f"{len(http.get('changed', []))} changed, "
+        f"{len(http.get('missing', []))} missing, "
+        f"{len(http.get('added', []))} added"
+    )
+    trace = regression.get("openinfer_trace_pass", {})
+    lines.append(
+        "trace: "
+        f"{len(trace.get('changed', []))} changed, "
+        f"{len(trace.get('missing', []))} missing, "
+        f"{len(trace.get('added', []))} added"
+    )
+    failed = regression.get("failed_setup_rows", {})
+    lines.append(
+        "failed setup rows: "
+        f"{len(failed.get('added', []))} added, "
+        f"{len(failed.get('resolved', []))} resolved, "
+        f"{len(failed.get('preserved', []))} preserved"
+    )
+    marker = regression.get("comparability", {}).get("claim_marker")
+    if marker:
+        lines.append(marker)
+    return lines
+
+
 def run_matrix(args: argparse.Namespace) -> dict[str, Any]:
     out_dir = repo_path(args.out_dir) / time.strftime("%Y%m%d-%H%M%S")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1092,6 +1888,7 @@ def run_matrix(args: argparse.Namespace) -> dict[str, Any]:
         sections["openinfer_trace_pass"] = run_openinfer_trace_pass(args, out_dir)
     summary = build_summary(args, out_dir, sections)
     write_json(out_dir / "summary.json", summary)
+    emit_benchmark_artifacts(args, out_dir, summary)
     return summary
 
 
@@ -1266,6 +2063,7 @@ def summarize_existing(args: argparse.Namespace) -> dict[str, Any]:
     if existing_summary.get("metadata"):
         summary["metadata"] = redact_payload(existing_summary["metadata"])
     write_json(out_dir / "summary.json", summary)
+    emit_benchmark_artifacts(args, out_dir, summary)
     return summary
 
 
@@ -1515,6 +2313,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-http", action="store_true")
     parser.add_argument("--openinfer-trace-pass", action="store_true")
     parser.add_argument("--summarize-only", type=Path)
+    parser.add_argument(
+        "--baseline-summary",
+        type=Path,
+        help=(
+            "Optional previous summary.json to compare against when writing "
+            "regression_summary.json. Omit to emit a no-directional-claim summary."
+        ),
+    )
     parser.add_argument("--plan-only", action="store_true")
     args = parser.parse_args(script_argv)
     args.vllm_serve_extra_args = normalize_vllm_serve_extra_args(vllm_serve_extra_args)
@@ -1530,6 +2336,8 @@ def parse_args() -> argparse.Namespace:
 def plan(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "metadata": metadata(args, probe_versions=False),
+        "baseline_summary": None if getattr(args, "baseline_summary", None) is None
+        else str(args.baseline_summary),
         "warmup_policy": {
             "num_warmups": args.num_warmups,
             "mode": "separate vllm bench serve call before each measured repeat",
