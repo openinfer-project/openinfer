@@ -779,6 +779,62 @@ pub fn dflash_qk_norm_rope_into(
     Ok(())
 }
 
+/// Plain RoPE (no QK-norm) for one EAGLE-3 draft step, because EAGLE-3 has no per-head q/k norm
+/// we implement a new kernel for EAGLE-3
+#[allow(clippy::too_many_arguments)]
+pub fn eagle3_rope_into(
+    ctx: &DeviceContext,
+    q: &mut HiddenStates,
+    q_row_offset: usize,
+    q_seq_len: usize,
+    k: &mut HiddenStates,
+    cos_cache: &DeviceVec,
+    sin_cache: &DeviceVec,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    q_start_pos: usize,
+    k_start_pos: usize,
+) -> Result<()> {
+    assert_eq!(q.hidden_dim, num_q_heads * head_dim);
+    assert_eq!(k.hidden_dim, num_kv_heads * head_dim);
+    assert!(
+        q_row_offset + q_seq_len <= q.seq_len,
+        "eagle3_rope q row range [{}..{}) exceeds seq_len {}",
+        q_row_offset,
+        q_row_offset + q_seq_len,
+        q.seq_len
+    );
+
+    let (q_ptr, _gq) = q.data.device_ptr_mut(&ctx.stream);
+    let q_ptr = q_ptr + (q_row_offset * q.hidden_dim * std::mem::size_of::<bf16>()) as u64;
+    let (k_ptr, _gk) = k.data.device_ptr_mut(&ctx.stream);
+    let (cos_ptr, _gc) = cos_cache.data.device_ptr(&ctx.stream);
+    let (sin_ptr, _gs) = sin_cache.data.device_ptr(&ctx.stream);
+
+    let result = unsafe {
+        ffi::eagle3_rope_cuda(
+            q_ptr as *mut ffi::Half,
+            k_ptr as *mut ffi::Half,
+            cos_ptr as *const ffi::Half,
+            sin_ptr as *const ffi::Half,
+            num_q_heads as i32,
+            num_kv_heads as i32,
+            head_dim as i32,
+            q_seq_len as i32,
+            k.seq_len as i32,
+            q_start_pos as i32,
+            k_start_pos as i32,
+            (cos_cache.data.len() / head_dim) as i32,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    if result != 0 {
+        anyhow::bail!("eagle3_rope_cuda failed with error {result}");
+    }
+    Ok(())
+}
+
 /// Non-causal prefill attention for one DFlash request's draft block.
 ///
 /// `q` and `output` share the SAME row sub-range of batched buffers: request
@@ -854,6 +910,127 @@ pub fn single_prefill_nhd_noncausal_into(
             "single_prefill_nhd_noncausal_cuda failed with error {result}{}",
             crate::ops::ffi_exception_message(result)
         );
+    }
+    Ok(())
+}
+
+/// Single-query **decode** over a contiguous NHD KV cache — the draft chain's
+/// per-step attention. One query (`q.seq_len == 1`) attends the whole `[0, kv_len)`
+/// prefix.
+///
+/// `q`/`output` are `[q_dim, 1]` and the k/v caches are the request's own whole
+/// buffers `[kv_dim, max_seq_len]` (NHD token-major). No RoPE inside — the caller
+/// applies [`eagle3_rope_into`] first.
+#[allow(clippy::too_many_arguments)]
+pub fn single_decode_nhd_into(
+    ctx: &DeviceContext,
+    q: &HiddenStates,
+    k_cache: &HiddenStates,
+    v_cache: &HiddenStates,
+    output: &mut HiddenStates,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    kv_len: usize,
+) -> Result<()> {
+    assert_eq!(
+        q.seq_len, 1,
+        "single_decode_nhd is single-query; got q.seq_len {}",
+        q.seq_len
+    );
+    assert_eq!(q.hidden_dim, num_q_heads * head_dim);
+    assert_eq!(output.hidden_dim, q.hidden_dim);
+    assert_eq!(output.seq_len, 1);
+    assert_eq!(k_cache.hidden_dim, num_kv_heads * head_dim);
+    assert_eq!(v_cache.hidden_dim, k_cache.hidden_dim);
+    assert_eq!(v_cache.seq_len, k_cache.seq_len);
+    assert!(kv_len <= k_cache.seq_len);
+
+    let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
+    let (k_ptr, _gk) = k_cache.data.device_ptr(&ctx.stream);
+    let (v_ptr, _gv) = v_cache.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::single_decode_nhd_cuda(
+            q_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            k_ptr as *const ffi::Half,
+            v_ptr as *const ffi::Half,
+            num_q_heads as i32,
+            num_kv_heads as i32,
+            head_dim as i32,
+            kv_len as i32,
+            k_cache.seq_len as i32,
+            1.0f32 / (head_dim as f32).sqrt(),
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    if result != 0 {
+        anyhow::bail!("single_decode_nhd_cuda failed with error {result}");
+    }
+    Ok(())
+}
+
+/// Causal NHD single-sequence prefill. Used for EAGLE-3's
+/// teacher-forced prefill in a single batched forward.
+#[allow(clippy::too_many_arguments)]
+pub fn single_prefill_nhd_causal_into(
+    ctx: &DeviceContext,
+    q: &HiddenStates,
+    row_offset: usize,
+    q_seq_len: usize,
+    k_cache: &HiddenStates,
+    v_cache: &HiddenStates,
+    output: &mut HiddenStates,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    kv_len: usize,
+) -> Result<()> {
+    assert_eq!(q.hidden_dim, num_q_heads * head_dim);
+    assert_eq!(output.hidden_dim, q.hidden_dim);
+    assert_eq!(output.seq_len, q.seq_len);
+    assert_eq!(k_cache.hidden_dim, num_kv_heads * head_dim);
+    assert_eq!(v_cache.hidden_dim, k_cache.hidden_dim);
+    assert_eq!(v_cache.seq_len, k_cache.seq_len);
+    assert!(kv_len <= k_cache.seq_len);
+    assert!(
+        q_seq_len <= kv_len,
+        "causal prefill q_seq_len {q_seq_len} exceeds kv_len {kv_len}"
+    );
+    assert!(
+        row_offset + q_seq_len <= q.seq_len,
+        "single_prefill row range [{}..{}) exceeds seq_len {}",
+        row_offset,
+        row_offset + q_seq_len,
+        q.seq_len
+    );
+
+    let byte_offset = (row_offset * q.hidden_dim * std::mem::size_of::<bf16>()) as u64;
+    let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
+    let q_ptr = q_ptr + byte_offset;
+    let (k_ptr, _gk) = k_cache.data.device_ptr(&ctx.stream);
+    let (v_ptr, _gv) = v_cache.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+    let out_ptr = out_ptr + byte_offset;
+    let result = unsafe {
+        ffi::single_prefill_nhd_causal_cuda(
+            q_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            k_ptr as *const ffi::Half,
+            v_ptr as *const ffi::Half,
+            num_q_heads as i32,
+            num_kv_heads as i32,
+            head_dim as i32,
+            q_seq_len as i32,
+            kv_len as i32,
+            k_cache.seq_len as i32,
+            1.0f32 / (head_dim as f32).sqrt(),
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    if result != 0 {
+        anyhow::bail!("single_prefill_nhd_causal_cuda failed with error {result}");
     }
     Ok(())
 }
