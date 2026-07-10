@@ -396,11 +396,111 @@ fn glm52_flashmla_arch_args(normalized_sms: &[String], nvcc: &str) -> Vec<String
     nvcc_arch_args(&promoted_sms)
 }
 
-/// Arch args for TUs whose device code is raw Hopper wgmma (the
-/// AOT-instantiated DeepGEMM MQA kernels): sm_90a ONLY — the instantiation
-/// cannot even be ptxas-assembled for other targets. Returns `None` when no
-/// sm_90 target is present (or nvcc lacks 90a); the TU then compiles its
-/// NOT_SUPPORTED stub for the requested targets instead.
+fn glm52_flashmla_sparse_arch_args(normalized_sms: &[String], nvcc: &str) -> Vec<String> {
+    let sm90a_supported = normalized_sms.iter().any(|sm| sm == "90" || sm == "90a")
+        && nvcc_accepts_gencode(nvcc, "90a", "90a");
+    let sm100f_supported = normalized_sms
+        .iter()
+        .any(|sm| sm_numeric_prefix(sm).is_some_and(|n| (100..120).contains(&n)))
+        && nvcc_accepts_gencode(nvcc, "100f", "100f");
+
+    let mut targets = Vec::new();
+    for sm in normalized_sms {
+        let target = match sm_numeric_prefix(sm) {
+            Some(90) => {
+                if sm90a_supported {
+                    Some(("90a", "90a", "sm_90a"))
+                } else {
+                    println!(
+                        "cargo:warning=nvcc cannot compile compute_90a/sm_90a; GLM5.2 FlashMLA sparse decode will use sm_{sm}"
+                    );
+                    Some((sm.as_str(), sm.as_str(), "native"))
+                }
+            }
+            Some(100..=119) => {
+                if sm100f_supported {
+                    Some(("100f", "100f", "sm_100f"))
+                } else {
+                    println!(
+                        "cargo:warning=nvcc cannot compile compute_100f/sm_100f; GLM5.2 FlashMLA sparse decode will use sm_{sm}"
+                    );
+                    Some((sm.as_str(), sm.as_str(), "native"))
+                }
+            }
+            _ => Some((sm.as_str(), sm.as_str(), "native")),
+        };
+        if let Some(target) = target {
+            if !targets.iter().any(|existing| existing == &target) {
+                targets.push(target);
+            }
+        }
+    }
+
+    let labels = targets
+        .iter()
+        .map(|(_, sm, label)| {
+            if *label == "native" {
+                format!("sm_{sm}")
+            } else {
+                label.to_string()
+            }
+        })
+        .collect::<Vec<_>>();
+    if labels
+        != normalized_sms
+            .iter()
+            .map(|sm| format!("sm_{sm}"))
+            .collect::<Vec<_>>()
+    {
+        println!(
+            "cargo:warning=Compiling GLM5.2 FlashMLA sparse decode for nvcc targets: {}",
+            labels.join(",")
+        );
+    }
+
+    let mut args = Vec::new();
+    for (compute, sm, _) in targets {
+        args.push("-gencode".to_string());
+        args.push(format!("arch=compute_{compute},code=sm_{sm}"));
+    }
+    args
+}
+
+/// Arch args for the AOT-instantiated DeepGEMM MQA kernels. Hopper uses the
+/// sm90a implementation; Blackwell uses the sm100 implementation and must be
+/// assembled as sm_100f because it contains tcgen05 instructions.
+fn glm52_deepgemm_mqa_arch_args(
+    normalized_sms: &[String],
+    nvcc: &str,
+) -> Option<(Vec<String>, String)> {
+    let has_sm100 = normalized_sms
+        .iter()
+        .any(|sm| sm_numeric_prefix(sm).is_some_and(|n| (100..120).contains(&n)));
+    if has_sm100 && nvcc_accepts_gencode(nvcc, "100f", "100f") {
+        return Some((
+            vec![
+                "-gencode".to_string(),
+                "arch=compute_100f,code=sm_100f".to_string(),
+            ],
+            "-DGLM52_DEEPGEMM_MQA_SM100F".to_string(),
+        ));
+    }
+
+    let has_sm90 = normalized_sms.iter().any(|sm| sm == "90" || sm == "90a");
+    if has_sm90 && nvcc_accepts_gencode(nvcc, "90a", "90a") {
+        return Some((
+            nvcc_arch_args(&["90a".to_string()]),
+            "-DGLM52_DEEPGEMM_MQA_SM90A".to_string(),
+        ));
+    }
+
+    None
+}
+
+/// Arch args for TUs whose device code is raw Hopper wgmma: sm_90a ONLY — the
+/// instantiation cannot even be ptxas-assembled for other targets. Returns
+/// `None` when no sm_90 target is present (or nvcc lacks 90a); the TU then
+/// compiles its NOT_SUPPORTED stub for the requested targets instead.
 fn glm52_sm90a_only_arch_args(normalized_sms: &[String], nvcc: &str) -> Option<Vec<String>> {
     let has_sm90 = normalized_sms.iter().any(|sm| sm == "90" || sm == "90a");
     (has_sm90 && nvcc_accepts_gencode(nvcc, "90a", "90a"))
@@ -1311,15 +1411,23 @@ fn main() {
             csrc_dir.to_string_lossy().to_string(),
         ];
         if stem == "glm52_flashmla_sparse" {
-            nvcc_args.extend(glm52_flashmla_arch_args(&nvcc_sm_targets, &nvcc));
-        } else if stem == "glm52_deepgemm_mqa" || stem == "glm52_deepgemm_grouped" {
+            nvcc_args.extend(glm52_flashmla_sparse_arch_args(&nvcc_sm_targets, &nvcc));
+        } else if stem == "glm52_deepgemm_mqa" {
+            if let Some((mqa_args, mqa_define)) =
+                glm52_deepgemm_mqa_arch_args(&nvcc_sm_targets, &nvcc)
+            {
+                nvcc_args.extend(mqa_args);
+                nvcc_args.push(mqa_define);
+            } else {
+                println!(
+                    "cargo:warning=No sm_90a or sm_100f target; GLM5.2 DeepGEMM {stem} kernels compile as NOT_SUPPORTED stubs"
+                );
+                nvcc_args.extend(arch_args.clone());
+            }
+        } else if stem == "glm52_deepgemm_grouped" {
             if let Some(sm90a_args) = glm52_sm90a_only_arch_args(&nvcc_sm_targets, &nvcc) {
                 nvcc_args.extend(sm90a_args);
-                nvcc_args.push(if stem == "glm52_deepgemm_mqa" {
-                    "-DGLM52_DEEPGEMM_MQA_SM90A".to_string()
-                } else {
-                    "-DGLM52_DEEPGEMM_GROUPED_SM90A".to_string()
-                });
+                nvcc_args.push("-DGLM52_DEEPGEMM_GROUPED_SM90A".to_string());
             } else {
                 println!(
                     "cargo:warning=No sm_90a target; GLM5.2 DeepGEMM {stem} kernels compile as NOT_SUPPORTED stubs"

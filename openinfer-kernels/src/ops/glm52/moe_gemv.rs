@@ -123,5 +123,5 @@ pub fn glm52_fp8_weight_only_gemv_launch(
         )
     }
     .result()
-    .map_err(|err| anyhow!("GLM5.2 linear GEMV launch failed: {err}"))
+    .map_err(|err| anyhow!("GLM5.2 linear GEMV launch failed for rows={rows}, n={n}, k={k}: {err}"))
 }

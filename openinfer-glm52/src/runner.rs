@@ -16,7 +16,8 @@ use crate::dspark::{
 use crate::model::{GLM52_MAX_BATCH_PER_RANK, Glm52RankModel, Glm52StepKv, Glm52StepShape};
 use crate::moe_ep8::Glm52MoeEp8State;
 use crate::moe_tp8::{
-    Glm52MoeTp8Rank, Glm52MoeTp8SliceBank, Glm52MoeTp8State, Glm52Tp8Exchange, load_tp8_slice_layer,
+    Glm52MoeTp4State, Glm52MoeTp8Rank, Glm52MoeTp8SliceBank, Glm52MoeTp8State, Glm52MoeTpState,
+    Glm52Tp8Exchange, load_tp_slice_layer,
 };
 use crate::weights::{
     GLM52_EP_RANKS, Glm52RankGpuContext, Glm52RankGpuWeights, Glm52RankLoadBundle,
@@ -113,6 +114,7 @@ enum Glm52RankCommand {
     /// pointers through `tp8_exchange`.
     SetupComm {
         unique_id: Box<[u8; 128]>,
+        moe_topo: crate::Glm52MoeTopo,
         tp8_exchange: Option<Arc<Glm52Tp8Exchange>>,
         resp: Sender<Result<()>>,
     },
@@ -240,12 +242,14 @@ impl Glm52RankWorker {
     pub(crate) fn setup_comm_async(
         &self,
         unique_id: [u8; 128],
+        moe_topo: crate::Glm52MoeTopo,
         tp8_exchange: Option<Arc<Glm52Tp8Exchange>>,
     ) -> Result<Receiver<Result<()>>> {
         let (resp_tx, resp_rx) = bounded(1);
         self.tx
             .send(Glm52RankCommand::SetupComm {
                 unique_id: Box::new(unique_id),
+                moe_topo,
                 tp8_exchange,
                 resp: resp_tx,
             })
@@ -410,17 +414,19 @@ impl Glm52RankThreadState {
         moe_topo: crate::Glm52MoeTopo,
     ) -> Result<Glm52RankWeightLoadReport> {
         let loaded = load_rank_weights_to_gpu(&self.ctx, model_path, &self.bundle)?;
-        if moe_topo == crate::Glm52MoeTopo::Tp8 {
-            // TP8 topology: the bundle carried no routed experts; gather this
-            // rank's 1/8-I slice of ALL experts for every MoE layer instead.
+        if moe_topo.uses_tensor_replicated_moe() {
+            // Tensor-replicated topology: the bundle carried no routed experts;
+            // gather this rank's 1/TP intermediate slice of ALL experts for
+            // every MoE layer instead.
             let manifest = Glm52WeightManifest::from_model_dir(model_path)?;
             let dev_ctx = self.ctx.device_context()?;
             for layer in crate::config::GLM52_DENSE_LAYERS..crate::config::GLM52_LAYERS {
-                let bank = load_tp8_slice_layer(
+                let bank = load_tp_slice_layer(
                     &dev_ctx,
                     model_path,
                     &manifest,
                     self.placement.rank,
+                    moe_topo.device_count(),
                     layer,
                 )?;
                 self.tp8_slices.insert(layer, bank);
@@ -461,7 +467,9 @@ impl Glm52RankThreadState {
             &mut weights,
             max_model_len,
             moe_topo,
-            (moe_topo == crate::Glm52MoeTopo::Tp8).then_some(self.placement.rank),
+            moe_topo
+                .uses_tensor_replicated_moe()
+                .then_some(self.placement.rank),
         )?);
         let arenas = model.kv_arenas(&dev_ctx.stream)?;
         let aux_ctx = self.ctx.auxiliary_device_context("decode aux")?;
@@ -574,6 +582,7 @@ impl Glm52RankThreadState {
     fn setup_comm(
         &mut self,
         unique_id: &[u8; 128],
+        moe_topo: crate::Glm52MoeTopo,
         tp8_exchange: Option<&Arc<Glm52Tp8Exchange>>,
     ) -> Result<()> {
         let dev_ctx = self.ctx.device_context()?;
@@ -588,31 +597,46 @@ impl Glm52RankThreadState {
         );
         // Before anything fallible: every rank must hold the exchange so the
         // shutdown teardown rendezvous counts the full fleet even when this
-        // rank's DeepEP or TP8 setup fails below.
+        // rank's TP setup fails below.
         runtime.tp8_exchange = tp8_exchange.cloned();
-        // Collective: every rank calls this concurrently.
-        runtime.ep8 = Some(Glm52MoeEp8State::new(
-            &dev_ctx,
-            unique_id,
-            GLM52_EP_RANKS,
-            self.placement.rank,
-        )?);
+        if moe_topo.uses_ep_expert_bundles() {
+            // Collective: every EP rank calls this concurrently.
+            runtime.ep8 = Some(Glm52MoeEp8State::new(
+                &dev_ctx,
+                unique_id,
+                GLM52_EP_RANKS,
+                self.placement.rank,
+            )?);
+        }
         if let Some(exchange) = tp8_exchange {
             ensure!(
                 !self.tp8_slices.is_empty(),
-                "GLM5.2 rank {} TP8 rendezvous without slice banks — load/setup drifted",
+                "GLM5.2 rank {} TP rendezvous without slice banks — load/setup drifted",
                 self.placement.rank
             );
-            // Collective: the LL pointer rendezvous blocks until all 8 ranks
-            // publish.
-            let state = Glm52MoeTp8State::new(
-                &dev_ctx,
-                self.placement.rank,
-                self.placement.device_ordinal,
-                exchange,
-                self.tp8_slices.len(),
-                crate::config::GLM52_LAYERS,
-            )?;
+            // Collective: the LL pointer rendezvous blocks until all topology
+            // ranks publish.
+            let state = match moe_topo {
+                crate::Glm52MoeTopo::Tp8 => Glm52MoeTpState::Tp8(Glm52MoeTp8State::new(
+                    &dev_ctx,
+                    self.placement.rank,
+                    self.placement.device_ordinal,
+                    exchange,
+                    self.tp8_slices.len(),
+                    crate::config::GLM52_LAYERS,
+                )?),
+                crate::Glm52MoeTopo::Tp4 => Glm52MoeTpState::Tp4(Glm52MoeTp4State::new(
+                    &dev_ctx,
+                    self.placement.rank,
+                    self.placement.device_ordinal,
+                    exchange,
+                    self.tp8_slices.len(),
+                    crate::config::GLM52_LAYERS,
+                )?),
+                crate::Glm52MoeTopo::Ep8 => {
+                    anyhow::bail!("GLM5.2 EP8 setup received a TP exchange")
+                }
+            };
             runtime.tp8 = Some(Glm52MoeTp8Rank {
                 state,
                 slices: std::mem::take(&mut self.tp8_slices),
@@ -664,14 +688,10 @@ impl Glm52RankThreadState {
             .runtime
             .as_mut()
             .context("GLM5.2 step before build_model")?;
-        let ep8 = runtime
-            .ep8
-            .as_mut()
-            .context("GLM5.2 step before setup_comm")?;
         runtime.model.decode_step(
             &dev_ctx,
             &runtime.aux_ctx,
-            ep8,
+            runtime.ep8.as_mut(),
             runtime.tp8.as_mut(),
             inputs,
             shape,
@@ -702,10 +722,11 @@ fn rank_worker_loop(rx: &Receiver<Glm52RankCommand>, mut state: Glm52RankThreadS
             }
             Glm52RankCommand::SetupComm {
                 unique_id,
+                moe_topo,
                 tp8_exchange,
                 resp,
             } => {
-                let _ = resp.send(state.setup_comm(&unique_id, tp8_exchange.as_ref()));
+                let _ = resp.send(state.setup_comm(&unique_id, moe_topo, tp8_exchange.as_ref()));
             }
             Glm52RankCommand::Step {
                 inputs,

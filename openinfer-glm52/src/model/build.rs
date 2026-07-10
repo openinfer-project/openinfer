@@ -64,15 +64,16 @@ pub(super) fn build_decoder_layer(
     let kv_b_full = take_proj(w, &format!("{p}.self_attn.kv_b_proj"), 28_672, 512)?;
     let q_b_full = take_proj(w, &format!("{p}.self_attn.q_b_proj"), 16_384, 2048)?;
     let o_proj_full = take_proj(w, &format!("{p}.self_attn.o_proj"), GLM52_HIDDEN, 16_384)?;
-    // Attention-TP head shard: rank r keeps q/v heads r*8..(r+1)*8 — q_b/kv_b
-    // output rows, o_proj input columns; `Glm52MlaLayerWeights` derives its
-    // head count from these shapes. The indexer is NOT sharded (its logits
-    // sum over all 32 index heads BEFORE the top-2048, so a shard would need
-    // a cross-rank logits reduction — the whole 21-layer indexer weight set
-    // is ~0.18 GB, replication is the right trade).
+    // Attention-TP head shard: rank r keeps its 1/TP slice of q/v heads
+    // (TP8 = 8 heads, TP4 = 16 heads) — q_b/kv_b output rows, o_proj input
+    // columns; `Glm52MlaLayerWeights` derives its head count from these
+    // shapes. The indexer is NOT sharded (its logits sum over all 32 index
+    // heads BEFORE the top-2048, so a shard would need a cross-rank logits
+    // reduction — the whole 21-layer indexer weight set is ~0.18 GB,
+    // replication is the right trade).
     let (q_b, kv_b, o_proj) = match attn_shard {
         Some(rank) => {
-            let heads = crate::config::GLM52_HEADS / 8;
+            let heads = crate::config::GLM52_HEADS / moe_topo.device_count();
             let q_rows = heads * crate::config::GLM52_QK_HEAD_DIM;
             let kv_rows =
                 heads * (crate::config::GLM52_QK_NOPE_HEAD_DIM + crate::config::GLM52_V_HEAD_DIM);
@@ -136,8 +137,8 @@ pub(super) fn build_decoder_layer(
             &take_proj(w, &format!("{mp}.up_proj"), 12_288, GLM52_HIDDEN)?,
             take_proj(w, &format!("{mp}.down_proj"), GLM52_HIDDEN, 12_288)?,
         )?))
-    } else if moe_topo == crate::Glm52MoeTopo::Tp8 {
-        // TP8 topology: the routed experts and the shared expert live in the
+    } else if moe_topo.uses_tensor_replicated_moe() {
+        // Tensor-replicated topology: the routed experts and shared expert live in the
         // rank's slice bank (shared folded at index 256); the resident first
         // pass therefore carries only the router for this layer.
         Glm52LayerMlp::MoeTp8(Box::new(Glm52MoeRouterWeights::new(

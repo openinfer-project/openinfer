@@ -120,12 +120,12 @@ pub(crate) fn run_dp8_coordinator(
     moe_topo: crate::Glm52MoeTopo,
     load_txs: Vec<watch::Sender<LoadSnapshot>>,
 ) {
-    // TP8 replicated topology: ONE logical rank drives 8 mirrored executors.
+    // Tensor-replicated topology: ONE logical rank drives mirrored executors.
     // Every worker receives the identical step (inputs, shape, KV, seed) and
     // must return bit-identical outputs — the scheduler admits, plans, and
     // applies on the single logical rank; the fan-out lives in the submit
     // and draft joins.
-    let mirrored = moe_topo == crate::Glm52MoeTopo::Tp8;
+    let mirrored = moe_topo.uses_tensor_replicated_moe();
     let logical_ranks = if mirrored { 1 } else { workers.len() };
     assert_eq!(
         load_txs.len(),

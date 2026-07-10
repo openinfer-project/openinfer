@@ -239,7 +239,7 @@ impl Glm52WeightManifest {
         &self,
         moe_topo: crate::Glm52MoeTopo,
     ) -> Result<Vec<Glm52RankLoadBundle>> {
-        (0..GLM52_EP_RANKS)
+        (0..moe_topo.device_count())
             .map(|rank| self.rank_load_bundle(rank, moe_topo))
             .collect()
     }
@@ -274,11 +274,16 @@ impl Glm52WeightManifest {
                 });
         }
         let tensor_count = by_shard.values().map(Vec::len).sum();
-        let expert_start = rank * GLM52_LOCAL_EXPERTS;
+        let expert_range = if include_experts {
+            let expert_start = rank * GLM52_LOCAL_EXPERTS;
+            expert_start..expert_start + GLM52_LOCAL_EXPERTS
+        } else {
+            0..0
+        };
         Ok(Glm52RankLoadBundle {
             plan: Glm52RankWeightPlan {
                 rank,
-                expert_range: expert_start..expert_start + GLM52_LOCAL_EXPERTS,
+                expert_range,
                 tensor_count,
             },
             shards: by_shard

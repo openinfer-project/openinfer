@@ -389,8 +389,8 @@ impl Glm52RankModel {
         attn_shard: Option<usize>,
     ) -> Result<Self> {
         ensure!(
-            (moe_topo == crate::Glm52MoeTopo::Tp8) == attn_shard.is_some(),
-            "GLM5.2 attention-TP shard must ride the tp8 topology (topo {moe_topo:?}, \
+            moe_topo.uses_tensor_replicated_moe() == attn_shard.is_some(),
+            "GLM5.2 attention-TP shard must ride a tensor-replicated topology (topo {moe_topo:?}, \
              shard {attn_shard:?})"
         );
         ensure!(
@@ -399,11 +399,11 @@ impl Glm52RankModel {
              {GLM52_MODEL_LEN_ALIGN} (the FlashMLA page / index-K block size)"
         );
         let batch = GLM52_MAX_BATCH_PER_RANK;
-        // Attention-TP keeps 8 of 64 heads per rank and uses the right-sized
+        // Attention-TP keeps a topology-sized shard of the 64 heads and uses the right-sized
         // sparse MLA backend, so it neither queries nor owns FlashMLA launch
         // metadata. EP8 retains the full 64-head FlashMLA plan.
         let mla_heads = if attn_shard.is_some() {
-            crate::config::GLM52_HEADS / 8
+            crate::config::GLM52_HEADS / moe_topo.device_count()
         } else {
             crate::config::GLM52_HEADS
         };
@@ -483,7 +483,7 @@ impl Glm52RankModel {
         // plans, scratch, and a zeroed block table (never read before the
         // first step prologue uploads the coordinator's page rows).
         // Attention-TP: every scratch buffer with a head dimension shrinks
-        // with the 8-head shard selected above.
+        // with the shard selected above.
         let mut buckets = Vec::with_capacity(GLM52_DECODE_BUCKETS.len());
         for rows in GLM52_DECODE_BUCKETS {
             let contract_rows = Glm52FlashMlaSparseDecode {
@@ -619,7 +619,7 @@ impl Glm52RankModel {
         &mut self,
         ctx: &DeviceContext,
         aux: &DeviceContext,
-        ep8: &mut Glm52MoeEp8State,
+        ep8: Option<&mut Glm52MoeEp8State>,
         tp8: Option<&mut Glm52MoeTp8Rank>,
         inputs: &[(u32, usize); GLM52_MAX_BATCH_PER_RANK],
         shape: Glm52StepShape,
@@ -764,7 +764,7 @@ impl Glm52RankModel {
         &mut self,
         ctx: &DeviceContext,
         aux: &DeviceContext,
-        ep8: &mut Glm52MoeEp8State,
+        ep8: Option<&mut Glm52MoeEp8State>,
         mut tp8: Option<&mut Glm52MoeTp8Rank>,
         inputs: &[(u32, usize); GLM52_MAX_BATCH_PER_RANK],
         shape: Glm52StepShape,
@@ -890,8 +890,8 @@ impl Glm52RankModel {
         // collectives — guaranteed by the coordinator agreeing the bucket.
         let global_tokens = crate::weights::GLM52_EP_RANKS * batch;
 
-        let mut graph = std::mem::take(&mut bucket.graph);
         let s = &mut bucket.scratch;
+        let mut graph = std::mem::take(&mut bucket.graphs[tier]);
         let result = graph.run_or_capture(ctx, || {
             run_step_body(
                 ctx,
@@ -923,7 +923,7 @@ impl Glm52RankModel {
 fn run_step_body(
     ctx: &DeviceContext,
     aux: &DeviceContext,
-    ep8: &mut Glm52MoeEp8State,
+    mut ep8: Option<&mut Glm52MoeEp8State>,
     mut tp8: Option<&mut Glm52MoeTp8Rank>,
     layers: &[Glm52DecoderLayerWeights],
     caches: &mut [Glm52LayerCaches],
@@ -992,6 +992,9 @@ fn run_step_body(
                 s.layer.mlp_out.data_mut(),
             )?,
             Glm52LayerMlp::MoeEp8(moe) => {
+                let ep8 = ep8
+                    .as_deref_mut()
+                    .context("GLM5.2 EP8 MoE layer reached without DeepEP state")?;
                 glm52_moe_ep8_layer(ctx, aux, ep8, moe, s, batch, global_tokens)
                     .with_context(|| format!("GLM5.2 layer {layer} EP8 MoE"))?;
             }

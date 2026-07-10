@@ -180,6 +180,65 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    // --- TP4 low-latency MoE: whole-layer cooperative kernel + LL packets ----
+    pub fn glm52_moe_tp4_max_blocks_cuda(out_blocks: *mut i32) -> CUresult;
+
+    pub fn glm52_moe_tp4_alloc_ll_cuda(
+        bytes: usize,
+        device_ordinals: *const i32,
+        n_devices: i32,
+        out_vas: *mut u64,
+    ) -> CUresult;
+
+    pub fn glm52_moe_tp4_free_ll_cuda(p: *mut std::ffi::c_void) -> CUresult;
+
+    pub fn glm52_moe_tp4_layer_launch_cuda(
+        normed2: *const Half,
+        topk_idx: *const i32,
+        topk_prob: *const f32,
+        w13: *const u8,
+        w13_scale: *const f32,
+        w2: *const u8,
+        w2_scale: *const f32,
+        mlp_out: *mut Half,
+        guidx: *mut i32,
+        guprob: *mut f32,
+        gucnt: *mut i32,
+        gused: *mut i32,
+        bpart: *mut f32,
+        ug: *mut Half,
+        cpart: *mut f32,
+        rs_local: *mut std::ffi::c_void,
+        peer_rs: *const *const std::ffi::c_void,
+        epoch_dev: *mut u64,
+        active_rows: *const i32,
+        layer_slot: i32,
+        nranks: i32,
+        myrank: i32,
+        grid_blocks: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn glm52_moe_tp4_epoch_advance_cuda(
+        epoch_dev: *mut std::ffi::c_void,
+        stream: CUstream,
+    ) -> CUresult;
+
+    // --- TP4 attention allreduce: o_proj/dense-down epilogue collective -----
+    pub fn glm52_tp4_ar_launch_cuda(
+        partial: *const Half,
+        out: *mut Half,
+        ar_local: *mut std::ffi::c_void,
+        peer_ar: *const *const std::ffi::c_void,
+        epoch_dev: *const u64,
+        active_rows: *const i32,
+        layer_slot: i32,
+        rows: i32,
+        nranks: i32,
+        myrank: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     // --- TP8 low-latency MoE: whole-layer cooperative kernel + LL packets ----
     pub fn glm52_moe_tp8_max_blocks_cuda(out_blocks: *mut i32) -> CUresult;
 

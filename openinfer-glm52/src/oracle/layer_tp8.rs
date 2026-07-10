@@ -53,7 +53,7 @@ fn layer_moe_tp8_oracle_gate() -> Result<()> {
         MOE_ORACLE_HIDDEN_DIGEST,
     )?);
     let manifest = Arc::new(Glm52WeightManifest::from_model_dir(&model_path())?);
-    let exchange = Arc::new(Glm52Tp8Exchange::new());
+    let exchange = Arc::new(Glm52Tp8Exchange::new(TP_RANKS));
 
     // Every rank: the identical full decoder-layer walk (replicated
     // attention/indexer/router weights + this rank's expert slice bank).

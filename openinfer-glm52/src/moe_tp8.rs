@@ -14,11 +14,16 @@ use anyhow::{Context, Result, bail, ensure};
 use cudarc::driver::CudaSlice;
 use half::bf16;
 use openinfer_kernels::ops::{
+    GLM52_TP4_AR_CHUNK_PACKETS, GLM52_TP4_BPART_LEN, GLM52_TP4_CPART_LEN, GLM52_TP4_GUPROB_LEN,
+    GLM52_TP4_HIDDEN, GLM52_TP4_RANKS, GLM52_TP4_RS_SLOT_PACKETS, GLM52_TP4_SLICE_I,
+    GLM52_TP4_SLICE_ROWS, GLM52_TP4_TOKENS, GLM52_TP4_UG_LEN, GLM52_TP4_UNION_MAX,
     GLM52_TP8_AR_CHUNK_PACKETS, GLM52_TP8_BANK_EXPERTS, GLM52_TP8_BPART_LEN, GLM52_TP8_CPART_LEN,
     GLM52_TP8_HIDDEN, GLM52_TP8_RANKS, GLM52_TP8_RS_SLOT_PACKETS, GLM52_TP8_SLICE_I,
     GLM52_TP8_SLICE_ROWS, GLM52_TP8_TOKENS, GLM52_TP8_UG_LEN, GLM52_TP8_UNION_MAX,
-    Glm52MoeTp8Buffers, Glm52Tp8LlBuffer, glm52_moe_tp8_epoch_advance, glm52_moe_tp8_layer_launch,
-    glm52_moe_tp8_max_blocks, glm52_tp8_ar_buffer_bytes, glm52_tp8_ar_launch,
+    Glm52MoeTp4Buffers, Glm52MoeTp8Buffers, Glm52Tp4LlBuffer, Glm52Tp8LlBuffer,
+    glm52_moe_tp4_epoch_advance, glm52_moe_tp4_layer_launch, glm52_moe_tp4_max_blocks,
+    glm52_moe_tp8_epoch_advance, glm52_moe_tp8_layer_launch, glm52_moe_tp8_max_blocks,
+    glm52_tp4_ar_buffer_bytes, glm52_tp4_ar_launch, glm52_tp8_ar_buffer_bytes, glm52_tp8_ar_launch,
 };
 use openinfer_kernels::tensor::DeviceContext;
 
@@ -39,14 +44,12 @@ const BANK: usize = GLM52_TP8_BANK_EXPERTS;
 const SLICE_ROWS: usize = GLM52_TP8_SLICE_ROWS;
 const SLICE_I: usize = GLM52_TP8_SLICE_I;
 
-const W13_SLICE_BYTES: usize = BANK * SLICE_ROWS * H;
-const W13_SLICE_SCALE_F32: usize = BANK * (SLICE_ROWS / QUANT_GROUP) * (H / QUANT_GROUP);
-const W2_SLICE_BYTES: usize = BANK * H * SLICE_I;
-const W2_SLICE_SCALE_F32: usize = BANK * (H / QUANT_GROUP) * (SLICE_I / QUANT_GROUP);
-
 /// One pilot layer's TP8 slice bank: this rank's 1/8-I rows of all 257
 /// experts, in the layout the cooperative kernel consumes.
 pub(crate) struct Glm52MoeTp8SliceBank {
+    pub(crate) tp_ranks: usize,
+    pub(crate) slice_i: usize,
+    pub(crate) slice_rows: usize,
     pub(crate) w13: CudaSlice<u8>,        // fp8 [257, 512, 6144]
     pub(crate) w13_scale: CudaSlice<f32>, // f32 [257, 4, 48]
     pub(crate) w2: CudaSlice<u8>,         // fp8 [257, 6144, 256]
@@ -57,6 +60,9 @@ pub(crate) struct Glm52MoeTp8SliceBank {
 /// `bank_idx` is the destination expert slot (routed id, or 256 for shared).
 struct SliceStaging {
     rank: usize,
+    tp_ranks: usize,
+    slice_i: usize,
+    slice_rows: usize,
     w13: Vec<u8>,
     w13_scale: Vec<u8>,
     w2: Vec<u8>,
@@ -64,23 +70,41 @@ struct SliceStaging {
 }
 
 impl SliceStaging {
-    fn new(rank: usize) -> Self {
-        Self {
+    fn new(rank: usize, tp_ranks: usize) -> Result<Self> {
+        ensure!(
+            tp_ranks > 0 && INTERMEDIATE.is_multiple_of(tp_ranks),
+            "GLM5.2 TP slice count {tp_ranks} must divide expert intermediate {INTERMEDIATE}"
+        );
+        ensure!(
+            rank < tp_ranks,
+            "GLM5.2 TP slice rank {rank} out of range for {tp_ranks} ranks"
+        );
+        let slice_i = INTERMEDIATE / tp_ranks;
+        let slice_rows = 2 * slice_i;
+        ensure!(
+            slice_i.is_multiple_of(QUANT_GROUP) && slice_rows.is_multiple_of(QUANT_GROUP),
+            "GLM5.2 TP slice geometry must align to FP8 quant group {QUANT_GROUP}: \
+             slice_i={slice_i}, slice_rows={slice_rows}"
+        );
+        Ok(Self {
             rank,
-            w13: vec![0u8; W13_SLICE_BYTES],
-            w13_scale: vec![0u8; W13_SLICE_SCALE_F32 * 4],
-            w2: vec![0u8; W2_SLICE_BYTES],
-            w2_scale: vec![0u8; W2_SLICE_SCALE_F32 * 4],
-        }
+            tp_ranks,
+            slice_i,
+            slice_rows,
+            w13: vec![0u8; BANK * slice_rows * H],
+            w13_scale: vec![0u8; BANK * (slice_rows / QUANT_GROUP) * (H / QUANT_GROUP) * 4],
+            w2: vec![0u8; BANK * H * slice_i],
+            w2_scale: vec![0u8; BANK * (H / QUANT_GROUP) * (slice_i / QUANT_GROUP) * 4],
+        })
     }
 
     /// gate/up [2048, 6144]: rows r*256..(r+1)*256 land at slice rows 0..256
     /// (gate) / 256..512 (up) — one contiguous copy each.
     fn put_w13_weight(&mut self, bank_idx: usize, is_up: bool, src: &[u8]) {
         debug_assert_eq!(src.len(), INTERMEDIATE * H);
-        let rows = SLICE_I; // 256 rows per projection per rank
+        let rows = self.slice_i; // rows per projection per rank
         let src_off = self.rank * rows * H;
-        let dst_off = bank_idx * SLICE_ROWS * H + if is_up { SLICE_I * H } else { 0 };
+        let dst_off = bank_idx * self.slice_rows * H + if is_up { self.slice_i * H } else { 0 };
         self.w13[dst_off..dst_off + rows * H].copy_from_slice(&src[src_off..src_off + rows * H]);
     }
 
@@ -92,10 +116,10 @@ impl SliceStaging {
             (INTERMEDIATE / QUANT_GROUP) * (H / QUANT_GROUP) * 4
         );
         let row_bytes = (H / QUANT_GROUP) * 4; // 48 f32
-        let blocks = SLICE_I / QUANT_GROUP; // 2
+        let blocks = self.slice_i / QUANT_GROUP;
         let src_off = self.rank * blocks * row_bytes;
-        let dst_off =
-            (bank_idx * (SLICE_ROWS / QUANT_GROUP) + if is_up { blocks } else { 0 }) * row_bytes;
+        let dst_off = (bank_idx * (self.slice_rows / QUANT_GROUP) + if is_up { blocks } else { 0 })
+            * row_bytes;
         self.w13_scale[dst_off..dst_off + blocks * row_bytes]
             .copy_from_slice(&src[src_off..src_off + blocks * row_bytes]);
     }
@@ -104,19 +128,19 @@ impl SliceStaging {
     /// gather into [6144, 256].
     fn put_w2_weight(&mut self, bank_idx: usize, src: &[u8]) {
         debug_assert_eq!(src.len(), W2_N * W2_K);
-        let dst_base = bank_idx * H * SLICE_I;
-        let src_col = self.rank * SLICE_I;
+        let dst_base = bank_idx * H * self.slice_i;
+        let src_col = self.rank * self.slice_i;
         for row in 0..H {
-            let dst = dst_base + row * SLICE_I;
+            let dst = dst_base + row * self.slice_i;
             let src_off = row * W2_K + src_col;
-            self.w2[dst..dst + SLICE_I].copy_from_slice(&src[src_off..src_off + SLICE_I]);
+            self.w2[dst..dst + self.slice_i].copy_from_slice(&src[src_off..src_off + self.slice_i]);
         }
     }
 
     /// down scale f32 [48, 16]: column blocks 2r..2r+2 of every row block.
     fn put_w2_scale(&mut self, bank_idx: usize, src: &[u8]) {
         debug_assert_eq!(src.len(), W2_SCALE_ROWS * W2_SCALE_COLS * 4);
-        let blocks = SLICE_I / QUANT_GROUP; // 2
+        let blocks = self.slice_i / QUANT_GROUP;
         let dst_base = bank_idx * W2_SCALE_ROWS * blocks * 4;
         let src_col = self.rank * blocks * 4;
         for row in 0..W2_SCALE_ROWS {
@@ -135,6 +159,9 @@ impl SliceStaging {
             Ok(dst)
         };
         Ok(Glm52MoeTp8SliceBank {
+            tp_ranks: self.tp_ranks,
+            slice_i: self.slice_i,
+            slice_rows: self.slice_rows,
             w13: htod(&self.w13)?,
             w13_scale: retype_owned::<f32>(&ctx.stream, htod(&self.w13_scale)?)?,
             w2: htod(&self.w2)?,
@@ -146,6 +173,7 @@ impl SliceStaging {
 /// Second-pass load of one pilot layer's TP8 slice bank for `rank`: re-reads
 /// every expert's fp8 tensors (plus the shared expert) from the checkpoint
 /// shards and gathers this rank's 1/8-I slice host-side, then uploads.
+#[allow(dead_code)] // Used by GPU oracle gates; production uses topology-aware load_tp_slice_layer.
 pub(crate) fn load_tp8_slice_layer(
     ctx: &DeviceContext,
     model_path: &Path,
@@ -153,7 +181,23 @@ pub(crate) fn load_tp8_slice_layer(
     rank: usize,
     layer: usize,
 ) -> Result<Glm52MoeTp8SliceBank> {
-    ensure!(rank < RANKS, "TP8 rank {rank} out of range");
+    load_tp_slice_layer(ctx, model_path, manifest, rank, RANKS, layer)
+}
+
+/// Second-pass load of one tensor-replicated MoE slice bank for `rank`.
+/// TP8 uses 1/8-intermediate slices; TP4 uses 1/4-intermediate slices.
+pub(crate) fn load_tp_slice_layer(
+    ctx: &DeviceContext,
+    model_path: &Path,
+    manifest: &Glm52WeightManifest,
+    rank: usize,
+    tp_ranks: usize,
+    layer: usize,
+) -> Result<Glm52MoeTp8SliceBank> {
+    ensure!(
+        rank < tp_ranks,
+        "TP rank {rank} out of range for {tp_ranks}"
+    );
     // (name, bank_idx, projection kind) for all 257 experts x 6 tensors.
     #[derive(Clone, Copy)]
     enum Kind {
@@ -200,7 +244,7 @@ pub(crate) fn load_tp8_slice_layer(
             .push((name, bank_idx, kind));
     }
 
-    let mut staging = SliceStaging::new(rank);
+    let mut staging = SliceStaging::new(rank, tp_ranks)?;
     let mut placed = 0usize;
     for (shard, tensors) in by_shard {
         let path = model_path.join(&shard);
@@ -251,9 +295,10 @@ struct Glm52Tp8LlVas {
 
 /// Cross-rank rendezvous for LL buffer mappings: every rank publishes its
 /// per-accessor VA tables (or its setup failure, as a poison pill) and blocks
-/// until all 8 are in. Also owns the shutdown-side rendezvous so no rank
+/// until the topology's ranks are in. Also owns the shutdown-side rendezvous so no rank
 /// unmaps LL buffers a peer's in-flight kernels could still be reading.
 pub(crate) struct Glm52Tp8Exchange {
+    rank_count: usize,
     slots: Mutex<[Option<Result<Glm52Tp8LlVas, String>>; RANKS]>,
     all_in: Condvar,
     departed: Mutex<usize>,
@@ -261,8 +306,13 @@ pub(crate) struct Glm52Tp8Exchange {
 }
 
 impl Glm52Tp8Exchange {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(rank_count: usize) -> Self {
+        assert!(
+            rank_count > 0 && rank_count <= RANKS,
+            "TP exchange rank count out of range"
+        );
         Self {
+            rank_count,
             slots: Mutex::new(std::array::from_fn(|_| None)),
             all_in: Condvar::new(),
             departed: Mutex::new(0),
@@ -281,27 +331,35 @@ impl Glm52Tp8Exchange {
     ) -> Result<[Glm52Tp8LlVas; RANKS]> {
         let mut slots = self.slots.lock().expect("TP8 exchange poisoned");
         ensure!(
+            rank < self.rank_count,
+            "TP exchange rank {rank} out of range for {} ranks",
+            self.rank_count
+        );
+        ensure!(
             slots[rank].is_none(),
-            "TP8 exchange rank {rank} published twice"
+            "TP exchange rank {rank} published twice"
         );
         slots[rank] = Some(vas);
         self.all_in.notify_all();
-        while slots.iter().any(Option::is_none) {
+        while slots[..self.rank_count].iter().any(Option::is_none) {
             let (guard, timeout) = self
                 .all_in
                 .wait_timeout(slots, Duration::from_secs(120))
                 .expect("TP8 exchange poisoned");
             slots = guard;
-            if timeout.timed_out() && slots.iter().any(Option::is_none) {
-                let missing: Vec<usize> = (0..RANKS).filter(|&r| slots[r].is_none()).collect();
+            if timeout.timed_out() && slots[..self.rank_count].iter().any(Option::is_none) {
+                let missing: Vec<usize> = (0..self.rank_count)
+                    .filter(|&r| slots[r].is_none())
+                    .collect();
                 bail!(
-                    "TP8 LL rendezvous timed out after 120s — rank(s) {missing:?} never \
+                    "TP LL rendezvous timed out after 120s — rank(s) {missing:?} never \
                      published (worker died before reaching the exchange?)"
                 );
             }
         }
         let failed: Vec<String> = slots
             .iter()
+            .take(self.rank_count)
             .enumerate()
             .filter_map(|(r, s)| match s {
                 Some(Err(err)) => Some(format!("rank {r}: {err}")),
@@ -310,15 +368,22 @@ impl Glm52Tp8Exchange {
             .collect();
         ensure!(
             failed.is_empty(),
-            "TP8 LL setup failed on peer rank(s): {}",
+            "TP LL setup failed on peer rank(s): {}",
             failed.join("; ")
         );
         Ok(std::array::from_fn(|r| {
-            *slots[r]
-                .as_ref()
-                .expect("checked above")
-                .as_ref()
-                .expect("failures bailed above")
+            if r < self.rank_count {
+                *slots[r]
+                    .as_ref()
+                    .expect("checked above")
+                    .as_ref()
+                    .expect("failures bailed above")
+            } else {
+                Glm52Tp8LlVas {
+                    rs: [0; RANKS],
+                    ar: [0; RANKS],
+                }
+            }
         }))
     }
 
@@ -333,17 +398,18 @@ impl Glm52Tp8Exchange {
         let mut departed = self.departed.lock().expect("TP8 exchange poisoned");
         *departed += 1;
         self.all_out.notify_all();
-        while *departed < RANKS {
+        while *departed < self.rank_count {
             let (guard, timeout) = self
                 .all_out
                 .wait_timeout(departed, Duration::from_secs(120))
                 .expect("TP8 exchange poisoned");
             departed = guard;
-            if timeout.timed_out() && *departed < RANKS {
+            if timeout.timed_out() && *departed < self.rank_count {
                 log::warn!(
-                    "GLM5.2 rank {rank} TP8 teardown rendezvous timed out ({}/{RANKS} arrived) \
+                    "GLM5.2 rank {rank} TP teardown rendezvous timed out ({}/{} arrived) \
                      — unmapping anyway; a peer rank likely died",
-                    *departed
+                    *departed,
+                    self.rank_count
                 );
                 return;
             }
@@ -351,23 +417,79 @@ impl Glm52Tp8Exchange {
     }
 }
 
-/// A rank's complete TP8 MoE runtime: the state plus the per-layer slice
-/// banks (keyed by absolute layer index).
+/// A rank's complete tensor-replicated MoE runtime: the state plus the
+/// per-layer slice banks (keyed by absolute layer index).
 pub(crate) struct Glm52MoeTp8Rank {
-    pub(crate) state: Glm52MoeTp8State,
+    pub(crate) state: Glm52MoeTpState,
     pub(crate) slices: BTreeMap<usize, Glm52MoeTp8SliceBank>,
 }
 
 impl Glm52MoeTp8Rank {
-    /// This layer's TP8 pieces: runtime state, LL slot index (the layer's
+    /// This layer's TP pieces: runtime state, LL slot index (the layer's
     /// position among this rank's sliced layers), and slice bank.
     pub(crate) fn layer_bank(
         &mut self,
         layer: usize,
-    ) -> Option<(&mut Glm52MoeTp8State, usize, &Glm52MoeTp8SliceBank)> {
+    ) -> Option<(&mut Glm52MoeTpState, usize, &Glm52MoeTp8SliceBank)> {
         let slot = self.slices.range(..layer).count();
         let bank = self.slices.get(&layer)?;
         Some((&mut self.state, slot, bank))
+    }
+}
+
+pub(crate) enum Glm52MoeTpState {
+    Tp8(Glm52MoeTp8State),
+    Tp4(Glm52MoeTp4State),
+}
+
+impl Glm52MoeTpState {
+    pub(crate) fn advance_epoch(&mut self, ctx: &DeviceContext) -> Result<()> {
+        match self {
+            Self::Tp8(state) => state.advance_epoch(ctx),
+            Self::Tp4(state) => state.advance_epoch(ctx),
+        }
+    }
+
+    pub(crate) fn stage_active_rows(&mut self, ctx: &DeviceContext, active: usize) -> Result<()> {
+        match self {
+            Self::Tp8(state) => state.stage_active_rows(ctx, active),
+            Self::Tp4(state) => state.stage_active_rows(ctx, active),
+        }
+    }
+
+    pub(crate) fn attn_ar_launch(
+        &mut self,
+        ctx: &DeviceContext,
+        layer_slot: usize,
+        rows: usize,
+        partial: &CudaSlice<bf16>,
+        out: &mut CudaSlice<bf16>,
+    ) -> Result<()> {
+        match self {
+            Self::Tp8(state) => state.attn_ar_launch(ctx, layer_slot, rows, partial, out),
+            Self::Tp4(state) => state.attn_ar_launch(ctx, layer_slot, rows, partial, out),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward(
+        &mut self,
+        ctx: &DeviceContext,
+        slot: usize,
+        bank: &Glm52MoeTp8SliceBank,
+        normed2: &CudaSlice<bf16>,
+        topk_idx: &CudaSlice<i32>,
+        topk_prob: &CudaSlice<f32>,
+        mlp_out: &mut CudaSlice<bf16>,
+    ) -> Result<()> {
+        match self {
+            Self::Tp8(state) => {
+                state.forward(ctx, slot, bank, normed2, topk_idx, topk_prob, mlp_out)
+            }
+            Self::Tp4(state) => {
+                state.forward(ctx, slot, bank, normed2, topk_idx, topk_prob, mlp_out)
+            }
+        }
     }
 }
 
@@ -549,6 +671,14 @@ impl Glm52MoeTp8State {
     ) -> Result<()> {
         debug_assert_eq!(GLM52_HIDDEN, H);
         debug_assert_eq!(GLM52_TP8_TOKENS, RANKS);
+        ensure!(
+            bank.tp_ranks == RANKS && bank.slice_i == SLICE_I && bank.slice_rows == SLICE_ROWS,
+            "TP8 CUDA launcher received TP{} slice geometry (slice_i={}, slice_rows={}); \
+             TP4 needs a dedicated CUDA launch variant",
+            bank.tp_ranks,
+            bank.slice_i,
+            bank.slice_rows
+        );
         let mut bufs = Glm52MoeTp8Buffers {
             guidx: &mut self.guidx,
             guprob: &mut self.guprob,
@@ -563,6 +693,190 @@ impl Glm52MoeTp8State {
             active_rows: Some(&self.active_rows_dev),
         };
         glm52_moe_tp8_layer_launch(
+            ctx,
+            slot,
+            normed2,
+            topk_idx,
+            topk_prob,
+            &bank.w13,
+            &bank.w13_scale,
+            &bank.w2,
+            &bank.w2_scale,
+            mlp_out,
+            &mut bufs,
+            self.rank,
+            self.grid_blocks,
+        )
+    }
+}
+
+/// Per-rank TP4 runtime state: same replicated-row protocol as TP8, but four
+/// ranks each own a 1/4 intermediate slice.
+pub(crate) struct Glm52MoeTp4State {
+    rank: usize,
+    grid_blocks: usize,
+    _rs: Glm52Tp4LlBuffer,
+    _ar: Glm52Tp4LlBuffer,
+    rs_local: u64,
+    ar_local: u64,
+    peer_rs: [u64; GLM52_TP4_RANKS],
+    peer_ar: [u64; GLM52_TP4_RANKS],
+    epoch_dev: CudaSlice<u64>,
+    active_rows_dev: CudaSlice<i32>,
+    guidx: CudaSlice<i32>,
+    guprob: CudaSlice<f32>,
+    gucnt: CudaSlice<i32>,
+    gused: CudaSlice<i32>,
+    bpart: CudaSlice<f32>,
+    ug: CudaSlice<bf16>,
+    cpart: CudaSlice<f32>,
+}
+
+impl Glm52MoeTp4State {
+    pub(crate) fn new(
+        ctx: &DeviceContext,
+        rank: usize,
+        device_ordinal: usize,
+        exchange: &Glm52Tp8Exchange,
+        slots: usize,
+        ar_slots: usize,
+    ) -> Result<Self> {
+        let prep = (|| -> Result<(Glm52Tp4LlBuffer, Glm52Tp4LlBuffer)> {
+            ensure!(rank < GLM52_TP4_RANKS, "TP4 rank {rank} out of range");
+            ensure!(
+                slots > 0 && ar_slots > 0,
+                "TP4 state needs at least one layer slot (moe {slots}, ar {ar_slots})"
+            );
+            ensure!(
+                device_ordinal < GLM52_TP4_RANKS,
+                "TP4 device ordinal {device_ordinal} outside the 0..{} fleet",
+                GLM52_TP4_RANKS
+            );
+            let fleet: Vec<usize> = (0..GLM52_TP4_RANKS).collect();
+            let rs = Glm52Tp4LlBuffer::alloc(slots * GLM52_TP4_RS_SLOT_PACKETS * 16, &fleet)?;
+            let ar = Glm52Tp4LlBuffer::alloc(glm52_tp4_ar_buffer_bytes(ar_slots), &fleet)?;
+            Ok((rs, ar))
+        })();
+        let vas = prep
+            .as_ref()
+            .map(|(rs, ar)| {
+                let mut out = Glm52Tp8LlVas {
+                    rs: [0; RANKS],
+                    ar: [0; RANKS],
+                };
+                for i in 0..GLM52_TP4_RANKS {
+                    out.rs[i] = rs.addr_for(i);
+                    out.ar[i] = ar.addr_for(i);
+                }
+                out
+            })
+            .map_err(|err| format!("{err:#}"));
+        let table = exchange.publish_and_wait(rank, vas)?;
+        let (rs, ar) = prep.expect("own failure would have surfaced via publish_and_wait");
+        let rs_slot = GLM52_TP4_HIDDEN * 16;
+        let ar_slot = GLM52_TP4_AR_CHUNK_PACKETS * 16;
+        let peer_rs =
+            std::array::from_fn(|p| table[p].rs[device_ordinal] + (rank * rs_slot) as u64);
+        let peer_ar =
+            std::array::from_fn(|p| table[p].ar[device_ordinal] + (rank * ar_slot) as u64);
+        let mut epoch_dev = ctx.stream.alloc_zeros::<u64>(1)?;
+        ctx.stream.memcpy_htod(&[1u64], &mut epoch_dev)?;
+        let mut active_rows_dev = ctx.stream.alloc_zeros::<i32>(1)?;
+        ctx.stream
+            .memcpy_htod(&[GLM52_TP4_TOKENS as i32], &mut active_rows_dev)?;
+        let grid_blocks = glm52_moe_tp4_max_blocks()?;
+        Ok(Self {
+            rank,
+            grid_blocks,
+            rs_local: rs.addr_for(device_ordinal),
+            ar_local: ar.addr_for(device_ordinal),
+            _rs: rs,
+            _ar: ar,
+            peer_rs,
+            peer_ar,
+            epoch_dev,
+            active_rows_dev,
+            guidx: ctx.stream.alloc_zeros(GLM52_TP4_UNION_MAX)?,
+            guprob: ctx.stream.alloc_zeros(GLM52_TP4_GUPROB_LEN)?,
+            gucnt: ctx.stream.alloc_zeros(1)?,
+            gused: ctx.stream.alloc_zeros(EXPERTS)?,
+            bpart: ctx.stream.alloc_zeros(GLM52_TP4_BPART_LEN)?,
+            ug: ctx.stream.alloc_zeros(GLM52_TP4_UG_LEN)?,
+            cpart: ctx.stream.alloc_zeros(GLM52_TP4_CPART_LEN)?,
+        })
+    }
+
+    pub(crate) fn advance_epoch(&mut self, ctx: &DeviceContext) -> Result<()> {
+        glm52_moe_tp4_epoch_advance(ctx, &mut self.epoch_dev)
+    }
+
+    pub(crate) fn stage_active_rows(&mut self, ctx: &DeviceContext, active: usize) -> Result<()> {
+        ensure!(
+            active <= GLM52_TP4_TOKENS,
+            "TP4 active rows {active} exceeds the bucket {GLM52_TP4_TOKENS}"
+        );
+        ctx.stream
+            .memcpy_htod(&[active as i32], &mut self.active_rows_dev)?;
+        Ok(())
+    }
+
+    pub(crate) fn attn_ar_launch(
+        &mut self,
+        ctx: &DeviceContext,
+        layer_slot: usize,
+        rows: usize,
+        partial: &CudaSlice<bf16>,
+        out: &mut CudaSlice<bf16>,
+    ) -> Result<()> {
+        glm52_tp4_ar_launch(
+            ctx,
+            layer_slot,
+            rows,
+            partial,
+            out,
+            self.ar_local,
+            self.peer_ar,
+            &self.epoch_dev,
+            Some(&self.active_rows_dev),
+            self.rank,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward(
+        &mut self,
+        ctx: &DeviceContext,
+        slot: usize,
+        bank: &Glm52MoeTp8SliceBank,
+        normed2: &CudaSlice<bf16>,
+        topk_idx: &CudaSlice<i32>,
+        topk_prob: &CudaSlice<f32>,
+        mlp_out: &mut CudaSlice<bf16>,
+    ) -> Result<()> {
+        debug_assert_eq!(GLM52_HIDDEN, GLM52_TP4_HIDDEN);
+        ensure!(
+            bank.tp_ranks == GLM52_TP4_RANKS
+                && bank.slice_i == GLM52_TP4_SLICE_I
+                && bank.slice_rows == GLM52_TP4_SLICE_ROWS,
+            "TP4 CUDA launcher received TP{} slice geometry (slice_i={}, slice_rows={})",
+            bank.tp_ranks,
+            bank.slice_i,
+            bank.slice_rows
+        );
+        let mut bufs = Glm52MoeTp4Buffers {
+            guidx: &mut self.guidx,
+            guprob: &mut self.guprob,
+            gucnt: &mut self.gucnt,
+            gused: &mut self.gused,
+            bpart: &mut self.bpart,
+            ug: &mut self.ug,
+            cpart: &mut self.cpart,
+            rs_local: self.rs_local,
+            peer_rs: self.peer_rs,
+            epoch_dev: &mut self.epoch_dev,
+            active_rows: Some(&self.active_rows_dev),
+        };
+        glm52_moe_tp4_layer_launch(
             ctx,
             slot,
             normed2,
@@ -599,7 +913,7 @@ mod tests {
             }
         }
         for rank in 0..RANKS {
-            let mut s = SliceStaging::new(rank);
+            let mut s = SliceStaging::new(rank, RANKS).expect("TP8 slice staging");
             s.put_w13_weight(3, false, &w13_src);
             s.put_w13_weight(3, true, &w13_src);
             s.put_w2_weight(3, &w2_src);
@@ -642,7 +956,7 @@ mod tests {
             }
         }
         for rank in 0..RANKS {
-            let mut s = SliceStaging::new(rank);
+            let mut s = SliceStaging::new(rank, RANKS).expect("TP8 slice staging");
             s.put_w13_scale(0, false, &w13s);
             s.put_w13_scale(0, true, &w13s);
             s.put_w2_scale(0, &w2s);
@@ -659,6 +973,46 @@ mod tests {
                     let expect = (2 * rank + b) as f32;
                     assert_eq!(read_f32(&s.w2_scale, row * 2 + b), expect);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn tp4_slice_staging_geometry() {
+        let mut w13_src = vec![0u8; INTERMEDIATE * H];
+        let tp4_slice_i = INTERMEDIATE / 4;
+        for (row, chunk) in w13_src.chunks_mut(H).enumerate() {
+            chunk.fill((row / tp4_slice_i) as u8);
+        }
+        let mut w2_src = vec![0u8; W2_N * W2_K];
+        for chunk in w2_src.chunks_mut(W2_K) {
+            for (col_block, seg) in chunk.chunks_mut(tp4_slice_i).enumerate() {
+                seg.fill(col_block as u8);
+            }
+        }
+
+        for rank in 0..4 {
+            let mut s = SliceStaging::new(rank, 4).expect("TP4 slice staging");
+            assert_eq!(s.slice_i, 512);
+            assert_eq!(s.slice_rows, 1024);
+            s.put_w13_weight(2, false, &w13_src);
+            s.put_w13_weight(2, true, &w13_src);
+            s.put_w2_weight(2, &w2_src);
+
+            let base = 2 * s.slice_rows * H;
+            assert!(
+                s.w13[base..base + s.slice_rows * H]
+                    .iter()
+                    .all(|&b| b == rank as u8)
+            );
+            let w2_base = 2 * H * s.slice_i;
+            for row in [0usize, 17, H - 1] {
+                assert!(
+                    s.w2[w2_base + row * s.slice_i..w2_base + (row + 1) * s.slice_i]
+                        .iter()
+                        .all(|&b| b == rank as u8),
+                    "rank {rank} row {row}"
+                );
             }
         }
     }

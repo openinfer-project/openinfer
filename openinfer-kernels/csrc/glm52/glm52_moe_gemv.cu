@@ -497,9 +497,11 @@ constexpr int kBatchedWarps = 4;
 bool whitelisted_linear_shape(int n, int k) {
   if (n == 2048  && k == 6144)  return true;  // q_a / shared gate,up
   if (n == 16384 && k == 2048)  return true;  // q_b
+  if (n == 4096  && k == 2048)  return true;  // q_b attention-TP 16-head shard
   if (n == 2048  && k == 2048)  return true;  // q_b attention-TP 8-head shard
   if (n == 576   && k == 6144)  return true;  // kv_a + rope (partial-N: 576%128!=0)
   if (n == 6144  && k == 16384) return true;  // o_proj
+  if (n == 6144  && k == 4096)  return true;  // o_proj attention-TP 16-head shard
   if (n == 24576 && k == 6144)  return true;  // dense gate|up (packed)
   if (n == 6144  && k == 12288) return true;  // dense down
   if (n == 4096  && k == 6144)  return true;  // shared gate|up (packed)

@@ -160,7 +160,7 @@ pub(crate) fn glm52_layer_attention_half(
     carry_ready: &mut bool,
     parity: usize,
     first_layer: bool,
-    tp8_ar: Option<(&mut crate::moe_tp8::Glm52MoeTp8State, usize)>,
+    tp8_ar: Option<(&mut crate::moe_tp8::Glm52MoeTpState, usize)>,
 ) -> Result<()> {
     // Attention-TP: a head-sharded layer (8 of 64 heads) produces an o_proj
     // PARTIAL that must cross the AR brick before the residual add; holding
