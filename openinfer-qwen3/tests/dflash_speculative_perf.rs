@@ -56,6 +56,7 @@ fn launch_options(draft: Option<PathBuf>) -> Qwen3LaunchOptions {
         device_ordinal: 0,
         tp_size: 1,
         cuda_graph: true,
+        dump_graph_png: None,
         offload: Qwen3OffloadOptions::disabled(),
         no_prefix_cache: true,
         max_prefill_tokens: DEFAULT_MAX_PREFILL_TOKENS,

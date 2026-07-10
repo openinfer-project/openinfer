@@ -11,6 +11,7 @@ mod plan;
 mod resolve;
 
 use std::collections::{HashSet, VecDeque};
+use std::path::Path;
 use std::thread;
 
 use anyhow::Result;
@@ -151,6 +152,7 @@ pub(crate) fn start_qwen3(
     decode_overlap: crate::DecodeOverlap,
     dflash_draft_model_path: Option<&str>,
     enable_kv_events: bool,
+    dump_graph_png: Option<&Path>,
 ) -> Result<EngineHandle> {
     let mut executor = Qwen3Executor::from_runtime_with_lora_options(
         model_path,
@@ -163,6 +165,17 @@ pub(crate) fn start_qwen3(
         memory_options,
         enable_kv_events,
     )?;
+    if let Some(path) = dump_graph_png {
+        let summary = executor.dump_decode_graph_png(path)?;
+        info!(
+            "Qwen3 decode CUDA Graph exported: nodes={}, kernels={}, edges={}, dot={}, png={}",
+            summary.nodes,
+            summary.kernels,
+            summary.edges,
+            summary.dot_path.display(),
+            summary.png_path.display()
+        );
+    }
     executor.set_no_prefix_cache(no_prefix_cache);
     executor.enable_decode_overlap(decode_overlap)?;
     // Speculative decoding loads its draft model after the target is up (the

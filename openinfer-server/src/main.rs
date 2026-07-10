@@ -210,6 +210,7 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
                     device_ordinal: args.device_ordinal,
                     tp_size: args.tp_size,
                     cuda_graph: args.cuda_graph,
+                    dump_graph_png: args.dump_graph_png.clone(),
                     offload,
                     no_prefix_cache: args.no_prefix_cache,
                     max_prefill_tokens: args

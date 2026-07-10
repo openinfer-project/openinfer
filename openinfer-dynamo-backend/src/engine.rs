@@ -145,6 +145,7 @@ impl OpeninferBackend {
             device_ordinal: args.device_ordinal,
             tp_size: 1,
             cuda_graph: !args.no_cuda_graph,
+            dump_graph_png: None,
             offload: Qwen3OffloadOptions::disabled(),
             // Keep the prefix cache on: it is both a single-worker win and the
             // source of the KV store/remove events published to the router for

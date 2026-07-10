@@ -25,6 +25,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 
 | Path | TL;DR |
 | --- | --- |
+| `models/qwen3/cuda-graph-png.md` | `--dump-graph-png PATH` exports the live Qwen3 rank-0, batch-1 SplitKv decode graph as an unfolded detailed DOT and a 192-DPI folded PNG; Qwen3-4B yields 507 kernels and 506 edges, with CUDA Driver API 12.3 as the repository floor. |
 | `models/qwen3/serving-performance.md` | **Authoritative Qwen3 serving perf numbers** (4B + 8B QPS sweep vs vLLM 0.24.0, footprint, DSpark/DFlash spec decode, warm prefix-cache TTFT, KV offload). All data reproducible via `tools/bench/run_serving_bench.sh`. |
 | `models/qwen3/serving-perf-5090.md` | Tuning history behind the serving numbers: unified-step attention fusion, batched step tail (#345), chunked prefill, cuBLAS 12.9 N=1025 cliff, cublasLt per-shape tuning, split-KV ≤bs32. Latest data lives in `serving-performance.md`. |
 | `models/qwen3/decode-attention.md` | Decode attention path (`NonPartition` vs `SplitKv`) is chosen by **batch (CTA-vs-SM), not context**: the old `max_seq_len>=1024` gate stranded bs=1 mid-context decode on the SM-starved NonPartition kernel — a tpot hump peaking ~ctx800, cliff-dropping at ctx1024. Removing it flattens bs=1 tpot (5090 −16% / 5070 Ti −7.5% @ctx800); kept `padded_bs<=32` (bs≤8 wins big, bs16 even, bs32 <1% loss). Also records the SplitKv chunk-size/grid policy (`Tuned` adaptive vs `Pin`/`PerToken` fixed-split batch-invariance, #435/#438). Two-card A/B + CUDA-graph capture + golden-gate verified. |

@@ -104,6 +104,7 @@ fn launch_options(draft: Option<PathBuf>) -> Qwen3LaunchOptions {
         device_ordinal: 0,
         tp_size: 1,
         cuda_graph: true,
+        dump_graph_png: None,
         offload: Qwen3OffloadOptions::disabled(),
         // The speculative engine forces the prefix cache off; match it on the
         // baseline so both take the same cold prefill path.

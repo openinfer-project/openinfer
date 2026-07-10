@@ -1,9 +1,11 @@
-//! TP=2 launch with CUDA Graph on — decode replays the graphs pre-captured at
-//! startup, so this gates both the sweep and graph-on concurrent serving.
+//! TP=2 launch with CUDA Graph on — when rendering tools are available, startup
+//! dumps rank 0's pre-captured bs1 graph, then decode replays captured graphs
+//! under concurrent serving.
 //! The drain loop polls with a deadline so a deadlock fails instead of wedging the run.
 
 use std::mem::ManuallyDrop;
 use std::path::Path;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use openinfer_core::engine::{GenerateRequest, TokenEvent, TokenSink};
@@ -39,8 +41,21 @@ fn cuda_device_count() -> usize {
     cudarc::driver::CudaContext::device_count().map_or(0, |n| n.max(0) as usize)
 }
 
+fn graph_render_tools_available() -> bool {
+    let succeeds = |program: &str, args: &[&str]| {
+        Command::new(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    };
+    succeeds("dot", &["-Tpng:cairo"]) && succeeds("c++filt", &["--version"])
+}
+
 #[test]
-fn tp2_concurrent_decode_completes() {
+fn tp2_graph_dump_when_available_and_concurrent_decode_complete() {
     let Some(model_path) = model_path_or_skip() else {
         return;
     };
@@ -49,11 +64,21 @@ fn tp2_concurrent_decode_completes() {
         eprintln!("skipping tp2 concurrent decode: needs >=2 GPUs, have {gpus}");
         return;
     }
+    let dump_dir = tempfile::tempdir().expect("create graph dump directory");
+    let dump_png = dump_dir.path().join("tp2-decode.png");
+    let dump_enabled = graph_render_tools_available();
+    if dump_enabled {
+        openinfer_core::cuda_graph::validate_graph_dump_request(&dump_png)
+            .expect("validate TP graph export request");
+    } else {
+        eprintln!("TP graph export coverage disabled: Graphviz Cairo or c++filt unavailable");
+    }
 
     let options = Qwen3LaunchOptions {
         device_ordinal: 0,
         tp_size: 2,
         cuda_graph: true,
+        dump_graph_png: dump_enabled.then(|| dump_png.clone()),
         offload: Qwen3OffloadOptions::disabled(),
         no_prefix_cache: false,
         max_prefill_tokens: DEFAULT_MAX_PREFILL_TOKENS,
@@ -75,6 +100,14 @@ fn tp2_concurrent_decode_completes() {
     let handle = ManuallyDrop::new(
         openinfer_qwen3::launch(Path::new(&model_path), options).expect("launch tp2 engine"),
     );
+    if dump_enabled {
+        let dump_dot = dump_png.with_extension("dot");
+        assert!(dump_png.is_file(), "TP graph PNG was not exported");
+        assert!(dump_dot.is_file(), "TP graph DOT was not exported");
+        let dot = std::fs::read_to_string(&dump_dot).expect("read TP graph DOT");
+        assert!(dot.contains("dynamic_shared_mem_bytes="));
+        assert!(dot.contains(" -> "), "TP graph DOT has no dependency edges");
+    }
 
     let tokenizer = common::load_tokenizer(&model_path);
     // Submit all up front so they coexist in the engine and form real decode batches.
