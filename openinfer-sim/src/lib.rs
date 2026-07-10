@@ -6,12 +6,15 @@ use openinfer_engine::engine::{
 };
 use tokio::sync::mpsc;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct SimulatedEngineConfig {
     base_ttft_ms: f64,
     prefill_tokens_per_ms: f64,
     tpot_ms: f64,
     fallback_token_id: u32,
+    /// Explicit completion token-id sequence to replay verbatim. Empty (the
+    /// default) keeps the legacy behaviour of cycling the prompt tokens.
+    scripted_completion: Vec<u32>,
 }
 
 impl SimulatedEngineConfig {
@@ -39,7 +42,14 @@ impl SimulatedEngineConfig {
             prefill_tokens_per_ms,
             tpot_ms,
             fallback_token_id,
+            scripted_completion: Vec::new(),
         })
+    }
+
+    /// Replay `ids` verbatim as the completion for every request
+    pub fn with_scripted_completion(mut self, ids: Vec<u32>) -> Self {
+        self.scripted_completion = ids;
+        self
     }
 
     fn ttft(&self, prompt_tokens: usize) -> Duration {
@@ -58,6 +68,7 @@ impl Default for SimulatedEngineConfig {
             prefill_tokens_per_ms: 100.0,
             tpot_ms: 12.0,
             fallback_token_id: 0,
+            scripted_completion: Vec::new(),
         }
     }
 }
@@ -66,7 +77,7 @@ pub fn start_engine(config: SimulatedEngineConfig) -> EngineHandle {
     let (submit_tx, mut submit_rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         while let Some(req) = submit_rx.recv().await {
-            tokio::spawn(run_simulated_request(req, config));
+            tokio::spawn(run_simulated_request(req, config.clone()));
         }
     });
     EngineHandle::new(submit_tx)
@@ -102,11 +113,18 @@ async fn run_simulated_request(req: GenerateRequest, config: SimulatedEngineConf
         return;
     }
 
-    if req.max_tokens > 0 {
+    let script = &config.scripted_completion;
+    let emit_count = if script.is_empty() {
+        req.max_tokens
+    } else {
+        req.max_tokens.min(script.len())
+    };
+
+    if emit_count > 0 {
         tokio::time::sleep(config.ttft(prompt_len)).await;
     }
 
-    for index in 0..req.max_tokens {
+    for index in 0..emit_count {
         if index > 0 {
             tokio::time::sleep(config.tpot()).await;
         }
@@ -115,12 +133,14 @@ async fn run_simulated_request(req: GenerateRequest, config: SimulatedEngineConf
             logprob: 0.0,
             top_logprobs: Vec::new(),
         });
+        let id = if script.is_empty() {
+            fake_token_id(&req.prompt_tokens, index, config.fallback_token_id)
+        } else {
+            script[index]
+        };
         if req
             .token_tx
-            .send(TokenEvent::Token {
-                id: fake_token_id(&req.prompt_tokens, index, config.fallback_token_id),
-                logprob,
-            })
+            .send(TokenEvent::Token { id, logprob })
             .is_err()
         {
             return;
@@ -128,8 +148,13 @@ async fn run_simulated_request(req: GenerateRequest, config: SimulatedEngineConf
         completion_tokens += 1;
     }
 
+    let finish_reason = if !script.is_empty() && emit_count == script.len() {
+        FinishReason::Stop
+    } else {
+        FinishReason::Length
+    };
     let _ = req.token_tx.send(TokenEvent::Finished {
-        finish_reason: FinishReason::Length,
+        finish_reason,
         prompt_tokens: prompt_len,
         completion_tokens,
     });
@@ -166,6 +191,96 @@ mod tests {
         assert_eq!(fake_token_id(&[7, 9], 1, 42), 9);
         assert_eq!(fake_token_id(&[7, 9], 2, 42), 7);
         assert_eq!(fake_token_id(&[], 0, 42), 42);
+    }
+
+    #[tokio::test]
+    async fn scripted_completion_replays_ids_and_stops() {
+        let config = SimulatedEngineConfig::new(0.0, 100.0, 0.0, 0)
+            .unwrap()
+            .with_scripted_completion(vec![11, 22, 33]);
+        let (token_tx, mut token_rx) = TokenSink::standalone();
+
+        run_simulated_request(
+            GenerateRequest {
+                request_id: Some("req-scripted".to_string()),
+                queued_at_unix_s: Some(1.0),
+                data_parallel_rank: None,
+                // Prompt is irrelevant in scripted mode; output ignores it.
+                prompt_tokens: vec![7, 9],
+                params: SamplingParams::default(),
+                max_tokens: 8,
+                lora_adapter: None,
+                token_tx,
+                logprobs: 0,
+                echo: false,
+            },
+            config,
+        )
+        .await;
+
+        assert!(matches!(
+            token_rx.recv().await.map(|(_, e)| e),
+            Some(TokenEvent::Scheduled { .. })
+        ));
+        for expected in [11u32, 22, 33] {
+            assert!(matches!(
+                token_rx.recv().await.map(|(_, e)| e),
+                Some(TokenEvent::Token { id, .. }) if id == expected
+            ));
+        }
+        // Whole script fit inside max_tokens -> Stop, not Length.
+        assert!(matches!(
+            token_rx.recv().await.map(|(_, e)| e),
+            Some(TokenEvent::Finished {
+                finish_reason: FinishReason::Stop,
+                completion_tokens: 3,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn scripted_completion_truncated_by_max_tokens_is_length() {
+        let config = SimulatedEngineConfig::new(0.0, 100.0, 0.0, 0)
+            .unwrap()
+            .with_scripted_completion(vec![11, 22, 33]);
+        let (token_tx, mut token_rx) = TokenSink::standalone();
+
+        run_simulated_request(
+            GenerateRequest {
+                request_id: Some("req-trunc".to_string()),
+                queued_at_unix_s: Some(1.0),
+                data_parallel_rank: None,
+                prompt_tokens: vec![7],
+                params: SamplingParams::default(),
+                max_tokens: 2,
+                lora_adapter: None,
+                token_tx,
+                logprobs: 0,
+                echo: false,
+            },
+            config,
+        )
+        .await;
+
+        assert!(matches!(
+            token_rx.recv().await.map(|(_, e)| e),
+            Some(TokenEvent::Scheduled { .. })
+        ));
+        for expected in [11u32, 22] {
+            assert!(matches!(
+                token_rx.recv().await.map(|(_, e)| e),
+                Some(TokenEvent::Token { id, .. }) if id == expected
+            ));
+        }
+        assert!(matches!(
+            token_rx.recv().await.map(|(_, e)| e),
+            Some(TokenEvent::Finished {
+                finish_reason: FinishReason::Length,
+                completion_tokens: 2,
+                ..
+            })
+        ));
     }
 
     #[test]
