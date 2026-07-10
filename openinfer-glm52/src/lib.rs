@@ -31,7 +31,11 @@ mod scheduler;
 mod scratch;
 mod weights;
 
-use std::{collections::BTreeSet, path::Path, time::Instant};
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+    time::Instant,
+};
 
 use anyhow::{Context as _, Result, ensure};
 use bytesize::ByteSize;
@@ -88,6 +92,11 @@ pub struct Glm52LaunchOptions {
     /// four-GPU bring-up target using 16 attention heads per rank and 1/4
     /// intermediate MoE slices.
     pub moe_topo: Glm52MoeTopo,
+    /// Export rank 0's already pre-captured whole-step decode graph during
+    /// startup. EP8 and TP4 export bucket 1; TP8 exports its fixed bucket 8.
+    /// The requested PNG gets a complete sibling `.dot` for machine
+    /// inspection.
+    pub dump_graph_png: Option<PathBuf>,
 }
 
 /// Launch-time MoE sharding topology (the expert slab is repacked during
@@ -227,7 +236,11 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
         no_prefix_cache,
         kv_offload,
         moe_topo,
+        dump_graph_png,
     } = options;
+    if let Some(path) = &dump_graph_png {
+        openinfer_core::cuda_graph::validate_graph_dump_request(path)?;
+    }
     match moe_topo {
         Glm52MoeTopo::Ep8 | Glm52MoeTopo::Tp8 => {
             ensure!(
@@ -279,6 +292,7 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
         no_prefix_cache,
         kv_offload,
         moe_topo,
+        dump_graph_png,
     )
 }
 
@@ -448,7 +462,9 @@ fn start_engine(
     no_prefix_cache: bool,
     kv_offload: Option<Glm52KvOffloadOptions>,
     moe_topo: Glm52MoeTopo,
+    dump_graph_png: Option<PathBuf>,
 ) -> Result<EngineHandle> {
+    let dspark_enabled = dspark_path.is_some();
     let startup = validate_startup(model_path, options, moe_topo)?;
     let loaded = load_rank_weights_to_gpu(model_path, &startup, moe_topo)?;
     log::info!(
@@ -466,11 +482,8 @@ fn start_engine(
         .copied()
         .min()
         .expect("at least one rank loaded");
-    let budget = derive_max_model_len(
-        requested_max_model_len,
-        min_free_vram_bytes,
-        dspark_path.is_some(),
-    )?;
+    let budget =
+        derive_max_model_len(requested_max_model_len, min_free_vram_bytes, dspark_enabled)?;
     let max_model_len = budget.max_model_len;
     log::info!(
         "GLM5.2 max_model_len={max_model_len} ({}): min rank free VRAM {} after weights, \
@@ -483,7 +496,7 @@ fn start_engine(
         ByteSize(min_free_vram_bytes as u64),
         ByteSize(budget.arena_bytes as u64),
         model::GLM52_MAX_BATCH_PER_RANK,
-        if dspark_path.is_some() {
+        if dspark_enabled {
             " (dspark lane included)"
         } else {
             ""
@@ -502,29 +515,27 @@ fn start_engine(
     // down, and the launch error surfaces only after the ~100 s DeepEP
     // device timeout. The TP8 LL rendezvous rejecting a topology (poison
     // pill, NVLink probe) is a real failure landing exactly in this window.
-    let rank_arenas = match build_rank_models(&loaded.workers, max_model_len, moe_topo) {
-        Ok(rank_arenas) => rank_arenas,
-        Err(err) => {
-            for worker in &loaded.workers {
-                let _ = worker.request_shutdown();
+    let rank_arenas =
+        match build_rank_models(&loaded.workers, max_model_len, moe_topo, dspark_enabled) {
+            Ok(rank_arenas) => rank_arenas,
+            Err(err) => {
+                for worker in &loaded.workers {
+                    let _ = worker.request_shutdown();
+                }
+                return Err(err);
             }
-            return Err(err);
-        }
-    };
-    let post_comm_startup = || -> Result<(bool, Option<Vec<OffloadEngine>>)> {
-        let dspark_enabled = if let Some(dspark_path) = dspark_path {
-            load_dspark_drafters(&loaded.workers, dspark_path)?;
-            true
-        } else {
-            false
         };
+    let post_comm_startup = || -> Result<Option<Vec<OffloadEngine>>> {
+        if let Some(dspark_path) = dspark_path {
+            load_dspark_drafters(&loaded.workers, dspark_path)?;
+        }
         ensure_post_build_headroom(&loaded.workers)?;
         let offload = kv_offload
             .map(|opts| build_offload_engines(&opts, rank_arenas, &startup.device_ordinals))
             .transpose()?;
-        Ok((dspark_enabled, offload))
+        Ok(offload)
     };
-    let (dspark_enabled, offload) = match post_comm_startup() {
+    let offload = match post_comm_startup() {
         Ok(started) => started,
         Err(err) => {
             for worker in &loaded.workers {
@@ -544,6 +555,13 @@ fn start_engine(
         })
         .unzip();
     let (submit_tx, submit_rx) = mpsc::unbounded_channel();
+    let (graph_dump_request, graph_dump_response) = match dump_graph_png {
+        Some(path) => {
+            let (response_tx, response_rx) = crossbeam_channel::bounded(1);
+            (Some((path, response_tx)), Some(response_rx))
+        }
+        None => (None, None),
+    };
     let coord_handle = std::thread::Builder::new()
         .name("glm52-coord".into())
         .spawn(move || {
@@ -557,9 +575,39 @@ fn start_engine(
                 offload,
                 moe_topo,
                 load_txs,
+                graph_dump_request,
             );
         })
         .map_err(|err| anyhow::anyhow!("failed to spawn GLM5.2 coordinator: {err}"))?;
+    if let Some(response) = graph_dump_response {
+        let Ok(dump_result) = response.recv() else {
+            drop(submit_tx);
+            coord_handle.join().map_err(|_| {
+                anyhow::anyhow!("GLM5.2 coordinator panicked before reporting graph export")
+            })?;
+            return Err(anyhow::anyhow!(
+                "GLM5.2 coordinator exited before reporting CUDA Graph export"
+            ));
+        };
+        let summary = match dump_result {
+            Ok(summary) => summary,
+            Err(err) => {
+                drop(submit_tx);
+                coord_handle.join().map_err(|_| {
+                    anyhow::anyhow!("GLM5.2 coordinator panicked after graph export failure")
+                })?;
+                return Err(err.context("GLM5.2 CUDA Graph export failed"));
+            }
+        };
+        log::info!(
+            "GLM5.2 decode CUDA Graph exported: nodes={}, kernels={}, edges={}, dot={}, png={}",
+            summary.nodes,
+            summary.kernels,
+            summary.edges,
+            summary.dot_path.display(),
+            summary.png_path.display()
+        );
+    }
     // Publish the launch-time cap so the frontend clamps its config.json
     // max_position_embeddings (1M) at the API boundary instead of admitting
     // requests the scheduler would reject (same contract as qwen3/dsv2-lite).
@@ -637,11 +685,12 @@ fn build_rank_models(
     workers: &[Glm52RankWorker],
     max_model_len: usize,
     moe_topo: Glm52MoeTopo,
+    dspark_enabled: bool,
 ) -> Result<Vec<Vec<KvArena>>> {
     let build_started = Instant::now();
     let responses = workers
         .iter()
-        .map(|worker| worker.build_model_async(max_model_len, moe_topo))
+        .map(|worker| worker.build_model_async(max_model_len, moe_topo, dspark_enabled))
         .collect::<Result<Vec<_>>>()?;
     let mut rank_arenas = Vec::with_capacity(responses.len());
     for (rank, response) in responses.into_iter().enumerate() {

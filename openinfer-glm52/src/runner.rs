@@ -7,6 +7,7 @@ use std::{
 
 use anyhow::{Context as _, Result, ensure};
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
+use openinfer_core::cuda_graph::CudaGraphDumpSummary;
 use openinfer_kv_offload::KvArena;
 
 use crate::dspark::{
@@ -105,6 +106,7 @@ enum Glm52RankCommand {
     BuildModel {
         max_model_len: usize,
         moe_topo: crate::Glm52MoeTopo,
+        dspark_enabled: bool,
         resp: Sender<Result<Vec<KvArena>>>,
     },
     /// Collective: create the DeepEP context (barriers across ranks). Issued
@@ -161,6 +163,15 @@ enum Glm52RankCommand {
         appends: Vec<(usize, usize)>,
         proposals: Vec<(usize, u32, usize)>,
         resp: Sender<Result<Vec<[u32; GLM52_DSPARK_DRAFTS]>>>,
+    },
+    /// Rank-local inspection of an already pre-captured whole-step graph.
+    /// This command stays on the worker so CUDA graph handles never cross the
+    /// thread/context ownership boundary.
+    DumpDecodeGraph {
+        bucket: usize,
+        png_path: PathBuf,
+        title: String,
+        resp: Sender<Result<CudaGraphDumpSummary>>,
     },
     Shutdown,
 }
@@ -226,12 +237,14 @@ impl Glm52RankWorker {
         &self,
         max_model_len: usize,
         moe_topo: crate::Glm52MoeTopo,
+        dspark_enabled: bool,
     ) -> Result<Receiver<Result<Vec<KvArena>>>> {
         let (resp_tx, resp_rx) = bounded(1);
         self.tx
             .send(Glm52RankCommand::BuildModel {
                 max_model_len,
                 moe_topo,
+                dspark_enabled,
                 resp: resp_tx,
             })
             .map_err(|_| anyhow::anyhow!("GLM5.2 rank worker channel closed"))?;
@@ -313,6 +326,24 @@ impl Glm52RankWorker {
                 resets,
                 appends,
                 proposals,
+                resp: resp_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("GLM5.2 rank worker channel closed"))?;
+        Ok(resp_rx)
+    }
+
+    pub(crate) fn dump_decode_graph_async(
+        &self,
+        bucket: usize,
+        png_path: PathBuf,
+        title: String,
+    ) -> Result<Receiver<Result<CudaGraphDumpSummary>>> {
+        let (resp_tx, resp_rx) = bounded(1);
+        self.tx
+            .send(Glm52RankCommand::DumpDecodeGraph {
+                bucket,
+                png_path,
+                title,
                 resp: resp_tx,
             })
             .map_err(|_| anyhow::anyhow!("GLM5.2 rank worker channel closed"))?;
@@ -455,6 +486,7 @@ impl Glm52RankThreadState {
         &mut self,
         max_model_len: usize,
         moe_topo: crate::Glm52MoeTopo,
+        dspark_enabled: bool,
     ) -> Result<Vec<KvArena>> {
         let mut weights = self
             .loaded
@@ -469,6 +501,7 @@ impl Glm52RankThreadState {
             moe_topo
                 .uses_tensor_replicated_moe()
                 .then_some(self.placement.rank),
+            dspark_enabled,
         )?);
         let arenas = model.kv_arenas(&dev_ctx.stream)?;
         let aux_ctx = self.ctx.auxiliary_device_context("decode aux")?;
@@ -697,6 +730,19 @@ impl Glm52RankThreadState {
             seed,
         )
     }
+
+    fn dump_decode_graph(
+        &self,
+        bucket: usize,
+        png_path: &Path,
+        title: &str,
+    ) -> Result<CudaGraphDumpSummary> {
+        let runtime = self
+            .runtime
+            .as_ref()
+            .context("GLM5.2 graph dump before build_model")?;
+        runtime.model.dump_decode_graph_png(bucket, png_path, title)
+    }
 }
 
 fn rank_worker_loop(rx: &Receiver<Glm52RankCommand>, mut state: Glm52RankThreadState) {
@@ -712,9 +758,10 @@ fn rank_worker_loop(rx: &Receiver<Glm52RankCommand>, mut state: Glm52RankThreadS
             Glm52RankCommand::BuildModel {
                 max_model_len,
                 moe_topo,
+                dspark_enabled,
                 resp,
             } => {
-                let _ = resp.send(state.build_model(max_model_len, moe_topo));
+                let _ = resp.send(state.build_model(max_model_len, moe_topo, dspark_enabled));
             }
             Glm52RankCommand::SetupComm {
                 unique_id,
@@ -734,6 +781,14 @@ fn rank_worker_loop(rx: &Receiver<Glm52RankCommand>, mut state: Glm52RankThreadS
                 resp,
             } => {
                 let _ = resp.send(state.step(&inputs, shape, &kv, flags, &sampling, seed));
+            }
+            Glm52RankCommand::DumpDecodeGraph {
+                bucket,
+                png_path,
+                title,
+                resp,
+            } => {
+                let _ = resp.send(state.dump_decode_graph(bucket, &png_path, &title));
             }
             Glm52RankCommand::LoadDspark { path, resp } => {
                 let _ = resp.send(state.load_dspark(&path));

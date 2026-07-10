@@ -35,6 +35,7 @@
 mod admission;
 #[cfg(test)]
 mod contract_tests;
+mod graph;
 mod load;
 mod offload;
 mod plan;
@@ -44,8 +45,6 @@ mod testkit;
 
 use std::collections::VecDeque;
 
-use anyhow::Context as _;
-
 use openinfer_core::engine::{GenerateRequest, LoadSnapshot, TokenEvent, unix_now_s};
 use openinfer_kv_cache::{BlockPool, RequestKv};
 use openinfer_kv_offload::OffloadEngine;
@@ -53,16 +52,15 @@ use openinfer_sample::mix_seed;
 use tokio::sync::{mpsc, watch};
 
 use crate::model::{
-    GLM52_DECODE_BUCKETS, GLM52_MAX_BATCH_PER_RANK, GLM52_MODEL_LEN_ALIGN, Glm52StepKv,
-    Glm52StepShape, glm52_pool_blocks, glm52_table_width,
+    GLM52_MAX_BATCH_PER_RANK, GLM52_MODEL_LEN_ALIGN, Glm52StepKv, Glm52StepShape,
+    glm52_pool_blocks, glm52_table_width,
 };
 use crate::runner::{Glm52RankWorker, Glm52StepFlags};
 
 use admission::{intake, lifetime_blocks};
+use graph::{GraphDumpRequest, dump_rank0_decode_graph, precapture_step_graphs};
 use load::{pending_is_empty, publish_load, running_counts};
-use plan::{
-    collect_sampling_rows, feed_wants, launch_ahead_flags, padding_step_kv, plan_step_shapes,
-};
+use plan::{collect_sampling_rows, feed_wants, launch_ahead_flags, plan_step_shapes};
 use slot::{GLM52_PADDING_STEP, Glm52SlotState, Glm52StepOutcome};
 
 /// The KV page size (== the FlashMLA page / index-K block / model-len
@@ -119,6 +117,7 @@ pub(crate) fn run_dp8_coordinator(
     offload: Option<Vec<OffloadEngine>>,
     moe_topo: crate::Glm52MoeTopo,
     load_txs: Vec<watch::Sender<LoadSnapshot>>,
+    graph_dump_request: Option<GraphDumpRequest>,
 ) {
     // Tensor-replicated topology: ONE logical rank drives mirrored executors.
     // Every worker receives the identical step (inputs, shape, KV, seed) and
@@ -200,11 +199,29 @@ pub(crate) fn run_dp8_coordinator(
     // workers' sequential Drop joins them (the same collective-teardown
     // contract as the exit path).
     if let Err(err) = precapture_step_graphs(&workers, &pools, table_width, mirrored, full_bucket) {
+        if let Some((_, response)) = graph_dump_request {
+            let _ = response.send(Err(anyhow::anyhow!("{err:#}")));
+        }
         log::error!("GLM5.2 graph pre-capture failed: {err:#}");
         for worker in &workers {
             let _ = worker.request_shutdown();
         }
         return;
+    }
+    if let Some((png_path, response)) = graph_dump_request {
+        match dump_rank0_decode_graph(&workers, moe_topo, full_bucket, png_path) {
+            Ok(summary) => {
+                let _ = response.send(Ok(summary));
+            }
+            Err(err) => {
+                log::error!("GLM5.2 CUDA Graph export failed: {err:#}");
+                let _ = response.send(Err(err));
+                for worker in &workers {
+                    let _ = worker.request_shutdown();
+                }
+                return;
+            }
+        }
     }
 
     // The step shapes that carried the last launch-ahead lease, and whether
@@ -382,66 +399,6 @@ pub(crate) fn run_dp8_coordinator(
         let _ = worker.request_shutdown();
     }
     drop(workers);
-}
-
-/// Pre-capture every whole-step bucket graph while the ranks are idle and
-/// trivially in lock-step. Launch-ahead speculation requires captured-ness
-/// to be UNIFORM across ranks — a lazily capturing rank would skip the
-/// speculative replay the others enqueued and desync the collectives — and
-/// pre-capturing also removes the old mid-serving capture stall. Every row
-/// is a padding write into the pool's padding page.
-fn precapture_step_graphs(
-    workers: &[Glm52RankWorker],
-    pools: &[BlockPool],
-    table_width: usize,
-    mirrored: bool,
-    full_bucket: bool,
-) -> anyhow::Result<()> {
-    // TP8 serves exactly one shape. EP8 and TP4 capture every bucket; TP4 is
-    // still mirrored, but only its MoE subgraph pads to eight rows.
-    let capture_bucket = |bucket: usize| !full_bucket || bucket == GLM52_MAX_BATCH_PER_RANK;
-    for &bucket in GLM52_DECODE_BUCKETS
-        .iter()
-        .filter(|&&bucket| capture_bucket(bucket))
-    {
-        let mut shape = Glm52StepShape {
-            bucket,
-            slots: [0; GLM52_MAX_BATCH_PER_RANK],
-            active_rows: 0,
-        };
-        for (slot, dst) in shape.slots.iter_mut().enumerate().take(bucket) {
-            *dst = slot as u8;
-        }
-        let inputs =
-            [(GLM52_PADDING_STEP.token, GLM52_PADDING_STEP.position); GLM52_MAX_BATCH_PER_RANK];
-        let flags = Glm52StepFlags::plain();
-        let responses = workers
-            .iter()
-            .enumerate()
-            .map(|(rank, worker)| {
-                let pool = &pools[if mirrored { 0 } else { rank }];
-                let kv = padding_step_kv(bucket, table_width, pool.padding_block_id(), &inputs);
-                worker.step_async(inputs, shape, kv, flags, Vec::new(), 0)
-            })
-            .collect::<anyhow::Result<Vec<_>>>()
-            .context("GLM5.2 graph pre-capture submit")?;
-        for (rank, resp) in responses.into_iter().enumerate() {
-            resp.recv()
-                .map_err(|_| anyhow::anyhow!("rank dropped its pre-capture response"))
-                .and_then(|r| r)
-                .with_context(|| {
-                    format!("GLM5.2 graph pre-capture (bucket {bucket}) on rank {rank}")
-                })?;
-        }
-    }
-    log::info!(
-        "GLM5.2 whole-step graphs pre-captured: {} buckets",
-        GLM52_DECODE_BUCKETS
-            .iter()
-            .filter(|&&bucket| capture_bucket(bucket))
-            .count()
-    );
-    Ok(())
 }
 
 /// Admission: fill each rank's free slots from its own FIFO queue while its

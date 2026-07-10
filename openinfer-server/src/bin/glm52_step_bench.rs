@@ -105,6 +105,7 @@ fn main() -> Result<()> {
             no_prefix_cache: false,
             kv_offload: None,
             moe_topo,
+            dump_graph_png: None,
         },
     )
     .context("failed to start GLM5.2 engine")?;

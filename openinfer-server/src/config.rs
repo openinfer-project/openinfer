@@ -33,10 +33,11 @@ pub(crate) struct Args {
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub cuda_graph: bool,
 
-    /// Dump the live Qwen3 rank-0, batch-1 SplitKv decode CUDA Graph during
-    /// startup. Writes a detailed sibling `.dot` for LLM inspection and a
-    /// compact Graphviz-rendered PNG at this path. Requires CUDA driver API
-    /// 12.3 or newer for kernel-name inspection.
+    /// Dump a live rank-0 decode CUDA Graph during startup. Qwen3 exports its
+    /// batch-1 SplitKv graph; GLM5.2 exports EP8 bucket 1 or the fixed TP8
+    /// bucket 8 selected by `--moe-topo`. Writes a complete sibling `.dot` for
+    /// machine inspection and a folded Graphviz PNG at this path. Requires
+    /// CUDA driver API 12.3 or newer for kernel-name inspection.
     #[arg(long)]
     pub dump_graph_png: Option<PathBuf>,
 
@@ -259,6 +260,7 @@ fn consumed_args(model_type: ModelType) -> &'static [&'static str] {
             "kv_offload_host_gib",
             "kv_offload_hugepages",
             "moe_topo",
+            "dump_graph_png",
         ],
         #[cfg(feature = "kimi-k2")]
         ModelType::KimiK2 => &["tp_size", "dp_size", "ep_backend", "cuda_graph"],
@@ -656,6 +658,15 @@ mod tests {
 
         assert!(error.contains("--max-lora-rank must be one of"));
         assert!(error.contains("16"));
+    }
+
+    #[cfg(feature = "glm52")]
+    #[test]
+    fn glm52_accepts_graph_png_dump() {
+        let (args, provided) =
+            parse_with_provided(&["openinfer", "--dump-graph-png", "decode.png"]);
+        args.validate(ModelType::Glm52, &provided)
+            .expect("GLM5.2 should accept a graph PNG dump");
     }
 
     #[cfg(feature = "glm52")]

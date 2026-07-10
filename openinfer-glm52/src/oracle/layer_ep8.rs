@@ -193,7 +193,7 @@ fn run_layer_prefill_ep8(
     let mqa_shape =
         Glm52IndexerScratch::decode_shape(1, index_cache_layout, index_blocks, NUM_SMS, oracle_ctx);
     let mut scratch =
-        Glm52DecodeScratch::new(ctx, &contract, mqa_shape, crate::config::GLM52_HEADS)?;
+        Glm52DecodeScratch::new(ctx, &contract, mqa_shape, crate::config::GLM52_HEADS, false)?;
 
     let mut outputs = Vec::with_capacity(oracle_ctx * HIDDEN);
     for position in 0..oracle_ctx {

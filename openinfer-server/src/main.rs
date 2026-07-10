@@ -145,6 +145,7 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
                             use_hugepages: args.kv_offload_hugepages,
                         }),
                     moe_topo,
+                    dump_graph_png: args.dump_graph_png.clone(),
                 },
             )
             .context("failed to start GLM5.2 engine")?

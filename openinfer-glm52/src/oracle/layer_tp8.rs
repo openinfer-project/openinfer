@@ -211,7 +211,7 @@ fn run_layer_prefill_tp8(
     let mqa_shape =
         Glm52IndexerScratch::decode_shape(1, index_cache_layout, index_blocks, NUM_SMS, oracle_ctx);
     let mut scratch =
-        Glm52DecodeScratch::new(ctx, &contract, mqa_shape, crate::config::GLM52_HEADS)?;
+        Glm52DecodeScratch::new(ctx, &contract, mqa_shape, crate::config::GLM52_HEADS, false)?;
     let mut router_scratch = Glm52RouterScratch::new(ctx, 1)?;
 
     // 8-row staging for the replicated kernel (rows 1..8 stay zero).

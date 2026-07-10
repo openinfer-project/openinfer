@@ -58,11 +58,12 @@ pub(crate) struct Glm52DecodeScratch {
     /// The residual stream: embed writes it, every layer reads and rewrites
     /// it, the final norm consumes it.
     pub(crate) hidden: Rows<GLM52_HIDDEN>,
-    /// DSpark aux-hidden capture: each row's residual stream after the
+    /// Optional DSpark aux-hidden capture: each row's residual stream after the
     /// [`crate::dspark::GLM52_DSPARK_AUX_LAYERS`] layers, concatenated per row
-    /// (`[tokens, 5 * GLM52_HIDDEN]`). Written inside the captured step graph
-    /// (5 strided row copies), read by the draft lane between steps.
-    pub(crate) captured: Rows<GLM52_DSPARK_CONTEXT_DIM>,
+    /// (`[tokens, 5 * GLM52_HIDDEN]`). Present only when the drafter was
+    /// requested at launch; otherwise neither the buffer nor its five graph
+    /// copy nodes exist.
+    pub(crate) captured: Option<Rows<GLM52_DSPARK_CONTEXT_DIM>>,
     pub(crate) final_normed: Rows<GLM52_HIDDEN>,
     pub(crate) logits: Rows<GLM52_VOCAB>,
     /// Device greedy argmax outputs: each row's top logit bf16 value (for the
@@ -82,6 +83,7 @@ impl Glm52DecodeScratch {
         contract: &Glm52FlashMlaSparseDecode,
         mqa_shape: Glm52DeepGemmMqaLogitsShape,
         mla_heads: usize,
+        dspark_enabled: bool,
     ) -> Result<Self> {
         Self::new_for_backend(
             ctx,
@@ -89,6 +91,7 @@ impl Glm52DecodeScratch {
             mqa_shape,
             mla_heads,
             Glm52MlaBackend::FlashMlaFp8Ds,
+            dspark_enabled,
         )
     }
 
@@ -98,6 +101,7 @@ impl Glm52DecodeScratch {
         mqa_shape: Glm52DeepGemmMqaLogitsShape,
         mla_heads: usize,
         mla_backend: Glm52MlaBackend,
+        dspark_enabled: bool,
     ) -> Result<Self> {
         let tokens = contract.batch_size;
         anyhow::ensure!(
@@ -125,7 +129,9 @@ impl Glm52DecodeScratch {
                 .alloc_zeros::<bf16>(GLM52_TP_TOKENS * GLM52_HIDDEN)?,
             layer: Glm52LayerScratch::new(ctx, tokens)?,
             hidden: Rows::zeros(ctx, tokens)?,
-            captured: Rows::zeros(ctx, tokens)?,
+            captured: dspark_enabled
+                .then(|| Rows::zeros(ctx, tokens))
+                .transpose()?,
             final_normed: Rows::zeros(ctx, tokens)?,
             logits: Rows::zeros(ctx, tokens)?,
             argmax_partial_values: ctx
