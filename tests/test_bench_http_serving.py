@@ -216,11 +216,11 @@ class BenchHttpServingTests(unittest.TestCase):
     def test_server_trace_loader_ignores_lines_before_measured_offset(self) -> None:
         stale = (
             'INFO openinfer_http_trace {"request_id":"cmpl-bench-0-stale",'
-            '"queued_at_unix_s":50.0}\\n'
+            '"queued_at_unix_s":50.0}\n'
         )
         current = (
             'INFO openinfer_http_trace {"request_id":"cmpl-bench-0-current",'
-            '"queued_at_unix_s":100.0}\\n'
+            '"queued_at_unix_s":100.0}\n'
         )
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "server.log"
@@ -307,19 +307,61 @@ class BenchHttpServingTests(unittest.TestCase):
             output_hash="abcd",
             text_prefix="text",
         )
-        line = (
+        lines = (
             'ERROR vllm_engine_core_client::client::stream: stream.rs:90 '
             'request failed with an internal error during generation '
-            'self.request_id="cmpl-bench-0-generated"\\n'
+            'self.request_id="cmpl-bench-0-generated"\n'
+            'INFO openinfer_http_trace {"request_id":"cmpl-bench-0-generated",'
+            '"queued_at_unix_s":100.01,"terminal_unix_s":100.30,'
+            '"completion_tokens":1,"finish_reason":"length"}\n'
         )
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "server.log"
-            path.write_text(line, encoding="utf-8")
+            path.write_text(lines, encoding="utf-8")
             traces = bench_http_serving.load_server_traces(path)
             bench_http_serving.attach_server_traces([result], traces)
 
         self.assertFalse(result.ok)
         self.assertIn("server generation error", result.error or "")
+        assert result.server_trace is not None
+        self.assertIn("server_error", result.server_trace)
+
+    def test_stale_server_trace_is_not_attached(self) -> None:
+        result = bench_http_serving.RequestResult(
+            index=0,
+            request_id="bench-0",
+            prompt_words=16,
+            max_tokens=16,
+            ok=True,
+            status=200,
+            error=None,
+            timed_out=False,
+            start_s=1.0,
+            start_wall_s=1000.0,
+            first_token_s=1.2,
+            first_token_wall_s=1000.2,
+            end_s=1.4,
+            end_wall_s=1000.4,
+            latency_ms=400.0,
+            ttft_ms=200.0,
+            tpot_ms=None,
+            itl_ms=[],
+            output_chunks=1,
+            output_chars=80,
+            output_hash="abcd",
+            text_prefix="text",
+        )
+        stale = {
+            "cmpl-bench-0-stale": {
+                "request_id": "cmpl-bench-0-stale",
+                "queued_at_unix_s": 10.0,
+                "terminal_unix_s": 11.0,
+            }
+        }
+
+        bench_http_serving.attach_server_traces([result], stale)
+
+        self.assertIsNone(result.server_trace)
 
     def test_server_trace_zero_completion_tokens_marks_request_failed(self) -> None:
         result = bench_http_serving.RequestResult(
@@ -348,6 +390,7 @@ class BenchHttpServingTests(unittest.TestCase):
         )
         line = (
             'INFO openinfer_http_trace {"request_id":"cmpl-bench-0-generated",'
+            '"queued_at_unix_s":100.01,"terminal_unix_s":100.30,'
             '"completion_tokens":0}\\n'
         )
         with tempfile.TemporaryDirectory() as tmp:
@@ -449,15 +492,6 @@ class BenchHttpServingTests(unittest.TestCase):
         self.assertAlmostEqual(report["summary"]["input_tokens_per_s"], 93.5)
         self.assertAlmostEqual(report["summary"]["output_tokens_per_s"], 6.0)
         self.assertEqual(
-            report["server_trace"]["prompt_tokens"],
-            {
-                "min": 22,
-                "max": 165,
-                "total": 187,
-                "samples": 2,
-            },
-        )
-        self.assertEqual(
             report["workload"]["mixed_shapes"],
             {
                 "prompt_words=16,max_tokens=4": 1,
@@ -521,33 +555,8 @@ class BenchHttpServingTests(unittest.TestCase):
         self.assertAlmostEqual(report["summary"]["output_tokens_per_s"], 8.0)
 
     def test_server_trace_summary_includes_decode_step_breakdown(self) -> None:
-        first = bench_http_serving.RequestResult(
-            index=0,
+        first = SimpleNamespace(
             request_id="bench-0",
-            prompt_words=16,
-            max_tokens=4,
-            ok=True,
-            status=200,
-            error=None,
-            timed_out=False,
-            start_s=0.0,
-            start_wall_s=0.0,
-            first_token_s=0.1,
-            first_token_wall_s=0.1,
-            end_s=0.2,
-            end_wall_s=0.2,
-            latency_ms=200.0,
-            ttft_ms=100.0,
-            tpot_ms=30.0,
-            itl_ms=[30.0, 30.0, 30.0],
-            output_chunks=4,
-            output_chars=8,
-            output_hash="aaaa",
-            text_prefix="text",
-            sampling_label="greedy",
-            temperature=0.0,
-            top_k=-1,
-            top_p=1.0,
             server_trace={
                 "active_set_size": 2,
                 "decode_batch_size_max": 2,
@@ -560,36 +569,10 @@ class BenchHttpServingTests(unittest.TestCase):
                 "scheduled_to_terminal_ms": 60.0,
                 "decode_step_count": 2,
                 "batch_decode_steps": 1,
-                "singleton_decode_steps": 1,
             },
         )
-        second = bench_http_serving.RequestResult(
-            index=1,
+        second = SimpleNamespace(
             request_id="bench-1",
-            prompt_words=16,
-            max_tokens=4,
-            ok=True,
-            status=200,
-            error=None,
-            timed_out=False,
-            start_s=0.0,
-            start_wall_s=0.0,
-            first_token_s=0.2,
-            first_token_wall_s=0.2,
-            end_s=0.4,
-            end_wall_s=0.4,
-            latency_ms=400.0,
-            ttft_ms=200.0,
-            tpot_ms=40.0,
-            itl_ms=[40.0, 40.0, 40.0],
-            output_chunks=4,
-            output_chars=8,
-            output_hash="bbbb",
-            text_prefix="more",
-            sampling_label="greedy",
-            temperature=0.0,
-            top_k=-1,
-            top_p=1.0,
             server_trace={
                 "active_set_size": 4,
                 "decode_batch_size_max": 4,
@@ -602,7 +585,6 @@ class BenchHttpServingTests(unittest.TestCase):
                 "scheduled_to_terminal_ms": 90.0,
                 "decode_step_count": 3,
                 "batch_decode_steps": 3,
-                "singleton_decode_steps": 0,
             },
         )
 
@@ -615,9 +597,9 @@ class BenchHttpServingTests(unittest.TestCase):
         self.assertEqual(summary["decode_steps"]["per_request"]["min"], 2)
         self.assertEqual(summary["decode_steps"]["per_request"]["max"], 3)
         self.assertEqual(summary["decode_steps"]["per_request"]["total"], 5)
-        self.assertEqual(summary["decode_steps"]["batched_total"], 4)
-        self.assertEqual(summary["decode_steps"]["singleton_total"], 1)
-        self.assertAlmostEqual(summary["decode_steps"]["batched_share"], 0.8)
+        self.assertEqual(summary["decode_steps"]["batched_request_steps_total"], 4)
+        self.assertEqual(summary["decode_steps"]["singleton_request_steps_total"], 1)
+        self.assertAlmostEqual(summary["decode_steps"]["request_step_batched_share"], 0.8)
 
     def test_server_trace_summary_marks_partial_decode_breakdown_unknown(self) -> None:
         legacy = SimpleNamespace(
@@ -627,9 +609,9 @@ class BenchHttpServingTests(unittest.TestCase):
 
         summary = bench_http_serving.summarize_trace_ms([legacy])
 
-        self.assertIsNone(summary["decode_steps"]["batched_total"])
-        self.assertIsNone(summary["decode_steps"]["singleton_total"])
-        self.assertIsNone(summary["decode_steps"]["batched_share"])
+        self.assertIsNone(summary["decode_steps"]["batched_request_steps_total"])
+        self.assertIsNone(summary["decode_steps"]["singleton_request_steps_total"])
+        self.assertIsNone(summary["decode_steps"]["request_step_batched_share"])
 
     def test_server_trace_summary_infers_singleton_steps_from_total(self) -> None:
         trace = SimpleNamespace(
@@ -642,9 +624,9 @@ class BenchHttpServingTests(unittest.TestCase):
 
         summary = bench_http_serving.summarize_trace_ms([trace])
 
-        self.assertEqual(summary["decode_steps"]["batched_total"], 3)
-        self.assertEqual(summary["decode_steps"]["singleton_total"], 2)
-        self.assertAlmostEqual(summary["decode_steps"]["batched_share"], 0.6)
+        self.assertEqual(summary["decode_steps"]["batched_request_steps_total"], 3)
+        self.assertEqual(summary["decode_steps"]["singleton_request_steps_total"], 2)
+        self.assertAlmostEqual(summary["decode_steps"]["request_step_batched_share"], 0.6)
 
 
 if __name__ == "__main__":

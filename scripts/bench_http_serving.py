@@ -203,6 +203,16 @@ def summarize_trace_ms(measured: list[RequestResult]) -> dict[str, Any]:
         ]
         phase_summary[field] = summarize(values)
     traced = [result for result in measured if result.server_trace is not None]
+    prompt_tokens = [
+        int(result.server_trace["prompt_tokens"])
+        for result in traced
+        if isinstance(result.server_trace.get("prompt_tokens"), int)
+    ]
+    completion_tokens = [
+        int(result.server_trace["completion_tokens"])
+        for result in traced
+        if isinstance(result.server_trace.get("completion_tokens"), int)
+    ]
     active_set_sizes = [
         int(result.server_trace["active_set_size"])
         for result in traced
@@ -213,14 +223,9 @@ def summarize_trace_ms(measured: list[RequestResult]) -> dict[str, Any]:
         for result in traced
         if isinstance(result.server_trace.get("decode_batch_size_max"), int)
     ]
-    prompt_token_counts = [
-        int(result.server_trace["prompt_tokens"])
-        for result in traced
-        if isinstance(result.server_trace.get("prompt_tokens"), int)
-    ]
     decode_step_counts: list[int] = []
-    decode_step_breakdowns: list[tuple[int, int] | None] = []
-    saw_decode_step_fields = False
+    complete_breakdowns: list[tuple[int, int]] = []
+    breakdown_complete = bool(traced)
     for result in traced:
         trace = result.server_trace
         assert trace is not None
@@ -234,39 +239,17 @@ def summarize_trace_ms(measured: list[RequestResult]) -> dict[str, Any]:
             if isinstance(trace.get("batch_decode_steps"), int)
             else None
         )
-        singleton = (
-            int(trace["singleton_decode_steps"])
-            if isinstance(trace.get("singleton_decode_steps"), int)
-            else None
-        )
         if count is not None:
             decode_step_counts.append(count)
-        if count is None and batched is None and singleton is None:
-            decode_step_breakdowns.append(None)
+        if count is None or batched is None:
+            breakdown_complete = False
             continue
 
-        saw_decode_step_fields = True
-        if batched is None and count is not None and singleton is not None:
-            batched = count - singleton
-        if singleton is None and count is not None and batched is not None:
-            singleton = count - batched
-        if (
-            batched is not None
-            and singleton is not None
-            and batched >= 0
-            and singleton >= 0
-            and (count is None or batched + singleton == count)
-        ):
-            decode_step_breakdowns.append((batched, singleton))
-        else:
-            decode_step_breakdowns.append(None)
-
-    complete_breakdowns = [
-        breakdown for breakdown in decode_step_breakdowns if breakdown is not None
-    ]
-    breakdown_complete = (
-        saw_decode_step_fields and len(complete_breakdowns) == len(traced)
-    )
+        singleton = count - batched
+        if batched < 0 or singleton < 0:
+            breakdown_complete = False
+            continue
+        complete_breakdowns.append((batched, singleton))
     if breakdown_complete:
         batched_total = sum(batched for batched, _ in complete_breakdowns)
         singleton_total = sum(singleton for _, singleton in complete_breakdowns)
@@ -282,15 +265,16 @@ def summarize_trace_ms(measured: list[RequestResult]) -> dict[str, Any]:
         "source": "server log lines matching `openinfer_http_trace`; frontend_to_queue includes HTTP ingress, tokenization, and vLLM submit before engine queue",
         "traced_requests": len(traced),
         "missing_traces": [result.request_id for result in measured if result.server_trace is None],
-        "prompt_tokens": summarize_counts(prompt_token_counts),
+        "prompt_tokens": summarize_counts(prompt_tokens),
+        "completion_tokens": summarize_counts(completion_tokens),
         "phases_ms": phase_summary,
         "active_set_size_max": max(active_set_sizes) if active_set_sizes else None,
         "decode_batch_size_max": max(decode_batch_sizes) if decode_batch_sizes else None,
         "decode_steps": {
             "per_request": summarize_counts(decode_step_counts),
-            "batched_total": batched_total,
-            "singleton_total": singleton_total,
-            "batched_share": batched_share,
+            "batched_request_steps_total": batched_total,
+            "singleton_request_steps_total": singleton_total,
+            "request_step_batched_share": batched_share,
         },
     }
 
@@ -564,6 +548,7 @@ def failed_result(
 
 TRACE_RE = re.compile(r"openinfer_http_trace\s+(\{.*\})")
 STREAM_ERROR_RE = re.compile(r'request failed .*self\.request_id="([^"]+)"')
+TRACE_MATCH_SLOP_S = 5.0
 
 
 def server_log_offset(path: Path | None) -> int:
@@ -600,13 +585,21 @@ def load_server_traces(
             continue
         request_id = trace.get("request_id")
         if isinstance(request_id, str):
+            existing = traces.get(request_id)
+            if existing is not None and isinstance(existing.get("server_error"), str):
+                trace["server_error"] = existing["server_error"]
             traces[request_id] = trace
     return traces
 
 
 def attach_server_traces(results: list[RequestResult], traces: dict[str, dict[str, Any]]) -> None:
     for result in results:
-        trace = find_server_trace(result.request_id, result.start_wall_s, traces)
+        trace = find_server_trace(
+            result.request_id,
+            result.start_wall_s,
+            result.end_wall_s,
+            traces,
+        )
         if trace is None:
             continue
         result.server_trace = trace
@@ -645,6 +638,7 @@ def apply_server_error_gate(result: RequestResult) -> None:
 def find_server_trace(
     request_id: str,
     start_wall_s: float,
+    end_wall_s: float,
     traces: dict[str, dict[str, Any]],
 ) -> dict[str, Any] | None:
     prefix = f"cmpl-{request_id}-"
@@ -653,19 +647,30 @@ def find_server_trace(
         for trace_id, trace in traces.items()
         if trace_id == request_id or trace_id == f"cmpl-{request_id}" or trace_id.startswith(prefix)
     ]
-    if len(matches) == 1:
-        return matches[0]
-    if len(matches) > 1:
-        timed_matches = [
-            trace
-            for trace in matches
-            if isinstance(trace.get("queued_at_unix_s"), (int, float))
+    timed_matches = []
+    for trace in matches:
+        timestamps = [
+            float(trace[field])
+            for field in ("queued_at_unix_s", "terminal_unix_s")
+            if isinstance(trace.get(field), (int, float))
         ]
-        if timed_matches:
-            return min(
-                timed_matches,
-                key=lambda trace: abs(float(trace["queued_at_unix_s"]) - start_wall_s),
-            )
+        if any(
+            start_wall_s - TRACE_MATCH_SLOP_S
+            <= timestamp
+            <= end_wall_s + TRACE_MATCH_SLOP_S
+            for timestamp in timestamps
+        ):
+            timed_matches.append(trace)
+    if len(timed_matches) == 1:
+        return timed_matches[0]
+    if len(timed_matches) > 1:
+        return min(
+            timed_matches,
+            key=lambda trace: abs(
+                float(trace.get("queued_at_unix_s", trace.get("terminal_unix_s")))
+                - start_wall_s
+            ),
+        )
     return None
 
 
@@ -758,7 +763,6 @@ def build_report(args: argparse.Namespace, measured: list[RequestResult], wall_s
         "base_url": args.base_url,
         "model": args.model,
         "workload": {
-            "request_id_prefix": arg_value(args, "request_id_prefix", None),
             "num_requests": args.num_requests,
             "concurrency": args.concurrency,
             "warmup": args.warmup,
@@ -858,19 +862,15 @@ def main() -> None:
     if args.num_requests <= 0:
         raise SystemExit("--num-requests must be positive")
     validate_sampling_args(args)
-    args.request_id_prefix = f"openinfer-bench-{uuid.uuid4().hex}"
     if args.warmup > 0:
         warmup_results, _ = run_batch(args, measured=False)
         failed = [result for result in warmup_results if not result.ok]
         if failed:
             raise SystemExit(f"warmup failed: {failed[0].error}")
 
-    trace_log_offset = server_log_offset(args.server_log)
+    trace_offset = server_log_offset(args.server_log)
     measured, wall_s = run_batch(args, measured=True)
-    attach_server_traces(
-        measured,
-        load_server_traces(args.server_log, start_offset=trace_log_offset),
-    )
+    attach_server_traces(measured, load_server_traces(args.server_log, start_offset=trace_offset))
     report = build_report(args, measured, wall_s)
     rendered = json.dumps(report, indent=2, sort_keys=True)
     if args.out:

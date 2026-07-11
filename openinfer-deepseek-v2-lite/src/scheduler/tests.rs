@@ -538,7 +538,7 @@ fn http_trace_payload_includes_error_and_batch_fields() {
 }
 
 #[test]
-fn http_trace_payload_counts_singleton_and_batched_decode_steps() {
+fn http_trace_payload_counts_total_and_batched_decode_steps() {
     let mut trace = trace();
     trace.first_token_emit_unix_s = Some(5.0);
     trace.note_decode_step(1, 4.0);
@@ -547,8 +547,8 @@ fn http_trace_payload_counts_singleton_and_batched_decode_steps() {
     let payload = http_trace_payload("req-b", &trace, 3, 2, FinishReason::Length, None);
 
     assert_eq!(payload["decode_step_count"], 2);
-    assert_eq!(payload["singleton_decode_steps"], 1);
     assert_eq!(payload["batch_decode_steps"], 1);
+    assert_eq!(payload["singleton_decode_steps"], 1);
     assert_eq!(payload["decode_batch_size_max"], 4);
     assert_eq!(payload["first_decode_ms"], 4.0);
     assert_eq!(payload["decode_total_ms"], 12.0);

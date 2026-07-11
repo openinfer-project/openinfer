@@ -11,13 +11,13 @@ pub(super) struct RequestTrace {
     pub(super) first_decode_ms: Option<f64>,
     pub(super) decode_total_ms: f64,
     pub(super) decode_step_count: usize,
-    pub(super) singleton_decode_steps: usize,
     pub(super) active_set_size_max: usize,
     pub(super) pending_queue_size_max: usize,
     pub(super) active_set_size_at_terminal: usize,
     pub(super) pending_queue_size_at_terminal: usize,
     pub(super) decode_batch_size_max: usize,
     pub(super) batch_decode_steps: usize,
+    pub(super) singleton_decode_steps: usize,
 }
 
 #[derive(Debug)]
@@ -43,13 +43,13 @@ impl RequestTrace {
             first_decode_ms: None,
             decode_total_ms: 0.0,
             decode_step_count: 0,
-            singleton_decode_steps: 0,
             active_set_size_max: 1,
             pending_queue_size_max: 0,
             active_set_size_at_terminal: 0,
             pending_queue_size_at_terminal: 0,
             decode_batch_size_max: 0,
             batch_decode_steps: 0,
+            singleton_decode_steps: 0,
         }
     }
 
@@ -64,13 +64,13 @@ impl RequestTrace {
             first_decode_ms: None,
             decode_total_ms: 0.0,
             decode_step_count: 0,
-            singleton_decode_steps: 0,
             active_set_size_max: 0,
             pending_queue_size_max: 0,
             active_set_size_at_terminal: 0,
             pending_queue_size_at_terminal: 0,
             decode_batch_size_max: 0,
             batch_decode_steps: 0,
+            singleton_decode_steps: 0,
         }
     }
 

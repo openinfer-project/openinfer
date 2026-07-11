@@ -27,7 +27,7 @@ use openinfer_core::{
     tensor::{DeviceContext, HiddenStates, HiddenStatesRef},
 };
 use openinfer_kernels::ops::{
-    accumulate_bf16_row_scaled_to_f32_into, dsv2_lite_accumulate_fixed_expert_into,
+    dsv2_lite_accumulate_fixed_expert_into, dsv2_lite_accumulate_route_row_into,
 };
 use serde::Serialize;
 
@@ -423,26 +423,6 @@ impl NaiveNcclEp2Backend {
         Ok(())
     }
 
-    pub(crate) fn accumulate_device_contribution(
-        &self,
-        rank: usize,
-        ctx: &DeviceContext,
-        expert_output: &HiddenStates,
-        token_idx: usize,
-        seq_len: usize,
-        weight: f32,
-    ) -> Result<()> {
-        self.accumulate_device_contribution_row(
-            rank,
-            ctx,
-            expert_output,
-            0,
-            token_idx,
-            seq_len,
-            weight,
-        )
-    }
-
     pub(crate) fn accumulate_device_contribution_row(
         &self,
         rank: usize,
@@ -456,7 +436,7 @@ impl NaiveNcclEp2Backend {
         let mut scratch = self.combine_scratch()?;
         scratch.ensure_shape(expert_output.hidden_dim, seq_len)?;
         activate(ctx)?;
-        accumulate_bf16_row_scaled_to_f32_into(
+        dsv2_lite_accumulate_route_row_into(
             ctx,
             expert_output.as_ref(),
             output_row,

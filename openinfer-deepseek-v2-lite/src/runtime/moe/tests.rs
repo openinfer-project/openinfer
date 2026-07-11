@@ -1,7 +1,8 @@
 use half::bf16;
 use openinfer_core::tensor::{DeviceContext, DeviceMatrix, HiddenStates};
 use openinfer_kernels::ops::{
-    Dsv2LiteRouterOutput, dsv2_lite_accumulate_fixed_expert_into, dsv2_lite_router_logits_into,
+    Dsv2LiteRouterOutput, dsv2_lite_accumulate_fixed_expert_into,
+    dsv2_lite_accumulate_route_row_into, dsv2_lite_router_logits_into,
     dsv2_lite_router_softmax_topk_into,
 };
 
@@ -9,6 +10,23 @@ use crate::{
     config::test_lite_config,
     host_ops::{gate_logits_host, topk_softmax_routes},
 };
+
+use super::parse_rollback_value;
+
+#[test]
+fn rollback_policy_parser_rejects_unknown_values() {
+    for (name, optimized, rollback) in [
+        ("host expert batch", "batched", "serial"),
+        ("NCCL expert batch", "grouped", "serial"),
+        ("NCCL router", "device", "host"),
+    ] {
+        assert!(!parse_rollback_value(name, None, optimized, rollback).unwrap());
+        assert!(!parse_rollback_value(name, Some(""), optimized, rollback).unwrap());
+        assert!(!parse_rollback_value(name, Some(optimized), optimized, rollback).unwrap());
+        assert!(parse_rollback_value(name, Some(rollback), optimized, rollback).unwrap());
+        assert!(parse_rollback_value(name, Some("typo"), optimized, rollback).is_err());
+    }
+}
 
 #[test]
 fn device_router_matches_host_softmax_topk_rule() {
@@ -110,6 +128,27 @@ fn device_router_logits_match_host_accumulation_bitwise() {
             "router logits mismatch at index {idx}: got={got} expected={expected}"
         );
     }
+}
+
+#[test]
+fn route_row_accumulation_selects_group_output_row() {
+    let ctx = DeviceContext::new().expect("create CUDA context");
+    let rows = HiddenStates {
+        data: ctx
+            .stream
+            .clone_htod(&bf16_vec(&[1.0, 2.0, 3.0, 4.0]))
+            .expect("rows H2D"),
+        hidden_dim: 2,
+        seq_len: 2,
+    };
+    let mut out = ctx.stream.alloc_zeros::<f32>(4).expect("output");
+
+    dsv2_lite_accumulate_route_row_into(&ctx, rows.as_ref(), 1, 0.5, 0, 2, &mut out)
+        .expect("accumulate row");
+
+    let actual = ctx.stream.clone_dtoh(&out).expect("output D2H");
+    ctx.sync().expect("sync accumulation");
+    assert_eq!(actual, vec![1.5, 2.0, 0.0, 0.0]);
 }
 
 #[test]

@@ -51,6 +51,55 @@ pub fn dsv2_lite_router_logits_into(
         .map_err(|err| anyhow!("DSV2-Lite router logits CUDA launch failed: {err}"))
 }
 
+pub fn dsv2_lite_accumulate_route_row_into(
+    ctx: &DeviceContext,
+    rows: HiddenStatesRef<'_>,
+    source_row: usize,
+    scale: f32,
+    token_idx: usize,
+    seq_len: usize,
+    out: &mut CudaSlice<f32>,
+) -> Result<()> {
+    ensure!(scale.is_finite(), "DSV2-Lite route scale must be finite");
+    ensure!(
+        source_row < rows.seq_len,
+        "DSV2-Lite route source row {source_row} exceeds seq_len {}",
+        rows.seq_len
+    );
+    ensure!(
+        token_idx < seq_len,
+        "DSV2-Lite route token {token_idx} exceeds seq_len {seq_len}"
+    );
+    let output_elems = rows
+        .hidden_dim
+        .checked_mul(seq_len)
+        .ok_or_else(|| anyhow!("DSV2-Lite route accumulation output size overflow"))?;
+    ensure!(
+        out.len() >= output_elems,
+        "DSV2-Lite route accumulation output too small: have {}, need {output_elems}",
+        out.len()
+    );
+    let source_offset = source_row
+        .checked_mul(rows.hidden_dim)
+        .ok_or_else(|| anyhow!("DSV2-Lite route source offset overflow"))?;
+    let (rows_ptr, _rows_guard) = rows.data.device_ptr(&ctx.stream);
+    let (out_ptr, _out_guard) = out.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::accumulate_bf16_token_scaled_to_f32_cuda(
+            (rows_ptr as *const ffi::Half).add(source_offset),
+            scale,
+            out_ptr as *mut f32,
+            rows.hidden_dim as i32,
+            token_idx as i32,
+            seq_len as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result
+        .result()
+        .map_err(|err| anyhow!("DSV2-Lite route accumulation CUDA launch failed: {err}"))
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Dsv2LiteAttentionConfig {
     pub num_heads: usize,

@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, env};
+use std::{collections::BTreeMap, env, sync::LazyLock};
 
 use anyhow::{Context, Result, bail, ensure};
 use cudarc::driver::CudaSlice;
@@ -31,107 +31,60 @@ use crate::{
     nccl_backend::NaiveNcclEp2Backend,
 };
 
-#[derive(Clone, Copy)]
-pub(super) struct HostStagedRouteWork {
-    pub(super) token: usize,
-    pub(super) global_expert: usize,
-    pub(super) owner_rank: usize,
-    pub(super) weight: f32,
-}
-
-impl HostStagedRouteWork {
-    pub(super) fn new(token: usize, global_expert: usize, owner_rank: usize, weight: f32) -> Self {
-        Self {
-            token,
-            global_expert,
-            owner_rank,
-            weight,
-        }
+fn parse_rollback_value(
+    name: &str,
+    raw: Option<&str>,
+    optimized: &str,
+    rollback: &str,
+) -> std::result::Result<bool, String> {
+    match raw.map(str::trim) {
+        None | Some("") => Ok(false),
+        Some(value) if value == optimized => Ok(false),
+        Some(value) if value == rollback => Ok(true),
+        Some(value) => Err(format!(
+            "{name} must be `{optimized}` or `{rollback}`, got `{value}`"
+        )),
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum HostStagedExpertBatchPolicy {
-    Batched,
-    Serial,
-}
-
-impl HostStagedExpertBatchPolicy {
-    pub(super) fn from_env_value(raw: Option<&str>) -> Self {
-        match raw.map(str::trim).filter(|value| !value.is_empty()) {
-            Some("0" | "false" | "off" | "serial" | "legacy") => Self::Serial,
-            _ => Self::Batched,
-        }
-    }
-
-    fn use_serial(self) -> bool {
-        self == Self::Serial
+fn load_rollback_value(
+    name: &str,
+    optimized: &str,
+    rollback: &str,
+) -> std::result::Result<bool, String> {
+    match env::var(name) {
+        Ok(value) => parse_rollback_value(name, Some(&value), optimized, rollback),
+        Err(env::VarError::NotPresent) => Ok(false),
+        Err(env::VarError::NotUnicode(_)) => Err(format!("{name} must contain valid Unicode text")),
     }
 }
 
-fn host_staged_expert_batch_policy() -> HostStagedExpertBatchPolicy {
-    HostStagedExpertBatchPolicy::from_env_value(
-        env::var("OPENINFER_DSV2_LITE_HOST_STAGED_EXPERT_BATCH")
-            .ok()
-            .as_deref(),
+fn rollback_enabled(value: &std::result::Result<bool, String>) -> Result<bool> {
+    value
+        .as_ref()
+        .copied()
+        .map_err(|message| anyhow::anyhow!("{message}"))
+}
+
+static HOST_STAGED_SERIAL: LazyLock<std::result::Result<bool, String>> = LazyLock::new(|| {
+    load_rollback_value(
+        "OPENINFER_DSV2_LITE_HOST_STAGED_EXPERT_BATCH",
+        "batched",
+        "serial",
     )
-}
+});
+static NCCL_SERIAL: LazyLock<std::result::Result<bool, String>> = LazyLock::new(|| {
+    load_rollback_value("OPENINFER_DSV2_LITE_NCCL_EXPERT_BATCH", "grouped", "serial")
+});
+static NCCL_HOST_ROUTER: LazyLock<std::result::Result<bool, String>> =
+    LazyLock::new(|| load_rollback_value("OPENINFER_DSV2_LITE_NCCL_ROUTER", "device", "host"));
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum NcclExpertBatchPolicy {
-    Grouped,
-    Serial,
-}
-
-impl NcclExpertBatchPolicy {
-    pub(super) fn from_env_value(raw: Option<&str>) -> Self {
-        match raw.map(str::trim).filter(|value| !value.is_empty()) {
-            Some("0" | "false" | "off" | "serial" | "legacy") => Self::Serial,
-            _ => Self::Grouped,
-        }
-    }
-
-    fn use_serial(self) -> bool {
-        self == Self::Serial
-    }
-}
-
-fn nccl_expert_batch_policy() -> NcclExpertBatchPolicy {
-    NcclExpertBatchPolicy::from_env_value(
-        env::var("OPENINFER_DSV2_LITE_NCCL_EXPERT_BATCH")
-            .ok()
-            .as_deref(),
-    )
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum NcclRouterPolicy {
-    Host,
-    Device,
-}
-
-impl NcclRouterPolicy {
-    pub(super) fn from_env_value(raw: Option<&str>) -> Self {
-        match raw.map(str::trim).filter(|value| !value.is_empty()) {
-            Some("0" | "false" | "off" | "host" | "cpu" | "legacy") => Self::Host,
-            _ => Self::Device,
-        }
-    }
-}
-
-fn nccl_router_policy() -> NcclRouterPolicy {
-    NcclRouterPolicy::from_env_value(env::var("OPENINFER_DSV2_LITE_NCCL_ROUTER").ok().as_deref())
-}
-
-pub(super) fn group_nccl_route_indices(
-    routes: &[MoeRouteEntry],
+fn group_route_indices(
+    keys: impl IntoIterator<Item = (usize, usize)>,
 ) -> BTreeMap<(usize, usize), Vec<usize>> {
     let mut groups = BTreeMap::new();
-    for (route_index, route) in routes.iter().enumerate() {
-        groups
-            .entry((route.owner_rank, route.global_expert))
-            .or_insert_with(Vec::new)
-            .push(route_index);
+    for (route_index, key) in keys.into_iter().enumerate() {
+        groups.entry(key).or_insert_with(Vec::new).push(route_index);
     }
     groups
 }
@@ -141,47 +94,10 @@ struct NcclRouteReplayBuffers {
     _outputs: Vec<HiddenStates>,
 }
 
-pub(super) fn scatter_host_staged_group_output(
-    route_outputs: &mut [Option<Vec<f32>>],
-    route_indices: &[usize],
-    out: &[f32],
-    hidden_size: usize,
-) -> Result<()> {
-    ensure!(
-        hidden_size > 0,
-        "host-staged expert output requires nonzero hidden size"
-    );
-    let expected_len = route_indices
-        .len()
-        .checked_mul(hidden_size)
-        .context("host-staged expert output length overflow")?;
-    ensure!(
-        out.len() == expected_len,
-        "host-staged expert output len mismatch: got {}, expected {}",
-        out.len(),
-        expected_len
-    );
-    for (group_row, route_index) in route_indices.iter().copied().enumerate() {
-        ensure!(
-            route_index < route_outputs.len(),
-            "host-staged route index {route_index} exceeds output slots {}",
-            route_outputs.len()
-        );
-        ensure!(
-            route_outputs[route_index].is_none(),
-            "host-staged route output {route_index} was assigned more than once"
-        );
-        let begin = group_row * hidden_size;
-        let end = begin + hidden_size;
-        route_outputs[route_index] = Some(out[begin..end].to_vec());
-    }
-    Ok(())
-}
-
-pub(super) fn accumulate_host_staged_route_output(
+fn accumulate_host_staged_route_output(
     dst: &mut [f32],
-    route: HostStagedRouteWork,
-    out: Vec<f32>,
+    route: &MoeRouteEntry,
+    out: &[f32],
     hidden_size: usize,
 ) -> Result<()> {
     ensure!(
@@ -206,7 +122,7 @@ pub(super) fn accumulate_host_staged_route_output(
     );
     let token_begin = token_end - hidden_size;
     for (dst, value) in dst[token_begin..token_end].iter_mut().zip(out) {
-        *dst += route.weight * value;
+        *dst += route.weight * *value;
     }
     Ok(())
 }
@@ -338,37 +254,17 @@ impl DeepSeekV2LiteEp2Generator {
                 }
             },
         )?;
-        let route_count = routes.iter().map(Vec::len).sum();
-        let mut route_work = Vec::with_capacity(route_count);
-        let mut route_groups: BTreeMap<(usize, usize), Vec<usize>> = BTreeMap::new();
-        let mut local_routes = 0usize;
-        let mut remote_routes = 0usize;
-
-        for (token, token_routes) in routes.iter().enumerate() {
-            for &(global_expert, weight) in token_routes {
-                let owner_rank = self.rank0.layout.owner_rank(global_expert)?;
-                let route_index = route_work.len();
-                route_work.push(HostStagedRouteWork::new(
-                    token,
-                    global_expert,
-                    owner_rank,
-                    weight,
-                ));
-                route_groups
-                    .entry((owner_rank, global_expert))
-                    .or_default()
-                    .push(route_index);
-                if owner_rank == 0 {
-                    local_routes += 1;
-                } else {
-                    remote_routes += 1;
-                }
-            }
-        }
-
-        let mut route_outputs = vec![None; route_work.len()];
-        if host_staged_expert_batch_policy().use_serial() {
-            for (route_index, route) in route_work.iter().enumerate() {
+        let route_plan = MoeRoutePlan::from_topk_routes(&routes, &self.rank0.layout)?;
+        let route_groups = group_route_indices(
+            route_plan
+                .entries()
+                .iter()
+                .map(|route| (route.owner_rank, route.global_expert)),
+        );
+        let mut group_outputs = Vec::with_capacity(route_groups.len());
+        let mut route_locations = vec![None; route_plan.route_count()];
+        if rollback_enabled(&HOST_STAGED_SERIAL)? {
+            for (route_index, route) in route_plan.entries().iter().enumerate() {
                 let section = if route.owner_rank == 0 {
                     "host_staged_local_expert"
                 } else {
@@ -381,7 +277,7 @@ impl DeepSeekV2LiteEp2Generator {
                 };
                 let begin = route.token * self.config.hidden_size;
                 let end = begin + self.config.hidden_size;
-                let (out, is_remote) = attribution.record_gpu_result(
+                let out = attribution.record_gpu_result(
                     expert_ctx,
                     phase,
                     section,
@@ -396,13 +292,8 @@ impl DeepSeekV2LiteEp2Generator {
                         )
                     },
                 )?;
-                let expected_remote = route.owner_rank != 0;
-                ensure!(
-                    is_remote == expected_remote,
-                    "host-staged expert owner mismatch for expert {}: expected remote={expected_remote}, got {is_remote}",
-                    route.global_expert
-                );
-                route_outputs[route_index] = Some(out);
+                route_locations[route_index] = Some((group_outputs.len(), 0));
+                group_outputs.push(out);
             }
         } else {
             for ((owner_rank, global_expert), route_indices) in route_groups {
@@ -416,7 +307,7 @@ impl DeepSeekV2LiteEp2Generator {
                 } else {
                     &self.rank1.ctx
                 };
-                let (out, is_remote) = attribution.record_gpu_result(
+                let out = attribution.record_gpu_result(
                     expert_ctx,
                     phase,
                     section,
@@ -428,43 +319,51 @@ impl DeepSeekV2LiteEp2Generator {
                             layer_idx,
                             global_expert,
                             &input_host,
-                            &route_work,
+                            route_plan.entries(),
                             &route_indices,
                         )
                     },
                 )?;
-                let expected_remote = owner_rank != 0;
                 ensure!(
-                    is_remote == expected_remote,
-                    "host-staged expert owner mismatch for expert {global_expert}: expected remote={expected_remote}, got {is_remote}"
+                    out.len() == route_indices.len() * self.config.hidden_size,
+                    "host-staged expert output len mismatch: got {}, expected {}",
+                    out.len(),
+                    route_indices.len() * self.config.hidden_size
                 );
-                scatter_host_staged_group_output(
-                    &mut route_outputs,
-                    &route_indices,
-                    &out,
-                    self.config.hidden_size,
-                )?;
+                let group_index = group_outputs.len();
+                for (group_row, route_index) in route_indices.into_iter().enumerate() {
+                    ensure!(
+                        route_locations[route_index]
+                            .replace((group_index, group_row))
+                            .is_none(),
+                        "host-staged route {route_index} was assigned more than once"
+                    );
+                }
+                group_outputs.push(out);
             }
         }
 
         let mut rank0_contrib = vec![0.0f32; input.seq_len * self.config.hidden_size];
         let mut rank1_contrib = vec![0.0f32; rank0_contrib.len()];
-        for (route_index, route) in route_work.iter().enumerate() {
+        for (route_index, route) in route_plan.entries().iter().enumerate() {
             let dst = if route.owner_rank == 0 {
                 &mut rank0_contrib
             } else {
                 &mut rank1_contrib
             };
-            let out = route_outputs[route_index].take().with_context(|| {
+            let (group_index, group_row) = route_locations[route_index].with_context(|| {
                 format!("missing host-staged expert output for route {route_index}")
             })?;
+            let begin = group_row * self.config.hidden_size;
+            let end = begin + self.config.hidden_size;
+            let out = &group_outputs[group_index][begin..end];
             attribution.record_result(
                 phase,
                 "host_staged_combine_accumulate",
                 || format!("layer.{layer_idx}.host_staged.combine_accumulate"),
                 Some(layer_idx),
                 token_index,
-                || accumulate_host_staged_route_output(dst, *route, out, self.config.hidden_size),
+                || accumulate_host_staged_route_output(dst, route, out, self.config.hidden_size),
             )?;
         }
         let routed_accum: Vec<_> = rank0_contrib
@@ -499,7 +398,11 @@ impl DeepSeekV2LiteEp2Generator {
             token_index,
             || ops::add_batch(&self.rank0.ctx, &routed, &shared),
         )?;
-        Ok((hidden, local_routes, remote_routes))
+        Ok((
+            hidden,
+            route_plan.local_routes(),
+            route_plan.remote_routes(),
+        ))
     }
 
     fn moe_forward_nccl(
@@ -514,10 +417,11 @@ impl DeepSeekV2LiteEp2Generator {
         shared_per_token_gemm: bool,
     ) -> Result<(HiddenStates, usize, usize)> {
         activate(&self.rank0.ctx)?;
-        let router_policy = nccl_router_policy();
-        let route_section = match router_policy {
-            NcclRouterPolicy::Host => "ep_route_host",
-            NcclRouterPolicy::Device => "ep_route_device",
+        let host_router = rollback_enabled(&NCCL_HOST_ROUTER)?;
+        let route_section = if host_router {
+            "ep_route_host"
+        } else {
+            "ep_route_device"
         };
         let route_plan = attribution.record_result(
             phase,
@@ -525,16 +429,15 @@ impl DeepSeekV2LiteEp2Generator {
             || format!("layer.{layer_idx}.nccl.route"),
             Some(layer_idx),
             token_index,
-            || match router_policy {
-                NcclRouterPolicy::Host => {
+            || {
+                if host_router {
                     let input_host = hidden_to_bf16(&self.rank0.ctx, input)?;
                     let route_logits_host =
                         gate_logits_host(&self.config, &input_host, &moe.gate_host);
                     let routes =
                         topk_softmax_routes(&self.config, &route_logits_host, input.seq_len);
                     MoeRoutePlan::from_topk_routes(&routes, &self.rank0.layout)
-                }
-                NcclRouterPolicy::Device => {
+                } else {
                     self.build_nccl_route_plan_device(input, &moe.gate_device)
                 }
             },
@@ -752,9 +655,9 @@ impl DeepSeekV2LiteEp2Generator {
         layer_idx: usize,
         global_expert: usize,
         input_host: &[bf16],
-        route_work: &[HostStagedRouteWork],
+        route_work: &[MoeRouteEntry],
         route_indices: &[usize],
-    ) -> Result<(Vec<f32>, bool)> {
+    ) -> Result<Vec<f32>> {
         let owner_rank = self.rank0.layout.owner_rank(global_expert)?;
         let (ctx, expert) = match owner_rank {
             0 => (
@@ -774,7 +677,7 @@ impl DeepSeekV2LiteEp2Generator {
         );
         let mut batch_input = Vec::with_capacity(route_indices.len() * self.config.hidden_size);
         for &route_index in route_indices {
-            let route = route_work[route_index];
+            let route = &route_work[route_index];
             ensure!(
                 route.global_expert == global_expert && route.owner_rank == owner_rank,
                 "host-staged expert batch mixed route: expected expert {global_expert}/rank {owner_rank}, got expert {}/rank {}",
@@ -792,7 +695,7 @@ impl DeepSeekV2LiteEp2Generator {
             route_indices.len(),
         )?;
         let out = dense_mlp_forward_per_token(ctx, &expert.dense, &input)?;
-        Ok((hidden_to_f32(ctx, &out)?, owner_rank != 0))
+        hidden_to_f32(ctx, &out)
     }
 
     fn expert_forward_host_token(
@@ -800,7 +703,7 @@ impl DeepSeekV2LiteEp2Generator {
         layer_idx: usize,
         global_expert: usize,
         token_input: &[bf16],
-    ) -> Result<(Vec<f32>, bool)> {
+    ) -> Result<Vec<f32>> {
         let owner_rank = self.rank0.layout.owner_rank(global_expert)?;
         let (ctx, expert) = match owner_rank {
             0 => (
@@ -816,7 +719,7 @@ impl DeepSeekV2LiteEp2Generator {
 
         let input = hidden_from_bf16_host(ctx, token_input, self.config.hidden_size, 1)?;
         let out = dense_mlp_forward(ctx, &expert.dense, &input)?;
-        Ok((hidden_to_f32(ctx, &out)?, owner_rank != 0))
+        hidden_to_f32(ctx, &out)
     }
 
     fn replay_nccl_route_plan(
@@ -830,7 +733,7 @@ impl DeepSeekV2LiteEp2Generator {
         phase: &'static str,
         token_index: Option<usize>,
     ) -> Result<NcclRouteReplayBuffers> {
-        if nccl_expert_batch_policy().use_serial() {
+        if rollback_enabled(&NCCL_SERIAL)? {
             return self.replay_nccl_route_plan_serial(
                 nccl,
                 layer_idx,
@@ -892,10 +795,11 @@ impl DeepSeekV2LiteEp2Generator {
                 Some(layer_idx),
                 token_index,
                 || {
-                    nccl.accumulate_device_contribution(
+                    nccl.accumulate_device_contribution_row(
                         route.owner_rank,
                         expert_ctx,
                         &out,
+                        0,
                         route.token,
                         input.seq_len,
                         route.weight,
@@ -921,7 +825,12 @@ impl DeepSeekV2LiteEp2Generator {
         phase: &'static str,
         token_index: Option<usize>,
     ) -> Result<NcclRouteReplayBuffers> {
-        let route_groups = group_nccl_route_indices(route_plan.entries());
+        let route_groups = group_route_indices(
+            route_plan
+                .entries()
+                .iter()
+                .map(|route| (route.owner_rank, route.global_expert)),
+        );
         let mut group_inputs = Vec::with_capacity(route_groups.len());
         let mut group_outputs = Vec::with_capacity(route_groups.len());
         let mut route_locations = vec![None; route_plan.route_count()];
