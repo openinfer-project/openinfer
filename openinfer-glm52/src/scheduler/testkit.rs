@@ -42,6 +42,7 @@ pub(super) fn request(
     GenerateRequest {
         request_id: None,
         queued_at_unix_s: None,
+        data_parallel_rank: None,
         prompt_tokens: prompt,
         params,
         max_tokens,

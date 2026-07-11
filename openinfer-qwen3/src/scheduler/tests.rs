@@ -758,6 +758,7 @@ fn request(
         GenerateRequest {
             request_id: None,
             queued_at_unix_s: None,
+            data_parallel_rank: None,
             prompt_tokens: vec![1; prompt_len],
             params: SamplingParams::default(),
             max_tokens,

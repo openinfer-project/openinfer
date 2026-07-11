@@ -56,6 +56,7 @@ fn launch_options(draft: Option<PathBuf>) -> Qwen3LaunchOptions {
         device_ordinal: 0,
         tp_size: 1,
         cuda_graph: true,
+        dump_graph_png: None,
         offload: Qwen3OffloadOptions::disabled(),
         no_prefix_cache: true,
         max_prefill_tokens: DEFAULT_MAX_PREFILL_TOKENS,
@@ -82,6 +83,7 @@ fn timed_generate(handle: &EngineHandle, prompt_tokens: Vec<u32>) -> (usize, Dur
         .submit(GenerateRequest {
             request_id: None,
             queued_at_unix_s: None,
+            data_parallel_rank: None,
             prompt_tokens,
             params: SamplingParams {
                 ignore_eos: true,

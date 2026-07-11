@@ -33,6 +33,13 @@ pub(crate) struct Args {
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub cuda_graph: bool,
 
+    /// Dump the live Qwen3 rank-0, batch-1 SplitKv decode CUDA Graph during
+    /// startup. Writes a detailed sibling `.dot` for LLM inspection and a
+    /// compact Graphviz-rendered PNG at this path. Requires CUDA driver API
+    /// 12.3 or newer for kernel-name inspection.
+    #[arg(long)]
+    pub dump_graph_png: Option<PathBuf>,
+
     /// Enable Qwen3 LoRA serving mode.
     #[arg(long, default_value_t = false)]
     pub enable_lora: bool,
@@ -262,6 +269,7 @@ fn consumed_args(model_type: ModelType) -> &'static [&'static str] {
         #[cfg(feature = "qwen3")]
         ModelType::Qwen3 => &[
             "cuda_graph",
+            "dump_graph_png",
             "enable_lora",
             "lora_modules",
             "max_loras",
@@ -345,6 +353,14 @@ impl Args {
         }
         if self.batch_invariant && self.enable_lora {
             bail!("--batch-invariant is not supported with --enable-lora; enable one at a time");
+        }
+        if self.dump_graph_png.is_some() && !self.cuda_graph {
+            bail!("--dump-graph-png requires --cuda-graph=true");
+        }
+        if self.dump_graph_png.is_some() && self.enable_lora {
+            bail!(
+                "--dump-graph-png is not supported with --enable-lora (LoRA disables CUDA Graph)"
+            );
         }
         if self.batch_invariant && !matches!(self.decode_overlap, CliDecodeOverlap::Off) {
             bail!(
@@ -480,7 +496,7 @@ fn parse_lora_module_fields(name: &str, path: &str) -> Result<LoraModule, String
 mod tests {
     use super::*;
 
-    #[cfg(feature = "glm52")]
+    #[cfg(any(feature = "glm52", feature = "qwen3"))]
     fn parse_with_provided(argv: &[&str]) -> (Args, BTreeSet<String>) {
         use clap::FromArgMatches;
         let matches = Args::command()
@@ -573,6 +589,49 @@ mod tests {
     #[test]
     fn qwen3_lora_default_rank_is_64() {
         assert_eq!(Qwen3LoraOptions::default().max_lora_rank, 64);
+    }
+
+    #[cfg(feature = "qwen3")]
+    #[test]
+    fn qwen3_accepts_graph_png_dump() {
+        let (args, provided) =
+            parse_with_provided(&["openinfer", "--dump-graph-png", "decode.png"]);
+        args.validate(ModelType::Qwen3, &provided)
+            .expect("Qwen3 should accept a graph PNG dump with CUDA Graph enabled");
+    }
+
+    #[cfg(feature = "qwen3")]
+    #[test]
+    fn qwen3_graph_png_dump_requires_cuda_graph() {
+        let (args, provided) = parse_with_provided(&[
+            "openinfer",
+            "--dump-graph-png",
+            "decode.png",
+            "--cuda-graph=false",
+        ]);
+        let error = args
+            .validate(ModelType::Qwen3, &provided)
+            .expect_err("graph dump without CUDA Graph should be rejected");
+        assert!(error.to_string().contains("requires --cuda-graph=true"));
+    }
+
+    #[cfg(feature = "qwen3")]
+    #[test]
+    fn qwen3_graph_png_dump_rejects_lora() {
+        let (args, provided) = parse_with_provided(&[
+            "openinfer",
+            "--dump-graph-png",
+            "decode.png",
+            "--enable-lora",
+        ]);
+        let error = args
+            .validate(ModelType::Qwen3, &provided)
+            .expect_err("graph dump with LoRA should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("not supported with --enable-lora")
+        );
     }
 
     #[cfg(feature = "qwen3")]

@@ -145,6 +145,7 @@ impl OpeninferBackend {
             device_ordinal: args.device_ordinal,
             tp_size: 1,
             cuda_graph: !args.no_cuda_graph,
+            dump_graph_png: None,
             offload: Qwen3OffloadOptions::disabled(),
             // Keep the prefix cache on: it is both a single-worker win and the
             // source of the KV store/remove events published to the router for
@@ -283,6 +284,7 @@ impl LLMEngine for OpeninferBackend {
         let req = GenerateRequest {
             request_id: Some(ctx.id().to_string()),
             queued_at_unix_s: request.request_timestamp_ms.map(|ms| ms / 1000.0),
+            data_parallel_rank: None,
             prompt_tokens: request.token_ids,
             params,
             max_tokens,

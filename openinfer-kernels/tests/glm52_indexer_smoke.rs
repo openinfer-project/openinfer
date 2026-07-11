@@ -138,7 +138,6 @@ fn indexer_cache_round_trip() -> Result<()> {
             128, // quant_block_size
             cache_block_size as i32,
             stride as i64,
-            0, // F32 scale
             STREAM,
         )
     })?;

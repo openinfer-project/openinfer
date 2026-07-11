@@ -185,8 +185,10 @@ fn as_i32(st: &SafeTensors, name: &str) -> (Vec<i32>, Vec<usize>) {
     assert_eq!(t.dtype(), Dtype::I32, "{name} must be i32");
     let v = t
         .data()
-        .chunks_exact(4)
-        .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|bytes| i32::from_le_bytes(*bytes))
         .collect();
     (v, t.shape().to_vec())
 }
@@ -198,8 +200,10 @@ fn as_f32(st: &SafeTensors, name: &str) -> (Vec<f32>, Vec<usize>) {
     assert_eq!(t.dtype(), Dtype::F32, "{name} must be f32");
     let v = t
         .data()
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|bytes| f32::from_le_bytes(*bytes))
         .collect();
     (v, t.shape().to_vec())
 }
@@ -326,6 +330,7 @@ fn submit(
         .submit(openinfer_core::engine::GenerateRequest {
             request_id: Some(label.clone()),
             queued_at_unix_s: None,
+            data_parallel_rank: None,
             prompt_tokens: prompt.to_vec(),
             params: SamplingParams {
                 temperature: 0.0,

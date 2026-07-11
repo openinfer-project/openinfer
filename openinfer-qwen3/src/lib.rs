@@ -210,6 +210,9 @@ pub struct Qwen3LaunchOptions {
     /// Whether the user requested CUDA Graph. LoRA serving forces it off;
     /// under tensor parallelism every decode graph is pre-captured at startup.
     pub cuda_graph: bool,
+    /// Export the live rank-0, batch-1 SplitKv decode graph during startup.
+    /// The requested PNG gets a detailed sibling `.dot` for LLM inspection.
+    pub dump_graph_png: Option<PathBuf>,
     pub offload: Qwen3OffloadOptions,
     pub no_prefix_cache: bool,
     pub max_prefill_tokens: usize,
@@ -249,6 +252,17 @@ pub fn launch(model_path: &Path, options: Qwen3LaunchOptions) -> Result<EngineHa
     } else {
         options.cuda_graph
     };
+    if let Some(path) = &options.dump_graph_png {
+        anyhow::ensure!(
+            enable_cuda_graph,
+            "Qwen3 graph export requires CUDA Graph enabled"
+        );
+        anyhow::ensure!(
+            options.lora.is_none(),
+            "Qwen3 graph export is not supported with LoRA serving"
+        );
+        openinfer_core::cuda_graph::validate_graph_dump_request(path)?;
+    }
     let engine = EngineLoadOptions {
         enable_cuda_graph,
         enable_prefill_profile: false,
@@ -302,7 +316,7 @@ pub fn launch(model_path: &Path, options: Qwen3LaunchOptions) -> Result<EngineHa
                 options.batch_invariant,
             )
         }
-        None => start_engine_with_offload(
+        None => start_engine_with_offload_inner(
             model_path,
             engine,
             options.offload,
@@ -313,6 +327,7 @@ pub fn launch(model_path: &Path, options: Qwen3LaunchOptions) -> Result<EngineHa
             options.batch_invariant,
             options.dflash_draft_model_path.as_deref(),
             options.enable_kv_events,
+            options.dump_graph_png.as_deref(),
         ),
     }
 }
@@ -357,6 +372,35 @@ pub fn start_engine_with_offload(
     dflash_draft_model_path: Option<&Path>,
     enable_kv_events: bool,
 ) -> Result<EngineHandle> {
+    start_engine_with_offload_inner(
+        model_path,
+        options,
+        offload_options,
+        no_prefix_cache,
+        max_prefill_tokens,
+        memory_options,
+        decode_overlap,
+        batch_invariant,
+        dflash_draft_model_path,
+        enable_kv_events,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_engine_with_offload_inner(
+    model_path: &Path,
+    options: EngineLoadOptions,
+    offload_options: Qwen3OffloadOptions,
+    no_prefix_cache: bool,
+    max_prefill_tokens: usize,
+    memory_options: Qwen3MemoryOptions,
+    decode_overlap: DecodeOverlap,
+    batch_invariant: bool,
+    dflash_draft_model_path: Option<&Path>,
+    enable_kv_events: bool,
+    dump_graph_png: Option<&Path>,
+) -> Result<EngineHandle> {
     let EngineLoadOptions {
         enable_cuda_graph,
         device_ordinals,
@@ -390,6 +434,7 @@ pub fn start_engine_with_offload(
         decode_overlap,
         dflash_draft_model_path,
         enable_kv_events,
+        dump_graph_png,
     )
 }
 

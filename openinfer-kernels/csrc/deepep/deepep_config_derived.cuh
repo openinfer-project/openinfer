@@ -4,12 +4,16 @@
 // Include this INSIDE a config namespace, after defining the base constants:
 //   kNumRanks, kNumExperts, kNumLocalExperts, kNumTopk, kHidden, kHiddenBytes,
 //   kExpertAlignment, kKernelQPs, kAllocatedQPs, kTimeoutCycles, kDeviceSms,
-//   kSmemBytes, kDecodeMaxTokens, kDecodeNumSms, kPrefillMaxTokens,
-//   kPrefillNumSms.
+//   kSmemBytes, kDecodeMaxTokens, kDecodeNumSms. Prefill-capable instances
+//   additionally define kPrefillMaxTokens and kPrefillNumSms.
 //
 // deepep_ctx_create runtime-asserts these mirrors against the real layout
 // classes so upstream layout changes fail loudly instead of corrupting
 // buffers.
+
+#ifndef DEEPEP_SHIM_HAS_PREFILL
+#error "instantiation must define DEEPEP_SHIM_HAS_PREFILL before its config"
+#endif
 
 inline constexpr int kTMAAlign = 32;  // ptx::kNumTMAAlignBytes
 
@@ -55,4 +59,6 @@ inline constexpr int kDecodeWorstExpandedTokens = align_up(
         (kExpertAlignment - 1) * kNumLocalExperts,
     kExpertAlignment);
 
+#if DEEPEP_SHIM_HAS_PREFILL
 inline constexpr int kPrefillWorstRecvTokens = kNumRanks * kPrefillMaxTokens;
+#endif

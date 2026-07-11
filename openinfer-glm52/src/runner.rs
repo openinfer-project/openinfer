@@ -463,15 +463,6 @@ impl Glm52RankThreadState {
             moe_topo,
             (moe_topo == crate::Glm52MoeTopo::Tp8).then_some(self.placement.rank),
         )?);
-        ensure!(
-            weights.expert_layers.is_empty(),
-            "GLM5.2 rank {} left {} expert layers unconsumed after model build",
-            self.placement.rank,
-            weights.expert_layers.len()
-        );
-        // Non-expert leftovers are the MTP-layer tensors (out of scope) —
-        // dropped with `weights` here.
-        drop(weights);
         let arenas = model.kv_arenas(&dev_ctx.stream)?;
         let aux_ctx = self.ctx.auxiliary_device_context("decode aux")?;
         self.runtime = Some(Glm52RankRuntime {

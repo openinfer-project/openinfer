@@ -530,37 +530,51 @@ pub(crate) fn glm52_mla_decode_forward(
     Ok(o)
 }
 
-/// A FlashMLA sparse decode contract paired with its tile-scheduler plan. The
-/// plan depends only on `batch_size`, `topk` and `num_sm_parts` — not on
-/// position, sequence length, or layer — so it is computed once (model build
-/// time) instead of per layer per step (78 × ~25 µs/step at bs=1). Owning the
-/// contract makes a plan/contract mismatch unrepresentable: every consumer
-/// reads both from the same object.
+enum Glm52MlaSchedBackend {
+    Rightsize,
+    Flash {
+        tile_scheduler_metadata: CudaSlice<i32>,
+        num_splits: CudaSlice<i32>,
+    },
+}
+
+/// Sparse MLA contract paired with only the selected backend's scheduler
+/// state. The 64-head EP8 FlashMLA path owns its precomputed tile plan; the
+/// right-sized attention-TP path has no FlashMLA metadata to allocate or
+/// initialize.
 pub(crate) struct Glm52MlaSchedMetadata {
     contract: Glm52FlashMlaSparseDecode,
-    tile_scheduler_metadata: CudaSlice<i32>,
-    num_splits: CudaSlice<i32>,
+    backend: Glm52MlaSchedBackend,
 }
 
 impl Glm52MlaSchedMetadata {
-    pub(crate) fn new(ctx: &DeviceContext, contract: Glm52FlashMlaSparseDecode) -> Result<Self> {
-        let mut tile_scheduler_metadata = ctx
-            .stream
-            .alloc_zeros::<i32>(contract.tile_scheduler_metadata_len())?;
-        let mut num_splits = ctx.stream.alloc_zeros::<i32>(contract.num_splits_len())?;
-        glm52_flashmla_sparse_decode_metadata_launch(
-            ctx,
-            contract.batch_size,
-            contract.topk,
-            contract.num_sm_parts,
-            &mut tile_scheduler_metadata,
-            &mut num_splits,
-        )?;
-        Ok(Self {
-            contract,
-            tile_scheduler_metadata,
-            num_splits,
-        })
+    pub(crate) fn new(
+        ctx: &DeviceContext,
+        contract: Glm52FlashMlaSparseDecode,
+        heads: usize,
+    ) -> Result<Self> {
+        let backend = if heads <= GLM52_SPARSE_MLA_HEAD_SLOTS {
+            rightsize_contract(&contract, heads).validate()?;
+            Glm52MlaSchedBackend::Rightsize
+        } else {
+            let mut tile_scheduler_metadata = ctx
+                .stream
+                .alloc_zeros::<i32>(contract.tile_scheduler_metadata_len())?;
+            let mut num_splits = ctx.stream.alloc_zeros::<i32>(contract.num_splits_len())?;
+            glm52_flashmla_sparse_decode_metadata_launch(
+                ctx,
+                contract.batch_size,
+                contract.topk,
+                contract.num_sm_parts,
+                &mut tile_scheduler_metadata,
+                &mut num_splits,
+            )?;
+            Glm52MlaSchedBackend::Flash {
+                tile_scheduler_metadata,
+                num_splits,
+            }
+        };
+        Ok(Self { contract, backend })
     }
 
     /// The sparse index-list length this plan was built for. The DSA indexer
@@ -680,8 +694,8 @@ pub(crate) fn glm52_mla_attend_into(
     )?;
 
     // ---- sparse decode -> latent[T,64,512] ----
-    match &mut s.attend {
-        Glm52SparseAttend::Rightsize { o_part, ml_part } => {
+    match (&mut s.attend, &sched.backend) {
+        (Glm52SparseAttend::Rightsize { o_part, ml_part }, Glm52MlaSchedBackend::Rightsize) => {
             glm52_sparse_mla_decode_launch(
                 ctx,
                 rightsize_contract(&contract, heads),
@@ -693,25 +707,32 @@ pub(crate) fn glm52_mla_attend_into(
                 &mut s.latent,
             )?;
         }
-        Glm52SparseAttend::Flash {
-            lse,
-            lse_accum,
-            o_accum,
-        } => {
+        (
+            Glm52SparseAttend::Flash {
+                lse,
+                lse_accum,
+                o_accum,
+            },
+            Glm52MlaSchedBackend::Flash {
+                tile_scheduler_metadata,
+                num_splits,
+            },
+        ) => {
             glm52_flashmla_sparse_decode_launch(
                 ctx,
                 contract,
                 &s.query,
                 cache,
                 topk,
-                &sched.tile_scheduler_metadata,
-                &sched.num_splits,
+                tile_scheduler_metadata,
+                num_splits,
                 &mut s.latent,
                 lse,
                 lse_accum,
                 o_accum,
             )?;
         }
+        _ => anyhow::bail!("GLM5.2 sparse MLA scratch and scheduler backends disagree"),
     }
 
     // ---- back: v[T,heads,256] = latent @ W_UV, then o_proj ----

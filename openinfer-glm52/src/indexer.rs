@@ -36,8 +36,8 @@ use half::bf16;
 use openinfer_kernels::ops::{
     GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW, GLM52_INDEXER_HEAD_DIM, GLM52_INDEXER_TOPK,
     Glm52DeepGemmMqaLogitsShape, Glm52IndexerCacheInsert, Glm52IndexerCacheLayout,
-    Glm52IndexerLocalTopKToSlots, Glm52IndexerScaleFormat, Glm52IndexerTopK, Glm52MoeQuantShape,
-    bf16_bytes_to_f32_into, gemm_strided_batched_bf16, glm52_deepgemm_paged_mqa_logits_launch,
+    Glm52IndexerLocalTopKToSlots, Glm52IndexerTopK, Glm52MoeQuantShape, bf16_bytes_to_f32_into,
+    gemm_strided_batched_bf16, glm52_deepgemm_paged_mqa_logits_launch,
     glm52_deepgemm_paged_mqa_metadata_launch, glm52_flashinfer_topk_2048_launch,
     glm52_fp8_per_token_group_quant_bf16_launch, glm52_indexer_k_quant_and_cache_launch,
     glm52_indexer_local_topk_to_slots_launch, glm52_indexer_rope_launch,
@@ -238,7 +238,6 @@ pub(crate) fn glm52_indexer_cache_fill(
         Glm52IndexerCacheInsert {
             tokens: 1,
             layout: cache_layout,
-            scale_format: Glm52IndexerScaleFormat::F32,
         },
         &k,
         index_k_cache,
@@ -472,7 +471,6 @@ pub(crate) fn glm52_indexer_forward_into(
         Glm52IndexerCacheInsert {
             tokens: t,
             layout: cache_layout,
-            scale_format: Glm52IndexerScaleFormat::F32,
         },
         &s.k,
         index_k_cache,

@@ -39,10 +39,6 @@ use crate::mla_decode::{
     Glm52MlaLayerWeights, Glm52MlaSchedMetadata, glm52_mla_attend_into, glm52_mla_front_q_into,
     glm52_mla_front_rest_into,
 };
-#[cfg(test)]
-use crate::moe_decode::Glm52MoeLayerWeights;
-#[cfg(test)]
-use crate::moe_decode::{Glm52MoeExpertPath, glm52_moe_forward};
 use crate::moe_ep8::Glm52MoeEp8LayerWeights;
 use crate::rows::Rows;
 use crate::scratch::Glm52DecodeScratch;
@@ -50,7 +46,6 @@ use crate::scratch::Glm52DecodeScratch;
 const HIDDEN: usize = GLM52_HIDDEN;
 
 /// The MLP half of a decoder layer: dense (layers 0..first_k_dense_replace),
-/// EP1 routed+shared MoE (all 256 experts local — the oracle-gate path), or
 /// the EP8 rank-0 MoE (router + shared + this rank's 32 experts; the expert
 /// compute itself runs through the collective driver in `moe_ep8`, so the
 /// single-layer forward below rejects it). Boxed: layer weight structs are
@@ -58,8 +53,6 @@ const HIDDEN: usize = GLM52_HIDDEN;
 /// stays small.
 pub(crate) enum Glm52LayerMlp {
     Dense(Box<Glm52DenseMlpWeights>),
-    #[cfg(test)]
-    Moe(Box<Glm52MoeLayerWeights>),
     MoeEp8(Box<Glm52MoeEp8LayerWeights>),
     /// TP8 topology: the router is the only per-layer MLP weight here — the
     /// routed experts AND the shared expert live in the rank's slice bank
@@ -100,8 +93,8 @@ pub(crate) struct Glm52DecodeStep<'a> {
     pub(crate) mla_sin: &'a CudaSlice<bf16>,
     pub(crate) idx_cos: &'a CudaSlice<bf16>,
     pub(crate) idx_sin: &'a CudaSlice<bf16>,
-    /// FlashMLA contract + tile-scheduler plan — computed once (the plan only
-    /// depends on batch size / SM parts), shared by every layer.
+    /// Sparse-MLA contract plus the selected backend's scheduler state,
+    /// shared by every layer.
     pub(crate) mla_sched: &'a Glm52MlaSchedMetadata,
     pub(crate) slot_mapping: &'a CudaSlice<i64>,
     pub(crate) block_table: &'a CudaSlice<i32>,
@@ -353,18 +346,14 @@ pub(crate) fn glm52_layer_finish(
     )
 }
 
-/// One full decoder layer for one token (attention half + local MLP half),
-/// `s.hidden` → `s.hidden`. EP8 rank MoE layers must go through the
-/// collective driver in `moe_ep8` instead — this single-layer path fails
-/// closed on them. Oracle-gate path (the production spine drives the halves
-/// directly in `model.rs`).
+/// Dense-layer oracle helper. Production drives the two halves directly;
+/// collective MoE layers fail closed here.
 #[cfg(test)]
 pub(crate) fn glm52_decoder_layer_forward(
     ctx: &DeviceContext,
     w: &Glm52DecoderLayerWeights,
     caches: &mut Glm52LayerCaches,
     step: &Glm52DecodeStep<'_>,
-    moe_path: Glm52MoeExpertPath,
     s: &mut Glm52DecodeScratch,
     carry_ready: &mut bool,
 ) -> Result<()> {
@@ -389,12 +378,6 @@ pub(crate) fn glm52_decoder_layer_forward(
             &mut s.dense_mlp,
             s.layer.mlp_out.data_mut(),
         )?,
-        Glm52LayerMlp::Moe(moe) => {
-            // EP1 oracle path: the all-256-expert forward allocates internally;
-            // relay its output into the layer scratch.
-            let mlp = glm52_moe_forward(ctx, moe, s.layer.normed2.data(), moe_path)?;
-            ctx.stream.memcpy_dtod(&mlp, s.layer.mlp_out.data_mut())?;
-        }
         Glm52LayerMlp::MoeEp8(_) | Glm52LayerMlp::MoeTp8(_) => anyhow::bail!(
             "GLM5.2 EP8/TP8 MoE layers require their collective drivers, not the single-layer forward"
         ),

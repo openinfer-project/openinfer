@@ -81,6 +81,27 @@ impl Glm52RankGpuWeights {
             anyhow::anyhow!("GLM5.2 resident weights missing expert regions for layer {layer}")
         })
     }
+
+    /// Every resident load-plan entry must move into the built model. Keeping
+    /// validation-only tensors in these maps silently spends H2D bandwidth
+    /// and transient HBM before dropping them with the load bundle.
+    pub(crate) fn ensure_consumed(&self) -> Result<()> {
+        let tensor_sample = self.tensors.keys().take(5).cloned().collect::<Vec<_>>();
+        let expert_sample = self
+            .expert_layers
+            .keys()
+            .take(5)
+            .copied()
+            .collect::<Vec<_>>();
+        ensure!(
+            self.tensors.is_empty() && self.expert_layers.is_empty(),
+            "GLM5.2 resident load plan contains tensors the model did not consume: \
+             tensors={} sample={tensor_sample:?}, expert_layers={} sample={expert_sample:?}",
+            self.tensors.len(),
+            self.expert_layers.len(),
+        );
+        Ok(())
+    }
 }
 
 pub(crate) struct Glm52RankLoadOutput {

@@ -245,7 +245,7 @@ fn run_mla_oracle_gate(topk: usize, sm_parts_cap: Option<usize>) -> Result<()> {
     let mut cache = ctx
         .stream
         .alloc_zeros::<u8>(contract.packed_kv_cache_len())?;
-    let mla_sched = Glm52MlaSchedMetadata::new(&ctx, contract)?;
+    let mla_sched = Glm52MlaSchedMetadata::new(&ctx, contract, w.heads)?;
 
     // Prefill via decode: position p writes its token into the cache, then
     // attends over the full prefix [0..=p] via a -1-padded top-k list.

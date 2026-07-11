@@ -31,7 +31,7 @@ const FP8_BLOCK_SIZE: usize = 128;
 // ---------------------------------------------------------------------------
 // Expert packed placement: routed-expert tensors are written into their FINAL
 // expert-major layout at H2D time (per expert: [gate; up] rows, scales
-// likewise), byte-identical to `Glm52MoeLayerWeights::from_host` packing.
+// likewise), byte-identical to `Glm52MoeExpertBank::pack_from_host` packing.
 // Repacking after load cannot work — a rank's expert slab (~85 GiB) plus its
 // packed copy exceeds the 141 GiB HBM — so placement happens in the loader.
 // ---------------------------------------------------------------------------
@@ -235,15 +235,12 @@ impl Glm52WeightManifest {
         Ok(manifest)
     }
 
-    /// `include_experts = false` builds the TP8-topology bundle: every
-    /// non-expert tensor, zero routed experts — the per-rank all-expert
-    /// slice banks are gathered by `load_tp8_slice_layer` instead.
     pub(crate) fn all_rank_load_bundles(
         &self,
-        include_experts: bool,
+        moe_topo: crate::Glm52MoeTopo,
     ) -> Result<Vec<Glm52RankLoadBundle>> {
         (0..GLM52_EP_RANKS)
-            .map(|rank| self.rank_load_bundle(rank, include_experts))
+            .map(|rank| self.rank_load_bundle(rank, moe_topo))
             .collect()
     }
 
@@ -256,8 +253,12 @@ impl Glm52WeightManifest {
             .with_context(|| format!("GLM5.2 safetensors index missing tensor {name}"))
     }
 
-    fn rank_load_bundle(&self, rank: usize, include_experts: bool) -> Result<Glm52RankLoadBundle> {
-        let names = self.rank_tensor_names_with(rank, include_experts)?;
+    fn rank_load_bundle(
+        &self,
+        rank: usize,
+        moe_topo: crate::Glm52MoeTopo,
+    ) -> Result<Glm52RankLoadBundle> {
+        let names = self.rank_resident_tensor_names(rank, moe_topo)?;
         let mut by_shard: BTreeMap<String, Vec<Glm52TensorLoadSpec>> = BTreeMap::new();
         for name in names {
             let shard = self
@@ -287,30 +288,54 @@ impl Glm52WeightManifest {
         })
     }
 
-    /// Every rank loads the full non-expert stack (DP8 replication, ~19.6 GiB
-    /// per rank) plus its 32-expert slice of every MoE layer.
+    /// Full checkpoint coverage, including the native MTP layer. This is a
+    /// manifest invariant only: resident load plans below deliberately omit
+    /// tensors that the serving model never consumes.
     fn rank_tensor_names(&self, rank: usize) -> Result<Vec<String>> {
-        self.rank_tensor_names_with(rank, true)
-    }
-
-    fn rank_tensor_names_with(&self, rank: usize, include_experts: bool) -> Result<Vec<String>> {
         ensure!(
             rank < GLM52_EP_RANKS,
             "GLM5.2 rank must be in 0..{GLM52_EP_RANKS}, got {rank}"
         );
         let mut names = Vec::new();
-        self.push_non_expert_names(&mut names);
-        if include_experts {
+        self.push_checkpoint_non_expert_names(&mut names);
+        let expert_start = rank * GLM52_LOCAL_EXPERTS;
+        let expert_range = expert_start..expert_start + GLM52_LOCAL_EXPERTS;
+        for layer_idx in GLM52_DENSE_LAYERS..=GLM52_MTP_LAYER {
+            push_routed_experts(&mut names, layer_idx, expert_range.clone());
+        }
+        Ok(names)
+    }
+
+    /// Tensors that must become GPU-resident for one serving rank. Native MTP
+    /// layer 78 is validation-only and never enters this list. TP8 gets all
+    /// routed + shared experts from `load_tp8_slice_layer`, so its first pass
+    /// loads routers but not duplicate full shared-expert projections.
+    fn rank_resident_tensor_names(
+        &self,
+        rank: usize,
+        moe_topo: crate::Glm52MoeTopo,
+    ) -> Result<Vec<String>> {
+        ensure!(
+            rank < GLM52_EP_RANKS,
+            "GLM5.2 rank must be in 0..{GLM52_EP_RANKS}, got {rank}"
+        );
+        let mut names = Vec::new();
+        self.push_resident_non_expert_names(&mut names, moe_topo == crate::Glm52MoeTopo::Ep8);
+        if moe_topo == crate::Glm52MoeTopo::Ep8 {
             let expert_start = rank * GLM52_LOCAL_EXPERTS;
             let expert_range = expert_start..expert_start + GLM52_LOCAL_EXPERTS;
-            for layer_idx in GLM52_DENSE_LAYERS..=GLM52_MTP_LAYER {
+            for layer_idx in GLM52_DENSE_LAYERS..GLM52_LAYERS {
                 push_routed_experts(&mut names, layer_idx, expert_range.clone());
             }
         }
         Ok(names)
     }
 
-    fn push_non_expert_names(&self, names: &mut Vec<String>) {
+    fn push_resident_non_expert_names(
+        &self,
+        names: &mut Vec<String>,
+        include_shared_experts: bool,
+    ) {
         names.push("model.embed_tokens.weight".to_owned());
         names.push("model.norm.weight".to_owned());
         names.push("lm_head.weight".to_owned());
@@ -320,10 +345,13 @@ impl Glm52WeightManifest {
             if layer_idx < GLM52_DENSE_LAYERS {
                 push_dense_mlp(names, layer_idx);
             } else {
-                push_moe_non_expert(names, layer_idx);
+                push_moe_non_expert(names, layer_idx, include_shared_experts);
             }
         }
+    }
 
+    fn push_checkpoint_non_expert_names(&self, names: &mut Vec<String>) {
+        self.push_resident_non_expert_names(names, true);
         names.push(format!("model.layers.{GLM52_MTP_LAYER}.enorm.weight"));
         names.push(format!("model.layers.{GLM52_MTP_LAYER}.hnorm.weight"));
         names.push(format!("model.layers.{GLM52_MTP_LAYER}.eh_proj.weight"));
@@ -331,7 +359,7 @@ impl Glm52WeightManifest {
             "model.layers.{GLM52_MTP_LAYER}.shared_head.norm.weight"
         ));
         self.push_attention_names(names, GLM52_MTP_LAYER);
-        push_moe_non_expert(names, GLM52_MTP_LAYER);
+        push_moe_non_expert(names, GLM52_MTP_LAYER, true);
     }
 
     fn push_attention_names(&self, names: &mut Vec<String>, layer_idx: usize) {
@@ -394,13 +422,15 @@ fn push_dense_mlp(names: &mut Vec<String>, layer_idx: usize) {
     push_fp8(names, &format!("{prefix}.down_proj"));
 }
 
-fn push_moe_non_expert(names: &mut Vec<String>, layer_idx: usize) {
+fn push_moe_non_expert(names: &mut Vec<String>, layer_idx: usize, include_shared_experts: bool) {
     let prefix = format!("model.layers.{layer_idx}.mlp");
     names.push(format!("{prefix}.gate.weight"));
     names.push(format!("{prefix}.gate.e_score_correction_bias"));
-    push_fp8(names, &format!("{prefix}.shared_experts.gate_proj"));
-    push_fp8(names, &format!("{prefix}.shared_experts.up_proj"));
-    push_fp8(names, &format!("{prefix}.shared_experts.down_proj"));
+    if include_shared_experts {
+        push_fp8(names, &format!("{prefix}.shared_experts.gate_proj"));
+        push_fp8(names, &format!("{prefix}.shared_experts.up_proj"));
+        push_fp8(names, &format!("{prefix}.shared_experts.down_proj"));
+    }
 }
 
 fn push_routed_experts(names: &mut Vec<String>, layer_idx: usize, experts: std::ops::Range<usize>) {
@@ -630,7 +660,7 @@ mod tests {
     #[test]
     fn expert_placement_matches_from_host_packing() {
         // The packed layout must stay byte-identical to
-        // `Glm52MoeLayerWeights::from_host` (per expert: gate bytes then up
+        // `Glm52MoeExpertBank::pack_from_host` (per expert: gate bytes then up
         // bytes; scales likewise; down alone). Walk rank 1's experts in
         // checkpoint order and require contiguous, gap-free regions.
         let rank_experts = 32..64usize;
@@ -667,5 +697,32 @@ mod tests {
             expected_tensor_contract("model.layers.0.self_attn.kv_b_proj.weight").unwrap(),
             contract(Dtype::F8_E4M3, [28_672, 512])
         );
+    }
+
+    #[test]
+    fn resident_load_plans_exclude_validation_only_and_duplicate_tensors() {
+        let manifest = Glm52WeightManifest {
+            weight_map: BTreeMap::new(),
+        };
+        let ep8 = manifest
+            .rank_resident_tensor_names(0, crate::Glm52MoeTopo::Ep8)
+            .unwrap();
+        let tp8 = manifest
+            .rank_resident_tensor_names(0, crate::Glm52MoeTopo::Tp8)
+            .unwrap();
+
+        let mtp_prefix = format!("model.layers.{GLM52_MTP_LAYER}.");
+        assert!(ep8.iter().all(|name| !name.starts_with(&mtp_prefix)));
+        assert!(tp8.iter().all(|name| !name.starts_with(&mtp_prefix)));
+        assert!(ep8.iter().any(|name| name.contains(".mlp.shared_experts.")));
+        assert!(
+            tp8.iter()
+                .all(|name| !name.contains(".mlp.shared_experts."))
+        );
+        assert!(
+            ep8.iter()
+                .any(|name| name.contains(".mlp.experts.0.gate_proj.weight"))
+        );
+        assert!(tp8.iter().all(|name| !name.contains(".mlp.experts.")));
     }
 }

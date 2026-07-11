@@ -187,6 +187,7 @@ mod tests {
             GenerateRequest {
                 request_id: Some("req-1".to_string()),
                 queued_at_unix_s: Some(1.0),
+                data_parallel_rank: None,
                 prompt_tokens: vec![7, 9],
                 params: SamplingParams::default(),
                 max_tokens: 3,

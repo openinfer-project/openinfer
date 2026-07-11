@@ -104,6 +104,7 @@ fn launch_options(draft: Option<PathBuf>) -> Qwen3LaunchOptions {
         device_ordinal: 0,
         tp_size: 1,
         cuda_graph: true,
+        dump_graph_png: None,
         offload: Qwen3OffloadOptions::disabled(),
         // The speculative engine forces the prefix cache off; match it on the
         // baseline so both take the same cold prefill path.
@@ -143,6 +144,7 @@ fn generate(
         .submit(GenerateRequest {
             request_id: None,
             queued_at_unix_s: None,
+            data_parallel_rank: None,
             prompt_tokens,
             params: SamplingParams::default(),
             max_tokens,
@@ -185,6 +187,7 @@ fn generate_concurrent(handle: &EngineHandle, requests: Vec<(Vec<u32>, usize)>) 
                 .submit(GenerateRequest {
                     request_id: None,
                     queued_at_unix_s: None,
+                    data_parallel_rank: None,
                     prompt_tokens,
                     params: SamplingParams::default(),
                     max_tokens,
@@ -237,6 +240,7 @@ fn prefill_next(handle: &EngineHandle, context: Vec<u32>, logprobs: usize) -> St
         .submit(GenerateRequest {
             request_id: None,
             queued_at_unix_s: None,
+            data_parallel_rank: None,
             prompt_tokens: context,
             params: SamplingParams::default(),
             max_tokens: 1,
@@ -686,6 +690,7 @@ fn dflash_request_in_draft_headroom_is_rejected_not_panicked() {
         .submit(GenerateRequest {
             request_id: None,
             queued_at_unix_s: None,
+            data_parallel_rank: None,
             prompt_tokens: vec![100u32; prompt_len],
             params: SamplingParams::default(),
             max_tokens,

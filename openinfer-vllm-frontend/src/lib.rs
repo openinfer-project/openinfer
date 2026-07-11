@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use axum::Router;
 use log::warn;
 use serde::Deserialize;
@@ -56,6 +56,31 @@ pub async fn serve(
     max_model_len: Option<u32>,
     shutdown: CancellationToken,
 ) -> Result<()> {
+    serve_with_engine_count(
+        engine,
+        model_path,
+        served_model_name,
+        port,
+        max_model_len,
+        1,
+        shutdown,
+    )
+    .await
+}
+
+/// Serve one HTTP endpoint backed by `engine_count` frontend-visible engine
+/// identities. Data-parallel model lines use one identity per scheduler
+/// partition; ordinary model lines call [`serve`] and get the single-engine
+/// case.
+pub async fn serve_with_engine_count(
+    engine: impl Future<Output = Result<EngineHandle>> + Send + 'static,
+    model_path: &Path,
+    served_model_name: Vec<String>,
+    port: u16,
+    max_model_len: Option<u32>,
+    engine_count: usize,
+    shutdown: CancellationToken,
+) -> Result<()> {
     serve_model_on_host(
         engine,
         model_path.to_string_lossy().into_owned(),
@@ -63,6 +88,7 @@ pub async fn serve(
         "0.0.0.0".to_string(),
         port,
         resolve_max_model_len(model_path, max_model_len),
+        engine_count,
         shutdown,
     )
     .await
@@ -91,6 +117,7 @@ pub async fn serve_model_with_lora_routes(
         "0.0.0.0".to_string(),
         port,
         max_model_len,
+        1,
         shutdown,
         move |router| {
             let lora_router = lora_routes(handle.clone(), Arc::clone(&adapter_names));
@@ -113,6 +140,7 @@ async fn serve_model_on_host(
     host: String,
     port: u16,
     max_model_len: u32,
+    engine_count: usize,
     shutdown: CancellationToken,
 ) -> Result<()> {
     serve_model_on_host_with_router_extension(
@@ -122,6 +150,7 @@ async fn serve_model_on_host(
         host,
         port,
         max_model_len,
+        engine_count,
         shutdown,
         |router| router,
     )
@@ -135,12 +164,16 @@ async fn serve_model_on_host_with_router_extension<F>(
     host: String,
     port: u16,
     max_model_len: u32,
+    engine_count: usize,
     shutdown: CancellationToken,
     extend_router: F,
 ) -> Result<()>
 where
     F: FnOnce(Router) -> Router,
 {
+    ensure!(engine_count > 0, "frontend engine_count must be positive");
+    let data_parallel_size = u32::try_from(engine_count)
+        .map_err(|_| anyhow::anyhow!("frontend engine_count {engine_count} exceeds u32"))?;
     let namespace = local_ipc_namespace()?;
     let input_address = ipc_endpoint(&namespace, "input.sock");
     let output_address = ipc_endpoint(&namespace, "output.sock");
@@ -166,15 +199,63 @@ where
                     return Err(error);
                 }
             };
+            let actual_partitions = handle.scheduler_partition_count();
+            if actual_partitions != engine_count {
+                server_shutdown.cancel();
+                anyhow::bail!(
+                    "frontend declared {engine_count} engines but the resolved handle exposes \
+                     {actual_partitions} scheduler partitions"
+                );
+            }
             let servable_limit = handle.servable_len().map(|cap| max_model_len.min(cap));
-            let bridge = LocalEngineBridge {
-                input_address,
-                output_address,
-                handle,
-                max_model_len: servable_limit.unwrap_or(max_model_len),
-            };
-            if let Err(error) = bridge.run(bridge_shutdown).await {
-                warn!("local vLLM engine bridge exited: {error:#}");
+            let max_model_len = servable_limit.unwrap_or(max_model_len);
+            let mut bridges = tokio::task::JoinSet::new();
+            for engine_index in 0..engine_count {
+                let bridge = LocalEngineBridge {
+                    input_address: input_address.clone(),
+                    output_address: output_address.clone(),
+                    handle: handle.clone(),
+                    max_model_len,
+                    engine_index: engine_index as u32,
+                    data_parallel_size,
+                    load_watch: handle.load_watch_for(engine_index),
+                };
+                let shutdown = bridge_shutdown.clone();
+                bridges.spawn(async move { (engine_index, bridge.run(shutdown).await) });
+            }
+            drop(handle);
+
+            let mut bridge_error = None;
+            while let Some(joined) = bridges.join_next().await {
+                match joined {
+                    Ok((_, Ok(()))) if bridge_shutdown.is_cancelled() => {}
+                    Ok((engine_index, Ok(()))) => {
+                        bridge_error = Some(anyhow::anyhow!(
+                            "local vLLM engine {engine_index} bridge exited unexpectedly"
+                        ));
+                        break;
+                    }
+                    Ok((engine_index, Err(error))) => {
+                        bridge_error = Some(
+                            error
+                                .context(format!("local vLLM engine {engine_index} bridge failed")),
+                        );
+                        break;
+                    }
+                    Err(error) => {
+                        bridge_error = Some(anyhow::anyhow!(
+                            "local vLLM engine bridge task panicked: {error}"
+                        ));
+                        break;
+                    }
+                }
+            }
+            if let Some(error) = bridge_error {
+                server_shutdown.cancel();
+                bridge_shutdown.cancel();
+                bridges.abort_all();
+                while bridges.join_next().await.is_some() {}
+                return Err(error);
             }
             Ok(())
         }
@@ -185,7 +266,7 @@ where
             input_address,
             output_address,
             engine_start_index: 0,
-            engine_count: 1,
+            engine_count,
             // The in-process bridge registers once the engine future resolves,
             // so this bounds the whole engine load (multi-GPU MoE models take
             // minutes, cold starts longer). Load *failure* already cancels the

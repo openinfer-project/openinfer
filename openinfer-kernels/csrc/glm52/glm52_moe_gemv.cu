@@ -1,24 +1,19 @@
-// GLM5.2 bs=1 weight-only FP8 GEMV (bf16 activation, on-the-fly e4m3 block-scale
-// weight dequant, f32 accumulate). Replaces the TRTLLM CUTLASS block-scale GEMM at
-// M=1, where the M-tile pads 1->64 and runs compute-bound; this reads each weight
-// exactly once and is weight-memory-bound. dequant matches the host reference
-// glm52/src/mla_decode.rs:188-189: deq(W) = float(e4m3(W)) * weight_scale_inv.
+// GLM5.2 plain/batched weight-only FP8 linear projections: bf16 activation,
+// on-the-fly e4m3 block-scale weight dequant, and f32 accumulation. Dequant
+// matches the host reference: deq(W) = float(e4m3(W)) * weight_scale_inv.
 //
-// One __device__ row-tile core serves both:
-//   - the routed grouped path: grid.x = slot in [0,topk), expert = topk_idx[slot];
-//     computes exactly the topk live experts x 1 real row each (no 256-group, no
-//     512-row pad). The topk multiplier is also the occupancy lever (topk x blocks).
-//   - the plain linear path: groups=1, expert 0, broadcast activation.
+// One __device__ row-tile core serves the plain linear path: one weight matrix
+// and one broadcast activation row.
 //
 // Activation is NOT staged in shared: it is read straight from global (L2-resident,
 // reused across every block). Staging it cost a 32KB-shared prologue + __syncthreads +
 // a shared-occupancy cap that throttled the long-K GEMVs hardest. Dropping the stage
-// (H200 sm_90 microbench /tmp/gemv_grouped + /tmp/gemv_v2, bit-identical chksum):
+// (H200 sm_90 microbench, bit-identical checksum):
 //   W13 gate_up 67->83%, W2 down 63->75%, o_proj 54->73%, q_b 59->79% HBM BW.
 // (Blog "Twelve Attempts": keep the reused vector hot in L2, not shared; shared only
 // pays off for re-read data, and a streamed GEMV re-reads nothing.) rows/warp is the
-// second lever: short-K amortises per-block overhead with 4 rows/warp, long-K fills the
-// grid with 1 (grouped is topk-saturated -> always 4; plain dispatches on k).
+// second lever: short-K amortises per-block overhead with 4 rows/warp, while long-K
+// fills the single grid column with 1 row/warp.
 
 #include "../common.cuh"  // warp_reduce_sum
 
@@ -38,19 +33,10 @@ constexpr int kVec          = 16;                             // 16 e4m3 = 128-b
 constexpr int kFp8Block     = 128;
 constexpr int kStep         = kWarpSize * kVec;               // 512 k per warp step
 
-// The grouped (routed) path keeps 4 rows/warp: grid.x = topk already saturates the SMs,
-// and at full occupancy more rows/warp amortise the per-block overhead (microbench W13
-// RW1->RW4 at STAGE0: 74->83%). The plain path dispatches rows/warp on k (see the
-// launcher): short-K (q_b k=2048) wants 4 to amortise; long-K (o_proj k=16384) wants 1
-// to fill the single grid column. Both choices are bit-identical -- only the warp->row
-// mapping changes, never a row's dot or its accumulation order.
-constexpr int kRowsGrouped         = 4;
-constexpr int kRowsPerBlockGrouped = kWarpsPerBlk * kRowsGrouped;  // 32
+// The plain path dispatches rows/warp on k: short-K (q_b k=2048) wants 4 to
+// amortise; long-K (o_proj k=16384) wants 1 to fill the single grid column.
 constexpr int kRowsPlainShortK     = 4;  // k <= 2048
 constexpr int kRowsPlainLongK      = 1;  // k  > 2048
-
-constexpr int kKindW13 = 1, kKindW13N = 4096, kKindW13K = 6144;
-constexpr int kKindW2  = 2, kKindW2N  = 6144, kKindW2K  = 2048;
 
 CUresult map_cuda_error(cudaError_t err) {
   if (err == cudaSuccess) return CUDA_SUCCESS;
@@ -464,33 +450,9 @@ CUresult launch_gemv_batched_mma(const __nv_bfloat16* activation,
   return consume_last_cuda_error();
 }
 
-// Routed grouped GEMV: blockIdx.x = slot in [0,topk); expert = topk_idx[slot].
-__global__ void glm52_moe_fp8_weight_only_gemv_kernel(
-    const __nv_bfloat16* __restrict__ activation,  // W13: [k]; W2: [topk, k]
-    int act_row_stride,                            // 0 (W13 broadcast) | k (W2)
-    const int* __restrict__ topk_idx,              // [topk]
-    const unsigned char* __restrict__ weight,      // [experts, n, k] e4m3
-    const float* __restrict__ weight_scale,        // [experts, n/128, k/128]
-    __nv_bfloat16* __restrict__ out,               // [topk, n]
-    int n, int k) {
-  const int slot   = blockIdx.x;
-  const int expert = topk_idx[slot];
-  const __nv_bfloat16* act_row = activation + (size_t)slot * act_row_stride;
-  const size_t scale_stride = (size_t)(n >> 7) * (k >> 7);    // (n/128)*(k/128) per expert
-  gemv_row_tile<kRowsGrouped>(act_row,                        // x straight from L2
-                              weight + ((size_t)expert * n) * k,
-                              weight_scale + (size_t)expert * scale_stride,
-                              out + (size_t)slot * n,
-                              n, k);
-}
-
-// Weighted SiLU(gate)*up -> bf16, route weight folded per slot. Consumes the W13
-// GEMV output [rows, 2*inter] (gate|up) and emits the bf16 W2 GEMV input
-// [rows, inter]. bf16 companion of silu_and_mul_per_token_group_quant_bf16 with the
-// fp8 quant dropped -- the W2 GEMV takes bf16 activation directly.
-__global__ void glm52_silu_and_mul_weighted_bf16_kernel(
+// Plain SiLU(gate)*up -> bf16 for dense/shared MLPs.
+__global__ void glm52_silu_and_mul_bf16_kernel(
     const __nv_bfloat16* __restrict__ input,    // [rows, 2*inter] (gate|up)
-    const float* __restrict__ topk_weights,     // [rows] route weight per slot (or null)
     __nv_bfloat16* __restrict__ output,         // [rows, inter]
     int rows, int inter) {
   const int row = blockIdx.x;
@@ -501,28 +463,7 @@ __global__ void glm52_silu_and_mul_weighted_bf16_kernel(
   const float g = __bfloat162float(gate[col]);
   const float u = __bfloat162float(up[col]);
   const float sg = 1.0f / (1.0f + expf(-g));
-  const float w = topk_weights == nullptr ? 1.0f : __ldg(topk_weights + row);
-  output[(size_t)row * inter + col] = __float2bfloat16(g * sg * u * w);
-}
-
-// Combine the topk slot rows -> routed[n] (the route weight is already folded into
-// the W2 input by the weighted SiLU, so this is a plain sum -- one row per slot, no
-// expert_offsets indirection).
-__global__ void glm52_moe_combine_slots_kernel(
-    const __nv_bfloat16* __restrict__ w2_out,   // [topk, n]
-    __nv_bfloat16* __restrict__ routed,         // [n]
-    int n, int topk) {
-  const int c = blockIdx.x * blockDim.x + threadIdx.x;
-  if (c >= n) return;
-  float acc = 0.0f;
-  for (int j = 0; j < topk; ++j) acc += __bfloat162float(w2_out[(size_t)j * n + c]);
-  routed[c] = __float2bfloat16(acc);
-}
-
-bool valid_gemv_shape(int operand_kind, int n, int k) {
-  if (operand_kind == kKindW13) return n == kKindW13N && k == kKindW13K;
-  if (operand_kind == kKindW2)  return n == kKindW2N  && k == kKindW2K;
-  return false;
+  output[(size_t)row * inter + col] = __float2bfloat16(g * sg * u);
 }
 
 // Kernel-coverage + scale-index invariants. k%128 keeps the scale column stride
@@ -578,23 +519,7 @@ bool valid_linear_shape(int n, int k) {
 
 extern "C" {
 
-CUresult glm52_moe_fp8_weight_only_gemv_cuda(
-    int operand_kind, const __nv_bfloat16* activation, int act_row_stride,
-    const int* topk_idx, const unsigned char* weight, const float* weight_scale,
-    __nv_bfloat16* out, int topk, int n, int k, cudaStream_t stream) {
-  if (activation == nullptr || topk_idx == nullptr || weight == nullptr ||
-      weight_scale == nullptr || out == nullptr || topk <= 0 ||
-      !aligned16(activation) || !valid_gemv_shape(operand_kind, n, k) ||
-      !valid_tiling(n, k, kRowsPerBlockGrouped)) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
-  const dim3 grid(topk, n / kRowsPerBlockGrouped, 1);
-  glm52_moe_fp8_weight_only_gemv_kernel<<<grid, kBlockThreads, 0, stream>>>(
-      activation, act_row_stride, topk_idx, weight, weight_scale, out, n, k);
-  return consume_last_cuda_error();
-}
-
-CUresult glm52_fp8_weight_only_gemv_cuda(
+static CUresult fp8_weight_only_gemv(
     const __nv_bfloat16* activation, const unsigned char* weight,
     const float* weight_scale, __nv_bfloat16* out, int n, int k,
     cudaStream_t stream) {
@@ -634,8 +559,8 @@ CUresult glm52_fp8_weight_only_gemv_batched_cuda(
     return CUDA_ERROR_INVALID_VALUE;
   }
   if (batch == 1) {
-    return glm52_fp8_weight_only_gemv_cuda(activation, weight, weight_scale, out,
-                                           n, k, stream);
+    return fp8_weight_only_gemv(activation, weight, weight_scale, out, n, k,
+                                stream);
   }
   switch (batch) {
     case kBatchedGemvBatch2: {
@@ -696,29 +621,16 @@ CUresult glm52_fp8_weight_only_gemv_batched_cuda(
   return consume_last_cuda_error();
 }
 
-CUresult glm52_silu_and_mul_weighted_bf16_cuda(
-    const __nv_bfloat16* input, const float* topk_weights, __nv_bfloat16* output,
-    int rows, int inter, cudaStream_t stream) {
+CUresult glm52_silu_and_mul_bf16_cuda(
+    const __nv_bfloat16* input, __nv_bfloat16* output, int rows, int inter,
+    cudaStream_t stream) {
   if (input == nullptr || output == nullptr || rows <= 0 || inter <= 0) {
     return CUDA_ERROR_INVALID_VALUE;
   }
   const int threads = 256;
   const dim3 grid(rows, (inter + threads - 1) / threads, 1);
-  glm52_silu_and_mul_weighted_bf16_kernel<<<grid, threads, 0, stream>>>(
-      input, topk_weights, output, rows, inter);
-  return consume_last_cuda_error();
-}
-
-CUresult glm52_moe_combine_slots_cuda(const __nv_bfloat16* w2_out,
-                                      __nv_bfloat16* routed, int n, int topk,
-                                      cudaStream_t stream) {
-  if (w2_out == nullptr || routed == nullptr || n <= 0 || topk <= 0) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
-  const int threads = 256;
-  const int blocks = (n + threads - 1) / threads;
-  glm52_moe_combine_slots_kernel<<<blocks, threads, 0, stream>>>(w2_out, routed, n,
-                                                                 topk);
+  glm52_silu_and_mul_bf16_kernel<<<grid, threads, 0, stream>>>(input, output, rows,
+                                                               inter);
   return consume_last_cuda_error();
 }
 

@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::thread;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossbeam_channel as channel;
 
 use crate::batch_decode::DecodeGraphUse;
@@ -9,6 +10,7 @@ use crate::batch_decode_buffers::{BATCH_BUCKETS, BatchDecodeBuffers};
 use crate::config::{Config, TensorParallelConfig};
 use crate::weights::{KvBudget, ModelRuntimeConfig, Qwen3MemoryOptions, Qwen3Model};
 use crate::{Qwen3LoraOptions, Qwen3OffloadOptions};
+use openinfer_core::cuda_graph::CudaGraphDumpSummary;
 use openinfer_core::engine::{
     LoadLoraAdapterRequest, TokenEvent, TokenLogprob, TokenSink, UnloadLoraAdapterRequest,
     panic_message,
@@ -1013,6 +1015,10 @@ enum PrefetchPhase {
 const REMOTE_FETCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
 
 impl Qwen3Executor {
+    pub(crate) fn dump_decode_graph_png(&self, png_path: &Path) -> Result<CudaGraphDumpSummary> {
+        self.primary.dump_decode_graph_png(png_path.to_path_buf())
+    }
+
     pub(crate) fn single(
         model: Qwen3Model,
         offload_opts: &Qwen3OffloadOptions,
@@ -2957,6 +2963,26 @@ impl LocalQwen3Lane {
         Ok(())
     }
 
+    fn dump_decode_graph_png(&mut self, png_path: &Path) -> Result<CudaGraphDumpSummary> {
+        let bucket_idx = 0;
+        let bucket = BATCH_BUCKETS[bucket_idx];
+        let attention_path = BatchDecodeBuffers::attention_path(bucket);
+        let graph_idx = BatchDecodeBuffers::graph_index(bucket_idx, attention_path);
+        if !self.bufs.graphs[graph_idx].is_captured() {
+            anyhow::ensure!(
+                !self.model.tp_graph_enabled(),
+                "Qwen3 TP batch-1 graph was not captured by the startup sweep"
+            );
+            self.precapture_decode(bucket_idx, DecodeGraphUse::CaptureOnly)?;
+        }
+        let title = format!("Qwen3 decode CUDA Graph · bs={bucket} · {attention_path:?}");
+        self.bufs.graphs[graph_idx]
+            .dump_png(png_path, &title)
+            .with_context(|| {
+                format!("dump Qwen3 rank-0 batch-{bucket} {attention_path:?} decode CUDA Graph")
+            })
+    }
+
     /// Load the DFlash draft model into this lane (primary rank only). The draft
     /// model is built here on the worker thread because it reads the co-located
     /// target model's embeddings and head.
@@ -3324,6 +3350,10 @@ enum WorkerCommand {
         phase: PrecapturePhase,
         resp: channel::Sender<Result<()>>,
     },
+    DumpDecodeGraph {
+        png_path: PathBuf,
+        resp: channel::Sender<Result<CudaGraphDumpSummary>>,
+    },
     Shutdown,
 }
 
@@ -3440,6 +3470,10 @@ impl RankWorker {
                                     let result = lane.precapture_phase(phase);
                                     let _ = resp.send(result);
                                 }
+                                WorkerCommand::DumpDecodeGraph { png_path, resp } => {
+                                    let result = lane.dump_decode_graph_png(&png_path);
+                                    let _ = resp.send(result);
+                                }
                                 WorkerCommand::Shutdown => break,
                             }
                         }
@@ -3491,6 +3525,19 @@ impl RankWorker {
             })
             .map_err(|_| anyhow::anyhow!("worker channel closed on precapture {phase:?}"))?;
         Ok(resp_rx)
+    }
+
+    fn dump_decode_graph_png(&self, png_path: PathBuf) -> Result<CudaGraphDumpSummary> {
+        let (resp_tx, resp_rx) = channel::bounded(1);
+        self.tx
+            .send(WorkerCommand::DumpDecodeGraph {
+                png_path,
+                resp: resp_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("worker channel closed on CUDA Graph dump"))?;
+        resp_rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("worker dropped CUDA Graph dump response"))?
     }
 
     /// Ask the worker to sync its in-flight prefill and return the result.

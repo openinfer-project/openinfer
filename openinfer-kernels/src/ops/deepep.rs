@@ -65,6 +65,12 @@ pub trait DeepEpAbi {
         num_tokens: i32,
         combined_x: *mut c_void,
     ) -> c_int;
+}
+
+/// Optional CPU-synchronized prefill capability. GLM5.2 deliberately does
+/// not implement this trait: its scheduler sends prompt rows through decode.
+#[allow(clippy::missing_safety_doc, clippy::too_many_arguments)]
+pub trait DeepEpPrefillAbi: DeepEpAbi {
     unsafe fn prefill_dispatch_send(
         ctx: *mut Self::RawCtx,
         stream: *mut c_void,
@@ -118,10 +124,6 @@ macro_rules! deepep_abi {
         ctx_destroy => $ctx_destroy:path,
         decode_dispatch => $decode_dispatch:path,
         decode_combine => $decode_combine:path,
-        prefill_dispatch_send => $prefill_dispatch_send:path,
-        prefill_wait_counts => $prefill_wait_counts:path,
-        prefill_dispatch_recv => $prefill_dispatch_recv:path,
-        prefill_combine => $prefill_combine:path,
     ) => {
         pub struct $abi;
 
@@ -207,88 +209,6 @@ macro_rules! deepep_abi {
                     )
                 }
             }
-            unsafe fn prefill_dispatch_send(
-                ctx: *mut Self::RawCtx,
-                stream: *mut c_void,
-                x: *const c_void,
-                topk_idx: *const i32,
-                topk_weights: *const f32,
-                num_tokens: i32,
-                rank_count_scratch: *mut i32,
-                dst_slot_scratch: *mut i32,
-                psum_rank: *mut i32,
-                psum_expert: *mut i32,
-            ) -> c_int {
-                unsafe {
-                    $prefill_dispatch_send(
-                        ctx,
-                        stream,
-                        x,
-                        topk_idx,
-                        topk_weights,
-                        num_tokens,
-                        rank_count_scratch,
-                        dst_slot_scratch,
-                        psum_rank,
-                        psum_expert,
-                    )
-                }
-            }
-            unsafe fn prefill_wait_counts(
-                ctx: *mut Self::RawCtx,
-                num_recv_tokens: *mut i32,
-                num_expanded_tokens: *mut i32,
-            ) -> c_int {
-                unsafe { $prefill_wait_counts(ctx, num_recv_tokens, num_expanded_tokens) }
-            }
-            unsafe fn prefill_dispatch_recv(
-                ctx: *mut Self::RawCtx,
-                stream: *mut c_void,
-                num_recv_tokens: i32,
-                psum_rank: *const i32,
-                psum_expert: *const i32,
-                recv_x: *mut c_void,
-                recv_topk_weights: *mut f32,
-                recv_src_metadata: *mut i32,
-            ) -> c_int {
-                unsafe {
-                    $prefill_dispatch_recv(
-                        ctx,
-                        stream,
-                        num_recv_tokens,
-                        psum_rank,
-                        psum_expert,
-                        recv_x,
-                        recv_topk_weights,
-                        recv_src_metadata,
-                    )
-                }
-            }
-            unsafe fn prefill_combine(
-                ctx: *mut Self::RawCtx,
-                stream: *mut c_void,
-                x: *const c_void,
-                src_metadata: *const i32,
-                psum_rank: *const i32,
-                num_recv_tokens: i32,
-                combined_topk_idx: *const i32,
-                num_tokens: i32,
-                combined_x: *mut c_void,
-            ) -> c_int {
-                unsafe {
-                    $prefill_combine(
-                        ctx,
-                        stream,
-                        x,
-                        src_metadata,
-                        psum_rank,
-                        num_recv_tokens,
-                        combined_topk_idx,
-                        num_tokens,
-                        combined_x,
-                    )
-                }
-            }
         }
     };
 }
@@ -303,11 +223,95 @@ deepep_abi!(
     ctx_destroy => ffi::deepep_ctx_destroy,
     decode_dispatch => ffi::deepep_decode_dispatch,
     decode_combine => ffi::deepep_decode_combine,
-    prefill_dispatch_send => ffi::deepep_prefill_dispatch_send,
-    prefill_wait_counts => ffi::deepep_prefill_wait_counts,
-    prefill_dispatch_recv => ffi::deepep_prefill_dispatch_recv,
-    prefill_combine => ffi::deepep_prefill_combine,
 );
+
+impl DeepEpPrefillAbi for KimiDeepEpAbi {
+    unsafe fn prefill_dispatch_send(
+        ctx: *mut Self::RawCtx,
+        stream: *mut c_void,
+        x: *const c_void,
+        topk_idx: *const i32,
+        topk_weights: *const f32,
+        num_tokens: i32,
+        rank_count_scratch: *mut i32,
+        dst_slot_scratch: *mut i32,
+        psum_rank: *mut i32,
+        psum_expert: *mut i32,
+    ) -> c_int {
+        unsafe {
+            ffi::deepep_prefill_dispatch_send(
+                ctx,
+                stream,
+                x,
+                topk_idx,
+                topk_weights,
+                num_tokens,
+                rank_count_scratch,
+                dst_slot_scratch,
+                psum_rank,
+                psum_expert,
+            )
+        }
+    }
+
+    unsafe fn prefill_wait_counts(
+        ctx: *mut Self::RawCtx,
+        num_recv_tokens: *mut i32,
+        num_expanded_tokens: *mut i32,
+    ) -> c_int {
+        unsafe { ffi::deepep_prefill_wait_counts(ctx, num_recv_tokens, num_expanded_tokens) }
+    }
+
+    unsafe fn prefill_dispatch_recv(
+        ctx: *mut Self::RawCtx,
+        stream: *mut c_void,
+        num_recv_tokens: i32,
+        psum_rank: *const i32,
+        psum_expert: *const i32,
+        recv_x: *mut c_void,
+        recv_topk_weights: *mut f32,
+        recv_src_metadata: *mut i32,
+    ) -> c_int {
+        unsafe {
+            ffi::deepep_prefill_dispatch_recv(
+                ctx,
+                stream,
+                num_recv_tokens,
+                psum_rank,
+                psum_expert,
+                recv_x,
+                recv_topk_weights,
+                recv_src_metadata,
+            )
+        }
+    }
+
+    unsafe fn prefill_combine(
+        ctx: *mut Self::RawCtx,
+        stream: *mut c_void,
+        x: *const c_void,
+        src_metadata: *const i32,
+        psum_rank: *const i32,
+        num_recv_tokens: i32,
+        combined_topk_idx: *const i32,
+        num_tokens: i32,
+        combined_x: *mut c_void,
+    ) -> c_int {
+        unsafe {
+            ffi::deepep_prefill_combine(
+                ctx,
+                stream,
+                x,
+                src_metadata,
+                psum_rank,
+                num_recv_tokens,
+                combined_topk_idx,
+                num_tokens,
+                combined_x,
+            )
+        }
+    }
+}
 
 #[cfg(feature = "glm52")]
 deepep_abi!(
@@ -320,10 +324,6 @@ deepep_abi!(
     ctx_destroy => ffi::glm52_deepep_ctx_destroy,
     decode_dispatch => ffi::glm52_deepep_decode_dispatch,
     decode_combine => ffi::glm52_deepep_decode_combine,
-    prefill_dispatch_send => ffi::glm52_deepep_prefill_dispatch_send,
-    prefill_wait_counts => ffi::glm52_deepep_prefill_wait_counts,
-    prefill_dispatch_recv => ffi::glm52_deepep_prefill_dispatch_recv,
-    prefill_combine => ffi::glm52_deepep_prefill_combine,
 );
 
 fn shim_error<A: DeepEpAbi>(what: &str) -> anyhow::Error {
@@ -592,6 +592,28 @@ impl<A: DeepEpAbi> DeepEpBase<A> {
         Ok(())
     }
 
+    fn validate_dispatch_inputs(
+        &self,
+        x: &CudaSlice<bf16>,
+        topk_idx: &CudaSlice<i32>,
+        topk_weights: &CudaSlice<f32>,
+        num_tokens: usize,
+    ) -> Result<()> {
+        let info = &self.info;
+        let topk = info.num_topk as usize;
+        ensure!(
+            x.len() >= num_tokens * info.hidden as usize,
+            "dispatch: x smaller than num_tokens × hidden"
+        );
+        ensure!(
+            topk_idx.len() >= num_tokens * topk && topk_weights.len() >= num_tokens * topk,
+            "dispatch: topk arrays smaller than num_tokens × topk"
+        );
+        Ok(())
+    }
+}
+
+impl<A: DeepEpPrefillAbi> DeepEpBase<A> {
     /// Prefill dispatch send: prologue + dispatch. Follow with
     /// [`Self::prefill_wait_counts`] and [`Self::prefill_dispatch_recv`].
     pub fn prefill_dispatch_send(
@@ -744,26 +766,6 @@ impl<A: DeepEpAbi> DeepEpBase<A> {
                 out_ptr as *mut _,
             )
         });
-        Ok(())
-    }
-
-    fn validate_dispatch_inputs(
-        &self,
-        x: &CudaSlice<bf16>,
-        topk_idx: &CudaSlice<i32>,
-        topk_weights: &CudaSlice<f32>,
-        num_tokens: usize,
-    ) -> Result<()> {
-        let info = &self.info;
-        let topk = info.num_topk as usize;
-        ensure!(
-            x.len() >= num_tokens * info.hidden as usize,
-            "dispatch: x smaller than num_tokens × hidden"
-        );
-        ensure!(
-            topk_idx.len() >= num_tokens * topk && topk_weights.len() >= num_tokens * topk,
-            "dispatch: topk arrays smaller than num_tokens × topk"
-        );
         Ok(())
     }
 }

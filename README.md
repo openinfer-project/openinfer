@@ -41,7 +41,7 @@ and [Co-locating Prefill and Decode on One GPU](https://open-infer.org/blog/gree
 ### Prerequisites
 
 - Rust (2024 edition), CUDA Toolkit (nvcc, cuBLAS), CUDA-capable GPU
-- NVIDIA driver R535 (CUDA 12.2) or newer; driver symbols resolve lazily at call time, so the `cuda-12090` cudarc feature does not raise the driver floor
+- NVIDIA driver R545 (CUDA 12.3) or newer; `cuFuncGetName` sets this floor, while per-symbol lazy loading keeps the `cuda-12090` cudarc binding from requiring a CUDA 12.9 driver
 - The default build (Qwen3-4B / 8B) is pure Rust + CUDA — no Python at all
 - Python 3 + Triton for `qwen35-4b` feature builds (build-time only — no Python at runtime)
 - TileLang for `deepseek-v4` feature builds (build-time only)

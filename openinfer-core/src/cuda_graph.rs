@@ -10,6 +10,10 @@ use cudarc::driver::sys::{self, CUgraph, CUgraphExec};
 
 use crate::tensor::{DeviceContext, active_cu_stream};
 
+mod dump;
+
+pub use dump::{CudaGraphDumpSummary, validate_graph_dump_request};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CudaGraphPhase {
     BeforeBeginCapture,

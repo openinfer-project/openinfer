@@ -93,11 +93,10 @@ __global__ void fp8_per_token_group_quant_bf16_k128_kernel(
   }
 }
 
-// Grid-strided over rows — see the quant kernel note above. kMasked: the
-// gate|up input rows are ALREADY in the masked layout (the W13 masked GEMM
-// wrote them there); the route weight stays indexed by the aligned recv row.
-template <bool kMasked>
-__global__ void silu_and_mul_per_token_group_quant_bf16_k128_kernel(
+// Grid-strided over aligned receive rows. The gate|up input rows are already
+// in the masked layout written by W13; route weights stay indexed by aligned
+// receive row.
+__global__ void silu_and_mul_per_token_group_quant_bf16_k128_masked_kernel(
     const __nv_bfloat16* __restrict__ input,
     const float* __restrict__ topk_weights, unsigned char* __restrict__ output,
     float* __restrict__ scales, int rows, int hidden_size,
@@ -117,11 +116,8 @@ __global__ void silu_and_mul_per_token_group_quant_bf16_k128_kernel(
 
   __shared__ float shared[kGroupSize];
   for (int row = blockIdx.x; row < end; row += gridDim.x) {
-    int data_row = row;
-    if constexpr (kMasked) {
-      data_row = row_map[row];
-      if (data_row < 0) continue;
-    }
+    const int data_row = row_map[row];
+    if (data_row < 0) continue;
     float activated = 0.0f;
     if (col < hidden_size) {
       const __nv_bfloat16* token_gate =
@@ -130,8 +126,7 @@ __global__ void silu_and_mul_per_token_group_quant_bf16_k128_kernel(
       float gate = __bfloat162float(token_gate[tid]);
       float up = __bfloat162float(token_up[tid]);
       float sigmoid_gate = 1.0f / (1.0f + expf(-gate));
-      const float route_weight =
-          topk_weights == nullptr ? 1.0f : __ldg(topk_weights + row);
+      const float route_weight = __ldg(topk_weights + row);
       activated = gate * sigmoid_gate * up * route_weight;
     }
     shared[tid] = fabsf(activated);
@@ -147,14 +142,9 @@ __global__ void silu_and_mul_per_token_group_quant_bf16_k128_kernel(
 
     if (tid == 0) {
       shared[0] = fmaxf(shared[0] / kFp8Max, kMinSiluScale);
-      if constexpr (kMasked) {
-        const int g = data_row / masked_cap;
-        const int r_local = data_row % masked_cap;
-        scales[((size_t)g * scale_cols + group) * masked_cap + r_local] =
-            shared[0];
-      } else {
-        scales[(size_t)row * scale_cols + group] = shared[0];
-      }
+      const int g = data_row / masked_cap;
+      const int r_local = data_row % masked_cap;
+      scales[((size_t)g * scale_cols + group) * masked_cap + r_local] = shared[0];
     }
     __syncthreads();
 
@@ -229,27 +219,6 @@ CUresult glm52_fp8_per_token_group_quant_bf16_masked_cuda(
   return consume_last_cuda_error();
 }
 
-CUresult glm52_silu_and_mul_weighted_per_token_group_quant_bf16_cuda(
-    const __nv_bfloat16* input, const float* topk_weights,
-    unsigned char* output, float* scales, int rows, int hidden_size,
-    int group_size, cudaStream_t stream) {
-  if (input == nullptr || topk_weights == nullptr || output == nullptr ||
-      scales == nullptr) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
-  if (!valid_quant_shape(rows, hidden_size, group_size)) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
-
-  // Mirrors DeepGEMM third-party/tilelang_ops/swiglu_apply_weight_to_fp8.py:
-  // y = silu(gate) * up * topk_weight, then per-token/per-channel FP8 quant.
-  dim3 grid(row_grid(rows), hidden_size / kGroupSize, 1);
-  silu_and_mul_per_token_group_quant_bf16_k128_kernel<false>
-      <<<grid, kGroupSize, 0, stream>>>(input, topk_weights, output, scales,
-                                        rows, hidden_size, nullptr, nullptr, 0);
-  return consume_last_cuda_error();
-}
-
 CUresult glm52_silu_and_mul_weighted_per_token_group_quant_bf16_masked_cuda(
     const __nv_bfloat16* input, const float* topk_weights,
     unsigned char* output, float* scales, int rows, int hidden_size,
@@ -264,7 +233,7 @@ CUresult glm52_silu_and_mul_weighted_per_token_group_quant_bf16_masked_cuda(
     return CUDA_ERROR_INVALID_VALUE;
   }
   dim3 grid(row_grid(rows), hidden_size / kGroupSize, 1);
-  silu_and_mul_per_token_group_quant_bf16_k128_kernel<true>
+  silu_and_mul_per_token_group_quant_bf16_k128_masked_kernel
       <<<grid, kGroupSize, 0, stream>>>(input, topk_weights, output, scales,
                                         rows, hidden_size, row_bound, row_map,
                                         masked_cap);

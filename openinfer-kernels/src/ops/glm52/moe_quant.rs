@@ -65,60 +65,6 @@ pub fn glm52_fp8_per_token_group_quant_bf16_launch(
         .map_err(|err| anyhow!("GLM5.2 FP8 per-token-group quant launch failed: {err}"))
 }
 
-pub fn glm52_silu_and_mul_weighted_per_token_group_quant_bf16_launch(
-    ctx: &DeviceContext,
-    shape: Glm52MoeQuantShape,
-    input: &CudaSlice<bf16>,
-    topk_weights: &CudaSlice<f32>,
-    output: &mut CudaSlice<u8>,
-    scales: &mut CudaSlice<f32>,
-) -> Result<()> {
-    shape.validate()?;
-    ensure!(
-        input.len() >= shape.rows * shape.width * 2,
-        "GLM5.2 weighted SiLU quant input too small: have {}, need {}",
-        input.len(),
-        shape.rows * shape.width * 2
-    );
-    ensure!(
-        topk_weights.len() >= shape.rows,
-        "GLM5.2 weighted SiLU quant topk_weights too small: have {}, need {}",
-        topk_weights.len(),
-        shape.rows
-    );
-    ensure!(
-        output.len() >= shape.rows * shape.width,
-        "GLM5.2 weighted SiLU quant output too small: have {}, need {}",
-        output.len(),
-        shape.rows * shape.width
-    );
-    ensure!(
-        scales.len() >= shape.rows * shape.scale_cols()?,
-        "GLM5.2 weighted SiLU quant scales too small: have {}, need {}",
-        scales.len(),
-        shape.rows * shape.scale_cols()?
-    );
-    let (input_ptr, _input_guard) = input.device_ptr(&ctx.stream);
-    let (weight_ptr, _weight_guard) = topk_weights.device_ptr(&ctx.stream);
-    let (output_ptr, _output_guard) = output.device_ptr_mut(&ctx.stream);
-    let (scale_ptr, _scale_guard) = scales.device_ptr_mut(&ctx.stream);
-    let result = unsafe {
-        ffi::glm52_silu_and_mul_weighted_per_token_group_quant_bf16_cuda(
-            input_ptr as *const ffi::Half,
-            weight_ptr as *const f32,
-            output_ptr as *mut u8,
-            scale_ptr as *mut f32,
-            shape.rows as i32,
-            shape.width as i32,
-            shape.group_size as i32,
-            ctx.stream.cu_stream(),
-        )
-    };
-    result
-        .result()
-        .map_err(|err| anyhow!("GLM5.2 weighted SiLU+mul FP8 group quant launch failed: {err}"))
-}
-
 fn validate_quant_buffers(
     shape: Glm52MoeQuantShape,
     input: &CudaSlice<bf16>,

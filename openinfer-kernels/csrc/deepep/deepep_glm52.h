@@ -47,41 +47,6 @@ int glm52_deepep_decode_combine(
     int32_t num_tokens,
     void* combined_x);
 
-int glm52_deepep_prefill_dispatch_send(
-    Glm52DeepEpCtx* ctx, void* stream,
-    const void* x,
-    const int32_t* topk_idx,
-    const float* topk_weights,
-    int32_t num_tokens,
-    int32_t* rank_count_scratch,
-    int32_t* dst_slot_scratch,
-    int32_t* psum_rank,
-    int32_t* psum_expert);
-
-int glm52_deepep_prefill_wait_counts(
-    Glm52DeepEpCtx* ctx,
-    int32_t* num_recv_tokens,
-    int32_t* num_expanded_tokens);
-
-int glm52_deepep_prefill_dispatch_recv(
-    Glm52DeepEpCtx* ctx, void* stream,
-    int32_t num_recv_tokens,
-    const int32_t* psum_rank,
-    const int32_t* psum_expert,
-    void* recv_x,
-    float* recv_topk_weights,
-    int32_t* recv_src_metadata);
-
-int glm52_deepep_prefill_combine(
-    Glm52DeepEpCtx* ctx, void* stream,
-    const void* x,
-    const int32_t* src_metadata,
-    const int32_t* psum_rank,
-    int32_t num_recv_tokens,
-    const int32_t* combined_topk_idx,
-    int32_t num_tokens,
-    void* combined_x);
-
 #ifdef __cplusplus
 }  // extern "C"
 #endif

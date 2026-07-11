@@ -3,16 +3,93 @@
 //! real [`BlockPool`] — a schedule failure in serving tears the whole EP8
 //! engine down, so the full-lifetime reservation must be proven tight here.
 
-use openinfer_core::engine::FinishReason;
+use std::collections::VecDeque;
+
+use openinfer_core::engine::{FinishReason, GenerateRequest, LoadSnapshot, TokenSink};
 use openinfer_kv_cache::BlockPool;
+use openinfer_sample::SamplingParams;
 
 use crate::model::GLM52_MAX_BATCH_PER_RANK;
 
-use super::PAGE;
 use super::admission::lifetime_blocks;
 use super::slot::GLM52_DSPARK_EP8_SPAN_DRAFTS;
 use super::slot::{Glm52SlotState, Glm52StepOutcome};
-use super::testkit::EOS;
+use super::testkit::{EOS, request};
+use super::{ActiveRequest, PAGE, RankSlots, admit_from_queue, publish_load};
+
+#[test]
+fn load_snapshots_keep_rank_ownership() {
+    let pools = vec![
+        BlockPool::new(PAGE, 8).expect("rank 0 pool"),
+        BlockPool::new(PAGE, 8).expect("rank 1 pool"),
+    ];
+    let mut slots: Vec<RankSlots> = (0..2).map(|_| std::array::from_fn(|_| None)).collect();
+
+    let req = request(vec![10, 11], SamplingParams::default(), 4);
+    let state = Glm52SlotState::new(req.prompt_tokens.clone(), req.max_tokens, true, 0);
+    let mut kv = pools[0].new_request(req.prompt_tokens.clone(), req.max_tokens, None);
+    kv.schedule_prefill(1, &pools[0])
+        .expect("rank 0 owns one live KV block");
+    slots[0][0] = Some(ActiveRequest { req, state, kv });
+
+    let mut pending: Vec<VecDeque<GenerateRequest>> = (0..2).map(|_| VecDeque::new()).collect();
+    pending[1].push_back(request(vec![20], SamplingParams::default(), 4));
+    pending[1].push_back(request(vec![21], SamplingParams::default(), 4));
+
+    let channels: Vec<_> = (0..2)
+        .map(|_| tokio::sync::watch::channel(LoadSnapshot::default()))
+        .collect();
+    let load_txs: Vec<_> = channels.iter().map(|(tx, _)| tx.clone()).collect();
+    let load_rxs: Vec<_> = channels.into_iter().map(|(_, rx)| rx).collect();
+    publish_load(&load_txs, &pools, &slots, &pending);
+
+    let rank0 = *load_rxs[0].borrow();
+    assert_eq!(rank0.num_running_reqs, 1);
+    assert_eq!(rank0.num_waiting_reqs, 0);
+    assert_eq!(rank0.kv_total_blocks, 7);
+    assert_eq!(rank0.kv_used_blocks, 1);
+
+    let rank1 = *load_rxs[1].borrow();
+    assert_eq!(rank1.num_running_reqs, 0);
+    assert_eq!(rank1.num_waiting_reqs, 2);
+    assert_eq!(rank1.kv_total_blocks, 7);
+    assert_eq!(rank1.kv_used_blocks, 0);
+}
+
+#[test]
+fn admission_never_moves_a_rank_bound_request() {
+    let pools = vec![
+        BlockPool::new(PAGE, 8).expect("rank 0 pool"),
+        BlockPool::new(PAGE, 8).expect("rank 1 pool"),
+    ];
+    let mut slots: Vec<RankSlots> = (0..2).map(|_| std::array::from_fn(|_| None)).collect();
+    let mut pending: Vec<VecDeque<GenerateRequest>> = (0..2).map(|_| VecDeque::new()).collect();
+    let mut req = request(vec![10], SamplingParams::default(), 4);
+    req.data_parallel_rank = Some(1);
+    let (token_tx, _token_rx) = TokenSink::standalone();
+    req.token_tx = token_tx;
+    pending[1].push_back(req);
+    let mut pending_resets = vec![Vec::new(), Vec::new()];
+    let mut slots_changed = false;
+
+    admit_from_queue(
+        &mut pending,
+        &mut slots,
+        &pools,
+        &[7, 7],
+        None,
+        false,
+        false,
+        &mut pending_resets,
+        &mut slots_changed,
+    )
+    .expect("admission");
+
+    assert!(slots[0].iter().all(Option::is_none));
+    assert!(slots[1][0].is_some());
+    assert!(pending.iter().all(VecDeque::is_empty));
+    assert!(slots_changed);
+}
 
 /// Drive one request end to end through the coordinator's exact
 /// schedule/apply sequence against `pool` — the offline replica of the

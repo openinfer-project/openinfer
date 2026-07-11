@@ -399,7 +399,19 @@ impl Glm52RankModel {
              {GLM52_MODEL_LEN_ALIGN} (the FlashMLA page / index-K block size)"
         );
         let batch = GLM52_MAX_BATCH_PER_RANK;
-        let num_sm_parts = glm52_flashmla_sparse_decode_num_sm_parts()?;
+        // Attention-TP keeps 8 of 64 heads per rank and uses the right-sized
+        // sparse MLA backend, so it neither queries nor owns FlashMLA launch
+        // metadata. EP8 retains the full 64-head FlashMLA plan.
+        let mla_heads = if attn_shard.is_some() {
+            crate::config::GLM52_HEADS / 8
+        } else {
+            crate::config::GLM52_HEADS
+        };
+        let num_sm_parts = if attn_shard.is_some() {
+            1
+        } else {
+            glm52_flashmla_sparse_decode_num_sm_parts()?
+        };
         let contract = Glm52FlashMlaSparseDecode {
             batch_size: batch,
             num_blocks: glm52_pool_blocks(max_model_len),
@@ -448,13 +460,7 @@ impl Glm52RankModel {
             cols: GLM52_HIDDEN,
         };
         let final_norm = build::take_bf16_vec(ctx, w, "model.norm.weight", GLM52_HIDDEN)?;
-
-        // The MTP layer's experts are loaded (checkpoint-coverage validation)
-        // but out of campaign scope — drop this rank's copy. The TP8 bundle
-        // never loads routed experts, so there is nothing to drop there.
-        if moe_topo == crate::Glm52MoeTopo::Ep8 {
-            let _ = w.take_expert_layer(crate::weights::GLM52_MTP_LAYER)?;
-        }
+        w.ensure_consumed()?;
 
         let mut cos_host = Vec::with_capacity(max_model_len * GLM52_ROPE_HALF);
         let mut sin_host = Vec::with_capacity(max_model_len * GLM52_ROPE_HALF);
@@ -476,13 +482,8 @@ impl Glm52RankModel {
         // (num_blocks is cache geometry, not batch, so it carries over),
         // plans, scratch, and a zeroed block table (never read before the
         // first step prologue uploads the coordinator's page rows).
-        // Attention-TP: the shard keeps 8 of 64 heads per rank; every scratch
-        // buffer with a head dimension shrinks with it.
-        let mla_heads = if attn_shard.is_some() {
-            crate::config::GLM52_HEADS / 8
-        } else {
-            crate::config::GLM52_HEADS
-        };
+        // Attention-TP: every scratch buffer with a head dimension shrinks
+        // with the 8-head shard selected above.
         let mut buckets = Vec::with_capacity(GLM52_DECODE_BUCKETS.len());
         for rows in GLM52_DECODE_BUCKETS {
             let contract_rows = Glm52FlashMlaSparseDecode {
@@ -499,7 +500,7 @@ impl Glm52RankModel {
             let bucket_table = ctx.stream.alloc_zeros::<i32>(rows * table_width)?;
             buckets.push(Glm52BucketState {
                 rows,
-                sched: Glm52MlaSchedMetadata::new(ctx, contract_rows)?,
+                sched: Glm52MlaSchedMetadata::new(ctx, contract_rows, mla_heads)?,
                 scratch: Glm52DecodeScratch::new(ctx, &contract_rows, mqa_shape, mla_heads)?,
                 graph: CudaGraphState::new(),
                 block_table: bucket_table,
@@ -1025,10 +1026,6 @@ fn run_step_body(
                         s.layer.mlp_out.data_mut(),
                     )
                     .with_context(|| format!("GLM5.2 layer {layer} TP8 MoE"))?;
-            }
-            #[cfg(test)]
-            Glm52LayerMlp::Moe(_) => {
-                anyhow::bail!("GLM5.2 EP8 spine built an EP1 MoE layer — loader bug")
             }
         }
         if layer + 1 < layers.len() {

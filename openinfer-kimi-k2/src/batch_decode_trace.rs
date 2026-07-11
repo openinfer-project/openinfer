@@ -121,6 +121,7 @@ pub fn trace_runtime_decode_kernel_calls(
             engine.submit(GenerateRequest {
                 request_id: Some(format!("kimi-trace-{request_idx}")),
                 queued_at_unix_s: None,
+                data_parallel_rank: None,
                 prompt_tokens: vec![0_u32; prompt_len],
                 params: SamplingParams {
                     temperature: 0.0,

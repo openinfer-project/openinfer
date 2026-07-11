@@ -60,6 +60,7 @@ impl Demux {
         match self.event_rx.try_recv() {
             Ok(first) => {
                 dispatch_burst(
+                    0,
                     first,
                     &mut self.event_rx,
                     &mut self.streams,
@@ -466,6 +467,7 @@ async fn load_snapshots_become_stats_only_batches() {
     let (output_tx, mut output_rx) = mpsc::unbounded_channel();
     let shutdown = CancellationToken::new();
     let task = tokio::spawn(publish_scheduler_stats(
+        7,
         load_rx,
         output_tx,
         shutdown.clone(),
@@ -477,6 +479,7 @@ async fn load_snapshots_become_stats_only_batches() {
     };
     assert!(batch.outputs.is_empty());
     assert!(batch.finished_requests.is_none());
+    assert_eq!(batch.engine_index, 7);
     let stats = batch.scheduler_stats.expect("scheduler stats");
     assert_eq!(stats.num_running_reqs, 2);
     assert_eq!(stats.num_waiting_reqs, 1);
@@ -492,5 +495,7 @@ async fn load_snapshots_become_stats_only_batches() {
     assert_eq!(stats.kv_cache_usage.to_bits(), 0.0_f64.to_bits());
 
     shutdown.cancel();
-    task.await.expect("stats task exits on shutdown");
+    task.await
+        .expect("stats task exits on shutdown")
+        .expect("stats publisher shuts down cleanly");
 }
