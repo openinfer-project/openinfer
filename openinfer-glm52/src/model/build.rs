@@ -138,10 +138,9 @@ pub(super) fn build_decoder_layer(
             take_proj(w, &format!("{mp}.down_proj"), GLM52_HIDDEN, 12_288)?,
         )?))
     } else if moe_topo.uses_tensor_replicated_moe() {
-        // Tensor-replicated topology: the routed experts and shared expert live in the
-        // rank's slice bank (shared folded at index 256); the resident first
-        // pass therefore carries only the router for this layer.
-        Glm52LayerMlp::MoeTp8(Box::new(Glm52MoeRouterWeights::new(
+        // Tensor-replicated topology keeps routed and shared experts in the
+        // rank slice bank; the resident first pass carries only the router.
+        Glm52LayerMlp::MoeTp(Box::new(Glm52MoeRouterWeights::new(
             w.take_tensor(&format!("{mp}.gate.weight"))?,
             w.take_tensor(&format!("{mp}.gate.e_score_correction_bias"))?,
         )?))

@@ -53,8 +53,8 @@ use openinfer_sample::mix_seed;
 use tokio::sync::{mpsc, watch};
 
 use crate::model::{
-    GLM52_DECODE_BUCKETS, GLM52_MAX_BATCH_PER_RANK, GLM52_MODEL_LEN_ALIGN, Glm52StepKv,
-    Glm52StepShape, glm52_pool_blocks, glm52_table_width,
+    GLM52_DECODE_BUCKETS, GLM52_MAX_BATCH_PER_RANK, GLM52_MLA_TOPK_SHORT, GLM52_MODEL_LEN_ALIGN,
+    Glm52StepKv, Glm52StepShape, glm52_pool_blocks, glm52_table_width,
 };
 use crate::runner::{Glm52RankWorker, Glm52StepFlags};
 
@@ -126,6 +126,10 @@ pub(crate) fn run_dp8_coordinator(
     // applies on the single logical rank; the fan-out lives in the submit
     // and draft joins.
     let mirrored = moe_topo.uses_tensor_replicated_moe();
+    // TP8's phase kernels retain their original single bucket-8 contract.
+    // TP4 pads only the MoE phase chain internally, so attention, projections,
+    // norms, and sampling can use the smallest regular decode bucket.
+    let full_bucket = matches!(moe_topo, crate::Glm52MoeTopo::Tp8);
     let logical_ranks = if mirrored { 1 } else { workers.len() };
     assert_eq!(
         load_txs.len(),
@@ -194,7 +198,7 @@ pub(crate) fn run_dp8_coordinator(
     // contexts already exist: on failure broadcast Shutdown before the
     // workers' sequential Drop joins them (the same collective-teardown
     // contract as the exit path).
-    if let Err(err) = precapture_step_graphs(&workers, &pools, table_width, mirrored) {
+    if let Err(err) = precapture_step_graphs(&workers, &pools, table_width, mirrored, full_bucket) {
         log::error!("GLM5.2 graph pre-capture failed: {err:#}");
         for worker in &workers {
             let _ = worker.request_shutdown();
@@ -259,7 +263,7 @@ pub(crate) fn run_dp8_coordinator(
         // active slot's span of consecutive next tokens, padding rows on the
         // free slots — and all responses are joined before any output is
         // interpreted.
-        let shapes = plan_step_shapes(&feed_wants(&slots), mirrored);
+        let shapes = plan_step_shapes(&feed_wants(&slots), full_bucket);
         let flags = launch_ahead_flags(
             &shapes,
             leased_shapes.as_deref(),
@@ -390,46 +394,55 @@ fn precapture_step_graphs(
     pools: &[BlockPool],
     table_width: usize,
     mirrored: bool,
+    full_bucket: bool,
 ) -> anyhow::Result<()> {
-    // tp8 serves exactly one shape (the full bucket, every worker mirrored);
-    // EP8 captures every bucket.
-    let capture_bucket = |bucket: usize| !mirrored || bucket == GLM52_MAX_BATCH_PER_RANK;
+    // TP8 serves exactly one shape. EP8 and TP4 capture every bucket; TP4 is
+    // still mirrored, but only its MoE subgraph pads to eight rows.
+    let capture_bucket = |bucket: usize| !full_bucket || bucket == GLM52_MAX_BATCH_PER_RANK;
     for &bucket in GLM52_DECODE_BUCKETS
         .iter()
         .filter(|&&bucket| capture_bucket(bucket))
     {
-        let mut shape = Glm52StepShape {
-            bucket,
-            slots: [0; GLM52_MAX_BATCH_PER_RANK],
-            active_rows: 0,
-        };
-        for (slot, dst) in shape.slots.iter_mut().enumerate().take(bucket) {
-            *dst = slot as u8;
-        }
-        let inputs =
-            [(GLM52_PADDING_STEP.token, GLM52_PADDING_STEP.position); GLM52_MAX_BATCH_PER_RANK];
-        let flags = Glm52StepFlags::plain();
-        let responses = workers
-            .iter()
-            .enumerate()
-            .map(|(rank, worker)| {
-                let pool = &pools[if mirrored { 0 } else { rank }];
-                let kv = padding_step_kv(bucket, table_width, pool.padding_block_id(), &inputs);
-                worker.step_async(inputs, shape, kv, flags, Vec::new(), 0)
-            })
-            .collect::<anyhow::Result<Vec<_>>>()
-            .context("GLM5.2 graph pre-capture submit")?;
-        for (rank, resp) in responses.into_iter().enumerate() {
-            resp.recv()
-                .map_err(|_| anyhow::anyhow!("rank dropped its pre-capture response"))
-                .and_then(|r| r)
-                .with_context(|| {
-                    format!("GLM5.2 graph pre-capture (bucket {bucket}) on rank {rank}")
-                })?;
+        for full_tier in [false, true] {
+            let mut shape = Glm52StepShape {
+                bucket,
+                slots: [0; GLM52_MAX_BATCH_PER_RANK],
+                active_rows: 0,
+            };
+            for (slot, dst) in shape.slots.iter_mut().enumerate().take(bucket) {
+                *dst = slot as u8;
+            }
+            let mut inputs =
+                [(GLM52_PADDING_STEP.token, GLM52_PADDING_STEP.position); GLM52_MAX_BATCH_PER_RANK];
+            if full_tier {
+                inputs[0] = (GLM52_PADDING_STEP.token, GLM52_MLA_TOPK_SHORT);
+            }
+            let flags = Glm52StepFlags::plain();
+            let responses = workers
+                .iter()
+                .enumerate()
+                .map(|(rank, worker)| {
+                    let pool = &pools[if mirrored { 0 } else { rank }];
+                    let kv = padding_step_kv(bucket, table_width, pool.padding_block_id(), &inputs);
+                    worker.step_async(inputs, shape, kv, flags, Vec::new(), 0)
+                })
+                .collect::<anyhow::Result<Vec<_>>>()
+                .context("GLM5.2 graph pre-capture submit")?;
+            for (rank, resp) in responses.into_iter().enumerate() {
+                resp.recv()
+                    .map_err(|_| anyhow::anyhow!("rank dropped its pre-capture response"))
+                    .and_then(|r| r)
+                    .with_context(|| {
+                        format!(
+                            "GLM5.2 graph pre-capture (bucket {bucket}, full tier {full_tier}) \
+                             on rank {rank}"
+                        )
+                    })?;
+            }
         }
     }
     log::info!(
-        "GLM5.2 whole-step graphs pre-captured: {} buckets",
+        "GLM5.2 whole-step graphs pre-captured: {} buckets x 2 tiers",
         GLM52_DECODE_BUCKETS
             .iter()
             .filter(|&&bucket| capture_bucket(bucket))

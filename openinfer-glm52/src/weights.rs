@@ -274,16 +274,11 @@ impl Glm52WeightManifest {
                 });
         }
         let tensor_count = by_shard.values().map(Vec::len).sum();
-        let expert_range = if include_experts {
-            let expert_start = rank * GLM52_LOCAL_EXPERTS;
-            expert_start..expert_start + GLM52_LOCAL_EXPERTS
-        } else {
-            0..0
-        };
+        let expert_start = rank * GLM52_LOCAL_EXPERTS;
         Ok(Glm52RankLoadBundle {
             plan: Glm52RankWeightPlan {
                 rank,
-                expert_range,
+                expert_range: expert_start..expert_start + GLM52_LOCAL_EXPERTS,
                 tensor_count,
             },
             shards: by_shard

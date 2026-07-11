@@ -25,7 +25,8 @@ use openinfer_kernels::ops::{
     GLM52_FLASHMLA_SPARSE_TOPK, GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW, Glm52FlashMlaSparseDecode,
     Glm52IndexerCacheLayout, add_into, argmax_bf16_split_into, copy_hidden_rows_raw_into,
     embedding_rows_into, glm52_flashmla_sparse_decode_num_sm_parts,
-    glm52_fp8_weight_only_gemv_launch, rms_norm_rows_into,
+    glm52_fp8_weight_only_gemv_launch, glm52_vocab_parallel_pack_launch,
+    glm52_vocab_parallel_unpack_launch, rms_norm_rows_into,
 };
 use openinfer_kernels::tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStatesRef};
 use openinfer_kv_offload::KvArena;
@@ -44,10 +45,12 @@ use crate::layer::{
     Glm52DecodeStep, Glm52DecoderLayerWeights, Glm52LayerCaches, Glm52LayerMlp,
     glm52_layer_attention_half, glm52_layer_finish, glm52_layer_finish_fused,
 };
-use crate::mla_decode::Glm52MlaSchedMetadata;
+use crate::mla_decode::{
+    Glm52MlaSchedMetadata, glm52_mla_backend_preflight, glm52_select_mla_backend,
+};
 use crate::moe_decode::run_router_into;
 use crate::moe_ep8::{Glm52MoeEp8LayerWeights, Glm52MoeEp8State, glm52_moe_ep8_routed_forward};
-use crate::moe_tp8::Glm52MoeTp8Rank;
+use crate::moe_tp::Glm52MoeTpRank;
 use crate::scratch::Glm52DecodeScratch;
 use crate::weights::{Glm52RankGpuWeights, retype_owned};
 
@@ -194,19 +197,16 @@ pub(crate) struct Glm52StepKv {
     pub(crate) slot_mapping: [i64; GLM52_MAX_BATCH_PER_RANK],
 }
 
-// There used to be a short-context attention tier here (topk 256 while every
-// row's context fit in it — lossless, 1/8 the index walk). Dropped: the
-// serving traffic is agent workloads whose contexts start well past 2048, so
-// the tier was dead weight — 2x the pre-captured graphs and a second sparse
-// MLA kernel instantiation. To bring it back, restore the (bucket x tier)
-// arrays from git history and add 256 to `TOPKS` in
-// openinfer-kernels/tools/tilelang/glm52/generate.py (plus
-// `GLM52_SPARSE_MLA_TOPKS` there and `supported_topk` in
-// csrc/glm52/glm52_sparse_mla.cu).
+/// Lossless short-context attention tier: while every row has at most 256
+/// visible tokens, top-256 contains the full context and avoids the padded
+/// top-2048 walk. TP4's 1/256 serving gate exercises this tier.
+pub(crate) const GLM52_MLA_TOPK_SHORT: usize = 256;
 
 // The attention `topk` feeds the DSA indexer's top-k selection, whose
 // buffers are sized for GLM52_INDEX_TOPK rows — pin the range here so the
 // indexer forward never needs to re-check it per layer per step.
+const _: () = assert!(GLM52_MLA_TOPK_SHORT > 0 && GLM52_MLA_TOPK_SHORT.is_multiple_of(64));
+const _: () = assert!(GLM52_MLA_TOPK_SHORT <= GLM52_INDEX_TOPK);
 const _: () = assert!(GLM52_FLASHMLA_SPARSE_TOPK > 0);
 const _: () = assert!(GLM52_FLASHMLA_SPARSE_TOPK <= GLM52_INDEX_TOPK);
 
@@ -233,7 +233,12 @@ pub(crate) struct Glm52RankModel {
     caches: Vec<Glm52LayerCaches>,
     embed: DeviceMatrix,
     final_norm: DeviceVec,
+    /// Full vocabulary head retained for DSpark and non-greedy sampling.
     lm_head: DeviceMatrix,
+    /// Contiguous vocabulary shard used only by attention-TP decode. EP8
+    /// computes the full head directly and leaves this absent.
+    decode_lm_head: Option<DeviceMatrix>,
+    decode_vocab_start: usize,
     /// Per-bucket execution state, index-aligned with
     /// [`GLM52_DECODE_BUCKETS`]. Selecting one `Glm52BucketState` selects the
     /// plans, scratch, graphs, and block table together — a graph can never
@@ -247,7 +252,10 @@ pub(crate) struct Glm52RankModel {
     /// rank-wide per-layer MLA and index-K page pools at build time
     /// ([`glm52_pool_blocks`]).
     max_model_len: usize,
-    /// Built with `--moe-topo tp8`: every MoE arm is `MoeTp8`, bucket-8
+    /// Token stride of this rank's MLA arena. FlashMLA fp8_ds_mla uses 656
+    /// bytes; TP4 FlashInfer uses the standard 576-byte E4M3 layout.
+    mla_cache_bytes_per_token: usize,
+    /// Built with `--moe-topo tp`: every MoE arm is `MoeTp`, bucket-8
     /// steps are span steps (all 8 rows one owner rank), and the
     /// coordinator must stage the span owner on every such step.
     slot_mapping: CudaSlice<i64>,
@@ -275,21 +283,13 @@ pub(crate) struct Glm52RankModel {
     device_positions: [usize; GLM52_MAX_BATCH_PER_RANK],
 }
 
-/// Everything one decode bucket owns: the batch-`rows` FlashMLA plan, the
-/// scratch arena, the whole-step CUDA graph (captured on this rank's first
-/// step in that bucket shape and replayed every step after — valid forever,
-/// since within a shape every step has the same kernel sequence and the same
-/// arena pointers by construction; the per-step inputs are the device
-/// buffers the prologue rewrites), and the `[rows, table_width]` block
-/// table, uploaded by the prologue every step from the coordinator's
-/// [`Glm52StepKv`] page rows, so the captured graph addresses whichever pool
-/// pages hold the requests — and span rows their repeated slot's row —
-/// through device data, never baked page ids.
+/// Everything one decode bucket owns: per-attention-tier MLA schedules and
+/// whole-step graphs, shared scratch, and the device block table.
 struct Glm52BucketState {
     rows: usize,
-    sched: Glm52MlaSchedMetadata,
+    scheds: [Glm52MlaSchedMetadata; 2],
     scratch: Glm52DecodeScratch,
-    graph: CudaGraphState,
+    graphs: [CudaGraphState; 2],
     block_table: CudaSlice<i32>,
     /// Pinned landing buffers for this bucket's argmax D2H, sized exactly
     /// `rows` (`memcpy_dtoh` copies the DESTINATION's byte count). Pinned
@@ -299,6 +299,13 @@ struct Glm52BucketState {
     argmax_indices_host: PinnedHostSlice<i32>,
 }
 
+/// Tier index into the per-tier arrays: every consumer selects with the same
+/// index computed once per step.
+const TIER_FULL: usize = 0;
+const TIER_SHORT: usize = 1;
+/// Attention layers occupy AR slots `0..GLM52_LAYERS`; the tail reuses the
+/// same fixed-order transport to gather vocabulary-shard top-1 candidates.
+const VOCAB_AR_SLOT: usize = GLM52_LAYERS;
 impl Glm52RankModel {
     /// The token embedding table — the DSpark draft's block embedding reuses
     /// it (the draft checkpoint's copy is byte-identical and not loaded).
@@ -342,8 +349,7 @@ impl Glm52RankModel {
     /// contiguous, so a block's stride equals its copy size.
     pub(crate) fn kv_arenas(&self, stream: &CudaStream) -> Result<Vec<KvArena>> {
         let num_blocks = glm52_pool_blocks(self.max_model_len);
-        let mla_block_bytes =
-            GLM52_FLASHMLA_SPARSE_PAGE_SIZE * GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN;
+        let mla_block_bytes = GLM52_FLASHMLA_SPARSE_PAGE_SIZE * self.mla_cache_bytes_per_token;
         let idxk_block_bytes = INDEX_CACHE_BLOCK * (GLM52_INDEX_HEAD_DIM + 4);
         let mut arenas = Vec::with_capacity(self.caches.len() * 2);
         for (layer, caches) in self.caches.iter().enumerate() {
@@ -399,14 +405,19 @@ impl Glm52RankModel {
              {GLM52_MODEL_LEN_ALIGN} (the FlashMLA page / index-K block size)"
         );
         let batch = GLM52_MAX_BATCH_PER_RANK;
-        // Attention-TP keeps a topology-sized shard of the 64 heads and uses the right-sized
-        // sparse MLA backend, so it neither queries nor owns FlashMLA launch
-        // metadata. EP8 retains the full 64-head FlashMLA plan.
         let mla_heads = if attn_shard.is_some() {
             crate::config::GLM52_HEADS / moe_topo.device_count()
         } else {
             crate::config::GLM52_HEADS
         };
+        let mla_backend = glm52_select_mla_backend(mla_heads)?;
+        let mla_cache_bytes_per_token = mla_backend.cache_bytes_per_token();
+        log::info!(
+            "GLM5.2 MLA backend: {:?} ({} heads/rank, {} bytes/cache token)",
+            mla_backend,
+            mla_heads,
+            mla_cache_bytes_per_token
+        );
         let num_sm_parts = if attn_shard.is_some() {
             1
         } else {
@@ -429,9 +440,11 @@ impl Glm52RankModel {
                     .with_context(|| format!("build GLM5.2 decoder layer {layer}"))?,
             );
             caches.push(Glm52LayerCaches {
-                mla_cache: ctx
-                    .stream
-                    .alloc_zeros::<u8>(contract.packed_kv_cache_len())?,
+                mla_cache: ctx.stream.alloc_zeros::<u8>(
+                    contract.num_blocks
+                        * GLM52_FLASHMLA_SPARSE_PAGE_SIZE
+                        * mla_cache_bytes_per_token,
+                )?,
                 index_k_cache: glm52_layer_has_full_indexer(layer)
                     .then(|| {
                         ctx.stream
@@ -459,6 +472,33 @@ impl Glm52RankModel {
             rows: GLM52_VOCAB,
             cols: GLM52_HIDDEN,
         };
+        let (decode_lm_head, decode_vocab_start) = if let Some(rank) = attn_shard {
+            let ranks = moe_topo.device_count();
+            ensure!(
+                rank < ranks && GLM52_VOCAB.is_multiple_of(ranks),
+                "GLM5.2 vocab TP shard {rank}/{ranks} cannot partition {} rows",
+                GLM52_VOCAB
+            );
+            let rows = GLM52_VOCAB / ranks;
+            let start = rank * rows;
+            let mut data = ctx.stream.alloc_zeros::<bf16>(rows * GLM52_HIDDEN)?;
+            ctx.stream.memcpy_dtod(
+                &lm_head
+                    .data
+                    .slice(start * GLM52_HIDDEN..(start + rows) * GLM52_HIDDEN),
+                &mut data,
+            )?;
+            (
+                Some(DeviceMatrix {
+                    data,
+                    rows,
+                    cols: GLM52_HIDDEN,
+                }),
+                start,
+            )
+        } else {
+            (None, 0)
+        };
         let final_norm = build::take_bf16_vec(ctx, w, "model.norm.weight", GLM52_HIDDEN)?;
         w.ensure_consumed()?;
 
@@ -482,12 +522,18 @@ impl Glm52RankModel {
         // (num_blocks is cache geometry, not batch, so it carries over),
         // plans, scratch, and a zeroed block table (never read before the
         // first step prologue uploads the coordinator's page rows).
-        // Attention-TP: every scratch buffer with a head dimension shrinks
-        // with the shard selected above.
+        // Attention-TP scratch follows the head shard and selected MLA cache
+        // layout; both were fixed before the per-layer arenas were allocated.
         let mut buckets = Vec::with_capacity(GLM52_DECODE_BUCKETS.len());
         for rows in GLM52_DECODE_BUCKETS {
             let contract_rows = Glm52FlashMlaSparseDecode {
                 batch_size: rows,
+                ..contract
+            };
+            let contract_rows_short = Glm52FlashMlaSparseDecode {
+                batch_size: rows,
+                topk: GLM52_MLA_TOPK_SHORT,
+                num_sm_parts: num_sm_parts.min(GLM52_MLA_TOPK_SHORT / 64),
                 ..contract
             };
             let mqa_shape = Glm52IndexerScratch::decode_shape(
@@ -500,9 +546,28 @@ impl Glm52RankModel {
             let bucket_table = ctx.stream.alloc_zeros::<i32>(rows * table_width)?;
             buckets.push(Glm52BucketState {
                 rows,
-                sched: Glm52MlaSchedMetadata::new(ctx, contract_rows, mla_heads)?,
-                scratch: Glm52DecodeScratch::new(ctx, &contract_rows, mqa_shape, mla_heads)?,
-                graph: CudaGraphState::new(),
+                scheds: [
+                    Glm52MlaSchedMetadata::new_for_backend(
+                        ctx,
+                        contract_rows,
+                        mla_heads,
+                        mla_backend,
+                    )?,
+                    Glm52MlaSchedMetadata::new_for_backend(
+                        ctx,
+                        contract_rows_short,
+                        mla_heads,
+                        mla_backend,
+                    )?,
+                ],
+                scratch: Glm52DecodeScratch::new_for_backend(
+                    ctx,
+                    &contract_rows,
+                    mqa_shape,
+                    mla_heads,
+                    mla_backend,
+                )?,
+                graphs: [CudaGraphState::new(), CudaGraphState::new()],
                 block_table: bucket_table,
                 // Read only after a D2H lands in them (the write-combined
                 // pages start uninitialized).
@@ -513,6 +578,21 @@ impl Glm52RankModel {
         let buckets: [Glm52BucketState; GLM52_DECODE_BUCKETS.len()] = buckets
             .try_into()
             .map_err(|_| anyhow::anyhow!("GLM5.2 bucket state count drifted from the const"))?;
+        let mut buckets = buckets;
+
+        if mla_backend == crate::mla_decode::Glm52MlaBackend::FlashInferFp8 {
+            for bucket in &mut buckets {
+                for tier in 0..bucket.scheds.len() {
+                    glm52_mla_backend_preflight(
+                        ctx,
+                        &bucket.scheds[tier],
+                        &mut bucket.scratch.mla_attend,
+                        &caches[0].mla_cache,
+                    )?;
+                }
+            }
+            ctx.sync()?;
+        }
 
         // Crash-early pre-flight: launch the batched weight-only GEMV once
         // per bucket, so a GLM52_DECODE_BUCKETS entry without a matching CUDA
@@ -563,9 +643,12 @@ impl Glm52RankModel {
             embed,
             final_norm,
             lm_head,
+            decode_lm_head,
+            decode_vocab_start,
             buckets,
             table_width,
             max_model_len,
+            mla_cache_bytes_per_token,
             slot_mapping: ctx.stream.alloc_zeros::<i64>(batch)?,
             seq_lens: ctx.stream.alloc_zeros::<i32>(batch)?,
             cos_table: DeviceMatrix {
@@ -620,7 +703,7 @@ impl Glm52RankModel {
         ctx: &DeviceContext,
         aux: &DeviceContext,
         ep8: Option<&mut Glm52MoeEp8State>,
-        tp8: Option<&mut Glm52MoeTp8Rank>,
+        tp: Option<&mut Glm52MoeTpRank>,
         inputs: &[(u32, usize); GLM52_MAX_BATCH_PER_RANK],
         shape: Glm52StepShape,
         kv: &Glm52StepKv,
@@ -668,7 +751,7 @@ impl Glm52RankModel {
             // a global grant), so the stale replay's collectives pair up and
             // it degrades to a harmless recompute the prologue overwrites.
             self.speculated = None;
-            self.decode_step_prologue_and_replay(ctx, aux, ep8, tp8, inputs, shape, kv)?;
+            self.decode_step_prologue_and_replay(ctx, aux, ep8, tp, inputs, shape, kv)?;
         }
         let mut outputs = self.decode_step_harvest(ctx, inputs, shape, flags.lease)?;
         self.sample_rows_into(ctx, shape, sampling, seed, &mut outputs)?;
@@ -713,9 +796,20 @@ impl Glm52RankModel {
         }
         let bucket = self
             .buckets
-            .iter()
+            .iter_mut()
             .find(|bucket| bucket.rows == shape.bucket)
             .expect("decode_step validated the bucket");
+        // TP greedy decode writes compact shard logits into the shared
+        // buffer. Sampling needs the full distribution, so only sampled
+        // steps pay one eager full-head recompute after the graph.
+        if self.decode_lm_head.is_some() {
+            glm52_lm_head_into(
+                ctx,
+                &bucket.scratch.final_normed,
+                &self.lm_head,
+                &mut bucket.scratch.logits,
+            )?;
+        }
         let logits = HiddenStatesRef {
             data: bucket.scratch.logits.data(),
             hidden_dim: GLM52_VOCAB,
@@ -765,7 +859,7 @@ impl Glm52RankModel {
         ctx: &DeviceContext,
         aux: &DeviceContext,
         ep8: Option<&mut Glm52MoeEp8State>,
-        mut tp8: Option<&mut Glm52MoeTp8Rank>,
+        mut tp: Option<&mut Glm52MoeTpRank>,
         inputs: &[(u32, usize); GLM52_MAX_BATCH_PER_RANK],
         shape: Glm52StepShape,
         kv: &Glm52StepKv,
@@ -868,12 +962,17 @@ impl Glm52RankModel {
         // step, and LL push/wait symmetry depends on it. A leased replay
         // (consume path) skips this prologue, which is safe: the lease
         // guarantees the identical shape, so the staged value still holds.
-        if let Some(rank) = tp8.as_deref_mut() {
+        if let Some(rank) = tp.as_deref_mut() {
             if !rank.slices.is_empty() {
                 rank.state.stage_active_rows(ctx, shape.active_rows)?;
             }
         }
 
+        let short_tier = (0..batch)
+            .map(|row| inputs[row].1 + 1)
+            .max()
+            .is_some_and(|longest| longest <= GLM52_MLA_TOPK_SHORT);
+        let tier = if short_tier { TIER_SHORT } else { TIER_FULL };
         // The bucket state selected above carries the plan, scratch, graph,
         // and block table together — one coherent shape.
         let step = Glm52DecodeStep {
@@ -881,7 +980,7 @@ impl Glm52RankModel {
             mla_sin: &self.sin,
             idx_cos: &self.cos,
             idx_sin: &self.sin,
-            mla_sched: &bucket.sched,
+            mla_sched: &bucket.scheds[tier],
             slot_mapping: &self.slot_mapping,
             block_table: &bucket.block_table,
             seq_lens: &self.seq_lens,
@@ -891,25 +990,27 @@ impl Glm52RankModel {
         let global_tokens = crate::weights::GLM52_EP_RANKS * batch;
 
         let s = &mut bucket.scratch;
+        let decode_lm_head = self.decode_lm_head.as_ref().unwrap_or(&self.lm_head);
         let mut graph = std::mem::take(&mut bucket.graphs[tier]);
         let result = graph.run_or_capture(ctx, || {
             run_step_body(
                 ctx,
                 aux,
                 ep8,
-                tp8,
+                tp,
                 &self.layers,
                 &mut self.caches,
                 &self.embed,
                 &self.final_norm,
-                &self.lm_head,
+                decode_lm_head,
+                self.decode_vocab_start,
                 &self.token_ids,
                 &step,
                 s,
                 global_tokens,
             )
         });
-        bucket.graph = graph;
+        bucket.graphs[tier] = graph;
         result
     }
 }
@@ -924,12 +1025,13 @@ fn run_step_body(
     ctx: &DeviceContext,
     aux: &DeviceContext,
     mut ep8: Option<&mut Glm52MoeEp8State>,
-    mut tp8: Option<&mut Glm52MoeTp8Rank>,
+    mut tp: Option<&mut Glm52MoeTpRank>,
     layers: &[Glm52DecoderLayerWeights],
     caches: &mut [Glm52LayerCaches],
     embed: &DeviceMatrix,
     final_norm: &DeviceVec,
     lm_head: &DeviceMatrix,
+    vocab_start: usize,
     token_ids: &CudaSlice<u32>,
     step: &Glm52DecodeStep<'_>,
     s: &mut Glm52DecodeScratch,
@@ -939,7 +1041,7 @@ fn run_step_body(
     // TP8 step head: advance the shared LL epoch exactly once per replayed
     // step that runs TP8 kernels (all TP8 layers of the step share the tag;
     // per-layer slot regions alternate parity across steps).
-    if let Some(rank) = tp8.as_deref_mut() {
+    if let Some(rank) = tp.as_deref_mut() {
         if !rank.slices.is_empty() {
             rank.state.advance_epoch(ctx)?;
         }
@@ -962,13 +1064,13 @@ fn run_step_body(
         let parity = layer % 2;
         // Attention-TP: a head-sharded layer's o_proj partial crosses the AR
         // brick inside the attention half; the layer index is its AR slot.
-        let tp8_ar = if weights.mla.heads != crate::config::GLM52_HEADS {
-            let rank = tp8
-                .as_deref_mut()
-                .context("GLM5.2 sharded attention without TP8 state")?;
-            Some((&mut rank.state, layer))
-        } else {
+        let tp_ar = if weights.mla.heads == crate::config::GLM52_HEADS {
             None
+        } else {
+            let rank = tp
+                .as_deref_mut()
+                .context("GLM5.2 sharded attention without TP state")?;
+            Some((&mut rank.state, layer))
         };
         glm52_layer_attention_half(
             ctx,
@@ -980,9 +1082,10 @@ fn run_step_body(
             &mut carry_ready,
             parity,
             layer == 0,
-            tp8_ar,
+            tp_ar,
         )
         .with_context(|| format!("GLM5.2 layer {layer} attention half"))?;
+        let mut tp_padded_mlp = false;
         match &weights.mlp {
             Glm52LayerMlp::Dense(dense) => glm52_dense_mlp_forward_into(
                 ctx,
@@ -998,17 +1101,8 @@ fn run_step_body(
                 glm52_moe_ep8_layer(ctx, aux, ep8, moe, s, batch, global_tokens)
                     .with_context(|| format!("GLM5.2 layer {layer} EP8 MoE"))?;
             }
-            Glm52LayerMlp::MoeTp8(router) => {
-                // TP8 topology: every MoE layer runs the replicated
-                // phase-kernel chain over ALL 8 global rows — the topology
-                // serves exactly one shape (bucket-8; pad rows ride free
-                // slots). Any other bucket is a scheduler bug.
-                ensure!(
-                    batch == GLM52_MAX_BATCH_PER_RANK,
-                    "GLM5.2 TP8 topology stepped at bucket {batch} — replicated activations \
-                     serve the single bucket-{GLM52_MAX_BATCH_PER_RANK} shape"
-                );
-                let (state, slot, bank) = tp8
+            Glm52LayerMlp::MoeTp(router) => {
+                let (state, slot, bank) = tp
                     .as_deref_mut()
                     .and_then(|rank| rank.layer_bank(layer))
                     .with_context(|| {
@@ -1018,8 +1112,8 @@ fn run_step_body(
                 // ranks (same kernel, same replicated normed2), so the
                 // kernel's union and prob table need no routing exchange.
                 run_router_into(ctx, router, s.layer.normed2.data(), &mut s.router)?;
-                state
-                    .forward(
+                if batch == GLM52_MAX_BATCH_PER_RANK {
+                    state.forward(
                         ctx,
                         slot,
                         bank,
@@ -1027,14 +1121,38 @@ fn run_step_body(
                         &s.router.route.topk_idx,
                         &s.router.route.topk_weight,
                         s.layer.mlp_out.data_mut(),
-                    )
-                    .with_context(|| format!("GLM5.2 layer {layer} TP8 MoE"))?;
+                    )?;
+                } else {
+                    // TP4 keeps the proven eight-row MoE ABI while allowing
+                    // every other layer component to use bucket 1/2/4.
+                    copy_hidden_rows_raw_into(
+                        ctx,
+                        s.layer.normed2.data(),
+                        GLM52_HIDDEN,
+                        &mut s.tp_normed2,
+                        GLM52_HIDDEN,
+                        0,
+                        batch,
+                    )?;
+                    state.forward(
+                        ctx,
+                        slot,
+                        bank,
+                        &s.tp_normed2,
+                        &s.router.route.topk_idx,
+                        &s.router.route.topk_weight,
+                        &mut s.tp_mlp_out,
+                    )?;
+                    // The active rows are the contiguous prefix. The closing
+                    // residual/norm reads them directly from the padded output.
+                    tp_padded_mlp = true;
+                }
             }
         }
         if layer + 1 < layers.len() {
-            glm52_layer_finish_fused(ctx, s, parity, &layers[layer + 1].input_ln)?;
+            glm52_layer_finish_fused(ctx, s, parity, &layers[layer + 1].input_ln, tp_padded_mlp)?;
         } else {
-            glm52_layer_finish(ctx, s, parity)?;
+            glm52_layer_finish(ctx, s, parity, tp_padded_mlp)?;
         }
         // DSpark aux-hidden capture: after layer L's closing add the residual
         // stream lives in `attn[parity]` (updated in place by the fused
@@ -1070,12 +1188,53 @@ fn run_step_body(
         ctx,
         s.logits.data(),
         batch,
-        GLM52_VOCAB,
+        lm_head.rows,
         &mut s.argmax_partial_values,
         &mut s.argmax_partial_indices,
         &mut s.argmax_values,
         &mut s.argmax_indices,
-    )
+    )?;
+
+    if let Some(rank) = tp {
+        ensure!(
+            lm_head.rows * rank.state.ranks() == GLM52_VOCAB
+                && vocab_start == rank.state.rank() * lm_head.rows,
+            "GLM5.2 vocab shard [{vocab_start}..{}) does not match TP rank {}/{}",
+            vocab_start + lm_head.rows,
+            rank.state.rank(),
+            rank.state.ranks()
+        );
+        glm52_vocab_parallel_pack_launch(
+            ctx,
+            &s.argmax_values,
+            &s.argmax_indices,
+            s.layer.ar_partial.data_mut(),
+            batch,
+            rank.state.rank(),
+            vocab_start,
+        )?;
+        rank.state.attn_ar_launch(
+            ctx,
+            VOCAB_AR_SLOT,
+            batch,
+            s.layer.ar_partial.data(),
+            s.layer.attn[0].data_mut(),
+        )?;
+        glm52_vocab_parallel_unpack_launch(
+            ctx,
+            s.layer.attn[0].data(),
+            &mut s.argmax_values,
+            &mut s.argmax_indices,
+            batch,
+            rank.state.ranks(),
+        )?;
+    } else {
+        ensure!(
+            lm_head.rows == GLM52_VOCAB && vocab_start == 0,
+            "GLM5.2 non-TP decode received a sharded vocabulary head"
+        );
+    }
+    Ok(())
 }
 
 /// One layer's EP8 MoE half: shared expert forked to the aux stream, routed

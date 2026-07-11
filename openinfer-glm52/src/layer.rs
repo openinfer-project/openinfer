@@ -56,8 +56,8 @@ pub(crate) enum Glm52LayerMlp {
     MoeEp8(Box<Glm52MoeEp8LayerWeights>),
     /// TP8 topology: the router is the only per-layer MLP weight here — the
     /// routed experts AND the shared expert live in the rank's slice bank
-    /// (`Glm52MoeTp8Rank.slices`, shared folded at bank index 256).
-    MoeTp8(Box<crate::moe_decode::Glm52MoeRouterWeights>),
+    /// (`Glm52MoeTpRank.slices`, shared folded at bank index 256).
+    MoeTp(Box<crate::moe_decode::Glm52MoeRouterWeights>),
 }
 
 /// The DSA indexer role of a decoder layer (`config.indexer_types[layer]`):
@@ -160,7 +160,7 @@ pub(crate) fn glm52_layer_attention_half(
     carry_ready: &mut bool,
     parity: usize,
     first_layer: bool,
-    tp8_ar: Option<(&mut crate::moe_tp8::Glm52MoeTpState, usize)>,
+    tp_ar: Option<(&mut crate::moe_tp::Glm52MoeTpState, usize)>,
 ) -> Result<()> {
     // Attention-TP: a head-sharded layer (8 of 64 heads) produces an o_proj
     // PARTIAL that must cross the AR brick before the residual add; holding
@@ -168,10 +168,10 @@ pub(crate) fn glm52_layer_attention_half(
     // crash here, not on silently-wrong hidden states.
     let sharded = w.mla.heads != crate::config::GLM52_HEADS;
     ensure!(
-        sharded == tp8_ar.is_some(),
+        sharded == tp_ar.is_some(),
         "GLM5.2 attention-TP wiring mismatch: layer holds {} heads but AR is {}",
         w.mla.heads,
-        if tp8_ar.is_some() { "wired" } else { "absent" }
+        if tp_ar.is_some() { "wired" } else { "absent" }
     );
     // `s.layer.normed` (this layer's input_layernorm output) is already
     // populated: by the previous layer's closing fused add+norm, or — for
@@ -242,8 +242,8 @@ pub(crate) fn glm52_layer_attention_half(
     } else {
         (&mut attn_hi[0], &attn_lo[0])
     };
-    match tp8_ar {
-        Some((tp8, layer_slot)) => {
+    match tp_ar {
+        Some((tp, layer_slot)) => {
             // Sharded: attend lands the o_proj partial in `ar_partial`; the
             // AR brick sums the 8 ranks' partials into `attn_out`
             // (bit-identical on every rank, fixed source order).
@@ -256,11 +256,12 @@ pub(crate) fn glm52_layer_attention_half(
                 &mut caches.mla_cache,
                 step.slot_mapping,
                 &s.idx.global_slots,
+                step.seq_lens,
                 step.mla_sched,
                 &mut s.mla_attend,
                 &mut s.layer.ar_partial,
             )?;
-            tp8.attn_ar_launch(
+            tp.attn_ar_launch(
                 ctx,
                 layer_slot,
                 tokens,
@@ -277,6 +278,7 @@ pub(crate) fn glm52_layer_attention_half(
             &mut caches.mla_cache,
             step.slot_mapping,
             &s.idx.global_slots,
+            step.seq_lens,
             step.mla_sched,
             &mut s.mla_attend,
             attn_out,
@@ -316,12 +318,18 @@ pub(crate) fn glm52_layer_finish_fused(
     s: &mut Glm52DecodeScratch,
     parity: usize,
     next_input_ln: &DeviceVec,
+    tp_padded_mlp: bool,
 ) -> Result<()> {
     let tokens = s.layer.normed.tokens();
+    let mlp_out = if tp_padded_mlp {
+        &s.tp_mlp_out
+    } else {
+        s.layer.mlp_out.data()
+    };
     fused_add_rms_norm_round_into(
         ctx,
         s.layer.attn[parity].data_mut(),
-        s.layer.mlp_out.data(),
+        mlp_out,
         next_input_ln,
         RMS_EPS,
         HIDDEN,
@@ -336,11 +344,17 @@ pub(crate) fn glm52_layer_finish(
     ctx: &DeviceContext,
     s: &mut Glm52DecodeScratch,
     parity: usize,
+    tp_padded_mlp: bool,
 ) -> Result<()> {
+    let mlp_out = if tp_padded_mlp {
+        &s.tp_mlp_out
+    } else {
+        s.layer.mlp_out.data()
+    };
     add_into(
         ctx,
         s.layer.attn[parity].data(),
-        s.layer.mlp_out.data(),
+        mlp_out,
         s.hidden.tokens() * HIDDEN,
         s.hidden.data_mut(),
     )
@@ -378,9 +392,9 @@ pub(crate) fn glm52_decoder_layer_forward(
             &mut s.dense_mlp,
             s.layer.mlp_out.data_mut(),
         )?,
-        Glm52LayerMlp::MoeEp8(_) | Glm52LayerMlp::MoeTp8(_) => anyhow::bail!(
+        Glm52LayerMlp::MoeEp8(_) | Glm52LayerMlp::MoeTp(_) => anyhow::bail!(
             "GLM5.2 EP8/TP8 MoE layers require their collective drivers, not the single-layer forward"
         ),
     }
-    glm52_layer_finish(ctx, s, 0)
+    glm52_layer_finish(ctx, s, 0, false)
 }

@@ -1,6 +1,5 @@
-// Low-latency (LL) packet primitives shared by the GLM5.2 TP4 collective
-// kernels (MoE AG/RS in glm52_moe_tp4.cu, attention allreduce in
-// glm52_tp4_ar.cu).
+// Low-latency (LL) packet primitives shared by the GLM5.2 tensor-parallel
+// MoE and attention collectives.
 //
 // LL packet contract: the tag rides in the 4th word of one 16 B aligned
 // vector store, and readers treat tag-match as "payload words are valid".
@@ -10,28 +9,28 @@
 // same assumption NCCL's LL128 protocol makes — NCCL disables LL128 on PCIe
 // paths for exactly this reason) and is enforced at buffer alloc time via
 // CU_DEVICE_P2P_ATTRIBUTE_NATIVE_ATOMIC_SUPPORTED (the NVLink-vs-PCIe
-// discriminator): see glm52_moe_tp4_alloc_ll_cuda. On an unprobed PCIe P2P
+// discriminator): see the tensor-parallel LL allocator. On unprobed PCIe P2P
 // topology a torn packet would be SILENT data corruption.
 #pragma once
 
 #include <cuda_bf16.h>
 
-static __device__ __forceinline__ void glm52_tp4_st_ll(uint4* p, uint2 v,
-                                                       unsigned tag) {
+static __device__ __forceinline__ void glm52_tp_st_ll(uint4* p, uint2 v,
+                                                      unsigned tag) {
   asm volatile("st.volatile.global.v4.b32 [%0],{%1,%2,%3,%4};" ::"l"(p),
                    "r"(v.x), "r"(v.y), "r"(0u), "r"(tag));
 }
 
 // 12 B payload variant: 3 data words + tag in one 16 B packet (the 8 B form
 // above wastes its third word). Same atomicity contract.
-static __device__ __forceinline__ void glm52_tp4_st_ll12(uint4* p, unsigned x,
-                                                         unsigned y, unsigned z,
-                                                         unsigned tag) {
+static __device__ __forceinline__ void glm52_tp_st_ll12(uint4* p, unsigned x,
+                                                        unsigned y, unsigned z,
+                                                        unsigned tag) {
   asm volatile("st.volatile.global.v4.b32 [%0],{%1,%2,%3,%4};" ::"l"(p),
                    "r"(x), "r"(y), "r"(z), "r"(tag));
 }
 
-static __device__ __forceinline__ uint4 glm52_tp4_ld_ll(const uint4* p) {
+static __device__ __forceinline__ uint4 glm52_tp_ld_ll(const uint4* p) {
   uint4 q;
   asm volatile("ld.volatile.global.v4.b32 {%0,%1,%2,%3},[%4];"
                : "=r"(q.x), "=r"(q.y), "=r"(q.z), "=r"(q.w)
@@ -39,13 +38,13 @@ static __device__ __forceinline__ uint4 glm52_tp4_ld_ll(const uint4* p) {
   return q;
 }
 
-static __device__ __forceinline__ void glm52_tp4_ll_wait(const uint4* p,
-                                                         unsigned tag,
-                                                         uint4* out) {
+static __device__ __forceinline__ void glm52_tp_ll_wait(const uint4* p,
+                                                        unsigned tag,
+                                                        uint4* out) {
   uint4 q;
   long c = 0;
   do {
-    q = glm52_tp4_ld_ll(p);
+    q = glm52_tp_ld_ll(p);
     if (++c > 200000000L) __trap();
   } while (q.w != tag);
   *out = q;

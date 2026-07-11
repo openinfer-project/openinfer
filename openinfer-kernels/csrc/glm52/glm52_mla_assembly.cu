@@ -31,6 +31,7 @@ constexpr int kRopeHalf = 32;     // rope_dim / 2 = cos/sin length used
 constexpr int kQueryDim = kQkNope + kRopeDim;  // 576
 constexpr int kKvLora = 512;      // ckv width
 constexpr int kCacheBytes = 656;  // 512 fp8 + 16 scale + 128 bf16 kpe
+constexpr int kFlashInferCacheBytes = 576;  // 512 fp8 ckv + 64 fp8 rope(k_pe)
 constexpr int kScaleOffset = 512;
 constexpr int kKpeOffset = 528;
 
@@ -48,6 +49,11 @@ __device__ __forceinline__ __nv_bfloat16 rope_block(const __nv_bfloat16* x, int 
   const float odd = __bfloat162float(x[2 * pair + 1]);
   const float v = upper ? (odd * c + even * s) : (even * c - odd * s);
   return __float2bfloat16(v);
+}
+
+__device__ __forceinline__ unsigned char quantize_static_e4m3(float value) {
+  value = fminf(fmaxf(value, -448.0f), 448.0f);
+  return __nv_cvt_float_to_fp8(value, __NV_SATFINITE, __NV_E4M3);
 }
 
 constexpr int kScaleGroups = 4;  // KvLora / 128
@@ -91,6 +97,35 @@ __global__ void glm52_mla_query_assemble_kernel(
   }
 }
 
+// FlashInfer TRTLLM-gen consumes compact, statically-scaled E4M3 Q. This is
+// the same assembly math as above without the 64-head FlashMLA padding.
+__global__ void glm52_mla_query_assemble_fp8_kernel(
+    const __nv_bfloat16* __restrict__ ql_nope,
+    const __nv_bfloat16* __restrict__ q_pe_base, int q_pe_offset,
+    int q_pe_head_stride, int num_q_heads,
+    const __nv_bfloat16* __restrict__ cos,
+    const __nv_bfloat16* __restrict__ sin,
+    unsigned char* __restrict__ query) {  // [T, num_q_heads, 576]
+  const int h = blockIdx.x;
+  const int t = blockIdx.y;
+  const __nv_bfloat16* q_pe = q_pe_base + q_pe_offset +
+                              (size_t)t * num_q_heads * q_pe_head_stride +
+                              h * q_pe_head_stride;
+  const __nv_bfloat16* cos_t = cos + (size_t)t * kRopeHalf;
+  const __nv_bfloat16* sin_t = sin + (size_t)t * kRopeHalf;
+  const __nv_bfloat16* ql_t =
+      ql_nope + ((size_t)t * num_q_heads + h) * kQkNope;
+  unsigned char* query_t =
+      query + ((size_t)t * num_q_heads + h) * kQueryDim;
+  for (int i = threadIdx.x; i < kQueryDim; i += blockDim.x) {
+    float value = i < kQkNope
+                      ? __bfloat162float(ql_t[i])
+                      : __bfloat162float(
+                            rope_block(q_pe, i - kQkNope, cos_t, sin_t));
+    query_t[i] = quantize_static_e4m3(value);
+  }
+}
+
 __global__ void glm52_mla_cache_pack_kernel(
     const unsigned char* __restrict__ ckv_fp8,   // [T, 512]
     const float* __restrict__ ckv_scales,        // [T, 4]
@@ -129,6 +164,35 @@ __global__ void glm52_mla_cache_pack_kernel(
   __nv_bfloat16* kpe_out = reinterpret_cast<__nv_bfloat16*>(cache_token + kKpeOffset);
   for (int r = tid; r < kRopeDim; r += blockDim.x) {
     kpe_out[r] = rope_block(k_pe_t, r, cos_t, sin_t);
+  }
+}
+
+// Standard FP8 MLA cache used by FlashInfer: one token is a single E4M3
+// [576] vector, with normalized ckv followed by the rotated k_pe. The scale is
+// statically 1.0, matching vLLM's uncalibrated GLM-5.2-FP8 cache path.
+__global__ void glm52_mla_cache_pack_fp8_kernel(
+    const __nv_bfloat16* __restrict__ ckv,       // [T, 512]
+    const __nv_bfloat16* __restrict__ k_pe,      // [T, 64]
+    const __nv_bfloat16* __restrict__ cos,       // [T, 32]
+    const __nv_bfloat16* __restrict__ sin,       // [T, 32]
+    unsigned char* __restrict__ cache,           // [max_slots, 576]
+    const long long* __restrict__ slot_mapping,  // [T]
+    long long max_slots) {
+  const int t = blockIdx.x;
+  const long long slot = slot_mapping[t];
+  if (slot < 0 || slot >= max_slots) __trap();
+  unsigned char* cache_token =
+      cache + slot * static_cast<long long>(kFlashInferCacheBytes);
+  const __nv_bfloat16* ckv_t = ckv + (size_t)t * kKvLora;
+  const __nv_bfloat16* k_pe_t = k_pe + (size_t)t * kRopeDim;
+  const __nv_bfloat16* cos_t = cos + (size_t)t * kRopeHalf;
+  const __nv_bfloat16* sin_t = sin + (size_t)t * kRopeHalf;
+  for (int i = threadIdx.x; i < kFlashInferCacheBytes; i += blockDim.x) {
+    float value = i < kKvLora
+                      ? __bfloat162float(ckv_t[i])
+                      : __bfloat162float(
+                            rope_block(k_pe_t, i - kKvLora, cos_t, sin_t));
+    cache_token[i] = quantize_static_e4m3(value);
   }
 }
 
@@ -182,6 +246,23 @@ CUresult glm52_mla_query_assemble_cuda(const __nv_bfloat16* ql_nope,
   return consume_last_cuda_error();
 }
 
+CUresult glm52_mla_query_assemble_fp8_cuda(
+    const __nv_bfloat16* ql_nope, const __nv_bfloat16* q_pe_base,
+    int q_pe_offset, int q_pe_head_stride, int num_q_heads,
+    const __nv_bfloat16* cos, const __nv_bfloat16* sin,
+    unsigned char* query, int tokens, cudaStream_t stream) {
+  if (ql_nope == nullptr || q_pe_base == nullptr || cos == nullptr ||
+      sin == nullptr || query == nullptr || tokens <= 0 ||
+      num_q_heads <= 0 || num_q_heads > kHeads) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  const dim3 grid(num_q_heads, tokens, 1);
+  glm52_mla_query_assemble_fp8_kernel<<<grid, 192, 0, stream>>>(
+      ql_nope, q_pe_base, q_pe_offset, q_pe_head_stride, num_q_heads, cos,
+      sin, query);
+  return consume_last_cuda_error();
+}
+
 CUresult glm52_mla_cache_pack_cuda(const unsigned char* ckv_fp8,
                                    const float* ckv_scales,
                                    const __nv_bfloat16* k_pe,
@@ -198,6 +279,21 @@ CUresult glm52_mla_cache_pack_cuda(const unsigned char* ckv_fp8,
   }
   glm52_mla_cache_pack_kernel<<<tokens, 128, 0, stream>>>(
       ckv_fp8, ckv_scales, k_pe, cos, sin, cache, slot_mapping, max_slots);
+  return consume_last_cuda_error();
+}
+
+CUresult glm52_mla_cache_pack_fp8_cuda(
+    const __nv_bfloat16* ckv, const __nv_bfloat16* k_pe,
+    const __nv_bfloat16* cos, const __nv_bfloat16* sin,
+    unsigned char* cache, const long long* slot_mapping, long long max_slots,
+    int tokens, cudaStream_t stream) {
+  if (ckv == nullptr || k_pe == nullptr || cos == nullptr || sin == nullptr ||
+      cache == nullptr || slot_mapping == nullptr || max_slots <= 0 ||
+      tokens <= 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  glm52_mla_cache_pack_fp8_kernel<<<tokens, 192, 0, stream>>>(
+      ckv, k_pe, cos, sin, cache, slot_mapping, max_slots);
   return consume_last_cuda_error();
 }
 

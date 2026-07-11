@@ -1,573 +1,203 @@
-# GLM5.2 TP4 GB300 Bring-Up
+# GLM5.2 TP4 on GB300
 
-> **TL;DR:** Active bring-up for serving GLM-5.2-FP8 on one 4xGB300 host with `--tp-size 4`; TP4 now boots, pre-captures graphs, and serves longer, long-prompt, and bucket-8 concurrent completion smokes on GB300. Remaining work is golden/oracle coverage and perf characterization.
+> **TL;DR:** GLM-5.2-FP8 on 4xGB300 now beats matched vLLM pure TP4 at both fully warmed bs=1 shapes: `9.03ms` vs `9.21ms` for 1/256 and `9.56ms` vs `9.60ms` for 1024/256. The path combines FlashInfer sparse MLA, compact decode buckets, SM-selected GEMV/MoE launches, and a vocabulary-sharded greedy tail that reuses the existing TP all-reduce. A controlled vLLM EP4 run is slower at `9.47/9.84ms`, so EP4 is outside this PR.
 >
 > **Last touched:** 2026-07
 
-## Preparation
-
-- **Read**:
-  - `docs/index.md` - routed this task to the GLM5.2 model-line docs and the kernel boundary.
-  - `docs/models/glm52/serving-status.md` - showed the current GLM5.2 serving surface and the low-latency TP8/attention-TP arc.
-  - `docs/models/glm52/dp8-scheduler.md` - explained the existing lock-step eight-rank scheduler contract.
-  - `docs/models/glm52/ep8-deepep-moe.md` - captured why the original full-model path assumes 8 ranks and packed expert placement at load time.
-  - `docs/models/glm52/whole-step-decode-graph.md` - captured the graph and bucket contracts that TP changes must preserve.
-  - `docs/models/glm52/moe-tp8-low-latency.md` - documented the existing TP8 MoE and attention-TP topology that TP4 should generalize from.
-  - `docs/subsystems/kernels/openinfer-kernels-boundary.md` - confirmed GLM5.2 kernel surfaces are model-local on top of the shared MoE/MLA substrate.
-- **Relevant history**:
-  - `docs/models/glm52/moe-tp8-low-latency.md` - TP8 proved that low-latency GLM uses replicated activations plus rank-sliced FP8 experts/heads, but its constants are currently 8-rank-specific.
-  - `docs/models/kimi-k2/dp-design.md` - warns that TP2/TP4 shapes are not automatic once MoE and TP interact.
-  - `docs/lessons/kimi-bringup-numerics.md` - greedy parity can break from small partial-sum changes, so TP4 needs runtime text/smoke evidence rather than compile-only claims.
-- **Plan**:
-  1. Inspect the current GLM5.2 launch, weight-loader, TP8 MoE, attention all-reduce, scheduler, and kernel build paths for fixed eight-rank assumptions.
-  2. Check vendored FlashInfer first for reusable TP4 collectives, Blackwell MLA, and Blackwell grouped-GEMM paths before adding custom kernels.
-  3. Add a rank-count-aware launch/topology path for the requested 4xGB300 target, starting from `--tp-size 4` and the existing TP low-latency mode rather than pretending the EP8 path can run on 4 devices.
-  4. Build with `cargo build --release --features glm52` on this GB300 host, fixing compile and SM103 build blockers.
-  5. Start OpenInfer against `/mnt/shared/home/susun/hf_cache/hub/models--zai-org--GLM-5.2-FP8/snapshots/ba978f7d347eaf65d22f1a86833408afdb953541` with `--tp-size 4` and run a minimal `/v1/completions` smoke.
-- **Risks / open questions**:
-  - TP4 is not a one-line validation change: existing kernels and buffers are named TP8 and bake `RANKS=8`, 8 tokens, 8 attention heads per rank, and 1/8 expert slices.
-  - GB300 is SM103; the current GLM DeepGEMM AOT kernels only build real code for sm90a and become NOT_SUPPORTED stubs on SM103.
-  - Full correctness needs new TP4 oracle coverage after the first runtime smoke, because partial-sum and routing orders differ from both EP8 and TP8.
-
-## Execution Log
-
-### Step 1: Inspect current state
-
-- `git status --short --branch` reported a clean `main` worktree.
-- `/mnt/shared` is mounted read-only, but the same commit is available writable at `/work/openinfer`; edits are being made there.
-- `nvidia-smi` shows this host has 4x NVIDIA GB300, each with 284208 MiB and compute capability 10.3.
-- Source inspection found:
-  - `openinfer-server/src/config.rs` rejects GLM5.2 `--dp-size` values other than 8.
-  - `openinfer-glm52/src/lib.rs` rejects `--tp-size != 1`.
-  - `validate_startup` requires TP1/DP8/EP8 and exactly `GLM52_EP_RANKS` devices.
-  - `weights.rs` defines `GLM52_EP_RANKS = 8`, and the weight manifest emits eight rank bundles.
-  - The low-latency path has attention-TP and TP8 MoE code, but it is hardwired through constants such as `GLM52_TP8_RANKS = 8`, `GLM52_TP8_TOKENS = 8`, and 1/8 head/expert slicing.
-
-### Step 2: Check FlashInfer before adding kernels
-
-- Vendored FlashInfer has a TRT-LLM allreduce path that dispatches rank counts `{2, 4, 6, 8, 16}` in `include/flashinfer/comm/trtllm_allreduce.cuh`, and the newer allreduce-fusion path supports `{2, 4, 8, 16}`.
-- FlashInfer also has Blackwell CuTe DSL GEMM+allreduce examples and tests. The test-side `can_implement` admits distributed world sizes `{2, 4, 8}`, but the code is Python/Torch-distributed symmetric-memory oriented, so it is a reference/design source rather than a direct Rust runtime dependency.
-- FlashInfer has Blackwell-related MLA/GEMM surfaces (`attention/blackwell`, `cute_dsl/attention`, SM103 fused-MoE generators, and SM100/SM103 GEMM paths). These should be preferred before writing replacement GLM kernels for GB300.
-
-### Step 3: Build current GLM5.2 on GB300
-
-- Plain `cargo` was not on `PATH`; the usable toolchain is:
-  - `CARGO_HOME=/mnt/shared/home/susun/.cargo`
-  - `RUSTUP_HOME=/mnt/shared/home/susun/.rustup`
-  - `/mnt/shared/home/susun/.cargo/bin/cargo`
-- CUDA 13.0 nvcc lists `compute_103`.
-- Initial build failed because the system NCCL is 2.28.9 and GLM MoE requires NCCL >= 2.30.4.
-- The suitable NCCL root is `/mnt/shared/home/susun/.venv/lib/python3.12/site-packages/nvidia/nccl` (2.30.7).
-- Verified build command:
-
-```bash
-CARGO_HOME=/mnt/shared/home/susun/.cargo \
-RUSTUP_HOME=/mnt/shared/home/susun/.rustup \
-CARGO_TARGET_DIR=/tmp/openinfer-target \
-OPENINFER_CUDA_SM=103 \
-OPENINFER_BUILD_TIMING=1 \
-OPENINFER_NCCL_ROOT=/mnt/shared/home/susun/.venv/lib/python3.12/site-packages/nvidia/nccl \
-OPENINFER_NVCC_JOBS=16 \
-PATH=/mnt/shared/home/susun/.cargo/bin:/usr/local/cuda/bin:$PATH \
-/mnt/shared/home/susun/.cargo/bin/cargo build --release --features glm52 -p openinfer-server
-```
-
-- Result: build passed in `1m 27s`.
-- Important warnings:
-  - `No sm_90a target; GLM5.2 DeepGEMM glm52_deepgemm_grouped kernels compile as NOT_SUPPORTED stubs`
-  - `No sm_90a target; GLM5.2 DeepGEMM glm52_deepgemm_mqa kernels compile as NOT_SUPPORTED stubs`
-
-### Step 4: Run current binary to capture launch blockers
-
-- Runtime needs the 2.30.7 NCCL library first:
-
-```bash
-LD_LIBRARY_PATH=/mnt/shared/home/susun/.venv/lib/python3.12/site-packages/nvidia/nccl/lib:$LD_LIBRARY_PATH \
-/tmp/openinfer-target/release/openinfer --help
-```
-
-- Without that `LD_LIBRARY_PATH`, the binary picks system NCCL 2.28 and fails with `undefined symbol: ncclCommQueryProperties`.
-- Current help still says `--tp-size` is for Qwen3/Kimi and "GLM5.2 requires 1"; `--moe-topo` only accepts `ep8|tp8`.
-- Current TP4 command:
-
-```bash
-LD_LIBRARY_PATH=/mnt/shared/home/susun/.venv/lib/python3.12/site-packages/nvidia/nccl/lib:$LD_LIBRARY_PATH \
-/tmp/openinfer-target/release/openinfer \
-  --model-path /mnt/shared/home/susun/hf_cache/hub/models--zai-org--GLM-5.2-FP8/snapshots/ba978f7d347eaf65d22f1a86833408afdb953541 \
-  --tp-size 4 \
-  --moe-topo tp8 \
-  --port 18000
-```
-
-- Result: fails before loading weights with `GLM5.2 requires --tp-size=1, got 4`.
-
-### Step 5: Add explicit TP4 topology scaffold
-
-- Updated `openinfer-server` so GLM5.2 accepts `--moe-topo tp4`, defaults it to `--dp-size 1`, and rejects explicit non-DP1 values for that topology.
-- Updated `openinfer-glm52::Glm52MoeTopo` with `Tp4`, `default_dp_size()`, and `device_count()`.
-- Added a GLM launch guard for TP4 that validates `--tp-size 4 --dp-size 1` and then stops with the current real blocker instead of the stale TP1-only error.
-- Focused test command:
-
-```bash
-CARGO_HOME=/mnt/shared/home/susun/.cargo \
-RUSTUP_HOME=/mnt/shared/home/susun/.rustup \
-CARGO_TARGET_DIR=/tmp/openinfer-target-wip \
-OPENINFER_CUDA_SM=103 \
-OPENINFER_NCCL_ROOT=/mnt/shared/home/susun/.venv/lib/python3.12/site-packages/nvidia/nccl \
-OPENINFER_NVCC_JOBS=16 \
-LD_LIBRARY_PATH=/mnt/shared/home/susun/.venv/lib/python3.12/site-packages/nvidia/nccl/lib:$LD_LIBRARY_PATH \
-PATH=/mnt/shared/home/susun/.cargo/bin:/usr/local/cuda/bin:$PATH \
-/mnt/shared/home/susun/.cargo/bin/cargo test --release --features glm52 -p openinfer-server glm52_ -- --nocapture
-```
-
-- Result: 4 GLM server validation tests passed.
-- TP4 launch smoke from the edited binary:
-
-```bash
-LD_LIBRARY_PATH=/mnt/shared/home/susun/.venv/lib/python3.12/site-packages/nvidia/nccl/lib:$LD_LIBRARY_PATH \
-/tmp/openinfer-target-wip/release/openinfer \
-  --model-path /mnt/shared/home/susun/hf_cache/hub/models--zai-org--GLM-5.2-FP8/snapshots/ba978f7d347eaf65d22f1a86833408afdb953541 \
-  --tp-size 4 \
-  --moe-topo tp4 \
-  --port 18000
-```
-
-- Result: reaches the new GLM TP4 guard and fails with:
-  `GLM5.2 TP4 GB300 launch is scaffolded but not runnable yet: TP4 needs rank-count-aware MoE/attention collectives and Blackwell replacements for the current sm90a-only DeepGEMM MQA/grouped kernels`.
-
-### Step 6: Kernel direction after FlashInfer audit
-
-- Existing OpenInfer TP8 kernels cannot be reused by changing `nranks` alone:
-  - Attention allreduce hardcodes `kRanks = 8` and `kChunk = hidden / 8`; TP4 needs `hidden / 4`.
-  - MoE hardcodes 1/8 intermediate slices (`kSliceI = 256`, `kSliceRows = 512`); TP4 needs `kSliceI = 512`, `kSliceRows = 1024`.
-  - Rust wrappers expose fixed `[u64; GLM52_TP8_RANKS]` peer arrays and TP8 scratch sizes.
-- FlashInfer has TP4-capable collective code (`trtllm_allreduce`, `trtllm_allreduce_fusion`, and MNNVL fusion dispatches). These are the preferred source for attention/output reductions before adding a new bespoke OpenInfer collective.
-- MoE/FP8 still needs a Blackwell-capable grouped GEMM path. Current SM103 builds produce `NOT_SUPPORTED` for GLM DeepGEMM grouped and MQA kernels, so a full server smoke cannot pass until those are replaced or bypassed.
-
-### Step 7: Thread TP4 through host-side topology plumbing
-
-- Added topology helpers on `Glm52MoeTopo`:
-  - `Tp4` expects TP4/DP1/EP1 and four devices.
-  - `Tp8` and `Tp4` are both classified as tensor-replicated MoE topologies.
-- Updated startup validation and rank-bundle generation so topology rank count is not always `GLM52_EP_RANKS`:
-  - EP8 still creates eight expert-owning rank bundles.
-  - TP8 still creates eight non-expert replicated bundles.
-  - TP4 can now request four non-expert replicated bundles.
-- Generalized the host TP slice staging loader:
-  - TP8 remains 1/8 slices (`slice_i=256`, `slice_rows=512`).
-  - TP4 stages 1/4 slices (`slice_i=512`, `slice_rows=1024`).
-  - The TP8 CUDA launcher now rejects non-TP8 slice geometry explicitly instead of silently accepting a TP4 bank.
-- Updated model construction so tensor-replicated attention sharding is based on topology rank count:
-  - TP8 keeps 8 MLA heads per rank.
-  - TP4 keeps 16 MLA heads per rank.
-- Verified:
-
-```bash
-CARGO_HOME=/tmp/openinfer-cargo-home \
-RUSTUP_HOME=/mnt/shared/home/susun/.rustup \
-CARGO_TARGET_DIR=/tmp/openinfer-target-wip \
-OPENINFER_CUDA_SM=103 \
-OPENINFER_NCCL_ROOT=/mnt/shared/home/susun/.venv/lib/python3.12/site-packages/nvidia/nccl \
-OPENINFER_NVCC_JOBS=16 \
-LD_LIBRARY_PATH=/mnt/shared/home/susun/.venv/lib/python3.12/site-packages/nvidia/nccl/lib:$LD_LIBRARY_PATH \
-PATH=/mnt/shared/home/susun/.cargo/bin:/usr/local/cuda/bin:$PATH \
-/mnt/shared/home/susun/.cargo/bin/cargo test --release -p openinfer-glm52 slice_staging -- --nocapture
-```
-
-- Result: 2 slice staging tests passed, including the new TP4 geometry test.
-
-```bash
-CARGO_HOME=/tmp/openinfer-cargo-home \
-RUSTUP_HOME=/mnt/shared/home/susun/.rustup \
-CARGO_TARGET_DIR=/tmp/openinfer-target-wip \
-OPENINFER_CUDA_SM=103 \
-OPENINFER_NCCL_ROOT=/mnt/shared/home/susun/.venv/lib/python3.12/site-packages/nvidia/nccl \
-OPENINFER_NVCC_JOBS=16 \
-LD_LIBRARY_PATH=/mnt/shared/home/susun/.venv/lib/python3.12/site-packages/nvidia/nccl/lib:$LD_LIBRARY_PATH \
-PATH=/mnt/shared/home/susun/.cargo/bin:/usr/local/cuda/bin:$PATH \
-/mnt/shared/home/susun/.cargo/bin/cargo test --release --features glm52 -p openinfer-server glm52_ -- --nocapture
-```
-
-- Result: 4 GLM server validation tests passed.
-
-```bash
-CARGO_HOME=/tmp/openinfer-cargo-home \
-RUSTUP_HOME=/mnt/shared/home/susun/.rustup \
-CARGO_TARGET_DIR=/tmp/openinfer-target-wip \
-OPENINFER_CUDA_SM=103 \
-OPENINFER_BUILD_TIMING=1 \
-OPENINFER_NCCL_ROOT=/mnt/shared/home/susun/.venv/lib/python3.12/site-packages/nvidia/nccl \
-OPENINFER_NVCC_JOBS=16 \
-LD_LIBRARY_PATH=/mnt/shared/home/susun/.venv/lib/python3.12/site-packages/nvidia/nccl/lib:$LD_LIBRARY_PATH \
-PATH=/mnt/shared/home/susun/.cargo/bin:/usr/local/cuda/bin:$PATH \
-/mnt/shared/home/susun/.cargo/bin/cargo build --release --features glm52 -p openinfer-server
-```
-
-- Result: build passed in `1m 22s`. The SM103 build still emits `NOT_SUPPORTED` warnings for the sm90a-only GLM DeepGEMM grouped/MQA kernels.
-- TP4 smoke still intentionally stops at the GLM TP4 guard; it now does so after tokenizer/frontend setup and before weight load.
-
-### Step 8: Move TP4 guard past model build, before unsafe collective setup
-
-- Removed the early `launch()` bail for `Glm52MoeTopo::Tp4`.
-- Updated `build_rank_models` so TP4 stops after all rank models build and before any collective context creation. This is deliberate: the old next step would have called `Glm52MoeEp8State::new(..., GLM52_EP_RANKS=8, rank)` from only four workers, which risks an NCCL/DeepEP collective init hang.
-- The new TP4 failure boundary is:
-  `GLM5.2 TP4 loaded weights and built the four sharded rank models, but serving is not runnable yet: TP4 still needs CUDA attention/MoE collective state and a Blackwell-capable indexer MQA path before entering decode`.
-- Updated scheduler mirroring so future TP4 decode uses the same one-logical-rank mirrored scheduling branch as TP8 once CUDA state exists.
-- Added topology tests for the intended shapes:
-  - TP4 = TP4/DP1/EP1, four devices, tensor-replicated MoE.
-  - EP8/TP8 keep their existing TP1/DP8/EP8 eight-device shapes.
-- Verified:
-
-```bash
-CARGO_HOME=/tmp/openinfer-cargo-home \
-RUSTUP_HOME=/mnt/shared/home/susun/.rustup \
-CARGO_TARGET_DIR=/tmp/openinfer-target-wip \
-OPENINFER_CUDA_SM=103 \
-OPENINFER_NCCL_ROOT=/mnt/shared/home/susun/.venv/lib/python3.12/site-packages/nvidia/nccl \
-OPENINFER_NVCC_JOBS=16 \
-LD_LIBRARY_PATH=/mnt/shared/home/susun/.venv/lib/python3.12/site-packages/nvidia/nccl/lib:$LD_LIBRARY_PATH \
-PATH=/mnt/shared/home/susun/.cargo/bin:/usr/local/cuda/bin:$PATH \
-/mnt/shared/home/susun/.cargo/bin/cargo test --release -p openinfer-glm52 topology -- --nocapture
-```
-
-- Result: 2 topology tests passed.
-
-```bash
-CARGO_HOME=/tmp/openinfer-cargo-home \
-RUSTUP_HOME=/mnt/shared/home/susun/.rustup \
-CARGO_TARGET_DIR=/tmp/openinfer-target-wip \
-OPENINFER_CUDA_SM=103 \
-OPENINFER_NCCL_ROOT=/mnt/shared/home/susun/.venv/lib/python3.12/site-packages/nvidia/nccl \
-OPENINFER_NVCC_JOBS=16 \
-LD_LIBRARY_PATH=/mnt/shared/home/susun/.venv/lib/python3.12/site-packages/nvidia/nccl/lib:$LD_LIBRARY_PATH \
-PATH=/mnt/shared/home/susun/.cargo/bin:/usr/local/cuda/bin:$PATH \
-/mnt/shared/home/susun/.cargo/bin/cargo test --release -p openinfer-glm52 slice_staging -- --nocapture
-```
-
-- Result: 2 slice staging tests passed.
-
-```bash
-CARGO_HOME=/tmp/openinfer-cargo-home \
-RUSTUP_HOME=/mnt/shared/home/susun/.rustup \
-CARGO_TARGET_DIR=/tmp/openinfer-target-wip \
-OPENINFER_CUDA_SM=103 \
-OPENINFER_NCCL_ROOT=/mnt/shared/home/susun/.venv/lib/python3.12/site-packages/nvidia/nccl \
-OPENINFER_NVCC_JOBS=16 \
-LD_LIBRARY_PATH=/mnt/shared/home/susun/.venv/lib/python3.12/site-packages/nvidia/nccl/lib:$LD_LIBRARY_PATH \
-PATH=/mnt/shared/home/susun/.cargo/bin:/usr/local/cuda/bin:$PATH \
-/mnt/shared/home/susun/.cargo/bin/cargo test --release --features glm52 -p openinfer-server glm52_ -- --nocapture
-```
-
-- Result: 4 GLM server validation tests passed.
-
-```bash
-CARGO_HOME=/tmp/openinfer-cargo-home \
-RUSTUP_HOME=/mnt/shared/home/susun/.rustup \
-CARGO_TARGET_DIR=/tmp/openinfer-target-wip \
-OPENINFER_CUDA_SM=103 \
-OPENINFER_BUILD_TIMING=1 \
-OPENINFER_NCCL_ROOT=/mnt/shared/home/susun/.venv/lib/python3.12/site-packages/nvidia/nccl \
-OPENINFER_NVCC_JOBS=16 \
-LD_LIBRARY_PATH=/mnt/shared/home/susun/.venv/lib/python3.12/site-packages/nvidia/nccl/lib:$LD_LIBRARY_PATH \
-PATH=/mnt/shared/home/susun/.cargo/bin:/usr/local/cuda/bin:$PATH \
-/mnt/shared/home/susun/.cargo/bin/cargo build --release --features glm52 -p openinfer-server
-```
-
-- Result: build passed in `1m 20s`; SM103 still emits the same `NOT_SUPPORTED` warnings for GLM DeepGEMM grouped/MQA.
-- Full TP4 launch was not run to the new post-build guard in this step because it would load and build the full four-rank checkpoint only to hit the known missing CUDA TP4 collective/indexer boundary.
-
-### Step 9: Add TP4 CUDA collectives and reach the FlashMLA GB300 boundary
-
-- Added TP4 kernel entry points by specializing the existing TP8 low-latency kernels:
-  - `openinfer-kernels/csrc/glm52/glm52_moe_tp4.cu`
-  - `openinfer-kernels/csrc/glm52/glm52_tp4_ar.cu`
-  - `openinfer-kernels/csrc/glm52/glm52_tp4_ll.cuh`
-  - `openinfer-kernels/src/ops/glm52/moe_tp4.rs`
-  - `openinfer-kernels/src/ops/glm52/tp4_ar.rs`
-- TP4 geometry differs from TP8:
-  - ranks = 4
-  - attention AR chunk = `6144 / 4 = 1536` bf16
-  - expert intermediate slice = `2048 / 4 = 512`
-  - gate/up slice rows = `1024`
-  - replicated token rows remain 8, so `UNION_MAX = 8 * (topk + shared)`, not `ranks * (...)`.
-- Registered TP4 FFI symbols and exports alongside TP8.
-- Fixed a link conflict from the copied CUDA VMM allocator state by giving the TP4 globals distinct names.
-- Generalized the TP LL rendezvous so one exchange can wait for either four or eight ranks.
-- Added a TP runtime enum:
-  - TP8 uses the existing eight-rank state.
-  - TP4 allocates four-rank LL windows and dispatches to the new TP4 MoE and attention AR wrappers.
-- Changed setup so:
-  - EP8 creates the DeepEP state.
-  - TP8/TP4 skip DeepEP and create tensor-replicated TP state.
-  - decode treats EP8 state as optional and only requires it if an EP8 MoE layer is actually reached.
-- Removed the post-model-build TP4 guard.
-- Verified:
-
-```bash
-CARGO_HOME=/tmp/openinfer-cargo-home \
-RUSTUP_HOME=/mnt/shared/home/susun/.rustup \
-CARGO_TARGET_DIR=/tmp/openinfer-target-wip \
-OPENINFER_CUDA_SM=103 \
-OPENINFER_NCCL_ROOT=/mnt/shared/home/susun/.venv/lib/python3.12/site-packages/nvidia/nccl \
-LD_LIBRARY_PATH=/mnt/shared/home/susun/.venv/lib/python3.12/site-packages/nvidia/nccl/lib:$LD_LIBRARY_PATH \
-PATH=/mnt/shared/home/susun/.cargo/bin:/usr/local/cuda/bin:$PATH \
-/mnt/shared/home/susun/.cargo/bin/cargo test --release -p openinfer-glm52 topology -- --nocapture
-```
-
-- Result: 2 topology tests passed.
-
-```bash
-CARGO_HOME=/tmp/openinfer-cargo-home \
-RUSTUP_HOME=/mnt/shared/home/susun/.rustup \
-CARGO_TARGET_DIR=/tmp/openinfer-target-wip \
-OPENINFER_CUDA_SM=103 \
-OPENINFER_NCCL_ROOT=/mnt/shared/home/susun/.venv/lib/python3.12/site-packages/nvidia/nccl \
-LD_LIBRARY_PATH=/mnt/shared/home/susun/.venv/lib/python3.12/site-packages/nvidia/nccl/lib:$LD_LIBRARY_PATH \
-PATH=/mnt/shared/home/susun/.cargo/bin:/usr/local/cuda/bin:$PATH \
-/mnt/shared/home/susun/.cargo/bin/cargo test --release -p openinfer-glm52 slice_staging -- --nocapture
-```
-
-- Result: 2 slice-staging tests passed.
-
-```bash
-CARGO_HOME=/tmp/openinfer-cargo-home \
-RUSTUP_HOME=/mnt/shared/home/susun/.rustup \
-CARGO_TARGET_DIR=/tmp/openinfer-target-wip \
-OPENINFER_CUDA_SM=103 \
-OPENINFER_NCCL_ROOT=/mnt/shared/home/susun/.venv/lib/python3.12/site-packages/nvidia/nccl \
-LD_LIBRARY_PATH=/mnt/shared/home/susun/.venv/lib/python3.12/site-packages/nvidia/nccl/lib:$LD_LIBRARY_PATH \
-PATH=/mnt/shared/home/susun/.cargo/bin:/usr/local/cuda/bin:$PATH \
-/mnt/shared/home/susun/.cargo/bin/cargo test --release --features glm52 -p openinfer-server glm52_ -- --nocapture
-```
-
-- Result: 4 GLM server validation tests passed.
-
-```bash
-CARGO_HOME=/tmp/openinfer-cargo-home \
-RUSTUP_HOME=/mnt/shared/home/susun/.rustup \
-CARGO_TARGET_DIR=/tmp/openinfer-target-wip \
-OPENINFER_CUDA_SM=103 \
-OPENINFER_BUILD_TIMING=1 \
-OPENINFER_NCCL_ROOT=/mnt/shared/home/susun/.venv/lib/python3.12/site-packages/nvidia/nccl \
-OPENINFER_NVCC_JOBS=16 \
-LD_LIBRARY_PATH=/mnt/shared/home/susun/.venv/lib/python3.12/site-packages/nvidia/nccl/lib:$LD_LIBRARY_PATH \
-PATH=/mnt/shared/home/susun/.cargo/bin:/usr/local/cuda/bin:$PATH \
-/mnt/shared/home/susun/.cargo/bin/cargo build --release --features glm52 -p openinfer-server
-```
-
-- Result: build passed in `1m 15s`; SM103 still emits the known `NOT_SUPPORTED` warnings for GLM DeepGEMM grouped/MQA.
-- TP4 launch with `--max-model-len 1024` failed before model build because GLM5.2 enforces a minimum cap of 4096.
-- TP4 launch with the minimum cap:
-
-```bash
-timeout 420s env \
-OPENINFER_CUDA_SM=103 \
-OPENINFER_NCCL_ROOT=/mnt/shared/home/susun/.venv/lib/python3.12/site-packages/nvidia/nccl \
-LD_LIBRARY_PATH=/mnt/shared/home/susun/.venv/lib/python3.12/site-packages/nvidia/nccl/lib:$LD_LIBRARY_PATH \
-PATH=/mnt/shared/home/susun/.cargo/bin:/usr/local/cuda/bin:$PATH \
-/tmp/openinfer-target-wip/release/openinfer \
-  --model-path /mnt/shared/home/susun/hf_cache/hub/models--zai-org--GLM-5.2-FP8/snapshots/ba978f7d347eaf65d22f1a86833408afdb953541 \
-  --tp-size 4 \
-  --moe-topo tp4 \
-  --max-model-len 4096 \
-  --port 18080
-```
-
-- Result: loaded all four non-expert replicated rank weight sets, then failed during model build with:
-  `GLM5.2 FlashMLA sparse num_sm_parts query failed: DriverError(CUDA_ERROR_NOT_SUPPORTED, "operation not supported")`.
-- FlashInfer/FlashMLA check:
-  - The current OpenInfer wrapper `glm52_flashmla_sparse.cu` includes the SM90 sparse FP8 FlashMLA path and explicitly returns `CUDA_ERROR_NOT_SUPPORTED` unless the current device is SM90.
-  - Vendored FlashMLA already has `csrc/sm100/decode/head64` with a V32 instantiation, which matches GLM5.2's 64-head, 576-QK, 512-V sparse-decode shape better than writing a new OpenInfer attention kernel from scratch.
-  - Vendored FlashInfer proper also has Blackwell MLA/TRTLLM sparse MLA infrastructure, but it is exposed through the Python/JIT/TVM FFI stack rather than this Rust FFI wrapper.
-  - Next kernel work should wire the existing Blackwell FlashMLA/FlashInfer sparse MLA implementation into `glm52_flashmla_sparse.cu` or replace the wrapper with a FlashInfer-backed FFI, before inventing a new kernel.
-
-### Step 10: Wire FlashMLA SM100 sparse decode and expose the DeepGEMM MQA blocker
-
-- Updated `glm52_flashmla_sparse.cu` to mirror FlashMLA's upstream sparse-decode dispatch:
-  - SM90 keeps the existing `sm90::decode::sparse_fp8` path.
-  - SM100-family devices use `sm100::decode::head64::run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::V32>`.
-  - `num_sm_parts` now accepts SM100-family devices and uses the upstream head64 formula `max(num_sms / s_q, 1)`.
-- Updated `openinfer-kernels/build.rs` so only the `glm52_flashmla_sparse.cu` TU promotes SM100-family targets to FlashMLA's `compute_100f,code=sm_100f`. Compiling that TU as plain `sm_103` failed because ptxas rejects `tcgen05`/CTA-group features on target `sm_103`.
-- Kept `glm52_trtllm_grouped_fp8.cu` on the normal GLM FlashMLA arch path; only sparse decode needs `sm_100f` today.
-- Verified kernel and server builds:
-
-```bash
-CARGO_HOME=/tmp/openinfer-cargo-home \
-RUSTUP_HOME=/mnt/shared/home/susun/.rustup \
-CARGO_TARGET_DIR=/tmp/openinfer-target-wip \
-OPENINFER_CUDA_SM=103 \
-OPENINFER_BUILD_TIMING=1 \
-OPENINFER_NCCL_ROOT=/mnt/shared/home/susun/.venv/lib/python3.12/site-packages/nvidia/nccl \
-OPENINFER_NVCC_JOBS=16 \
-LD_LIBRARY_PATH=/mnt/shared/home/susun/.venv/lib/python3.12/site-packages/nvidia/nccl/lib:$LD_LIBRARY_PATH \
-PATH=/mnt/shared/home/susun/.cargo/bin:/usr/local/cuda/bin:$PATH \
-/mnt/shared/home/susun/.cargo/bin/cargo build --release --features glm52 -p openinfer-kernels
-```
-
-- Result: build passed in `1m 12s`; build log shows `Compiling GLM5.2 FlashMLA sparse decode for nvcc targets: sm_100f`.
-
-```bash
-CARGO_HOME=/tmp/openinfer-cargo-home \
-RUSTUP_HOME=/mnt/shared/home/susun/.rustup \
-CARGO_TARGET_DIR=/tmp/openinfer-target-wip \
-OPENINFER_CUDA_SM=103 \
-OPENINFER_BUILD_TIMING=1 \
-OPENINFER_NCCL_ROOT=/mnt/shared/home/susun/.venv/lib/python3.12/site-packages/nvidia/nccl \
-OPENINFER_NVCC_JOBS=16 \
-LD_LIBRARY_PATH=/mnt/shared/home/susun/.venv/lib/python3.12/site-packages/nvidia/nccl/lib:$LD_LIBRARY_PATH \
-PATH=/mnt/shared/home/susun/.cargo/bin:/usr/local/cuda/bin:$PATH \
-/mnt/shared/home/susun/.cargo/bin/cargo build --release --features glm52 -p openinfer-server
-```
-
-- Result: build passed in `1m 25s`.
-- TP4 launch with `--max-model-len 4096` now loads weights, builds rank models, creates TP4 contexts, and starts the OpenAI server on port 18080.
-- Minimal completion request:
-
-```bash
-curl -sS --max-time 180 http://127.0.0.1:18080/v1/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"/mnt/shared/home/susun/hf_cache/hub/models--zai-org--GLM-5.2-FP8/snapshots/ba978f7d347eaf65d22f1a86833408afdb953541","prompt":"Hello","max_tokens":4,"temperature":0}'
-```
-
-- Result: the request entered decode graph pre-capture and failed at the next GB300 blocker:
-  `GLM5.2 graph pre-capture failed: GLM5.2 graph pre-capture (bucket 8, full_tier false) on rank 0: GLM5.2 layer 0 attention half: GLM5.2 DeepGEMM MQA metadata launch failed: DriverError(CUDA_ERROR_NOT_SUPPORTED, "operation not supported")`.
-- The HTTP client did not receive a response after the server-side pre-capture error and was interrupted; the server then logged an auto-abort for the dropped request stream. That is a follow-up error-propagation issue, separate from the kernel blocker.
-
-### Step 11: Add SM100 DeepGEMM MQA and fix TP4 scratch sizing
-
-- Added a Blackwell path in `openinfer-kernels/csrc/glm52/glm52_deepgemm_mqa.cu` using DeepGEMM's SM100 paged-MQA logits metadata and logits kernels. `openinfer-kernels/build.rs` now compiles that translation unit as `sm_100f` on SM100-family targets when nvcc accepts the target.
-- Added TP4 attention GEMV allow-list shapes:
-  - `n=4096, k=2048` for the TP4 `q_b` attention shard.
-  - `n=6144, k=4096` for the TP4 `o_proj` attention shard.
-- Fixed a TP4 MoE scratch-buffer overrun. The CUDA kernel indexes `guprob`, `bpart`, `ug`, and `cpart` by the eight replicated rows (`kTokens=8`), but the Rust-side TP4 allocation had kept rank-count sizing (`RANKS=4`) for several buffers. The final host sizes now use `GLM52_TP4_TOKENS` for `BPART`, `GUPROB`, `UG`, and `CPART`.
-- Diagnostic path:
-  - Before the scratch fix, `"Hello"` could return because it stopped without generating tokens, while `"The capital of France is"` returned HTTP 500 with `greedy argmax found no finite logit`.
-  - A finite probe with graph replay disabled showed first-step logits were finite; the second generated step reached layer 1 with finite post-attention residuals but non-finite `normed2`, consistent with earlier memory corruption rather than an RMSNorm math bug.
-  - After the scratch fix, the temporary finite probes and graph-disable hook were removed and the fused add+RMSNorm path was restored.
-- Final verified build:
-
-```bash
-CARGO_HOME=/tmp/openinfer-cargo-home \
-RUSTUP_HOME=/mnt/shared/home/susun/.rustup \
-CARGO_TARGET_DIR=/tmp/openinfer-target-wip \
-OPENINFER_CUDA_SM=103 \
-OPENINFER_BUILD_TIMING=1 \
-OPENINFER_NCCL_ROOT=/mnt/shared/home/susun/.venv/lib/python3.12/site-packages/nvidia/nccl \
-OPENINFER_NVCC_JOBS=16 \
-LD_LIBRARY_PATH=/mnt/shared/home/susun/.venv/lib/python3.12/site-packages/nvidia/nccl/lib:$LD_LIBRARY_PATH \
-PATH=/mnt/shared/home/susun/.cargo/bin:/usr/local/cuda/bin:$PATH \
-/mnt/shared/home/susun/.cargo/bin/cargo build --release --features glm52 -p openinfer-server
-```
-
-- Result: build passed; the build log shows `Compiling GLM5.2 FlashMLA sparse decode for nvcc targets: sm_100f`.
-- Final verified server launch:
-
-```bash
-OPENINFER_CUDA_SM=103 \
-OPENINFER_NCCL_ROOT=/mnt/shared/home/susun/.venv/lib/python3.12/site-packages/nvidia/nccl \
-LD_LIBRARY_PATH=/mnt/shared/home/susun/.venv/lib/python3.12/site-packages/nvidia/nccl/lib:$LD_LIBRARY_PATH \
-PATH=/mnt/shared/home/susun/.cargo/bin:/usr/local/cuda/bin:$PATH \
-/tmp/openinfer-target-wip/release/openinfer \
-  --model-path /mnt/shared/home/susun/hf_cache/hub/models--zai-org--GLM-5.2-FP8/snapshots/ba978f7d347eaf65d22f1a86833408afdb953541 \
-  --tp-size 4 \
-  --moe-topo tp4 \
-  --max-model-len 4096 \
-  --port 18080
-```
-
-- Result: server loaded all four TP4 rank models, started the OpenAI endpoint, and logged `GLM5.2 whole-step graphs pre-captured: 1 buckets x 2 tiers`.
-- Final HTTP smokes:
-
-```bash
-curl -sS --max-time 180 http://127.0.0.1:18080/v1/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"/mnt/shared/home/susun/hf_cache/hub/models--zai-org--GLM-5.2-FP8/snapshots/ba978f7d347eaf65d22f1a86833408afdb953541","prompt":"Hello","max_tokens":4,"temperature":0}'
-```
-
-- Result: returned `"Hello"` with `finish_reason="stop"` and `completion_tokens=0`.
-
-```bash
-curl -sS --max-time 180 http://127.0.0.1:18080/v1/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"/mnt/shared/home/susun/hf_cache/hub/models--zai-org--GLM-5.2-FP8/snapshots/ba978f7d347eaf65d22f1a86833408afdb953541","prompt":"The capital of France is","max_tokens":4,"temperature":0}'
-```
-
-- Result: returned `" Paris. The population"` with `finish_reason="length"` and `completion_tokens=4`. Server logs showed both requests completed cleanly.
-- Cleanup checks:
-
-```bash
-CARGO_HOME=/tmp/openinfer-cargo-home \
-RUSTUP_HOME=/mnt/shared/home/susun/.rustup \
-CARGO_TARGET_DIR=/tmp/openinfer-target-wip \
-OPENINFER_CUDA_SM=103 \
-OPENINFER_NCCL_ROOT=/mnt/shared/home/susun/.venv/lib/python3.12/site-packages/nvidia/nccl \
-LD_LIBRARY_PATH=/mnt/shared/home/susun/.venv/lib/python3.12/site-packages/nvidia/nccl/lib:$LD_LIBRARY_PATH \
-PATH=/mnt/shared/home/susun/.cargo/bin:/usr/local/cuda/bin:$PATH \
-/mnt/shared/home/susun/.cargo/bin/cargo test --release --features glm52 -p openinfer-server glm52_ -- --nocapture
-```
-
-- Result: 4 GLM server validation tests passed.
-
-```bash
-git diff --check
-```
-
-- Result: no whitespace errors.
-
-### Step 12: Strengthen TP4 serving smoke coverage
-
-- Reused the verified TP4 server command from Step 11 on the GB300 host. It loaded four rank models, started the OpenAI endpoint, and pre-captured `1 buckets x 2 tiers`.
-- Longer single-request decode:
-
-```bash
-curl -sS --max-time 240 http://127.0.0.1:18080/v1/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"/mnt/shared/home/susun/hf_cache/hub/models--zai-org--GLM-5.2-FP8/snapshots/ba978f7d347eaf65d22f1a86833408afdb953541","prompt":"Write a concise paragraph about why tensor parallel inference needs synchronized collectives.","max_tokens":32,"temperature":0}'
-```
-
-- Result: HTTP 200, `prompt_tokens=14`, `completion_tokens=32`, `finish_reason="length"`.
-- Four-way concurrent decode via a Python `urllib` thread pool:
-  - Result: all 4 requests returned HTTP 200, `completion_tokens=16`, `finish_reason="length"`.
-- Bucket-8 concurrent decode via the same Python harness:
-  - Result: all 8 requests returned HTTP 200, `completion_tokens=16`, `finish_reason="length"`.
-- Long-prompt request:
-
-```text
-prompt_tokens=874, completion_tokens=16, finish_reason="length"
-```
-
-- Server logs for the longer, four-way, eight-way, and long-prompt requests showed only normal `completion finished` records; no rank-side errors, aborts, or finite-logit failures appeared.
-- Focused GLM5.2 crate tests:
-
-```bash
-CARGO_HOME=/tmp/openinfer-cargo-home \
-RUSTUP_HOME=/mnt/shared/home/susun/.rustup \
-CARGO_TARGET_DIR=/tmp/openinfer-target-wip \
-OPENINFER_CUDA_SM=103 \
-OPENINFER_NCCL_ROOT=/mnt/shared/home/susun/.venv/lib/python3.12/site-packages/nvidia/nccl \
-LD_LIBRARY_PATH=/mnt/shared/home/susun/.venv/lib/python3.12/site-packages/nvidia/nccl/lib:$LD_LIBRARY_PATH \
-PATH=/mnt/shared/home/susun/.cargo/bin:/usr/local/cuda/bin:$PATH \
-/mnt/shared/home/susun/.cargo/bin/cargo test --release -p openinfer-glm52 tp4 -- --nocapture
-```
-
-- Result: 2 tests passed:
-  - `topology_tests::tp4_topology_shape_is_four_rank_replicated_tp`
-  - `moe_tp8::tests::tp4_slice_staging_geometry`
-
-## Debrief
-
-- **Outcome**: TP4 GB300 now reaches real serving coverage beyond a minimal smoke. The CLI/launch layer, host-side topology plumbing, TP4 CUDA MoE/attention collectives, four-rank TP runtime setup, FlashMLA SM100 sparse-decode dispatch, and SM100 DeepGEMM MQA path build on GB300. The cleaned graph-mode server pre-captures and completes longer, long-prompt, four-way, and bucket-8 concurrent `/v1/completions` requests.
-- **Pitfalls encountered**:
-  - The requested model path is the Hugging Face cache wrapper; the usable checkpoint directory is the snapshot under `snapshots/ba978f7d347eaf65d22f1a86833408afdb953541`.
-  - `/mnt/shared` is read-only in this session; use `/work/openinfer` for edits.
-  - Runtime must prefer NCCL 2.30.7 from the local venv over system NCCL 2.28.9.
-  - FlashMLA sparse decode needs `sm_100f` SASS on GB300; compiling the SM100 implementation as plain `sm_103` fails in ptxas on `tcgen05`/CTA-group features.
-  - Four-rank TP4 must never call the current DeepEP setup with `GLM52_EP_RANKS=8`; TP4 now skips DeepEP and uses the TP LL rendezvous instead.
-  - TP4 row count is not the same as TP4 rank count. Several TP4 MoE scratch buffers must be sized by `kTokens=8`, not `RANKS=4`; the wrong host sizes caused memory corruption that surfaced only after the first generated token.
-- **Lessons learned**:
-  - TP4 bring-up had three independent workstreams: topology generalization from TP8 hardcoding, Blackwell sparse MLA/FlashMLA support, and Blackwell replacement for the sm90a-only MQA path. All three are now far enough to pass a serving smoke.
-  - When generalizing TP8 code to TP4, audit kernel indexing expressions, not just the named constants. TP8 masked `RANKS == TOKENS == 8`; TP4 exposes every accidental substitution.
-- **Follow-ups**:
-  - Add a focused TP4 oracle or golden gate beyond HTTP smokes, because serving liveness does not prove numerical parity.
-  - Run a longer soak and perf characterization after the correctness gate exists.
-  - Decide whether to replace the remaining grouped-kernel warning with a true SM100 path or keep it as an unused EP8/DeepGEMM build warning for TP4.
+## Scope
+
+TP4 is a low-latency topology for the four-GB300 target. It is not an EP8 compatibility mode.
+
+| Topology | Devices | TP / DP / EP | Expert placement | Attention heads/rank |
+| --- | ---: | --- | --- | ---: |
+| EP8 | 8 | 1 / 8 / 8 | 32 whole routed experts/rank | 64 |
+| TP8 | 8 | 1 / 8 / 8 | 1/8 slice of all routed + shared experts | 8 |
+| TP4 | 4 | 4 / 1 / 1 | 1/4 slice of all routed + shared experts | 16 |
+
+TP4 launch requires `--tp-size 4 --moe-topo tp4`; omitted DP size resolves to one. Prefix-cache and DSpark behavior follows the existing tensor-replicated path. KV offload remains EP8-only because tensor-replicated ranks mirror the cache.
+
+## Design
+
+### Tensor-parallel runtime
+
+- Every TP rank runs the same eight-row logical bucket with replicated activations and routing.
+- Attention weights are head-sharded. MoE gate/up and down weights are sliced along the 2048-wide expert intermediate dimension.
+- The shared expert is folded into bank slot 256, so one phase chain handles routed and shared outputs.
+- The MoE chain is union, gate/up GEMM, SiLU, down GEMM, LL push, and fixed-order LL receive/reduce.
+- Attention `o_proj` partials use a two-shot LL reduce-scatter/broadcast chain. Every rank receives a bit-identical result before redundant downstream routing.
+- One device-side epoch tags parity-double-buffered 16-byte LL packets. Spins only wait on packets produced by a previous kernel node.
+- VMM buffers use one accessor-specific VA per GPU and reject links without native P2P atomics. Broad peer grants measurably tax the memory-bound GEMMs.
+
+The implementation is shared rather than copied:
+
+- `openinfer-kernels/csrc/glm52/glm52_moe_tp_impl.cuh` contains the MoE kernels and VMM protocol; TP4/TP8 `.cu` files only instantiate rank/slice/grid parameters and ABI names.
+- `openinfer-kernels/csrc/glm52/glm52_tp_ar_impl.cuh` and `glm52_tp_ll.cuh` contain the common attention collective and packet primitives.
+- `openinfer-kernels/src/ops/glm52/moe_tp.rs` and `tp_ar.rs` own topology-dependent shape validation and FFI dispatch.
+- `openinfer-glm52/src/moe_tp.rs` owns one topology-parameterized model runtime state and slice loader.
+
+### MLA backend and cache contract
+
+Kernel selection happens once at model build from the actual device capability and per-rank head shape. There is no `OPENINFER_GLM52_MLA_BACKEND` override.
+
+| Runtime shape | Backend | KV token layout |
+| --- | --- | ---: |
+| SM100/SM103 and 16 heads/rank | FlashInfer TRTLLM-generation sparse MLA | 576-byte standard E4M3 |
+| Other attention-TP shards up to 16 heads/rank | Right-sized sparse MLA | 656-byte `fp8_ds_mla` |
+| Full 64-head fallback | FlashMLA sparse decode | 656-byte `fp8_ds_mla` |
+| Neither contract supported | Startup error | n/a |
+
+The kernel and cache format are one immutable startup contract. Allocation stride, cache packing, query assembly, offload namespace, schedule state, and attention launch all derive from it. Backend-specific scratch and schedule metadata are enums; invalid `Option` combinations and dummy allocations are not representable.
+
+FlashInfer's header-only runner needs seven checked-in SM100-family cubins for the `{1,2,4,8} x {256,2048}` selector closure. Two are selector seeds and may not appear as final Nsight symbols, but removing them makes the upstream selector reject otherwise-supported shapes. Provenance and hashes are in `openinfer-kernels/cubin/glm52/README.md` and `trtllm_gen/flashInferMetaInfo.h`.
+
+### Blackwell-specific paths
+
+- FlashMLA fallback code is assembled as `sm_100f`; plain `sm_103` cannot encode its CTA-group/tensor-core instructions.
+- DeepGEMM MQA has an SM100f instantiation rather than falling into the Hopper-only stub.
+- FlashInfer uses standard E4M3 query/KV with static-token sparse indices and a 16MiB persistent workspace per bucket.
+- TP4 MoE keeps the same math and fixed reduction order as TP8, but grid sizing is architecture-specific. Blackwell caps GEMM B at 2 CTA/SM and GEMM C at 3 CTA/SM; Hopper retains its occupancy-derived grid.
+
+### Vocabulary-parallel greedy tail
+
+TP4/TP8 decode copies one contiguous `lm_head` vocabulary shard per rank at model build (`38,720` rows for TP4, `19,360` for TP8). The full head remains resident for DSpark and non-greedy sampling.
+
+Each rank computes compact shard logits and a local top-1. The candidate's bf16 value plus three exact bf16 token-id bytes are packed into rank-unique positions of a hidden-width scratch row, gathered through one reserved slot of the existing fixed-order attention TP all-reduce, and selected on-device with the same lowest-global-index tie break. This preserves launch-ahead: every rank has the same global next token before the next graph replay is enqueued. No host merge, new communication protocol, runtime environment variable, or full-logit exchange is added. Sampling steps recompute the full head eagerly outside the graph only when a non-greedy row exists.
+
+## Performance
+
+All serving rows are fully warmed, untraced, bs=1, concurrency 1, fixed input/output lengths, ignore EOS, temperature zero. TTFT is intentionally excluded from the decision.
+
+| Shape | Original TP4 FlashMLA | FlashInfer MLA | + MoE grid | + compact/fused | + vocab shard | vLLM TP4 | Advantage |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1/256 | `12.30ms` | `10.83ms` | `10.68ms` | `9.28ms` | **`9.03ms`** | `9.21ms` | `0.18ms` (`2.0%`) |
+| 1024/256 | `12.45ms` | `11.17ms` | `11.01ms` | `9.78ms` | **`9.56ms`** | `9.60ms` | `0.04ms` (`0.4%`) |
+
+The MLA switch recovered `1.47ms` at 1/256 and `1.28ms` at 1024/256. The MoE grid tune recovered another `0.15-0.16ms/token`. Compact TP4 graph buckets, SM103 one-row dense GEMV launches, the paired `q_a+kv_a` projection, and removal of the compact MoE output bridge recovered the next `1.23-1.40ms/token`. Vocabulary sharding recovered the final `0.22-0.25ms/token`.
+
+### EP4 topology check
+
+The original comparison and OpenInfer implementation both use pure TP4 for MoE. To test whether expert parallelism was the missing route, vLLM was relaunched with the same checkpoint, TP4 attention, standard FP8 KV cache, max model length 4096, and `--enable-expert-parallel`. This places 64 whole experts on each rank and uses the FlashInfer TRTLLM FP8 MoE backend.
+
+| Shape | vLLM pure TP4 | vLLM EP4 | EP4 delta |
+| --- | ---: | ---: | ---: |
+| 1/256 | `9.21ms` | `9.47ms` | `+2.8%` |
+| 1024/256 | `9.60ms` | `9.84ms` | `+2.5%` |
+
+EP4 is not a latency win for the bs=1 target. OpenInfer currently exposes EP8 and tensor-sliced TP4/TP8, not an attention-TP4 plus expert-EP4 hybrid; adding that topology would require 64-expert rank bundles, a four-rank DeepEP path, and composition with the TP4 attention collectives. The controlled vLLM result does not justify that PR expansion.
+
+### Profile attribution
+
+The accepted optimized node trace uses four ranks and exact per-layer instance counts. Totals are all-device kernel duration normalized by tokens and ranks; auxiliary-stream work may overlap.
+
+| Family | Original FlashMLA | FlashInfer FP8 | Delta |
+| --- | ---: | ---: | ---: |
+| MoE + router + RS | `3.868ms` | `3.840ms` | `-0.028ms` |
+| Projection GEMV + reduce | `3.743ms` | `3.765ms` | `+0.022ms` |
+| Sparse MLA attention | `2.042ms` | `0.554ms` | **`-1.488ms`** |
+| MLA/cache/query/quant glue | `0.734ms` | `0.562ms` | **`-0.172ms`** |
+| Norm + fused residual | `0.905ms` | `0.906ms` | `+0.001ms` |
+| Attention TP allreduce | `0.693ms` | `0.824ms` | `+0.131ms` |
+| MLA absorb W_UK/W_UV | `0.554ms` | `0.545ms` | `-0.009ms` |
+| Indexer + lm_head + other | `1.000ms` | `1.001ms` | `+0.002ms` |
+| **All-kernel sum** | **`13.540ms`** | **`11.999ms`** | **`-1.541ms`** |
+
+The attention-AR increase is one communication-wait outlier; per-kernel medians did not regress. The traced request measured `11.49ms` versus the untraced `10.83ms`, so the trace is composition evidence rather than the performance result.
+
+The final vocabulary-sharded node trace measures the local LM head at `77.01us` per rank versus about `312us` for the old redundant full-vocabulary head. Pack/unpack cost `1.63/2.46us`; the one extra TP AR triplet averages `8.41us`. The predicted net saving is about `222us/token`, matching serving.
+
+### MoE resource gate and grid tune
+
+The temporary standalone harness directly included the production TP4 `.cu` instantiation and used `UC=9`, one active row, production scratch shapes, and the production kernels. It was used for the measurements below but is intentionally excluded from the production PR.
+
+| NCU metric | GEMM B, grid 456 | GEMM C, grid 608 |
+| --- | ---: | ---: |
+| Registers/thread | 80 | 56 |
+| Theoretical occupancy | 37.50% | 50.00% |
+| Achieved occupancy | 30.27% | 35.27% |
+| Compute throughput | 33.60% | 20.07% |
+| Tensor-pipe active | 9.01% | 6.44% |
+| DRAM throughput | 29.62% | 21.31% |
+| L1/TEX throughput | 62.83% | 72.89% |
+
+The kernels were not near their compute, Tensor, or DRAM roofs. The occupancy-max grids created excess short-workload scheduling overhead on 152-SM GB300.
+
+Five hot-cache runs used 100 warmups and 1,000 measured launches each:
+
+| Exact kernel | Old grid median | Tuned grid median | Delta |
+| --- | ---: | ---: | ---: |
+| B | `13.847us` (456) | `13.095us` (304) | `-5.4%` |
+| C | `8.912us` (608) | `7.596us` (456) | `-14.8%` |
+| **B + C** | **`22.759us`** | **`20.691us`** | **`-2.068us` (`-9.1%`)** |
+
+Across 75 MoE layers, the hot-cache delta predicts `0.155ms/token`, matching the measured serving recovery. Cache-flushed NCU gives an upper bound of `39.33 -> 34.93us` (`-11.2%`).
+
+## Validation
+
+- SM103 release server build passes.
+- SM90a and SM103 standalone compilation passes for both TP4/TP8 MoE and attention-AR instantiations.
+- FlashInfer sparse MLA numerical smoke passes all eight `batch={1,2,4,8} x topk={256,2048}` combinations.
+- Focused GLM5.2 topology/slice tests pass.
+- A 64-token greedy HTTP smoke retains the accepted `" Paris. Distance from ..."` prefix.
+- A non-greedy temperature/top-p smoke passes through the eager full-head fallback.
+- Vocabulary pack/unpack passes a direct SM103 device smoke covering negative logits, cross-rank tie breaking, and a global token id above 65,535; the translation unit also compiles for SM90a.
+- Refactoring preserves TP4 B/C register counts (`80/56`) and launch grids. Clean post-refactor and compact/fused serving reruns pass for both target shapes.
+
+## Artifacts
+
+- Serving JSON: `bench_results/glm52-tp4-moe-tune-20260710/moe-grid-in{1,1024}-out256-c1-n20.json`
+- NCU reports: `bench_results/glm52-tp4-moe-util-20260710/tp4-gemm-{b,c}.ncu-rep`
+- Optimized node trace: `bench_results/glm52-tp4-flashinfer-profile-20260710/openinfer-flashinfer-node.{nsys-rep,sqlite}`
+- Trace summary: `bench_results/glm52-tp4-flashinfer-profile-20260710/openinfer-flashinfer-node-summary.md`
+- Compact/fused serving JSON: `bench_results/glm52-tp4-fused-front-20260710/fused-front-in{1,1024}-out256-c1-n20.json`
+- Compact node trace: `bench_results/glm52-tp4-compact-profile-20260710/openinfer-compact-node.{nsys-rep,sqlite}`
+- vLLM EP4 control: `bench_results/glm52-vllm-ep4-20260710/vllm-ep4-in{1,1024}-out256-c1-n20.json`
+- Final serving JSON: `bench_results/glm52-tp4-vocab-parallel-20260710/vocab-parallel-in{1,1024}-out256-c1-n20.json`
+- Final node trace: `bench_results/glm52-tp4-vocab-profile-20260710/openinfer-vocab-node.{nsys-rep,sqlite}`
+- Final trace summaries: `bench_results/glm52-tp4-vocab-profile-20260710/openinfer-vocab-node-{summary,tail}.md`
+
+## Pitfalls
+
+- TP8 historically hid `ranks == tokens == 8`. TP4 scratch and job counts must use the fixed eight-row bucket where appropriate, not the four-rank count.
+- TP4 must not initialize the EP8 DeepEP path. It uses the tensor-replicated LL rendezvous.
+- Backend labels do not imply cache-layout equality. vLLM's standard FP8 and the original OpenInfer `fp8_ds_mla` cache are different contracts.
+- FlashInfer module selection/loading must complete before CUDA Graph capture.
+- Node-trace sums include auxiliary-stream overlap and communication waits. Graph-level traces and untraced TPOT remain the wall-time truth.
+- H200 results explain the original launch choices but are not a controlled GB300 baseline.
+- A host-side merge of vocabulary candidates is invalid under launch-ahead: the global token must be identical on-device before every rank enqueues the speculative next replay.
+
+## PR Cleanup
+
+### Preparation
+
+- **Read**: this model record, the TP4/TP8 CUDA and Rust launch surfaces, the FlashInfer runner/metadata/cubin closure, and the server CLI diff.
+- **Plan**: remove runtime backend overrides; dispatch by SM and shape; consolidate TP4/TP8 collectives and runtime state; restore unrelated changes; distill the document; rerun architecture, correctness, kernel, and serving gates.
+- **Publish plan**: commit the scoped TP4 optimization/refactor diff, rebase onto the latest `origin/main`, preserve the newer mainline GLM5.2 scheduler/dead-kernel changes while resolving conflicts, rerun the available gates, push with `--force-with-lease`, and move PR #637 from draft to ready for review.
+- **Risk**: CUDA templating can change resource generation. Register counts, grids, exact-kernel timing, and serving TPOT are explicit acceptance gates. The latest main contains GLM5.2 scheduler-metrics and dead-kernel cleanup commits, so the rebase may require semantic conflict resolution rather than choosing one side wholesale.
+
+### Execution Log
+
+- Removed `OPENINFER_GLM52_MLA_BACKEND`; model build now selects the MLA/cache contract from actual SM support and heads/rank.
+- Replaced backend-specific `Option` scratch and dummy schedule allocations with mutually exclusive enums.
+- Consolidated TP4/TP8 LL, MoE, attention AR, Rust FFI wrappers, and model runtime state. Thin `.cu` files retain separate ABI symbols and architecture-specific parameters.
+- Audited against the branch merge-base rather than the moving `origin/main`; post-fork Qwen3 changes are not part of this PR and were not cherry-picked during cleanup.
+- SM90a/SM103 CUDA instantiations compile. Release Clippy passes with only the repository's existing lint exceptions; GLM5.2 lib tests pass (`59 passed, 14 GPU tests ignored` after the mainline scheduler-metrics merge), server topology tests pass (`4/4`), and the SM103 release server builds.
+- The extracted CUDA implementation keeps the exact TP4 resource footprint (`80` registers for GEMM B, `56` for GEMM C). Temporary old/new harness runs under the same externally loaded node were within noise, but those absolute timings are not a clean performance result; the harness source is not part of the production PR.
+- A rename-aware PR audit confirms one model TP runtime, one Rust kernel wrapper, and one CUDA implementation per collective. Git still renders the shared-header extraction as deletion plus addition because the original TP8 entry path remains as a thin instantiation.
+- Compact TP4 decode now captures buckets 1/2/4/8 while retaining the fixed eight-row MoE ABI behind narrow pad bridges. SM103 selects one-row dense FP8 GEMV launches, `q_a` and `kv_a` share one paired graph node, and the MoE output bridge was removed.
+- A same-checkpoint vLLM EP4 control measured `9.47/9.84ms`, slower than pure TP4 at `9.21/9.60ms`; EP4 is therefore excluded from this low-latency PR.
+- TP greedy decode now shards the vocabulary head, computes local top-1, and reuses one reserved attention-AR slot for device-side global selection. The full head is retained only for DSpark and sampled rows. Final n20 TPOT is `9.03/9.56ms`; the node trace attributes the serving delta to `312us -> 77us` LM-head work plus about `12.5us` of candidate transport/select overhead.
+- Final formatting and `git diff --check` pass. GLM52 Clippy passes with warnings denied after command-line allowances for four pre-existing model lints. GLM52 lib tests pass (`59 passed, 14 GPU tests ignored`), the four server GLM52 config tests pass, and the FlashInfer numerical smoke passes all eight `batch x topk` shapes on SM103.
+- Installed GitHub CLI, authenticated through the existing `~/.env` token without persisting or printing it, fetched `origin/main`, and confirmed PR #637 is an open draft targeting `main`. The branch was 16 mainline commits behind before the publish rebase.
+- Rebased both PR commits onto `origin/main` at `60ccc5f`. Conflict resolution preserved main's scheduler metrics and dead-kernel/weight-load cleanup: `deepgemm_layout`, `moe_route`, and `trtllm_grouped` were not restored; their stale build/FFI/module registrations and one superseded FlashMLA arch helper were removed. The H200 TP8 right-sized sparse MLA path now coexists with the SM103 TP4 FlashInfer path. Two temporary tuning harnesses were removed from the production diff.
+
+### Debrief
+
+- **Outcome**: TP4 beats the matched latest vLLM TP4 baseline at both requested bs=1 shapes, with exact greedy smoke, sampled fallback, release build/tests, and a final node-level Nsys trace.
+- **Pitfalls encountered**: TP8 had hidden the `ranks == bucket rows` assumption; full-vocabulary work was replicated even after the attention/MoE weights were sharded; a host candidate merge would break launch-ahead; EP4 was a plausible but ultimately slower alternative; and the mainline rebase required preserving the right-sized H200 MLA fallback plus both short/full graph pre-captures rather than choosing either conflict side wholesale.
+- **Lessons learned**: kernel/backend selection belongs to SM and topology at startup, compact graph shapes matter at bs=1, and replicated bookend work must be audited separately from the layer stack in tensor-parallel profiles.
+- **Follow-ups**: add the model-level TP4 golden/logit gate and rerun retained TP8 runtime gates on H200.
+
+## Remaining Work
+
+- Add a model-level TP4 golden/logit gate; HTTP prefix parity and focused kernel gates are narrower evidence.
+- Re-run the retained TP8 runtime gates on H200 when that host is available; GB300 can prove compilation but not H200 performance.

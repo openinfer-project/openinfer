@@ -15,6 +15,8 @@ pub const GLM52_MLA_KV_LORA: usize = 512;
 pub const GLM52_MLA_SCALE_GROUPS: usize = GLM52_MLA_KV_LORA / 128; // 4
 /// fp8_ds_mla token: 512 e4m3 ckv + 4 f32 scales + 64 bf16 rope-key.
 pub const GLM52_MLA_CACHE_BYTES: usize = 656;
+/// Standard E4M3 MLA token used by FlashInfer: 512 ckv + 64 rope-key.
+pub const GLM52_MLA_FLASHINFER_CACHE_BYTES: usize = 576;
 
 /// Assemble the FlashMLA sparse decode query `[GLM52_MLA_HEADS, 576]` =
 /// `[ql_nope(512) | rope(q_pe)(64)]` per head (bs=1 decode). `num_q_heads`
@@ -42,7 +44,7 @@ pub fn glm52_mla_query_assemble_launch(
 ) -> Result<()> {
     ensure!(tokens > 0, "GLM5.2 MLA assemble tokens must be positive");
     ensure!(
-        num_q_heads >= 1 && num_q_heads <= GLM52_MLA_HEADS,
+        (1..=GLM52_MLA_HEADS).contains(&num_q_heads),
         "GLM5.2 MLA assemble num_q_heads {num_q_heads} out of 1..={GLM52_MLA_HEADS}"
     );
     ensure!(
@@ -89,6 +91,71 @@ pub fn glm52_mla_query_assemble_launch(
     result
         .result()
         .map_err(|err| anyhow!("GLM5.2 MLA query assemble launch failed: {err}"))
+}
+
+/// Assemble a compact, statically-scaled E4M3 query for FlashInfer TRTLLM-gen.
+/// Unlike the FlashMLA form, the output contains only `num_q_heads` and has no
+/// full-model head padding.
+#[allow(clippy::too_many_arguments)]
+pub fn glm52_mla_query_assemble_fp8_launch(
+    ctx: &DeviceContext,
+    tokens: usize,
+    num_q_heads: usize,
+    ql_nope: &CudaSlice<bf16>,
+    q_pe_base: &CudaSlice<bf16>,
+    q_pe_offset: usize,
+    q_pe_head_stride: usize,
+    cos: &CudaSlice<bf16>,
+    sin: &CudaSlice<bf16>,
+    query: &mut CudaSlice<u8>,
+) -> Result<()> {
+    ensure!(
+        tokens > 0,
+        "GLM5.2 FP8 MLA assemble tokens must be positive"
+    );
+    ensure!(
+        (1..=GLM52_MLA_HEADS).contains(&num_q_heads),
+        "GLM5.2 FP8 MLA assemble heads {num_q_heads} out of range"
+    );
+    ensure!(
+        ql_nope.len() >= tokens * num_q_heads * GLM52_MLA_QK_NOPE,
+        "GLM5.2 FP8 MLA ql_nope too small"
+    );
+    ensure!(
+        q_pe_base.len()
+            >= q_pe_offset + (tokens * num_q_heads - 1) * q_pe_head_stride + GLM52_MLA_ROPE_DIM,
+        "GLM5.2 FP8 MLA q_pe overruns its buffer"
+    );
+    ensure!(
+        cos.len() >= tokens * GLM52_MLA_ROPE_HALF && sin.len() >= tokens * GLM52_MLA_ROPE_HALF,
+        "GLM5.2 FP8 MLA cos/sin too small"
+    );
+    ensure!(
+        query.len() >= tokens * num_q_heads * GLM52_MLA_QUERY_DIM,
+        "GLM5.2 FP8 MLA query too small"
+    );
+    let (ql_ptr, _g0) = ql_nope.device_ptr(&ctx.stream);
+    let (qpe_ptr, _g1) = q_pe_base.device_ptr(&ctx.stream);
+    let (cos_ptr, _g2) = cos.device_ptr(&ctx.stream);
+    let (sin_ptr, _g3) = sin.device_ptr(&ctx.stream);
+    let (query_ptr, _g4) = query.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::glm52_mla_query_assemble_fp8_cuda(
+            ql_ptr as *const ffi::Half,
+            qpe_ptr as *const ffi::Half,
+            q_pe_offset as i32,
+            q_pe_head_stride as i32,
+            num_q_heads as i32,
+            cos_ptr as *const ffi::Half,
+            sin_ptr as *const ffi::Half,
+            query_ptr as *mut u8,
+            tokens as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result
+        .result()
+        .map_err(|err| anyhow!("GLM5.2 FP8 MLA query assemble failed: {err}"))
 }
 
 /// Pack one fp8_ds_mla 656-byte cache token = `[512 e4m3 ckv | 4 f32 group scales
@@ -167,6 +234,65 @@ pub fn glm52_mla_cache_pack_launch(
     result
         .result()
         .map_err(|err| anyhow!("GLM5.2 MLA cache pack launch failed: {err}"))
+}
+
+/// Pack the normalized ckv and rotated k_pe into the standard statically-
+/// scaled E4M3 `[slot, 576]` cache consumed by FlashInfer TRTLLM-gen.
+#[allow(clippy::too_many_arguments)]
+pub fn glm52_mla_cache_pack_fp8_launch(
+    ctx: &DeviceContext,
+    tokens: usize,
+    ckv: &CudaSlice<bf16>,
+    k_pe: &CudaSlice<bf16>,
+    cos: &CudaSlice<bf16>,
+    sin: &CudaSlice<bf16>,
+    cache: &mut CudaSlice<u8>,
+    slot_mapping: &CudaSlice<i64>,
+) -> Result<()> {
+    ensure!(
+        tokens > 0,
+        "GLM5.2 FP8 MLA cache pack tokens must be positive"
+    );
+    ensure!(
+        ckv.len() >= tokens * GLM52_MLA_KV_LORA,
+        "GLM5.2 FP8 MLA ckv too small"
+    );
+    ensure!(
+        k_pe.len() >= tokens * GLM52_MLA_ROPE_DIM,
+        "GLM5.2 FP8 MLA k_pe too small"
+    );
+    ensure!(
+        cos.len() >= tokens * GLM52_MLA_ROPE_HALF && sin.len() >= tokens * GLM52_MLA_ROPE_HALF,
+        "GLM5.2 FP8 MLA cos/sin too small"
+    );
+    ensure!(
+        slot_mapping.len() >= tokens,
+        "GLM5.2 FP8 MLA slots too small"
+    );
+    let max_slots = cache.len() / GLM52_MLA_FLASHINFER_CACHE_BYTES;
+    ensure!(max_slots > 0, "GLM5.2 FP8 MLA cache is empty");
+    let (ckv_ptr, _g0) = ckv.device_ptr(&ctx.stream);
+    let (kpe_ptr, _g1) = k_pe.device_ptr(&ctx.stream);
+    let (cos_ptr, _g2) = cos.device_ptr(&ctx.stream);
+    let (sin_ptr, _g3) = sin.device_ptr(&ctx.stream);
+    let (cache_ptr, _g4) = cache.device_ptr_mut(&ctx.stream);
+    let (slot_ptr, _g5) = slot_mapping.device_ptr(&ctx.stream);
+    let result = unsafe {
+        ffi::glm52_mla_cache_pack_fp8_cuda(
+            ckv_ptr as *const ffi::Half,
+            kpe_ptr as *const ffi::Half,
+            cos_ptr as *const ffi::Half,
+            sin_ptr as *const ffi::Half,
+            cache_ptr as *mut u8,
+            slot_ptr as *const i64,
+            max_slots as i64,
+            tokens as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result
+        .result()
+        .map_err(|err| anyhow!("GLM5.2 FP8 MLA cache pack failed: {err}"))
 }
 
 /// Split the kv_a projection output `[T, 576]` into contiguous kv_c `[T, 512]`

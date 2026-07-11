@@ -22,7 +22,7 @@ mod mla_decode;
 mod model;
 mod moe_decode;
 mod moe_ep8;
-mod moe_tp8;
+mod moe_tp;
 #[cfg(test)]
 mod oracle;
 mod rows;
@@ -33,7 +33,7 @@ mod weights;
 
 use std::{collections::BTreeSet, path::Path, time::Instant};
 
-use anyhow::{Result, ensure};
+use anyhow::{Context as _, Result, ensure};
 use bytesize::ByteSize;
 use openinfer_core::engine::{EngineHandle, KvCapacity, LoadSnapshot};
 use openinfer_kv_offload::{HostConfig, KvArena, OffloadEngine, OffloadHost};
@@ -640,14 +640,12 @@ fn build_rank_models(
         );
     }
     let unique_id = openinfer_kernels::ops::glm52_deepep_unique_id()?;
-    let tp8_exchange = moe_topo.uses_tensor_replicated_moe().then(|| {
-        std::sync::Arc::new(crate::moe_tp8::Glm52Tp8Exchange::new(
-            moe_topo.device_count(),
-        ))
-    });
+    let tp_exchange = moe_topo
+        .uses_tensor_replicated_moe()
+        .then(|| std::sync::Arc::new(crate::moe_tp::Glm52TpExchange::new(moe_topo.device_count())));
     let responses = workers
         .iter()
-        .map(|worker| worker.setup_comm_async(unique_id, moe_topo, tp8_exchange.clone()))
+        .map(|worker| worker.setup_comm_async(unique_id, moe_topo, tp_exchange.clone()))
         .collect::<Result<Vec<_>>>()?;
     for (rank, response) in responses.into_iter().enumerate() {
         response
@@ -674,6 +672,20 @@ fn build_offload_engines(
     rank_arenas: Vec<Vec<KvArena>>,
     device_ordinals: &[usize],
 ) -> Result<Vec<OffloadEngine>> {
+    let mla_page_size = openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_PAGE_SIZE;
+    let mla_bytes_per_token = rank_arenas
+        .first()
+        .and_then(|arenas| arenas.iter().find(|arena| is_mla_arena_name(&arena.name)))
+        .context("GLM5.2 KV offload has no MLA arena")?
+        .bytes_per_block
+        / mla_page_size;
+    ensure!(
+        rank_arenas.iter().all(|arenas| arenas
+            .iter()
+            .filter(|arena| is_mla_arena_name(&arena.name))
+            .all(|arena| arena.bytes_per_block == mla_page_size * mla_bytes_per_token)),
+        "GLM5.2 KV offload ranks disagree on MLA cache layout"
+    );
     let host = OffloadHost::new(HostConfig {
         pinned_pool_bytes: opts.pinned_pool_bytes,
         use_hugepages: opts.use_hugepages,
@@ -683,8 +695,8 @@ fn build_offload_engines(
     .map_err(|err| anyhow::anyhow!("GLM5.2 KV offload host: {err}"))?;
     let namespace = format!(
         "openinfer-glm52-l{GLM52_LAYERS}-p{}-mla{}-idxk{}",
-        openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_PAGE_SIZE,
-        openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN,
+        mla_page_size,
+        mla_bytes_per_token,
         config::GLM52_INDEX_HEAD_DIM + 4,
     );
     let engines = rank_arenas
@@ -714,6 +726,11 @@ fn build_offload_engines(
         engines.len(),
     );
     Ok(engines)
+}
+
+fn is_mla_arena_name(name: &str) -> bool {
+    name.rsplit_once('.')
+        .is_some_and(|(_, arena_kind)| arena_kind == "mla")
 }
 
 /// EOS ids from the checkpoint's generation_config.json (`eos_token_id` is a

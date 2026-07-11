@@ -265,7 +265,7 @@ fn run_layer_prefill_ep8(
             HIDDEN,
             scratch.layer.mlp_out.data_mut(),
         )?;
-        glm52_layer_finish(ctx, &mut scratch, 0)?;
+        glm52_layer_finish(ctx, &mut scratch, 0, false)?;
         let out_host = ctx.stream.clone_dtoh(scratch.hidden.data())?;
         outputs.extend(out_host.iter().map(|v| v.to_f32()));
     }

@@ -5,7 +5,8 @@ use anyhow::{Result, ensure};
 use cudarc::driver::CudaSlice;
 use half::bf16;
 use openinfer_kernels::ops::{
-    Glm52RouterBatch, Glm52RouterConfig, Glm52RouterOutput, glm52_router_noaux_tc_launch,
+    GLM52_TP_TOKENS, Glm52RouterBatch, Glm52RouterConfig, Glm52RouterOutput,
+    glm52_router_noaux_tc_launch,
 };
 use openinfer_kernels::tensor::DeviceContext;
 
@@ -250,12 +251,16 @@ pub(crate) struct Glm52RouterScratch {
 impl Glm52RouterScratch {
     pub(crate) fn new(ctx: &DeviceContext, tokens: usize) -> Result<Self> {
         ensure!(tokens > 0, "GLM5.2 router scratch needs positive tokens");
+        // TP MoE keeps an eight-row ABI even when TP4's surrounding decode
+        // graph uses a smaller bucket. Only `tokens` rows are launched; the
+        // spare route capacity is padding storage for that fixed ABI.
+        let capacity = tokens.max(GLM52_TP_TOKENS);
         Ok(Self {
             tokens,
-            logits: ctx.stream.alloc_zeros::<f32>(tokens * EXPERTS)?,
+            logits: ctx.stream.alloc_zeros::<f32>(capacity * EXPERTS)?,
             route: RoutedTopk {
-                topk_idx: ctx.stream.alloc_zeros::<i32>(tokens * TOPK)?,
-                topk_weight: ctx.stream.alloc_zeros::<f32>(tokens * TOPK)?,
+                topk_idx: ctx.stream.alloc_zeros::<i32>(capacity * TOPK)?,
+                topk_weight: ctx.stream.alloc_zeros::<f32>(capacity * TOPK)?,
             },
         })
     }

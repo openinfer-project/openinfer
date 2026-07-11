@@ -20,13 +20,13 @@ use anyhow::{Result, ensure};
 use half::bf16;
 use openinfer_core::cuda_graph::CudaGraphState;
 use openinfer_kernels::ops::{
-    GLM52_TP8_AR_CHUNK_PACKETS, GLM52_TP8_HIDDEN, GLM52_TP8_RANKS, GLM52_TP8_TOKENS,
-    Glm52Tp8LlBuffer, glm52_moe_tp8_epoch_advance, glm52_tp8_ar_buffer_bytes, glm52_tp8_ar_launch,
+    GLM52_TP_HIDDEN, GLM52_TP_TOKENS, Glm52TpLlBuffer, Glm52TpTopology, glm52_moe_tp_epoch_advance,
+    glm52_tp_ar_buffer_bytes, glm52_tp_ar_chunk_packets, glm52_tp_ar_launch,
 };
 use openinfer_kernels::tensor::DeviceContext;
 
-const RANKS: usize = GLM52_TP8_RANKS;
-const H: usize = GLM52_TP8_HIDDEN;
+const RANKS: usize = 8;
+const H: usize = GLM52_TP_HIDDEN;
 /// Enough slots for the full 78-layer chain the perf phase drives.
 const SLOTS: usize = 78;
 const PERF_WARM_STEPS: usize = 50;
@@ -66,7 +66,11 @@ fn tp8_ar_brick_gate() -> Result<()> {
                 .spawn(move || -> Result<(Vec<Vec<bf16>>, f64)> {
                     let ctx = DeviceContext::new_with_device(rank)?;
                     let ordinals: Vec<usize> = (0..RANKS).collect();
-                    let buf = Glm52Tp8LlBuffer::alloc(glm52_tp8_ar_buffer_bytes(SLOTS), &ordinals)?;
+                    let buf = Glm52TpLlBuffer::alloc(
+                        Glm52TpTopology::Tp8,
+                        glm52_tp_ar_buffer_bytes(Glm52TpTopology::Tp8, SLOTS),
+                        &ordinals,
+                    )?;
                     vas.lock().unwrap()[rank] = (0..RANKS).map(|i| buf.addr_for(i)).collect();
                     barrier.wait();
                     // peer_ar[dst] = the VA THIS rank uses to reach dst's
@@ -74,15 +78,17 @@ fn tp8_ar_brick_gate() -> Result<()> {
                     let peer_ar: [u64; RANKS] = {
                         let published = vas.lock().unwrap();
                         std::array::from_fn(|dst| {
-                            published[dst][rank] + (rank * GLM52_TP8_AR_CHUNK_PACKETS * 16) as u64
+                            published[dst][rank]
+                                + (rank * glm52_tp_ar_chunk_packets(Glm52TpTopology::Tp8) * 16)
+                                    as u64
                         })
                     };
                     let ar_local = buf.addr_for(rank);
 
                     let mut epoch_dev = ctx.stream.alloc_zeros::<u64>(1)?;
                     let mut active_dev = ctx.stream.alloc_zeros::<i32>(1)?;
-                    let mut partial = ctx.stream.alloc_zeros::<bf16>(GLM52_TP8_TOKENS * H)?;
-                    let mut out = ctx.stream.alloc_zeros::<bf16>(GLM52_TP8_TOKENS * H)?;
+                    let mut partial = ctx.stream.alloc_zeros::<bf16>(GLM52_TP_TOKENS * H)?;
+                    let mut out = ctx.stream.alloc_zeros::<bf16>(GLM52_TP_TOKENS * H)?;
 
                     // --- correctness: 3 steps x 2 slots; step 3 re-enters
                     // step 1's parity region, which still holds tag-1
@@ -93,22 +99,23 @@ fn tp8_ar_brick_gate() -> Result<()> {
                     // canary.
                     let mut results: Vec<Vec<bf16>> = Vec::new();
                     for step in 0..3 {
-                        let active = if step == 1 { 3 } else { GLM52_TP8_TOKENS };
+                        let active = if step == 1 { 3 } else { GLM52_TP_TOKENS };
                         ctx.stream.memcpy_htod(&[active as i32], &mut active_dev)?;
-                        let host: Vec<bf16> = (0..GLM52_TP8_TOKENS * H)
+                        let host: Vec<bf16> = (0..GLM52_TP_TOKENS * H)
                             .map(|i| bf16::from_f32(partial_value(step, rank, i / H, i % H)))
                             .collect();
                         ctx.stream.memcpy_htod(&host, &mut partial)?;
                         ctx.stream.memcpy_htod(
-                            &vec![bf16::from_f32(f32::NAN); GLM52_TP8_TOKENS * H],
+                            &vec![bf16::from_f32(f32::NAN); GLM52_TP_TOKENS * H],
                             &mut out,
                         )?;
-                        glm52_moe_tp8_epoch_advance(&ctx, &mut epoch_dev)?;
+                        glm52_moe_tp_epoch_advance(&ctx, Glm52TpTopology::Tp8, &mut epoch_dev)?;
                         for slot in [0usize, 1] {
-                            glm52_tp8_ar_launch(
+                            glm52_tp_ar_launch(
                                 &ctx,
+                                Glm52TpTopology::Tp8,
                                 slot,
-                                GLM52_TP8_TOKENS,
+                                GLM52_TP_TOKENS,
                                 &partial,
                                 &mut out,
                                 ar_local,
@@ -137,12 +144,13 @@ fn tp8_ar_brick_gate() -> Result<()> {
                     let mut graph = CudaGraphState::new();
                     for _ in 0..PERF_WARM_STEPS {
                         graph.run_or_capture(&ctx, || {
-                            glm52_moe_tp8_epoch_advance(&ctx, &mut epoch_dev)?;
+                            glm52_moe_tp_epoch_advance(&ctx, Glm52TpTopology::Tp8, &mut epoch_dev)?;
                             for slot in 0..SLOTS {
-                                glm52_tp8_ar_launch(
+                                glm52_tp_ar_launch(
                                     &ctx,
+                                    Glm52TpTopology::Tp8,
                                     slot,
-                                    GLM52_TP8_TOKENS,
+                                    GLM52_TP_TOKENS,
                                     &partial,
                                     &mut out,
                                     ar_local,
@@ -178,14 +186,14 @@ fn tp8_ar_brick_gate() -> Result<()> {
         all.push(h.join().expect("tp8 ar gate rank thread panicked")?);
     }
 
-    for (step, &active) in [GLM52_TP8_TOKENS, 3, GLM52_TP8_TOKENS].iter().enumerate() {
-        let mut expected = Vec::with_capacity(GLM52_TP8_TOKENS * H);
+    for (step, &active) in [GLM52_TP_TOKENS, 3, GLM52_TP_TOKENS].iter().enumerate() {
+        let mut expected = Vec::with_capacity(GLM52_TP_TOKENS * H);
         for row in 0..active {
             expected.extend(expected_row(step, row));
         }
         // Want-mask contract: pad rows come back zero-filled (NaN canary
         // overwritten), not stale and not reduced.
-        expected.resize(GLM52_TP8_TOKENS * H, bf16::from_f32(0.0));
+        expected.resize(GLM52_TP_TOKENS * H, bf16::from_f32(0.0));
         for (rank, (results, _)) in all.iter().enumerate() {
             ensure!(
                 results[step] == expected,
