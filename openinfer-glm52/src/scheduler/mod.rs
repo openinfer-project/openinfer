@@ -53,8 +53,8 @@ use openinfer_sample::mix_seed;
 use tokio::sync::{mpsc, watch};
 
 use crate::model::{
-    GLM52_DECODE_BUCKETS, GLM52_MAX_BATCH_PER_RANK, GLM52_MLA_TOPK_SHORT, GLM52_MODEL_LEN_ALIGN,
-    Glm52StepKv, Glm52StepShape, glm52_pool_blocks, glm52_table_width,
+    GLM52_DECODE_BUCKETS, GLM52_MAX_BATCH_PER_RANK, GLM52_MODEL_LEN_ALIGN, Glm52StepKv,
+    Glm52StepShape, glm52_pool_blocks, glm52_table_width,
 };
 use crate::runner::{Glm52RankWorker, Glm52StepFlags};
 
@@ -404,46 +404,38 @@ fn precapture_step_graphs(
         .iter()
         .filter(|&&bucket| capture_bucket(bucket))
     {
-        for full_tier in [false, true] {
-            let mut shape = Glm52StepShape {
-                bucket,
-                slots: [0; GLM52_MAX_BATCH_PER_RANK],
-                active_rows: 0,
-            };
-            for (slot, dst) in shape.slots.iter_mut().enumerate().take(bucket) {
-                *dst = slot as u8;
-            }
-            let mut inputs =
-                [(GLM52_PADDING_STEP.token, GLM52_PADDING_STEP.position); GLM52_MAX_BATCH_PER_RANK];
-            if full_tier {
-                inputs[0] = (GLM52_PADDING_STEP.token, GLM52_MLA_TOPK_SHORT);
-            }
-            let flags = Glm52StepFlags::plain();
-            let responses = workers
-                .iter()
-                .enumerate()
-                .map(|(rank, worker)| {
-                    let pool = &pools[if mirrored { 0 } else { rank }];
-                    let kv = padding_step_kv(bucket, table_width, pool.padding_block_id(), &inputs);
-                    worker.step_async(inputs, shape, kv, flags, Vec::new(), 0)
-                })
-                .collect::<anyhow::Result<Vec<_>>>()
-                .context("GLM5.2 graph pre-capture submit")?;
-            for (rank, resp) in responses.into_iter().enumerate() {
-                resp.recv()
-                    .map_err(|_| anyhow::anyhow!("rank dropped its pre-capture response"))
-                    .and_then(|r| r)
-                    .with_context(|| {
-                        format!(
-                            "GLM5.2 graph pre-capture (bucket {bucket}, full tier {full_tier}) \
-                             on rank {rank}"
-                        )
-                    })?;
-            }
+        let mut shape = Glm52StepShape {
+            bucket,
+            slots: [0; GLM52_MAX_BATCH_PER_RANK],
+            active_rows: 0,
+        };
+        for (slot, dst) in shape.slots.iter_mut().enumerate().take(bucket) {
+            *dst = slot as u8;
+        }
+        let inputs =
+            [(GLM52_PADDING_STEP.token, GLM52_PADDING_STEP.position); GLM52_MAX_BATCH_PER_RANK];
+        let flags = Glm52StepFlags::plain();
+        let responses = workers
+            .iter()
+            .enumerate()
+            .map(|(rank, worker)| {
+                let pool = &pools[if mirrored { 0 } else { rank }];
+                let kv = padding_step_kv(bucket, table_width, pool.padding_block_id(), &inputs);
+                worker.step_async(inputs, shape, kv, flags, Vec::new(), 0)
+            })
+            .collect::<anyhow::Result<Vec<_>>>()
+            .context("GLM5.2 graph pre-capture submit")?;
+        for (rank, resp) in responses.into_iter().enumerate() {
+            resp.recv()
+                .map_err(|_| anyhow::anyhow!("rank dropped its pre-capture response"))
+                .and_then(|r| r)
+                .with_context(|| {
+                    format!("GLM5.2 graph pre-capture (bucket {bucket}) on rank {rank}")
+                })?;
         }
     }
     log::info!(
-        "GLM5.2 whole-step graphs pre-captured: {} buckets x 2 tiers",
+        "GLM5.2 whole-step graphs pre-captured: {} buckets",
         GLM52_DECODE_BUCKETS
             .iter()
             .filter(|&&bucket| capture_bucket(bucket))

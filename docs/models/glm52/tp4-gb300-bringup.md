@@ -1,6 +1,6 @@
 # GLM5.2 TP4 on GB300
 
-> **TL;DR:** GLM-5.2-FP8 TP4 on 4xGB300 via FlashInfer sparse MLA, compact decode buckets, SM-selected GEMV/MoE launches, and a vocabulary-sharded greedy tail. The 2026-07-10 matched pair beat vLLM pure TP4 at both fully warmed bs=1 shapes (`9.03` vs `9.21ms` at 1/256, `9.56` vs `9.60ms` at 1024/256); a 2026-07-11 re-validation on the same host reads `9.6/10.1ms` while vLLM reproduces its record — a host-state drift that hits only the OpenInfer path (same-day A/B proves the code did not regress; see "2026-07-11 re-validation"). Functional gates are all green. A controlled vLLM EP4 run is slower (`9.47/9.84ms`), so EP4 is out of scope.
+> **TL;DR:** GLM-5.2-FP8 TP4 on 4xGB300 via FlashInfer sparse MLA, compact decode buckets, SM-selected GEMV/MoE launches, and a vocabulary-sharded greedy tail. The 2026-07-10 matched pair beat vLLM pure TP4 at both fully warmed bs=1 shapes (`9.03` vs `9.21ms` at 1/256, `9.56` vs `9.60ms` at 1024/256); a 2026-07-11 re-validation on the same host reads higher on the OpenInfer path only — host-state drift, code exonerated by same-day A/B (see "2026-07-11 re-validation"). The short-context top-256 attention tier was then removed as non-production weight: it bought `~0.18ms/step` only at the synthetic 1/256 shape (real agent contexts pass 256 tokens immediately), so the 1/256 headline is now ~parity with vLLM while 1024/256 is unchanged. Functional gates are all green. A controlled vLLM EP4 run is slower (`9.47/9.84ms`), so EP4 is out of scope.
 >
 > **Last touched:** 2026-07
 
@@ -73,6 +73,8 @@ All serving rows are fully warmed, untraced, bs=1, concurrency 1, fixed input/ou
 | 1024/256 | `12.45ms` | `11.17ms` | `11.01ms` | `9.78ms` | **`9.56ms`** | `9.60ms` | `0.04ms` (`0.4%`) |
 
 The MLA switch recovered `1.47ms` at 1/256 and `1.28ms` at 1024/256. The MoE grid tune recovered another `0.15-0.16ms/token`. Compact TP4 graph buckets, SM103 one-row dense GEMV launches, the paired `q_a+kv_a` projection, and removal of the compact MoE output bridge recovered the next `1.23-1.40ms/token`. Vocabulary sharding recovered the final `0.22-0.25ms/token`.
+
+The compact/fused and vocab-shard 1/256 columns included a short-context top-256 attention tier that was later removed (see "Short-context tier removal" under the re-validation section); the 1024/256 columns never exercised it.
 
 ### EP4 topology check
 
@@ -148,7 +150,7 @@ A full re-run on the same host after the mainline rebase and review-hardening
 pass. Every functional gate is green: lib tests (59), server config tests (7,
 including the new tp-size/topology rejections), FlashInfer numerical smoke
 (uniform + paged-ramp), the vocabulary pack/unpack device smoke, graph
-pre-capture (`4 buckets x 2 tiers`), greedy byte-determinism ×2 with the
+pre-capture (`4 buckets`), greedy byte-determinism ×2 with the
 accepted `" Paris. Distance from ..."` prefix, sampled fallback, and 4-way
 concurrent greedy identity.
 
@@ -158,7 +160,8 @@ TPOT did not reproduce, and the cause is the host, not the code:
 | --- | ---: | ---: |
 | OpenInfer record (2026-07-10) | `9.03ms` | `9.56ms` |
 | OpenInfer pre-rebase source, rebuilt 07-11 | `9.57ms` | `10.10ms` |
-| OpenInfer HEAD (rebase + review fixes) | `9.67ms` | `10.21ms` |
+| OpenInfer rebase + review fixes | `9.67ms` | `10.21ms` |
+| OpenInfer HEAD (short tier removed) | `9.85ms` | `10.20ms` |
 | vLLM record (2026-07-10) | `9.21ms` | `9.60ms` |
 | vLLM re-run 07-11 (same launch config) | `9.27ms` | `9.65ms` |
 
@@ -168,6 +171,21 @@ the review fixes cost anything. vLLM reproduces its record within noise. The
 OpenInfer path alone pays a flat `+0.54ms/step` at BOTH shapes versus 07-10 —
 a constant per-step host effect (clocks pinned at max, no throttle reasons,
 no reboot, no MPS). Follow-up below.
+
+### Short-context tier removal
+
+The optimization pass had re-introduced a lossless top-256 attention tier
+(dual MLA schedule and whole-step graph per bucket, engaged while every row's
+context fit in 256 tokens) that mainline had previously deleted. It is
+removed again, for mainline's original reason: production serving is agent
+workloads whose contexts pass 256 tokens almost immediately, so the tier only
+ever engaged on the synthetic 1/256 benchmark shape. Same-day A/B: removing
+it costs `0.18ms/step` at 1/256 (`9.67 -> 9.85ms`) and nothing at 1024/256
+(`10.21 -> 10.20ms`). It also halves the pre-captured graphs and drops one
+MLA schedule per bucket. In record-day terms the 1/256 headline is therefore
+~parity with vLLM (`~9.21` vs `9.21ms`) rather than `2.0%` ahead; the
+1024/256 result is unaffected. Greedy byte-determinism, the sampled fallback,
+and the `" Paris. Distance from ..."` prefix all still pass post-removal.
 
 ## Artifacts
 
@@ -181,6 +199,7 @@ no reboot, no MPS). Follow-up below.
 - Final serving JSON: `bench_results/glm52-tp4-vocab-parallel-20260710/vocab-parallel-in{1,1024}-out256-c1-n20.json`
 - Final node trace: `bench_results/glm52-tp4-vocab-profile-20260710/openinfer-vocab-node.{nsys-rep,sqlite}`
 - Final trace summaries: `bench_results/glm52-tp4-vocab-profile-20260710/openinfer-vocab-node-{summary,tail}.md`
+- Post-tier-removal serving JSON: `bench_results/glm52-tp4-notier-20260711/notier-in{1,1024}-out256-c1-n20.json`
 
 ## Pitfalls
 

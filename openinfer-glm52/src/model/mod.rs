@@ -197,16 +197,17 @@ pub(crate) struct Glm52StepKv {
     pub(crate) slot_mapping: [i64; GLM52_MAX_BATCH_PER_RANK],
 }
 
-/// Lossless short-context attention tier: while every row has at most 256
-/// visible tokens, top-256 contains the full context and avoids the padded
-/// top-2048 walk. TP4's 1/256 serving gate exercises this tier.
-pub(crate) const GLM52_MLA_TOPK_SHORT: usize = 256;
+// There used to be a short-context attention tier here (topk 256 while every
+// row's context fit in it — lossless, 1/8 the index walk). Dropped: the
+// serving traffic is agent workloads whose contexts start well past 2048, so
+// the tier was dead weight — 2x the pre-captured graphs and a second MLA
+// schedule per bucket. To bring it back, restore the (bucket x tier) arrays
+// from git history; both decode backends already accept any topk multiple
+// of 64, and the checked-in FlashInfer cubin closure covers topk 256.
 
 // The attention `topk` feeds the DSA indexer's top-k selection, whose
 // buffers are sized for GLM52_INDEX_TOPK rows — pin the range here so the
 // indexer forward never needs to re-check it per layer per step.
-const _: () = assert!(GLM52_MLA_TOPK_SHORT > 0 && GLM52_MLA_TOPK_SHORT.is_multiple_of(64));
-const _: () = assert!(GLM52_MLA_TOPK_SHORT <= GLM52_INDEX_TOPK);
 const _: () = assert!(GLM52_FLASHMLA_SPARSE_TOPK > 0);
 const _: () = assert!(GLM52_FLASHMLA_SPARSE_TOPK <= GLM52_INDEX_TOPK);
 
@@ -287,13 +288,13 @@ pub(crate) struct Glm52RankModel {
     device_positions: [usize; GLM52_MAX_BATCH_PER_RANK],
 }
 
-/// Everything one decode bucket owns: per-attention-tier MLA schedules and
-/// whole-step graphs, shared scratch, and the device block table.
+/// Everything one decode bucket owns: the MLA schedule and whole-step
+/// graph, shared scratch, and the device block table.
 struct Glm52BucketState {
     rows: usize,
-    scheds: [Glm52MlaSchedMetadata; 2],
+    sched: Glm52MlaSchedMetadata,
     scratch: Glm52DecodeScratch,
-    graphs: [CudaGraphState; 2],
+    graph: CudaGraphState,
     block_table: CudaSlice<i32>,
     /// Pinned landing buffers for this bucket's argmax D2H, sized exactly
     /// `rows` (`memcpy_dtoh` copies the DESTINATION's byte count). Pinned
@@ -303,10 +304,6 @@ struct Glm52BucketState {
     argmax_indices_host: PinnedHostSlice<i32>,
 }
 
-/// Tier index into the per-tier arrays: every consumer selects with the same
-/// index computed once per step.
-const TIER_FULL: usize = 0;
-const TIER_SHORT: usize = 1;
 /// Attention layers occupy AR slots `0..GLM52_LAYERS`; the tail reuses the
 /// same fixed-order transport to gather vocabulary-shard top-1 candidates.
 const VOCAB_AR_SLOT: usize = GLM52_LAYERS;
@@ -534,12 +531,6 @@ impl Glm52RankModel {
                 batch_size: rows,
                 ..contract
             };
-            let contract_rows_short = Glm52FlashMlaSparseDecode {
-                batch_size: rows,
-                topk: GLM52_MLA_TOPK_SHORT,
-                num_sm_parts: num_sm_parts.min(GLM52_MLA_TOPK_SHORT / 64),
-                ..contract
-            };
             let mqa_shape = Glm52IndexerScratch::decode_shape(
                 rows,
                 index_cache_layout,
@@ -550,20 +541,12 @@ impl Glm52RankModel {
             let bucket_table = ctx.stream.alloc_zeros::<i32>(rows * table_width)?;
             buckets.push(Glm52BucketState {
                 rows,
-                scheds: [
-                    Glm52MlaSchedMetadata::new_for_backend(
-                        ctx,
-                        contract_rows,
-                        mla_heads,
-                        mla_backend,
-                    )?,
-                    Glm52MlaSchedMetadata::new_for_backend(
-                        ctx,
-                        contract_rows_short,
-                        mla_heads,
-                        mla_backend,
-                    )?,
-                ],
+                sched: Glm52MlaSchedMetadata::new_for_backend(
+                    ctx,
+                    contract_rows,
+                    mla_heads,
+                    mla_backend,
+                )?,
                 scratch: Glm52DecodeScratch::new_for_backend(
                     ctx,
                     &contract_rows,
@@ -571,7 +554,7 @@ impl Glm52RankModel {
                     mla_heads,
                     mla_backend,
                 )?,
-                graphs: [CudaGraphState::new(), CudaGraphState::new()],
+                graph: CudaGraphState::new(),
                 block_table: bucket_table,
                 // Read only after a D2H lands in them (the write-combined
                 // pages start uninitialized).
@@ -586,14 +569,12 @@ impl Glm52RankModel {
 
         if mla_backend == crate::mla_decode::Glm52MlaBackend::FlashInferFp8 {
             for bucket in &mut buckets {
-                for tier in 0..bucket.scheds.len() {
-                    glm52_mla_backend_preflight(
-                        ctx,
-                        &bucket.scheds[tier],
-                        &mut bucket.scratch.mla_attend,
-                        &caches[0].mla_cache,
-                    )?;
-                }
+                glm52_mla_backend_preflight(
+                    ctx,
+                    &bucket.sched,
+                    &mut bucket.scratch.mla_attend,
+                    &caches[0].mla_cache,
+                )?;
             }
             ctx.sync()?;
         }
@@ -972,11 +953,6 @@ impl Glm52RankModel {
             }
         }
 
-        let short_tier = (0..batch)
-            .map(|row| inputs[row].1 + 1)
-            .max()
-            .is_some_and(|longest| longest <= GLM52_MLA_TOPK_SHORT);
-        let tier = if short_tier { TIER_SHORT } else { TIER_FULL };
         // The bucket state selected above carries the plan, scratch, graph,
         // and block table together — one coherent shape.
         let step = Glm52DecodeStep {
@@ -984,7 +960,7 @@ impl Glm52RankModel {
             mla_sin: &self.sin,
             idx_cos: &self.cos,
             idx_sin: &self.sin,
-            mla_sched: &bucket.scheds[tier],
+            mla_sched: &bucket.sched,
             slot_mapping: &self.slot_mapping,
             block_table: &bucket.block_table,
             seq_lens: &self.seq_lens,
@@ -995,7 +971,7 @@ impl Glm52RankModel {
 
         let s = &mut bucket.scratch;
         let decode_lm_head = self.decode_lm_head.as_ref().unwrap_or(&self.lm_head);
-        let mut graph = std::mem::take(&mut bucket.graphs[tier]);
+        let mut graph = std::mem::take(&mut bucket.graph);
         let result = graph.run_or_capture(ctx, || {
             run_step_body(
                 ctx,
@@ -1014,7 +990,7 @@ impl Glm52RankModel {
                 global_tokens,
             )
         });
-        bucket.graphs[tier] = graph;
+        bucket.graph = graph;
         result
     }
 }
