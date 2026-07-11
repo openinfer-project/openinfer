@@ -1515,7 +1515,7 @@ fn main() {
             "-I".to_string(),
             cuda_include.to_string_lossy().to_string(),
         ];
-        nvcc_args.extend(arch_args.clone());
+        nvcc_args.extend(arch_args);
         nvcc_args.extend(["--compiler-options".to_string(), "-fPIC".to_string()]);
         nvcc_tasks.push(NvccTask {
             cu_file: stub_path,
