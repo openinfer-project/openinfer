@@ -1,9 +1,9 @@
 use half::bf16;
 use openinfer_core::tensor::{DeviceContext, DeviceMatrix, HiddenStates};
 use openinfer_kernels::ops::{
-    Dsv2LiteRouterOutput, dsv2_lite_accumulate_fixed_expert_into,
-    dsv2_lite_accumulate_route_row_into, dsv2_lite_router_logits_into,
-    dsv2_lite_router_softmax_topk_into,
+    Dsv2LiteAttentionConfig, Dsv2LiteRouterOutput, dsv2_lite_accumulate_fixed_expert_into,
+    dsv2_lite_accumulate_route_row_into, dsv2_lite_decode_attention_into, dsv2_lite_kv_norm_into,
+    dsv2_lite_router_logits_into, dsv2_lite_router_softmax_topk_into,
 };
 
 use crate::{
@@ -149,6 +149,293 @@ fn route_row_accumulation_selects_group_output_row() {
     let actual = ctx.stream.clone_dtoh(&out).expect("output D2H");
     ctx.sync().expect("sync accumulation");
     assert_eq!(actual, vec![1.5, 2.0, 0.0, 0.0]);
+}
+
+#[test]
+fn router_logits_rejects_inflated_hidden_metadata() {
+    let ctx = DeviceContext::new().expect("create CUDA context");
+    let hidden = HiddenStates {
+        data: ctx
+            .stream
+            .clone_htod(&bf16_vec(&[1.0, -2.0, 0.5, 3.0]))
+            .expect("hidden H2D"),
+        hidden_dim: 4,
+        seq_len: 4096,
+    };
+    let gate = DeviceMatrix::from_host(&ctx, &router_gate_fixture(), 8, 4).expect("gate H2D");
+    let mut logits = ctx
+        .stream
+        .alloc_zeros::<f32>(hidden.seq_len * gate.rows)
+        .expect("logits");
+
+    let err = dsv2_lite_router_logits_into(&ctx, &hidden, &gate, &mut logits)
+        .expect_err("inflated hidden metadata must fail before CUDA launch");
+    assert_error_contains(err, "router hidden backing buffer too small");
+}
+
+#[test]
+fn router_logits_rejects_inflated_gate_metadata() {
+    let ctx = DeviceContext::new().expect("create CUDA context");
+    let hidden = HiddenStates {
+        data: ctx
+            .stream
+            .clone_htod(&bf16_vec(&[1.0, -2.0, 0.5, 3.0]))
+            .expect("hidden H2D"),
+        hidden_dim: 4,
+        seq_len: 1,
+    };
+    let gate = DeviceMatrix {
+        data: ctx
+            .stream
+            .clone_htod(&bf16_vec(&[0.25, 0.5, -0.25, 1.0]))
+            .expect("gate H2D"),
+        rows: 8,
+        cols: 4,
+    };
+    let mut logits = ctx
+        .stream
+        .alloc_zeros::<f32>(hidden.seq_len * gate.rows)
+        .expect("logits");
+
+    let err = dsv2_lite_router_logits_into(&ctx, &hidden, &gate, &mut logits)
+        .expect_err("inflated gate metadata must fail before CUDA launch");
+    assert_error_contains(err, "router gate backing buffer too small");
+}
+
+#[test]
+fn router_topk_rejects_inflated_hidden_metadata() {
+    let ctx = DeviceContext::new().expect("create CUDA context");
+    let hidden = HiddenStates {
+        data: ctx
+            .stream
+            .clone_htod(&bf16_vec(&[1.0, -2.0, 0.5, 3.0]))
+            .expect("hidden H2D"),
+        hidden_dim: 4,
+        seq_len: 4096,
+    };
+    let gate = DeviceMatrix::from_host(&ctx, &router_gate_fixture(), 8, 4).expect("gate H2D");
+    let topk = 6;
+    let mut topk_weight = ctx
+        .stream
+        .alloc_zeros::<f32>(hidden.seq_len * topk)
+        .expect("topk weight");
+    let mut topk_idx = ctx
+        .stream
+        .alloc_zeros::<i32>(hidden.seq_len * topk)
+        .expect("topk idx");
+
+    let err = dsv2_lite_router_softmax_topk_into(
+        &ctx,
+        &hidden,
+        &gate,
+        topk,
+        &mut Dsv2LiteRouterOutput {
+            topk_weight: &mut topk_weight,
+            topk_idx: &mut topk_idx,
+        },
+    )
+    .expect_err("inflated hidden metadata must fail before CUDA launch");
+    assert_error_contains(err, "router hidden backing buffer too small");
+}
+
+#[test]
+fn route_row_accumulation_rejects_inflated_rows_metadata() {
+    let ctx = DeviceContext::new().expect("create CUDA context");
+    let rows = HiddenStates {
+        data: ctx
+            .stream
+            .clone_htod(&bf16_vec(&[1.0, 2.0]))
+            .expect("rows H2D"),
+        hidden_dim: 2,
+        seq_len: 4096,
+    };
+    let mut out = ctx
+        .stream
+        .alloc_zeros::<f32>(rows.hidden_dim * rows.seq_len)
+        .expect("output");
+
+    let err = dsv2_lite_accumulate_route_row_into(
+        &ctx,
+        rows.as_ref(),
+        4095,
+        0.5,
+        0,
+        rows.seq_len,
+        &mut out,
+    )
+    .expect_err("inflated rows metadata must fail before CUDA launch");
+    assert_error_contains(err, "route rows backing buffer too small");
+}
+
+#[test]
+fn fixed_expert_accumulate_rejects_inflated_output_metadata() {
+    let ctx = DeviceContext::new().expect("create CUDA context");
+    let expert_output = HiddenStates {
+        data: ctx
+            .stream
+            .clone_htod(&bf16_vec(&[1.0, 2.0, 3.0]))
+            .expect("expert output H2D"),
+        hidden_dim: 3,
+        seq_len: 2,
+    };
+    let topk = 3;
+    let topk_weight = ctx
+        .stream
+        .clone_htod(&[0.25f32, 0.5, 0.25, 0.1, 0.2, 0.7])
+        .expect("route weights H2D");
+    let topk_idx = ctx
+        .stream
+        .clone_htod(&[2i32, 5, 7, 1, 5, 6])
+        .expect("route idx H2D");
+    let mut accum = ctx
+        .stream
+        .alloc_zeros::<f32>(expert_output.hidden_dim * expert_output.seq_len)
+        .expect("accum");
+
+    let err = dsv2_lite_accumulate_fixed_expert_into(
+        &ctx,
+        &expert_output,
+        &topk_weight,
+        &topk_idx,
+        5,
+        topk,
+        &mut accum,
+    )
+    .expect_err("inflated expert output metadata must fail before CUDA launch");
+    assert_error_contains(err, "fixed-expert output backing buffer too small");
+}
+
+#[test]
+fn kv_norm_rejects_inflated_input_metadata() {
+    let ctx = DeviceContext::new().expect("create CUDA context");
+    let kv_a = HiddenStates {
+        data: ctx
+            .stream
+            .clone_htod(&bf16_vec(&[1.0, 2.0]))
+            .expect("kv_a H2D"),
+        hidden_dim: 4,
+        seq_len: 2,
+    };
+    let norm_weight = ctx
+        .stream
+        .clone_htod(&bf16_vec(&[1.0, 1.0]))
+        .expect("norm weight H2D");
+    let mut compressed = HiddenStates {
+        data: ctx
+            .stream
+            .clone_htod(&bf16_vec(&[0.0, 0.0, 0.0, 0.0]))
+            .expect("compressed H2D"),
+        hidden_dim: 2,
+        seq_len: 2,
+    };
+
+    let err = dsv2_lite_kv_norm_into(&ctx, &kv_a, &norm_weight, 2, 1.0e-6, &mut compressed)
+        .expect_err("inflated kv_a metadata must fail before CUDA launch");
+    assert_error_contains(err, "kv norm kv_a backing buffer too small");
+}
+
+#[test]
+fn kv_norm_rejects_inflated_output_metadata() {
+    let ctx = DeviceContext::new().expect("create CUDA context");
+    let kv_a = HiddenStates {
+        data: ctx
+            .stream
+            .clone_htod(&bf16_vec(&[1.0, 2.0, 3.0, 4.0]))
+            .expect("kv_a H2D"),
+        hidden_dim: 2,
+        seq_len: 2,
+    };
+    let norm_weight = ctx
+        .stream
+        .clone_htod(&bf16_vec(&[1.0, 1.0]))
+        .expect("norm weight H2D");
+    let mut compressed = HiddenStates {
+        data: ctx
+            .stream
+            .clone_htod(&bf16_vec(&[0.0, 0.0]))
+            .expect("compressed H2D"),
+        hidden_dim: 2,
+        seq_len: 2,
+    };
+
+    let err = dsv2_lite_kv_norm_into(&ctx, &kv_a, &norm_weight, 2, 1.0e-6, &mut compressed)
+        .expect_err("inflated compressed metadata must fail before CUDA launch");
+    assert_error_contains(err, "kv norm compressed backing buffer too small");
+}
+
+#[test]
+fn decode_attention_rejects_inflated_q_metadata() {
+    let ctx = DeviceContext::new().expect("create CUDA context");
+    let cfg = tiny_attention_config();
+    let q = HiddenStates {
+        data: ctx
+            .stream
+            .clone_htod(&bf16_vec(&[1.0, 2.0]))
+            .expect("q H2D"),
+        hidden_dim: 4,
+        seq_len: 1,
+    };
+    let kv_a = hidden_fixture(&ctx, 3);
+    let kv_b = hidden_fixture(&ctx, 4);
+    let mut out = hidden_fixture(&ctx, 2);
+    let mut key_cache = ctx
+        .stream
+        .alloc_zeros::<f32>(cfg.max_seq_len * cfg.num_heads * 4)
+        .expect("key cache");
+    let mut value_cache = ctx
+        .stream
+        .alloc_zeros::<f32>(cfg.max_seq_len * cfg.num_heads * cfg.v_head_dim)
+        .expect("value cache");
+
+    let err = dsv2_lite_decode_attention_into(
+        &ctx,
+        cfg,
+        &q,
+        &kv_a,
+        &kv_b,
+        0,
+        &mut key_cache,
+        &mut value_cache,
+        &mut out,
+    )
+    .expect_err("inflated q metadata must fail before CUDA launch");
+    assert_error_contains(err, "attention q backing buffer too small");
+}
+
+#[test]
+fn decode_attention_rejects_inflated_output_metadata() {
+    let ctx = DeviceContext::new().expect("create CUDA context");
+    let cfg = tiny_attention_config();
+    let q = hidden_fixture(&ctx, 4);
+    let kv_a = hidden_fixture(&ctx, 3);
+    let kv_b = hidden_fixture(&ctx, 4);
+    let mut out = HiddenStates {
+        data: ctx.stream.clone_htod(&bf16_vec(&[0.0])).expect("out H2D"),
+        hidden_dim: 2,
+        seq_len: 1,
+    };
+    let mut key_cache = ctx
+        .stream
+        .alloc_zeros::<f32>(cfg.max_seq_len * cfg.num_heads * 4)
+        .expect("key cache");
+    let mut value_cache = ctx
+        .stream
+        .alloc_zeros::<f32>(cfg.max_seq_len * cfg.num_heads * cfg.v_head_dim)
+        .expect("value cache");
+
+    let err = dsv2_lite_decode_attention_into(
+        &ctx,
+        cfg,
+        &q,
+        &kv_a,
+        &kv_b,
+        0,
+        &mut key_cache,
+        &mut value_cache,
+        &mut out,
+    )
+    .expect_err("inflated out metadata must fail before CUDA launch");
+    assert_error_contains(err, "attention out backing buffer too small");
 }
 
 #[test]
@@ -324,6 +611,31 @@ fn expert_output_fixture(ctx: &DeviceContext, hidden_dim: usize, seq_len: usize)
     }
 }
 
+fn hidden_fixture(ctx: &DeviceContext, hidden_dim: usize) -> HiddenStates {
+    HiddenStates {
+        data: ctx
+            .stream
+            .clone_htod(&bf16_vec(&vec![0.0; hidden_dim]))
+            .expect("hidden H2D"),
+        hidden_dim,
+        seq_len: 1,
+    }
+}
+
+fn tiny_attention_config() -> Dsv2LiteAttentionConfig {
+    Dsv2LiteAttentionConfig {
+        num_heads: 1,
+        qk_nope_head_dim: 2,
+        qk_rope_head_dim: 2,
+        v_head_dim: 2,
+        kv_lora_rank: 1,
+        max_seq_len: 2,
+        rms_norm_eps: 1.0e-6,
+        rope_theta: 10_000.0,
+        rope_scaling: None,
+    }
+}
+
 fn bf16_vec(values: &[f32]) -> Vec<bf16> {
     values.iter().copied().map(bf16::from_f32).collect()
 }
@@ -342,5 +654,13 @@ fn assert_close(got: f32, expected: f32, tolerance: f32) {
     assert!(
         (got - expected).abs() <= tolerance,
         "got {got}, expected {expected}, tolerance {tolerance}"
+    );
+}
+
+fn assert_error_contains(err: anyhow::Error, needle: &str) {
+    let message = err.to_string();
+    assert!(
+        message.contains(needle),
+        "expected error containing {needle:?}, got {message:?}"
     );
 }

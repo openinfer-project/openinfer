@@ -5,6 +5,53 @@ use half::bf16;
 use crate::ffi;
 use crate::tensor::{DeviceContext, DeviceMatrix, HiddenStates, HiddenStatesRef};
 
+const DSV2_LITE_ACCUM_THREADS: usize = 256;
+
+fn checked_len(label: &str, lhs: usize, rhs: usize) -> Result<usize> {
+    lhs.checked_mul(rhs)
+        .ok_or_else(|| anyhow!("DSV2-Lite {label} element count overflow"))
+}
+
+fn as_i32(label: &str, value: usize) -> Result<i32> {
+    i32::try_from(value).map_err(|_| anyhow!("DSV2-Lite {label} exceeds i32 range: {value}"))
+}
+
+fn as_accum_launch_i32(label: &str, len: usize) -> Result<i32> {
+    let max_len = i32::MAX as usize - (DSV2_LITE_ACCUM_THREADS - 1);
+    ensure!(
+        len <= max_len,
+        "DSV2-Lite {label} exceeds CUDA int launch rounding range: {len}"
+    );
+    as_i32(label, len)
+}
+
+fn ensure_hidden_backing_len(
+    label: &str,
+    data_len: usize,
+    hidden_dim: usize,
+    seq_len: usize,
+) -> Result<usize> {
+    let needed = checked_len(label, hidden_dim, seq_len)?;
+    as_i32(label, needed)?;
+    ensure!(
+        data_len >= needed,
+        "DSV2-Lite {label} backing buffer too small: have {}, need {needed}",
+        data_len
+    );
+    Ok(needed)
+}
+
+fn ensure_matrix_backing_len(label: &str, data_len: usize, rows: usize, cols: usize) -> Result<()> {
+    let needed = checked_len(label, rows, cols)?;
+    as_i32(label, needed)?;
+    ensure!(
+        data_len >= needed,
+        "DSV2-Lite {label} backing buffer too small: have {}, need {needed}",
+        data_len
+    );
+    Ok(())
+}
+
 pub struct Dsv2LiteRouterOutput<'a> {
     pub topk_weight: &'a mut CudaSlice<f32>,
     pub topk_idx: &'a mut CudaSlice<i32>,
@@ -22,15 +69,28 @@ pub fn dsv2_lite_router_logits_into(
         hidden.hidden_dim,
         gate_weight.cols
     );
-    let logits_elems = hidden
-        .seq_len
-        .checked_mul(gate_weight.rows)
-        .ok_or_else(|| anyhow!("DSV2-Lite router logits element count overflow"))?;
+    ensure_hidden_backing_len(
+        "router hidden",
+        hidden.data.len(),
+        hidden.hidden_dim,
+        hidden.seq_len,
+    )?;
+    ensure_matrix_backing_len(
+        "router gate",
+        gate_weight.data.len(),
+        gate_weight.rows,
+        gate_weight.cols,
+    )?;
+    let logits_elems = checked_len("router logits", hidden.seq_len, gate_weight.rows)?;
+    as_i32("router logits", logits_elems)?;
     ensure!(
         logits.len() >= logits_elems,
         "DSV2-Lite router logits output too small: have {}, need {logits_elems}",
         logits.len()
     );
+    let seq_len = as_i32("router seq_len", hidden.seq_len)?;
+    let hidden_dim = as_i32("router hidden_dim", hidden.hidden_dim)?;
+    let n_experts = as_i32("router n_experts", gate_weight.rows)?;
 
     let (hidden_ptr, _hidden_guard) = hidden.data.device_ptr(&ctx.stream);
     let (gate_ptr, _gate_guard) = gate_weight.data.device_ptr(&ctx.stream);
@@ -40,9 +100,9 @@ pub fn dsv2_lite_router_logits_into(
             hidden_ptr as *const ffi::Half,
             gate_ptr as *const ffi::Half,
             logits_ptr as *mut f32,
-            hidden.seq_len as i32,
-            hidden.hidden_dim as i32,
-            gate_weight.rows as i32,
+            seq_len,
+            hidden_dim,
+            n_experts,
             ctx.stream.cu_stream(),
         )
     };
@@ -70,10 +130,9 @@ pub fn dsv2_lite_accumulate_route_row_into(
         token_idx < seq_len,
         "DSV2-Lite route token {token_idx} exceeds seq_len {seq_len}"
     );
-    let output_elems = rows
-        .hidden_dim
-        .checked_mul(seq_len)
-        .ok_or_else(|| anyhow!("DSV2-Lite route accumulation output size overflow"))?;
+    ensure_hidden_backing_len("route rows", rows.data.len(), rows.hidden_dim, rows.seq_len)?;
+    let output_elems = checked_len("route accumulation output", rows.hidden_dim, seq_len)?;
+    as_i32("route accumulation output", output_elems)?;
     ensure!(
         out.len() >= output_elems,
         "DSV2-Lite route accumulation output too small: have {}, need {output_elems}",
@@ -82,16 +141,28 @@ pub fn dsv2_lite_accumulate_route_row_into(
     let source_offset = source_row
         .checked_mul(rows.hidden_dim)
         .ok_or_else(|| anyhow!("DSV2-Lite route source offset overflow"))?;
-    let (rows_ptr, _rows_guard) = rows.data.device_ptr(&ctx.stream);
+    let source_end = source_offset
+        .checked_add(rows.hidden_dim)
+        .ok_or_else(|| anyhow!("DSV2-Lite route source row end overflow"))?;
+    ensure!(
+        source_end <= rows.data.len(),
+        "DSV2-Lite route source row backing buffer too small: have {}, need {source_end}",
+        rows.data.len()
+    );
+    let hidden_dim = as_accum_launch_i32("route hidden_dim", rows.hidden_dim)?;
+    let token_idx = as_i32("route token_idx", token_idx)?;
+    let seq_len = as_i32("route seq_len", seq_len)?;
+    let source_view = rows.data.slice(source_offset..source_end);
+    let (source_ptr, _source_guard) = source_view.device_ptr(&ctx.stream);
     let (out_ptr, _out_guard) = out.device_ptr_mut(&ctx.stream);
     let result = unsafe {
         ffi::accumulate_bf16_token_scaled_to_f32_cuda(
-            (rows_ptr as *const ffi::Half).add(source_offset),
+            source_ptr as *const ffi::Half,
             scale,
             out_ptr as *mut f32,
-            rows.hidden_dim as i32,
-            token_idx as i32,
-            seq_len as i32,
+            hidden_dim,
+            token_idx,
+            seq_len,
             ctx.stream.cu_stream(),
         )
     };
@@ -151,10 +222,20 @@ pub fn dsv2_lite_router_softmax_topk_ref_into(
         "DSV2-Lite router invalid n_experts={} topk={topk}",
         gate_weight.rows
     );
-    let route_elems = hidden
-        .seq_len
-        .checked_mul(topk)
-        .ok_or_else(|| anyhow!("DSV2-Lite router route element count overflow"))?;
+    ensure_hidden_backing_len(
+        "router hidden",
+        hidden.data.len(),
+        hidden.hidden_dim,
+        hidden.seq_len,
+    )?;
+    ensure_matrix_backing_len(
+        "router gate",
+        gate_weight.data.len(),
+        gate_weight.rows,
+        gate_weight.cols,
+    )?;
+    let route_elems = checked_len("router route", hidden.seq_len, topk)?;
+    as_i32("router route", route_elems)?;
     ensure!(
         output.topk_weight.len() >= route_elems,
         "DSV2-Lite router topk_weight too small: have {}, need {route_elems}",
@@ -165,6 +246,10 @@ pub fn dsv2_lite_router_softmax_topk_ref_into(
         "DSV2-Lite router topk_idx too small: have {}, need {route_elems}",
         output.topk_idx.len()
     );
+    let seq_len = as_i32("router seq_len", hidden.seq_len)?;
+    let hidden_dim = as_i32("router hidden_dim", hidden.hidden_dim)?;
+    let n_experts = as_i32("router n_experts", gate_weight.rows)?;
+    let topk = as_i32("router topk", topk)?;
 
     let (hidden_ptr, _hidden_guard) = hidden.data.device_ptr(&ctx.stream);
     let (gate_ptr, _gate_guard) = gate_weight.data.device_ptr(&ctx.stream);
@@ -176,10 +261,10 @@ pub fn dsv2_lite_router_softmax_topk_ref_into(
             gate_ptr as *const ffi::Half,
             weight_ptr as *mut f32,
             idx_ptr as *mut i32,
-            hidden.seq_len as i32,
-            hidden.hidden_dim as i32,
-            gate_weight.rows as i32,
-            topk as i32,
+            seq_len,
+            hidden_dim,
+            n_experts,
+            topk,
             ctx.stream.cu_stream(),
         )
     };
@@ -201,14 +286,14 @@ pub fn dsv2_lite_accumulate_fixed_expert_into(
         expert_output.hidden_dim > 0 && expert_output.seq_len > 0,
         "DSV2-Lite fixed-expert accumulate requires non-empty expert output"
     );
-    let route_elems = expert_output
-        .seq_len
-        .checked_mul(topk)
-        .ok_or_else(|| anyhow!("DSV2-Lite fixed-expert route element count overflow"))?;
-    let hidden_elems = expert_output
-        .hidden_dim
-        .checked_mul(expert_output.seq_len)
-        .ok_or_else(|| anyhow!("DSV2-Lite fixed-expert hidden element count overflow"))?;
+    let route_elems = checked_len("fixed-expert route", expert_output.seq_len, topk)?;
+    as_i32("fixed-expert route", route_elems)?;
+    let hidden_elems = ensure_hidden_backing_len(
+        "fixed-expert output",
+        expert_output.data.len(),
+        expert_output.hidden_dim,
+        expert_output.seq_len,
+    )?;
     ensure!(
         topk_weight.len() >= route_elems && topk_idx.len() >= route_elems,
         "DSV2-Lite fixed-expert route buffers too small: weights={}, idx={}, need {route_elems}",
@@ -220,6 +305,11 @@ pub fn dsv2_lite_accumulate_fixed_expert_into(
         "DSV2-Lite fixed-expert accum too small: have {}, need {hidden_elems}",
         accum.len()
     );
+    as_accum_launch_i32("fixed-expert hidden", hidden_elems)?;
+    let global_expert = as_i32("fixed-expert global_expert", global_expert)?;
+    let seq_len = as_i32("fixed-expert seq_len", expert_output.seq_len)?;
+    let hidden_dim = as_i32("fixed-expert hidden_dim", expert_output.hidden_dim)?;
+    let topk = as_i32("fixed-expert topk", topk)?;
 
     let (expert_ptr, _expert_guard) = expert_output.data.device_ptr(&ctx.stream);
     let (weight_ptr, _weight_guard) = topk_weight.device_ptr(&ctx.stream);
@@ -231,10 +321,10 @@ pub fn dsv2_lite_accumulate_fixed_expert_into(
             weight_ptr as *const f32,
             idx_ptr as *const i32,
             accum_ptr as *mut f32,
-            global_expert as i32,
-            expert_output.seq_len as i32,
-            expert_output.hidden_dim as i32,
-            topk as i32,
+            global_expert,
+            seq_len,
+            hidden_dim,
+            topk,
             ctx.stream.cu_stream(),
         )
     };
@@ -268,6 +358,21 @@ pub fn dsv2_lite_kv_norm_into(
         "DSV2-Lite kv norm weight too small: have {}, need {kv_lora_rank}",
         norm_weight.len()
     );
+    ensure_hidden_backing_len(
+        "kv norm kv_a",
+        kv_a.data.len(),
+        kv_a.hidden_dim,
+        kv_a.seq_len,
+    )?;
+    ensure_hidden_backing_len(
+        "kv norm compressed",
+        compressed.data.len(),
+        compressed.hidden_dim,
+        compressed.seq_len,
+    )?;
+    let kv_lora_rank = as_i32("kv norm kv_lora_rank", kv_lora_rank)?;
+    let kv_a_rows = as_i32("kv norm kv_a rows", kv_a.hidden_dim)?;
+    let seq_len = as_i32("kv norm seq_len", kv_a.seq_len)?;
     let (kv_a_ptr, _kv_a_guard) = kv_a.data.device_ptr(&ctx.stream);
     let (weight_ptr, _weight_guard) = norm_weight.device_ptr(&ctx.stream);
     let (compressed_ptr, _compressed_guard) = compressed.data.device_ptr_mut(&ctx.stream);
@@ -276,9 +381,9 @@ pub fn dsv2_lite_kv_norm_into(
             kv_a_ptr as *const ffi::Half,
             weight_ptr as *const ffi::Half,
             compressed_ptr as *mut ffi::Half,
-            kv_lora_rank as i32,
-            kv_a.hidden_dim as i32,
-            kv_a.seq_len as i32,
+            kv_lora_rank,
+            kv_a_rows,
+            seq_len,
             eps,
             ctx.stream.cu_stream(),
         )
@@ -300,29 +405,51 @@ pub fn dsv2_lite_decode_attention_into(
     value_cache: &mut CudaSlice<f32>,
     out: &mut HiddenStates,
 ) -> Result<()> {
-    let query_head_dim = cfg.qk_nope_head_dim + cfg.qk_rope_head_dim;
-    let kv_b_stride = cfg.qk_nope_head_dim + cfg.v_head_dim;
+    let query_head_dim = cfg
+        .qk_nope_head_dim
+        .checked_add(cfg.qk_rope_head_dim)
+        .ok_or_else(|| anyhow!("DSV2-Lite attention query head dim overflow"))?;
+    let kv_b_stride = cfg
+        .qk_nope_head_dim
+        .checked_add(cfg.v_head_dim)
+        .ok_or_else(|| anyhow!("DSV2-Lite attention kv_b stride overflow"))?;
+    let expected_q_dim = cfg
+        .num_heads
+        .checked_mul(query_head_dim)
+        .ok_or_else(|| anyhow!("DSV2-Lite attention q dim overflow"))?;
+    let expected_kv_a_dim = cfg
+        .kv_lora_rank
+        .checked_add(cfg.qk_rope_head_dim)
+        .ok_or_else(|| anyhow!("DSV2-Lite attention kv_a dim overflow"))?;
+    let expected_kv_b_dim = cfg
+        .num_heads
+        .checked_mul(kv_b_stride)
+        .ok_or_else(|| anyhow!("DSV2-Lite attention kv_b dim overflow"))?;
+    let expected_out_dim = cfg
+        .num_heads
+        .checked_mul(cfg.v_head_dim)
+        .ok_or_else(|| anyhow!("DSV2-Lite attention out dim overflow"))?;
     ensure!(
-        q.hidden_dim == cfg.num_heads * query_head_dim && q.seq_len == 1,
+        q.hidden_dim == expected_q_dim && q.seq_len == 1,
         "DSV2-Lite attention q shape mismatch: got [{} x {}], expected [{} x 1]",
         q.hidden_dim,
         q.seq_len,
-        cfg.num_heads * query_head_dim
+        expected_q_dim
     );
     ensure!(
-        kv_a.hidden_dim == cfg.kv_lora_rank + cfg.qk_rope_head_dim && kv_a.seq_len == 1,
+        kv_a.hidden_dim == expected_kv_a_dim && kv_a.seq_len == 1,
         "DSV2-Lite attention kv_a shape mismatch: got [{} x {}]",
         kv_a.hidden_dim,
         kv_a.seq_len
     );
     ensure!(
-        kv_b.hidden_dim == cfg.num_heads * kv_b_stride && kv_b.seq_len == 1,
+        kv_b.hidden_dim == expected_kv_b_dim && kv_b.seq_len == 1,
         "DSV2-Lite attention kv_b shape mismatch: got [{} x {}]",
         kv_b.hidden_dim,
         kv_b.seq_len
     );
     ensure!(
-        out.hidden_dim == cfg.num_heads * cfg.v_head_dim && out.seq_len == 1,
+        out.hidden_dim == expected_out_dim && out.seq_len == 1,
         "DSV2-Lite attention out shape mismatch: got [{} x {}]",
         out.hidden_dim,
         out.seq_len
@@ -332,16 +459,13 @@ pub fn dsv2_lite_decode_attention_into(
         "DSV2-Lite attention position {position} exceeds max_seq_len {}",
         cfg.max_seq_len
     );
-    let key_elems = cfg
-        .max_seq_len
-        .checked_mul(cfg.num_heads)
-        .and_then(|value| value.checked_mul(query_head_dim))
-        .ok_or_else(|| anyhow!("DSV2-Lite attention key cache element overflow"))?;
-    let value_elems = cfg
-        .max_seq_len
-        .checked_mul(cfg.num_heads)
-        .and_then(|value| value.checked_mul(cfg.v_head_dim))
-        .ok_or_else(|| anyhow!("DSV2-Lite attention value cache element overflow"))?;
+    let key_cache_rows = checked_len("attention key cache rows", cfg.max_seq_len, cfg.num_heads)?;
+    let key_elems = checked_len("attention key cache", key_cache_rows, query_head_dim)?;
+    as_i32("attention key cache", key_elems)?;
+    let value_cache_rows =
+        checked_len("attention value cache rows", cfg.max_seq_len, cfg.num_heads)?;
+    let value_elems = checked_len("attention value cache", value_cache_rows, cfg.v_head_dim)?;
+    as_i32("attention value cache", value_elems)?;
     ensure!(
         key_cache.len() >= key_elems,
         "DSV2-Lite attention key cache too small: have {}, need {key_elems}",
@@ -352,6 +476,20 @@ pub fn dsv2_lite_decode_attention_into(
         "DSV2-Lite attention value cache too small: have {}, need {value_elems}",
         value_cache.len()
     );
+    ensure_hidden_backing_len("attention q", q.data.len(), q.hidden_dim, q.seq_len)?;
+    ensure_hidden_backing_len(
+        "attention kv_a",
+        kv_a.data.len(),
+        kv_a.hidden_dim,
+        kv_a.seq_len,
+    )?;
+    ensure_hidden_backing_len(
+        "attention kv_b",
+        kv_b.data.len(),
+        kv_b.hidden_dim,
+        kv_b.seq_len,
+    )?;
+    ensure_hidden_backing_len("attention out", out.data.len(), out.hidden_dim, out.seq_len)?;
 
     let (
         rope_factor,
@@ -374,6 +512,19 @@ pub fn dsv2_lite_decode_attention_into(
                 1,
             )
         });
+    let position = as_i32("attention position", position)?;
+    let num_heads = as_i32("attention num_heads", cfg.num_heads)?;
+    let qk_nope_head_dim = as_i32("attention qk_nope_head_dim", cfg.qk_nope_head_dim)?;
+    let qk_rope_head_dim = as_i32("attention qk_rope_head_dim", cfg.qk_rope_head_dim)?;
+    let v_head_dim = as_i32("attention v_head_dim", cfg.v_head_dim)?;
+    let kv_lora_rank = as_i32("attention kv_lora_rank", cfg.kv_lora_rank)?;
+    let kv_a_rows = as_i32("attention kv_a rows", kv_a.hidden_dim)?;
+    let kv_b_rows = as_i32("attention kv_b rows", kv_b.hidden_dim)?;
+    let max_seq_len = as_i32("attention max_seq_len", cfg.max_seq_len)?;
+    let rope_original = as_i32(
+        "attention rope original max position embeddings",
+        rope_original,
+    )?;
 
     let (q_ptr, _q_guard) = q.data.device_ptr(&ctx.stream);
     let (kv_a_ptr, _kv_a_guard) = kv_a.data.device_ptr(&ctx.stream);
@@ -389,22 +540,22 @@ pub fn dsv2_lite_decode_attention_into(
             key_cache_ptr as *mut f32,
             value_cache_ptr as *mut f32,
             out_ptr as *mut ffi::Half,
-            position as i32,
-            cfg.num_heads as i32,
-            cfg.qk_nope_head_dim as i32,
-            cfg.qk_rope_head_dim as i32,
-            cfg.v_head_dim as i32,
-            cfg.kv_lora_rank as i32,
-            kv_a.hidden_dim as i32,
-            kv_b.hidden_dim as i32,
-            cfg.max_seq_len as i32,
+            position,
+            num_heads,
+            qk_nope_head_dim,
+            qk_rope_head_dim,
+            v_head_dim,
+            kv_lora_rank,
+            kv_a_rows,
+            kv_b_rows,
+            max_seq_len,
             cfg.rope_theta,
             rope_factor,
             rope_mscale,
             rope_mscale_all_dim,
             rope_beta_fast,
             rope_beta_slow,
-            rope_original as i32,
+            rope_original,
             has_rope_scaling,
             ctx.stream.cu_stream(),
         )
@@ -412,4 +563,32 @@ pub fn dsv2_lite_decode_attention_into(
     result
         .result()
         .map_err(|err| anyhow!("DSV2-Lite decode attention CUDA launch failed: {err}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checked_len_and_as_i32_reject_cuda_int_index_overflow() {
+        let max = i32::MAX as usize;
+
+        let max_len = checked_len("unit", max, 1).expect("i32 max len");
+        assert_eq!(as_i32("unit", max_len).expect("i32 max"), i32::MAX);
+        assert!(as_i32("unit", max + 1).is_err());
+        assert!(as_i32("unit", checked_len("unit", max / 2 + 1, 2).unwrap()).is_err());
+        assert!(checked_len("unit", usize::MAX, 2).is_err());
+    }
+
+    #[test]
+    fn accum_launch_i32_rejects_cuda_grid_rounding_overflow() {
+        let max = i32::MAX as usize - (DSV2_LITE_ACCUM_THREADS - 1);
+        let max_i32 = i32::try_from(max).expect("max rounded fits i32");
+
+        assert_eq!(
+            as_accum_launch_i32("unit", max).expect("max rounded"),
+            max_i32
+        );
+        assert!(as_accum_launch_i32("unit", max + 1).is_err());
+    }
 }
