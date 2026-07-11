@@ -46,6 +46,8 @@ mod report;
 mod runners;
 mod snapshot;
 use cli::{Cli, Command};
+#[cfg(feature = "deepseek-v2-lite")]
+use exec::DeepSeekV2LiteBenchModel;
 use exec::{BenchModel, SchedulerBenchModel};
 use metrics::dur_ms;
 use runners::{emit_report, run_command};
