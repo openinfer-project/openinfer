@@ -779,6 +779,49 @@ pub fn dflash_qk_norm_rope_into(
     Ok(())
 }
 
+/// Require a capacity-backed `HiddenStates` to physically hold its logical
+/// `hidden_dim * seq_len` extent. Every `HiddenStates` field is public, so a safe
+/// caller can inflate `.seq_len` past the backing allocation; this rejects that
+/// before it reaches the kernel as an out-of-bounds read. `>=` (not `==`) keeps
+/// the capacity-backed convention where buffers are allocated at a max and
+/// `.seq_len` is rewritten to the active size per step (e.g. `batch_decode_buffers`).
+fn ensure_hidden_capacity(t: &HiddenStates, name: &str) -> Result<()> {
+    let extent = t
+        .hidden_dim
+        .checked_mul(t.seq_len)
+        .ok_or_else(|| anyhow::anyhow!("{name} logical extent overflow"))?;
+    anyhow::ensure!(
+        t.data.len() >= extent,
+        "{name} backing len {} < hidden_dim {} * seq_len {}",
+        t.data.len(),
+        t.hidden_dim,
+        t.seq_len
+    );
+    Ok(())
+}
+
+/// Validate a `[offset, offset + span)` row window into `t` and return the byte
+/// offset of `offset`, all with checked arithmetic. Release builds leave
+/// `overflow-checks` off, so an adversarial `offset` (e.g. `usize::MAX`) would
+/// otherwise wrap the range check and the pointer past its allocation, faulting
+/// only at the next sync as `CUDA_ERROR_ILLEGAL_ADDRESS`. Returns `Err`, never panics.
+fn checked_row_offset(t: &HiddenStates, offset: usize, span: usize, name: &str) -> Result<u64> {
+    let end = offset
+        .checked_add(span)
+        .ok_or_else(|| anyhow::anyhow!("{name} row range overflow"))?;
+    anyhow::ensure!(
+        end <= t.seq_len,
+        "{name} row range [{offset}..{end}) exceeds seq_len {}",
+        t.seq_len
+    );
+    ensure_hidden_capacity(t, name)?;
+    let bytes = offset
+        .checked_mul(t.hidden_dim)
+        .and_then(|elems| elems.checked_mul(std::mem::size_of::<bf16>()))
+        .ok_or_else(|| anyhow::anyhow!("{name} byte offset overflow"))?;
+    Ok(bytes as u64)
+}
+
 /// Plain RoPE (no QK-norm) for one EAGLE-3 draft step, because EAGLE-3 has no per-head q/k norm
 /// we implement a new kernel for EAGLE-3
 #[allow(clippy::too_many_arguments)]
@@ -798,13 +841,10 @@ pub fn eagle3_rope_into(
 ) -> Result<()> {
     assert_eq!(q.hidden_dim, num_q_heads * head_dim);
     assert_eq!(k.hidden_dim, num_kv_heads * head_dim);
-    assert!(
-        q_row_offset + q_seq_len <= q.seq_len,
-        "eagle3_rope q row range [{}..{}) exceeds seq_len {}",
-        q_row_offset,
-        q_row_offset + q_seq_len,
-        q.seq_len
-    );
+    // `q`/`k` are capacity-backed and reachable from safe re-exported code;
+    // validate the row window and backing length before deriving raw pointers.
+    let q_byte_offset = checked_row_offset(q, q_row_offset, q_seq_len, "eagle3_rope q")?;
+    ensure_hidden_capacity(k, "eagle3_rope k")?;
     // The kernel indexes both caches with the same `pos * head_dim + d`, and
     // `cos_max_pos` is derived from `cos_cache` alone; a shorter `sin_cache`
     // would let the kernel read out of bounds.
@@ -817,7 +857,7 @@ pub fn eagle3_rope_into(
     );
 
     let (q_ptr, _gq) = q.data.device_ptr_mut(&ctx.stream);
-    let q_ptr = q_ptr + (q_row_offset * q.hidden_dim * std::mem::size_of::<bf16>()) as u64;
+    let q_ptr = q_ptr + q_byte_offset;
     let (k_ptr, _gk) = k.data.device_ptr_mut(&ctx.stream);
     let (cos_ptr, _gc) = cos_cache.data.device_ptr(&ctx.stream);
     let (sin_ptr, _gs) = sin_cache.data.device_ptr(&ctx.stream);
@@ -955,6 +995,13 @@ pub fn single_decode_nhd_into(
     assert_eq!(v_cache.hidden_dim, k_cache.hidden_dim);
     assert_eq!(v_cache.seq_len, k_cache.seq_len);
     assert!(kv_len <= k_cache.seq_len);
+    // Shape asserts only relate the public metadata; validate it against the
+    // backing allocations too, since safe callers can inflate `.seq_len` past a
+    // small buffer (all `HiddenStates` fields are public).
+    ensure_hidden_capacity(q, "single_decode q")?;
+    ensure_hidden_capacity(k_cache, "single_decode k_cache")?;
+    ensure_hidden_capacity(v_cache, "single_decode v_cache")?;
+    ensure_hidden_capacity(output, "single_decode output")?;
 
     let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
     let (k_ptr, _gk) = k_cache.data.device_ptr(&ctx.stream);
@@ -1011,15 +1058,12 @@ pub fn single_prefill_nhd_causal_into(
         q_seq_len <= kv_len,
         "causal prefill q_seq_len {q_seq_len} exceeds kv_len {kv_len}"
     );
-    assert!(
-        row_offset + q_seq_len <= q.seq_len,
-        "single_prefill row range [{}..{}) exceeds seq_len {}",
-        row_offset,
-        row_offset + q_seq_len,
-        q.seq_len
-    );
-
-    let byte_offset = (row_offset * q.hidden_dim * std::mem::size_of::<bf16>()) as u64;
+    // Validate the row window with checked arithmetic and every backing
+    // allocation before deriving pointers; `q`/`output` share the row sub-range.
+    let byte_offset = checked_row_offset(q, row_offset, q_seq_len, "single_prefill_causal q")?;
+    ensure_hidden_capacity(output, "single_prefill_causal output")?;
+    ensure_hidden_capacity(k_cache, "single_prefill_causal k_cache")?;
+    ensure_hidden_capacity(v_cache, "single_prefill_causal v_cache")?;
     let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
     let q_ptr = q_ptr + byte_offset;
     let (k_ptr, _gk) = k_cache.data.device_ptr(&ctx.stream);
