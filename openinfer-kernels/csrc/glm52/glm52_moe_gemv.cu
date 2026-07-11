@@ -505,14 +505,18 @@ bool valid_tiling(int n, int k, int rpb) {
 // on H200; an exact production-kernel sweep on GB300 found ROWS=1 ahead for
 // 4096x2048 (3.70us vs 4.47us for ROWS=4).
 CUresult plain_rows_per_warp(int k, int* rows) {
+  // Attribute query only — this runs per projection launch during graph
+  // capture, and cudaGetDeviceProperties is orders of magnitude slower than
+  // the single cudaDevAttrComputeCapabilityMajor lookup needed here.
   int device = 0;
-  cudaDeviceProp prop = {};
+  int major = 0;
   cudaError_t err = cudaGetDevice(&device);
-  if (err == cudaSuccess) err = cudaGetDeviceProperties(&prop, device);
+  if (err == cudaSuccess) {
+    err = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
+  }
   if (err != cudaSuccess) return map_cuda_error(err);
-  *rows = prop.major >= 10
-              ? kRowsPlainBlackwell
-              : (k <= 2048 ? kRowsPlainShortKHopper : kRowsPlainLongK);
+  *rows = major >= 10 ? kRowsPlainBlackwell
+                      : (k <= 2048 ? kRowsPlainShortKHopper : kRowsPlainLongK);
   return CUDA_SUCCESS;
 }
 

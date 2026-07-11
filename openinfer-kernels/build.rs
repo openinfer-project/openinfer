@@ -511,7 +511,17 @@ fn glm52_deepgemm_mqa_arch_args(
     let has_sm100 = normalized_sms
         .iter()
         .any(|sm| sm_numeric_prefix(sm).is_some_and(|n| (100..120).contains(&n)));
+    let has_sm90 = normalized_sms.iter().any(|sm| sm == "90" || sm == "90a");
     if has_sm100 && nvcc_accepts_gencode(nvcc, "100f", "100f") {
+        if has_sm90 {
+            // The TU host-selects exactly one arch (#elif), so a mixed 90+100
+            // target list ships no Hopper MQA indexer — decode on the Hopper
+            // device would launch-fail. Warn instead of silently dropping it.
+            println!(
+                "cargo:warning=GLM5.2 DeepGEMM MQA compiles sm_100f ONLY in this mixed-SM \
+                 build; the sm_90 target gets no MQA indexer and fails at first decode"
+            );
+        }
         return Some((
             vec![
                 "-gencode".to_string(),
@@ -521,7 +531,6 @@ fn glm52_deepgemm_mqa_arch_args(
         ));
     }
 
-    let has_sm90 = normalized_sms.iter().any(|sm| sm == "90" || sm == "90a");
     if has_sm90 && nvcc_accepts_gencode(nvcc, "90a", "90a") {
         return Some((
             nvcc_arch_args(&["90a".to_string()]),

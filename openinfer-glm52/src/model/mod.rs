@@ -213,7 +213,11 @@ const _: () = assert!(GLM52_FLASHMLA_SPARSE_TOPK <= GLM52_INDEX_TOPK);
 /// DeepGEMM paged MQA requires BLOCK_KV=64 — a kernel constraint, not a
 /// model property (kept here, not in config.rs).
 pub(crate) const INDEX_CACHE_BLOCK: usize = 64;
-/// H200 SM count — hardware property, not a model property.
+/// The DeepGEMM MQA indexer's persistent-grid size. 132 is the H200 SM count
+/// and is baked into the AOT instantiation (`kAotNumSms` in
+/// glm52_deepgemm_mqa.cu, enforced by its `num_sms == kAotNumSms` gate), so
+/// it deliberately stays 132 on 152-SM GB300 — the schedule metadata drives
+/// correctness; "fixing" this to the live SM count breaks the AOT gate.
 pub(crate) const NUM_SMS: usize = 132;
 
 pub(crate) fn rope_tables(position: usize) -> (Vec<bf16>, Vec<bf16>) {

@@ -71,7 +71,9 @@ CUresult current_flashmla_arch(cudaDeviceProp* prop, FlashMlaArch* arch) {
     *arch = FlashMlaArch::Sm90;
     return CUDA_SUCCESS;
   }
-  if (prop->major >= 10 && prop->major < 12) {
+  // sm_100f family (10.x) only: the device code is assembled as sm_100f, so
+  // a future 11.x device must get NOT_SUPPORTED here, not a launch failure.
+  if (prop->major == 10) {
     *arch = FlashMlaArch::Sm100;
     return CUDA_SUCCESS;
   }

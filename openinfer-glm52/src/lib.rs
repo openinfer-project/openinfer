@@ -128,8 +128,10 @@ impl Glm52MoeTopo {
         }
     }
 
+    /// The `--tp-size` this topology requires (server validation mirrors the
+    /// launch-time ensure).
     #[must_use]
-    pub(crate) fn expected_tp_size(self) -> usize {
+    pub fn expected_tp_size(self) -> usize {
         match self {
             Self::Ep8 | Self::Tp8 => 1,
             Self::Tp4 => 4,

@@ -2,7 +2,7 @@
 // EP8 dispatch/grouped-GEMM/combine chain
 // (docs/models/glm52/moe-tp8-low-latency.md).
 //
-// Topology: every rank holds a 1/8 intermediate-slice of ALL 257 experts
+// Topology: every rank holds a 1/kRanks intermediate-slice of ALL 257 experts
 // (routed + shared folded in as expert index 256), and — replicated
 // activations — every rank holds ALL kTokens rows' normed2 and routing
 // locally (bit-identical redundant compute upstream), so there is NO
@@ -17,14 +17,14 @@
 //   U   active-expert union over all rows' topk (block 0, ballot compaction;
 //       slot order = expert order, deterministic; u=0 is the shared expert,
 //       prob 1, all tokens)
-//   B   gate|up mma over the union: fp8 w13 slice [257,512,6144] via
+//   B   gate|up mma over the union: fp8 w13 slice [257,kSliceRows,6144] via
 //       m16n8k16.bf16 (sigma permutation, fp8->bf16 lossless, f32 accum),
-//       k-split partials in fixed order, SiLU epilogue -> ug[u][8][256] bf16
-//   C   down mma: w2 slice [257,6144,256], per-expert partials -> cpart
+//       k-split partials in fixed order, SiLU epilogue -> ug[u][kTokens][kSliceI] bf16
+//   C   down mma: w2 slice [257,6144,kSliceI], per-expert partials -> cpart
 //   AR  out[j][h] = sum_u prob[u][j] * cpart[u][j][h] (fixed order); every
 //       row's partial is LL-pushed to EVERY rank (rs_* names keep the wire
 //       layout [row][src][hidden] of the former reduce-scatter; only the
-//       destination set changed); every rank sums 8 partials per row and
+//       destination set changed); every rank sums kRanks partials per row and
 //       writes all kTokens rows of mlp_out (bf16) — bit-identical across
 //       ranks (fixed source order). No residual here — the layer's closing
 //       add consumes mlp_out exactly like the EP8 arm's combined+shared.
@@ -193,10 +193,10 @@ struct Glm52MoeTpArgs {
   const __nv_bfloat16* normed2;  // [kTokens][H] all rows (replicated, bit-identical per rank)
   const int* topk_idx;           // [kTokens][8] production router output, all rows
   const float* topk_prob;        // [kTokens][8] renormalized x2.5 by the router
-  const unsigned char* w13;      // [257, 512, 6144] fp8 slice
-  const float* w13_scale;        // [257, 4, 48]
-  const unsigned char* w2;       // [257, 6144, 256] fp8 slice
-  const float* w2_scale;         // [257, 48, 2]
+  const unsigned char* w13;      // [257, kSliceRows, 6144] fp8 slice
+  const float* w13_scale;        // [257, kSliceRows/128, 48]
+  const unsigned char* w2;       // [257, 6144, kSliceI] fp8 slice
+  const float* w2_scale;         // [257, 48, kSliceI/128]
   __nv_bfloat16* mlp_out;        // [kTokens][H] all rows (routed + shared, no residual)
   // Want-mask: leading-active row count, read from device memory at kernel
   // time (staged identically on every rank by the host prologue — LL push/
@@ -205,15 +205,15 @@ struct Glm52MoeTpArgs {
   // never pushed, and zero-filled in mlp_out. nullptr = all rows active.
   const int* active_rows;
   // scratch arena (pointer-stable across capture/replay)
-  int* guidx;                    // [72]
-  float* guprob;                 // [72][8]
+  int* guidx;                    // [kUnionMax]
+  float* guprob;                 // [kUnionMax][kTokens]
   int* gucnt;                    // [1]
   int* gused;                    // [256]
-  float* bpart;                  // [kKsplitB][72][8][512]
-  __nv_bfloat16* ug;             // [72][8][256]
-  float* cpart;                  // [72][8][H]
+  float* bpart;                  // [kKsplitB][kUnionMax][kTokens][kSliceRows]
+  __nv_bfloat16* ug;             // [kUnionMax][kTokens][kSliceI]
+  float* cpart;                  // [kUnionMax][kTokens][H]
   // LL comm (all device pointers; peer_rs pre-offset to THIS rank's src slot)
-  uint4* rs_local;               // [2][row 8][src 8][H] own all-reduce buffer
+  uint4* rs_local;               // [2][row kTokens][src kRanks][H] own all-reduce buffer
   uint4* peer_rs[kRanks];        // peer p's rs buffer + myrank*H
   unsigned long long* epoch_dev;
   int nranks, myrank;
@@ -306,7 +306,7 @@ __global__ void __launch_bounds__(kThreads) tp_gemm_b_kernel(
   const int UC = *a.gucnt;
   {
     const int kslice = kHidden / kKsplitB;
-    const int pairs = kSliceRows / 32;  // 16 double-tile jobs per expert
+    const int pairs = kSliceRows / 32;  // double-tile jobs per expert (TP8 16, TP4 32)
     const int jobsPerU = pairs * kKsplitB;
     for (int job = gw; job < UC * jobsPerU; job += TW) {
       int u = job / jobsPerU, r0 = job % jobsPerU;
@@ -382,7 +382,7 @@ __global__ void __launch_bounds__(kThreads) tp_gemm_c_kernel(
 // partials, broadcast row j's partial to EVERY rank (each reduces all rows).
 // The RS buffer keeps the former reduce-scatter's [row][src][hidden] layout —
 // peer_rs[] is baked with the src offset (+myrank*kHidden), the row stride is
-// added here. Egress is 8x the former per-row push (~6 MB/layer/rank at 8
+// added here. Egress is kRanks x the former per-row push (~6 MB/layer/rank at 8
 // rows), spread evenly over the NVLink fabric — the concentrated span-owner
 // ingress of the old mapping paid the same bytes on one rank. ----
 __global__ void __launch_bounds__(kThreads) tp_rs_push_kernel(

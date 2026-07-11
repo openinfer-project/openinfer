@@ -61,6 +61,11 @@ __global__ void glm52_vocab_parallel_unpack_kernel(
       best_token = token;
     }
   }
+  // All-NaN row: no candidate was accepted. Degrade to token 0 like the
+  // non-sharded argmax path — INT_MAX would be read back as an embedding row
+  // index by the speculative decode feed. (Packed tokens are < 2^24, so
+  // INT_MAX can never be a legitimate winner.)
+  if (best_token == static_cast<uint32_t>(INT_MAX)) best_token = 0;
   values[row] = __float2bfloat16_rn(best);
   indices[row] = static_cast<int32_t>(best_token);
 }

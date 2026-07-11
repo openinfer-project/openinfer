@@ -3,8 +3,8 @@
 // moe-tp8-low-latency.md).
 //
 // Every rank computes a PARTIAL projection output for ALL bucket rows (its
-// 8/64 heads' contribution, full hidden width); afterwards every rank must
-// hold the identical full sum. At 8 rows x 12 KB the payload is byte-bound,
+// 64/kRanks heads' contribution, full hidden width); afterwards every rank
+// must hold the identical full sum. At 8 rows x 12 KB the payload is byte-bound,
 // not latency-bound, so this is a TWO-SHOT allreduce (reduce-scatter over
 // hidden chunks, then broadcast), not the one-shot the R4 probe used for a
 // single row: one-shot wire bytes are 7x payload per rank (measured 13.2
@@ -21,10 +21,10 @@
 // Chain (kernel boundaries are the only cross-phase sync, zero fences; every
 // spin waits exclusively on cross-rank packets from a PREVIOUS kernel):
 //   push    own partial's chunk c -> rank c's stage-0 slots (all rows)
-//   reduce  wait 8 contributors for MY chunk, fixed-order f32 sum ->
+//   reduce  wait kRanks contributors for MY chunk, fixed-order f32 sum ->
 //           broadcast the reduced chunk to every rank's stage-1 slots
 //           (fused: the spin waits on push packets, a previous kernel)
-//   recv    wait 8 chunk owners' stage-1 packets -> assemble out rows
+//   recv    wait the kRanks chunk owners' stage-1 packets -> assemble out rows
 // Each element is summed exactly once, on exactly one rank, in a fixed src
 // order — outputs are bit-identical across ranks, which the
 // replicated-activation topology RELIES on (router/sampling run redundantly
@@ -156,7 +156,7 @@ __global__ void __launch_bounds__(kThreads) tp_ar_reduce_bcast_kernel(
   }
 }
 
-// Stage 2: assemble the full rows from the 8 chunk owners' broadcasts.
+// Stage 2: assemble the full rows from the kRanks chunk owners' broadcasts.
 // Pad rows never crossed the wire — zero-fill their output so no stale (or
 // NaN) value leaks into the next layer through a pad row's residual.
 __global__ void __launch_bounds__(kThreads) tp_ar_recv_kernel(

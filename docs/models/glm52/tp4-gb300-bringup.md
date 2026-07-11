@@ -139,7 +139,7 @@ Across 75 MoE layers, the hot-cache delta predicts `0.155ms/token`, matching the
 - Focused GLM5.2 topology/slice tests pass.
 - A 64-token greedy HTTP smoke retains the accepted `" Paris. Distance from ..."` prefix.
 - A non-greedy temperature/top-p smoke passes through the eager full-head fallback.
-- Vocabulary pack/unpack passes a direct SM103 device smoke covering negative logits, cross-rank tie breaking, and a global token id above 65,535; the translation unit also compiles for SM90a.
+- Vocabulary pack/unpack passes the checked-in device smoke (`openinfer-kernels/tests/glm52_vocab_parallel_smoke.rs`) covering negative logits, cross-rank tie breaking, a global token id above 65,535, and the all-NaN row degrading to token 0; the translation unit also compiles for SM90a.
 - Refactoring preserves TP4 B/C register counts (`80/56`) and launch grids. Clean post-refactor and compact/fused serving reruns pass for both target shapes.
 
 ## Artifacts
@@ -165,38 +165,20 @@ Across 75 MoE layers, the hot-cache delta predicts `0.155ms/token`, matching the
 - H200 results explain the original launch choices but are not a controlled GB300 baseline.
 - A host-side merge of vocabulary candidates is invalid under launch-ahead: the global token must be identical on-device before every rank enqueues the speculative next replay.
 
-## PR Cleanup
+## Lessons
 
-### Preparation
-
-- **Read**: this model record, the TP4/TP8 CUDA and Rust launch surfaces, the FlashInfer runner/metadata/cubin closure, and the server CLI diff.
-- **Plan**: remove runtime backend overrides; dispatch by SM and shape; consolidate TP4/TP8 collectives and runtime state; restore unrelated changes; distill the document; rerun architecture, correctness, kernel, and serving gates.
-- **Publish plan**: commit the scoped TP4 optimization/refactor diff, rebase onto the latest `origin/main`, preserve the newer mainline GLM5.2 scheduler/dead-kernel changes while resolving conflicts, rerun the available gates, push with `--force-with-lease`, and move PR #637 from draft to ready for review.
-- **Risk**: CUDA templating can change resource generation. Register counts, grids, exact-kernel timing, and serving TPOT are explicit acceptance gates. The latest main contains GLM5.2 scheduler-metrics and dead-kernel cleanup commits, so the rebase may require semantic conflict resolution rather than choosing one side wholesale.
-
-### Execution Log
-
-- Removed `OPENINFER_GLM52_MLA_BACKEND`; model build now selects the MLA/cache contract from actual SM support and heads/rank.
-- Replaced backend-specific `Option` scratch and dummy schedule allocations with mutually exclusive enums.
-- Consolidated TP4/TP8 LL, MoE, attention AR, Rust FFI wrappers, and model runtime state. Thin `.cu` files retain separate ABI symbols and architecture-specific parameters.
-- Audited against the branch merge-base rather than the moving `origin/main`; post-fork Qwen3 changes are not part of this PR and were not cherry-picked during cleanup.
-- SM90a/SM103 CUDA instantiations compile. Release Clippy passes with only the repository's existing lint exceptions; GLM5.2 lib tests pass (`59 passed, 14 GPU tests ignored` after the mainline scheduler-metrics merge), server topology tests pass (`4/4`), and the SM103 release server builds.
-- The extracted CUDA implementation keeps the exact TP4 resource footprint (`80` registers for GEMM B, `56` for GEMM C). Temporary old/new harness runs under the same externally loaded node were within noise, but those absolute timings are not a clean performance result; the harness source is not part of the production PR.
-- A rename-aware PR audit confirms one model TP runtime, one Rust kernel wrapper, and one CUDA implementation per collective. Git still renders the shared-header extraction as deletion plus addition because the original TP8 entry path remains as a thin instantiation.
-- Compact TP4 decode now captures buckets 1/2/4/8 while retaining the fixed eight-row MoE ABI behind narrow pad bridges. SM103 selects one-row dense FP8 GEMV launches, `q_a` and `kv_a` share one paired graph node, and the MoE output bridge was removed.
-- A same-checkpoint vLLM EP4 control measured `9.47/9.84ms`, slower than pure TP4 at `9.21/9.60ms`; EP4 is therefore excluded from this low-latency PR.
-- TP greedy decode now shards the vocabulary head, computes local top-1, and reuses one reserved attention-AR slot for device-side global selection. The full head is retained only for DSpark and sampled rows. Final n20 TPOT is `9.03/9.56ms`; the node trace attributes the serving delta to `312us -> 77us` LM-head work plus about `12.5us` of candidate transport/select overhead.
-- Final formatting and `git diff --check` pass. GLM52 Clippy passes with warnings denied after command-line allowances for four pre-existing model lints. GLM52 lib tests pass (`59 passed, 14 GPU tests ignored`), the four server GLM52 config tests pass, and the FlashInfer numerical smoke passes all eight `batch x topk` shapes on SM103.
-- Installed GitHub CLI, authenticated through the existing `~/.env` token without persisting or printing it, fetched `origin/main`, and confirmed PR #637 is an open draft targeting `main`. The branch was 16 mainline commits behind before the publish rebase.
-- Rebased both PR commits onto `origin/main` at `60ccc5f`. Conflict resolution preserved main's scheduler metrics and dead-kernel/weight-load cleanup: `deepgemm_layout`, `moe_route`, and `trtllm_grouped` were not restored; their stale build/FFI/module registrations and one superseded FlashMLA arch helper were removed. The H200 TP8 right-sized sparse MLA path now coexists with the SM103 TP4 FlashInfer path. Two temporary tuning harnesses were removed from the production diff.
-- Addressed the first review pass by deriving scheduler partitions, startup load feeds, and frontend engine count from one topology-owned logical-rank count. TP4/TP8 now both expose one mirrored request partition, while EP8 retains eight independent partitions.
-
-### Debrief
-
-- **Outcome**: TP4 beats the matched latest vLLM TP4 baseline at both requested bs=1 shapes, with exact greedy smoke, sampled fallback, release build/tests, and a final node-level Nsys trace.
-- **Pitfalls encountered**: TP8 had hidden the `ranks == bucket rows` assumption; full-vocabulary work was replicated even after the attention/MoE weights were sharded; a host candidate merge would break launch-ahead; EP4 was a plausible but ultimately slower alternative; and the mainline rebase required preserving the right-sized H200 MLA fallback plus both short/full graph pre-captures rather than choosing either conflict side wholesale.
-- **Lessons learned**: kernel/backend selection belongs to SM and topology at startup, compact graph shapes matter at bs=1, and replicated bookend work must be audited separately from the layer stack in tensor-parallel profiles.
-- **Follow-ups**: add the model-level TP4 golden/logit gate and rerun retained TP8 runtime gates on H200.
+- Kernel/backend selection belongs to SM and topology at startup — the
+  `OPENINFER_GLM52_MLA_BACKEND` override was removed in favor of the build-time
+  contract above, and mutually exclusive scratch/schedule enums make an
+  inconsistent backend pairing unrepresentable.
+- Compact graph shapes matter at bs=1: buckets 1/2/4/8 plus the fused
+  `q_a+kv_a` front recovered more than the MLA backend swap itself.
+- Replicated bookend work must be audited separately from the layer stack in
+  tensor-parallel profiles — attention/MoE weights were sharded while the full
+  vocabulary head was still replicated on every rank.
+- CUDA refactors need resource acceptance gates: the shared-header extraction
+  was gated on exact register counts (`80/56` for GEMM B/C), launch grids, and
+  serving TPOT, not on compilation alone.
 
 ## Remaining Work
 

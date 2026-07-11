@@ -386,11 +386,15 @@ impl Args {
         }
         #[cfg(feature = "glm52")]
         if matches!(model_type, ModelType::Glm52) {
+            // Parse the topology here so an invalid --moe-topo string fails
+            // with the real problem instead of a misleading dp/tp complaint;
+            // the accepted strings live in one place (the model crate).
+            let moe_topo: openinfer_glm52::Glm52MoeTopo = self
+                .moe_topo
+                .parse()
+                .map_err(|err| anyhow::anyhow!("--moe-topo: {err}"))?;
             if let Some(dp_size) = self.dp_size {
-                let expected_dp_size = match self.moe_topo.as_str() {
-                    "tp4" => 1,
-                    _ => 8,
-                };
+                let expected_dp_size = moe_topo.default_dp_size();
                 if dp_size != expected_dp_size {
                     bail!(
                         "GLM5.2 --moe-topo={} requires --dp-size={} when provided; omit --dp-size to use the topology default",
@@ -398,6 +402,14 @@ impl Args {
                         expected_dp_size
                     );
                 }
+            }
+            let expected_tp_size = moe_topo.expected_tp_size();
+            if self.tp_size != expected_tp_size {
+                bail!(
+                    "GLM5.2 --moe-topo={} requires --tp-size={expected_tp_size}, got {}",
+                    self.moe_topo,
+                    self.tp_size
+                );
             }
         }
         Ok(())
@@ -689,5 +701,35 @@ mod tests {
             .validate(ModelType::Glm52, &provided)
             .expect_err("GLM5.2 TP4 should reject explicit non-DP1");
         assert!(error.to_string().contains("--dp-size=1"));
+    }
+
+    #[cfg(feature = "glm52")]
+    #[test]
+    fn glm52_tp4_rejects_omitted_tp_size() {
+        let (args, provided) = parse_with_provided(&["openinfer", "--moe-topo", "tp4"]);
+        let error = args
+            .validate(ModelType::Glm52, &provided)
+            .expect_err("GLM5.2 TP4 should reject the default --tp-size=1");
+        assert!(error.to_string().contains("--tp-size=4"));
+    }
+
+    #[cfg(feature = "glm52")]
+    #[test]
+    fn glm52_ep8_rejects_tp4_tp_size() {
+        let (args, provided) = parse_with_provided(&["openinfer", "--tp-size", "4"]);
+        let error = args
+            .validate(ModelType::Glm52, &provided)
+            .expect_err("GLM5.2 EP8 should reject --tp-size=4");
+        assert!(error.to_string().contains("--tp-size=1"));
+    }
+
+    #[cfg(feature = "glm52")]
+    #[test]
+    fn glm52_rejects_unknown_moe_topo() {
+        let (args, provided) = parse_with_provided(&["openinfer", "--moe-topo", "tp2"]);
+        let error = args
+            .validate(ModelType::Glm52, &provided)
+            .expect_err("GLM5.2 should reject an unknown topology string");
+        assert!(error.to_string().contains("ep8, tp8, or tp4"));
     }
 }
