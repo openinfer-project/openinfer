@@ -29,13 +29,6 @@ struct TileLangArtifacts {
     cutlass_include: PathBuf,
 }
 
-struct CuTeDslArtifacts {
-    obj_files: Vec<PathBuf>,
-    wrapper_files: Vec<PathBuf>,
-    include_dir: PathBuf,
-    runtime_lib_dirs: Vec<PathBuf>,
-}
-
 struct FlashInferIncludes {
     include: PathBuf,
     csrc: PathBuf,
@@ -433,15 +426,6 @@ fn collect_files_recursively(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn is_deepseek_v4_source(csrc_dir: &Path, path: &Path) -> bool {
-    match path.strip_prefix(csrc_dir) {
-        Ok(relative) => relative
-            .components()
-            .any(|part| part.as_os_str() == "deepseek_v4"),
-        Err(_) => false,
-    }
-}
-
 fn is_deepseek_v2_lite_source(csrc_dir: &Path, path: &Path) -> bool {
     match path.strip_prefix(csrc_dir) {
         Ok(relative) => relative
@@ -700,58 +684,6 @@ fn find_tilelang_python() -> Result<String, String> {
     ))
 }
 
-fn probe_cutedsl_python(candidate: &str) -> Result<String, String> {
-    let output = Command::new(candidate)
-        .args(["-c", "import cutlass, cutlass.cute"])
-        .output()
-        .map_err(|err| format!("{candidate}: {err}"))?;
-
-    if output.status.success() {
-        Ok(candidate.to_string())
-    } else {
-        Err(format!(
-            "{candidate}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
-    }
-}
-
-fn find_cutedsl_python() -> Result<String, String> {
-    if let Ok(candidate) = std::env::var("OPENINFER_CUTEDSL_PYTHON") {
-        let candidate = candidate.trim();
-        if candidate.is_empty() {
-            return Err("OPENINFER_CUTEDSL_PYTHON is set but empty.".to_string());
-        }
-        return probe_cutedsl_python(candidate).map_err(|message| {
-            format!("OPENINFER_CUTEDSL_PYTHON=`{candidate}` could not import CuTe DSL: {message}")
-        });
-    }
-
-    let workspace_venv = workspace_root().join(".venv/bin/python");
-    let parent_venv = workspace_root().join("../.venv/bin/python");
-    let mut diagnostics = Vec::new();
-    let mut candidates = Vec::new();
-    if workspace_venv.exists() {
-        candidates.push(workspace_venv.to_string_lossy().to_string());
-    }
-    if parent_venv.exists() {
-        candidates.push(parent_venv.to_string_lossy().to_string());
-    }
-    candidates.extend(["python3".to_string(), "python".to_string()]);
-
-    for candidate in candidates {
-        match probe_cutedsl_python(&candidate) {
-            Ok(path) => return Ok(path),
-            Err(message) => diagnostics.push(message),
-        }
-    }
-
-    Err(format!(
-        "Could not find a Python interpreter with CuTe DSL installed. Set OPENINFER_CUTEDSL_PYTHON. Probe results: {}.",
-        diagnostics.join(" | ")
-    ))
-}
-
 fn generate_tilelang_artifacts(out_dir: &Path, model_dir: &str, label: &str) -> TileLangArtifacts {
     let python = find_tilelang_python().unwrap_or_else(|message| {
         panic!("{label} TileLang kernels require TileLang at build time: {message}")
@@ -835,90 +767,6 @@ fn write_glm52_tilelang_stub(out_dir: &Path) -> PathBuf {
     )
     .unwrap_or_else(|err| panic!("failed to write GLM5.2 TileLang stub: {err}"));
     stub_path
-}
-
-fn generate_deepseek_cutedsl_artifacts(out_dir: &Path) -> CuTeDslArtifacts {
-    let python = find_cutedsl_python().unwrap_or_else(|message| {
-        panic!("DeepSeek V4 CuTe DSL kernels require CuTe DSL at build time: {message}")
-    });
-
-    let root = crate_root();
-    let repo_root = workspace_root();
-    let generator_path = root.join("tools/cutedsl/deepseek_v4/generate.py");
-    assert!(
-        generator_path.exists(),
-        "DeepSeek V4 CuTe DSL generator is missing: {}",
-        generator_path.display()
-    );
-
-    let artifact_dir = out_dir.join("cutedsl").join("deepseek_v4");
-    let mut command = Command::new(&python);
-    command
-        .arg(&generator_path)
-        .arg("--out-dir")
-        .arg(&artifact_dir)
-        .arg("--repo-root")
-        .arg(&repo_root);
-    if let Ok(cutlass_root) = std::env::var("OPENINFER_CUTEDSL_CUTLASS_ROOT") {
-        command.arg("--cutlass-root").arg(cutlass_root);
-    }
-
-    let output = time_phase("cutedsl-gen deepseek_v4", || {
-        command
-            .output()
-            .unwrap_or_else(|err| panic!("failed to run DeepSeek CuTe DSL generator: {err}"))
-    });
-    assert!(
-        output.status.success(),
-        "DeepSeek CuTe DSL generator failed. stdout: {} stderr: {}",
-        String::from_utf8_lossy(&output.stdout).trim(),
-        String::from_utf8_lossy(&output.stderr).trim(),
-    );
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut obj_files = Vec::new();
-    let mut wrapper_files = Vec::new();
-    let mut include_dir = None;
-    let mut runtime_lib_dirs = Vec::new();
-    for line in stdout.lines() {
-        if let Some(value) = line.strip_prefix("OBJ_PATH=") {
-            obj_files.push(PathBuf::from(value.trim()));
-        } else if let Some(value) = line.strip_prefix("WRAPPER_PATH=") {
-            wrapper_files.push(PathBuf::from(value.trim()));
-        } else if let Some(value) = line.strip_prefix("HEADER_DIR=") {
-            include_dir = Some(PathBuf::from(value.trim()));
-        } else if let Some(value) = line.strip_prefix("RUNTIME_LIB_DIR=") {
-            runtime_lib_dirs.push(PathBuf::from(value.trim()));
-        }
-    }
-
-    let include_dir = include_dir.expect("DeepSeek CuTe DSL generator did not print HEADER_DIR");
-    assert!(
-        !obj_files.is_empty() && !wrapper_files.is_empty(),
-        "DeepSeek CuTe DSL generator did not emit OBJ_PATH/WRAPPER_PATH"
-    );
-    for path in obj_files.iter().chain(wrapper_files.iter()) {
-        assert!(
-            path.exists(),
-            "generated CuTe DSL artifact missing: {}",
-            path.display()
-        );
-    }
-
-    println!(
-        "cargo:warning=Using DeepSeek V4 CuTe DSL AOT artifacts from {}",
-        artifact_dir.display()
-    );
-    println!("cargo:rerun-if-changed={}", generator_path.display());
-    println!("cargo:rerun-if-env-changed=OPENINFER_CUTEDSL_PYTHON");
-    println!("cargo:rerun-if-env-changed=OPENINFER_CUTEDSL_CUTLASS_ROOT");
-
-    CuTeDslArtifacts {
-        obj_files,
-        wrapper_files,
-        include_dir,
-        runtime_lib_dirs,
-    }
 }
 
 fn first_existing_dir(candidates: &[PathBuf], fallback: PathBuf) -> PathBuf {
@@ -1341,22 +1189,11 @@ fn main() {
     let sm_targets = detect_sm_targets();
     let nvcc_sm_targets = normalize_nvcc_sms(&sm_targets, &nvcc);
     let arch_args = nvcc_arch_args(&nvcc_sm_targets);
-    let deepseek_enabled = cfg!(feature = "deepseek-v4");
     let deepseek_v2_lite_enabled = cfg!(feature = "deepseek-v2-lite");
     let moe_enabled = cfg!(feature = "moe");
     let glm52_enabled = cfg!(feature = "glm52");
     let kimi_k2_enabled = cfg!(feature = "kimi-k2");
     let qwen35_enabled = cfg!(feature = "qwen35-4b");
-    let cutedsl_enabled = cfg!(feature = "deepseek-v4");
-    let tilelang_artifacts = if deepseek_enabled {
-        Some(generate_tilelang_artifacts(
-            &out_dir,
-            "deepseek_v4",
-            "DeepSeek V4",
-        ))
-    } else {
-        None
-    };
     let glm52_tilelang_artifacts = if glm52_enabled {
         glm52_sm90a_only_arch_args(&nvcc_sm_targets, &nvcc)
             .map(|_| generate_tilelang_artifacts(&out_dir, "glm52", "GLM5.2"))
@@ -1368,11 +1205,6 @@ fn main() {
             "cargo:warning=No sm_90a target; GLM5.2 TileLang sparse MLA compiles as a NOT_SUPPORTED stub"
         );
     }
-    let cutedsl_artifacts = if cutedsl_enabled {
-        Some(generate_deepseek_cutedsl_artifacts(&out_dir))
-    } else {
-        None
-    };
     println!(
         "cargo:warning=Detected CUDA SM targets: {}",
         sm_targets
@@ -1407,9 +1239,6 @@ fn main() {
         .iter()
         .filter_map(|path| {
             let file_name = path.file_name()?.to_str()?;
-            if !deepseek_enabled && is_deepseek_v4_source(&csrc_dir, path) {
-                return None;
-            }
             if !deepseek_v2_lite_enabled && is_deepseek_v2_lite_source(&csrc_dir, path) {
                 return None;
             }
@@ -1508,7 +1337,6 @@ fn main() {
             || stem == "flashinfer_sampling"
             || stem == "flashinfer_top1"
             || stem == "glm52_topk"
-            || stem.starts_with("deepseek_")
         {
             for dir in &flashinfer.cccl {
                 nvcc_args.extend(["-I".to_string(), dir.to_string_lossy().to_string()]);
@@ -1530,16 +1358,6 @@ fn main() {
                     .join("kimi_k2/vllm_marlin")
                     .to_string_lossy()
                     .to_string(),
-            ]);
-        }
-
-        if stem == "deepseek_quant" {
-            nvcc_args.extend([
-                "--expt-relaxed-constexpr".to_string(),
-                "-static-global-template-stub=false".to_string(),
-                "-DFLASHINFER_ENABLE_FP8_E8M0".to_string(),
-                "-DFLASHINFER_ENABLE_FP4_E2M1".to_string(),
-                "-DCUTLASS_ENABLE_GDC_FOR_SM100=1".to_string(),
             ]);
         }
 
@@ -1662,11 +1480,6 @@ fn main() {
         });
     }
 
-    if !deepseek_enabled {
-        println!(
-            "cargo:warning=DeepSeek V4 CUDA/TileLang kernels disabled; enable the openinfer-kernels `deepseek-v4` feature to build them"
-        );
-    }
     if !moe_enabled {
         println!(
             "cargo:warning=MoE third-party substrate disabled; enable the openinfer-kernels `moe` feature to build DeepEP-backed kernels"
@@ -1684,9 +1497,6 @@ fn main() {
     }
 
     let mut tilelang_compile_jobs = Vec::new();
-    if let Some(artifacts) = tilelang_artifacts {
-        tilelang_compile_jobs.push((artifacts, arch_args.clone()));
-    }
     if let Some(artifacts) = glm52_tilelang_artifacts {
         // TileLang-generated Hopper wgmma: sm_90a only (see
         // glm52_sm90a_only_arch_args); artifact generation already required it.
@@ -1747,39 +1557,6 @@ fn main() {
         }
     }
 
-    let mut cutedsl_obj_files = Vec::new();
-    let mut cutedsl_runtime_lib_dirs = Vec::new();
-    if let Some(cutedsl_artifacts) = cutedsl_artifacts {
-        cutedsl_obj_files.extend(cutedsl_artifacts.obj_files);
-        cutedsl_runtime_lib_dirs.extend(cutedsl_artifacts.runtime_lib_dirs);
-        for cu_file in cutedsl_artifacts.wrapper_files {
-            let stem = cu_file.file_stem().unwrap().to_str().unwrap();
-            let obj_file = out_dir.join(format!("{stem}_cuda.o"));
-            let mut nvcc_args = vec![
-                "-c".to_string(),
-                cu_file.to_string_lossy().to_string(),
-                "-o".to_string(),
-                obj_file.to_string_lossy().to_string(),
-                "-O3".to_string(),
-                "-I".to_string(),
-                cuda_include.to_string_lossy().to_string(),
-            ];
-            nvcc_args.extend(arch_args.clone());
-            nvcc_args.extend([
-                "--std=c++17".to_string(),
-                "--compiler-options".to_string(),
-                "-fPIC".to_string(),
-                "-I".to_string(),
-                cutedsl_artifacts.include_dir.to_string_lossy().to_string(),
-            ]);
-            nvcc_tasks.push(NvccTask {
-                cu_file,
-                obj_file,
-                args: nvcc_args,
-            });
-        }
-    }
-
     nvcc_tasks.sort_by_key(|task| nvcc_task_priority(&task.cu_file));
 
     let task_queue = Mutex::new(VecDeque::from(nvcc_tasks));
@@ -1825,8 +1602,6 @@ fn main() {
         }
     });
     obj_files.sort();
-    obj_files.extend(cutedsl_obj_files);
-    obj_files.sort();
 
     let cuda_lib = out_dir.join("libkernels_cuda.a");
     let _ = fs::remove_file(&cuda_lib);
@@ -1863,9 +1638,6 @@ fn main() {
     } else {
         toolkit.link_search();
     }
-    for dir in &cutedsl_runtime_lib_dirs {
-        println!("cargo:rustc-link-search=native={}", dir.display());
-    }
     println!("cargo:rustc-link-lib=static=kernels_cuda");
     println!("cargo:rustc-link-lib=cudart");
     println!("cargo:rustc-link-lib=cublas");
@@ -1877,9 +1649,6 @@ fn main() {
     println!("cargo:rustc-link-lib=nvrtc");
     if let Some(nccl_root) = &deepep_nccl {
         link_deepep_nccl(nccl_root, &out_dir);
-    }
-    if !cutedsl_runtime_lib_dirs.is_empty() {
-        println!("cargo:rustc-link-lib=static=cuda_dialect_runtime_static");
     }
     if !cfg!(target_os = "windows") {
         println!("cargo:rustc-link-lib=stdc++");

@@ -67,7 +67,6 @@ fn test_deepseek_v2_lite_ep2_rust_generation() -> Result<()> {
         &model_path,
         EngineLoadOptions {
             enable_cuda_graph: false,
-            enable_prefill_profile: false,
             device_ordinals: vec![0, 0],
             seed: 42,
             ..EngineLoadOptions::default()
@@ -112,7 +111,6 @@ fn run_rust_generation(model_path_label: &str, model_path: &Path) -> Result<()> 
         model_path,
         EngineLoadOptions {
             enable_cuda_graph: false,
-            enable_prefill_profile: false,
             device_ordinals: vec![0, 1],
             seed: 42,
             ..EngineLoadOptions::default()
@@ -300,7 +298,6 @@ fn run_case_set_generation(
         model_path,
         EngineLoadOptions {
             enable_cuda_graph: false,
-            enable_prefill_profile: false,
             device_ordinals: vec![0, 1],
             seed: 42,
             ..EngineLoadOptions::default()
@@ -501,7 +498,6 @@ fn run_mixed_serving_generation(model_path: &Path, model_path_label: &str) -> Re
         model_path,
         EngineLoadOptions {
             enable_cuda_graph: false,
-            enable_prefill_profile: false,
             device_ordinals: vec![0, 1],
             seed: 42,
             ..EngineLoadOptions::default()
@@ -598,7 +594,6 @@ fn run_mixed_serving_generation(model_path: &Path, model_path_label: &str) -> Re
         model_path,
         EngineLoadOptions {
             enable_cuda_graph: false,
-            enable_prefill_profile: false,
             device_ordinals: vec![0, 1],
             seed: 42,
             ..EngineLoadOptions::default()

@@ -12,7 +12,6 @@
 #![cfg_attr(
     not(any(
         feature = "deepseek-v2-lite",
-        feature = "deepseek-v4",
         feature = "kimi-k2",
         feature = "qwen3",
         feature = "qwen35-4b"
@@ -139,7 +138,6 @@ fn main() -> Result<()> {
                 Path::new(&cli.model_path),
                 EngineLoadOptions {
                     enable_cuda_graph: false,
-                    enable_prefill_profile: false,
                     device_ordinals: vec![0, 1],
                     parallel_config: None,
                     ep_backend: EpBackend::Nccl,
@@ -150,21 +148,6 @@ fn main() -> Result<()> {
             let load_ms = dur_ms(load_start.elapsed());
             let mut bench = DeepSeekV2LiteBenchModel { generator };
             dispatch(&cli, model_type, load_ms, false, &mut bench, &tokenizer)
-        }
-        #[cfg(feature = "deepseek-v4")]
-        ModelType::DeepSeekV4 => {
-            let handle = openinfer_deepseek_v4::start_engine(
-                Path::new(&cli.model_path),
-                EngineLoadOptions {
-                    enable_cuda_graph: false,
-                    enable_prefill_profile: false,
-                    device_ordinals: (0..8).collect(),
-                    parallel_config: None,
-                    ep_backend: EpBackend::Nccl,
-                    seed: command_seed(&cli),
-                },
-            )?;
-            finish(handle, false)
         }
         #[cfg(feature = "glm52")]
         ModelType::Glm52 => {
@@ -177,7 +160,6 @@ fn main() -> Result<()> {
                 Path::new(&cli.model_path),
                 EngineLoadOptions {
                     enable_cuda_graph: cli.cuda_graph,
-                    enable_prefill_profile: false,
                     device_ordinals: (0..parallel.ep_world()).collect(),
                     parallel_config: Some(parallel),
                     ep_backend: cli.ep_backend.into(),
@@ -199,7 +181,6 @@ fn main() -> Result<()> {
                 Path::new(&cli.model_path),
                 EngineLoadOptions {
                     enable_cuda_graph: cli.cuda_graph,
-                    enable_prefill_profile: false,
                     device_ordinals: vec![0],
                     parallel_config: None,
                     ep_backend: EpBackend::Nccl,
@@ -228,7 +209,6 @@ fn main() -> Result<()> {
                 Path::new(&cli.model_path),
                 EngineLoadOptions {
                     enable_cuda_graph: cli.cuda_graph,
-                    enable_prefill_profile: false,
                     device_ordinals: vec![0],
                     parallel_config: None,
                     ep_backend: EpBackend::Nccl,

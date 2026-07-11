@@ -8,7 +8,7 @@ programs in subdirectories:
 
 | Path | Role |
 | --- | --- |
-| `deepseek_v4/generate.py` | DeepSeek V4 MP8 FP8/FP4, sparse attention, and HC helper kernels. |
+| `glm52/generate.py` | GLM5.2 sparse MLA decode kernel (Hopper wgmma, sm_90a). |
 
 Generated CUDA is a build artifact under Cargo `OUT_DIR`; it should not be
 checked into the repository.

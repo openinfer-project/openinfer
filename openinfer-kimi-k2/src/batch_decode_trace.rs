@@ -108,7 +108,6 @@ pub fn trace_runtime_decode_kernel_calls(
         std::path::Path::new(model_path),
         EngineLoadOptions {
             enable_cuda_graph: false,
-            enable_prefill_profile: false,
             device_ordinals: (0..TP_WORLD_SIZE).collect(),
             seed: 42,
             ..EngineLoadOptions::default()

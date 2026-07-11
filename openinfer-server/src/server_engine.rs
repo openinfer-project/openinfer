@@ -10,8 +10,6 @@ pub use openinfer_core::engine::{FinishReason, TokenLogprob};
 pub enum ModelType {
     #[cfg(feature = "deepseek-v2-lite")]
     DeepSeekV2Lite,
-    #[cfg(feature = "deepseek-v4")]
-    DeepSeekV4,
     #[cfg(feature = "glm52")]
     Glm52,
     #[cfg(feature = "kimi-k2")]
@@ -29,8 +27,6 @@ impl fmt::Display for ModelType {
         match *self {
             #[cfg(feature = "deepseek-v2-lite")]
             Self::DeepSeekV2Lite => write!(f, "DeepSeek-V2-Lite"),
-            #[cfg(feature = "deepseek-v4")]
-            Self::DeepSeekV4 => write!(f, "DeepSeek V4"),
             #[cfg(feature = "glm52")]
             Self::Glm52 => write!(f, "GLM5.2"),
             #[cfg(feature = "kimi-k2")]
@@ -67,19 +63,6 @@ pub fn detect_model_type(model_path: impl AsRef<Path>) -> Result<ModelType> {
                 "DeepSeek-V2-Lite support is feature-gated; rebuild openinfer-server with --features deepseek-v2-lite"
             );
         }
-    }
-
-    if json
-        .get("model_type")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|model_type| model_type == "deepseek_v4")
-    {
-        #[cfg(feature = "deepseek-v4")]
-        return Ok(ModelType::DeepSeekV4);
-        #[cfg(not(feature = "deepseek-v4"))]
-        anyhow::bail!(
-            "DeepSeek V4 support is feature-gated; rebuild openinfer-server with --features deepseek-v4"
-        );
     }
 
     if json

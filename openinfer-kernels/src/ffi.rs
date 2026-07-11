@@ -6,7 +6,6 @@ pub type Half = u16;
 
 #[cfg(feature = "moe")]
 mod deepep;
-mod deepseek;
 #[cfg(feature = "deepseek-v2-lite")]
 mod deepseek_v2_lite;
 #[cfg(feature = "glm52")]
@@ -18,7 +17,6 @@ mod qwen35;
 mod shared;
 #[cfg(feature = "moe")]
 pub use deepep::*;
-pub use deepseek::*;
 #[cfg(feature = "deepseek-v2-lite")]
 pub use deepseek_v2_lite::*;
 #[cfg(feature = "glm52")]

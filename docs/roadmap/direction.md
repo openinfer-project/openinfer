@@ -10,7 +10,7 @@ Supporting a new model is not the hard part — it's config, weights, ops, accur
 
 - Qwen3 — dense full attention
 - Qwen3.5 — 24 linear + 8 full attention, with recurrent state
-- DeepSeek V4 — MLA compressed KV + DSA, MoE routing, FP8 block-scale GEMM, EP communication
+- GLM5.2 / Kimi-K2 — MLA compressed KV, MoE routing, FP8 / Marlin INT4 GEMM, EP communication
 
 They're all "LLM inference" at the marketing level. At the code level, state layout, scheduler, kernel DAG, and communication pattern all diverge. A single super-scheduler that subsumes them ends up as everyone's branches inside one shared blob, and no one dares touch it.
 
@@ -70,6 +70,6 @@ The closed loop matters: offline expectation (simulator) + online measurement (t
 
 Direction, not task list. Concrete current work lives in `execution.md`.
 
-- **Per-model crate is the unit of model work.** Qwen3 and Qwen3.5 already live as independent crates; DeepSeek V4 follows the same pattern. New models start by copying the closest existing crate as a reference, not by extending a shared abstraction.
+- **Per-model crate is the unit of model work.** Qwen3 and Qwen3.5 already live as independent crates; Kimi-K2 and GLM5.2 follow the same pattern. New models start by copying the closest existing crate as a reference, not by extending a shared abstraction.
 - **Build the ledger → simulator → tracing loop incrementally.** Start with model-owned kernel plans (Qwen3 has one); extend across models; then a cross-model index; then a simulator MVP against one model; then tracing.
 - **Treat each new model as a boundary test.** If something keeps re-appearing per-model, it might belong in the shared layer. If a "shared" thing keeps needing per-model escape hatches, it should fork. The boundary moves on evidence, not aesthetics.

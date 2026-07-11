@@ -21,8 +21,6 @@ tvm-ffi-triton-cubin = ["dep:tvm-ffi", "qwen35-4b"]
 # Qwen3.5 Triton AOT kernels (GDR chunkwise prefill) — the only feature that
 # needs Python + Triton at build time.
 qwen35-4b = []
-deepseek-v4 = []
-deepseek-v4-cutedsl-diagnostic = ["deepseek-v4"]
 deepseek-v2-lite = []
 # Shared MoE/MLA third-party substrate: DeepEP, DeepGEMM, and FlashMLA.
 moe = []

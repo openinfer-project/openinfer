@@ -19,7 +19,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | --- | --- |
 | `roadmap/roadmap-2026-h2.md` | 2026-H2 plan, supersedes issue #203. Now: website as product surface (recipes-style pages, no runtime Docker image), model maturity tiers (Qwen3-4B first Stable), observability wiring, GLM5.2 large-MoE mainline. Later: NIXL-compatible P/D, design-first. |
 | `roadmap/direction.md` | One size can't fit all. Shared infrastructure (frontend, runtime primitives, kernels, data plane) + per-model engines with their own scheduler/kernel DAG/state. Long-term loop: kernel ledger → simulator → request tracing. |
-| `roadmap/execution.md` | Current state and immediate next steps. No timeline — entries move through In progress → Next → Open. Covers cross-model infrastructure (kernel ledger, simulator, tracing, frontend polish) and per-model active work (DeepSeek V4, Qwen3.5, Qwen3). |
+| `roadmap/execution.md` | Current state and immediate next steps. No timeline — entries move through In progress → Next → Open. Covers cross-model infrastructure (kernel ledger, simulator, tracing, frontend polish) and per-model active work (Qwen3.5, Qwen3). |
 
 ## models / qwen3
 
@@ -77,21 +77,6 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | `models/glm52/bs1-decode-serial-overhead.md` | PR5a perf pass on the PR4 bring-up path: 101–103 → 46–50 ms/step (~2.2×) at bs=1, output byte-identical, all gates green. Fixes: quant/SiLU/GEMM rows bounded by the coordinator token count (device trap on violation), persistent MoE workspace (was ~11.6k allocs/step), FlashMLA sched metadata hoisted to build. Remaining gap = launch overhead → PR5c graph target. |
 | `models/glm52/dp8-scheduler.md` | PR5b: DP8 lock-step scheduler — non-expert stack replicated to every rank, one request per rank, padding tokens on idle ranks (`GLM52_DECODE_GLOBAL_TOKENS` 1→8). All 8 jz-38 gates green, outputs byte-identical to PR5a; retired the DeepGEMM MQA runtime JIT (3 latent bugs) via build-time AOT. Known: fixed ~200 ms step cost (8-way concurrency free) → PR5c graph. |
 | `models/glm52/whole-step-decode-graph.md` | Whole-step decode graph execution record: 200 → **19.6 ms/step** on jz-38 (below the vLLM 20.0 reference) via CUDA graph + weight-only fp8 GEMV (tensor-core mma at batch 4/8) + DeepGEMM masked grouped expert GEMM (the earlier "swapAB" attribution retracted inside). Remaining lever = collective wait structure (#542); indexer oracle reference drift (#541). |
-
-## models / deepseek-v4
-
-| Path | TL;DR |
-| --- | --- |
-| `models/deepseek-v4/support.md` | Initial DeepSeek V4 support PR record: native MP8 engine, official-style TileLang build-time kernels, exact E2E, HTTP validation, nsys-guided speed fixes, prefill RoPE reuse, sync removal, scratch reuse, and GPU index generation. |
-| `models/deepseek-v4/decode-performance.md` | Fixed long decode is retained sub-30 with exact E2E `20/20` and hash `6346f03343d75a65`; stable sub-25 remains open. |
-| `models/deepseek-v4/serving-baseline.md` | Serving baseline gate: HTTP single-request smoke and direct TPOT/hash regression available; bs>1 serving, continuous batching, and service-level KV management remain follow-up. |
-| `models/deepseek-v4/http-serving-benchmark.md` | HTTP serving benchmark gate: streaming `/v1/completions` load records QPS, TTFT, TPOT/ITL, latency percentiles, error rate, and output hashes without using direct bench as serving evidence. |
-| `models/deepseek-v4/online-throughput.md` | Latest-main DSV4 online throughput baseline: direct/HTTP/mixed 5090 results, input/output tok/s, bs>1 operator coverage, CUDA Graph blockers, and next task routing. |
-| `models/deepseek-v4/prefix-paged-kv-pd-handoff.md` | Prefix/paged KV and P-D handoff design contract: evolves slot-owned direct KV leases into page ownership, prefix cache, allocator telemetry, and transport-agnostic handoff handles. |
-| `models/deepseek-v4/moe-ag-rs.md` | Decode MoE now uses GPU AG/RS, GPU route compaction, and grouped TileLang FP4 local experts; no route/expert D2H in hot path. Current 1x32 TPOT avg `105.54ms`, exact E2E `20/20`. |
-| `models/deepseek-v4/moe-tilelang-review.md` | Persistent rank workers + decode-only direct top-k MoE cut 1x32 steady TPOT to `80.49ms/token`; remaining cost is rank arrival skew before `107` f32 collectives/token. |
-| `models/deepseek-v4/pplx-ep-integration.md` | DeepSeek V4 PPLX EP integration: pplx-garden decode MoE path, EP8 bootstrap, common NUMA rank-slice placement, and H200 steady TPOT p50 `66.65ms`. |
-| `models/deepseek-v4/kernel-paths.md` | DeepSeek V4 CUDA sources, TileLang generator path, and `openinfer-kernels/KERNELS.md` routing index are organized. |
 
 ## models / deepseek-v2-lite
 
@@ -205,7 +190,6 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | `benchmarks/mixed-load-itl.md` | Qwen3-4B + Qwen3.5 mixed-load ITL (#244, #375): chunking-off sweeps (qps × prompt × prefix) via `bench_serving mixed`. Both lines freeze every active decode for the full prefill in the unified step (8k≈0.9–1.2s, 12k≈1.4–2.2s). Qwen3 p99 blows up with prompt (8k 1161, 12k 3270ms at qps≥0.5); Qwen3.5's freeze lands just under the 1% p99 knee (shows in `max`, not p99 — measurement artifact of the 1024-tok background, **not** immunity). Prefix reuse defeats it. #375 chunked prefill caps the per-step freeze. |
 | `benchmarks/accuracy-eval-results.md` | Phase 1 GSM8K: Qwen3-4B PASS (openinfer 85.37% vs HF 85.82%, delta -0.45 pp). Qwen3.5-4B historical FAIL recovered by #250 (strict 79.38%, flexible 79.30% vs HF 79.45%). |
 | `benchmarks/qwen3-8b-pd-vs-mix-h200.md` | Qwen3-8B 多轮负载三方 A/B（2×H200）：P/D 1P+1D vs mixed×2（会话亲和 LB）vs mixed×1。吞吐持平（47.8k vs 47.0k tok/s），P/D 赢在 decode 稳定性（TPOT p99 10.08 vs 12.77ms，turn2+ TTFT 恒定 ~107ms vs 爬升 71→132ms），冷 turn1 多付 ~200ms（M3 目标）。含 vllm-bench 命令与 `max_completion_tokens` 坑。 |
-| `benchmarks/pplx-ep-a2a-h20-nvlink.md` | pplx EP all-to-all latency on 8× H20 NV18 NVLink: DSV4 & Kimi-K2 shapes, tok=1..256. tok=1 p50 ~82μs, tok=256 p50 ~204/303μs. |
 | `benchmarks/deepep-v2-vs-pplx-moe-backend.md` | H20 x8 DeepEP V2 vs current OpenInfer PPLX EP backend comparison: ElasticBuffer/NCCL Gin shows a directional 2.5x-5.3x paired-run ratio on tested DSV4 and Kimi-K2 MoE exchange shapes, with dtype, correctness, harness, and PPLX baseline-drift caveats recorded. |
 
 ## conventions

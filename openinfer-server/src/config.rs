@@ -76,10 +76,6 @@ pub(crate) struct Args {
     #[arg(long, default_value = "deepep")]
     pub ep_backend: CliEpBackend,
 
-    /// Emit synchronized DeepSeek V4 prefill phase timing records.
-    #[arg(long, default_value_t = false)]
-    pub deepseek_prefill_profile: bool,
-
     /// Enable pegaflow KV offload (host-tier "L2" cache): single-GPU Qwen3,
     /// or GLM5.2 DP8 (one pool shared by all 8 ranks under one namespace).
     /// Sealed KV blocks are saved to host pinned memory and restored into
@@ -248,8 +244,6 @@ const CORE_ARGS: &[&str] = &["model_path", "served_model_name", "port"];
 /// `validate()`.
 fn consumed_args(model_type: ModelType) -> &'static [&'static str] {
     match model_type {
-        #[cfg(feature = "deepseek-v4")]
-        ModelType::DeepSeekV4 => &["cuda_graph", "deepseek_prefill_profile"],
         #[cfg(feature = "deepseek-v2-lite")]
         ModelType::DeepSeekV2Lite => &["cuda_graph"],
         #[cfg(feature = "glm52")]
@@ -508,8 +502,6 @@ mod tests {
 
     fn all_model_types() -> Vec<ModelType> {
         [
-            #[cfg(feature = "deepseek-v4")]
-            ModelType::DeepSeekV4,
             #[cfg(feature = "deepseek-v2-lite")]
             ModelType::DeepSeekV2Lite,
             #[cfg(feature = "glm52")]

@@ -78,7 +78,6 @@ pub fn launch(model_path: &Path, options: KimiLaunchOptions) -> Result<EngineHan
         model_path,
         &EngineLoadOptions {
             enable_cuda_graph: options.cuda_graph,
-            enable_prefill_profile: false,
             device_ordinals: (0..parallel.ep_world()).collect(),
             parallel_config: Some(parallel),
             ep_backend: options.ep_backend,

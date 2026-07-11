@@ -115,13 +115,6 @@ async fn main() -> anyhow::Result<()> {
 // picks the crate by detected model type and forwards the relevant CLI knobs.
 fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandle> {
     let handle = match model_type {
-        #[cfg(feature = "deepseek-v4")]
-        ModelType::DeepSeekV4 => openinfer_deepseek_v4::launch(
-            &args.model_path,
-            args.cuda_graph,
-            args.deepseek_prefill_profile,
-        )
-        .context("failed to start DeepSeek V4 engine")?,
         #[cfg(feature = "deepseek-v2-lite")]
         ModelType::DeepSeekV2Lite => {
             openinfer_deepseek_v2_lite::launch(&args.model_path, args.cuda_graph)

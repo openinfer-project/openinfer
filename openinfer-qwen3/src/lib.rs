@@ -265,7 +265,6 @@ pub fn launch(model_path: &Path, options: Qwen3LaunchOptions) -> Result<EngineHa
     }
     let engine = EngineLoadOptions {
         enable_cuda_graph,
-        enable_prefill_profile: false,
         device_ordinals,
         parallel_config: None,
         ep_backend: EpBackend::Nccl,

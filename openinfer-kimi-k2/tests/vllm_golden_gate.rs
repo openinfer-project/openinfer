@@ -303,7 +303,6 @@ fn start_engine(path: &str) -> EngineHandle {
         Path::new(path),
         EngineLoadOptions {
             enable_cuda_graph: false,
-            enable_prefill_profile: false,
             device_ordinals: (0..8).collect(),
             parallel_config: Some(ParallelConfig::new(1, 8)),
             ep_backend: EpBackend::DeepEp,

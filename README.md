@@ -44,8 +44,7 @@ and [Co-locating Prefill and Decode on One GPU](https://open-infer.org/blog/gree
 - NVIDIA driver R545 (CUDA 12.3) or newer; `cuFuncGetName` sets this floor, while per-symbol lazy loading keeps the `cuda-12090` cudarc binding from requiring a CUDA 12.9 driver
 - The default build (Qwen3-4B / 8B) is pure Rust + CUDA — no Python at all
 - Python 3 + Triton for `qwen35-4b` feature builds (build-time only — no Python at runtime)
-- TileLang for `deepseek-v4` feature builds (build-time only)
-- `deepseek-v4` / `kimi-k2` EP paths additionally need NCCL ≥ 2.27 at runtime (`ncclAlltoAll`)
+- The `kimi-k2` EP path additionally needs NCCL ≥ 2.27 at runtime (`ncclAlltoAll`)
 
 ### Build & Run
 
@@ -58,7 +57,7 @@ export CUDA_HOME=/usr/local/cuda
 cargo run --release
 ```
 
-> **Note**: The server CLI is in `openinfer-server`. Model crates such as `openinfer-qwen3`, `openinfer-qwen35-4b`, and `openinfer-deepseek-v4` contain model logic and diagnostics but are not server entrypoints. Use `cargo run --release` from the workspace root, or `cargo run --release -p openinfer-server -- --model-path <path>`.
+> **Note**: The server CLI is in `openinfer-server`. Model crates such as `openinfer-qwen3`, `openinfer-qwen35-4b`, and `openinfer-kimi-k2` contain model logic and diagnostics but are not server entrypoints. Use `cargo run --release` from the workspace root, or `cargo run --release -p openinfer-server -- --model-path <path>`.
 
 ```bash
 # Try it
@@ -83,11 +82,6 @@ uv venv && uv pip install triton
 export OPENINFER_TRITON_PYTHON=.venv/bin/python
 cargo run --release --features qwen35-4b -- --model-path models/Qwen3.5-4B
 
-# DeepSeek V4 Flash requires the feature-gated MP8 path and TileLang at build time
-uv pip install "tilelang==0.1.9"
-export OPENINFER_TILELANG_PYTHON=.venv/bin/python
-cargo run --release --features deepseek-v4 -- --model-path models/DeepSeek-V4-Flash
-
 # Disable CUDA Graph (useful for debugging)
 cargo run --release -- --cuda-graph=false
 ```
@@ -98,7 +92,7 @@ cargo run --release -- --cuda-graph=false
 |----------|-------------|
 | `CUDA_HOME` | CUDA Toolkit path (default: `/usr/local/cuda`) |
 | `OPENINFER_TRITON_PYTHON` | Python with Triton for `qwen35-4b` build-time AOT compilation |
-| `OPENINFER_TILELANG_PYTHON` | Python with TileLang for `deepseek-v4` build-time kernel generation |
+| `OPENINFER_TILELANG_PYTHON` | Python with TileLang for the `glm52` sparse-MLA build-time kernel generation (sm_90a) |
 | `OPENINFER_CUDA_SM` | GPU SM target override when `nvidia-smi` unavailable (e.g. `120`) |
 
 </details>
@@ -130,14 +124,12 @@ cargo run --release --features qwen35-4b -- --model-path models/Qwen3.5-4B
 | [Qwen3-8B](https://huggingface.co/Qwen/Qwen3-8B) | Full attention (GQA) | 8B | Greedy + sampling, default feature, pure Rust + CUDA build |
 | [Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B) | Hybrid (24 linear + 8 full attention) | 4B | Greedy + sampling, feature-gated, `--features qwen35-4b` (build-time Triton) |
 | [DeepSeek-V2-Lite](https://huggingface.co/deepseek-ai/DeepSeek-V2-Lite) | MoE + EP | 15.7B total / 2.4B active | Feature-gated, `--features deepseek-v2-lite`, 2-GPU EP2 correctness path |
-| [DeepSeek-V4-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash) | MoE + sparse attention (compressor + indexer), MP8 checkpoint | 671B total / 37B active | Feature-gated, `--features deepseek-v4`, 8-GPU MP8, TileLang build-time kernels, greedy-only |
 | [Kimi-K2-Instruct](https://huggingface.co/moonshotai/Kimi-K2-Instruct) | MLA + MoE + Marlin INT4 | 1T total / 32B active | Feature-gated, `--features kimi-k2`, 8-GPU EP path |
 
 Model type is auto-detected from `config.json` — just point `--model-path` at any supported model directory. Every model line is controlled by a cargo feature; only `qwen3` is on by default, so the stock build serves Qwen3 with zero Python. Other lines require rebuilding `openinfer-server` with the matching `--features ...` flag before launch.
 
 DeepSeek support is intentionally narrower than the Qwen paths:
 
-- **DeepSeek-V4-Flash** requires `--features deepseek-v4`, the 8-GPU MP8 checkpoint, and TileLang at build time. The current OpenAI-compatible path is greedy-only with HTTP active-set decode wired through the batch path; it has been measured at active set `2` / decode batch `2`, with caveats that TPOT worsens versus the single-row path and c2/c4/c8 hashes still need second-review quality acceptance. Prefill batching, service-level KV management, and CUDA Graph remain follow-up. Evidence: [`support.md`](docs/models/deepseek-v4/support.md), [`online-throughput.md`](docs/models/deepseek-v4/online-throughput.md), and [`decode-performance.md`](docs/models/deepseek-v4/decode-performance.md).
 - **DeepSeek-V2-Lite** requires `--features deepseek-v2-lite` and the 2-GPU EP2 path. Its current gate is correctness and attribution only: HF, host-staged, and NCCL are token/text exact for the narrow `Hello`/16-token greedy contract; same-prompt batch and HTTP/vLLM data are diagnostic and do not claim production continuous batching or serving parity. Evidence: [`status.md`](docs/models/deepseek-v2-lite/status.md) and [`hf-accuracy-gate.md`](docs/models/deepseek-v2-lite/hf-accuracy-gate.md).
 
 ## API
@@ -153,7 +145,7 @@ OpenAI-compatible `/v1/completions` endpoint.
 | `top_p` | float | 1.0 | Nucleus sampling threshold |
 | `stream` | bool | false | Enable SSE streaming |
 
-Sampling and logprob support is model-dependent. Qwen models support the sampling controls above; the initial DeepSeek V4 path accepts greedy requests only and reports unsupported parameters through `stop_reason`.
+Sampling and logprob support is model-dependent; Qwen models support the sampling controls above.
 
 ## Performance
 
@@ -243,14 +235,12 @@ flowchart TB
         qwen3["openinfer-qwen3<br/>full attention"]
         qwen35["openinfer-qwen35-4b<br/>24 linear + 8 full attention"]
         dsv2["openinfer-deepseek-v2-lite<br/>MoE + EP"]
-        dsv4["openinfer-deepseek-v4<br/>MoE + compressor + indexer"]
         kimi["openinfer-kimi-k2<br/>MLA + MoE + Marlin INT4"]
     end
 
     runtime --> qwen3
     runtime --> qwen35
     runtime --> dsv2
-    runtime --> dsv4
     runtime --> kimi
 
     subgraph shared["Shared kernels and KV management"]
@@ -263,7 +253,6 @@ flowchart TB
     qwen3 --> kernels
     qwen35 --> kernels
     dsv2 --> kernels
-    dsv4 --> kernels
     kimi --> kernels
 
     qwen3 --> kvcache
@@ -279,7 +268,6 @@ flowchart TB
         flashinfer["FlashInfer"]
         nccl["NCCL"]
         deepep["DeepEP shim<br/>NCCL"]
-        comm["openinfer-comm<br/>optional pplx-ep PPLX all-to-all"]
     end
 
     kernels --> cuda
@@ -288,18 +276,14 @@ flowchart TB
     kernels --> tilelang
     kernels --> flashinfer
     dsv2 --> nccl
-    dsv4 --> nccl
     kimi --> deepep
     deepep --> nccl
-    dsv4 -.-> comm
-    comm --> nccl
 ```
 
 **Key design decisions:**
 
-- **GPU-first runtime** — model execution stays in native Rust/CUDA paths; initial DeepSeek V4 still performs host-side greedy token selection from rank0 logits
-- **Custom GPU kernels** — CUDA for decode-critical paths, Triton AOT for Qwen3.5 compatibility kernels, TileLang-generated CUDA for DeepSeek V4 compatibility kernels, FlashInfer for paged attention/sampling, NCCL for multi-GPU reductions, and cuBLAS for matrix multiplication
-- **Fused operators where mature** — Qwen decode paths use fused attention/MLP kernels; DeepSeek V4 is currently a multi-stage MP8 path with TileLang kernels, NCCL reductions, and CUDA glue
+- **GPU-first runtime** — model execution stays in native Rust/CUDA paths
+- **Custom GPU kernels** — CUDA for decode-critical paths, Triton AOT for Qwen3.5 compatibility kernels, FlashInfer for paged attention/sampling, NCCL for multi-GPU reductions, and cuBLAS for matrix multiplication
 - **CUDA Graph** on Qwen decode paths — eliminates kernel launch overhead where enabled
 - **Per-model crate boundary** — Qwen3-4B owns its config, weights, scheduler/executor, tests, benches, and kernel plan in `openinfer-qwen3`
 
@@ -308,11 +292,10 @@ flowchart TB
 - **Qwen3**: 32 Q heads, 8 KV heads (GQA 4:1), head_dim=128
 - **Qwen3.5**: hybrid — 24 linear attention layers (Gated Delta Rule) + 8 full attention layers, head_dim=256
 - **DeepSeek V2-Lite**: feature-gated 2-GPU EP2 correctness/attribution path for the HF/host-staged/NCCL narrow greedy gate
-- **DeepSeek V4 Flash**: feature-gated 8-way MP8 checkpoint with MoE routing, sparse attention, FP8/FP4 TileLang kernels, and single-request OpenAI-compatible greedy smoke/direct regression path
 
 ### What's not (yet) implemented
 
-- General-purpose quantization for the Qwen lines — INT4 and FP8/FP4 today are model-specific (Kimi-K2 Marlin INT4, DeepSeek-V4 FP8/FP4), not yet available for the BF16 Qwen models
+- General-purpose quantization for the Qwen lines — INT4 and FP8 today are model-specific (Kimi-K2 Marlin INT4, GLM5.2 FP8), not yet available for the BF16 Qwen models
 
 ## Development
 
@@ -344,7 +327,6 @@ cargo test --release --workspace --lib
 OPENINFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release -p openinfer-qwen3 --test hf_golden_gate
 OPENINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p openinfer-qwen35-4b --features qwen35-4b --test hf_golden_gate
 OPENINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p openinfer-qwen35-4b --features qwen35-4b --test e2e_scheduler
-OPENINFER_TEST_MODEL_PATH=models/DeepSeek-V4-Flash cargo test --release -p openinfer-deepseek-v4 --features deepseek-v4 --test mp8_manifest
 ```
 
 ## License
