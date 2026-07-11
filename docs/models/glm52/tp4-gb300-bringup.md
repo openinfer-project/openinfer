@@ -1,6 +1,6 @@
 # GLM5.2 TP4 on GB300
 
-> **TL;DR:** GLM-5.2-FP8 TP4 on 4xGB300 via FlashInfer sparse MLA, compact decode buckets, SM-selected GEMV/MoE launches, and a vocabulary-sharded greedy tail. The 2026-07-10 matched pair beat vLLM pure TP4 at both fully warmed bs=1 shapes (`9.03` vs `9.21ms` at 1/256, `9.56` vs `9.60ms` at 1024/256); a 2026-07-11 re-validation on the same host reads higher on the OpenInfer path only — host-state drift, code exonerated by same-day A/B (see "2026-07-11 re-validation"). The short-context top-256 attention tier was then removed as non-production weight: it bought `~0.18ms/step` only at the synthetic 1/256 shape (real agent contexts pass 256 tokens immediately), so the 1/256 headline is now ~parity with vLLM while 1024/256 is unchanged. Functional gates are all green. A controlled vLLM EP4 run is slower (`9.47/9.84ms`), so EP4 is out of scope.
+> **TL;DR:** GLM-5.2-FP8 TP4 on 4xGB300 via FlashInfer sparse MLA, compact decode buckets, SM-selected GEMV/MoE launches, and a vocabulary-sharded greedy tail. The 2026-07-10 matched pair beat vLLM pure TP4 at both fully warmed bs=1 shapes (`9.03` vs `9.21ms` at 1/256, `9.56` vs `9.60ms` at 1024/256); a 2026-07-11 re-validation on the same host reads higher on the OpenInfer path only — host-state drift, code exonerated by same-day A/B (see "2026-07-11 re-validation"). The short-context top-256 attention tier was then removed as non-production weight (it bought `~0.18ms/step` only at the synthetic 1/256 shape). A 2026-07-11 node-count campaign then fused the MLA front, the rows=1 attention AR, and the MoE gate|up+SiLU — all bit-exact — cutting the bucket-1 graph `2,334 -> 1,867` kernels and same-day TPOT `9.85 -> 9.38ms` / `10.20 -> 9.74ms` (see "Graph node-count reduction"). Functional gates are all green. A controlled vLLM EP4 run is slower (`9.47/9.84ms`), so EP4 is out of scope.
 >
 > **Last touched:** 2026-07
 
@@ -106,6 +106,37 @@ The accepted optimized node trace uses four ranks and exact per-layer instance c
 The attention-AR increase is one communication-wait outlier; per-kernel medians did not regress. The traced request measured `11.49ms` versus the untraced `10.83ms`, so the trace is composition evidence rather than the performance result.
 
 The final vocabulary-sharded node trace measures the local LM head at `77.01us` per rank versus about `312us` for the old redundant full-vocabulary head. Pack/unpack cost `1.63/2.46us`; the one extra TP AR triplet averages `8.41us`. The predicted net saving is about `222us/token`, matching serving.
+
+### Graph node-count reduction (2026-07-11)
+
+Three bit-exact fuses drove the bucket-1 whole-step graph from `2,334` to
+`1,867` kernels (`-20%`), each validated by a standalone randomized
+byte-compare harness, a graph-dump node count, a greedy byte-identity smoke,
+and a same-day TPOT A/B (the day's drifted baseline, not the 07-10 headline):
+
+| Fuse | Nodes | 1/256 TPOT | 1024/256 TPOT |
+| --- | ---: | ---: | ---: |
+| (day baseline, post short-tier removal) | `2,334` | `9.85ms` | `10.20ms` |
+| MLA front: ckv_split + kv_a norm + query/cache quant-pack → 1 | `-234` | `9.70ms` | `10.03ms` |
+| Attention AR one-shot at rows=1 (push/reduce/recv → 1) | `-158` | `9.49ms` | `9.85ms` |
+| MoE gate\|up mma + SiLU epilogue → 1 (bpart roundtrip deleted) | `-75` | **`9.38ms`** | **`9.74ms`** |
+
+Bit-exactness discipline: a fuse must reproduce the exact f32 association of
+the chain it replaces (FlashInfer's d=512 norm reduction; the AR's
+ascending-src sums; the SiLU's per-slice-then-ks two-level reduce), verified
+against the vendored FlashInfer templates or the production kernels in the
+harness before integration. Candidates that cannot preserve bits (router on
+cuBLAS tensor-op accumulation) are deferred until a deliberate re-baseline.
+
+**Rejected with data — recv + FusedAddRMSNormRound:** the closing add+norm
+needs one block per row, which concentrates the recv's `24,576` 16-byte LL
+packet loads (4-byte payload — a 4x wire waste) onto a single SM at bucket 1.
+Load-issue bound: `24.7us` naively, `13.4us` after coalescing the packet
+reads (strided ownership + shared staging), vs `4.9us` for the unfused
+recv+norm pair — and a 12-byte-payload wire format would still only reach
+~`4.5us`. A push+recv single-kernel fuse was also rejected: its progress
+guarantee needs every block of every rank resident simultaneously, a
+deadlock risk on shared GPUs. The MoE chain therefore stays at five nodes.
 
 ### MoE resource gate and grid tune
 
@@ -225,6 +256,21 @@ and the `" Paris. Distance from ..."` prefix all still pass post-removal.
 - CUDA refactors need resource acceptance gates: the shared-header extraction
   was gated on exact register counts (`80/56` for GEMM B/C), launch grids, and
   serving TPOT, not on compilation alone.
+- A fuse that shrinks the grid can starve SMs at bucket 1 even when total
+  work is unchanged: the first gemm_b+SiLU cut (16 k-slices per 256-thread
+  CTA) regressed TPOT `9.49 -> 10.13ms`; restoring the old ~2-slice serial
+  depth per warp with 512-thread CTAs won on both shapes. Node count is not
+  the objective function — the same-day TPOT A/B is.
+- LL packet consumers must separate load issue from tag check: a check after
+  each volatile load makes every packet a dependent memory round trip
+  (`+14.6us/layer` measured); batch the loads, then check, then fall back to
+  the spin only for misses. And per-element 16-byte packets are hostile to
+  any single-block consumer — one SM issues one load per cycle, so 24,576
+  packets cost `~13.6us` regardless of bandwidth.
+- Simulating N LL ranks on one GPU needs staged launches (device sync between
+  chain kernels): one GPU has no multi-device progress guarantee, so a spin
+  can starve the peer kernel it waits on and trip the 200M-iteration trap —
+  the production topology is immune (`tp_ar_oneshot_harness.cu`).
 
 ## Remaining Work
 
