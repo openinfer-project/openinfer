@@ -97,35 +97,6 @@ __global__ void glm52_mla_query_assemble_kernel(
   }
 }
 
-// FlashInfer TRTLLM-gen consumes compact, statically-scaled E4M3 Q. This is
-// the same assembly math as above without the 64-head FlashMLA padding.
-__global__ void glm52_mla_query_assemble_fp8_kernel(
-    const __nv_bfloat16* __restrict__ ql_nope,
-    const __nv_bfloat16* __restrict__ q_pe_base, int q_pe_offset,
-    int q_pe_head_stride, int num_q_heads,
-    const __nv_bfloat16* __restrict__ cos,
-    const __nv_bfloat16* __restrict__ sin,
-    unsigned char* __restrict__ query) {  // [T, num_q_heads, 576]
-  const int h = blockIdx.x;
-  const int t = blockIdx.y;
-  const __nv_bfloat16* q_pe = q_pe_base + q_pe_offset +
-                              (size_t)t * num_q_heads * q_pe_head_stride +
-                              h * q_pe_head_stride;
-  const __nv_bfloat16* cos_t = cos + (size_t)t * kRopeHalf;
-  const __nv_bfloat16* sin_t = sin + (size_t)t * kRopeHalf;
-  const __nv_bfloat16* ql_t =
-      ql_nope + ((size_t)t * num_q_heads + h) * kQkNope;
-  unsigned char* query_t =
-      query + ((size_t)t * num_q_heads + h) * kQueryDim;
-  for (int i = threadIdx.x; i < kQueryDim; i += blockDim.x) {
-    float value = i < kQkNope
-                      ? __bfloat162float(ql_t[i])
-                      : __bfloat162float(
-                            rope_block(q_pe, i - kQkNope, cos_t, sin_t));
-    query_t[i] = quantize_static_e4m3(value);
-  }
-}
-
 __global__ void glm52_mla_cache_pack_kernel(
     const unsigned char* __restrict__ ckv_fp8,   // [T, 512]
     const float* __restrict__ ckv_scales,        // [T, 4]
@@ -167,31 +138,98 @@ __global__ void glm52_mla_cache_pack_kernel(
   }
 }
 
-// Standard FP8 MLA cache used by FlashInfer: one token is a single E4M3
-// [576] vector, with normalized ckv followed by the rotated k_pe. The scale is
-// statically 1.0, matching vLLM's uncalibrated GLM-5.2-FP8 cache path.
-__global__ void glm52_mla_cache_pack_fp8_kernel(
-    const __nv_bfloat16* __restrict__ ckv,       // [T, 512]
-    const __nv_bfloat16* __restrict__ k_pe,      // [T, 64]
-    const __nv_bfloat16* __restrict__ cos,       // [T, 32]
-    const __nv_bfloat16* __restrict__ sin,       // [T, 32]
-    unsigned char* __restrict__ cache,           // [max_slots, 576]
-    const long long* __restrict__ slot_mapping,  // [T]
-    long long max_slots) {
-  const int t = blockIdx.x;
-  const long long slot = slot_mapping[t];
-  if (slot < 0 || slot >= max_slots) __trap();
-  unsigned char* cache_token =
-      cache + slot * static_cast<long long>(kFlashInferCacheBytes);
-  const __nv_bfloat16* ckv_t = ckv + (size_t)t * kKvLora;
-  const __nv_bfloat16* k_pe_t = k_pe + (size_t)t * kRopeDim;
+// Fused FlashInfer front pack: one launch replaces the per-layer
+// ckv_split -> kv_a RMSNorm -> query assemble -> cache pack chain
+// (4 graph nodes -> 1). Grid (num_q_heads + 1, T), block (32, 2):
+//   blockIdx.x <  num_q_heads : query assemble + static-e4m3 quantize
+//                               (elementwise).
+//   blockIdx.x == num_q_heads : kv_a RMSNorm over ckv_raw[t, 0..512) with the
+//                               EXACT FlashInfer RMSNormKernel d=512 reduction
+//                               (vec8 x 64 threads, shfl_xor 16..1, cross-warp
+//                               smem, rsqrtf(sum/512+eps)), then the 576-byte
+//                               cache pack. The normed value is rounded to
+//                               bf16 BEFORE e4m3 quantization, preserving the
+//                               unfused chain's double rounding bit-for-bit
+//                               (validated byte-identical over randomized
+//                               trials against the production chain with the
+//                               vendored flashinfer::norm::RMSNorm as
+//                               reference).
+__global__ void glm52_mla_front_pack_fp8_kernel(
+    const __nv_bfloat16* __restrict__ ql_nope,
+    const __nv_bfloat16* __restrict__ q_pe_base, int q_pe_offset,
+    int q_pe_head_stride, int num_q_heads,
+    const __nv_bfloat16* __restrict__ ckv_raw,      // [T, 576] kv_a output
+    const __nv_bfloat16* __restrict__ norm_weight,  // [512] kv_a_ln
+    float eps,
+    const __nv_bfloat16* __restrict__ cos, const __nv_bfloat16* __restrict__ sin,
+    unsigned char* __restrict__ query,              // [T, num_q_heads, 576]
+    unsigned char* __restrict__ cache,              // [max_slots, 576]
+    const long long* __restrict__ slot_mapping, long long max_slots) {
+  const int t = blockIdx.y;
   const __nv_bfloat16* cos_t = cos + (size_t)t * kRopeHalf;
   const __nv_bfloat16* sin_t = sin + (size_t)t * kRopeHalf;
-  for (int i = threadIdx.x; i < kFlashInferCacheBytes; i += blockDim.x) {
-    float value = i < kKvLora
-                      ? __bfloat162float(ckv_t[i])
-                      : __bfloat162float(
-                            rope_block(k_pe_t, i - kKvLora, cos_t, sin_t));
+  const int tx = threadIdx.x, ty = threadIdx.y;
+  const int thread_id = tx + ty * 32;
+
+  if ((int)blockIdx.x < num_q_heads) {
+    const int h = blockIdx.x;
+    const __nv_bfloat16* q_pe = q_pe_base + q_pe_offset +
+                                (size_t)t * num_q_heads * q_pe_head_stride +
+                                h * q_pe_head_stride;
+    const __nv_bfloat16* ql_t = ql_nope + ((size_t)t * num_q_heads + h) * kQkNope;
+    unsigned char* query_t = query + ((size_t)t * num_q_heads + h) * kQueryDim;
+    for (int i = thread_id; i < kQueryDim; i += 64) {
+      float value = i < kQkNope
+                        ? __bfloat162float(ql_t[i])
+                        : __bfloat162float(rope_block(q_pe, i - kQkNope, cos_t, sin_t));
+      query_t[i] = quantize_static_e4m3(value);
+    }
+    return;
+  }
+
+  // ---- kv role ----
+  const long long slot = slot_mapping[t];
+  if (slot < 0 || slot >= max_slots) __trap();
+  const __nv_bfloat16* row = ckv_raw + (size_t)t * (kKvLora + kRopeDim);
+  __shared__ float smem[2];
+
+  float sum_sq = 0.f;
+  {
+    const __nv_bfloat16* v = row + thread_id * 8;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      float value = __bfloat162float(v[j]);
+      sum_sq += value * value;
+    }
+  }
+#pragma unroll
+  for (int offset = 16; offset > 0; offset /= 2) {
+    sum_sq += __shfl_xor_sync(0xffffffff, sum_sq, offset);
+  }
+  if (tx == 0) smem[ty] = sum_sq;
+  __syncthreads();
+  if (ty == 0) {
+    sum_sq = (tx < 2) ? smem[tx] : 0.f;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+      sum_sq += __shfl_xor_sync(0xffffffff, sum_sq, offset);
+    }
+    smem[0] = sum_sq;
+  }
+  __syncthreads();
+  const float rms_rcp = rsqrtf(smem[0] / float(kKvLora) + eps);
+
+  unsigned char* cache_token =
+      cache + slot * static_cast<long long>(kFlashInferCacheBytes);
+  for (int i = thread_id; i < kFlashInferCacheBytes; i += 64) {
+    float value;
+    if (i < kKvLora) {
+      float normed = __bfloat162float(row[i]) * rms_rcp *
+                     (0.f + __bfloat162float(norm_weight[i]));
+      value = __bfloat162float(__float2bfloat16(normed));
+    } else {
+      value = __bfloat162float(rope_block(row + kKvLora, i - kKvLora, cos_t, sin_t));
+    }
     cache_token[i] = quantize_static_e4m3(value);
   }
 }
@@ -246,23 +284,6 @@ CUresult glm52_mla_query_assemble_cuda(const __nv_bfloat16* ql_nope,
   return consume_last_cuda_error();
 }
 
-CUresult glm52_mla_query_assemble_fp8_cuda(
-    const __nv_bfloat16* ql_nope, const __nv_bfloat16* q_pe_base,
-    int q_pe_offset, int q_pe_head_stride, int num_q_heads,
-    const __nv_bfloat16* cos, const __nv_bfloat16* sin,
-    unsigned char* query, int tokens, cudaStream_t stream) {
-  if (ql_nope == nullptr || q_pe_base == nullptr || cos == nullptr ||
-      sin == nullptr || query == nullptr || tokens <= 0 ||
-      num_q_heads <= 0 || num_q_heads > kHeads) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
-  const dim3 grid(num_q_heads, tokens, 1);
-  glm52_mla_query_assemble_fp8_kernel<<<grid, 192, 0, stream>>>(
-      ql_nope, q_pe_base, q_pe_offset, q_pe_head_stride, num_q_heads, cos,
-      sin, query);
-  return consume_last_cuda_error();
-}
-
 CUresult glm52_mla_cache_pack_cuda(const unsigned char* ckv_fp8,
                                    const float* ckv_scales,
                                    const __nv_bfloat16* k_pe,
@@ -282,18 +303,25 @@ CUresult glm52_mla_cache_pack_cuda(const unsigned char* ckv_fp8,
   return consume_last_cuda_error();
 }
 
-CUresult glm52_mla_cache_pack_fp8_cuda(
-    const __nv_bfloat16* ckv, const __nv_bfloat16* k_pe,
-    const __nv_bfloat16* cos, const __nv_bfloat16* sin,
+CUresult glm52_mla_front_pack_fp8_cuda(
+    const __nv_bfloat16* ql_nope, const __nv_bfloat16* q_pe_base,
+    int q_pe_offset, int q_pe_head_stride, int num_q_heads,
+    const __nv_bfloat16* ckv_raw, const __nv_bfloat16* norm_weight, float eps,
+    const __nv_bfloat16* cos, const __nv_bfloat16* sin, unsigned char* query,
     unsigned char* cache, const long long* slot_mapping, long long max_slots,
     int tokens, cudaStream_t stream) {
-  if (ckv == nullptr || k_pe == nullptr || cos == nullptr || sin == nullptr ||
-      cache == nullptr || slot_mapping == nullptr || max_slots <= 0 ||
-      tokens <= 0) {
+  if (ql_nope == nullptr || q_pe_base == nullptr || ckv_raw == nullptr ||
+      norm_weight == nullptr || cos == nullptr || sin == nullptr ||
+      query == nullptr || cache == nullptr || slot_mapping == nullptr ||
+      max_slots <= 0 || tokens <= 0 || num_q_heads <= 0 ||
+      num_q_heads > kHeads) {
     return CUDA_ERROR_INVALID_VALUE;
   }
-  glm52_mla_cache_pack_fp8_kernel<<<tokens, 192, 0, stream>>>(
-      ckv, k_pe, cos, sin, cache, slot_mapping, max_slots);
+  const dim3 grid(num_q_heads + 1, tokens, 1);
+  const dim3 block(32, 2, 1);
+  glm52_mla_front_pack_fp8_kernel<<<grid, block, 0, stream>>>(
+      ql_nope, q_pe_base, q_pe_offset, q_pe_head_stride, num_q_heads, ckv_raw,
+      norm_weight, eps, cos, sin, query, cache, slot_mapping, max_slots);
   return consume_last_cuda_error();
 }
 

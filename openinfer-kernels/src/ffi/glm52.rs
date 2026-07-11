@@ -94,19 +94,6 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn glm52_mla_query_assemble_fp8_cuda(
-        ql_nope: *const Half,
-        q_pe_base: *const Half,
-        q_pe_offset: i32,
-        q_pe_head_stride: i32,
-        num_q_heads: i32,
-        cos: *const Half,
-        sin: *const Half,
-        query: *mut u8,
-        tokens: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
     pub fn glm52_mla_cache_pack_cuda(
         ckv_fp8: *const u8,
         ckv_scales: *const f32,
@@ -120,11 +107,18 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn glm52_mla_cache_pack_fp8_cuda(
-        ckv: *const Half,
-        k_pe: *const Half,
+    pub fn glm52_mla_front_pack_fp8_cuda(
+        ql_nope: *const Half,
+        q_pe_base: *const Half,
+        q_pe_offset: i32,
+        q_pe_head_stride: i32,
+        num_q_heads: i32,
+        ckv_raw: *const Half,
+        norm_weight: *const Half,
+        eps: f32,
         cos: *const Half,
         sin: *const Half,
+        query: *mut u8,
         cache: *mut u8,
         slot_mapping: *const i64,
         max_slots: i64,

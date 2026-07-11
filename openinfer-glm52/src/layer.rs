@@ -231,7 +231,13 @@ pub(crate) fn glm52_layer_attention_half(
         *carry_ready,
         "GLM5.2 shared-indexer layer reached before any full indexer ran"
     );
-    glm52_mla_front_rest_into(ctx, &w.mla, &s.layer.normed, &mut s.mla_front)?;
+    glm52_mla_front_rest_into(
+        ctx,
+        &w.mla,
+        &s.layer.normed,
+        &mut s.mla_front,
+        step.mla_sched.folds_kv_pack(),
+    )?;
     if let Some(topk_ready) = &topk_ready {
         // Join before the attend consumes `s.idx.global_slots`.
         ctx.stream.wait(topk_ready)?;

@@ -26,9 +26,9 @@ use openinfer_kernels::ops::{
     Glm52MoeQuantShape, Glm52SparseMlaDecode, gemm_strided_batched_bf16,
     glm52_flashinfer_sparse_mla_fp8_launch, glm52_flashinfer_sparse_mla_supported,
     glm52_flashmla_sparse_decode_launch, glm52_flashmla_sparse_decode_metadata_launch,
-    glm52_fp8_per_token_group_quant_bf16_launch, glm52_mla_cache_pack_fp8_launch,
-    glm52_mla_cache_pack_launch, glm52_mla_ckv_split_launch, glm52_mla_query_assemble_fp8_launch,
-    glm52_mla_query_assemble_launch, glm52_sparse_mla_decode_launch, rms_norm_rows_into,
+    glm52_fp8_per_token_group_quant_bf16_launch, glm52_mla_cache_pack_launch,
+    glm52_mla_ckv_split_launch, glm52_mla_front_pack_fp8_launch, glm52_mla_query_assemble_launch,
+    glm52_sparse_mla_decode_launch, rms_norm_rows_into,
 };
 use openinfer_kernels::tensor::{DeviceContext, DeviceVec};
 
@@ -371,11 +371,16 @@ pub(crate) fn glm52_mla_front_q_into(
 
 /// The remainder of the MLA front: q_b + kv_a projections and the kv_c/k_pe
 /// unpacking, over the front's `tokens` rows. Independent of the indexer.
+///
+/// `fold_kv_pack` (the FlashInfer backend): the ckv split and kv_a RMSNorm
+/// are fused into the attend-side `glm52_mla_front_pack_fp8_launch`, so this
+/// half leaves `front.ckv` raw and never touches kv_c/k_pe.
 pub(crate) fn glm52_mla_front_rest_into(
     ctx: &DeviceContext,
     w: &Glm52MlaLayerWeights,
     hidden: &Rows<HIDDEN>,
     front: &mut Glm52MlaFront,
+    fold_kv_pack: bool,
 ) -> Result<()> {
     let t = front.tokens();
     ensure!(
@@ -402,6 +407,9 @@ pub(crate) fn glm52_mla_front_rest_into(
             &mut front.ckv,
         )?;
     }
+    if fold_kv_pack {
+        return Ok(());
+    }
     glm52_mla_ckv_split_launch(ctx, t, &front.ckv, &mut front.kv_c_raw, &mut front.k_pe)?;
     rms_norm_rows_into(
         ctx,
@@ -422,9 +430,10 @@ pub(crate) fn glm52_mla_front_into(
     w: &Glm52MlaLayerWeights,
     hidden: &Rows<HIDDEN>,
     front: &mut Glm52MlaFront,
+    fold_kv_pack: bool,
 ) -> Result<()> {
     glm52_mla_front_q_into(ctx, w, hidden, front)?;
-    glm52_mla_front_rest_into(ctx, w, hidden, front)
+    glm52_mla_front_rest_into(ctx, w, hidden, front, fold_kv_pack)
 }
 
 /// Persistent scratch for the MLA attend half: absorb/query-assemble/cache-
@@ -588,7 +597,7 @@ pub(crate) fn glm52_mla_decode_forward(
     ctx.stream
         .memcpy_htod(&[position as i64], &mut slot_mapping)?;
     let mut o = Rows::zeros(ctx, sched.batch())?;
-    glm52_mla_front_into(ctx, w, hidden, &mut front)?;
+    glm52_mla_front_into(ctx, w, hidden, &mut front, sched.folds_kv_pack())?;
     glm52_mla_attend_into(
         ctx,
         w,
@@ -681,6 +690,13 @@ impl Glm52MlaSchedMetadata {
     /// truth for a step's batch shape (every consumer reads it from here).
     pub(crate) fn batch(&self) -> usize {
         self.contract.batch_size
+    }
+
+    /// Whether the attend half packs the cache with the fused front kernel
+    /// (query assemble + kv_a RMSNorm + cache pack in one launch): the MLA
+    /// front must then leave `front.ckv` raw and skip the split/norm.
+    pub(crate) fn folds_kv_pack(&self) -> bool {
+        matches!(self.backend, Glm52MlaBackendSchedule::FlashInfer)
     }
 }
 
@@ -877,7 +893,10 @@ pub(crate) fn glm52_mla_attend_into(
             (&scratch.latent, HEADS * KV_LORA)
         }
         (Glm52MlaBackendSchedule::FlashInfer, Glm52MlaBackendScratch::FlashInfer(scratch)) => {
-            glm52_mla_query_assemble_fp8_launch(
+            // One fused launch: query assemble + kv_a RMSNorm + cache pack
+            // (the split/norm were skipped in `glm52_mla_front_rest_into` for
+            // this backend — the raw kv_a output is consumed directly).
+            glm52_mla_front_pack_fp8_launch(
                 ctx,
                 t,
                 heads,
@@ -885,17 +904,12 @@ pub(crate) fn glm52_mla_attend_into(
                 &front.q_full,
                 QK_NOPE,
                 Q_HEAD,
+                &front.ckv,
+                &w.kv_a_ln.data,
+                RMS_EPS,
                 cos,
                 sin,
                 &mut scratch.query,
-            )?;
-            glm52_mla_cache_pack_fp8_launch(
-                ctx,
-                t,
-                &front.kv_c,
-                &front.k_pe,
-                cos,
-                sin,
                 cache,
                 slot_mapping,
             )?;
