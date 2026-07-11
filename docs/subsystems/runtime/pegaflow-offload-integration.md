@@ -48,11 +48,10 @@ openinfer 仓里 vendored 的 `kvbm-physical` / `kvbm-engine` 设计目标就是
 | **Qwen3 / Qwen3.5 full-attn** | paged，page-first 单 buffer，`PagePool` | 无（dense 全前缀） | 有（前缀缓存已落地） | **已首发（#316）**：page-first 与 pegaflow `stride==copy-size` ABI 冲突已由 `block_stride`（§5.R1）解掉，端到端跑通 |
 | **Kimi-K2 MLA** | paged，per-layer ckv/kpe arena，后端是 `BlockPool`；latent 68.6 KiB/token，无 per-head | 无（dense 全前缀） | 有（HBM 内 prefix cache 已落地） | **下一候选**：layout 直接适配 pegaflow registration（接入面最干净），复用 Qwen3-4B 这套 connector 模式即可 |
 | **Qwen3.5 linear（24 层）** | per-request `RecurrentState` [32,128,128] f32 2 MiB/层，非 paged、独立分配 | 无（每步读写整个 matrix） | **零**（this-request 有损摘要，非 content-addressable） | **排除**：offload 无 prefix/dedup 收益；省显存是 per-request swap-out，另一套机制 |
-| **DeepSeek-V4 sparse** | per-request per-layer dense arena [window\|compressed]，非 paged；compressor 4:1 | **显式**：`topk_idxs` = window 行 + indexer 选中 compressed 行，token/row 粒度，每步重选 | 部分 | **暂缓**：compressor 已控 footprint；indexer 信号现成但 token 粒度 ≠ block 粒度（见 §7） |
 
 **边界结论**：connector 只收 **block-structured、content-addressable** 的 KV（MLA latent / full-attn paged）。recurrent/SSM state 不进 connector。稀疏的 active-set gather 是独立的、未来的课题。
 
-证据：Kimi `openinfer-kimi-k2/src/runner/{worker.rs:612-619, cache.rs:63-80, mla.rs:38-48}`、`scheduler.rs:16,27,146,180`、`pool.rs:123`；Qwen3.5 linear `openinfer-qwen35-4b/src/...recurrent.rs`、`batch_decode_graph.rs:82-86`；DeepSeek `openinfer-deepseek-v4/src/...state.rs:220, indexer.rs:609-670`、`csrc/.../deepseek_indexer.cu:470-527`。
+证据：Kimi `openinfer-kimi-k2/src/runner/{worker.rs:612-619, cache.rs:63-80, mla.rs:38-48}`、`scheduler.rs:16,27,146,180`、`pool.rs:123`；Qwen3.5 linear `openinfer-qwen35-4b/src/...recurrent.rs`、`batch_decode_graph.rs:82-86`。
 
 ## 4. 路线
 

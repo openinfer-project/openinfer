@@ -68,6 +68,16 @@ pub fn detect_model_type(model_path: impl AsRef<Path>) -> Result<ModelType> {
     if json
         .get("model_type")
         .and_then(serde_json::Value::as_str)
+        .is_some_and(|model_type| model_type == "deepseek_v4")
+    {
+        anyhow::bail!(
+            "DeepSeek-V4 support was removed from openinfer; the last release with the deepseek-v4 feature predates PR #649"
+        );
+    }
+
+    if json
+        .get("model_type")
+        .and_then(serde_json::Value::as_str)
         .is_some_and(|model_type| model_type == "glm_moe_dsa")
     {
         #[cfg(feature = "glm52")]

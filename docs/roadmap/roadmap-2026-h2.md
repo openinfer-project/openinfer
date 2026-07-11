@@ -91,7 +91,7 @@ Carried from `execution.md`. Qwen3 and Qwen3.5 already have `kernel_plan()` desc
 
 Prefill/decode disaggregation with KV transfer between workers, speaking the same NIXL semantics vLLM/Dynamo use, so openinfer workers drop into that ecosystem instead of inventing a transport protocol. PegaFlow remains the data plane.
 
-Design-first for the same reason the KV-cache crate was: it is load-bearing and under-specified. **One design issue** — not two parallel efforts (the earlier DeepSeek-V4 P/D handoff design doc was retired with that model line; its page-ownership/lease ideas live on in the issue). Implementation needs multi-GPU/multi-node verification, so it stays Later until the design is settled and the GLM5.2 line supplies a real workload.
+Design-first for the same reason the KV-cache crate was: it is load-bearing and under-specified. **One design issue** — not two parallel efforts (an earlier per-model P/D handoff design doc was retired with its model line; its page-ownership/lease ideas live on in the issue). Implementation needs multi-GPU/multi-node verification, so it stays Later until the design is settled and the GLM5.2 line supplies a real workload.
 
 Related positioning: **multi-instance concerns (routing, P/D orchestration) are delegated to Dynamo; openinfer is a first-class worker.** The `openinfer-dynamo-backend`/`-frontend` crates and the verified KV-aware routing result (follow-up-turn TTFT ~45 ms vs ~165 ms round-robin) already point this way.
 

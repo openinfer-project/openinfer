@@ -43,6 +43,4 @@ One engine seed at startup (`StdRng::seed_from_u64`), advanced to a fresh `u64` 
 
 ## Next step
 
-DeepSeek-V4 still selects greedily on the **host** — `argmax_f32` over a D2H'd logits row inside its direct scheduler (`sample_greedy_step`). It is the one CPU token-selection path left in the tree. V4 is greedy-only, so it needs nothing `select_batch` offers today; the day V4 grows temperature/top-p sampling, that host argmax is what should move here. Caveat: V4 cannot be built on a TileLang-less host, so any such change needs an 8-GPU box to verify — it was **not** compiled when this crate landed.
-
 Kimi's prefill single-row greedy still uses a separate FFI entry (`flashinfer_top1_cuda`) from its batched decode argmax (`argmax_batch_bf16_split_cuda`); unifying those two is a Kimi-local cleanup, not a crate concern. If a fourth model needs sharded selection, revisit whether a `select_batch_sharded` (returning ids + top-1 values) earns its place — today it would have exactly one caller.

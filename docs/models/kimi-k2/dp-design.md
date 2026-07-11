@@ -30,7 +30,7 @@ local_experts = 384 / ep_world         (按 ep_world 切)
 ### 数据结构
 
 ```rust
-/// 纯并行拓扑，跟模型无关。可复用于 DSV4、Qwen 等。
+/// 纯并行拓扑，跟模型无关。可复用于 Qwen 等其他模型线。
 /// 放 openinfer-core。
 pub struct ParallelConfig {
     pub tp_world: usize,

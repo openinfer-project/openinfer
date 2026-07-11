@@ -190,7 +190,6 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | `benchmarks/mixed-load-itl.md` | Qwen3-4B + Qwen3.5 mixed-load ITL (#244, #375): chunking-off sweeps (qps × prompt × prefix) via `bench_serving mixed`. Both lines freeze every active decode for the full prefill in the unified step (8k≈0.9–1.2s, 12k≈1.4–2.2s). Qwen3 p99 blows up with prompt (8k 1161, 12k 3270ms at qps≥0.5); Qwen3.5's freeze lands just under the 1% p99 knee (shows in `max`, not p99 — measurement artifact of the 1024-tok background, **not** immunity). Prefix reuse defeats it. #375 chunked prefill caps the per-step freeze. |
 | `benchmarks/accuracy-eval-results.md` | Phase 1 GSM8K: Qwen3-4B PASS (openinfer 85.37% vs HF 85.82%, delta -0.45 pp). Qwen3.5-4B historical FAIL recovered by #250 (strict 79.38%, flexible 79.30% vs HF 79.45%). |
 | `benchmarks/qwen3-8b-pd-vs-mix-h200.md` | Qwen3-8B 多轮负载三方 A/B（2×H200）：P/D 1P+1D vs mixed×2（会话亲和 LB）vs mixed×1。吞吐持平（47.8k vs 47.0k tok/s），P/D 赢在 decode 稳定性（TPOT p99 10.08 vs 12.77ms，turn2+ TTFT 恒定 ~107ms vs 爬升 71→132ms），冷 turn1 多付 ~200ms（M3 目标）。含 vllm-bench 命令与 `max_completion_tokens` 坑。 |
-| `benchmarks/deepep-v2-vs-pplx-moe-backend.md` | H20 x8 DeepEP V2 vs current OpenInfer PPLX EP backend comparison: ElasticBuffer/NCCL Gin shows a directional 2.5x-5.3x paired-run ratio on tested DSV4 and Kimi-K2 MoE exchange shapes, with dtype, correctness, harness, and PPLX baseline-drift caveats recorded. |
 
 ## conventions
 
