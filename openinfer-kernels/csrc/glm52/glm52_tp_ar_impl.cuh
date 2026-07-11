@@ -156,6 +156,74 @@ __global__ void __launch_bounds__(kThreads) tp_ar_reduce_bcast_kernel(
   }
 }
 
+// One-shot allreduce for the single-row TP4 shape: every rank pushes its
+// FULL partial to every peer, spins once, and reduces all kRanks partials
+// locally in the SAME ascending src order the two-shot reduce uses — the
+// f32 add sequence per element is identical, so the result is bit-identical
+// to the two-shot chain (and across ranks). One kernel replaces three graph
+// nodes per AR slot; chosen at graph capture from the bucket's row count.
+//
+// Shape gate: at rows=1 the payload is one 12 KB row — latency-bound, and
+// one-shot egress is only (kRanks-1)x vs two-shot's ~2x. At 8 rows (TP8's
+// fixed bucket, TP4's larger buckets) the R4 probe measured one-shot losing
+// on wire bytes, so those shapes keep the two-shot chain.
+//
+// Wire layout inside the slot's stage-0 region: [chunk kRanks][src kRanks]
+// [kChunkPk] — chunk takes the role row plays in the two-shot layout, so the
+// baked `peer_ar[p] = base_p + myrank*kChunkPk` pointers address it
+// unchanged, and chunk < kRanks <= kTokens keeps it inside stage 0. Mixed
+// layouts across steps are safe: the epoch tag is strictly increasing, so a
+// packet from a different bucket's layout never matches the current tag.
+//
+// Every thread issues its pushes BEFORE its first spin and block scheduling
+// is the only cross-rank dependency — the same progress guarantee the
+// two-shot chain's kernel boundary provides.
+static_assert(kRanks <= kTokens,
+              "one-shot [chunk][src] layout must fit inside stage 0");
+__global__ void __launch_bounds__(kThreads) tp_ar_oneshot_kernel(
+    Glm52TpArArgs a) {
+  TP_AR_PREAMBLE
+  for (int rp = gt; rp < kRanks * kChunkPk; rp += GT) {
+    const int c = rp / kChunkPk, i = rp % kChunkPk;
+    if (act == 0) {
+      st_payload12(a.out + (size_t)c * kChunk + i * 6, 0u, 0u, 0u);
+      continue;
+    }
+    unsigned x, y, z;
+    ld_payload12(a.partial + (size_t)c * kChunk + i * 6, &x, &y, &z);
+    for (int dst = 0; dst < a.nranks; ++dst) {
+      if (dst == a.myrank) continue;
+      glm52_tp_st_ll12(a.peer_ar[dst] + ar_off + (size_t)c * kRowStride + i, x,
+                       y, z, tag);
+    }
+    float2 a01 = make_float2(0.f, 0.f), a23 = a01, a45 = a01;
+    for (int src = 0; src < a.nranks; ++src) {
+      unsigned px, py, pz;
+      if (src == a.myrank) {
+        // Own contribution never crosses the wire: the packet would carry
+        // these exact bf16 words, so the local read is bit-identical.
+        px = x;
+        py = y;
+        pz = z;
+      } else {
+        uint4 q;
+        glm52_tp_ll_wait(a.ar_local + ar_off + (size_t)c * kRowStride +
+                             (size_t)src * kChunkPk + i,
+                         tag, &q);
+        px = q.x;
+        py = q.y;
+        pz = q.z;
+      }
+      const float2 p01 = bf2f(px), p23 = bf2f(py), p45 = bf2f(pz);
+      a01.x += p01.x; a01.y += p01.y;
+      a23.x += p23.x; a23.y += p23.y;
+      a45.x += p45.x; a45.y += p45.y;
+    }
+    st_payload12(a.out + (size_t)c * kChunk + i * 6, f2bf(a01.x, a01.y),
+                 f2bf(a23.x, a23.y), f2bf(a45.x, a45.y));
+  }
+}
+
 // Stage 2: assemble the full rows from the kRanks chunk owners' broadcasts.
 // Pad rows never crossed the wire — zero-fill their output so no stale (or
 // NaN) value leaks into the next layer through a pad row's residual.
@@ -206,6 +274,15 @@ extern "C" int GLM52_TP_AR_ABI(
   a.nranks = nranks;
   a.myrank = myrank;
 
+  if constexpr (kRanks == 4) {
+    if (rows == 1) {
+      // Latency-bound single-row shape: one kernel, one spin round (see
+      // tp_ar_oneshot_kernel). Larger buckets and TP8 stay two-shot.
+      const int oneshot_blocks = (kRanks * kChunkPk + kThreads - 1) / kThreads;
+      tp_ar_oneshot_kernel<<<oneshot_blocks, kThreads, 0, stream>>>(a);
+      return (int)cudaGetLastError();
+    }
+  }
   const int push_blocks = (rows * nranks * kChunkPk + kThreads - 1) / kThreads;
   const int reduce_blocks = (rows * kChunkPk + kThreads - 1) / kThreads;
   tp_ar_push_kernel<<<push_blocks, kThreads, 0, stream>>>(a);
