@@ -530,6 +530,14 @@ int gemm_lt_tune_cuda(const __nv_bfloat16 *const *Ws, int num_ws, int M, int N, 
 
 // Pin one cublasLt algo for (M,K) at rep_n (heuristic top, no timing → deterministic), keyed {M,K}.
 int gemm_lt_pin_tune_cuda(int M, int rep_n, int K) {
+  // Dropped before any check, so every failure below leaves {M,K} unpinned and lt_pin_run reports
+  // PIN_UNTUNED instead of serving the plan this call was meant to replace.
+  const std::array<int, 2> key{M, K};
+  auto existing = g_lt_pin_plans.find(key);
+  if (existing != g_lt_pin_plans.end()) {
+    lt_pin_destroy(existing->second);
+    g_lt_pin_plans.erase(existing);
+  }
   if (M <= 0 || rep_n <= 0 || K <= 0) {
     return static_cast<int>(cudaErrorInvalidValue);
   }
@@ -570,12 +578,6 @@ int gemm_lt_pin_tune_cuda(int M, int rep_n, int K) {
   }
 
   plan.algo = results[0].algo;
-  const std::array<int, 2> key{M, K};
-  auto existing = g_lt_pin_plans.find(key);
-  if (existing != g_lt_pin_plans.end()) {
-    lt_pin_destroy(existing->second);
-    g_lt_pin_plans.erase(existing);
-  }
   g_lt_pin_plans.emplace(key, plan);
   return static_cast<int>(cudaSuccess);
 }
