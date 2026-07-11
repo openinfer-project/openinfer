@@ -17,9 +17,10 @@
 //   U   active-expert union over all rows' topk (block 0, ballot compaction;
 //       slot order = expert order, deterministic; u=0 is the shared expert,
 //       prob 1, all tokens)
-//   B   gate|up mma over the union: fp8 w13 slice [257,kSliceRows,6144] via
-//       m16n8k16.bf16 (sigma permutation, fp8->bf16 lossless, f32 accum),
-//       k-split partials in fixed order, SiLU epilogue -> ug[u][kTokens][kSliceI] bf16
+//   B   gate|up mma + fused SiLU over the union: fp8 w13 slice
+//       [257,kSliceRows,6144] via m16n8k16.bf16 (sigma permutation,
+//       fp8->bf16 lossless, f32 accum), per-CTA k-split partials reduced in
+//       fixed ks order through shared -> ug[u][kTokens][kSliceI] bf16
 //   C   down mma: w2 slice [257,6144,kSliceI], per-expert partials -> cpart
 //   AR  out[j][h] = sum_u prob[u][j] * cpart[u][j][h] (fixed order); every
 //       row's partial is LL-pushed to EVERY rank (rs_* names keep the wire
@@ -209,7 +210,6 @@ struct Glm52MoeTpArgs {
   float* guprob;                 // [kUnionMax][kTokens]
   int* gucnt;                    // [1]
   int* gused;                    // [256]
-  float* bpart;                  // [kKsplitB][kUnionMax][kTokens][kSliceRows]
   __nv_bfloat16* ug;             // [kUnionMax][kTokens][kSliceI]
   float* cpart;                  // [kUnionMax][kTokens][H]
   // LL comm (all device pointers; peer_rs pre-offset to THIS rank's src slot)
@@ -297,59 +297,76 @@ __global__ void __launch_bounds__(kThreads) tp_union_kernel(
   }
 }
 
-// ---- B: gate|up mma over the union (NT=2 chains) ----
-__global__ void __launch_bounds__(kThreads) tp_gemm_b_kernel(
+// ---- B: fused gate|up mma + SiLU over the union. The former split (gemm_b
+// k-split partials -> f32 bpart in global -> silu reduce kernel) paid a
+// bpart write+read roundtrip and a graph node per layer. Here one 512-thread
+// CTA owns a (u, 32-gate-row group) job: warp w runs k-slice w against the
+// gate tile-pair and the matching up tile-pair (serial mma depth 2, the same
+// ~2 slice-sweeps a warp of the old grid-stride gemm_b averaged), parks the
+// per-slice f32 partials in shared, and 512 reduce lanes then sum their
+// (half, row, token) position over ks IN ASCENDING ORDER — the exact
+// two-level association the silu kernel used (per-slice mma sums, then the
+// ks-ordered G/U sums), so ug is bit-identical to the unfused chain. SiLU
+// math is unchanged (__expf).
+//
+// A warp's mma_tiles_kslice<2> tile is 32 rows x 8 tokens = 256 values, one
+// full k-slice of the job — part[half][ks] holds exactly that, and the
+// (lane, n, i) -> slot map is ks-invariant, so the cross-ks reduce at slot p
+// always sums the same (row, token) position.
+constexpr int kBGroups = kSliceI / 32;    // 32-row gate groups per expert
+constexpr int kBSiluThreads = 2 * kThreads;  // one warp per k-slice
+static_assert(kBSiluThreads / 32 == kKsplitB, "one warp per k-slice");
+static_assert(kSliceI % 32 == 0, "gate/up groups must tile kSliceI");
+__global__ void __launch_bounds__(kBSiluThreads) tp_gemm_b_silu_kernel(
     Glm52MoeTpArgs a) {
   TP_PREAMBLE
-  const int w = t >> 5;
-  const int gw = blockIdx.x * (kThreads / 32) + w, TW = gridDim.x * (kThreads / 32);
   const int UC = *a.gucnt;
-  {
-    const int kslice = kHidden / kKsplitB;
-    const int pairs = kSliceRows / 32;  // double-tile jobs per expert (TP8 16, TP4 32)
-    const int jobsPerU = pairs * kKsplitB;
-    for (int job = gw; job < UC * jobsPerU; job += TW) {
-      int u = job / jobsPerU, r0 = job % jobsPerU;
-      int tp = r0 / kKsplitB, ks = r0 % kKsplitB;
-      int e = a.guidx[u];
-      const unsigned char* W = a.w13 + (size_t)e * kSliceRows * kHidden;
-      const float* S = a.w13_scale + (size_t)e * (kSliceRows / 128) * (kHidden / 128);
+  const int w = t >> 5;  // = this warp's k-slice
+  const int lane = t & 31;
+  const int kslice = kHidden / kKsplitB;
+  __shared__ float part[2][kKsplitB][kThreads];  // [half][ks][position]
+  __shared__ float sums[2][kThreads];            // [half][position]
+  // Slot map (matches the mma C-fragment layout; ks-invariant):
+  //   part[half][ks][lane*8 + n*4 + i] = acc[n][i] of the warp running ks.
+  // Decode for the final store: position p carries
+  //   row = ((p&7)>>2)*16 + (p>>5) + ((p&3)>=2 ? 8 : 0),
+  //   token = ((p>>3)&3)*2 + (p&1).
+  const int slot0 = lane * 8;
+  const int rhalf = t >> 8, rpos = t & (kThreads - 1);
+  for (int job = blockIdx.x; job < UC * kBGroups; job += gridDim.x) {
+    const int u = job / kBGroups, tg = job % kBGroups;
+    const int e = a.guidx[u];
+    const unsigned char* W = a.w13 + (size_t)e * kSliceRows * kHidden;
+    const float* S =
+        a.w13_scale + (size_t)e * (kSliceRows / 128) * (kHidden / 128);
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {  // 0 = gate rows, 1 = up rows
+      const int row0 = half * kSliceI + tg * 32;
       float acc[2][4];
-      mma_tiles_kslice<2>(W, S, kHidden / 128, tp * 32, a.normed2, kHidden,
-                          ks * kslice, kslice, acc);
-      const int lane = t & 31, gid = lane >> 2, c0 = (lane & 3) * 2;
-      float* bp = a.bpart + ((size_t)ks * kUnionMax + u) * kTokens * kSliceRows;
+      mma_tiles_kslice<2>(W, S, kHidden / 128, row0, a.normed2, kHidden,
+                          w * kslice, kslice, acc);
 #pragma unroll
-      for (int n = 0; n < 2; n++) {
-        int row = tp * 32 + n * 16;
-        bp[(size_t)c0 * kSliceRows + row + gid] = acc[n][0];
-        bp[(size_t)(c0 + 1) * kSliceRows + row + gid] = acc[n][1];
-        bp[(size_t)c0 * kSliceRows + row + gid + 8] = acc[n][2];
-        bp[(size_t)(c0 + 1) * kSliceRows + row + gid + 8] = acc[n][3];
-      }
-    }
-  }
-}
-
-// SiLU epilogue: gate rows [0,256), up rows [256,512), fixed-order k reduce.
-__global__ void __launch_bounds__(kThreads) tp_silu_kernel(Glm52MoeTpArgs a) {
-  TP_PREAMBLE
-  const int UC = *a.gucnt;
-  for (int i = gt; i < UC * kTokens * kSliceI; i += GT) {
-    int u = i / (kTokens * kSliceI);
-    int rem = i - u * kTokens * kSliceI;
-    int j = rem / kSliceI, row = rem % kSliceI;
-    float G = 0, U = 0;
+      for (int n = 0; n < 2; ++n)
 #pragma unroll
-    for (int ks = 0; ks < kKsplitB; ks++) {
-      const float* bp = a.bpart +
-                        ((size_t)ks * kUnionMax + u) * kTokens * kSliceRows +
-                        (size_t)j * kSliceRows;
-      G += bp[row];
-      U += bp[kSliceI + row];
+        for (int i = 0; i < 4; ++i) part[half][w][slot0 + n * 4 + i] = acc[n][i];
     }
-    float sg = G / (1.f + __expf(-G));
-    a.ug[((size_t)u * kTokens + j) * kSliceI + row] = __float2bfloat16(sg * U);
+    __syncthreads();
+    float s = 0.f;
+#pragma unroll
+    for (int ks = 0; ks < kKsplitB; ++ks) s += part[rhalf][ks][rpos];  // silu's ks order
+    sums[rhalf][rpos] = s;
+    __syncthreads();
+    if (t < kThreads) {
+      const float G = sums[0][t], U = sums[1][t];
+      const float sg = G / (1.f + __expf(-G));
+      const int row = ((t & 7) >> 2) * 16 + (t >> 5) + ((t & 3) >= 2 ? 8 : 0);
+      const int tok = (((t >> 3) & 3) * 2) + (t & 1);
+      a.ug[((size_t)u * kTokens + tok) * kSliceI + tg * 32 + row] =
+          __float2bfloat16(sg * U);
+    }
+    // No trailing barrier: the next iteration's mma stores are gated by the
+    // sums barrier above, and silu lanes reread nothing the next job writes
+    // before they pass it.
   }
 }
 
@@ -432,10 +449,11 @@ __global__ void __launch_bounds__(kThreads) tp_rs_recv_kernel(
 }
 
 // Occupancy-max grid for one phase kernel on the calling thread's device.
-cudaError_t tp_occupancy_grid(const void* kernel_fn, int* out_blocks) {
+cudaError_t tp_occupancy_grid(const void* kernel_fn, int threads,
+                              int* out_blocks) {
   int per_sm = 0, dev = 0, sms = 0;
   cudaError_t e = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-      &per_sm, kernel_fn, kThreads, 0);
+      &per_sm, kernel_fn, threads, 0);
   if (e == cudaSuccess) e = cudaGetDevice(&dev);
   if (e == cudaSuccess)
     e = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
@@ -464,11 +482,12 @@ cudaError_t tp_arch_grid_cap(int blocks_per_sm, int* blocks) {
 
 extern "C" {
 
-// Grid sizing for gemm_b and silu (occupancy-derived; no longer a
-// correctness invariant — nothing grid-syncs anymore). gemm_c sizes itself
+// Grid sizing for the fused gemm_b+silu kernel (occupancy-derived; no longer
+// a correctness invariant — nothing grid-syncs anymore). gemm_c sizes itself
 // inside the layer launcher: its lower register count fits more CTAs/SM.
 int GLM52_TP_ABI(max_blocks_cuda)(int* out_blocks) {
-  cudaError_t e = tp_occupancy_grid((const void*)tp_gemm_b_kernel, out_blocks);
+  cudaError_t e = tp_occupancy_grid((const void*)tp_gemm_b_silu_kernel,
+                                    kBSiluThreads, out_blocks);
   if (e == cudaSuccess)
     e = tp_arch_grid_cap(GLM52_TP_BLACKWELL_GEMM_B_BLOCKS_PER_SM, out_blocks);
   return (int)e;
@@ -602,7 +621,7 @@ int GLM52_TP_ABI(layer_launch_cuda)(
     const void* normed2, const void* topk_idx, const void* topk_prob,
     const void* w13, const void* w13_scale, const void* w2,
     const void* w2_scale, void* mlp_out, void* guidx, void* guprob,
-    void* gucnt, void* gused, void* bpart, void* ug, void* cpart,
+    void* gucnt, void* gused, void* ug, void* cpart,
     void* rs_local, const void* const* peer_rs, void* epoch_dev,
     const void* active_rows, int layer_slot, int nranks, int myrank,
     int grid_blocks, cudaStream_t stream) {
@@ -622,7 +641,6 @@ int GLM52_TP_ABI(layer_launch_cuda)(
   a.guprob = (float*)guprob;
   a.gucnt = (int*)gucnt;
   a.gused = (int*)gused;
-  a.bpart = (float*)bpart;
   a.ug = (__nv_bfloat16*)ug;
   a.cpart = (float*)cpart;
   a.rs_local = (uint4*)rs_local;
@@ -648,8 +666,8 @@ int GLM52_TP_ABI(layer_launch_cuda)(
   // call costs nothing on the replay path.
   int gemm_c_blocks = 0;
   {
-    cudaError_t e =
-        tp_occupancy_grid((const void*)tp_gemm_c_kernel, &gemm_c_blocks);
+    cudaError_t e = tp_occupancy_grid((const void*)tp_gemm_c_kernel, kThreads,
+                                      &gemm_c_blocks);
     if (e == cudaSuccess)
       e = tp_arch_grid_cap(GLM52_TP_BLACKWELL_GEMM_C_BLOCKS_PER_SM,
                            &gemm_c_blocks);
@@ -660,16 +678,16 @@ int GLM52_TP_ABI(layer_launch_cuda)(
   struct Phase {
     const void* fn;
     int blocks;
+    int threads;
   } phases[] = {
-      {(const void*)tp_union_kernel, 1},
-      {(const void*)tp_gemm_b_kernel, grid_blocks},
-      {(const void*)tp_silu_kernel, grid_blocks},
-      {(const void*)tp_gemm_c_kernel, gemm_c_blocks},
-      {(const void*)tp_rs_push_kernel, rs_blocks * kTokens},
-      {(const void*)tp_rs_recv_kernel, rs_blocks * kTokens},
+      {(const void*)tp_union_kernel, 1, kThreads},
+      {(const void*)tp_gemm_b_silu_kernel, grid_blocks, kBSiluThreads},
+      {(const void*)tp_gemm_c_kernel, gemm_c_blocks, kThreads},
+      {(const void*)tp_rs_push_kernel, rs_blocks * kTokens, kThreads},
+      {(const void*)tp_rs_recv_kernel, rs_blocks * kTokens, kThreads},
   };
   for (const Phase& ph : phases) {
-    cudaError_t e = cudaLaunchKernel(ph.fn, dim3(ph.blocks), dim3(kThreads),
+    cudaError_t e = cudaLaunchKernel(ph.fn, dim3(ph.blocks), dim3(ph.threads),
                                      args, 0, stream);
     if (e != cudaSuccess) return (int)e;
   }

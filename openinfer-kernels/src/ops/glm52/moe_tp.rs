@@ -12,7 +12,6 @@ pub const GLM52_TP_HIDDEN: usize = 6144;
 pub const GLM52_TP_TOPK: usize = 8;
 pub const GLM52_TP_BANK_EXPERTS: usize = 257;
 pub const GLM52_TP_TOKENS: usize = 8;
-pub const GLM52_TP_KSPLIT_B: usize = 16;
 pub const GLM52_TP_UNION_MAX: usize = GLM52_TP_TOKENS * (GLM52_TP_TOPK + 1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -43,10 +42,6 @@ impl Glm52TpTopology {
 
     pub const fn guprob_len(self) -> usize {
         GLM52_TP_UNION_MAX * GLM52_TP_TOKENS
-    }
-
-    pub const fn bpart_len(self) -> usize {
-        GLM52_TP_KSPLIT_B * GLM52_TP_UNION_MAX * GLM52_TP_TOKENS * self.slice_rows()
     }
 
     pub const fn ug_len(self) -> usize {
@@ -164,7 +159,6 @@ pub struct Glm52MoeTpBuffers<'a> {
     pub guprob: &'a mut CudaSlice<f32>,
     pub gucnt: &'a mut CudaSlice<i32>,
     pub gused: &'a mut CudaSlice<i32>,
-    pub bpart: &'a mut CudaSlice<f32>,
     pub ug: &'a mut CudaSlice<bf16>,
     pub cpart: &'a mut CudaSlice<f32>,
     pub rs_local: u64,
@@ -216,7 +210,6 @@ pub fn glm52_moe_tp_layer_launch(
             && bufs.guprob.len() >= topology.guprob_len()
             && !bufs.gucnt.is_empty()
             && bufs.gused.len() >= 256
-            && bufs.bpart.len() >= topology.bpart_len()
             && bufs.ug.len() >= topology.ug_len()
             && bufs.cpart.len() >= topology.cpart_len()
             && !bufs.epoch_dev.is_empty(),
@@ -240,7 +233,6 @@ pub fn glm52_moe_tp_layer_launch(
     let (guprob_ptr, _g9) = bufs.guprob.device_ptr_mut(&ctx.stream);
     let (gucnt_ptr, _g10) = bufs.gucnt.device_ptr_mut(&ctx.stream);
     let (gused_ptr, _g11) = bufs.gused.device_ptr_mut(&ctx.stream);
-    let (bpart_ptr, _g12) = bufs.bpart.device_ptr_mut(&ctx.stream);
     let (ug_ptr, _g13) = bufs.ug.device_ptr_mut(&ctx.stream);
     let (cpart_ptr, _g14) = bufs.cpart.device_ptr_mut(&ctx.stream);
     let (epoch_ptr, _g15) = bufs.epoch_dev.device_ptr_mut(&ctx.stream);
@@ -264,7 +256,6 @@ pub fn glm52_moe_tp_layer_launch(
                 guprob_ptr as *mut f32,
                 gucnt_ptr as *mut i32,
                 gused_ptr as *mut i32,
-                bpart_ptr as *mut f32,
                 ug_ptr as *mut ffi::Half,
                 cpart_ptr as *mut f32,
                 bufs.rs_local as *mut std::ffi::c_void,

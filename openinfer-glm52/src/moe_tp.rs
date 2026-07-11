@@ -462,7 +462,6 @@ pub(crate) struct Glm52MoeTpState {
     guprob: CudaSlice<f32>,
     gucnt: CudaSlice<i32>,
     gused: CudaSlice<i32>,
-    bpart: CudaSlice<f32>,
     ug: CudaSlice<bf16>,
     cpart: CudaSlice<f32>,
 }
@@ -563,7 +562,6 @@ impl Glm52MoeTpState {
             guprob: ctx.stream.alloc_zeros(topology.guprob_len())?,
             gucnt: ctx.stream.alloc_zeros(1)?,
             gused: ctx.stream.alloc_zeros(EXPERTS)?,
-            bpart: ctx.stream.alloc_zeros(topology.bpart_len())?,
             ug: ctx.stream.alloc_zeros(topology.ug_len())?,
             cpart: ctx.stream.alloc_zeros(topology.cpart_len())?,
         })
@@ -648,7 +646,6 @@ impl Glm52MoeTpState {
             guprob: &mut self.guprob,
             gucnt: &mut self.gucnt,
             gused: &mut self.gused,
-            bpart: &mut self.bpart,
             ug: &mut self.ug,
             cpart: &mut self.cpart,
             rs_local: self.rs_local,

@@ -259,7 +259,6 @@ macro_rules! declare_tp_ffi {
                 guprob: *mut f32,
                 gucnt: *mut i32,
                 gused: *mut i32,
-                bpart: *mut f32,
                 ug: *mut Half,
                 cpart: *mut f32,
                 rs_local: *mut std::ffi::c_void,
