@@ -1,6 +1,6 @@
 # GLM5.2 TP4 on GB300
 
-> **TL;DR:** GLM-5.2-FP8 on 4xGB300 now beats matched vLLM pure TP4 at both fully warmed bs=1 shapes: `9.03ms` vs `9.21ms` for 1/256 and `9.56ms` vs `9.60ms` for 1024/256. The path combines FlashInfer sparse MLA, compact decode buckets, SM-selected GEMV/MoE launches, and a vocabulary-sharded greedy tail that reuses the existing TP all-reduce. A controlled vLLM EP4 run is slower at `9.47/9.84ms`, so EP4 is outside this PR.
+> **TL;DR:** GLM-5.2-FP8 TP4 on 4xGB300 via FlashInfer sparse MLA, compact decode buckets, SM-selected GEMV/MoE launches, and a vocabulary-sharded greedy tail. The 2026-07-10 matched pair beat vLLM pure TP4 at both fully warmed bs=1 shapes (`9.03` vs `9.21ms` at 1/256, `9.56` vs `9.60ms` at 1024/256); a 2026-07-11 re-validation on the same host reads `9.6/10.1ms` while vLLM reproduces its record — a host-state drift that hits only the OpenInfer path (same-day A/B proves the code did not regress; see "2026-07-11 re-validation"). Functional gates are all green. A controlled vLLM EP4 run is slower (`9.47/9.84ms`), so EP4 is out of scope.
 >
 > **Last touched:** 2026-07
 
@@ -142,6 +142,33 @@ Across 75 MoE layers, the hot-cache delta predicts `0.155ms/token`, matching the
 - Vocabulary pack/unpack passes the checked-in device smoke (`openinfer-kernels/tests/glm52_vocab_parallel_smoke.rs`) covering negative logits, cross-rank tie breaking, a global token id above 65,535, and the all-NaN row degrading to token 0; the translation unit also compiles for SM90a.
 - Refactoring preserves TP4 B/C register counts (`80/56`) and launch grids. Clean post-refactor and compact/fused serving reruns pass for both target shapes.
 
+### 2026-07-11 re-validation
+
+A full re-run on the same host after the mainline rebase and review-hardening
+pass. Every functional gate is green: lib tests (59), server config tests (7,
+including the new tp-size/topology rejections), FlashInfer numerical smoke
+(uniform + paged-ramp), the vocabulary pack/unpack device smoke, graph
+pre-capture (`4 buckets x 2 tiers`), greedy byte-determinism ×2 with the
+accepted `" Paris. Distance from ..."` prefix, sampled fallback, and 4-way
+concurrent greedy identity.
+
+TPOT did not reproduce, and the cause is the host, not the code:
+
+| p50 TPOT, c1 n20 warmed | 1/256 | 1024/256 |
+| --- | ---: | ---: |
+| OpenInfer record (2026-07-10) | `9.03ms` | `9.56ms` |
+| OpenInfer pre-rebase source, rebuilt 07-11 | `9.57ms` | `10.10ms` |
+| OpenInfer HEAD (rebase + review fixes) | `9.67ms` | `10.21ms` |
+| vLLM record (2026-07-10) | `9.21ms` | `9.60ms` |
+| vLLM re-run 07-11 (same launch config) | `9.27ms` | `9.65ms` |
+
+The pre-rebase source (with its own pinned older nightly) rebuilt and
+re-measured on 07-11 lands within `0.1ms` of HEAD, so neither the rebase nor
+the review fixes cost anything. vLLM reproduces its record within noise. The
+OpenInfer path alone pays a flat `+0.54ms/step` at BOTH shapes versus 07-10 —
+a constant per-step host effect (clocks pinned at max, no throttle reasons,
+no reboot, no MPS). Follow-up below.
+
 ## Artifacts
 
 - Serving JSON: `bench_results/glm52-tp4-moe-tune-20260710/moe-grid-in{1,1024}-out256-c1-n20.json`
@@ -184,3 +211,9 @@ Across 75 MoE layers, the hot-cache delta predicts `0.155ms/token`, matching the
 
 - Add a model-level TP4 golden/logit gate; HTTP prefix parity and focused kernel gates are narrower evidence.
 - Re-run the retained TP8 runtime gates on H200 when that host is available; GB300 can prove compilation but not H200 performance.
+- Root-cause the 07-11 flat `+0.54ms/step` host drift (see the re-validation
+  table): it hits the OpenInfer serving path at both shapes while vLLM is
+  unaffected, and it survives a rebuild of the pre-rebase source with its
+  original toolchain. Suspect host state (P2P/VMM mapping latency, NUMA
+  placement); re-baseline BOTH engines in one session on a quiet host and
+  update the TL;DR table.
