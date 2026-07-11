@@ -189,6 +189,7 @@ Across 75 MoE layers, the hot-cache delta predicts `0.155ms/token`, matching the
 - Final formatting and `git diff --check` pass. GLM52 Clippy passes with warnings denied after command-line allowances for four pre-existing model lints. GLM52 lib tests pass (`59 passed, 14 GPU tests ignored`), the four server GLM52 config tests pass, and the FlashInfer numerical smoke passes all eight `batch x topk` shapes on SM103.
 - Installed GitHub CLI, authenticated through the existing `~/.env` token without persisting or printing it, fetched `origin/main`, and confirmed PR #637 is an open draft targeting `main`. The branch was 16 mainline commits behind before the publish rebase.
 - Rebased both PR commits onto `origin/main` at `60ccc5f`. Conflict resolution preserved main's scheduler metrics and dead-kernel/weight-load cleanup: `deepgemm_layout`, `moe_route`, and `trtllm_grouped` were not restored; their stale build/FFI/module registrations and one superseded FlashMLA arch helper were removed. The H200 TP8 right-sized sparse MLA path now coexists with the SM103 TP4 FlashInfer path. Two temporary tuning harnesses were removed from the production diff.
+- Addressed the first review pass by deriving scheduler partitions, startup load feeds, and frontend engine count from one topology-owned logical-rank count. TP4/TP8 now both expose one mirrored request partition, while EP8 retains eight independent partitions.
 
 ### Debrief
 

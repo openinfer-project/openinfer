@@ -130,7 +130,8 @@ pub(crate) fn run_dp8_coordinator(
     // TP4 pads only the MoE phase chain internally, so attention, projections,
     // norms, and sampling can use the smallest regular decode bucket.
     let full_bucket = matches!(moe_topo, crate::Glm52MoeTopo::Tp8);
-    let logical_ranks = if mirrored { 1 } else { workers.len() };
+    let logical_ranks = moe_topo.logical_rank_count();
+    debug_assert_eq!(logical_ranks, if mirrored { 1 } else { workers.len() });
     assert_eq!(
         load_txs.len(),
         logical_ranks,

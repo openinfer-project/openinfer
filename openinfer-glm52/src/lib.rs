@@ -117,6 +117,17 @@ impl Glm52MoeTopo {
         }
     }
 
+    /// Number of independently scheduled request partitions. Tensor-
+    /// replicated workers execute one mirrored partition in lock-step.
+    #[must_use]
+    pub fn logical_rank_count(self) -> usize {
+        if self.uses_tensor_replicated_moe() {
+            1
+        } else {
+            self.device_count()
+        }
+    }
+
     #[must_use]
     pub(crate) fn expected_tp_size(self) -> usize {
         match self {
@@ -165,6 +176,7 @@ mod topology_tests {
     fn tp4_topology_shape_is_four_rank_replicated_tp() {
         assert_eq!(Glm52MoeTopo::Tp4.default_dp_size(), 1);
         assert_eq!(Glm52MoeTopo::Tp4.device_count(), 4);
+        assert_eq!(Glm52MoeTopo::Tp4.logical_rank_count(), 1);
         assert_eq!(Glm52MoeTopo::Tp4.expected_tp_size(), 4);
         assert_eq!(Glm52MoeTopo::Tp4.expected_ep_size(), 1);
         assert!(!Glm52MoeTopo::Tp4.uses_ep_expert_bundles());
@@ -179,6 +191,8 @@ mod topology_tests {
             assert_eq!(topo.expected_tp_size(), 1);
             assert_eq!(topo.expected_ep_size(), GLM52_EP_RANKS);
         }
+        assert_eq!(Glm52MoeTopo::Ep8.logical_rank_count(), GLM52_EP_RANKS);
+        assert_eq!(Glm52MoeTopo::Tp8.logical_rank_count(), 1);
         assert!(Glm52MoeTopo::Ep8.uses_ep_expert_bundles());
         assert!(!Glm52MoeTopo::Ep8.uses_tensor_replicated_moe());
         assert!(!Glm52MoeTopo::Tp8.uses_ep_expert_bundles());
@@ -517,11 +531,7 @@ fn start_engine(
             return Err(err);
         }
     };
-    let logical_ranks = if moe_topo == Glm52MoeTopo::Tp8 {
-        1
-    } else {
-        loaded.workers.len()
-    };
+    let logical_ranks = moe_topo.logical_rank_count();
     let kv_total_blocks = glm52_pool_blocks(max_model_len) - 1;
     let (load_txs, load_rxs): (Vec<_>, Vec<_>) = (0..logical_ranks)
         .map(|_| {

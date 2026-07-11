@@ -50,10 +50,15 @@ async fn main() -> anyhow::Result<()> {
     let lora_modules = args.lora_modules.clone();
     let enable_lora = args.enable_lora;
     let port = args.port;
-    let frontend_engine_count = match model_type {
-        #[cfg(feature = "glm52")]
-        ModelType::Glm52 if args.moe_topo != "tp8" => args.dp_size.unwrap_or(8),
-        _ => 1,
+    let frontend_engine_count = 1;
+    #[cfg(feature = "glm52")]
+    let frontend_engine_count = if model_type == ModelType::Glm52 {
+        args.moe_topo
+            .parse::<openinfer_glm52::Glm52MoeTopo>()
+            .context("--moe-topo")?
+            .logical_rank_count()
+    } else {
+        frontend_engine_count
     };
     let engine_load = tokio::task::spawn_blocking(move || -> anyhow::Result<EngineHandle> {
         load_engine(&args, model_type)
