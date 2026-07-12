@@ -6,6 +6,8 @@
 
 mod plan;
 
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::mpsc as std_mpsc;
 use std::thread;
 
@@ -16,8 +18,18 @@ use rand::rngs::StdRng;
 use tokio::sync::mpsc;
 
 use crate::batch_decode_graph::BatchDecodeGraphState;
+use crate::dflash::{
+    DFLASH_MAX_ACTIVE_REQUESTS, DFLASH_MAX_VERIFIED_CONTEXT_TOKENS, DFlashBatchScratch,
+    DFlashDraftModel, DFlashRequestState,
+};
 use crate::logprobs::snapshot_requested_logprobs;
+use crate::prefill::PREFILL_CHUNK_LEN;
 use crate::recurrent_state::RecurrentState;
+use crate::speculative::{
+    VerifiedToken, capture_hybrid_states, commit_hybrid_states, restore_hybrid_states,
+    verify_hybrid_spans,
+};
+use crate::verify_buffers::VerifyBuffers35;
 use crate::weights::Qwen35Model;
 use openinfer_core::engine::{
     EngineHandle as SchedulerHandle, FinishReason, GenerateRequest as SchedulerRequest, KvCapacity,
@@ -33,11 +45,16 @@ use self::plan::{
     slot_for_new_request,
 };
 
+const DFLASH_MIN_CONTEXT_TOKENS: usize = 16;
+const DFLASH_PROBE_DRAFT_TOKENS: usize = 4;
+const DFLASH_REQUIRE_SPEC_ENV: &str = "OPENINFER_QWEN35_DFLASH_REQUIRE_SPEC";
+
 // ── Internal types ──────────────────────────────────────────────────────
 
 /// An in-flight request being decoded. Recurrent state lives in the
 /// `BatchDecodeGraphState` at `graph_slot_idx` — NOT owned here.
 struct ActiveRequest35 {
+    local_id: usize,
     request_id: Option<String>,
     token_tx: TokenSink,
     kv: KvState,
@@ -52,10 +69,95 @@ struct ActiveRequest35 {
     logprobs: usize,
 }
 
+struct DFlashSchedulerState {
+    model: DFlashDraftModel,
+    requests: HashMap<usize, DFlashRequestState>,
+    scratch: DFlashBatchScratch,
+    verify_bufs: VerifyBuffers35,
+    backup_states: Vec<RecurrentState>,
+    verify_scratch_states: Vec<RecurrentState>,
+}
+
+impl DFlashSchedulerState {
+    fn new(target: &Qwen35Model, draft_path: &str) -> Result<Self> {
+        let model =
+            DFlashDraftModel::from_safetensors_for_target(target.device_ctx(), draft_path, target)?;
+        if std::env::var_os("OPENINFER_QWEN35_DFLASH_TUNE_GEMM").is_some() {
+            model.tune_gemm_algos(target)?;
+        }
+        let scratch = model.new_batch_scratch(target.device_ctx(), DFLASH_MAX_ACTIVE_REQUESTS)?;
+        let verify_bufs = VerifyBuffers35::new(
+            target.device_ctx(),
+            target.config(),
+            DFLASH_MAX_ACTIVE_REQUESTS,
+            model.verify_span(),
+            model.target_layer_ids().len(),
+            target.kv_pool().capacity_pages(),
+        )?;
+        Ok(Self {
+            model,
+            requests: HashMap::new(),
+            scratch,
+            verify_bufs,
+            backup_states: Vec::new(),
+            verify_scratch_states: Vec::new(),
+        })
+    }
+
+    fn capture_layer_ids(&self) -> &[usize] {
+        self.model.target_layer_ids()
+    }
+
+    fn usable_context_tokens(&self, target_max_position_embeddings: usize) -> usize {
+        target_max_position_embeddings.min(
+            self.model
+                .max_position_embeddings()
+                .saturating_sub(self.model.block_size()),
+        )
+    }
+
+    fn verified_context_tokens(&self, target_max_position_embeddings: usize) -> usize {
+        DFLASH_MAX_VERIFIED_CONTEXT_TOKENS
+            .min(self.usable_context_tokens(target_max_position_embeddings))
+    }
+
+    fn drop_request(&mut self, local_id: usize) {
+        self.requests.remove(&local_id);
+    }
+
+    fn ready_for_draft(&self, local_id: usize) -> bool {
+        self.requests
+            .get(&local_id)
+            .is_some_and(|state| state.ready_for_draft(DFLASH_MIN_CONTEXT_TOKENS))
+    }
+
+    fn can_capture_request(&self, local_id: usize, chunk_start: usize) -> bool {
+        self.requests.contains_key(&local_id)
+            || (chunk_start == 0 && self.requests.len() < DFLASH_MAX_ACTIVE_REQUESTS)
+    }
+
+    fn ensure_state_scratch(
+        &mut self,
+        ctx: &openinfer_core::tensor::DeviceContext,
+        config: &crate::config::Config35,
+        batch: usize,
+    ) -> Result<()> {
+        while self.backup_states.len() < batch {
+            self.backup_states.push(RecurrentState::new(ctx, config)?);
+        }
+        while self.verify_scratch_states.len() < batch {
+            self.verify_scratch_states
+                .push(RecurrentState::new(ctx, config)?);
+        }
+        Ok(())
+    }
+}
+
 /// A request whose prompt is being prefilled across multiple scheduler steps.
 /// It owns its growing KV and recurrent state until the prompt is exhausted,
 /// at which point it is promoted into the decode batch.
 struct PrefillingRequest35 {
+    local_id: usize,
     req: SchedulerRequest,
     kv: KvState,
     rec: RecurrentState,
@@ -79,6 +181,16 @@ pub fn start_with_capacity(
     max_batch: usize,
     max_prefill_tokens: usize,
 ) -> Result<SchedulerHandle> {
+    start_with_capacity_and_dflash(model, seed, max_batch, max_prefill_tokens, None)
+}
+
+pub(crate) fn start_with_capacity_and_dflash(
+    model: Qwen35Model,
+    seed: u64,
+    max_batch: usize,
+    max_prefill_tokens: usize,
+    dflash_draft_model_path: Option<PathBuf>,
+) -> Result<SchedulerHandle> {
     assert!(
         max_prefill_tokens > 0,
         "max_prefill_tokens must be positive: a zero budget can never schedule a prefill chunk"
@@ -101,8 +213,32 @@ pub fn start_with_capacity(
         .name("scheduler-qwen35".into())
         .spawn(move || match bind_model_thread(&model) {
             Ok(_guard) => {
+                let dflash = match dflash_draft_model_path
+                    .as_ref()
+                    .map(|path| {
+                        path.to_str()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("DFlash draft model path must be valid UTF-8")
+                            })
+                            .and_then(|path| DFlashSchedulerState::new(&model, path))
+                    })
+                    .transpose()
+                {
+                    Ok(dflash) => dflash,
+                    Err(err) => {
+                        let _ = startup_tx.send(Err(err));
+                        return;
+                    }
+                };
                 let _ = startup_tx.send(Ok(()));
-                scheduler_loop(model, graph_state, submit_rx, seed, max_prefill_tokens);
+                scheduler_loop(
+                    model,
+                    graph_state,
+                    submit_rx,
+                    seed,
+                    max_prefill_tokens,
+                    dflash,
+                );
             }
             Err(err) => {
                 let _ = startup_tx.send(Err(err));
@@ -110,15 +246,12 @@ pub fn start_with_capacity(
         })
         .expect("failed to spawn Qwen3.5 scheduler thread");
 
-    let startup = match startup_rx.recv() {
-        Ok(startup) => startup,
-        Err(_) => {
-            let panic_note = match join_handle.join() {
-                Err(panic) => format!(" (thread panicked: {})", panic_message(panic.as_ref())),
-                Ok(()) => String::new(),
-            };
-            anyhow::bail!("Qwen3.5 scheduler exited during startup{panic_note}");
-        }
+    let Ok(startup) = startup_rx.recv() else {
+        let panic_note = match join_handle.join() {
+            Err(panic) => format!(" (thread panicked: {})", panic_message(panic.as_ref())),
+            Ok(()) => String::new(),
+        };
+        anyhow::bail!("Qwen3.5 scheduler exited during startup{panic_note}");
     };
     if let Err(err) = startup {
         let _ = join_handle.join();
@@ -182,12 +315,14 @@ fn scheduler_loop(
     mut submit_rx: mpsc::UnboundedReceiver<SchedulerRequest>,
     seed: u64,
     prefill_budget: usize,
+    mut dflash: Option<DFlashSchedulerState>,
 ) {
     let mut rng = StdRng::seed_from_u64(seed);
     let mut active: Vec<ActiveRequest35> = Vec::new();
     let mut deferred: Vec<SchedulerRequest> = Vec::new();
     let mut prefilling: Vec<PrefillingRequest35> = Vec::new();
     let max_batch = graph_state.slot_states.len();
+    let mut next_local_id = 0usize;
 
     info!("scheduler ready (max_batch={})", max_batch);
 
@@ -245,7 +380,11 @@ fn scheduler_loop(
             // KvPool capacity includes the CUDA Graph padding page reserved at
             // construction, so a real request can use at most the remaining pages.
             model.kv_pool().capacity_pages().saturating_sub(1),
-            model.config().max_position_embeddings,
+            dflash
+                .as_ref()
+                .map_or(model.config().max_position_embeddings, |state| {
+                    state.usable_context_tokens(model.config().max_position_embeddings)
+                }),
             |req| req.prompt_tokens.len(),
             |req| req.max_tokens,
         );
@@ -263,6 +402,13 @@ fn scheduler_loop(
             );
             match RecurrentState::new(model.device_ctx(), model.config()) {
                 Ok(rec) => prefilling.push(PrefillingRequest35 {
+                    local_id: {
+                        let id = next_local_id;
+                        next_local_id = next_local_id
+                            .checked_add(1)
+                            .expect("Qwen3.5 scheduler local request id exhausted");
+                        id
+                    },
                     kv: model.alloc_kv(),
                     rec,
                     cursor: 0,
@@ -285,7 +431,24 @@ fn scheduler_loop(
         // 5. Take this step's budgeted prefill chunk off the front of the queue,
         //    then dispatch by plan.
         let scheduled = take_prefill_chunks(&mut prefilling, prefill_budget);
-        if let Some(plan) = plan::build_next_plan(!active.is_empty(), scheduled) {
+        // DFlash context capture is useful only for the current single-active
+        // verifier. Keep multi-active fallback on the normal unified path.
+        let can_capture_dflash_prefill =
+            dflash.is_some() && active.is_empty() && scheduled.len() == 1;
+        let force_prefill_for_dflash = can_capture_dflash_prefill
+            && dflash.as_ref().is_some_and(|dflash| {
+                scheduled.iter().any(|pending| {
+                    can_capture_dflash_prefill_chunk(
+                        &pending.req,
+                        pending.local_id,
+                        pending.cursor,
+                        dflash,
+                    )
+                })
+            });
+        if let Some(plan) =
+            plan::build_next_plan(!active.is_empty() && !force_prefill_for_dflash, scheduled)
+        {
             match plan {
                 ExecutionPlan::Unified { pending } => unified_step_sched(
                     &model,
@@ -294,6 +457,7 @@ fn scheduler_loop(
                     &mut prefilling,
                     &mut graph_state,
                     &mut rng,
+                    dflash.as_mut(),
                 ),
                 ExecutionPlan::Prefill { pending } => prefill_batch(
                     &model,
@@ -302,9 +466,24 @@ fn scheduler_loop(
                     &mut prefilling,
                     &mut graph_state,
                     &mut rng,
+                    dflash.as_mut(),
+                    can_capture_dflash_prefill,
                 ),
                 ExecutionPlan::Decode => {
-                    decode_step(&model, &mut active, &mut graph_state, &mut rng);
+                    if !decode_step_speculative(
+                        &model,
+                        &mut active,
+                        &mut graph_state,
+                        dflash.as_mut(),
+                    ) {
+                        decode_step(
+                            &model,
+                            &mut active,
+                            &mut graph_state,
+                            &mut rng,
+                            dflash.as_mut(),
+                        );
+                    }
                 }
             }
         }
@@ -343,30 +522,68 @@ fn prefill_batch(
     prefilling: &mut Vec<PrefillingRequest35>,
     graph_state: &mut BatchDecodeGraphState,
     rng: &mut StdRng,
+    mut dflash: Option<&mut DFlashSchedulerState>,
+    can_capture_dflash_prefill: bool,
 ) {
     let mut chunk = ScheduledChunk::from(scheduled);
+    let should_capture_dflash = can_capture_dflash_prefill
+        && dflash.as_ref().is_some_and(|dflash| {
+            (0..chunk.reqs.len()).any(|i| {
+                can_capture_dflash_prefill_chunk(
+                    &chunk.reqs[i],
+                    chunk.local_ids[i],
+                    chunk_start(&chunk, i),
+                    dflash,
+                )
+            })
+        });
+    let capture_layer_ids = dflash
+        .as_ref()
+        .filter(|_| should_capture_dflash)
+        .map(|d| d.capture_layer_ids());
     // Scope the borrows of `chunk` to the executor call so the error path can
     // move `chunk` into `fail_chunk`.
     let result = {
-        let window_refs: Vec<&[u32]> = chunk.windows.iter().map(|w| w.as_slice()).collect();
+        let window_refs: Vec<&[u32]> = chunk.windows.iter().map(std::vec::Vec::as_slice).collect();
         let mut rec_refs: Vec<&mut RecurrentState> = chunk.recs.iter_mut().collect();
-        model.batch_prefill_logits(&window_refs, &mut chunk.kvs, &mut rec_refs)
+        model.batch_prefill_logits_with_capture(
+            &window_refs,
+            &mut chunk.kvs,
+            &mut rec_refs,
+            capture_layer_ids,
+        )
     };
-    let logits = match result {
+    let (logits, captured_hidden) = match result {
         Ok(v) => v,
         Err(e) => {
             warn!("batch prefill failed: {e}");
-            fail_chunk(chunk, &e.to_string());
+            fail_chunk(chunk, dflash.as_deref_mut(), &e.to_string());
             return;
         }
     };
+    if let Some(dflash) = dflash.as_mut() {
+        if should_capture_dflash {
+            if let Err(e) =
+                record_dflash_prefill_context(model, &mut chunk, dflash, captured_hidden.as_ref())
+            {
+                warn!("DFlash prefill context failed: {e}");
+                for local_id in &chunk.local_ids {
+                    dflash.drop_request(*local_id);
+                }
+            }
+        } else {
+            for local_id in &chunk.local_ids {
+                dflash.drop_request(*local_id);
+            }
+        }
+    }
 
     let (tokens, logprobs_vec) =
         match sample_prefill_logits(model, &chunk.reqs, &logits, graph_state, rng) {
             Ok(v) => v,
             Err(e) => {
                 warn!("prefill sampling failed: {e}");
-                fail_chunk(chunk, &e.to_string());
+                fail_chunk(chunk, dflash.as_deref_mut(), &e.to_string());
                 return;
             }
         };
@@ -379,6 +596,7 @@ fn prefill_batch(
         chunk,
         &tokens,
         &logprobs_vec,
+        dflash,
     );
 }
 
@@ -430,12 +648,13 @@ fn unified_step_sched(
     prefilling: &mut Vec<PrefillingRequest35>,
     graph_state: &mut BatchDecodeGraphState,
     rng: &mut StdRng,
+    mut dflash: Option<&mut DFlashSchedulerState>,
 ) {
     let mut chunk = ScheduledChunk::from(scheduled);
     // Scope the borrows of `chunk` / `active` to the executor call so the error
     // and decode-processing paths can use them afterwards.
     let result = {
-        let window_refs: Vec<&[u32]> = chunk.windows.iter().map(|w| w.as_slice()).collect();
+        let window_refs: Vec<&[u32]> = chunk.windows.iter().map(std::vec::Vec::as_slice).collect();
         let mut rec_refs: Vec<&mut RecurrentState> = chunk.recs.iter_mut().collect();
         let decode_tokens: Vec<u32> = active.iter().map(|r| r.last_token).collect();
         let mut decode_kv_refs: Vec<&mut KvState> = active.iter_mut().map(|r| &mut r.kv).collect();
@@ -453,14 +672,8 @@ fn unified_step_sched(
         Err(e) => {
             warn!("unified step failed: {e}");
             let message = e.to_string();
-            for req in active.drain(..) {
-                let _ = req.token_tx.send(TokenEvent::Error {
-                    message: message.clone(),
-                    prompt_tokens: req.prompt_len,
-                    completion_tokens: req.generated_count,
-                });
-            }
-            fail_chunk(chunk, &message);
+            fail_active(active, dflash.as_deref_mut(), &message);
+            fail_chunk(chunk, dflash, &message);
             return;
         }
     };
@@ -468,7 +681,12 @@ fn unified_step_sched(
     // Process decode results FIRST (it may retire requests and free graph slots
     // that promotion then fills densely).
     if output.decoded {
-        process_decode_logits(model, active, graph_state, rng);
+        if let Some(dflash) = dflash.as_mut() {
+            for req in active.iter() {
+                dflash.drop_request(req.local_id);
+            }
+        }
+        process_decode_logits(model, active, graph_state, rng, dflash.as_deref_mut());
     }
 
     let prefill_logits = output
@@ -480,7 +698,7 @@ fn unified_step_sched(
             Ok(v) => v,
             Err(e) => {
                 warn!("unified prefill sampling failed: {e}");
-                fail_chunk(chunk, &e.to_string());
+                fail_chunk(chunk, dflash, &e.to_string());
                 return;
             }
         };
@@ -493,6 +711,7 @@ fn unified_step_sched(
         chunk,
         &tokens,
         &logprobs_vec,
+        None,
     );
 }
 
@@ -503,6 +722,7 @@ fn decode_step(
     active: &mut Vec<ActiveRequest35>,
     graph_state: &mut BatchDecodeGraphState,
     rng: &mut StdRng,
+    mut dflash: Option<&mut DFlashSchedulerState>,
 ) {
     let token_ids: Vec<u32> = active.iter().map(|r| r.last_token).collect();
     let mut kv_refs: Vec<&mut KvState> = active.iter_mut().map(|r| &mut r.kv).collect();
@@ -510,14 +730,13 @@ fn decode_step(
     if let Err(e) = model.batch_decode_graph(&token_ids, &mut kv_refs, graph_state) {
         warn!("batch_decode_graph error: {e}");
         let message = e.to_string();
-        for req in active.drain(..) {
-            let _ = req.token_tx.send(TokenEvent::Error {
-                message: message.clone(),
-                prompt_tokens: req.prompt_len,
-                completion_tokens: req.generated_count,
-            });
-        }
+        fail_active(active, dflash.as_deref_mut(), &message);
         return;
+    }
+    if let Some(dflash) = dflash.as_mut() {
+        for req in active.iter() {
+            dflash.drop_request(req.local_id);
+        }
     }
 
     // Snapshot logits to CPU BEFORE sampling (sampling may modify bufs.logits)
@@ -531,13 +750,7 @@ fn decode_step(
         Err(e) => {
             warn!("logprobs snapshot error: {e}");
             let message = e.to_string();
-            for req in active.drain(..) {
-                let _ = req.token_tx.send(TokenEvent::Error {
-                    message: message.clone(),
-                    prompt_tokens: req.prompt_len,
-                    completion_tokens: req.generated_count,
-                });
-            }
+            fail_active(active, dflash.as_deref_mut(), &message);
             return;
         }
     };
@@ -551,13 +764,7 @@ fn decode_step(
             Err(e) => {
                 warn!("sampling error: {e}");
                 let message = e.to_string();
-                for req in active.drain(..) {
-                    let _ = req.token_tx.send(TokenEvent::Error {
-                        message: message.clone(),
-                        prompt_tokens: req.prompt_len,
-                        completion_tokens: req.generated_count,
-                    });
-                }
+                fail_active(active, dflash, &message);
                 return;
             }
         };
@@ -572,7 +779,7 @@ fn decode_step(
         })
         .collect();
 
-    dispatch_decode_tokens(model, active, &tokens, &logprobs_vec, graph_state);
+    dispatch_decode_tokens(model, active, &tokens, &logprobs_vec, graph_state, None);
 }
 
 /// Process decode logits from unified step: sample, extract logprobs, dispatch.
@@ -581,6 +788,7 @@ fn process_decode_logits(
     active: &mut Vec<ActiveRequest35>,
     graph_state: &mut BatchDecodeGraphState,
     rng: &mut StdRng,
+    dflash: Option<&mut DFlashSchedulerState>,
 ) {
     let requested_logprobs: Vec<usize> = active.iter().map(|r| r.logprobs).collect();
     let cpu_logits = match snapshot_requested_logprobs(
@@ -592,13 +800,7 @@ fn process_decode_logits(
         Err(e) => {
             warn!("decode logprobs snapshot error: {e}");
             let message = e.to_string();
-            for req in active.drain(..) {
-                let _ = req.token_tx.send(TokenEvent::Error {
-                    message: message.clone(),
-                    prompt_tokens: req.prompt_len,
-                    completion_tokens: req.generated_count,
-                });
-            }
+            fail_active(active, dflash, &message);
             return;
         }
     };
@@ -612,13 +814,7 @@ fn process_decode_logits(
             Err(e) => {
                 warn!("decode sampling error: {e}");
                 let message = e.to_string();
-                for req in active.drain(..) {
-                    let _ = req.token_tx.send(TokenEvent::Error {
-                        message: message.clone(),
-                        prompt_tokens: req.prompt_len,
-                        completion_tokens: req.generated_count,
-                    });
-                }
+                fail_active(active, dflash, &message);
                 return;
             }
         };
@@ -633,7 +829,424 @@ fn process_decode_logits(
         })
         .collect();
 
-    dispatch_decode_tokens(model, active, &tokens, &logprobs_vec, graph_state);
+    dispatch_decode_tokens(model, active, &tokens, &logprobs_vec, graph_state, dflash);
+}
+
+fn decode_step_speculative(
+    model: &Qwen35Model,
+    active: &mut Vec<ActiveRequest35>,
+    graph_state: &mut BatchDecodeGraphState,
+    dflash: Option<&mut DFlashSchedulerState>,
+) -> bool {
+    let Some(dflash) = dflash else {
+        return false;
+    };
+    let require_spec = std::env::var_os(DFLASH_REQUIRE_SPEC_ENV).is_some();
+    if active.len() != DFLASH_MAX_ACTIVE_REQUESTS {
+        for req in active.iter() {
+            dflash.drop_request(req.local_id);
+        }
+        return false;
+    }
+    if let Some(reason) = dflash_ineligible_reason(&active[0], dflash) {
+        if require_spec && strict_dflash_candidate(&active[0]) {
+            let req = active.remove(0);
+            dflash.drop_request(req.local_id);
+            let _ = req.token_tx.send(TokenEvent::Error {
+                message: format!(
+                    "Qwen3.5 DFlash strict mode expected speculative decode, but request was ineligible: {reason}"
+                ),
+                prompt_tokens: req.prompt_len,
+                completion_tokens: req.generated_count,
+            });
+            return true;
+        }
+        dflash.drop_request(active[0].local_id);
+        return false;
+    }
+
+    let draft_spans = match execute_dflash_draft(model, active, dflash) {
+        Ok(spans) => spans,
+        Err(e) => {
+            if require_spec {
+                let message = format!("Qwen3.5 DFlash strict mode draft failed: {e}");
+                for req in active.drain(..) {
+                    dflash.drop_request(req.local_id);
+                    let _ = req.token_tx.send(TokenEvent::Error {
+                        message: message.clone(),
+                        prompt_tokens: req.prompt_len,
+                        completion_tokens: req.generated_count,
+                    });
+                }
+                return true;
+            }
+            warn!("Qwen3.5 DFlash draft failed, falling back to decode: {e}");
+            return false;
+        }
+    };
+    let accepted = match verify_dflash_spans(model, active, graph_state, dflash, &draft_spans) {
+        Ok(accepted) => accepted,
+        Err(e) => {
+            warn!("Qwen3.5 DFlash verify failed: {e}");
+            let message = e.to_string();
+            for req in active.drain(..) {
+                dflash.drop_request(req.local_id);
+                let _ = req.token_tx.send(TokenEvent::Error {
+                    message: message.clone(),
+                    prompt_tokens: req.prompt_len,
+                    completion_tokens: req.generated_count,
+                });
+            }
+            return true;
+        }
+    };
+    dispatch_speculative_tokens(model, active, &accepted, graph_state, dflash);
+    true
+}
+
+fn strict_dflash_candidate(req: &ActiveRequest35) -> bool {
+    req.logprobs == 0
+        && req.params.is_greedy()
+        && req.max_tokens.saturating_sub(req.generated_count) > 1
+        && req.kv.seq_len() <= DFLASH_MAX_VERIFIED_CONTEXT_TOKENS
+}
+
+fn dflash_ineligible_reason(
+    req: &ActiveRequest35,
+    dflash: &DFlashSchedulerState,
+) -> Option<&'static str> {
+    if req.logprobs != 0 {
+        return Some("logprobs requested");
+    }
+    if !req.params.is_greedy() {
+        return Some("non-greedy sampling");
+    }
+    if req.max_tokens.saturating_sub(req.generated_count) <= 1 {
+        return Some("not enough remaining tokens");
+    }
+    if req.kv.seq_len().saturating_add(dflash.model.verify_span())
+        > DFLASH_MAX_VERIFIED_CONTEXT_TOKENS
+    {
+        return Some("verify span exceeds verified DFlash bound");
+    }
+    if !dflash.ready_for_draft(req.local_id) {
+        return Some("missing captured DFlash context");
+    }
+    None
+}
+
+fn execute_dflash_draft(
+    model: &Qwen35Model,
+    active: &[ActiveRequest35],
+    dflash: &mut DFlashSchedulerState,
+) -> Result<Vec<Vec<u32>>> {
+    let block_size = dflash.model.block_size();
+    let current_tokens: Vec<u32> = active.iter().map(|req| req.last_token).collect();
+    let mut taken = Vec::with_capacity(active.len());
+    for req in active {
+        let state = dflash
+            .requests
+            .remove(&req.local_id)
+            .ok_or_else(|| anyhow::anyhow!("missing Qwen3.5 DFlash state for {}", req.local_id))?;
+        taken.push((req.local_id, state));
+    }
+
+    let result = (|| -> Result<Vec<Vec<u32>>> {
+        let mut state_refs: Vec<&mut DFlashRequestState> =
+            taken.iter_mut().map(|(_, state)| state).collect();
+        let logits = dflash.model.draft_logits_batched(
+            model,
+            &mut state_refs,
+            &current_tokens,
+            &mut dflash.scratch,
+        )?;
+        anyhow::ensure!(
+            logits.seq_len == active.len() * block_size,
+            "Qwen3.5 DFlash logits rows {} != active {} x block {}",
+            logits.seq_len,
+            active.len(),
+            block_size
+        );
+        let greedy = SamplingParams::default();
+        let params: Vec<&SamplingParams> = vec![&greedy; logits.seq_len];
+        let steps = vec![0_u64; logits.seq_len];
+        let sampled = openinfer_sample::select_batch(
+            model.device_ctx(),
+            logits,
+            &params,
+            &steps,
+            0,
+            &mut dflash.verify_bufs.sample,
+        )?;
+        let drafts_start = usize::from(!dflash.model.anchor_first());
+        let mut spans = Vec::with_capacity(active.len());
+        for (i, req) in active.iter().enumerate() {
+            let remaining = req.max_tokens.saturating_sub(req.generated_count);
+            let draft_budget = remaining.saturating_sub(1);
+            if draft_budget == 0 {
+                spans.push(vec![req.last_token]);
+                continue;
+            }
+            let block = &sampled[i * block_size..(i + 1) * block_size];
+            let drafts = &block[drafts_start..];
+            let draft_limit = drafts
+                .len()
+                .min(DFLASH_PROBE_DRAFT_TOKENS)
+                .min(draft_budget);
+            let mut span = Vec::with_capacity(draft_limit + 1);
+            span.push(req.last_token);
+            span.extend(drafts.iter().take(draft_limit).copied());
+            spans.push(span);
+        }
+        Ok(spans)
+    })();
+
+    if result.is_ok() {
+        for (local_id, state) in taken {
+            dflash.requests.insert(local_id, state);
+        }
+    }
+    result
+}
+
+fn verify_dflash_spans(
+    model: &Qwen35Model,
+    active: &mut [ActiveRequest35],
+    graph_state: &mut BatchDecodeGraphState,
+    dflash: &mut DFlashSchedulerState,
+    spans: &[Vec<u32>],
+) -> Result<Vec<Vec<VerifiedToken>>> {
+    anyhow::ensure!(
+        active.len() == DFLASH_MAX_ACTIVE_REQUESTS && spans.len() == active.len(),
+        "Qwen3.5 DFlash currently verifies only one active request"
+    );
+    let batch = active.len();
+    dflash.ensure_state_scratch(model.device_ctx(), model.config(), batch)?;
+    let graph_slot_indices: Vec<usize> = active.iter().map(|req| req.graph_slot_idx).collect();
+    let original_seq_lens: Vec<usize> = active.iter().map(|req| req.kv.seq_len()).collect();
+    capture_hybrid_states(
+        model,
+        graph_state,
+        &graph_slot_indices,
+        &mut dflash.backup_states[..batch],
+    )?;
+
+    let result = (|| -> Result<Vec<Vec<VerifiedToken>>> {
+        let capture_layer_ids = dflash.capture_layer_ids().to_vec();
+        let span_refs: Vec<&[u32]> = spans.iter().map(Vec::as_slice).collect();
+        let requested_logprobs = vec![0usize; batch];
+        let verify_results = {
+            let mut kv_refs: Vec<&mut KvState> = active.iter_mut().map(|req| &mut req.kv).collect();
+            verify_hybrid_spans(
+                model,
+                &mut kv_refs,
+                &span_refs,
+                &capture_layer_ids,
+                &requested_logprobs,
+                &mut dflash.verify_bufs,
+                &dflash.backup_states[..batch],
+                &mut dflash.verify_scratch_states[..batch],
+            )?
+        };
+        let mut row_offset = 0usize;
+        for slot_idx in 0..batch {
+            let local_id = active[slot_idx].local_id;
+            let accepted_len = verify_results[slot_idx].accepted_tokens.len();
+            let state = dflash.requests.get_mut(&local_id).ok_or_else(|| {
+                anyhow::anyhow!("missing Qwen3.5 DFlash request state for {local_id}")
+            })?;
+            dflash.model.append_pending_context(
+                model.device_ctx(),
+                state,
+                &dflash.verify_bufs.captured_hidden,
+                row_offset,
+                accepted_len,
+            )?;
+            row_offset += spans[slot_idx].len();
+        }
+        {
+            let mut kv_refs: Vec<&mut KvState> = active.iter_mut().map(|req| &mut req.kv).collect();
+            commit_hybrid_states(
+                model,
+                &mut kv_refs,
+                graph_state,
+                &graph_slot_indices,
+                &span_refs,
+                &dflash.backup_states[..batch],
+                &mut dflash.verify_scratch_states[..batch],
+                &mut dflash.verify_bufs,
+                &original_seq_lens,
+                &verify_results,
+            )?;
+        }
+        Ok(verify_results
+            .into_iter()
+            .map(|result| result.accepted_tokens)
+            .collect())
+    })();
+
+    match result {
+        Ok(accepted) => Ok(accepted),
+        Err(err) => {
+            let mut rollback_errors = Vec::new();
+            {
+                let mut kv_refs: Vec<&mut KvState> =
+                    active.iter_mut().map(|req| &mut req.kv).collect();
+                if let Err(restore_err) = restore_hybrid_states(
+                    model,
+                    &mut kv_refs,
+                    graph_state,
+                    &graph_slot_indices,
+                    &dflash.backup_states[..batch],
+                    &original_seq_lens,
+                ) {
+                    rollback_errors.push(restore_err.to_string());
+                }
+            }
+            for req in active.iter() {
+                dflash.drop_request(req.local_id);
+            }
+            if !rollback_errors.is_empty() {
+                anyhow::bail!("{err}; {}", rollback_errors.join("; "));
+            }
+            Err(err)
+        }
+    }
+}
+
+fn dispatch_speculative_tokens(
+    model: &Qwen35Model,
+    active: &mut Vec<ActiveRequest35>,
+    accepted: &[Vec<VerifiedToken>],
+    graph_state: &mut BatchDecodeGraphState,
+    dflash: &mut DFlashSchedulerState,
+) {
+    let n = active.len();
+    let mut to_retire = Vec::new();
+    for i in 0..n {
+        let req = &mut active[i];
+        for token in &accepted[i] {
+            req.generated_count += 1;
+            let is_eos = !req.params.ignore_eos && model.is_stop_token(token.token);
+            let at_limit = req.generated_count >= req.max_tokens;
+            if is_eos {
+                let _ = req.token_tx.send(TokenEvent::Finished {
+                    finish_reason: FinishReason::Stop,
+                    prompt_tokens: req.prompt_len,
+                    completion_tokens: req.generated_count,
+                });
+                to_retire.push(i);
+                break;
+            }
+            if req
+                .token_tx
+                .send(TokenEvent::Token {
+                    id: token.token,
+                    logprob: token.logprob.clone(),
+                })
+                .is_err()
+            {
+                to_retire.push(i);
+                break;
+            }
+            if at_limit {
+                let _ = req.token_tx.send(TokenEvent::Finished {
+                    finish_reason: FinishReason::Length,
+                    prompt_tokens: req.prompt_len,
+                    completion_tokens: req.generated_count,
+                });
+                to_retire.push(i);
+                break;
+            }
+            req.last_token = token.token;
+        }
+    }
+    for &i in to_retire.iter().rev() {
+        dflash.drop_request(active[i].local_id);
+        compact_slot(model, active, graph_state, i);
+    }
+}
+
+fn record_dflash_prefill_context(
+    model: &Qwen35Model,
+    chunk: &mut ScheduledChunk,
+    dflash: &mut DFlashSchedulerState,
+    captured_hidden: Option<&HiddenStates>,
+) -> Result<()> {
+    let captured_hidden = captured_hidden.ok_or_else(|| {
+        anyhow::anyhow!("DFlash prefill capture requested but no hidden returned")
+    })?;
+    let expected_tokens: usize = chunk.windows.iter().map(Vec::len).sum();
+    anyhow::ensure!(
+        captured_hidden.seq_len == expected_tokens,
+        "Qwen3.5 DFlash captured {} hidden rows for {} scheduled tokens",
+        captured_hidden.seq_len,
+        expected_tokens
+    );
+    let mut token_offset = 0usize;
+    for (i, req) in chunk.reqs.iter().enumerate() {
+        let local_id = chunk.local_ids[i];
+        let chunk_start = chunk_start(chunk, i);
+        if should_capture_dflash_prefill_context(req)
+            && dflash.can_capture_request(local_id, chunk_start)
+        {
+            let max_cache_len = req
+                .prompt_tokens
+                .len()
+                .saturating_add(req.max_tokens)
+                .min(dflash.verified_context_tokens(model.config().max_position_embeddings))
+                .saturating_add(dflash.model.block_size());
+            let mut state = match dflash.requests.remove(&local_id) {
+                Some(state) => state,
+                None if chunk_start == 0 => dflash
+                    .model
+                    .new_request_state(model.device_ctx(), max_cache_len)?,
+                None => {
+                    dflash.drop_request(local_id);
+                    token_offset += chunk.windows[i].len();
+                    continue;
+                }
+            };
+            let pending_len = state.pending_context_len().unwrap_or(0);
+            anyhow::ensure!(
+                pending_len == chunk_start,
+                "Qwen3.5 DFlash prefill context for local request {local_id} is discontinuous: pending={pending_len}, chunk_start={chunk_start}"
+            );
+            dflash.model.append_pending_context(
+                model.device_ctx(),
+                &mut state,
+                captured_hidden,
+                token_offset,
+                chunk.windows[i].len(),
+            )?;
+            dflash.requests.insert(local_id, state);
+        } else {
+            dflash.drop_request(local_id);
+        }
+        token_offset += chunk.windows[i].len();
+    }
+    Ok(())
+}
+
+fn can_capture_dflash_prefill_chunk(
+    req: &SchedulerRequest,
+    local_id: usize,
+    chunk_start: usize,
+    dflash: &DFlashSchedulerState,
+) -> bool {
+    should_capture_dflash_prefill_context(req) && dflash.can_capture_request(local_id, chunk_start)
+}
+
+fn should_capture_dflash_prefill_context(req: &SchedulerRequest) -> bool {
+    req.prompt_tokens.len() <= DFLASH_MAX_VERIFIED_CONTEXT_TOKENS
+        && req.lora_adapter.is_none()
+        && req.logprobs == 0
+        && !req.echo
+        && req.params.is_greedy()
+}
+
+fn chunk_start(chunk: &ScheduledChunk, idx: usize) -> usize {
+    chunk.ends[idx] - chunk.windows[idx].len()
 }
 
 /// Dispatch sampled decode tokens: send events, check EOS/limits, retire finished.
@@ -646,6 +1259,7 @@ fn dispatch_decode_tokens(
     tokens: &[u32],
     logprobs: &[Option<TokenLogprob>],
     graph_state: &mut BatchDecodeGraphState,
+    mut dflash: Option<&mut DFlashSchedulerState>,
 ) {
     let n = active.len();
     let mut to_retire = Vec::new();
@@ -705,6 +1319,9 @@ fn dispatch_decode_tokens(
 
     // Remove in reverse order so compact_slot indices stay valid
     for &i in to_retire.iter().rev() {
+        if let Some(dflash) = dflash.as_mut() {
+            dflash.drop_request(active[i].local_id);
+        }
         compact_slot(model, active, graph_state, i);
     }
 }
@@ -763,6 +1380,7 @@ fn compact_slot(
 
 /// Step's scheduled prefill set
 struct ScheduledChunk {
+    local_ids: Vec<usize>,
     reqs: Vec<SchedulerRequest>,
     kvs: Vec<KvState>,
     recs: Vec<RecurrentState>,
@@ -776,6 +1394,7 @@ impl From<Vec<PrefillingRequest35>> for ScheduledChunk {
     fn from(scheduled: Vec<PrefillingRequest35>) -> Self {
         let n = scheduled.len();
         let mut chunk = ScheduledChunk {
+            local_ids: Vec::with_capacity(n),
             reqs: Vec::with_capacity(n),
             kvs: Vec::with_capacity(n),
             recs: Vec::with_capacity(n),
@@ -784,6 +1403,7 @@ impl From<Vec<PrefillingRequest35>> for ScheduledChunk {
         };
         for p in scheduled {
             let end = p.cursor + p.step_chunk;
+            chunk.local_ids.push(p.local_id);
             chunk
                 .windows
                 .push(p.req.prompt_tokens[p.cursor..end].to_vec());
@@ -806,7 +1426,7 @@ fn take_prefill_chunks(
         .iter()
         .map(|p| p.req.prompt_tokens.len() - p.cursor)
         .collect();
-    let chunks = plan_prefill_chunks(&remaining, prefill_budget);
+    let chunks = plan_prefill_chunks(&remaining, prefill_budget, PREFILL_CHUNK_LEN);
     let mut scheduled: Vec<PrefillingRequest35> = prefilling.drain(0..chunks.len()).collect();
     for (p, chunk) in scheduled.iter_mut().zip(&chunks) {
         p.step_chunk = *chunk;
@@ -814,13 +1434,35 @@ fn take_prefill_chunks(
     scheduled
 }
 
-/// Report a forward/sampling failure to every request in the failed chunk.
-fn fail_chunk(chunk: ScheduledChunk, message: &str) {
+/// Drop speculative state and report a forward/sampling failure for the chunk.
+fn fail_chunk(chunk: ScheduledChunk, mut dflash: Option<&mut DFlashSchedulerState>, message: &str) {
+    if let Some(dflash) = dflash.as_mut() {
+        for local_id in &chunk.local_ids {
+            dflash.drop_request(*local_id);
+        }
+    }
     for req in chunk.reqs {
         let _ = req.token_tx.send(TokenEvent::Error {
             message: message.to_string(),
             prompt_tokens: req.prompt_tokens.len(),
             completion_tokens: 0,
+        });
+    }
+}
+
+fn fail_active(
+    active: &mut Vec<ActiveRequest35>,
+    mut dflash: Option<&mut DFlashSchedulerState>,
+    message: &str,
+) {
+    for req in active.drain(..) {
+        if let Some(dflash) = dflash.as_mut() {
+            dflash.drop_request(req.local_id);
+        }
+        let _ = req.token_tx.send(TokenEvent::Error {
+            message: message.to_string(),
+            prompt_tokens: req.prompt_len,
+            completion_tokens: req.generated_count,
         });
     }
 }
@@ -837,8 +1479,10 @@ fn promote_or_requeue(
     chunk: ScheduledChunk,
     tokens: &[u32],
     logprobs: &[Option<TokenLogprob>],
+    mut dflash: Option<&mut DFlashSchedulerState>,
 ) {
     let ScheduledChunk {
+        local_ids,
         reqs,
         kvs,
         recs,
@@ -847,10 +1491,18 @@ fn promote_or_requeue(
     } = chunk;
     let mut still_prefilling: Vec<PrefillingRequest35> = Vec::new();
 
-    for (i, (((req, kv), rec), end)) in reqs.into_iter().zip(kvs).zip(recs).zip(ends).enumerate() {
+    for (i, ((((local_id, req), kv), rec), end)) in local_ids
+        .into_iter()
+        .zip(reqs)
+        .zip(kvs)
+        .zip(recs)
+        .zip(ends)
+        .enumerate()
+    {
         // Not finished: re-queue with the advanced cursor
         if end < req.prompt_tokens.len() {
             still_prefilling.push(PrefillingRequest35 {
+                local_id,
                 req,
                 kv,
                 rec,
@@ -885,6 +1537,9 @@ fn promote_or_requeue(
                 prompt_tokens: prompt_len,
                 completion_tokens: 0,
             });
+            if let Some(dflash) = dflash.as_mut() {
+                dflash.drop_request(local_id);
+            }
             continue;
         }
 
@@ -900,6 +1555,9 @@ fn promote_or_requeue(
                 "request dropped: client disconnected: request_id={:?} tokens_generated={}",
                 req.request_id, 0
             );
+            if let Some(dflash) = dflash.as_mut() {
+                dflash.drop_request(local_id);
+            }
             continue;
         }
 
@@ -916,6 +1574,9 @@ fn promote_or_requeue(
                 prompt_tokens: prompt_len,
                 completion_tokens: 1,
             });
+            if let Some(dflash) = dflash.as_mut() {
+                dflash.drop_request(local_id);
+            }
             continue;
         }
 
@@ -926,6 +1587,7 @@ fn promote_or_requeue(
             .copy_state_to_slot(model.device_ctx(), &rec, slot_idx)
             .expect("copy recurrent state to slot failed");
         active.push(ActiveRequest35 {
+            local_id,
             request_id: req.request_id,
             token_tx: req.token_tx,
             kv,

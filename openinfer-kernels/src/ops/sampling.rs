@@ -38,6 +38,20 @@ pub struct BatchSamplingScratch {
 }
 
 impl BatchSamplingScratch {
+    pub fn estimate_bytes(max_rows: usize, vocab: usize) -> usize {
+        let softmax_workspace_bytes = max_rows
+            .saturating_mul(vocab.div_ceil(8192))
+            .saturating_mul(8)
+            .saturating_add(256);
+        let topk_row_states_bytes = unsafe { ffi::gpu_sample_topk_renorm_row_states_bytes_cuda() };
+        max_rows
+            .saturating_mul(vocab)
+            .saturating_mul(std::mem::size_of::<f32>())
+            .saturating_add(max_rows.saturating_mul(25))
+            .saturating_add(topk_row_states_bytes)
+            .saturating_add(softmax_workspace_bytes)
+    }
+
     pub fn new(ctx: &DeviceContext, max_rows: usize, vocab: usize) -> Result<Self> {
         ensure!(
             max_rows > 0 && vocab > 0,

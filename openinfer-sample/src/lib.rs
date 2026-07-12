@@ -63,6 +63,20 @@ pub struct SampleScratch {
 }
 
 impl SampleScratch {
+    pub fn estimate_bytes(vocab: usize, max_rows: usize) -> usize {
+        let partials = argmax_batch_bf16_split_partials_len(max_rows, vocab);
+        max_rows
+            .saturating_mul(
+                std::mem::size_of::<i32>()
+                    + std::mem::size_of::<half::bf16>()
+                    + std::mem::size_of::<i32>(),
+            )
+            .saturating_add(
+                partials.saturating_mul(std::mem::size_of::<f32>() + std::mem::size_of::<i32>()),
+            )
+            .saturating_add(BatchSamplingScratch::estimate_bytes(max_rows, vocab))
+    }
+
     pub fn new(ctx: &DeviceContext, vocab: usize, max_rows: usize) -> Result<Self> {
         ensure!(
             vocab > 0 && max_rows > 0,

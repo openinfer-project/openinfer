@@ -154,6 +154,10 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub(crate) max_prefill_tokens: Option<usize>,
 
+    /// Qwen3.5 DFlash draft model path for opt-in speculative benchmarks.
+    #[arg(long = "dflash-draft-model-path")]
+    pub(crate) dflash_draft_model_path: Option<String>,
+
     #[command(subcommand)]
     pub(crate) command: Command,
 }

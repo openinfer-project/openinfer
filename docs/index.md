@@ -46,6 +46,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | Path | TL;DR |
 | --- | --- |
 | `models/qwen35/roadmap.md` | Qwen3.5-4B roadmap (2026-06 review): decode-tuning refresh improves direct TPOT by 2-3%, while vLLM still leads 1024/256 HTTP decode and high-concurrency throughput. Open items: HND prefill staging, prefix-cache design, serving concurrency. |
+| `models/qwen35/dflash-speculative-decoding.md` | Qwen3.5 DFlash speculative decoding is opt-in behind `--dflash-draft-model-path`; the current implementation supports a single-active greedy path with normal-decode fallback for multi-active/logprobs and no concurrent-throughput claim. |
 | `models/qwen35/kv-admission.md` | Issue #254 complete: Qwen3.5 now uses full-lifetime KV admission, deferred pressure handling, impossible-request rejection, explicit error semantics, direct rejection-event coverage, RTX 5090 e2e, and real HTTP pressure/post-pressure validation. |
 | `models/qwen35/optimization.md` | Hybrid 24 linear + 8 full attn optimization ledger. Decode-tuning refresh fuses MLP gate/up and tunes decode cublasLt buckets, improving direct TPOT by 2-3%; vLLM still leads 1024/256 HTTP decode. |
 | `models/qwen35/accuracy.md` | Qwen3.5 HF bf16 logits goldens, size-keyed (4b, 9b committed; 27b once dumped), through `past_key_values`: short replay covers sequential graph, bucket-straddling batched graph, and slot-compaction; long replay covers 4097/8192-token prompts; full GSM8K 8-shot now matches the HF baseline within 0.15 percentage points. |

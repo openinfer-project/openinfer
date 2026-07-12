@@ -37,6 +37,20 @@ pub struct PrefillPagedPlan {
 }
 
 impl PrefillPagedPlan {
+    pub fn estimate_preallocated_bytes(
+        max_total_tokens: usize,
+        max_total_pages: usize,
+        max_batch: usize,
+        max_tiles: usize,
+    ) -> usize {
+        let i32_elements = max_total_pages
+            .saturating_add(max_total_tokens.saturating_mul(2))
+            .saturating_add(max_tiles.saturating_mul(3))
+            .saturating_add(max_batch.saturating_mul(4))
+            .saturating_add(3);
+        i32_elements.saturating_mul(std::mem::size_of::<i32>())
+    }
+
     pub fn page_indices_d(&self) -> &CudaSlice<i32> {
         &self.page_indices_d
     }

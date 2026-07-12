@@ -11,6 +11,20 @@ pub struct PrefillPagedPlan {
 }
 
 impl PrefillPagedPlan {
+    pub fn estimate_preallocated_bytes(
+        max_total_tokens: usize,
+        max_total_pages: usize,
+        max_batch: usize,
+        max_tiles: usize,
+    ) -> usize {
+        openinfer_kernels::ops::PrefillPagedPlan::estimate_preallocated_bytes(
+            max_total_tokens,
+            max_total_pages,
+            max_batch,
+            max_tiles,
+        )
+    }
+
     pub fn new(
         ctx: &DeviceContext,
         desc: &KvDesc<'_>,

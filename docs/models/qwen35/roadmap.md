@@ -1,8 +1,8 @@
 # Qwen3.5-4B Roadmap
 
-> **TL;DR:** Qwen3.5-4B is decode-correct and still improving: the decode-tuning refresh improves direct TPOT by `2.1-3.2%`, while vLLM still leads 1024/256 HTTP decode and high-concurrency throughput. Long-prompt HF logits and GSM8K gates cover the old 4096-position RoPE boundary. Remaining structural items are HND prefill staging, prefix-cache design, and the serving-level concurrency gap.
+> **TL;DR:** Qwen3.5-4B is decode-correct and still improving: the decode-tuning refresh improves direct TPOT by `2.1-3.2%`, while vLLM still leads 1024/256 HTTP decode and high-concurrency throughput. Long-prompt HF logits and GSM8K gates cover the old 4096-position RoPE boundary. Opt-in single-active DFlash is correctness-gated and shows 2.08x-2.40x direct throughput on verified shapes; multi-active speculation remains follow-up work. Remaining structural items are HND prefill staging, prefix-cache design, and the serving-level concurrency gap.
 >
-> **Last touched:** 2026-06
+> **Last touched:** 2026-07
 
 Tracking issue: see the `[Model] Qwen3.5-4B roadmap` GitHub issue. Sibling doc: `docs/models/qwen3/roadmap.md` — batched sampling is shared and #284 now routes Qwen3.5 decode through the same compact batched sampler; Qwen3.5 now has its own model-level non-greedy behavior gate, while qwen3 keeps the sibling gate on its side.
 
@@ -20,6 +20,7 @@ Tracking issue: see the `[Model] Qwen3.5-4B roadmap` GitHub issue. Sibling doc: 
 | Admission | ✓ existing full-lifetime KV admission and explicit `Rejected` events cover impossible KV requests; #253 adds the context-window rejection reason before prefill/decode | `scheduler.rs`, `src/scheduler/plan.rs`, `docs/models/qwen35/kv-admission.md` |
 | Scheduler tests | Partial: current plan selection, full-lifetime admission, context-window rejection, slot assignment, and slot-compaction decisions are CPU-tested; GPU execution remains coupled to the production scheduler | `src/scheduler/plan.rs` |
 | Step tail | Local branch verified: #353 batches the prefill final norm/lm_head tail, samples decode/unified rows from batched logits, and keeps host full-vocab copies only for requested logprobs; HF/e2e gates pass, short-output serving A/B shows TTFT benefit, long-decode TPOT remains a no-claim diagnostic | `docs/models/qwen35/batched-step-tail.md` |
+| DFlash | Opt-in single-active greedy DFlash path behind `--dflash-draft-model-path`; verified direct c1 shapes improve 2.08x-2.40x with matching hashes, while multi-active/logprobs fall back to normal decode | `docs/models/qwen35/dflash-speculative-decoding.md` |
 | TP | ✗ absent (single GPU only) | — |
 | Prefix cache | ✗ absent; recurrent GDR state (~48MB per boundary snapshot) makes "prefix hit" itself a design question | — |
 
