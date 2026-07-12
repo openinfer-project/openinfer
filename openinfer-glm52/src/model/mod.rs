@@ -43,7 +43,7 @@ use crate::layer::{Glm52DecodeStep, Glm52DecoderLayerWeights, Glm52LayerCaches};
 use crate::mla_decode::{
     Glm52MlaSchedMetadata, glm52_mla_backend_preflight, glm52_select_mla_backend,
 };
-use crate::moe_ep4::Glm52MoeEpState;
+use crate::moe_ep_wo::Glm52MoeEpState;
 use crate::moe_tp::Glm52MoeTpRank;
 use crate::scratch::Glm52DecodeScratch;
 use crate::weights::{Glm52RankGpuWeights, retype_owned};

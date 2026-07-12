@@ -21,8 +21,8 @@ mod layer;
 mod mla_decode;
 mod model;
 mod moe_decode;
-mod moe_ep4;
 mod moe_ep8;
+mod moe_ep_wo;
 mod moe_tp;
 #[cfg(test)]
 mod oracle;

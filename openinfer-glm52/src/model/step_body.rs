@@ -16,7 +16,7 @@ use crate::layer::{
     glm52_layer_attention_half, glm52_layer_finish, glm52_layer_finish_fused,
 };
 use crate::moe_decode::run_router_into;
-use crate::moe_ep4::Glm52MoeEpState;
+use crate::moe_ep_wo::Glm52MoeEpState;
 use crate::moe_ep8::Glm52MoeEp8LayerWeights;
 use crate::moe_tp::Glm52MoeTpRank;
 use crate::scratch::Glm52DecodeScratch;

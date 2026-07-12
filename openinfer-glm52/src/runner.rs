@@ -15,7 +15,7 @@ use crate::dspark::{
 };
 
 use crate::model::{GLM52_MAX_BATCH_PER_RANK, Glm52RankModel, Glm52StepKv, Glm52StepShape};
-use crate::moe_ep4::{Glm52MoeEp4State, Glm52MoeEpState};
+use crate::moe_ep_wo::{Glm52MoeEpState, Glm52MoeEpWoState};
 use crate::moe_ep8::Glm52MoeEp8State;
 use crate::moe_tp::{
     Glm52MoeTpRank, Glm52MoeTpSliceBank, Glm52MoeTpState, Glm52TpExchange, load_tp_slice_layer,
@@ -753,11 +753,15 @@ impl Glm52RankThreadState {
         // rank's TP setup fails below.
         runtime.tp_exchange = tp_exchange.cloned();
         if moe_topo.uses_ep_expert_bundles() {
-            // Collective: every EP rank calls this concurrently. The
-            // topology selects both the shim instantiation and the
-            // routed-expert GEMM chain.
-            runtime.ep8 = Some(match moe_topo {
-                crate::Glm52MoeTopo::Ep8 => {
+            // Collective: every EP rank calls this concurrently. The topology
+            // selects the shim instantiation; the device generation selects
+            // the routed-expert GEMM chain (the DeepGEMM masked chain is
+            // sm_90a-only; everything else runs the weight-only mma chain).
+            let sm_major = dev_ctx.ctx.attribute(
+                cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+            )?;
+            runtime.ep8 = Some(match (moe_topo, sm_major) {
+                (crate::Glm52MoeTopo::Ep8, 9) => {
                     Glm52MoeEpState::MaskedFp8(Box::new(Glm52MoeEp8State::new(
                         &dev_ctx,
                         unique_id,
@@ -765,15 +769,23 @@ impl Glm52RankThreadState {
                         self.placement.rank,
                     )?))
                 }
-                crate::Glm52MoeTopo::Ep4 => {
-                    Glm52MoeEpState::WeightOnly(Box::new(Glm52MoeEp4State::new(
+                (crate::Glm52MoeTopo::Ep8, _) => {
+                    Glm52MoeEpState::WeightOnlyEp8(Box::new(Glm52MoeEpWoState::new(
                         &dev_ctx,
                         unique_id,
                         moe_topo.expected_ep_size(),
                         self.placement.rank,
                     )?))
                 }
-                other => anyhow::bail!("GLM5.2 {other:?} is not an expert-bundle topology"),
+                (crate::Glm52MoeTopo::Ep4, _) => {
+                    Glm52MoeEpState::WeightOnlyEp4(Box::new(Glm52MoeEpWoState::new(
+                        &dev_ctx,
+                        unique_id,
+                        moe_topo.expected_ep_size(),
+                        self.placement.rank,
+                    )?))
+                }
+                (other, _) => anyhow::bail!("GLM5.2 {other:?} is not an expert-bundle topology"),
             });
         }
         if let Some(exchange) = tp_exchange {

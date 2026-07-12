@@ -38,7 +38,7 @@ use crate::layer::{
 use crate::mla_decode::Glm52MlaSchedMetadata;
 use crate::model::{GLM52_DECODE_BUCKETS, INDEX_CACHE_BLOCK, NUM_SMS, rope_tables};
 use crate::moe_decode::{HIDDEN, run_router};
-use crate::moe_ep4::{Glm52MoeEp4State, glm52_moe_ep4_routed_forward};
+use crate::moe_ep_wo::{Glm52MoeEpWoState, glm52_moe_ep_wo_routed_forward};
 use crate::scratch::Glm52DecodeScratch;
 
 const EP_RANKS: usize = 4;
@@ -77,10 +77,13 @@ fn layer_moe_ep4_oracle_gate() -> Result<()> {
                     let ctx = DeviceContext::new_with_device(rank)?;
                     let bank =
                         load_rank_expert_bank(&ctx, &tensors, MOE_ORACLE_LAYER, rank, EP_RANKS)?;
-                    let mut ep4 = Glm52MoeEp4State::new(&ctx, &unique_id, EP_RANKS, rank)?;
+                    let mut ep4 =
+                        Glm52MoeEpWoState::<openinfer_kernels::ops::Glm52Ep4DeepEpAbi>::new(
+                            &ctx, &unique_id, EP_RANKS, rank,
+                        )?;
                     for global_tokens in GLOBAL_TOKEN_BUCKETS {
                         for _position in 0..MOE_ORACLE_CTX {
-                            let dispatched = glm52_moe_ep4_routed_forward(
+                            let dispatched = glm52_moe_ep_wo_routed_forward(
                                 &ctx,
                                 &mut ep4,
                                 &bank,
@@ -104,7 +107,9 @@ fn layer_moe_ep4_oracle_gate() -> Result<()> {
         MOE_ORACLE_LAYER,
         GateLayerMlp::MoeEp4Rank0,
     )?;
-    let mut ep4 = Glm52MoeEp4State::new(&ctx, &unique_id, EP_RANKS, 0)?;
+    let mut ep4 = Glm52MoeEpWoState::<openinfer_kernels::ops::Glm52Ep4DeepEpAbi>::new(
+        &ctx, &unique_id, EP_RANKS, 0,
+    )?;
     let outputs: Result<Vec<Vec<f32>>> = GLOBAL_TOKEN_BUCKETS
         .into_iter()
         .map(|global_tokens| {
@@ -146,7 +151,7 @@ fn layer_moe_ep4_oracle_gate() -> Result<()> {
 fn run_layer_prefill_ep4(
     ctx: &DeviceContext,
     w: &crate::layer::Glm52DecoderLayerWeights,
-    ep4: &mut Glm52MoeEp4State,
+    ep4: &mut Glm52MoeEpWoState<openinfer_kernels::ops::Glm52Ep4DeepEpAbi>,
     hidden_host: &[bf16],
     oracle_ctx: usize,
     global_tokens: usize,
@@ -239,7 +244,7 @@ fn run_layer_prefill_ep4(
             None,
         )?;
         let route = run_router(ctx, &moe.router, scratch.layer.normed2.data())?;
-        let dispatched = glm52_moe_ep4_routed_forward(
+        let dispatched = glm52_moe_ep_wo_routed_forward(
             ctx,
             ep4,
             &moe.bank,

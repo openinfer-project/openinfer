@@ -1,10 +1,13 @@
-//! GLM5.2 EP4 routed-MoE decode: the DeepEP dispatch/combine collectives
-//! around the weight-only masked grouped mma GEMMs.
+//! GLM5.2 weight-only routed-MoE decode: the DeepEP dispatch/combine
+//! collectives around the weight-only masked grouped mma GEMMs, generic over
+//! the shim instantiation (EP4 = 4 ranks × 64 local experts, EP8 = 8 × 32 —
+//! every shape below comes from the shim's `DeepEpInfo`, so a new EP width
+//! is a new instantiation, not new code).
 //!
-//! Same DP-coordinator protocol as EP8 (every rank enters the collective per
-//! MoE layer with the agreed `global_tokens`), but four ranks × 64 local
-//! experts, and the expert GEMMs run the arch-portable weight-only chain
-//! (`glm52_moe_ep_wo.cu`) instead of the sm_90a DeepGEMM masked chain:
+//! Same DP-coordinator protocol as the masked EP8 chain (every rank enters
+//! the collective per MoE layer with the agreed `global_tokens`), but the
+//! expert GEMMs run the arch-portable weight-only chain
+//! (`glm52_moe_ep_wo.cu`) instead of the sm_90a-only DeepGEMM masked chain:
 //!
 //! ```text
 //! dispatch(x bf16, global topk)        # collective; recv = expert-major
@@ -27,9 +30,10 @@ use cudarc::driver::CudaSlice;
 use half::bf16;
 use openinfer_kernels::ffi::DeepEpInfo;
 use openinfer_kernels::ops::{
-    DeepEpDispatchScratch, GLM52_DEEPGEMM_GROUPED_EXPERT_ALIGNMENT, Glm52DeepGemmGroupedFp8Kind,
-    Glm52Ep4DeepEp, glm52_ep4_deepep_info, glm52_moe_ep_wo_masked_mma_launch,
-    glm52_moe_ep_wo_max_tiles, glm52_moe_ep_wo_silu_launch, glm52_moe_ep_wo_tiles_launch,
+    DeepEpAbi, DeepEpBase, DeepEpDispatchScratch, GLM52_DEEPGEMM_GROUPED_EXPERT_ALIGNMENT,
+    Glm52DeepEpAbi, Glm52DeepGemmGroupedFp8Kind, Glm52Ep4DeepEpAbi,
+    glm52_moe_ep_wo_masked_mma_launch, glm52_moe_ep_wo_max_tiles, glm52_moe_ep_wo_silu_launch,
+    glm52_moe_ep_wo_tiles_launch,
 };
 use openinfer_kernels::tensor::DeviceContext;
 
@@ -37,11 +41,11 @@ use crate::model::GLM52_MAX_BATCH_PER_RANK;
 use crate::moe_decode::{EXPERTS, Glm52MoeExpertBank, HIDDEN, RoutedTopk, TOPK, W2_K, W2_N, W13_N};
 use crate::moe_ep8::{Glm52MoeEp8State, glm52_moe_ep8_routed_forward};
 
-/// Per-rank DeepEP EP4 context plus every buffer the weight-only chain
-/// touches, allocated once at startup at worst-case capacity (pointer-stable
-/// for graph capture, no per-layer allocator traffic — the EP8 discipline).
-pub(crate) struct Glm52MoeEp4State {
-    ep: Glm52Ep4DeepEp,
+/// Per-rank DeepEP context plus every buffer the weight-only chain touches,
+/// allocated once at startup at worst-case capacity (pointer-stable for
+/// graph capture, no per-layer allocator traffic — the EP8 discipline).
+pub(crate) struct Glm52MoeEpWoState<A: DeepEpAbi> {
+    ep: DeepEpBase<A>,
     scratch: DeepEpDispatchScratch,
     info: DeepEpInfo,
     /// Fixed worst-case tile budget: the protocol's max global tokens
@@ -74,16 +78,14 @@ pub(crate) struct Glm52MoeEp4State {
     combined: CudaSlice<bf16>,
 }
 
-impl Glm52MoeEp4State {
+impl<A: DeepEpAbi> Glm52MoeEpWoState<A> {
     /// The routed output rows written by the last dispatching
-    /// [`glm52_moe_ep4_routed_forward`] call (valid only when that call
+    /// [`glm52_moe_ep_wo_routed_forward`] call (valid only when that call
     /// returned `true`).
     pub(crate) fn combined(&self) -> &CudaSlice<bf16> {
         &self.combined
     }
-}
 
-impl Glm52MoeEp4State {
     /// Collective: all ranks' worker threads must call concurrently with the
     /// same unique id, device set.
     pub(crate) fn new(
@@ -92,25 +94,25 @@ impl Glm52MoeEp4State {
         num_ranks: usize,
         rank_idx: usize,
     ) -> Result<Self> {
-        let info = glm52_ep4_deepep_info();
+        let info = A::info();
         ensure!(
             info.num_experts as usize == EXPERTS
                 && info.num_topk as usize == TOPK
                 && info.hidden as usize == HIDDEN
                 && info.expert_alignment as usize == GLM52_DEEPGEMM_GROUPED_EXPERT_ALIGNMENT,
-            "GLM5.2 EP4 DeepEP shim config does not match the model: {info:?}"
+            "GLM5.2 EP-wo DeepEP shim config does not match the model: {info:?}"
         );
         ensure!(
             num_ranks == info.num_ranks as usize,
-            "GLM5.2 EP4 DeepEP requires {} ranks, got {num_ranks}",
+            "GLM5.2 EP-wo DeepEP requires {} ranks, got {num_ranks}",
             info.num_ranks
         );
         ensure!(
             info.num_local_experts as usize * info.num_ranks as usize == EXPERTS,
-            "GLM5.2 EP4 shim local experts do not partition the routed set: {info:?}"
+            "GLM5.2 EP-wo shim local experts do not partition the routed set: {info:?}"
         );
-        let ep = Glm52Ep4DeepEp::new(unique_id, num_ranks, rank_idx)
-            .with_context(|| format!("GLM5.2 rank {rank_idx} EP4 DeepEP context create"))?;
+        let ep = DeepEpBase::<A>::new(unique_id, num_ranks, rank_idx)
+            .with_context(|| format!("GLM5.2 rank {rank_idx} EP-wo DeepEP context create"))?;
         let expanded = info.decode_worst_expanded_tokens as usize;
         let recv_tokens = info.decode_worst_recv_tokens as usize;
         let n_local = info.num_local_experts as usize;
@@ -139,13 +141,13 @@ impl Glm52MoeEp4State {
     }
 }
 
-/// One EP4 MoE layer's routed contribution — a collective every rank must
-/// enter simultaneously per layer, same contract as
+/// One weight-only MoE layer's routed contribution — a collective every rank
+/// must enter simultaneously per layer, same contract as
 /// [`glm52_moe_ep8_routed_forward`] (see there for the `token` /
 /// `global_tokens` semantics).
-pub(crate) fn glm52_moe_ep4_routed_forward(
+pub(crate) fn glm52_moe_ep_wo_routed_forward<A: DeepEpAbi>(
     ctx: &DeviceContext,
-    state: &mut Glm52MoeEp4State,
+    state: &mut Glm52MoeEpWoState<A>,
     bank: &Glm52MoeExpertBank,
     token: Option<(&CudaSlice<bf16>, &RoutedTopk, usize)>,
     global_tokens: usize,
@@ -153,25 +155,25 @@ pub(crate) fn glm52_moe_ep4_routed_forward(
     let n_local = state.info.num_local_experts as usize;
     ensure!(
         bank.n_experts() == n_local,
-        "GLM5.2 EP4 MoE needs the {n_local}-expert rank-local bank, got {}",
+        "GLM5.2 EP-wo MoE needs the {n_local}-expert rank-local bank, got {}",
         bank.n_experts()
     );
     let expanded = state.info.decode_worst_expanded_tokens as usize;
     let num_tokens = token.map_or(0, |(_, _, t)| t);
     ensure!(
         token.is_none() || num_tokens > 0,
-        "GLM5.2 EP4 MoE dispatching rank must pass a positive token count"
+        "GLM5.2 EP-wo MoE dispatching rank must pass a positive token count"
     );
     ensure!(
         global_tokens >= num_tokens && global_tokens > 0,
-        "GLM5.2 EP4 MoE global_tokens {global_tokens} must be positive and >= local tokens {num_tokens}"
+        "GLM5.2 EP-wo MoE global_tokens {global_tokens} must be positive and >= local tokens {num_tokens}"
     );
     // The startup tile budget covers the protocol's max global token count;
     // a larger step would overflow the fixed tile buffer.
     let max_global_tokens = state.info.num_ranks as usize * GLM52_MAX_BATCH_PER_RANK;
     ensure!(
         global_tokens <= max_global_tokens,
-        "GLM5.2 EP4 MoE global_tokens {global_tokens} exceeds the protocol cap {max_global_tokens}"
+        "GLM5.2 EP-wo MoE global_tokens {global_tokens} exceeds the protocol cap {max_global_tokens}"
     );
     let expanded_rows = global_tokens * TOPK;
     let bound_rows = expanded.min(
@@ -280,8 +282,11 @@ pub(crate) fn glm52_moe_ep4_routed_forward(
 pub(crate) enum Glm52MoeEpState {
     /// EP8: sm_90a DeepGEMM masked grouped fp8 chain (8×H200 production).
     MaskedFp8(Box<Glm52MoeEp8State>),
-    /// EP4: arch-portable weight-only mma chain (4×GB300 target).
-    WeightOnly(Box<Glm52MoeEp4State>),
+    /// EP4: arch-portable weight-only mma chain on the EP4 shim (4×GB300).
+    WeightOnlyEp4(Box<Glm52MoeEpWoState<Glm52Ep4DeepEpAbi>>),
+    /// EP8 on Blackwell: the same weight-only chain on the EP8 shim (the
+    /// masked DeepGEMM chain is sm_90a-only).
+    WeightOnlyEp8(Box<Glm52MoeEpWoState<Glm52DeepEpAbi>>),
 }
 
 impl Glm52MoeEpState {
@@ -296,8 +301,11 @@ impl Glm52MoeEpState {
             Self::MaskedFp8(state) => {
                 glm52_moe_ep8_routed_forward(ctx, state, bank, token, global_tokens)
             }
-            Self::WeightOnly(state) => {
-                glm52_moe_ep4_routed_forward(ctx, state, bank, token, global_tokens)
+            Self::WeightOnlyEp4(state) => {
+                glm52_moe_ep_wo_routed_forward(ctx, state, bank, token, global_tokens)
+            }
+            Self::WeightOnlyEp8(state) => {
+                glm52_moe_ep_wo_routed_forward(ctx, state, bank, token, global_tokens)
             }
         }
     }
@@ -307,7 +315,8 @@ impl Glm52MoeEpState {
     pub(crate) fn combined(&self) -> &CudaSlice<bf16> {
         match self {
             Self::MaskedFp8(state) => state.combined(),
-            Self::WeightOnly(state) => state.combined(),
+            Self::WeightOnlyEp4(state) => state.combined(),
+            Self::WeightOnlyEp8(state) => state.combined(),
         }
     }
 }
