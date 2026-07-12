@@ -317,7 +317,7 @@ pub(super) fn admit_vllm_pd(
                                     .wait()
                                     .map_err(|err| anyhow::anyhow!("remote KV load: {err}"))
                                     .and_then(|()| {
-                                        vllm_rope_fixup(fixup_workers, reservation.page_ids())
+                                        vllm_rope_fixup(fixup_workers, &reservation.page_ids())
                                     });
                                 match landed {
                                     Ok(()) => pool.commit_loaded_blocks(&mut probe, reservation),
