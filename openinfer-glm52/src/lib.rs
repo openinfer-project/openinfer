@@ -37,7 +37,7 @@ use std::{
     time::Instant,
 };
 
-use anyhow::{Context as _, Result, ensure};
+use anyhow::{Context as _, Result, bail, ensure};
 use bytesize::ByteSize;
 use openinfer_core::engine::{EngineHandle, KvCapacity, LoadSnapshot};
 use openinfer_kv_offload::{HostConfig, KvArena, OffloadEngine, OffloadHost};
@@ -836,17 +836,29 @@ fn build_offload_engines(
             config::GLM52_INDEX_HEAD_DIM + 4,
         ),
     };
+    // vLLM-compat: the P side's connector stores MLA-model blocks page-first —
+    // one host page per block, layers at offsets ordered by lexicographic
+    // layer name. Byte-identical interop therefore requires registering under
+    // vLLM's own layer names (same sort order ⇒ same page offsets; the
+    // per-layer byte widths already match by construction) and page-first.
+    let vllm_compat_active = opts.vllm_compat.is_some();
     let engines = rank_arenas
         .into_iter()
         .zip(device_ordinals)
         .enumerate()
-        .map(|(rank, (arenas, &device_ordinal))| {
+        .map(|(rank, (mut arenas, &device_ordinal))| {
+            if vllm_compat_active {
+                for arena in &mut arenas {
+                    arena.name = vllm_arena_name(&arena.name)?;
+                }
+            }
             OffloadEngine::with_arenas_on(
                 std::sync::Arc::clone(&host),
                 format!("glm52-rank{rank}"),
                 &namespace,
                 device_ordinal as i32,
                 &arenas,
+                vllm_compat_active,
             )
             .map_err(|err| anyhow::anyhow!("GLM5.2 KV offload rank {rank} registration: {err}"))
         })
@@ -868,6 +880,22 @@ fn build_offload_engines(
 fn is_mla_arena_name(name: &str) -> bool {
     name.rsplit_once('.')
         .is_some_and(|(_, arena_kind)| arena_kind == "mla")
+}
+
+/// Map a native arena name (`glm52.L{n}.mla` / `glm52.L{n}.idxk`) to the name
+/// vLLM registers the same cache under (`GlmMoeDsaForCausalLM`, vLLM ≥ 0.24:
+/// MLA latent on every layer, indexer K only on full-indexer layers).
+fn vllm_arena_name(name: &str) -> Result<String> {
+    let parse = || -> Option<(usize, &str)> {
+        let rest = name.strip_prefix("glm52.L")?;
+        let (layer, kind) = rest.split_once('.')?;
+        Some((layer.parse().ok()?, kind))
+    };
+    match parse() {
+        Some((layer, "mla")) => Ok(format!("model.layers.{layer}.self_attn.attn")),
+        Some((layer, "idxk")) => Ok(format!("model.layers.{layer}.self_attn.indexer.k_cache")),
+        _ => bail!("GLM5.2 arena {name} has no vLLM-compat mapping"),
+    }
 }
 
 /// EOS ids from the checkpoint's generation_config.json (`eos_token_id` is a
