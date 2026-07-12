@@ -82,8 +82,10 @@ pub fn glm52_moe_ep_wo_tiles_launch(
 /// accumulation in a fixed per-shape order. Activation and output rows are
 /// the DeepEP aligned receive slots; the weight/scale banks are the packed
 /// per-rank expert slabs (`[groups, n, k]` e4m3 / `[groups, n/128, k/128]`
-/// f32, checkpoint layout as-is). The grid is shaped at `max_tiles`; blocks
-/// past the device tile count retire immediately (CUDA-graph stable).
+/// f32, checkpoint layout as-is). `row_weights` (per aligned row, the
+/// dispatch route weights on W2) scales the f32 accumulator before the bf16
+/// store. The grid is shaped at `max_tiles`; blocks past the device tile
+/// count retire immediately (CUDA-graph stable).
 #[allow(clippy::too_many_arguments)]
 pub fn glm52_moe_ep_wo_masked_mma_launch(
     ctx: &DeviceContext,
@@ -95,6 +97,7 @@ pub fn glm52_moe_ep_wo_masked_mma_launch(
     weight_scale: &CudaSlice<f32>,
     tiles: &CudaSlice<i32>,
     tile_count: &CudaSlice<i32>,
+    row_weights: Option<&CudaSlice<f32>>,
     out: &mut CudaSlice<bf16>,
 ) -> Result<()> {
     let (n, k) = kind.shape();
@@ -118,11 +121,22 @@ pub fn glm52_moe_ep_wo_masked_mma_launch(
         tiles.len(),
         out.len()
     );
+    if let Some(weights) = row_weights {
+        ensure!(
+            weights.len() >= out.len() / n,
+            "GLM5.2 EP-WO masked mma {kind:?} row weights smaller than the output rows: {}",
+            weights.len()
+        );
+    }
     let (act_ptr, _act_guard) = activation.device_ptr(&ctx.stream);
     let (w_ptr, _w_guard) = weight.device_ptr(&ctx.stream);
     let (w_scale_ptr, _w_scale_guard) = weight_scale.device_ptr(&ctx.stream);
     let (tiles_ptr, _tiles_guard) = tiles.device_ptr(&ctx.stream);
     let (count_ptr, _count_guard) = tile_count.device_ptr(&ctx.stream);
+    let row_weights_guarded = row_weights.map(|w| w.device_ptr(&ctx.stream));
+    let rw_ptr = row_weights_guarded
+        .as_ref()
+        .map_or(std::ptr::null(), |(ptr, _)| *ptr as *const f32);
     let (out_ptr, _out_guard) = out.device_ptr_mut(&ctx.stream);
     let result = unsafe {
         ffi::glm52_moe_ep_wo_masked_mma_cuda(
@@ -131,6 +145,7 @@ pub fn glm52_moe_ep_wo_masked_mma_launch(
             w_scale_ptr as *const f32,
             tiles_ptr as *const i32,
             count_ptr as *const i32,
+            rw_ptr,
             out_ptr as *mut ffi::Half,
             n as i32,
             k as i32,
@@ -143,16 +158,15 @@ pub fn glm52_moe_ep_wo_masked_mma_launch(
         .map_err(|err| anyhow!("GLM5.2 EP-WO masked mma {kind:?} launch failed: {err}"))
 }
 
-/// `silu(gate) * up * route_weight` over the tile rows, bf16 out. `input`
-/// rows are the W13 gate|up outputs (`[·, 2*inter]`), `topk_weights` the
-/// dispatch's aligned per-row route weights, `output` the W2 activation rows
-/// (`[·, inter]`) — all in the aligned receive layout.
+/// `silu(gate) * up` over the tile rows, bf16 out (the route weight applies
+/// to the f32 W2 output instead — see the masked mma's `row_weights`).
+/// `input` rows are the W13 gate|up outputs (`[·, 2*inter]`), `output` the
+/// W2 activation rows (`[·, inter]`) — all in the aligned receive layout.
 pub fn glm52_moe_ep_wo_silu_launch(
     ctx: &DeviceContext,
     inter: usize,
     max_tiles: usize,
     input: &CudaSlice<bf16>,
-    topk_weights: &CudaSlice<f32>,
     tiles: &CudaSlice<i32>,
     tile_count: &CudaSlice<i32>,
     output: &mut CudaSlice<bf16>,
@@ -165,24 +179,20 @@ pub fn glm52_moe_ep_wo_silu_launch(
         input.len() >= 2 * inter
             && output.len() >= inter
             && input.len() / (2 * inter) >= output.len() / inter
-            && topk_weights.len() >= output.len() / inter
             && tiles.len() >= 2 * max_tiles
             && !tile_count.is_empty(),
-        "GLM5.2 EP-WO SiLU buffers too small: input {}, weights {}, tiles {}, output {}",
+        "GLM5.2 EP-WO SiLU buffers too small: input {}, tiles {}, output {}",
         input.len(),
-        topk_weights.len(),
         tiles.len(),
         output.len()
     );
     let (in_ptr, _in_guard) = input.device_ptr(&ctx.stream);
-    let (w_ptr, _w_guard) = topk_weights.device_ptr(&ctx.stream);
     let (tiles_ptr, _tiles_guard) = tiles.device_ptr(&ctx.stream);
     let (count_ptr, _count_guard) = tile_count.device_ptr(&ctx.stream);
     let (out_ptr, _out_guard) = output.device_ptr_mut(&ctx.stream);
     let result = unsafe {
         ffi::glm52_moe_ep_wo_silu_cuda(
             in_ptr as *const ffi::Half,
-            w_ptr as *const f32,
             tiles_ptr as *const i32,
             count_ptr as *const i32,
             out_ptr as *mut ffi::Half,

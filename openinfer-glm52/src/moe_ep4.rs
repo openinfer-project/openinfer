@@ -10,8 +10,8 @@
 //! dispatch(x bf16, global topk)        # collective; recv = expert-major
 //!   → psum → compact tile list (expert, aligned row base, rows ≤ 8)
 //!   → W13 weight-only mma over tiles (bf16 recv rows × deq fp8 bank)
-//!   → silu(gate)·up·route_weight (bf16)
-//!   → W2 weight-only mma over tiles → aligned slots
+//!   → silu(gate)·up (bf16)
+//!   → W2 weight-only mma × route_weight → aligned slots
 //!   → combine                          # collective; sums slots per token
 //! ```
 //!
@@ -225,23 +225,24 @@ pub(crate) fn glm52_moe_ep4_routed_forward(
         &bank.w13_scale,
         &state.tiles,
         &state.tile_count,
+        None,
         &mut state.w13_out,
     )?;
 
-    // silu(gate)·up·route_weight → bf16 W2 activation rows.
+    // silu(gate)·up → bf16 W2 activation rows (route weight applies below).
     glm52_moe_ep_wo_silu_launch(
         ctx,
         W2_K,
         state.max_tiles,
         &state.w13_out,
-        &state.recv_topk_weight,
         &state.tiles,
         &state.tile_count,
         &mut state.w2_act,
     )?;
 
-    // W2 (down) weight-only masked mma, straight into the aligned slots
-    // `decode_combine` addresses.
+    // W2 (down) weight-only masked mma; the dispatch route weight scales the
+    // f32 output before the bf16 store, and the rows land straight in the
+    // aligned slots `decode_combine` addresses.
     glm52_moe_ep_wo_masked_mma_launch(
         ctx,
         Glm52DeepGemmGroupedFp8Kind::W2,
@@ -252,6 +253,7 @@ pub(crate) fn glm52_moe_ep4_routed_forward(
         &bank.w2_scale,
         &state.tiles,
         &state.tile_count,
+        Some(&state.recv_topk_weight),
         &mut state.expert_out,
     )?;
 

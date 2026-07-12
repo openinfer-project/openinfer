@@ -42,7 +42,10 @@ fn e4m3_to_f32(byte: u8) -> f32 {
 struct Lcg(u64);
 impl Lcg {
     fn next_u32(&mut self) -> u32 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
         (self.0 >> 33) as u32
     }
     fn fp8_byte(&mut self) -> u8 {
@@ -137,13 +140,20 @@ fn glm52_moe_ep_wo_chain_matches_host_reference() {
         );
     }
 
-    // --- masked mma GEMM (both operand shapes) -----------------------------
+    // --- masked mma GEMM (both operand shapes; W2 exercises the per-row
+    // route-weight scaling of the f32 accumulator) --------------------------
     let mut rng = Lcg(0x9e3779b97f4a7c15);
+    let mut row_weights = vec![0f32; expanded];
+    for v in row_weights.iter_mut() {
+        *v = (rng.unit_f32() + 1.5) * 0.5; // 0.25..1.25
+    }
+    let row_weights_dev = ctx.stream.clone_htod(&row_weights).expect("rw H2D");
     for kind in [
         Glm52DeepGemmGroupedFp8Kind::W13,
         Glm52DeepGemmGroupedFp8Kind::W2,
     ] {
         let (n, k) = kind.shape();
+        let weighted = kind == Glm52DeepGemmGroupedFp8Kind::W2;
         let active: Vec<usize> = COUNTS.iter().map(|&(e, _)| e).collect();
         // Weight bank: random e4m3 for active experts, zeros elsewhere (the
         // kernel must only touch listed experts, and zero banks keep host
@@ -182,6 +192,7 @@ fn glm52_moe_ep_wo_chain_matches_host_reference() {
             &scale_dev,
             &tiles_dev,
             &count_dev,
+            weighted.then_some(&row_weights_dev),
             &mut out_dev,
         )
         .expect("mma launch");
@@ -209,7 +220,11 @@ fn glm52_moe_ep_wo_chain_matches_host_reference() {
                         acc += f64::from(scale) * partial;
                     }
                     let got = f32::from(out_host[row * n + col]);
-                    let want = acc as f32;
+                    let want = if weighted {
+                        (acc * f64::from(row_weights[row])) as f32
+                    } else {
+                        acc as f32
+                    };
                     let rel = (got - want).abs() / want.abs().max(1.0);
                     max_rel = max_rel.max(rel);
                     assert!(
@@ -242,12 +257,7 @@ fn glm52_moe_ep_wo_chain_matches_host_reference() {
     for v in gate_up.iter_mut() {
         *v = bf16::from_f32(rng.unit_f32() * 2.0);
     }
-    let mut route = vec![0f32; expanded];
-    for v in route.iter_mut() {
-        *v = (rng.unit_f32() + 1.5) * 1.0; // 0.5..2.5
-    }
     let gate_up_dev = ctx.stream.clone_htod(&gate_up).expect("gate_up H2D");
-    let route_dev = ctx.stream.clone_htod(&route).expect("route H2D");
     let sentinel = bf16::from_f32(-77.0);
     let mut silu_dev = ctx
         .stream
@@ -258,7 +268,6 @@ fn glm52_moe_ep_wo_chain_matches_host_reference() {
         inter,
         max_tiles,
         &gate_up_dev,
-        &route_dev,
         &tiles_dev,
         &count_dev,
         &mut silu_dev,
@@ -271,7 +280,7 @@ fn glm52_moe_ep_wo_chain_matches_host_reference() {
             for col in (0..inter).step_by(97) {
                 let gate = f32::from(gate_up[row * 2 * inter + col]);
                 let up = f32::from(gate_up[row * 2 * inter + inter + col]);
-                let want = gate * (1.0 / (1.0 + (-gate).exp())) * up * route[row];
+                let want = gate * (1.0 / (1.0 + (-gate).exp())) * up;
                 let got = f32::from(silu_host[row * inter + col]);
                 assert!(
                     (got - want).abs() <= want.abs().max(0.25) * 1e-2,

@@ -109,6 +109,7 @@ moe_ep_wo_masked_mma_kernel(
     const float* __restrict__ weight_scale,        // [groups, n/128, k/128]
     const int2* __restrict__ tiles,
     const int* __restrict__ tile_count,
+    const float* __restrict__ row_weights,  // per aligned row f32 scale, or null
     __nv_bfloat16* __restrict__ out,               // [expanded, n] aligned rows
     int n, int k) {
   if (static_cast<int>(blockIdx.y) >= *tile_count) {
@@ -203,28 +204,36 @@ moe_ep_wo_masked_mma_kernel(
     }
   }
   // C fragment: c0=(weight row gid, col tid*2) c1=(gid, +1) c2=(gid+8, tid*2)
-  // c3=(gid+8, +1); cols index the tile's live activation rows.
+  // c3=(gid+8, +1); cols index the tile's live activation rows. The optional
+  // per-row weight (the dispatch route weight on W2) scales the f32
+  // accumulator BEFORE the bf16 store — the same association as the oracle
+  // reference's post-down multiply.
   const int col0 = tid * 2;
+  float rw0 = 1.0f, rw1 = 1.0f;
+  if (row_weights != nullptr) {
+    if (col0 < live_rows) rw0 = __ldg(row_weights + row_base + col0);
+    if (col0 + 1 < live_rows) rw1 = __ldg(row_weights + row_base + col0 + 1);
+  }
 #pragma unroll
   for (int t = 0; t < kNTiles; ++t) {
     const int n0 = (tile0 + t) * 16;
     if (col0 < live_rows)
-      out[(size_t)(row_base + col0) * n + n0 + gid] = __float2bfloat16(macc[t][0]);
+      out[(size_t)(row_base + col0) * n + n0 + gid] = __float2bfloat16(rw0 * macc[t][0]);
     if (col0 + 1 < live_rows)
-      out[(size_t)(row_base + col0 + 1) * n + n0 + gid] = __float2bfloat16(macc[t][1]);
+      out[(size_t)(row_base + col0 + 1) * n + n0 + gid] = __float2bfloat16(rw1 * macc[t][1]);
     if (col0 < live_rows)
-      out[(size_t)(row_base + col0) * n + n0 + gid + 8] = __float2bfloat16(macc[t][2]);
+      out[(size_t)(row_base + col0) * n + n0 + gid + 8] = __float2bfloat16(rw0 * macc[t][2]);
     if (col0 + 1 < live_rows)
-      out[(size_t)(row_base + col0 + 1) * n + n0 + gid + 8] = __float2bfloat16(macc[t][3]);
+      out[(size_t)(row_base + col0 + 1) * n + n0 + gid + 8] = __float2bfloat16(rw1 * macc[t][3]);
   }
 }
 
-// silu(gate) * up * route_weight over the tile rows, bf16 out (no quant —
-// W2 is weight-only too). gate|up layout and the route-weight indexing match
-// the EP8 masked SiLU kernel; the tile list replaces row_map.
+// silu(gate) * up over the tile rows, bf16 out (no quant, no route weight —
+// the weight applies to the f32 W2 output instead, matching the oracle
+// reference's post-down association). gate|up layout matches the EP8 masked
+// SiLU kernel; the tile list replaces row_map.
 __global__ void moe_ep_wo_silu_kernel(
     const __nv_bfloat16* __restrict__ input,       // [expanded, 2*inter] aligned
-    const float* __restrict__ topk_weights,        // [expanded] aligned rows
     const int2* __restrict__ tiles,
     const int* __restrict__ tile_count,
     __nv_bfloat16* __restrict__ output,            // [expanded, inter] aligned
@@ -238,7 +247,6 @@ __global__ void moe_ep_wo_silu_kernel(
     return;
   }
   const int row = tile.x + blockIdx.y;
-  const float route_weight = __ldg(topk_weights + row);
   const __nv_bfloat16* gate_row = input + (size_t)row * (inter * 2);
   const __nv_bfloat16* up_row = gate_row + inter;
   __nv_bfloat16* out_row = output + (size_t)row * inter;
@@ -246,7 +254,7 @@ __global__ void moe_ep_wo_silu_kernel(
     const float gate = __bfloat162float(gate_row[col]);
     const float up = __bfloat162float(up_row[col]);
     const float sigmoid_gate = 1.0f / (1.0f + expf(-gate));
-    out_row[col] = __float2bfloat16(gate * sigmoid_gate * up * route_weight);
+    out_row[col] = __float2bfloat16(gate * sigmoid_gate * up);
   }
 }
 
@@ -286,7 +294,8 @@ CUresult glm52_moe_ep_wo_tiles_cuda(const int* psum_expert, int2* tiles,
 CUresult glm52_moe_ep_wo_masked_mma_cuda(
     const __nv_bfloat16* activation, const unsigned char* weight,
     const float* weight_scale, const int2* tiles, const int* tile_count,
-    __nv_bfloat16* out, int n, int k, int max_tiles, cudaStream_t stream) {
+    const float* row_weights, __nv_bfloat16* out, int n, int k, int max_tiles,
+    cudaStream_t stream) {
   if (activation == nullptr || weight == nullptr || weight_scale == nullptr ||
       tiles == nullptr || tile_count == nullptr || out == nullptr) {
     return CUDA_ERROR_INVALID_VALUE;
@@ -299,25 +308,24 @@ CUresult glm52_moe_ep_wo_masked_mma_cuda(
   const int n_blocks = n / (16 * kNTiles * kMmaWarps);
   moe_ep_wo_masked_mma_kernel<<<dim3(n_blocks, max_tiles),
                                 kMmaWarps * WARP_SIZE, 0, stream>>>(
-      activation, weight, weight_scale, tiles, tile_count, out, n, k);
+      activation, weight, weight_scale, tiles, tile_count, row_weights, out,
+      n, k);
   return consume_last_cuda_error();
 }
 
 CUresult glm52_moe_ep_wo_silu_cuda(const __nv_bfloat16* input,
-                                   const float* topk_weights,
                                    const int2* tiles, const int* tile_count,
                                    __nv_bfloat16* output, int inter,
                                    int max_tiles, cudaStream_t stream) {
-  if (input == nullptr || topk_weights == nullptr || tiles == nullptr ||
-      tile_count == nullptr || output == nullptr) {
+  if (input == nullptr || tiles == nullptr || tile_count == nullptr ||
+      output == nullptr) {
     return CUDA_ERROR_INVALID_VALUE;
   }
   if (inter <= 0 || max_tiles <= 0) {
     return CUDA_ERROR_INVALID_VALUE;
   }
   moe_ep_wo_silu_kernel<<<dim3(max_tiles, kTileRows), kSiluThreads, 0,
-                          stream>>>(input, topk_weights, tiles, tile_count,
-                                    output, inter);
+                          stream>>>(input, tiles, tile_count, output, inter);
   return consume_last_cuda_error();
 }
 

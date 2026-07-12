@@ -4,12 +4,14 @@
 //! Rank 0 walks the full decoder layer (attention + indexer + EP4 MoE +
 //! shared expert) over the same seeded input as the EP1 gate; ranks 1..3
 //! hold their 64 local experts and replay one collective per position. The
-//! probe constants, tolerance, and router tie-flip allowance are shared
-//! verbatim with `layer_oracle_gate` — passing here proves the EP4
-//! collective path (dispatch → tile metadata → weight-only mma GEMMs →
-//! combine) computes the same layer output as the local EP1 chain, with the
-//! bf16×fp8 weight-only numerics standing in for the EP8 chain's
-//! fp8-requantized activations.
+//! probes are the gemv-precision block (`MOE_ORACLE_WO_LAYER_PROBES`): the
+//! weight-only chain reads bf16 activations directly, so the fp8sim
+//! reference (which emulates the EP8 chain's activation re-quant) deviates
+//! from it by a systematic ~2-3× tol — the gemv reference is the matching
+//! numerics regime. Passing here proves the EP4 collective path (dispatch →
+//! tile metadata → weight-only mma GEMMs → combine) lands on the
+//! HF-oracle layer output within the same tolerance discipline as the EP1
+//! and EP8 gates.
 
 use std::sync::Arc;
 
@@ -24,7 +26,7 @@ use openinfer_kernels::tensor::DeviceContext;
 
 use super::layer::{
     GateLayerMlp, LayerTensors, MOE_ORACLE_CTX, MOE_ORACLE_HIDDEN_DIGEST, MOE_ORACLE_INPUT_SCALE,
-    MOE_ORACLE_LAYER, MOE_ORACLE_LAYER_PROBES, MOE_ORACLE_LAYER_TOL, MOE_ORACLE_SEED,
+    MOE_ORACLE_LAYER, MOE_ORACLE_SEED, MOE_ORACLE_WO_LAYER_PROBES, MOE_ORACLE_WO_LAYER_TOL,
     assert_layer_probes, checked_hidden, load_decoder_layer, load_rank_expert_bank, model_path,
 };
 use crate::config::{GLM52_INDEX_HEAD_DIM, GLM52_ROPE_HALF, GLM52_SM_SCALE};
@@ -130,8 +132,8 @@ fn layer_moe_ep4_oracle_gate() -> Result<()> {
         assert_layer_probes(
             &format!("layer6/moe/ep4/g{global_tokens}"),
             outputs,
-            MOE_ORACLE_LAYER_PROBES,
-            MOE_ORACLE_LAYER_TOL,
+            MOE_ORACLE_WO_LAYER_PROBES,
+            MOE_ORACLE_WO_LAYER_TOL,
             4,
         );
     }
