@@ -318,7 +318,7 @@ fn fuse_tokenizer_json() -> Result<String> {
     // these the chat request 500s before ever reaching the tool parser.
     vocab.insert("<think>".to_string(), json!(4));
     vocab.insert("</think>".to_string(), json!(5));
-    // Trailing EOS terminator (see script construction in the harness).
+    // EOS id padded onto the script in `ToolCallSimServer::spawn` (see there for why).
     vocab.insert("<|endoftext|>".to_string(), json!(6));
 
     let special = |id: u32, content: &str| {
