@@ -1,6 +1,6 @@
 # GLM5.2 Serving Status & Remaining Work
 
-> **TL;DR:** Decode serving is feature-complete for its scope (whole-step graph buckets, DSpark speculation, paged KV + prefix cache, VRAM-derived max_model_len, pegaflow host-tier offload behind `--kv-offload`); sampling surface frozen at `temperature/top_p/top_k/min_p/seed`. Low-latency arc: `--moe-topo tp8` (#609) + span MTP (#610) + attention-TP with replicated activations (`feat/glm52-attn-tp`, solo 13.75 ms / MTP code 221 tok/s — see `moe-tp8-low-latency.md`). GLM5.2's next P/D step is design input only; implementation remains Later under `roadmap-2026-h2.md`.
+> **TL;DR:** Decode serving is feature-complete for its scope (whole-step graph buckets, DSpark speculation, paged KV + prefix cache, VRAM-derived max_model_len, pegaflow host-tier offload behind `--kv-offload`); sampling surface frozen at `temperature/top_p/top_k/min_p/seed`. Low-latency arc: `--moe-topo tp8` (#609) + span MTP (#610) + attention-TP with replicated activations (`feat/glm52-attn-tp`, solo 13.75 ms / MTP code 221 tok/s — see `moe-tp8-low-latency.md`). Cross-tray EP-N on GB300 NVL72 shipped on `feat/glm52-rank-host`: `--rank-hosts` remote ranks over framed TCP, EP widths {4..64} instantiated, 2-tray EP8 solo p50 23.61 / p99 24.00 ms (see `cross-node-scaling.md`). GLM5.2's next P/D step is design input only; implementation remains Later under `roadmap-2026-h2.md`.
 >
 > **Last touched:** 2026-07
 
