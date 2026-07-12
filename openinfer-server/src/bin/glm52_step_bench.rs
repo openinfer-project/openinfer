@@ -211,7 +211,10 @@ fn bench_concurrency(bucket: usize, moe_topo: openinfer_glm52::Glm52MoeTopo) -> 
         // compact bs=1 shape (the PR's headline latency) is directly iterable.
         bucket
     } else {
-        GLM52_RANKS * bucket
+        // One stream per (logical DP rank, slot): more would make the
+        // scheduler run a LARGER per-rank bucket than the label says (EP4
+        // has 4 logical ranks, not the EP8 constant).
+        moe_topo.default_dp_size() * bucket
     }
 }
 
