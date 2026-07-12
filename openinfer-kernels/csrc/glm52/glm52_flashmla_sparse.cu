@@ -6,6 +6,7 @@
 #include <exception>
 
 #include "params.h"
+#include "sm100/decode/head64/kernel.cuh"
 #include "sm90/decode/sparse_fp8/splitkv_mla.cuh"
 #include "smxx/decode/combine/combine.cu"
 #include "smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu"
@@ -51,17 +52,41 @@ CUresult run_flashmla_host(Fn&& fn) {
   return consume_last_cuda_error();
 }
 
-CUresult current_sm90_num_sm_parts(int* num_sm_parts) {
-  if (num_sm_parts == nullptr) return CUDA_ERROR_INVALID_VALUE;
+enum class FlashMlaArch {
+  Sm90,
+  Sm100,
+};
+
+CUresult current_flashmla_arch(cudaDeviceProp* prop, FlashMlaArch* arch) {
+  if (prop == nullptr || arch == nullptr) return CUDA_ERROR_INVALID_VALUE;
 
   int device = 0;
   cudaError_t err = cudaGetDevice(&device);
   if (err != cudaSuccess) return map_cuda_error(err);
 
-  cudaDeviceProp prop{};
-  err = cudaGetDeviceProperties(&prop, device);
+  err = cudaGetDeviceProperties(prop, device);
   if (err != cudaSuccess) return map_cuda_error(err);
-  if (prop.major != 9 || prop.minor != 0) return CUDA_ERROR_NOT_SUPPORTED;
+
+  if (prop->major == 9 && prop->minor == 0) {
+    *arch = FlashMlaArch::Sm90;
+    return CUDA_SUCCESS;
+  }
+  // sm_100f family (10.x) only: the device code is assembled as sm_100f, so
+  // a future 11.x device must get NOT_SUPPORTED here, not a launch failure.
+  if (prop->major == 10) {
+    *arch = FlashMlaArch::Sm100;
+    return CUDA_SUCCESS;
+  }
+  return CUDA_ERROR_NOT_SUPPORTED;
+}
+
+CUresult current_flashmla_num_sm_parts(int* num_sm_parts) {
+  if (num_sm_parts == nullptr) return CUDA_ERROR_INVALID_VALUE;
+
+  cudaDeviceProp prop{};
+  FlashMlaArch arch{};
+  CUresult result = current_flashmla_arch(&prop, &arch);
+  if (result != CUDA_SUCCESS) return result;
 
   int parts = std::max(prop.multiProcessorCount / kSq / (kHeads / 64), 1);
   if (parts > kMaxSmParts) return CUDA_ERROR_NOT_SUPPORTED;
@@ -83,7 +108,7 @@ bool valid_common_shape(int batch_size, int num_blocks, int topk,
 
 extern "C" CUresult glm52_flashmla_sparse_decode_num_sm_parts_cuda(
     int* num_sm_parts) {
-  return current_sm90_num_sm_parts(num_sm_parts);
+  return current_flashmla_num_sm_parts(num_sm_parts);
 }
 
 extern "C" CUresult glm52_flashmla_sparse_decode_metadata_cuda(
@@ -187,9 +212,22 @@ extern "C" CUresult glm52_flashmla_sparse_decode_launch_cuda(
   params.num_splits_ptr = const_cast<int*>(num_splits);
   params.num_sm_parts = num_sm_parts;
 
-  CUresult result = run_flashmla_host([&] {
-    sm90::decode::sparse_fp8::run_flash_splitkv_mla_fp8_sparse_kernel<
-        ModelType::V32, kHeads>(params);
+  cudaDeviceProp prop{};
+  FlashMlaArch arch{};
+  CUresult result = current_flashmla_arch(&prop, &arch);
+  if (result != CUDA_SUCCESS) return result;
+
+  result = run_flashmla_host([&] {
+    switch (arch) {
+      case FlashMlaArch::Sm90:
+        sm90::decode::sparse_fp8::run_flash_splitkv_mla_fp8_sparse_kernel<
+            ModelType::V32, kHeads>(params);
+        break;
+      case FlashMlaArch::Sm100:
+        sm100::decode::head64::run_flash_splitkv_mla_fp8_sparse_kernel<
+            ModelType::V32>(params);
+        break;
+    }
   });
   if (result != CUDA_SUCCESS) return result;
 

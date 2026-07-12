@@ -1,4 +1,6 @@
-use anyhow::{Result, bail};
+use std::{collections::BTreeMap, env, sync::LazyLock};
+
+use anyhow::{Context, Result, bail, ensure};
 use cudarc::driver::CudaSlice;
 use half::bf16;
 use openinfer_core::{
@@ -6,7 +8,7 @@ use openinfer_core::{
     tensor::{HiddenStates, HiddenStatesRef},
 };
 use openinfer_kernels::ops::{
-    Dsv2LiteRouterOutput, dsv2_lite_router_softmax_topk_into,
+    Dsv2LiteRouterOutput, dsv2_lite_router_logits_into, dsv2_lite_router_softmax_topk_into,
     dsv2_lite_router_softmax_topk_ref_into,
 };
 
@@ -28,6 +30,102 @@ use crate::{
     },
     nccl_backend::NaiveNcclEp2Backend,
 };
+
+fn parse_rollback_value(
+    name: &str,
+    raw: Option<&str>,
+    optimized: &str,
+    rollback: &str,
+) -> std::result::Result<bool, String> {
+    match raw.map(str::trim) {
+        None | Some("") => Ok(false),
+        Some(value) if value == optimized => Ok(false),
+        Some(value) if value == rollback => Ok(true),
+        Some(value) => Err(format!(
+            "{name} must be `{optimized}` or `{rollback}`, got `{value}`"
+        )),
+    }
+}
+
+fn load_rollback_value(
+    name: &str,
+    optimized: &str,
+    rollback: &str,
+) -> std::result::Result<bool, String> {
+    match env::var(name) {
+        Ok(value) => parse_rollback_value(name, Some(&value), optimized, rollback),
+        Err(env::VarError::NotPresent) => Ok(false),
+        Err(env::VarError::NotUnicode(_)) => Err(format!("{name} must contain valid Unicode text")),
+    }
+}
+
+fn rollback_enabled(value: &std::result::Result<bool, String>) -> Result<bool> {
+    value
+        .as_ref()
+        .copied()
+        .map_err(|message| anyhow::anyhow!("{message}"))
+}
+
+static HOST_STAGED_SERIAL: LazyLock<std::result::Result<bool, String>> = LazyLock::new(|| {
+    load_rollback_value(
+        "OPENINFER_DSV2_LITE_HOST_STAGED_EXPERT_BATCH",
+        "batched",
+        "serial",
+    )
+});
+static NCCL_SERIAL: LazyLock<std::result::Result<bool, String>> = LazyLock::new(|| {
+    load_rollback_value("OPENINFER_DSV2_LITE_NCCL_EXPERT_BATCH", "grouped", "serial")
+});
+static NCCL_HOST_ROUTER: LazyLock<std::result::Result<bool, String>> =
+    LazyLock::new(|| load_rollback_value("OPENINFER_DSV2_LITE_NCCL_ROUTER", "device", "host"));
+
+fn group_route_indices(
+    keys: impl IntoIterator<Item = (usize, usize)>,
+) -> BTreeMap<(usize, usize), Vec<usize>> {
+    let mut groups = BTreeMap::new();
+    for (route_index, key) in keys.into_iter().enumerate() {
+        groups.entry(key).or_insert_with(Vec::new).push(route_index);
+    }
+    groups
+}
+
+struct NcclRouteReplayBuffers {
+    _inputs: Vec<HiddenStates>,
+    _outputs: Vec<HiddenStates>,
+}
+
+fn accumulate_host_staged_route_output(
+    dst: &mut [f32],
+    route: &MoeRouteEntry,
+    out: &[f32],
+    hidden_size: usize,
+) -> Result<()> {
+    ensure!(
+        hidden_size > 0,
+        "host-staged route output requires nonzero hidden size"
+    );
+    ensure!(
+        out.len() == hidden_size,
+        "host-staged route output len mismatch: got {}, expected {hidden_size}",
+        out.len()
+    );
+    let token_end = route
+        .token
+        .checked_add(1)
+        .and_then(|tokens| tokens.checked_mul(hidden_size))
+        .context("host-staged route output offset overflow")?;
+    ensure!(
+        token_end <= dst.len(),
+        "host-staged route token {} exceeds contribution rows {}",
+        route.token,
+        dst.len() / hidden_size
+    );
+    let token_begin = token_end - hidden_size;
+    for (dst, value) in dst[token_begin..token_end].iter_mut().zip(out) {
+        *dst += route.weight * *value;
+    }
+    Ok(())
+}
 
 pub(super) struct FixedTopologyMoeScratch {
     rank0_topk_weight: CudaSlice<f32>,
@@ -156,16 +254,49 @@ impl DeepSeekV2LiteEp2Generator {
                 }
             },
         )?;
-        let mut rank0_contrib = vec![0.0f32; input.seq_len * self.config.hidden_size];
-        let mut rank1_contrib = vec![0.0f32; rank0_contrib.len()];
-        let mut local_routes = 0usize;
-        let mut remote_routes = 0usize;
-
-        for (token, token_routes) in routes.iter().enumerate() {
-            let token_input =
-                &input_host[token * self.config.hidden_size..(token + 1) * self.config.hidden_size];
-            for &(global_expert, weight) in token_routes {
-                let owner_rank = self.rank0.layout.owner_rank(global_expert)?;
+        let route_plan = MoeRoutePlan::from_topk_routes(&routes, &self.rank0.layout)?;
+        let route_groups = group_route_indices(
+            route_plan
+                .entries()
+                .iter()
+                .map(|route| (route.owner_rank, route.global_expert)),
+        );
+        let mut group_outputs = Vec::with_capacity(route_groups.len());
+        let mut route_locations = vec![None; route_plan.route_count()];
+        if rollback_enabled(&HOST_STAGED_SERIAL)? {
+            for (route_index, route) in route_plan.entries().iter().enumerate() {
+                let section = if route.owner_rank == 0 {
+                    "host_staged_local_expert"
+                } else {
+                    "host_staged_remote_dispatch"
+                };
+                let expert_ctx = if route.owner_rank == 0 {
+                    &self.rank0.ctx
+                } else {
+                    &self.rank1.ctx
+                };
+                let begin = route.token * self.config.hidden_size;
+                let end = begin + self.config.hidden_size;
+                let out = attribution.record_gpu_result(
+                    expert_ctx,
+                    phase,
+                    section,
+                    || format!("layer.{layer_idx}.{section}"),
+                    Some(layer_idx),
+                    token_index,
+                    || {
+                        self.expert_forward_host_token(
+                            layer_idx,
+                            route.global_expert,
+                            &input_host[begin..end],
+                        )
+                    },
+                )?;
+                route_locations[route_index] = Some((group_outputs.len(), 0));
+                group_outputs.push(out);
+            }
+        } else {
+            for ((owner_rank, global_expert), route_indices) in route_groups {
                 let section = if owner_rank == 0 {
                     "host_staged_local_expert"
                 } else {
@@ -176,43 +307,64 @@ impl DeepSeekV2LiteEp2Generator {
                 } else {
                     &self.rank1.ctx
                 };
-                let dst = if owner_rank == 0 {
-                    &mut rank0_contrib
-                } else {
-                    &mut rank1_contrib
-                };
-                let (out, is_remote) = attribution.record_gpu_result(
+                let out = attribution.record_gpu_result(
                     expert_ctx,
                     phase,
                     section,
-                    || format!("layer.{layer_idx}.{section}"),
-                    Some(layer_idx),
-                    token_index,
-                    || self.expert_forward_host(layer_idx, global_expert, token_input),
-                )?;
-                if is_remote {
-                    remote_routes += 1;
-                } else {
-                    local_routes += 1;
-                }
-                let offset = token * self.config.hidden_size;
-                attribution.record_result(
-                    phase,
-                    "host_staged_combine_accumulate",
-                    || format!("layer.{layer_idx}.host_staged.combine_accumulate"),
+                    || format!("layer.{layer_idx}.{section}.expert{global_expert}"),
                     Some(layer_idx),
                     token_index,
                     || {
-                        for (dst, value) in dst[offset..offset + self.config.hidden_size]
-                            .iter_mut()
-                            .zip(out)
-                        {
-                            *dst += weight * value;
-                        }
-                        Ok(())
+                        self.expert_forward_host_batch(
+                            layer_idx,
+                            global_expert,
+                            &input_host,
+                            route_plan.entries(),
+                            &route_indices,
+                        )
                     },
                 )?;
+                ensure!(
+                    out.len() == route_indices.len() * self.config.hidden_size,
+                    "host-staged expert output len mismatch: got {}, expected {}",
+                    out.len(),
+                    route_indices.len() * self.config.hidden_size
+                );
+                let group_index = group_outputs.len();
+                for (group_row, route_index) in route_indices.into_iter().enumerate() {
+                    ensure!(
+                        route_locations[route_index]
+                            .replace((group_index, group_row))
+                            .is_none(),
+                        "host-staged route {route_index} was assigned more than once"
+                    );
+                }
+                group_outputs.push(out);
             }
+        }
+
+        let mut rank0_contrib = vec![0.0f32; input.seq_len * self.config.hidden_size];
+        let mut rank1_contrib = vec![0.0f32; rank0_contrib.len()];
+        for (route_index, route) in route_plan.entries().iter().enumerate() {
+            let dst = if route.owner_rank == 0 {
+                &mut rank0_contrib
+            } else {
+                &mut rank1_contrib
+            };
+            let (group_index, group_row) = route_locations[route_index].with_context(|| {
+                format!("missing host-staged expert output for route {route_index}")
+            })?;
+            let begin = group_row * self.config.hidden_size;
+            let end = begin + self.config.hidden_size;
+            let out = &group_outputs[group_index][begin..end];
+            attribution.record_result(
+                phase,
+                "host_staged_combine_accumulate",
+                || format!("layer.{layer_idx}.host_staged.combine_accumulate"),
+                Some(layer_idx),
+                token_index,
+                || accumulate_host_staged_route_output(dst, route, out, self.config.hidden_size),
+            )?;
         }
         let routed_accum: Vec<_> = rank0_contrib
             .into_iter()
@@ -246,7 +398,11 @@ impl DeepSeekV2LiteEp2Generator {
             token_index,
             || ops::add_batch(&self.rank0.ctx, &routed, &shared),
         )?;
-        Ok((hidden, local_routes, remote_routes))
+        Ok((
+            hidden,
+            route_plan.local_routes(),
+            route_plan.remote_routes(),
+        ))
     }
 
     fn moe_forward_nccl(
@@ -261,17 +417,29 @@ impl DeepSeekV2LiteEp2Generator {
         shared_per_token_gemm: bool,
     ) -> Result<(HiddenStates, usize, usize)> {
         activate(&self.rank0.ctx)?;
+        let host_router = rollback_enabled(&NCCL_HOST_ROUTER)?;
+        let route_section = if host_router {
+            "ep_route_host"
+        } else {
+            "ep_route_device"
+        };
         let route_plan = attribution.record_result(
             phase,
-            "ep_route_host",
+            route_section,
             || format!("layer.{layer_idx}.nccl.route"),
             Some(layer_idx),
             token_index,
             || {
-                let input_host = hidden_to_bf16(&self.rank0.ctx, input)?;
-                let route_logits_host = gate_logits_host(&self.config, &input_host, &moe.gate_host);
-                let routes = topk_softmax_routes(&self.config, &route_logits_host, input.seq_len);
-                MoeRoutePlan::from_topk_routes(&routes, &self.rank0.layout)
+                if host_router {
+                    let input_host = hidden_to_bf16(&self.rank0.ctx, input)?;
+                    let route_logits_host =
+                        gate_logits_host(&self.config, &input_host, &moe.gate_host);
+                    let routes =
+                        topk_softmax_routes(&self.config, &route_logits_host, input.seq_len);
+                    MoeRoutePlan::from_topk_routes(&routes, &self.rank0.layout)
+                } else {
+                    self.build_nccl_route_plan_device(input, &moe.gate_device)
+                }
             },
         )?;
 
@@ -362,6 +530,24 @@ impl DeepSeekV2LiteEp2Generator {
             route_plan.local_routes(),
             route_plan.remote_routes(),
         ))
+    }
+
+    fn build_nccl_route_plan_device(
+        &self,
+        input: &HiddenStates,
+        gate_device: &openinfer_core::tensor::DeviceMatrix,
+    ) -> Result<MoeRoutePlan> {
+        activate(&self.rank0.ctx)?;
+        let logits_elems = input
+            .seq_len
+            .checked_mul(self.config.n_routed_experts)
+            .context("NCCL device router logits element count overflow")?;
+        let mut route_logits = self.rank0.ctx.stream.alloc_zeros::<f32>(logits_elems)?;
+        dsv2_lite_router_logits_into(&self.rank0.ctx, input, gate_device, &mut route_logits)?;
+        let route_logits = self.rank0.ctx.stream.clone_dtoh(&route_logits)?;
+        self.rank0.ctx.sync()?;
+        let routes = topk_softmax_routes(&self.config, &route_logits, input.seq_len);
+        MoeRoutePlan::from_topk_routes(&routes, &self.rank0.layout)
     }
 
     pub(super) fn moe_forward_nccl_fixed_topology_preallocated_into(
@@ -464,12 +650,60 @@ impl DeepSeekV2LiteEp2Generator {
         ops::add_batch_into(&self.rank0.ctx, &scratch.routed, &scratch.shared.out, out)
     }
 
-    fn expert_forward_host(
+    fn expert_forward_host_batch(
+        &self,
+        layer_idx: usize,
+        global_expert: usize,
+        input_host: &[bf16],
+        route_work: &[MoeRouteEntry],
+        route_indices: &[usize],
+    ) -> Result<Vec<f32>> {
+        let owner_rank = self.rank0.layout.owner_rank(global_expert)?;
+        let (ctx, expert) = match owner_rank {
+            0 => (
+                &self.rank0.ctx,
+                self.rank0.routed_expert(layer_idx, global_expert)?,
+            ),
+            1 => (
+                &self.rank1.ctx,
+                self.rank1.routed_expert(layer_idx, global_expert)?,
+            ),
+            other => bail!("routed expert {global_expert} maps to unsupported EP rank {other}"),
+        };
+
+        ensure!(
+            !route_indices.is_empty(),
+            "host-staged expert batch requires at least one route"
+        );
+        let mut batch_input = Vec::with_capacity(route_indices.len() * self.config.hidden_size);
+        for &route_index in route_indices {
+            let route = &route_work[route_index];
+            ensure!(
+                route.global_expert == global_expert && route.owner_rank == owner_rank,
+                "host-staged expert batch mixed route: expected expert {global_expert}/rank {owner_rank}, got expert {}/rank {}",
+                route.global_expert,
+                route.owner_rank
+            );
+            let begin = route.token * self.config.hidden_size;
+            let end = begin + self.config.hidden_size;
+            batch_input.extend_from_slice(&input_host[begin..end]);
+        }
+        let input = hidden_from_bf16_host(
+            ctx,
+            &batch_input,
+            self.config.hidden_size,
+            route_indices.len(),
+        )?;
+        let out = dense_mlp_forward_per_token(ctx, &expert.dense, &input)?;
+        hidden_to_f32(ctx, &out)
+    }
+
+    fn expert_forward_host_token(
         &self,
         layer_idx: usize,
         global_expert: usize,
         token_input: &[bf16],
-    ) -> Result<(Vec<f32>, bool)> {
+    ) -> Result<Vec<f32>> {
         let owner_rank = self.rank0.layout.owner_rank(global_expert)?;
         let (ctx, expert) = match owner_rank {
             0 => (
@@ -485,7 +719,7 @@ impl DeepSeekV2LiteEp2Generator {
 
         let input = hidden_from_bf16_host(ctx, token_input, self.config.hidden_size, 1)?;
         let out = dense_mlp_forward(ctx, &expert.dense, &input)?;
-        Ok((hidden_to_f32(ctx, &out)?, owner_rank != 0))
+        hidden_to_f32(ctx, &out)
     }
 
     fn replay_nccl_route_plan(
@@ -498,7 +732,42 @@ impl DeepSeekV2LiteEp2Generator {
         attribution: &mut DecodeAttributionProfile,
         phase: &'static str,
         token_index: Option<usize>,
-    ) -> Result<Vec<HiddenStates>> {
+    ) -> Result<NcclRouteReplayBuffers> {
+        if rollback_enabled(&NCCL_SERIAL)? {
+            return self.replay_nccl_route_plan_serial(
+                nccl,
+                layer_idx,
+                input,
+                rank1_hidden,
+                route_plan,
+                attribution,
+                phase,
+                token_index,
+            );
+        }
+        self.replay_nccl_route_plan_grouped(
+            nccl,
+            layer_idx,
+            input,
+            rank1_hidden,
+            route_plan,
+            attribution,
+            phase,
+            token_index,
+        )
+    }
+
+    fn replay_nccl_route_plan_serial(
+        &self,
+        nccl: &NaiveNcclEp2Backend,
+        layer_idx: usize,
+        input: &HiddenStates,
+        rank1_hidden: HiddenStatesRef<'_>,
+        route_plan: &MoeRoutePlan,
+        attribution: &mut DecodeAttributionProfile,
+        phase: &'static str,
+        token_index: Option<usize>,
+    ) -> Result<NcclRouteReplayBuffers> {
         let mut live_expert_outputs = Vec::with_capacity(route_plan.route_count());
         for route in route_plan.entries() {
             let out = self.forward_nccl_route(
@@ -526,10 +795,11 @@ impl DeepSeekV2LiteEp2Generator {
                 Some(layer_idx),
                 token_index,
                 || {
-                    nccl.accumulate_device_contribution(
+                    nccl.accumulate_device_contribution_row(
                         route.owner_rank,
                         expert_ctx,
                         &out,
+                        0,
                         route.token,
                         input.seq_len,
                         route.weight,
@@ -538,7 +808,115 @@ impl DeepSeekV2LiteEp2Generator {
             )?;
             live_expert_outputs.push(out);
         }
-        Ok(live_expert_outputs)
+        Ok(NcclRouteReplayBuffers {
+            _inputs: Vec::new(),
+            _outputs: live_expert_outputs,
+        })
+    }
+
+    fn replay_nccl_route_plan_grouped(
+        &self,
+        nccl: &NaiveNcclEp2Backend,
+        layer_idx: usize,
+        input: &HiddenStates,
+        rank1_hidden: HiddenStatesRef<'_>,
+        route_plan: &MoeRoutePlan,
+        attribution: &mut DecodeAttributionProfile,
+        phase: &'static str,
+        token_index: Option<usize>,
+    ) -> Result<NcclRouteReplayBuffers> {
+        let route_groups = group_route_indices(
+            route_plan
+                .entries()
+                .iter()
+                .map(|route| (route.owner_rank, route.global_expert)),
+        );
+        let mut group_inputs = Vec::with_capacity(route_groups.len());
+        let mut group_outputs = Vec::with_capacity(route_groups.len());
+        let mut route_locations = vec![None; route_plan.route_count()];
+
+        for ((owner_rank, global_expert), route_indices) in route_groups {
+            let (ctx, source_hidden, expert, section) = match owner_rank {
+                0 => (
+                    &self.rank0.ctx,
+                    input.as_ref(),
+                    self.rank0.routed_expert(layer_idx, global_expert)?,
+                    "nccl_local_expert",
+                ),
+                1 => (
+                    &self.rank1.ctx,
+                    rank1_hidden,
+                    self.rank1.routed_expert(layer_idx, global_expert)?,
+                    "nccl_remote_expert",
+                ),
+                other => {
+                    bail!("routed expert {global_expert} maps to unsupported EP rank {other}")
+                }
+            };
+            ensure!(
+                !route_indices.is_empty(),
+                "NCCL expert group requires at least one route"
+            );
+            let group_input =
+                gather_nccl_route_group(ctx, source_hidden, route_plan.entries(), &route_indices)?;
+            let group_output = attribution.record_gpu_result(
+                ctx,
+                phase,
+                section,
+                || format!("layer.{layer_idx}.nccl.expert{global_expert}"),
+                Some(layer_idx),
+                token_index,
+                || dense_mlp_forward_per_token(ctx, &expert.dense, &group_input),
+            )?;
+            let group_index = group_outputs.len();
+            for (group_row, route_index) in route_indices.into_iter().enumerate() {
+                ensure!(
+                    route_locations[route_index]
+                        .replace((group_index, group_row))
+                        .is_none(),
+                    "NCCL route {route_index} was assigned to more than one expert group"
+                );
+            }
+            group_inputs.push(group_input);
+            group_outputs.push(group_output);
+        }
+
+        for (route_index, route) in route_plan.entries().iter().enumerate() {
+            let (group_index, output_row) = route_locations[route_index]
+                .with_context(|| format!("missing NCCL expert output for route {route_index}"))?;
+            let expert_ctx = match route.owner_rank {
+                0 => &self.rank0.ctx,
+                1 => &self.rank1.ctx,
+                other => bail!(
+                    "routed expert {} maps to unsupported EP rank {other}",
+                    route.global_expert
+                ),
+            };
+            attribution.record_gpu_result(
+                expert_ctx,
+                phase,
+                "nccl_contribution_accumulate_device",
+                || format!("layer.{layer_idx}.nccl.contribution_accumulate_device"),
+                Some(layer_idx),
+                token_index,
+                || {
+                    nccl.accumulate_device_contribution_row(
+                        route.owner_rank,
+                        expert_ctx,
+                        &group_outputs[group_index],
+                        output_row,
+                        route.token,
+                        input.seq_len,
+                        route.weight,
+                    )
+                },
+            )?;
+        }
+
+        Ok(NcclRouteReplayBuffers {
+            _inputs: group_inputs,
+            _outputs: group_outputs,
+        })
     }
 
     fn forward_nccl_route(
@@ -598,6 +976,41 @@ fn expert_forward_device(
         data: token.data,
     };
     dense_mlp_forward(ctx, &expert.dense, &token_hidden)
+}
+
+fn gather_nccl_route_group(
+    ctx: &openinfer_core::tensor::DeviceContext,
+    input: HiddenStatesRef<'_>,
+    routes: &[MoeRouteEntry],
+    route_indices: &[usize],
+) -> Result<HiddenStates> {
+    ensure!(
+        !route_indices.is_empty(),
+        "NCCL route gather requires at least one route"
+    );
+    activate(ctx)?;
+    let mut gathered = HiddenStates::zeros(ctx, input.hidden_dim, route_indices.len())?;
+    for (group_row, route_index) in route_indices.iter().copied().enumerate() {
+        let route = routes
+            .get(route_index)
+            .with_context(|| format!("NCCL route index {route_index} is out of bounds"))?;
+        ensure!(
+            route.token < input.seq_len,
+            "NCCL route token {} exceeds input seq_len {}",
+            route.token,
+            input.seq_len
+        );
+        let src_begin = route.token * input.hidden_dim;
+        let dst_begin = group_row * input.hidden_dim;
+        let src = input.data.slice(src_begin..src_begin + input.hidden_dim);
+        let mut dst = gathered
+            .data
+            .slice_mut(dst_begin..dst_begin + input.hidden_dim);
+        ctx.stream
+            .memcpy_dtod(&src, &mut dst)
+            .context("gather NCCL route input row")?;
+    }
+    Ok(gathered)
 }
 
 #[cfg(test)]

@@ -8,7 +8,7 @@ These are the shared layers — frontend, runtime, kernels, ledger/simulator/tra
 
 ### In progress
 
-- **Model-owned kernel plans.** Qwen3 already carries a light `kernel_plan` mapping prefill/decode/unified phases → Rust wrappers, FFI symbols, and CUDA/Triton/cuBLAS backends. Extend the same shape to Qwen3.5 and DeepSeek V4 so each model crate is self-describing.
+- **Model-owned kernel plans.** Qwen3 already carries a light `kernel_plan` mapping prefill/decode/unified phases → Rust wrappers, FFI symbols, and CUDA/Triton/cuBLAS backends. Extend the same shape to Qwen3.5 so each model crate is self-describing.
 - **Frontend polish.** `vllm-frontend-rs` is the default OpenAI surface, talking to openinfer via a local engine-core IPC bridge. Outstanding: logprobs / prompt-logprobs translation, usage accounting, and a deliberate decision on whether the served-model-id should decouple from the tokenizer path.
 - **KV data plane (pegaflow).** First concrete tier landed: `openinfer-kv-offload::OffloadEngine` wraps in-process `pegaflow-core` as a host-tier ("L2") KV backend (mechanism), with per-model schedulers owning the residency policy (no universal connector trait — policy/mechanism split per `direction.md`). Shipped on Qwen3-4B full-attn (#316). Next candidate: Kimi-K2 MLA (layout zero-impedance, reuses the same connector pattern). SSD/RDMA tiers and DeepSeek sparse remain unrealized scope. See `subsystems/runtime/pegaflow-offload-integration.md`.
 
@@ -25,19 +25,6 @@ These are the shared layers — frontend, runtime, kernels, ledger/simulator/tra
 ## Models
 
 Each model crate owns its own scheduler, kernels, accuracy story, and benchmarks. The boundary with shared infrastructure is `openinfer-core` (runtime contract) + `openinfer-kernels` (op layer).
-
-### DeepSeek V4
-
-**Goal:** bring V4 to a serving-ready state on the GPUs we run on.
-
-**Done:** initial native MP8 engine, TileLang build-time kernels, exact E2E, OpenAI-compatible HTTP path. Decode MoE moved onto GPU AG/RS with GPU-side route compaction and grouped TileLang FP4 local experts — no route/expert D2H on the hot path.
-
-**In progress:**
-- Decode-side EP — extend the existing MoE decode path to expert-parallel rank workers.
-
-**Next:**
-- Hopper performance. Current optimization work is on consumer Blackwell (sm_120); Hopper is the next target architecture.
-- P/D and KV cache design — to be captured separately when scoped.
 
 ### Qwen3.5-4B
 

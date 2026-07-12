@@ -3,6 +3,8 @@ use cudarc::driver::sys::{CUresult, CUstream};
 
 mod flashmla_sparse;
 pub use flashmla_sparse::*;
+mod flashinfer_sparse;
+pub use flashinfer_sparse::*;
 mod sparse_mla;
 pub use sparse_mla::*;
 mod indexer;
@@ -15,6 +17,25 @@ mod deepgemm_mqa;
 pub use deepgemm_mqa::*;
 
 unsafe extern "C" {
+    pub fn glm52_vocab_parallel_pack_cuda(
+        local_values: *const Half,
+        local_indices: *const i32,
+        partial: *mut Half,
+        rows: i32,
+        rank: i32,
+        vocab_start: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn glm52_vocab_parallel_unpack_cuda(
+        gathered: *const Half,
+        values: *mut Half,
+        indices: *mut i32,
+        rows: i32,
+        ranks: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn glm52_decode_feed_launch_cuda(
         argmax_indices: *const i32,
         token_ids: *mut u32,
@@ -59,6 +80,44 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    // --- EP4 weight-only routed-expert chain (glm52_moe_ep_wo.cu) -------------
+    // `tiles` is an int2 array on the C side: pass an i32 buffer of len
+    // 2 * max_tiles (16-byte-aligned allocation bases satisfy int2 alignment).
+    pub fn glm52_moe_ep_wo_tiles_cuda(
+        psum_expert: *const i32,
+        tiles: *mut i32,
+        tile_count: *mut i32,
+        groups: i32,
+        m_capacity: i32,
+        masked_cap: i32,
+        max_tiles: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn glm52_moe_ep_wo_masked_mma_cuda(
+        activation: *const Half,
+        weight: *const u8,
+        weight_scale: *const f32,
+        tiles: *const i32,
+        tile_count: *const i32,
+        row_weights: *const f32,
+        out: *mut Half,
+        n: i32,
+        k: i32,
+        max_tiles: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn glm52_moe_ep_wo_silu_cuda(
+        input: *const Half,
+        tiles: *const i32,
+        tile_count: *const i32,
+        output: *mut Half,
+        inter: i32,
+        max_tiles: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     // --- MLA decode assembly (projections -> FlashMLA glue) -------------------
     pub fn glm52_mla_query_assemble_cuda(
         ql_nope: *const Half,
@@ -86,6 +145,25 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn glm52_mla_front_pack_fp8_cuda(
+        ql_nope: *const Half,
+        q_pe_base: *const Half,
+        q_pe_offset: i32,
+        q_pe_head_stride: i32,
+        num_q_heads: i32,
+        ckv_raw: *const Half,
+        norm_weight: *const Half,
+        eps: f32,
+        cos: *const Half,
+        sin: *const Half,
+        query: *mut u8,
+        cache: *mut u8,
+        slot_mapping: *const i64,
+        max_slots: i64,
+        tokens: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn glm52_mla_ckv_split_cuda(
         ckv: *const Half,
         kv_c: *mut Half,
@@ -106,6 +184,16 @@ unsafe extern "C" {
 
     // --- FP8 per-token-group quant (shared by MLA cache, MoE, dense) ----------
     pub fn glm52_fp8_per_token_group_quant_bf16_cuda(
+        input: *const Half,
+        output: *mut u8,
+        scales: *mut f32,
+        rows: i32,
+        hidden_dim: i32,
+        group_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn glm52_fp8_per_token_group_quant_bf16_ue8m0_cuda(
         input: *const Half,
         output: *mut u8,
         scales: *mut f32,
@@ -159,6 +247,20 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn glm52_fp8_weight_only_gemv_pair_cuda(
+        activation: *const Half,
+        weight_a: *const u8,
+        weight_scale_a: *const f32,
+        out_a: *mut Half,
+        n_a: i32,
+        weight_b: *const u8,
+        weight_scale_b: *const f32,
+        out_b: *mut Half,
+        n_b: i32,
+        k: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn glm52_fp8_weight_only_gemv_batched_cuda(
         activation: *const Half,
         weight: *const u8,
@@ -179,63 +281,75 @@ unsafe extern "C" {
         inter: i32,
         stream: CUstream,
     ) -> CUresult;
-
-    // --- TP8 low-latency MoE: whole-layer cooperative kernel + LL packets ----
-    pub fn glm52_moe_tp8_max_blocks_cuda(out_blocks: *mut i32) -> CUresult;
-
-    pub fn glm52_moe_tp8_alloc_ll_cuda(
-        bytes: usize,
-        device_ordinals: *const i32,
-        n_devices: i32,
-        out_vas: *mut u64,
-    ) -> CUresult;
-
-    pub fn glm52_moe_tp8_free_ll_cuda(p: *mut std::ffi::c_void) -> CUresult;
-
-    pub fn glm52_moe_tp8_layer_launch_cuda(
-        normed2: *const Half,
-        topk_idx: *const i32,
-        topk_prob: *const f32,
-        w13: *const u8,
-        w13_scale: *const f32,
-        w2: *const u8,
-        w2_scale: *const f32,
-        mlp_out: *mut Half,
-        guidx: *mut i32,
-        guprob: *mut f32,
-        gucnt: *mut i32,
-        gused: *mut i32,
-        bpart: *mut f32,
-        ug: *mut Half,
-        cpart: *mut f32,
-        rs_local: *mut std::ffi::c_void,
-        peer_rs: *const *const std::ffi::c_void,
-        epoch_dev: *mut u64,
-        active_rows: *const i32,
-        layer_slot: i32,
-        nranks: i32,
-        myrank: i32,
-        grid_blocks: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn glm52_moe_tp8_epoch_advance_cuda(
-        epoch_dev: *mut std::ffi::c_void,
-        stream: CUstream,
-    ) -> CUresult;
-
-    // --- TP8 attention allreduce: o_proj/dense-down epilogue collective -----
-    pub fn glm52_tp8_ar_launch_cuda(
-        partial: *const Half,
-        out: *mut Half,
-        ar_local: *mut std::ffi::c_void,
-        peer_ar: *const *const std::ffi::c_void,
-        epoch_dev: *const u64,
-        active_rows: *const i32,
-        layer_slot: i32,
-        rows: i32,
-        nranks: i32,
-        myrank: i32,
-        stream: CUstream,
-    ) -> CUresult;
 }
+
+macro_rules! declare_tp_ffi {
+    ($max_blocks:ident, $alloc_ll:ident, $free_ll:ident, $layer:ident, $epoch:ident, $ar:ident) => {
+        unsafe extern "C" {
+            pub fn $max_blocks(out_blocks: *mut i32) -> CUresult;
+            pub fn $alloc_ll(
+                bytes: usize,
+                device_ordinals: *const i32,
+                n_devices: i32,
+                out_vas: *mut u64,
+            ) -> CUresult;
+            pub fn $free_ll(p: *mut std::ffi::c_void) -> CUresult;
+            pub fn $layer(
+                normed2: *const Half,
+                topk_idx: *const i32,
+                topk_prob: *const f32,
+                w13: *const u8,
+                w13_scale: *const f32,
+                w2: *const u8,
+                w2_scale: *const f32,
+                mlp_out: *mut Half,
+                guidx: *mut i32,
+                guprob: *mut f32,
+                gucnt: *mut i32,
+                gused: *mut i32,
+                ug: *mut Half,
+                cpart: *mut f32,
+                rs_local: *mut std::ffi::c_void,
+                peer_rs: *const *const std::ffi::c_void,
+                epoch_dev: *mut u64,
+                active_rows: *const i32,
+                layer_slot: i32,
+                nranks: i32,
+                myrank: i32,
+                grid_blocks: i32,
+                stream: CUstream,
+            ) -> CUresult;
+            pub fn $epoch(epoch_dev: *mut std::ffi::c_void, stream: CUstream) -> CUresult;
+            pub fn $ar(
+                partial: *const Half,
+                out: *mut Half,
+                ar_local: *mut std::ffi::c_void,
+                peer_ar: *const *const std::ffi::c_void,
+                epoch_dev: *const u64,
+                active_rows: *const i32,
+                layer_slot: i32,
+                rows: i32,
+                nranks: i32,
+                myrank: i32,
+                stream: CUstream,
+            ) -> CUresult;
+        }
+    };
+}
+
+declare_tp_ffi!(
+    glm52_moe_tp4_max_blocks_cuda,
+    glm52_moe_tp4_alloc_ll_cuda,
+    glm52_moe_tp4_free_ll_cuda,
+    glm52_moe_tp4_layer_launch_cuda,
+    glm52_moe_tp4_epoch_advance_cuda,
+    glm52_tp4_ar_launch_cuda
+);
+declare_tp_ffi!(
+    glm52_moe_tp8_max_blocks_cuda,
+    glm52_moe_tp8_alloc_ll_cuda,
+    glm52_moe_tp8_free_ll_cuda,
+    glm52_moe_tp8_layer_launch_cuda,
+    glm52_moe_tp8_epoch_advance_cuda,
+    glm52_tp8_ar_launch_cuda
+);

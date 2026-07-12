@@ -3,6 +3,7 @@
 use anyhow::Result;
 
 use cudarc::driver::CudaSlice;
+use log::info;
 
 use openinfer_core::cuda_graph::CudaGraphState;
 use openinfer_core::tensor::{DeviceContext, HiddenStates};
@@ -85,7 +86,12 @@ pub(crate) fn warmup_decode_projection_pins(
     vocab: usize,
 ) -> Result<()> {
     for (m, k) in decode_projection_pin_shapes(hidden, q_dim, kv_dim, intermediate, vocab) {
-        gemm_lt_pin_warmup(m, k)?;
+        let config = gemm_lt_pin_warmup(m, k)?;
+        info!(
+            "Qwen3 GEMM pin: m={m}, k={k}, splitk={}, reduction_scheme={}",
+            config.splitk,
+            config.reduction_scheme_name()
+        );
     }
     Ok(())
 }

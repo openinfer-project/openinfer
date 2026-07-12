@@ -157,6 +157,25 @@ def quant_dequant_groups(x: torch.Tensor) -> torch.Tensor:
     return dq.reshape(shape).to(orig_dtype)
 
 
+def quant_dequant_groups_ue8m0(x: torch.Tensor) -> torch.Tensor:
+    """Per-128-group fp8 e4m3 quant->dequant with the scale rounded UP to the
+    next power of two — the engine's fp8_ds_mla KV-cache contract (the FlashMLA
+    sm100 kernel truncates stored f32 scales to e8m0 for its block-scaled MMA,
+    so the cache writer keeps them exact powers of two; upstream FlashMLA
+    tests/quant.py does the same). frexp keeps the pow2 rounding exact — no
+    log2 float hazard."""
+    orig_dtype = x.dtype
+    xf = x.to(torch.float32)
+    shape = xf.shape
+    assert shape[-1] % FP8_GROUP == 0, f"width {shape[-1]} not a multiple of {FP8_GROUP}"
+    g = xf.reshape(-1, shape[-1] // FP8_GROUP, FP8_GROUP)
+    scale = g.abs().amax(dim=-1, keepdim=True).clamp(min=1e-10) / E4M3_MAX
+    m, e = torch.frexp(scale)  # scale = m * 2^e, m in [0.5, 1)
+    scale = torch.where(m == 0.5, scale, torch.exp2(e.to(torch.float32)))
+    dq = (g / scale).to(torch.float8_e4m3fn).to(torch.float32) * scale
+    return dq.reshape(shape).to(orig_dtype)
+
+
 class Fp8SimLinear(torch.nn.Module):
     """Engine fp8 GEMM precision emulation: quant-dequant the activation per
     128-group, f32 matmul against the block-dequantized weight, bf16 out."""
@@ -294,11 +313,19 @@ def build_attention(ckpt: Checkpoint, config, layer: int, precision: str, fault:
 
 
 class Fp8SimExperts(torch.nn.Module):
-    """Routed-experts forward with the engine's fp8 precision regime: the token
-    activation is quant-dequanted per 128-group before the gate|up GEMM, and the
-    SwiGLU product before the down GEMM (the engine's W2-input re-quant; the
-    route weight commutes with the per-group dynamic scale, so applying it after
-    down as the official code does is equivalent up to f32 scale rounding).
+    """Routed-experts forward with the engine's precision regime. In `fp8sim`
+    (the EP8 DeepGEMM chain) the token activation is quant-dequanted per
+    128-group before the gate|up GEMM, and the SwiGLU product before the down
+    GEMM (the engine's W2-input re-quant; the route weight commutes with the
+    per-group dynamic scale, so applying it after down as the official code
+    does is equivalent up to f32 scale rounding). In `gemv` (the EP4
+    weight-only chain) activations are never quantized: bf16 rows feed the
+    GEMM directly, the gate|up GEMM output is rounded to bf16 (the engine's
+    W13 store — nothing absorbs that rounding here, unlike fp8sim where the
+    e4m3 prod quant dominates it), and the SwiGLU product is rounded to bf16
+    (the engine's bf16 store between W13 and W2); the engine applies the
+    route weight to the f32 W2 output before its bf16 store, matching the
+    post-down application below.
 
     The loop itself mirrors `GlmMoeDsaExperts.forward` (transport, no new math).
     Expert weights are block-dequanted lazily per hit expert and cached WITHOUT
@@ -334,7 +361,7 @@ class Fp8SimExperts(torch.nn.Module):
 
     def forward(self, hidden_states, top_k_index, top_k_weights):
         final = torch.zeros_like(hidden_states)
-        if self.precision in ("fp8sim", "gemv"):
+        if self.precision == "fp8sim":
             hidden_states = quant_dequant_groups(hidden_states)
         act = hidden_states.to(torch.float32)
         expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
@@ -343,9 +370,18 @@ class Fp8SimExperts(torch.nn.Module):
             gate_up, down = self._expert(expert_idx)
             top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
             gate, up = torch.nn.functional.linear(act[token_idx], gate_up).chunk(2, dim=-1)
+            if self.precision == "gemv":
+                # The weight-only engine stores the W13 output as bf16 before
+                # the SiLU kernel reads it.
+                gate = gate.to(torch.bfloat16).to(torch.float32)
+                up = up.to(torch.bfloat16).to(torch.float32)
             prod = torch.nn.functional.silu(gate) * up
-            if self.precision in ("fp8sim", "gemv"):
+            if self.precision == "fp8sim":
                 prod = quant_dequant_groups(prod.to(torch.bfloat16)).to(torch.float32)
+            elif self.precision == "gemv":
+                # The weight-only engine stores the SwiGLU product as bf16
+                # between W13 and W2 — no quant.
+                prod = prod.to(torch.bfloat16).to(torch.float32)
             out = torch.nn.functional.linear(prod, down)
             out = out * top_k_weights[token_idx, top_k_pos, None].to(torch.float32)
             final.index_add_(0, token_idx, out.to(final.dtype))
@@ -426,10 +462,11 @@ def run(attn, config, hidden: torch.Tensor, precision: str, fault: str) -> dict[
 
     def kv_c_hook(_mod, _args, out):
         # Engine cache fidelity: kv_c lives in the paged cache as fp8 per-128
-        # group; everything downstream (kv_b decompress -> K/V) must see the
-        # quantized value, exactly like FlashMLA reading the cache.
+        # group with UE8M0 (power-of-two) scales; everything downstream (kv_b
+        # decompress -> K/V) must see the quantized value, exactly like
+        # FlashMLA reading the cache.
         if precision in ("fp8sim", "gemv"):
-            out = quant_dequant_groups(out)
+            out = quant_dequant_groups_ue8m0(out)
         taps["kv_c_cached"] = out.detach().squeeze(0)
         return out
 
@@ -451,7 +488,7 @@ def run(attn, config, hidden: torch.Tensor, precision: str, fault: str) -> dict[
     return taps
 
 
-def run_layer(dl, config, hidden: torch.Tensor, fault: str) -> dict[str, torch.Tensor]:
+def run_layer(dl, config, hidden: torch.Tensor, precision: str, fault: str) -> dict[str, torch.Tensor]:
     """Full decoder-layer forward (norms + attention + residuals + MLP/MoE)."""
     from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import (
         GlmMoeDsaMoE,
@@ -469,6 +506,17 @@ def run_layer(dl, config, hidden: torch.Tensor, fault: str) -> dict[str, torch.T
         cos, sin = sin, cos
         print("// !!! FAULT INJECTED: cos/sin swapped — DO NOT COMMIT", file=sys.stderr)
     taps["cos"], taps["sin"] = cos.squeeze(0), sin.squeeze(0)
+
+    # Engine cache fidelity, same as `run`: kv_c lives in the paged cache as
+    # fp8 per-128-group with UE8M0 scales. (Historically the layer stage
+    # skipped this; the effect sat just under the layer tolerance but is a
+    # systematic engine-vs-oracle bias — model it.)
+    def kv_c_cache_hook(_mod, _args, out):
+        if precision in ("fp8sim", "gemv"):
+            out = quant_dequant_groups_ue8m0(out)
+        return out
+
+    dl.self_attn.kv_a_layernorm.register_forward_hook(kv_c_cache_hook)
 
     if isinstance(dl.mlp, GlmMoeDsaMoE):
         def gate_hook(_mod, _args, out):
@@ -748,7 +796,7 @@ def main() -> int:
 
     if args.stage == "layer":
         dl = build_decoder_layer(ckpt, config, args.layer, args.precision, args.inject_fault)
-        taps = run_layer(dl, config, hidden, args.inject_fault)
+        taps = run_layer(dl, config, hidden, args.precision, args.inject_fault)
     elif args.stage == "bookend":
         taps = run_bookend(ckpt, config, hidden, args.seed)
     else:

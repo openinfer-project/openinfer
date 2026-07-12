@@ -223,7 +223,7 @@ pub trait PhysicalBackend {
 #### FullAttentionBackend
 
 ```rust
-/// Full attention (Qwen3, DSv4 dense layers, Qwen3.5 的 8 个 attn 层)。
+/// Full attention (Qwen3, Qwen3.5 的 8 个 attn 层)。
 /// 单 buffer，page-first layout：
 ///   block_i: [L0_K | L0_V | L1_K | L1_V | ...]
 pub struct FullAttentionBackend {
@@ -238,7 +238,7 @@ pub struct FullAttentionBackend {
 #### MlaBackend
 
 ```rust
-/// MLA (K2, DSv4 attention)。
+/// MLA (K2 attention)。
 /// 双 buffer + 共享 block index。
 ///   ckv_buffer: block_i → [L0(block_size × compressed_dim) | L1 | ...]
 ///   kpe_buffer: block_i → [L0(block_size × rope_dim) | L1 | ...]
@@ -414,12 +414,6 @@ bs=64, avg 4K tokens/req → 256 blocks/req → 16,384 blocks → 19% utilizatio
 bs=64, avg 16K tokens/req → 1,000 blocks/req → 64,000 blocks → 75% utilization
 ```
 
-## 和现有设计文档的关系
-
-`models/deepseek-v4/prefix-paged-kv-pd-handoff.md` 定义了 `KvLease` / `KvPageAllocator` / `KvExportHandle` 等 DSv4 特定的 prefix + P-D handoff 合约。
-
-本文档的 `BlockManager` + `PhysicalBackend` 是那份合约的基础设施层。DSv4 的 `KvPageAllocator` 可以在 `BlockManager` 之上实现——`BlockManager` 管 block 分配，DSv4 adapter 管 sliding window / compressor / indexer 的 per-layer row 映射。两份文档不冲突。
-
 ## 已落地代码
 
 ### `openinfer-block-manager` crate
@@ -486,6 +480,5 @@ K2 DP mode 每个 rank 独立 `BlockManager`。Load balancer 基于 `free_blocks
 
 ## 待讨论
 
-1. **block_size**: 16（FlashInfer 推荐，K2 和 Qwen3 已用）。DSv4 待验证。
+1. **block_size**: 16（FlashInfer 推荐，K2 和 Qwen3 已用）。
 2. **Inactive 池的 eviction policy**: 将来 prefix cache 需要时选择。候选：LRU（vLLM）、TinyLFU（pegaflow）、LFU（Dynamo）。不在本轮 scope。
-3. **DSv4 集成时机**: DSv4 的 per-layer 异构布局（sliding window + compressor + indexer）在 `PhysicalBackend` 层面需要第三种 backend。可以延后，先跑 K2 和 Qwen3。

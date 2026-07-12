@@ -146,7 +146,6 @@ fn qwen3_lora_loads_rank_and_generates(rank: usize, adapter_name: &str) {
         Path::new(&model_path),
         EngineLoadOptions {
             enable_cuda_graph: false,
-            enable_prefill_profile: false,
             device_ordinals: vec![get_device_ordinal()],
             seed: 42,
             ..EngineLoadOptions::default()

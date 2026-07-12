@@ -5,7 +5,8 @@ use anyhow::{Result, ensure};
 use cudarc::driver::CudaSlice;
 use half::bf16;
 use openinfer_kernels::ops::{
-    Glm52RouterBatch, Glm52RouterConfig, Glm52RouterOutput, glm52_router_noaux_tc_launch,
+    GLM52_TP_TOKENS, Glm52RouterBatch, Glm52RouterConfig, Glm52RouterOutput,
+    glm52_router_noaux_tc_launch,
 };
 use openinfer_kernels::tensor::DeviceContext;
 
@@ -209,15 +210,24 @@ impl Glm52MoeExpertBank {
         )
     }
 
-    /// Adopt one layer's loader-packed regions (this rank's 32 local experts)
-    /// — a pure retype, no copies. The loader wrote the regions in exactly
-    /// the `from_host` packing (proven by `expert_placement_matches_from_host_packing`).
+    /// Adopt one layer's loader-packed regions (this rank's local experts —
+    /// 32 for EP8, 64 for EP4) — a pure retype, no copies. The loader wrote
+    /// the regions in exactly the `from_host` packing (proven by
+    /// `expert_placement_matches_from_host_packing`); the expert count is
+    /// read back from the region size so bank and loader can never drift.
     pub(crate) fn from_regions(
         ctx: &DeviceContext,
         regions: crate::weights::Glm52ExpertLayerRegions,
     ) -> Result<Self> {
+        let stride = crate::weights::Glm52ExpertRegionKind::W13Weight.expert_stride();
+        ensure!(
+            regions.w13_weight.len().is_multiple_of(stride),
+            "GLM5.2 expert region size {} is not a whole number of experts",
+            regions.w13_weight.len()
+        );
+        let n_experts = regions.w13_weight.len() / stride;
         Self::new(
-            crate::weights::GLM52_LOCAL_EXPERTS,
+            n_experts,
             regions.w13_weight,
             crate::weights::retype_owned::<f32>(&ctx.stream, regions.w13_scale)?,
             regions.w2_weight,
@@ -250,12 +260,16 @@ pub(crate) struct Glm52RouterScratch {
 impl Glm52RouterScratch {
     pub(crate) fn new(ctx: &DeviceContext, tokens: usize) -> Result<Self> {
         ensure!(tokens > 0, "GLM5.2 router scratch needs positive tokens");
+        // TP MoE keeps an eight-row ABI even when TP4's surrounding decode
+        // graph uses a smaller bucket. Only `tokens` rows are launched; the
+        // spare route capacity is padding storage for that fixed ABI.
+        let capacity = tokens.max(GLM52_TP_TOKENS);
         Ok(Self {
             tokens,
-            logits: ctx.stream.alloc_zeros::<f32>(tokens * EXPERTS)?,
+            logits: ctx.stream.alloc_zeros::<f32>(capacity * EXPERTS)?,
             route: RoutedTopk {
-                topk_idx: ctx.stream.alloc_zeros::<i32>(tokens * TOPK)?,
-                topk_weight: ctx.stream.alloc_zeros::<f32>(tokens * TOPK)?,
+                topk_idx: ctx.stream.alloc_zeros::<i32>(capacity * TOPK)?,
+                topk_weight: ctx.stream.alloc_zeros::<f32>(capacity * TOPK)?,
             },
         })
     }

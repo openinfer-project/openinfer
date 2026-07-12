@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import ctypes
 import hashlib
 import http.client
 import json
@@ -43,6 +44,7 @@ CLAIM_CORRECTNESS = "correctness"
 CLAIM_DIRECT = "direct_diagnostic_batch"
 CLAIM_HTTP = "http_pressure"
 CLAIM_FAILED = "failed_setup"
+HTTP_METADATA_PREFIX = "openinfer_contract_"
 
 
 @dataclass(frozen=True)
@@ -176,6 +178,130 @@ def try_command(cmd: list[str], timeout_s: float = 15.0) -> dict[str, Any]:
     }
 
 
+def decode_nccl_version_code(version_code: int) -> dict[str, Any] | None:
+    if isinstance(version_code, bool) or not isinstance(version_code, int) or version_code <= 0:
+        return None
+    scale = 1000 if version_code < 10000 else 10000
+    major = version_code // scale
+    minor = (version_code % scale) // 100
+    patch = version_code % 100
+    return {"version_code": version_code, "version": f"{major}.{minor}.{patch}"}
+
+
+def nccl_version_from_library(library_name: str) -> dict[str, Any]:
+    try:
+        library = ctypes.CDLL(library_name)
+    except OSError as exc:
+        return {"library": library_name, "available": False, "error": redact_text(str(exc))}
+    try:
+        get_version = library.ncclGetVersion
+        get_version.argtypes = [ctypes.POINTER(ctypes.c_int)]
+        get_version.restype = ctypes.c_int
+        version_code = ctypes.c_int()
+        exit_code = int(get_version(ctypes.byref(version_code)))
+    except Exception as exc:  # noqa: BLE001 - metadata probe should not fail the benchmark.
+        return {
+            "library": library_name,
+            "available": True,
+            "exit_code": 1,
+            "error": redact_text(str(exc)),
+        }
+    result: dict[str, Any] = {"library": library_name, "available": True, "exit_code": exit_code}
+    if exit_code != 0:
+        return result
+    decoded = decode_nccl_version_code(version_code.value)
+    if decoded is None:
+        result["error"] = f"invalid NCCL version code: {version_code.value}"
+        return result
+    result.update(decoded)
+    return result
+
+
+def mapped_nccl_libraries(maps_text: str) -> list[str]:
+    libraries = []
+    seen = set()
+    for line in maps_text.splitlines():
+        parts = line.split(maxsplit=5)
+        if len(parts) < 6:
+            continue
+        mapped_path = parts[5].removesuffix(" (deleted)")
+        if not Path(mapped_path).name.startswith("libnccl.so"):
+            continue
+        if mapped_path not in seen:
+            libraries.append(mapped_path)
+            seen.add(mapped_path)
+    return libraries
+
+
+def process_group_pids(pid: int, proc_root: Path = Path("/proc")) -> tuple[int, list[int]]:
+    process_group_id = os.getpgid(pid)
+    members = []
+    for candidate in proc_root.iterdir():
+        if not candidate.name.isdigit():
+            continue
+        candidate_pid = int(candidate.name)
+        try:
+            if os.getpgid(candidate_pid) == process_group_id:
+                members.append(candidate_pid)
+        except (OSError, ProcessLookupError):
+            continue
+    return process_group_id, sorted(set(members))
+
+
+def process_nccl_runtime(pid: int, proc_root: Path = Path("/proc")) -> dict[str, Any]:
+    try:
+        process_group_id, pids = process_group_pids(pid, proc_root)
+    except Exception as exc:  # noqa: BLE001 - metadata probe should not fail benchmark execution.
+        return {
+            "source": "server_process_group_maps",
+            "available": False,
+            "error": redact_text(str(exc)),
+        }
+
+    libraries: list[str] = []
+    map_errors: list[dict[str, Any]] = []
+    mapped_pids: list[int] = []
+    for member_pid in pids:
+        maps_path = proc_root / str(member_pid) / "maps"
+        try:
+            text = maps_path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            map_errors.append({"pid": member_pid, "error": redact_text(str(exc))})
+            continue
+        mapped = mapped_nccl_libraries(text)
+        if mapped:
+            mapped_pids.append(member_pid)
+            libraries.extend(mapped)
+
+    unique_libraries = sorted(set(libraries))
+    base: dict[str, Any] = {
+        "source": "server_process_group_maps",
+        "process_group_id": process_group_id,
+        "process_group_pids": pids,
+        "mapped_pids": mapped_pids,
+        "mapped_library_count": len(unique_libraries),
+        "map_errors": map_errors,
+    }
+    if map_errors:
+        base["available"] = False
+        base["error"] = "expected every server process-group maps file to be readable"
+        return base
+    if len(unique_libraries) != 1:
+        base["available"] = False
+        base["error"] = f"expected exactly one NCCL library, found {len(unique_libraries)}"
+        base["libraries"] = [redact_text(library) for library in unique_libraries]
+        return base
+    probed = nccl_version_from_library(unique_libraries[0])
+    available = bool(probed.get("available") and probed.get("exit_code") == 0)
+    return {
+        **base,
+        **probed,
+        "available": available,
+        "library": Path(unique_libraries[0]).name,
+        "library_path": redact_text(unique_libraries[0]),
+    }
+
+
 def render_cmd(cmd: list[str]) -> str:
     return " ".join(shell_quote(part) for part in cmd)
 
@@ -263,6 +389,24 @@ def first_number(payload: dict[str, Any], *keys: str) -> float | None:
     return None
 
 
+def coerce_number(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    return None
+
+
+def coerce_int(value: Any) -> int | None:
+    number = coerce_number(value)
+    return None if number is None else int(number)
+
+
 def first_int(payload: dict[str, Any], *keys: str) -> int | None:
     value = first_number(payload, *keys)
     return None if value is None else int(value)
@@ -303,7 +447,12 @@ def model_snapshot(model_path: Path) -> dict[str, Any]:
     }
 
 
-def metadata(args: argparse.Namespace, *, probe_versions: bool = True) -> dict[str, Any]:
+def metadata(
+    args: argparse.Namespace,
+    *,
+    probe_versions: bool = True,
+    nccl_runtime: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     git_head = run_capture(["git", "rev-parse", "HEAD"], check=False)
     git_status = run_capture(["git", "status", "--porcelain"], check=False)
     versions: dict[str, Any] = {
@@ -351,6 +500,8 @@ def metadata(args: argparse.Namespace, *, probe_versions: bool = True) -> dict[s
                 "vllm": {"command": redact_command([args.vllm_cmd, "--version"])},
             }
         )
+    if nccl_runtime is not None:
+        versions["nccl_runtime"] = redact_payload(nccl_runtime)
     return {
         "schema_version": 1,
         "created_unix_s": unix_s(),
@@ -538,6 +689,179 @@ def trace_missing_count(trace: Any) -> int | None:
     return int(value) if isinstance(value, (int, float)) else None
 
 
+def trace_summary_for_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    trace = payload.get("server_trace", {})
+    workload = payload.get("workload", {})
+    requests = payload.get("requests", [])
+    phases = trace.get("phases_ms", {}) if isinstance(trace, dict) else {}
+    if not isinstance(phases, dict):
+        phases = {}
+    output_hash_count = sum(
+        isinstance(request, dict)
+        and isinstance(request.get("output_hash"), str)
+        and bool(request["output_hash"])
+        for request in requests
+    ) if isinstance(requests, list) else 0
+    return {
+        "trace": trace,
+        "workload": workload if isinstance(workload, dict) else {},
+        "num_requests": workload.get("num_requests") if isinstance(workload, dict) else None,
+        "traced_requests": trace.get("traced_requests") if isinstance(trace, dict) else None,
+        "missing_trace_count": trace_missing_count(trace),
+        "output_hash_count": output_hash_count,
+        "prompt_tokens": trace.get("prompt_tokens") if isinstance(trace, dict) else None,
+        "completion_tokens": trace.get("completion_tokens") if isinstance(trace, dict) else None,
+        "active_set_size_max": trace.get("active_set_size_max") if isinstance(trace, dict) else None,
+        "decode_batch_size_max": trace.get("decode_batch_size_max") if isinstance(trace, dict) else None,
+        "decode_steps": trace.get("decode_steps") if isinstance(trace, dict) else None,
+        "phase_ms": {
+            "queue_wait": phases.get("queue_wait_ms"),
+            "prefill": phases.get("prefill_ms"),
+            "first_decode": phases.get("first_decode_ms"),
+            "decode_mean": phases.get("decode_mean_ms"),
+            "decode_total": phases.get("decode_total_ms"),
+            "scheduled_to_first_token": phases.get("scheduled_to_first_token_ms"),
+            "scheduled_to_terminal": phases.get("scheduled_to_terminal_ms"),
+            "stream_flush": phases.get("stream_flush_ms"),
+        },
+    }
+
+
+def trace_cell_errors(
+    cell: dict[str, Any],
+    args: argparse.Namespace,
+    concurrency: int,
+) -> list[str]:
+    expected = args.num_prompts
+    workload = cell.get("workload")
+    prompt_tokens = cell.get("prompt_tokens")
+    completion_tokens = cell.get("completion_tokens")
+    decode_steps = cell.get("decode_steps")
+    phase_ms = cell.get("phase_ms")
+    errors = []
+    expected_workload = {
+        "num_requests": expected,
+        "concurrency": concurrency,
+        "warmup": 0,
+        "prompt_words": args.input_len,
+        "max_tokens": args.output_len,
+        "temperature": args.temperature,
+        "ignore_eos": args.ignore_eos,
+    }
+    if not isinstance(workload, dict) or any(
+        workload.get(key) != value for key, value in expected_workload.items()
+    ):
+        errors.append("workload mismatch")
+    if cell.get("completed") != expected or cell.get("num_requests") != expected:
+        errors.append("request count mismatch")
+    if cell.get("failed") != 0 or cell.get("timeouts") != 0:
+        errors.append("request failures")
+    if cell.get("missing_trace_count") != 0 or cell.get("traced_requests") != expected:
+        errors.append("incomplete trace coverage")
+    if cell.get("output_hash_count") != expected:
+        errors.append("incomplete output hash coverage")
+    if not (
+        isinstance(prompt_tokens, dict)
+        and prompt_tokens.get("samples") == expected
+        and isinstance(prompt_tokens.get("min"), int)
+        and prompt_tokens["min"] > 0
+        and isinstance(prompt_tokens.get("max"), int)
+        and prompt_tokens["max"] >= prompt_tokens["min"]
+        and isinstance(prompt_tokens.get("total"), int)
+        and prompt_tokens["min"] * expected
+        <= prompt_tokens["total"]
+        <= prompt_tokens["max"] * expected
+    ):
+        errors.append("invalid prompt token coverage")
+    if not (
+        isinstance(completion_tokens, dict)
+        and completion_tokens.get("samples") == expected
+        and isinstance(completion_tokens.get("min"), int)
+        and completion_tokens["min"] > 0
+        and isinstance(completion_tokens.get("max"), int)
+        and completion_tokens["max"] >= completion_tokens["min"]
+        and isinstance(completion_tokens.get("total"), int)
+        and completion_tokens["min"] * expected
+        <= completion_tokens["total"]
+        <= completion_tokens["max"] * expected
+    ):
+        errors.append("invalid completion token coverage")
+    elif args.ignore_eos and not (
+        completion_tokens["min"] == args.output_len
+        and completion_tokens["max"] == args.output_len
+        and completion_tokens["total"] == args.output_len * expected
+    ):
+        errors.append("incomplete fixed-length generation")
+    batch_attribution_valid = (
+        isinstance(cell.get("active_set_size_max"), int)
+        and cell["active_set_size_max"] > 0
+        and isinstance(cell.get("decode_batch_size_max"), int)
+        and cell["decode_batch_size_max"] > 0
+    )
+    if not batch_attribution_valid:
+        errors.append("missing active/decode batch attribution")
+    elif concurrency > 1 and (
+        cell["active_set_size_max"] <= 1 or cell["decode_batch_size_max"] <= 1
+    ):
+        errors.append("no concurrent decode batch evidence")
+    required_phases = (
+        "queue_wait",
+        "prefill",
+        "first_decode",
+        "decode_mean",
+        "decode_total",
+        "scheduled_to_first_token",
+        "scheduled_to_terminal",
+    )
+    if not isinstance(phase_ms, dict) or any(
+        not isinstance(phase_ms.get(name), dict)
+        or phase_ms[name].get("samples") != expected
+        for name in required_phases
+    ):
+        errors.append("incomplete phase attribution")
+    per_request = decode_steps.get("per_request") if isinstance(decode_steps, dict) else None
+    batched = (
+        decode_steps.get("batched_request_steps_total")
+        if isinstance(decode_steps, dict)
+        else None
+    )
+    singleton = (
+        decode_steps.get("singleton_request_steps_total")
+        if isinstance(decode_steps, dict)
+        else None
+    )
+    batched_share = (
+        decode_steps.get("request_step_batched_share")
+        if isinstance(decode_steps, dict)
+        else None
+    )
+    request_step_total = per_request.get("total") if isinstance(per_request, dict) else None
+    request_steps_valid = (
+        isinstance(per_request, dict)
+        and per_request.get("samples") == expected
+        and isinstance(per_request.get("min"), int)
+        and per_request["min"] > 0
+        and isinstance(per_request.get("max"), int)
+        and per_request["max"] >= per_request["min"]
+        and isinstance(request_step_total, int)
+        and per_request["min"] * expected
+        <= request_step_total
+        <= per_request["max"] * expected
+        and isinstance(batched, int)
+        and batched >= 0
+        and isinstance(singleton, int)
+        and singleton >= 0
+        and batched + singleton == request_step_total
+        and isinstance(batched_share, (int, float))
+        and abs(batched_share - batched / request_step_total) <= 1.0e-12
+    )
+    if not request_steps_valid:
+        errors.append("invalid request-step attribution")
+    elif concurrency > 1 and batched == 0:
+        errors.append("no batched request-step evidence")
+    return errors
+
+
 def correctness_passed(comparison: dict[str, Any]) -> bool:
     return (
         comparison.get("classification") == "all_token_text_exact"
@@ -686,6 +1010,23 @@ def engine_env(args: argparse.Namespace, spec: EngineSpec) -> dict[str, str]:
     return env
 
 
+BENCHMARK_SERVER_ENV_KEYS = (
+    "OPENINFER_DSV2_LITE_EP_BACKEND",
+    "OPENINFER_DSV2_LITE_HOST_STAGED_EXPERT_BATCH",
+    "OPENINFER_DSV2_LITE_NCCL_EXPERT_BATCH",
+    "OPENINFER_DSV2_LITE_NCCL_ROUTER",
+    "CUDA_VISIBLE_DEVICES",
+)
+
+
+def benchmark_server_env(env: dict[str, str]) -> dict[str, str]:
+    return {
+        key: env[key]
+        for key in BENCHMARK_SERVER_ENV_KEYS
+        if key in env
+    }
+
+
 def vllm_bench_command(
     args: argparse.Namespace,
     *,
@@ -711,6 +1052,13 @@ def vllm_bench_command(
         "--request-rate", str(args.request_rate),
         "--temperature", str(args.temperature),
     ]
+    for key, value in {
+        f"{HTTP_METADATA_PREFIX}input_len": args.input_len,
+        f"{HTTP_METADATA_PREFIX}output_len": args.output_len,
+        f"{HTTP_METADATA_PREFIX}temperature": args.temperature,
+        f"{HTTP_METADATA_PREFIX}ignore_eos": args.ignore_eos,
+    }.items():
+        cmd.extend(["--metadata", f"{key}={value}"])
     if args.ignore_eos:
         cmd.append("--ignore-eos")
     if result_dir is not None and result_filename is not None:
@@ -741,16 +1089,14 @@ def run_http_matrix(args: argparse.Namespace, out_dir: Path) -> list[dict[str, A
             "claim_bucket": CLAIM_HTTP,
             "server_command": redact_command(cmd),
             "server_log": display_path(log_path),
-            "server_env": {
-                key: env[key]
-                for key in ("OPENINFER_DSV2_LITE_EP_BACKEND", "CUDA_VISIBLE_DEVICES")
-                if key in env
-            },
+            "server_env": benchmark_server_env(env),
             "cells": [],
         }
         try:
             with ManagedServer(cmd, env, log_path) as server:
                 wait_for_server(server, spec, port, args.model_id, args.server_ready_timeout_s)
+                if spec.ep_backend == "nccl" and server.process is not None:
+                    engine_row["nccl_runtime"] = process_nccl_runtime(server.process.pid)
                 for concurrency in args.concurrency:
                     for repeat in range(args.repeats):
                         cell = run_http_cell(args, out_dir, spec, port, concurrency, repeat)
@@ -827,13 +1173,34 @@ def run_http_cell(
         cell.update({"exit_code": completed.returncode})
         if not result_path.exists():
             raise FileNotFoundError(f"vLLM bench result not found: {result_path}")
-        cell.update(parse_vllm_bench_artifact(load_json(result_path)))
+        cell.update(
+            parse_vllm_bench_artifact(
+                load_json(result_path),
+                expected_http_workload(args, concurrency),
+            )
+        )
     except Exception as exc:  # noqa: BLE001
         cell.update({"passed": False, "claim_bucket": CLAIM_FAILED, "error": error_text(exc)})
     return cell
 
 
-def parse_vllm_bench_artifact(payload: dict[str, Any]) -> dict[str, Any]:
+def expected_http_workload(args: argparse.Namespace, concurrency: int) -> dict[str, Any]:
+    return {
+        "model_id": args.model_id,
+        "num_prompts": args.num_prompts,
+        "max_concurrency": concurrency,
+        "request_rate": args.request_rate,
+        "input_len": args.input_len,
+        "output_len": args.output_len,
+        "temperature": args.temperature,
+        "ignore_eos": args.ignore_eos,
+    }
+
+
+def parse_vllm_bench_artifact(
+    payload: dict[str, Any],
+    expected_workload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     completed = first_int(payload, "completed", "num_completed_requests", "successful_requests")
     failed = first_int(
         payload,
@@ -850,9 +1217,46 @@ def parse_vllm_bench_artifact(payload: dict[str, Any]) -> dict[str, Any]:
     if output_tok_s is None and total_output_tokens is not None and duration:
         output_tok_s = total_output_tokens / duration
     output_hash = output_text_hash(payload)
-    passed = failed == 0 and timeouts == 0
-    if completed is not None:
-        passed = passed and completed > 0
+    output_count = output_hash["count"]
+    detailed_outputs_valid = (
+        completed is not None
+        and output_count == completed
+        and output_count > 0
+        and output_hash["sha256"] is not None
+        and output_hash.get("valid") is True
+    )
+    workload_mismatches: list[str] = []
+    expected_completed = None
+    if expected_workload is not None:
+        expected_completed = expected_workload.get("num_prompts")
+        ignore_eos = payload.get(f"{HTTP_METADATA_PREFIX}ignore_eos", payload.get("ignore_eos"))
+        if isinstance(ignore_eos, str):
+            ignore_eos = ignore_eos.lower() == "true"
+        observed = {
+            "model_id": payload.get("model_id") or payload.get("model"),
+            "num_prompts": coerce_int(payload.get("num_prompts")),
+            "max_concurrency": coerce_int(payload.get("max_concurrency")),
+            "request_rate": str(payload.get("request_rate")) if payload.get("request_rate") is not None else None,
+            "input_len": coerce_int(payload.get(f"{HTTP_METADATA_PREFIX}input_len", payload.get("input_len"))),
+            "output_len": coerce_int(payload.get(f"{HTTP_METADATA_PREFIX}output_len", payload.get("output_len"))),
+            "temperature": coerce_number(payload.get(f"{HTTP_METADATA_PREFIX}temperature", payload.get("temperature"))),
+            "ignore_eos": ignore_eos,
+        }
+        for key, expected in expected_workload.items():
+            if observed.get(key) != expected:
+                workload_mismatches.append(key)
+    full_completion = (
+        completed is not None
+        and completed > 0
+        and (expected_completed is None or completed == expected_completed)
+    )
+    passed = (
+        full_completion
+        and failed == 0
+        and timeouts == 0
+        and detailed_outputs_valid
+        and not workload_mismatches
+    )
     return {
         "claim_bucket": CLAIM_HTTP,
         "passed": passed,
@@ -871,12 +1275,17 @@ def parse_vllm_bench_artifact(payload: dict[str, Any]) -> dict[str, Any]:
         "mean_itl_ms": first_number(payload, "mean_itl_ms", "itl.mean_ms"),
         "median_itl_ms": first_number(payload, "median_itl_ms", "itl.median_ms"),
         "output_text_sha256": output_hash["sha256"],
-        "output_text_count": output_hash["count"],
+        "output_text_count": output_count,
+        "detailed_outputs_valid": detailed_outputs_valid,
+        "workload_mismatches": workload_mismatches,
+        "expected_completed": expected_completed,
+        "full_completion": full_completion,
     }
 
 
 def output_text_hash(payload: dict[str, Any]) -> dict[str, Any]:
     texts: list[str] = []
+    detailed_outputs_valid = False
     for key in (
         "generated_texts",
         "generated_outputs",
@@ -889,12 +1298,18 @@ def output_text_hash(payload: dict[str, Any]) -> dict[str, Any]:
     ):
         value = payload.get(key)
         if isinstance(value, list):
+            source_valid = True
             for item in value:
-                texts.extend(extract_output_texts(item))
+                item_texts = extract_output_texts(item)
+                texts.extend(item_texts)
+                if len(item_texts) != 1 or not item_texts[0]:
+                    source_valid = False
+            detailed_outputs_valid = source_valid
+            break
     if not texts:
-        return {"sha256": None, "count": 0}
+        return {"sha256": None, "count": 0, "valid": False}
     digest = hashlib.sha256(json.dumps(texts, ensure_ascii=False).encode("utf-8")).hexdigest()
-    return {"sha256": digest, "count": len(texts)}
+    return {"sha256": digest, "count": len(texts), "valid": detailed_outputs_valid}
 
 
 def extract_output_texts(value: Any) -> list[str]:
@@ -940,8 +1355,17 @@ def summarize_http_rows(engine_rows: list[dict[str, Any]], noisy_threshold: floa
                 grouped.setdefault(int(cell["concurrency"]), []).append(cell)
         summary_rows = []
         for concurrency, repeats in sorted(grouped.items()):
-            tpot = [cell["mean_tpot_ms"] for cell in repeats if cell.get("mean_tpot_ms") is not None]
-            output = [cell["output_tok_s"] for cell in repeats if cell.get("output_tok_s") is not None]
+            passed_repeats = [cell for cell in repeats if cell.get("passed") is True]
+            tpot = [
+                cell["mean_tpot_ms"]
+                for cell in passed_repeats
+                if cell.get("mean_tpot_ms") is not None
+            ]
+            output = [
+                cell["output_tok_s"]
+                for cell in passed_repeats
+                if cell.get("output_tok_s") is not None
+            ]
             failed = [cell.get("failed", 0) for cell in repeats]
             timeouts = [cell.get("timeouts", 0) for cell in repeats]
             tpot_summary = summarize_values(tpot, noisy_threshold)
@@ -950,18 +1374,28 @@ def summarize_http_rows(engine_rows: list[dict[str, Any]], noisy_threshold: floa
                 {
                     "concurrency": concurrency,
                     "repeat_count": len(repeats),
+                    "passed_repeat_count": len(passed_repeats),
                     "completed": [cell.get("completed") for cell in repeats],
                     "failed": failed,
                     "timeouts": timeouts,
+                    "cell_passed": [cell.get("passed") is True for cell in repeats],
                     "output_text_sha256": [cell.get("output_text_sha256") for cell in repeats],
                     "mean_tpot_ms": tpot_summary,
                     "output_tok_s": output_summary,
                     "mean_ttft_ms": summarize_values(
-                        [cell["mean_ttft_ms"] for cell in repeats if cell.get("mean_ttft_ms") is not None],
+                        [
+                            cell["mean_ttft_ms"]
+                            for cell in passed_repeats
+                            if cell.get("mean_ttft_ms") is not None
+                        ],
                         noisy_threshold,
                     ),
                     "mean_itl_ms": summarize_values(
-                        [cell["mean_itl_ms"] for cell in repeats if cell.get("mean_itl_ms") is not None],
+                        [
+                            cell["mean_itl_ms"]
+                            for cell in passed_repeats
+                            if cell.get("mean_itl_ms") is not None
+                        ],
                         noisy_threshold,
                     ),
                     "noisy": tpot_summary["noisy"] or output_summary["noisy"],
@@ -998,7 +1432,7 @@ def run_openinfer_trace_pass(args: argparse.Namespace, out_dir: Path) -> list[di
                         sys.executable, "scripts/bench_http_serving.py",
                         "--base-url", f"http://127.0.0.1:{port}",
                         "--model", args.model_id,
-                        "--num-requests", str(min(args.num_prompts, 8)),
+                        "--num-requests", str(args.num_prompts),
                         "--concurrency", str(concurrency),
                         "--warmup", "0",
                         "--prompt-words", str(args.input_len),
@@ -1017,14 +1451,21 @@ def run_openinfer_trace_pass(args: argparse.Namespace, out_dir: Path) -> list[di
                         "artifact": display_path(out),
                         "completed": payload["summary"]["completed"],
                         "failed": payload["summary"]["failed"],
+                        "timeouts": payload["summary"]["timeouts"],
                         "output_tok_s": payload["summary"]["output_tokens_per_s"],
-                        "trace": payload.get("server_trace", {}),
                     }
-                    cell["missing_trace_count"] = trace_missing_count(cell["trace"])
+                    cell.update(trace_summary_for_payload(payload))
+                    cell["validation_errors"] = trace_cell_errors(cell, args, concurrency)
+                    cell["passed"] = not cell["validation_errors"]
                     row["cells"].append(cell)
             row["passed"] = bool(row["cells"]) and all(
-                cell.get("failed", 0) == 0 for cell in row["cells"]
+                cell.get("passed") is True for cell in row["cells"]
             )
+            if row["cells"] and not row["passed"]:
+                row.update({
+                    "claim_bucket": CLAIM_FAILED,
+                    "error": "trace cells failed strict coverage validation",
+                })
             if not row["cells"]:
                 row.update({
                     "claim_bucket": CLAIM_FAILED,
@@ -1923,7 +2364,12 @@ def summarize_existing(args: argparse.Namespace) -> dict[str, Any]:
                 "concurrency": int(artifact.parents[1].name.removeprefix("c")),
                 "repeat": int(artifact.parent.name.removeprefix("r")),
             }
-            cell.update(parse_vllm_bench_artifact(payload))
+            cell.update(
+                parse_vllm_bench_artifact(
+                    payload,
+                    expected_http_workload(args, cell["concurrency"]),
+                )
+            )
             engine["cells"].append(cell)
         expected_cells = {
             (concurrency, repeat)
@@ -1984,9 +2430,14 @@ def summarize_existing(args: argparse.Namespace) -> dict[str, Any]:
                 "failed": payload.get("summary", {}).get("failed"),
                 "timeouts": payload.get("summary", {}).get("timeouts"),
                 "output_tok_s": payload.get("summary", {}).get("output_tokens_per_s"),
-                "trace": payload.get("server_trace", {}),
             }
-            cell["missing_trace_count"] = trace_missing_count(cell["trace"])
+            cell.update(trace_summary_for_payload(payload))
+            cell["validation_errors"] = trace_cell_errors(
+                cell,
+                args,
+                cell["concurrency"],
+            )
+            cell["passed"] = not cell["validation_errors"]
             row["cells"].append(cell)
         observed_concurrency = {
             cell.get("concurrency")
@@ -1995,7 +2446,7 @@ def summarize_existing(args: argparse.Namespace) -> dict[str, Any]:
         }
         missing_concurrency = sorted(set(args.concurrency) - observed_concurrency) if row["cells"] else []
         row["passed"] = bool(row["cells"]) and not missing_concurrency and all(
-            cell.get("failed", 0) == 0 for cell in row["cells"]
+            cell.get("passed") is True for cell in row["cells"]
         )
         if not row["cells"]:
             row.update({
@@ -2007,6 +2458,11 @@ def summarize_existing(args: argparse.Namespace) -> dict[str, Any]:
             row.update({
                 "claim_bucket": CLAIM_FAILED,
                 "error": "missing OpenInfer trace result artifacts",
+            })
+        elif not row["passed"]:
+            row.update({
+                "claim_bucket": CLAIM_FAILED,
+                "error": "trace cells failed strict coverage validation",
             })
         trace_rows.append(row)
     trace_rows.extend(infer_failed_trace_rows_from_logs(out_dir, trace_rows))
@@ -2023,7 +2479,16 @@ def summarize_existing(args: argparse.Namespace) -> dict[str, Any]:
     if trace_rows:
         sections["openinfer_trace_pass"] = trace_rows
     elif existing_summary.get("openinfer_trace_pass"):
-        sections["openinfer_trace_pass"] = existing_summary["openinfer_trace_pass"]
+        sections["openinfer_trace_pass"] = [
+            {
+                **row,
+                "passed": False,
+                "claim_bucket": CLAIM_FAILED,
+                "error": "raw OpenInfer trace artifacts are missing",
+            }
+            for row in existing_summary["openinfer_trace_pass"]
+            if isinstance(row, dict)
+        ]
     summary = build_summary(args, out_dir, sections)
     if existing_summary.get("metadata"):
         summary["metadata"] = redact_payload(existing_summary["metadata"])

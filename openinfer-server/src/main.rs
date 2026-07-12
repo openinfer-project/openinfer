@@ -50,10 +50,15 @@ async fn main() -> anyhow::Result<()> {
     let lora_modules = args.lora_modules.clone();
     let enable_lora = args.enable_lora;
     let port = args.port;
-    let frontend_engine_count = match model_type {
-        #[cfg(feature = "glm52")]
-        ModelType::Glm52 if args.moe_topo != "tp8" => args.dp_size.unwrap_or(8),
-        _ => 1,
+    let frontend_engine_count = 1;
+    #[cfg(feature = "glm52")]
+    let frontend_engine_count = if model_type == ModelType::Glm52 {
+        args.moe_topo
+            .parse::<openinfer_glm52::Glm52MoeTopo>()
+            .context("--moe-topo")?
+            .logical_rank_count()
+    } else {
+        frontend_engine_count
     };
     let engine_load = tokio::task::spawn_blocking(move || -> anyhow::Result<EngineHandle> {
         load_engine(&args, model_type)
@@ -115,38 +120,36 @@ async fn main() -> anyhow::Result<()> {
 // picks the crate by detected model type and forwards the relevant CLI knobs.
 fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandle> {
     let handle = match model_type {
-        #[cfg(feature = "deepseek-v4")]
-        ModelType::DeepSeekV4 => openinfer_deepseek_v4::launch(
-            &args.model_path,
-            args.cuda_graph,
-            args.deepseek_prefill_profile,
-        )
-        .context("failed to start DeepSeek V4 engine")?,
         #[cfg(feature = "deepseek-v2-lite")]
         ModelType::DeepSeekV2Lite => {
             openinfer_deepseek_v2_lite::launch(&args.model_path, args.cuda_graph)
                 .context("failed to start DeepSeek V2 Lite engine")?
         }
         #[cfg(feature = "glm52")]
-        ModelType::Glm52 => openinfer_glm52::launch(
-            &args.model_path,
-            openinfer_glm52::Glm52LaunchOptions {
-                tp_size: args.tp_size,
-                dp_size: args.dp_size.unwrap_or(8),
-                dspark_draft_model_path: args.dflash_draft_model_path.clone(),
-                max_model_len: args.max_model_len,
-                no_prefix_cache: args.no_prefix_cache,
-                kv_offload: args
-                    .kv_offload
-                    .then(|| openinfer_glm52::Glm52KvOffloadOptions {
-                        pinned_pool_bytes: (args.kv_offload_host_gib * f64::from(1u32 << 30))
-                            as usize,
-                        use_hugepages: args.kv_offload_hugepages,
-                    }),
-                moe_topo: args.moe_topo.parse().context("--moe-topo")?,
-            },
-        )
-        .context("failed to start GLM5.2 engine")?,
+        ModelType::Glm52 => {
+            let moe_topo: openinfer_glm52::Glm52MoeTopo =
+                args.moe_topo.parse().context("--moe-topo")?;
+            openinfer_glm52::launch(
+                &args.model_path,
+                openinfer_glm52::Glm52LaunchOptions {
+                    tp_size: args.tp_size,
+                    dp_size: args.dp_size.unwrap_or_else(|| moe_topo.default_dp_size()),
+                    dspark_draft_model_path: args.dflash_draft_model_path.clone(),
+                    max_model_len: args.max_model_len,
+                    no_prefix_cache: args.no_prefix_cache,
+                    kv_offload: args
+                        .kv_offload
+                        .then(|| openinfer_glm52::Glm52KvOffloadOptions {
+                            pinned_pool_bytes: (args.kv_offload_host_gib * f64::from(1u32 << 30))
+                                as usize,
+                            use_hugepages: args.kv_offload_hugepages,
+                        }),
+                    moe_topo,
+                    dump_graph_png: args.dump_graph_png.clone(),
+                },
+            )
+            .context("failed to start GLM5.2 engine")?
+        }
         #[cfg(feature = "kimi-k2")]
         ModelType::KimiK2 => openinfer_kimi_k2::launch(
             &args.model_path,

@@ -89,7 +89,6 @@ pub fn launch(model_path: &Path, cuda_graph: bool) -> Result<EngineHandle> {
         model_path,
         EngineLoadOptions {
             enable_cuda_graph: false,
-            enable_prefill_profile: false,
             device_ordinals: vec![0, 1],
             parallel_config: None,
             ep_backend: EpBackend::Nccl,

@@ -34,7 +34,7 @@ Out of scope:
 
 | Issue / maintainer requirement | Covered by | Evidence |
 | --- | --- | --- |
-| DeepSeek-V2-Lite config loads independently from DeepSeek V4 assumptions. | PR #149 | Dedicated `openinfer-deepseek-v2-lite` config/weight/model crate. |
+| DeepSeek-V2-Lite config loads via its own crate, sharing no config assumptions with other DeepSeek lines. | PR #149 | Dedicated `openinfer-deepseek-v2-lite` config/weight/model crate. |
 | Single-node `ep_size=2` validates rank, expert ownership, and local expert count. | PR #149 | EP layout is fixed to rank 0 experts `0..31` and rank 1 experts `32..63`, with load-time validation. |
 | Each rank only loads its owned 32 routed experts. | PR #149 | Driver rank loads rank 0 experts; expert rank loads only rank 1 routed experts. |
 | Unsupported backend/topology reports explicit errors. | PR #149 / #150 | Unsupported device count, duplicate devices, cuda_graph, and backend names fail closed. |

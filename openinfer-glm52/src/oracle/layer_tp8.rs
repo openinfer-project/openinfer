@@ -38,7 +38,7 @@ use super::layer::{
 use crate::config::{GLM52_INDEX_HEAD_DIM, GLM52_ROPE_HALF, GLM52_SM_SCALE};
 use crate::model::{INDEX_CACHE_BLOCK, NUM_SMS, rope_tables};
 use crate::moe_decode::{Glm52RouterScratch, HIDDEN, run_router_into};
-use crate::moe_tp8::{Glm52MoeTp8State, Glm52Tp8Exchange, load_tp8_slice_layer};
+use crate::moe_tp::{Glm52MoeTpState, Glm52TpExchange, load_tp8_slice_layer};
 use crate::weights::Glm52WeightManifest;
 
 const TP_RANKS: usize = 8;
@@ -53,7 +53,7 @@ fn layer_moe_tp8_oracle_gate() -> Result<()> {
         MOE_ORACLE_HIDDEN_DIGEST,
     )?);
     let manifest = Arc::new(Glm52WeightManifest::from_model_dir(&model_path())?);
-    let exchange = Arc::new(Glm52Tp8Exchange::new());
+    let exchange = Arc::new(Glm52TpExchange::new(TP_RANKS));
 
     // Every rank: the identical full decoder-layer walk (replicated
     // attention/indexer/router weights + this rank's expert slice bank).
@@ -79,7 +79,15 @@ fn layer_moe_tp8_oracle_gate() -> Result<()> {
                         rank,
                         MOE_ORACLE_LAYER,
                     )?;
-                    let mut tp8 = Glm52MoeTp8State::new(&ctx, rank, rank, &exchange, 1, 1)?;
+                    let mut tp8 = Glm52MoeTpState::new(
+                        &ctx,
+                        openinfer_kernels::ops::Glm52TpTopology::Tp8,
+                        rank,
+                        rank,
+                        &exchange,
+                        1,
+                        1,
+                    )?;
                     let outputs = run_layer_prefill_tp8(
                         &ctx,
                         &w,
@@ -103,7 +111,15 @@ fn layer_moe_tp8_oracle_gate() -> Result<()> {
         GateLayerMlp::MoeEp8Rank0,
     )?;
     let bank = load_tp8_slice_layer(&ctx, &model_path(), &manifest, 0, MOE_ORACLE_LAYER)?;
-    let mut tp8 = Glm52MoeTp8State::new(&ctx, 0, 0, &exchange, 1, 1)?;
+    let mut tp8 = Glm52MoeTpState::new(
+        &ctx,
+        openinfer_kernels::ops::Glm52TpTopology::Tp8,
+        0,
+        0,
+        &exchange,
+        1,
+        1,
+    )?;
     let outputs = run_layer_prefill_tp8(&ctx, &w, &mut tp8, &bank, &hidden_host, MOE_ORACLE_CTX);
     ctx.stream.synchronize()?;
 
@@ -151,8 +167,8 @@ fn layer_moe_tp8_oracle_gate() -> Result<()> {
 fn run_layer_prefill_tp8(
     ctx: &DeviceContext,
     w: &crate::layer::Glm52DecoderLayerWeights,
-    tp8: &mut Glm52MoeTp8State,
-    bank: &crate::moe_tp8::Glm52MoeTp8SliceBank,
+    tp8: &mut Glm52MoeTpState,
+    bank: &crate::moe_tp::Glm52MoeTpSliceBank,
     hidden_host: &[bf16],
     oracle_ctx: usize,
 ) -> Result<Vec<f32>> {
@@ -195,7 +211,7 @@ fn run_layer_prefill_tp8(
     let mqa_shape =
         Glm52IndexerScratch::decode_shape(1, index_cache_layout, index_blocks, NUM_SMS, oracle_ctx);
     let mut scratch =
-        Glm52DecodeScratch::new(ctx, &contract, mqa_shape, crate::config::GLM52_HEADS)?;
+        Glm52DecodeScratch::new(ctx, &contract, mqa_shape, crate::config::GLM52_HEADS, false)?;
     let mut router_scratch = Glm52RouterScratch::new(ctx, 1)?;
 
     // 8-row staging for the replicated kernel (rows 1..8 stay zero).
@@ -286,7 +302,7 @@ fn run_layer_prefill_tp8(
             &mlp_out_all.slice(0..HIDDEN),
             scratch.layer.mlp_out.data_mut(),
         )?;
-        glm52_layer_finish(ctx, &mut scratch, 0)?;
+        glm52_layer_finish(ctx, &mut scratch, 0, false)?;
         let out_host = ctx.stream.clone_dtoh(scratch.hidden.data())?;
         outputs.extend(out_host.iter().map(|v| v.to_f32()));
     }

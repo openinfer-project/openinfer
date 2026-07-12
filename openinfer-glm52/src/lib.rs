@@ -21,8 +21,9 @@ mod layer;
 mod mla_decode;
 mod model;
 mod moe_decode;
+mod moe_ep4;
 mod moe_ep8;
-mod moe_tp8;
+mod moe_tp;
 #[cfg(test)]
 mod oracle;
 mod rows;
@@ -31,9 +32,13 @@ mod scheduler;
 mod scratch;
 mod weights;
 
-use std::{collections::BTreeSet, path::Path, time::Instant};
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+    time::Instant,
+};
 
-use anyhow::{Result, ensure};
+use anyhow::{Context as _, Result, ensure};
 use bytesize::ByteSize;
 use openinfer_core::engine::{EngineHandle, KvCapacity, LoadSnapshot};
 use openinfer_kv_offload::{HostConfig, KvArena, OffloadEngine, OffloadHost};
@@ -49,9 +54,8 @@ pub use config::{
     GLM52_ROUTED_EXPERTS, GLM52_TOPK, GLM52_VOCAB, probe_config_json,
 };
 
-/// GLM5.2 parallel shape: TP1/DP8/EP8 is the only supported layout — every
-/// rank holds the full non-expert stack plus its 32 routed experts, and
-/// serves one request at a time.
+/// GLM5.2 parallel shape. EP8 is the production layout today; TP4 is the
+/// GB300 bring-up target.
 #[derive(Clone, Debug)]
 pub struct Glm52LaunchOptions {
     pub tp_size: usize,
@@ -85,8 +89,15 @@ pub struct Glm52LaunchOptions {
     /// every rank holds a 1/8-intermediate slice of ALL experts plus 8 of
     /// the 64 attention heads, all 8 workers mirror ONE logical rank (up to
     /// 8 concurrent requests, single bucket-8 shape), and the MoE path is
-    /// the TP8 phase-kernel chain on all 75 layers.
+    /// the TP8 phase-kernel chain on all 75 layers. `Tp4` is the GB300
+    /// four-GPU bring-up target using 16 attention heads per rank and 1/4
+    /// intermediate MoE slices.
     pub moe_topo: Glm52MoeTopo,
+    /// Export rank 0's already pre-captured whole-step decode graph during
+    /// startup. EP8 and TP4 export bucket 1; TP8 exports its fixed bucket 8.
+    /// The requested PNG gets a complete sibling `.dot` for machine
+    /// inspection.
+    pub dump_graph_png: Option<PathBuf>,
 }
 
 /// Launch-time MoE sharding topology (the expert slab is repacked during
@@ -95,7 +106,81 @@ pub struct Glm52LaunchOptions {
 pub enum Glm52MoeTopo {
     #[default]
     Ep8,
+    /// Four-GPU expert-parallel layout (DP4/EP4, 64 whole routed experts per
+    /// rank — the GB300 high-throughput target). Same DeepEP protocol as EP8
+    /// with its own shim instantiation; the routed-expert GEMM runs the
+    /// arch-portable weight-only mma chain instead of the sm_90a DeepGEMM
+    /// masked chain.
+    Ep4,
     Tp8,
+    Tp4,
+}
+
+impl Glm52MoeTopo {
+    #[must_use]
+    pub fn default_dp_size(self) -> usize {
+        match self {
+            Self::Ep8 | Self::Tp8 => GLM52_EP_RANKS,
+            Self::Ep4 => 4,
+            Self::Tp4 => 1,
+        }
+    }
+
+    #[must_use]
+    pub fn device_count(self) -> usize {
+        match self {
+            Self::Ep8 | Self::Tp8 => GLM52_EP_RANKS,
+            Self::Ep4 | Self::Tp4 => 4,
+        }
+    }
+
+    /// Number of independently scheduled request partitions. Tensor-
+    /// replicated workers execute one mirrored partition in lock-step.
+    #[must_use]
+    pub fn logical_rank_count(self) -> usize {
+        if self.uses_tensor_replicated_moe() {
+            1
+        } else {
+            self.device_count()
+        }
+    }
+
+    /// The `--tp-size` this topology requires (server validation mirrors the
+    /// launch-time ensure).
+    #[must_use]
+    pub fn expected_tp_size(self) -> usize {
+        match self {
+            Self::Ep8 | Self::Ep4 | Self::Tp8 => 1,
+            Self::Tp4 => 4,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn expected_ep_size(self) -> usize {
+        match self {
+            Self::Ep8 | Self::Tp8 => GLM52_EP_RANKS,
+            Self::Ep4 => 4,
+            Self::Tp4 => 1,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn uses_ep_expert_bundles(self) -> bool {
+        matches!(self, Self::Ep8 | Self::Ep4)
+    }
+
+    /// Whole routed experts per rank of an expert-bundle topology (EP8 → 32,
+    /// EP4 → 64). Meaningless for the tensor-replicated topologies.
+    #[must_use]
+    pub(crate) fn ep_local_experts(self) -> usize {
+        debug_assert!(self.uses_ep_expert_bundles());
+        GLM52_ROUTED_EXPERTS / self.expected_ep_size()
+    }
+
+    #[must_use]
+    pub(crate) fn uses_tensor_replicated_moe(self) -> bool {
+        matches!(self, Self::Tp8 | Self::Tp4)
+    }
 }
 
 impl std::str::FromStr for Glm52MoeTopo {
@@ -104,9 +189,59 @@ impl std::str::FromStr for Glm52MoeTopo {
     fn from_str(s: &str) -> Result<Self> {
         match s {
             "ep8" => Ok(Self::Ep8),
+            "ep4" => Ok(Self::Ep4),
             "tp8" => Ok(Self::Tp8),
-            other => anyhow::bail!("GLM5.2 MoE topology must be ep8 or tp8, got {other}"),
+            "tp4" => Ok(Self::Tp4),
+            other => {
+                anyhow::bail!("GLM5.2 MoE topology must be ep8, ep4, tp8, or tp4, got {other}")
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod topology_tests {
+    use super::*;
+
+    #[test]
+    fn tp4_topology_shape_is_four_rank_replicated_tp() {
+        assert_eq!(Glm52MoeTopo::Tp4.default_dp_size(), 1);
+        assert_eq!(Glm52MoeTopo::Tp4.device_count(), 4);
+        assert_eq!(Glm52MoeTopo::Tp4.logical_rank_count(), 1);
+        assert_eq!(Glm52MoeTopo::Tp4.expected_tp_size(), 4);
+        assert_eq!(Glm52MoeTopo::Tp4.expected_ep_size(), 1);
+        assert!(!Glm52MoeTopo::Tp4.uses_ep_expert_bundles());
+        assert!(Glm52MoeTopo::Tp4.uses_tensor_replicated_moe());
+    }
+
+    #[test]
+    fn tp8_and_ep8_shapes_remain_unchanged() {
+        for topo in [Glm52MoeTopo::Ep8, Glm52MoeTopo::Tp8] {
+            assert_eq!(topo.default_dp_size(), GLM52_EP_RANKS);
+            assert_eq!(topo.device_count(), GLM52_EP_RANKS);
+            assert_eq!(topo.expected_tp_size(), 1);
+            assert_eq!(topo.expected_ep_size(), GLM52_EP_RANKS);
+        }
+        assert_eq!(Glm52MoeTopo::Ep8.logical_rank_count(), GLM52_EP_RANKS);
+        assert_eq!(Glm52MoeTopo::Tp8.logical_rank_count(), 1);
+        assert!(Glm52MoeTopo::Ep8.uses_ep_expert_bundles());
+        assert!(!Glm52MoeTopo::Ep8.uses_tensor_replicated_moe());
+        assert!(!Glm52MoeTopo::Tp8.uses_ep_expert_bundles());
+        assert!(Glm52MoeTopo::Tp8.uses_tensor_replicated_moe());
+        assert_eq!(Glm52MoeTopo::Ep8.ep_local_experts(), 32);
+    }
+
+    #[test]
+    fn ep4_topology_shape_is_four_rank_expert_parallel() {
+        assert_eq!(Glm52MoeTopo::Ep4.default_dp_size(), 4);
+        assert_eq!(Glm52MoeTopo::Ep4.device_count(), 4);
+        assert_eq!(Glm52MoeTopo::Ep4.logical_rank_count(), 4);
+        assert_eq!(Glm52MoeTopo::Ep4.expected_tp_size(), 1);
+        assert_eq!(Glm52MoeTopo::Ep4.expected_ep_size(), 4);
+        assert!(Glm52MoeTopo::Ep4.uses_ep_expert_bundles());
+        assert!(!Glm52MoeTopo::Ep4.uses_tensor_replicated_moe());
+        assert_eq!(Glm52MoeTopo::Ep4.ep_local_experts(), 64);
+        assert_eq!("ep4".parse::<Glm52MoeTopo>().unwrap(), Glm52MoeTopo::Ep4);
     }
 }
 
@@ -135,12 +270,34 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
         no_prefix_cache,
         kv_offload,
         moe_topo,
+        dump_graph_png,
     } = options;
-    ensure!(tp_size == 1, "GLM5.2 requires --tp-size=1, got {tp_size}");
-    ensure!(
-        dp_size == GLM52_EP_RANKS,
-        "GLM5.2 requires --dp-size={GLM52_EP_RANKS} (or omitted), got {dp_size}"
-    );
+    if let Some(path) = &dump_graph_png {
+        openinfer_core::cuda_graph::validate_graph_dump_request(path)?;
+    }
+    match moe_topo {
+        Glm52MoeTopo::Ep8 | Glm52MoeTopo::Ep4 | Glm52MoeTopo::Tp8 => {
+            ensure!(
+                tp_size == 1,
+                "GLM5.2 {moe_topo:?} requires --tp-size=1, got {tp_size}"
+            );
+            let expected_dp = moe_topo.default_dp_size();
+            ensure!(
+                dp_size == expected_dp,
+                "GLM5.2 {moe_topo:?} requires --dp-size={expected_dp} (or omitted), got {dp_size}"
+            );
+        }
+        Glm52MoeTopo::Tp4 => {
+            ensure!(
+                tp_size == 4,
+                "GLM5.2 TP4 requires --tp-size=4, got {tp_size}"
+            );
+            ensure!(
+                dp_size == 1,
+                "GLM5.2 TP4 requires --dp-size=1 (or omitted), got {dp_size}"
+            );
+        }
+    }
     // The offload tier extends the prefix cache (restored blocks surface as
     // matched prefix), so a config that disables prefix matching while asking
     // for offload is contradictory — fail loud instead of silently idling an
@@ -160,16 +317,17 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
     start_engine(
         model_path,
         &Glm52LoadOptions {
-            device_ordinals: (0..GLM52_EP_RANKS).collect(),
+            device_ordinals: (0..moe_topo.device_count()).collect(),
             tp_size,
             dp_size,
-            ep_size: GLM52_EP_RANKS,
+            ep_size: moe_topo.expected_ep_size(),
         },
         dspark_draft_model_path.as_deref(),
         max_model_len,
         no_prefix_cache,
         kv_offload,
         moe_topo,
+        dump_graph_png,
     )
 }
 
@@ -339,7 +497,9 @@ fn start_engine(
     no_prefix_cache: bool,
     kv_offload: Option<Glm52KvOffloadOptions>,
     moe_topo: Glm52MoeTopo,
+    dump_graph_png: Option<PathBuf>,
 ) -> Result<EngineHandle> {
+    let dspark_enabled = dspark_path.is_some();
     let startup = validate_startup(model_path, options, moe_topo)?;
     let loaded = load_rank_weights_to_gpu(model_path, &startup, moe_topo)?;
     log::info!(
@@ -357,11 +517,8 @@ fn start_engine(
         .copied()
         .min()
         .expect("at least one rank loaded");
-    let budget = derive_max_model_len(
-        requested_max_model_len,
-        min_free_vram_bytes,
-        dspark_path.is_some(),
-    )?;
+    let budget =
+        derive_max_model_len(requested_max_model_len, min_free_vram_bytes, dspark_enabled)?;
     let max_model_len = budget.max_model_len;
     log::info!(
         "GLM5.2 max_model_len={max_model_len} ({}): min rank free VRAM {} after weights, \
@@ -374,7 +531,7 @@ fn start_engine(
         ByteSize(min_free_vram_bytes as u64),
         ByteSize(budget.arena_bytes as u64),
         model::GLM52_MAX_BATCH_PER_RANK,
-        if dspark_path.is_some() {
+        if dspark_enabled {
             " (dspark lane included)"
         } else {
             ""
@@ -393,34 +550,27 @@ fn start_engine(
     // down, and the launch error surfaces only after the ~100 s DeepEP
     // device timeout. The TP8 LL rendezvous rejecting a topology (poison
     // pill, NVLink probe) is a real failure landing exactly in this window.
-    let rank_arenas = match build_rank_models(
-        &loaded.workers,
-        max_model_len,
-        moe_topo,
-        moe_topo == Glm52MoeTopo::Tp8,
-    ) {
-        Ok(rank_arenas) => rank_arenas,
-        Err(err) => {
-            for worker in &loaded.workers {
-                let _ = worker.request_shutdown();
+    let rank_arenas =
+        match build_rank_models(&loaded.workers, max_model_len, moe_topo, dspark_enabled) {
+            Ok(rank_arenas) => rank_arenas,
+            Err(err) => {
+                for worker in &loaded.workers {
+                    let _ = worker.request_shutdown();
+                }
+                return Err(err);
             }
-            return Err(err);
-        }
-    };
-    let post_comm_startup = || -> Result<(bool, Option<Vec<OffloadEngine>>)> {
-        let dspark_enabled = if let Some(dspark_path) = dspark_path {
-            load_dspark_drafters(&loaded.workers, dspark_path)?;
-            true
-        } else {
-            false
         };
+    let post_comm_startup = || -> Result<Option<Vec<OffloadEngine>>> {
+        if let Some(dspark_path) = dspark_path {
+            load_dspark_drafters(&loaded.workers, dspark_path)?;
+        }
         ensure_post_build_headroom(&loaded.workers)?;
         let offload = kv_offload
             .map(|opts| build_offload_engines(&opts, rank_arenas, &startup.device_ordinals))
             .transpose()?;
-        Ok((dspark_enabled, offload))
+        Ok(offload)
     };
-    let (dspark_enabled, offload) = match post_comm_startup() {
+    let offload = match post_comm_startup() {
         Ok(started) => started,
         Err(err) => {
             for worker in &loaded.workers {
@@ -429,11 +579,7 @@ fn start_engine(
             return Err(err);
         }
     };
-    let logical_ranks = if moe_topo == Glm52MoeTopo::Tp8 {
-        1
-    } else {
-        loaded.workers.len()
-    };
+    let logical_ranks = moe_topo.logical_rank_count();
     let kv_total_blocks = glm52_pool_blocks(max_model_len) - 1;
     let (load_txs, load_rxs): (Vec<_>, Vec<_>) = (0..logical_ranks)
         .map(|_| {
@@ -444,6 +590,13 @@ fn start_engine(
         })
         .unzip();
     let (submit_tx, submit_rx) = mpsc::unbounded_channel();
+    let (graph_dump_request, graph_dump_response) = match dump_graph_png {
+        Some(path) => {
+            let (response_tx, response_rx) = crossbeam_channel::bounded(1);
+            (Some((path, response_tx)), Some(response_rx))
+        }
+        None => (None, None),
+    };
     let coord_handle = std::thread::Builder::new()
         .name("glm52-coord".into())
         .spawn(move || {
@@ -457,9 +610,39 @@ fn start_engine(
                 offload,
                 moe_topo,
                 load_txs,
+                graph_dump_request,
             );
         })
         .map_err(|err| anyhow::anyhow!("failed to spawn GLM5.2 coordinator: {err}"))?;
+    if let Some(response) = graph_dump_response {
+        let Ok(dump_result) = response.recv() else {
+            drop(submit_tx);
+            coord_handle.join().map_err(|_| {
+                anyhow::anyhow!("GLM5.2 coordinator panicked before reporting graph export")
+            })?;
+            return Err(anyhow::anyhow!(
+                "GLM5.2 coordinator exited before reporting CUDA Graph export"
+            ));
+        };
+        let summary = match dump_result {
+            Ok(summary) => summary,
+            Err(err) => {
+                drop(submit_tx);
+                coord_handle.join().map_err(|_| {
+                    anyhow::anyhow!("GLM5.2 coordinator panicked after graph export failure")
+                })?;
+                return Err(err.context("GLM5.2 CUDA Graph export failed"));
+            }
+        };
+        log::info!(
+            "GLM5.2 decode CUDA Graph exported: nodes={}, kernels={}, edges={}, dot={}, png={}",
+            summary.nodes,
+            summary.kernels,
+            summary.edges,
+            summary.dot_path.display(),
+            summary.png_path.display()
+        );
+    }
     // Publish the launch-time cap so the frontend clamps its config.json
     // max_position_embeddings (1M) at the API boundary instead of admitting
     // requests the scheduler would reject (same contract as qwen3/dsv2-lite).
@@ -527,21 +710,22 @@ fn ensure_post_build_headroom(workers: &[Glm52RankWorker]) -> Result<()> {
     Ok(())
 }
 
-/// Build every rank's resident model, then create the DeepEP contexts. Two
-/// phases on purpose: the build is per-rank and can fail (OOM, packaging
-/// drift) — every rank must report success BEFORE anyone enters the
-/// collective context creation, or a single failure strands the other seven
-/// ranks in NCCL init with no timeout.
+/// Build every rank's resident model, then create the collective contexts.
+/// Two phases on purpose: the build is per-rank and can fail (OOM, packaging
+/// drift) — every rank must report success BEFORE anyone enters context
+/// creation, or a single failure strands peer ranks in a collective init with
+/// no useful error. TP4 currently stops after the per-rank build, before
+/// entering any EP8/TP8 collective setup.
 fn build_rank_models(
     workers: &[Glm52RankWorker],
     max_model_len: usize,
     moe_topo: Glm52MoeTopo,
-    tp8_active: bool,
+    dspark_enabled: bool,
 ) -> Result<Vec<Vec<KvArena>>> {
     let build_started = Instant::now();
     let responses = workers
         .iter()
-        .map(|worker| worker.build_model_async(max_model_len, moe_topo))
+        .map(|worker| worker.build_model_async(max_model_len, moe_topo, dspark_enabled))
         .collect::<Result<Vec<_>>>()?;
     let mut rank_arenas = Vec::with_capacity(responses.len());
     for (rank, response) in responses.into_iter().enumerate() {
@@ -551,13 +735,16 @@ fn build_rank_models(
                 .map_err(|_| anyhow::anyhow!("GLM5.2 rank {rank} dropped its build response"))??,
         );
     }
-
-    let unique_id = openinfer_kernels::ops::glm52_deepep_unique_id()?;
-    let tp8_exchange =
-        tp8_active.then(|| std::sync::Arc::new(crate::moe_tp8::Glm52Tp8Exchange::new()));
+    let unique_id = match moe_topo {
+        Glm52MoeTopo::Ep4 => openinfer_kernels::ops::glm52_ep4_deepep_unique_id()?,
+        _ => openinfer_kernels::ops::glm52_deepep_unique_id()?,
+    };
+    let tp_exchange = moe_topo
+        .uses_tensor_replicated_moe()
+        .then(|| std::sync::Arc::new(crate::moe_tp::Glm52TpExchange::new(moe_topo.device_count())));
     let responses = workers
         .iter()
-        .map(|worker| worker.setup_comm_async(unique_id, tp8_exchange.clone()))
+        .map(|worker| worker.setup_comm_async(unique_id, moe_topo, tp_exchange.clone()))
         .collect::<Result<Vec<_>>>()?;
     for (rank, response) in responses.into_iter().enumerate() {
         response
@@ -565,8 +752,9 @@ fn build_rank_models(
             .map_err(|_| anyhow::anyhow!("GLM5.2 rank {rank} dropped its comm-setup response"))??;
     }
     log::info!(
-        "GLM5.2 rank models built in {:.2}s (weights adopted in place + DeepEP contexts up)",
-        build_started.elapsed().as_secs_f64()
+        "GLM5.2 rank models built in {:.2}s (weights adopted in place + {:?} contexts up)",
+        build_started.elapsed().as_secs_f64(),
+        moe_topo
     );
     Ok(rank_arenas)
 }
@@ -583,6 +771,20 @@ fn build_offload_engines(
     rank_arenas: Vec<Vec<KvArena>>,
     device_ordinals: &[usize],
 ) -> Result<Vec<OffloadEngine>> {
+    let mla_page_size = openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_PAGE_SIZE;
+    let mla_bytes_per_token = rank_arenas
+        .first()
+        .and_then(|arenas| arenas.iter().find(|arena| is_mla_arena_name(&arena.name)))
+        .context("GLM5.2 KV offload has no MLA arena")?
+        .bytes_per_block
+        / mla_page_size;
+    ensure!(
+        rank_arenas.iter().all(|arenas| arenas
+            .iter()
+            .filter(|arena| is_mla_arena_name(&arena.name))
+            .all(|arena| arena.bytes_per_block == mla_page_size * mla_bytes_per_token)),
+        "GLM5.2 KV offload ranks disagree on MLA cache layout"
+    );
     let host = OffloadHost::new(HostConfig {
         pinned_pool_bytes: opts.pinned_pool_bytes,
         use_hugepages: opts.use_hugepages,
@@ -592,8 +794,8 @@ fn build_offload_engines(
     .map_err(|err| anyhow::anyhow!("GLM5.2 KV offload host: {err}"))?;
     let namespace = format!(
         "openinfer-glm52-l{GLM52_LAYERS}-p{}-mla{}-idxk{}",
-        openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_PAGE_SIZE,
-        openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN,
+        mla_page_size,
+        mla_bytes_per_token,
         config::GLM52_INDEX_HEAD_DIM + 4,
     );
     let engines = rank_arenas
@@ -623,6 +825,11 @@ fn build_offload_engines(
         engines.len(),
     );
     Ok(engines)
+}
+
+fn is_mla_arena_name(name: &str) -> bool {
+    name.rsplit_once('.')
+        .is_some_and(|(_, arena_kind)| arena_kind == "mla")
 }
 
 /// EOS ids from the checkpoint's generation_config.json (`eos_token_id` is a
@@ -664,16 +871,20 @@ fn validate_startup(
         .map_err(|err| anyhow::anyhow!("parse {}: {err}", config_path.display()))?;
     probe_config_json(&json)?;
 
+    let expected_devices = moe_topo.device_count();
     ensure!(
-        options.device_ordinals.len() == GLM52_EP_RANKS,
-        "GLM5.2 EP8 load requires {GLM52_EP_RANKS} devices, got {:?}",
+        options.device_ordinals.len() == expected_devices,
+        "GLM5.2 {moe_topo:?} load requires {expected_devices} devices, got {:?}",
         options.device_ordinals
     );
     ensure!(
-        options.tp_size == 1
-            && options.dp_size == GLM52_EP_RANKS
-            && options.ep_size == GLM52_EP_RANKS,
-        "GLM5.2 requires TP1/DP8/EP8, got TP{} DP{} EP{}",
+        options.tp_size == moe_topo.expected_tp_size()
+            && options.dp_size == moe_topo.default_dp_size()
+            && options.ep_size == moe_topo.expected_ep_size(),
+        "GLM5.2 {moe_topo:?} requires TP{}/DP{}/EP{}, got TP{} DP{} EP{}",
+        moe_topo.expected_tp_size(),
+        moe_topo.default_dp_size(),
+        moe_topo.expected_ep_size(),
         options.tp_size,
         options.dp_size,
         options.ep_size

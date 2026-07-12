@@ -326,6 +326,19 @@ deepep_abi!(
     decode_combine => ffi::glm52_deepep_decode_combine,
 );
 
+#[cfg(feature = "glm52")]
+deepep_abi!(
+    Glm52Ep4DeepEpAbi,
+    ffi::Glm52Ep4DeepEpCtx,
+    last_error => ffi::glm52_ep4_deepep_last_error,
+    info => ffi::glm52_ep4_deepep_info,
+    unique_id => ffi::glm52_ep4_deepep_unique_id,
+    ctx_create => ffi::glm52_ep4_deepep_ctx_create,
+    ctx_destroy => ffi::glm52_ep4_deepep_ctx_destroy,
+    decode_dispatch => ffi::glm52_ep4_deepep_decode_dispatch,
+    decode_combine => ffi::glm52_ep4_deepep_decode_combine,
+);
+
 fn shim_error<A: DeepEpAbi>(what: &str) -> anyhow::Error {
     // Safety: last_error returns a valid thread-local C string.
     let message = unsafe { CStr::from_ptr(A::last_error()) };
@@ -350,6 +363,12 @@ pub fn glm52_deepep_info() -> DeepEpInfo {
     Glm52DeepEpAbi::info()
 }
 
+/// Baked shim capacities of the GLM5.2 DP1/EP4 config.
+#[cfg(feature = "glm52")]
+pub fn glm52_ep4_deepep_info() -> DeepEpInfo {
+    Glm52Ep4DeepEpAbi::info()
+}
+
 /// NCCL unique id, generated on rank 0 and shared with all ranks.
 pub fn deepep_unique_id() -> Result<[u8; 128]> {
     deepep_unique_id_for::<KimiDeepEpAbi>()
@@ -359,6 +378,12 @@ pub fn deepep_unique_id() -> Result<[u8; 128]> {
 #[cfg(feature = "glm52")]
 pub fn glm52_deepep_unique_id() -> Result<[u8; 128]> {
     deepep_unique_id_for::<Glm52DeepEpAbi>()
+}
+
+/// NCCL unique id via the GLM5.2 EP4 shim instantiation.
+#[cfg(feature = "glm52")]
+pub fn glm52_ep4_deepep_unique_id() -> Result<[u8; 128]> {
+    deepep_unique_id_for::<Glm52Ep4DeepEpAbi>()
 }
 
 fn deepep_unique_id_for<A: DeepEpAbi>() -> Result<[u8; 128]> {
@@ -443,6 +468,10 @@ pub type DeepEp = DeepEpBase<KimiDeepEpAbi>;
 /// The GLM5.2 shim instantiation (glm52_deepep_* symbols).
 #[cfg(feature = "glm52")]
 pub type Glm52DeepEp = DeepEpBase<Glm52DeepEpAbi>;
+
+/// The GLM5.2 EP4 shim instantiation (glm52_ep4_deepep_* symbols).
+#[cfg(feature = "glm52")]
+pub type Glm52Ep4DeepEp = DeepEpBase<Glm52Ep4DeepEpAbi>;
 
 // One context per rank thread; the shim has no thread-affine state beyond
 // the thread-local error string.

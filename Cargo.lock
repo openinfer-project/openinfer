@@ -387,26 +387,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bindgen"
-version = "0.72.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "993776b509cfb49c750f11b8f07a46fa23e0a1386ffc01fb1e7d343efc387895"
-dependencies = [
- "bitflags 2.11.1",
- "cexpr",
- "clang-sys",
- "itertools 0.13.0",
- "log",
- "prettyplease",
- "proc-macro2",
- "quote",
- "regex",
- "rustc-hash 2.1.2",
- "shlex",
- "syn 2.0.117",
-]
-
-[[package]]
 name = "bit-set"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -731,17 +711,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "codespan-reporting"
-version = "0.13.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af491d569909a7e4dee0ad7db7f5341fef5c614d5b8ec8cf765732aba3cff681"
-dependencies = [
- "serde",
- "termcolor",
- "unicode-width",
-]
-
-[[package]]
 name = "color_quant"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1050,68 +1019,6 @@ checksum = "1cea5f10a99e025c1b44ae2354c2d8326b25ddbd0baf76bde8e55cfd4018a2cc"
 dependencies = [
  "half",
  "libloading 0.9.0",
-]
-
-[[package]]
-name = "cxx"
-version = "1.0.194"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "747d8437319e3a2f43d93b341c137927ca70c0f5dabeea7a005a73665e247c7e"
-dependencies = [
- "cc",
- "cxx-build",
- "cxxbridge-cmd",
- "cxxbridge-flags",
- "cxxbridge-macro",
- "foldhash 0.2.0",
- "link-cplusplus",
-]
-
-[[package]]
-name = "cxx-build"
-version = "1.0.194"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b0f4697d190a142477b16aef7da8a99bfdc41e7e8b1687583c0d23a79c7afc1e"
-dependencies = [
- "cc",
- "codespan-reporting",
- "indexmap 2.14.0",
- "proc-macro2",
- "quote",
- "scratch",
- "syn 2.0.117",
-]
-
-[[package]]
-name = "cxxbridge-cmd"
-version = "1.0.194"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d0956799fa8678d4c50eed028f2de1c0552ae183c76e976cf7ca8c4e36a7c328"
-dependencies = [
- "clap",
- "codespan-reporting",
- "indexmap 2.14.0",
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
-name = "cxxbridge-flags"
-version = "1.0.194"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23384a836ab4f0ad98ace7e3955ad2de39de42378ab487dc28d3990392cb283a"
-
-[[package]]
-name = "cxxbridge-macro"
-version = "1.0.194"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6acc6b5822b9526adfb4fc377b67128fdd60aac757cc4a741a6278603f763cf"
-dependencies = [
- "indexmap 2.14.0",
- "proc-macro2",
- "quote",
- "syn 2.0.117",
 ]
 
 [[package]]
@@ -2400,15 +2307,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "indoc"
-version = "2.0.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "79cf5c93f93228cf8efb3ba362535fb11199ac548a09ce117c9b1adc3030d706"
-dependencies = [
- "rustversion",
-]
-
-[[package]]
 name = "io-uring"
 version = "0.7.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2637,15 +2535,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e02f3bb43d335493c96bf3fd3a321600bf6bd07ed34bc64118e9293bdffea46c"
 dependencies = [
  "libc",
-]
-
-[[package]]
-name = "link-cplusplus"
-version = "1.0.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f78c730aaa7d0b9336a299029ea49f9ee53b0ed06e9202e8cb7db9bae7b8c82"
-dependencies = [
- "cc",
 ]
 
 [[package]]
@@ -3234,191 +3123,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "openinfer-comm"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "clap",
- "cudarc",
- "half",
- "log",
- "openinfer-comm-cuda-lib",
- "openinfer-comm-fabric-lib",
- "openinfer-comm-p2p-all-to-all",
- "openinfer-core",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "openinfer-comm-a2a-kernels"
-version = "0.0.0"
-dependencies = [
- "cc",
- "cxx",
- "cxx-build",
- "openinfer-build",
-]
-
-[[package]]
-name = "openinfer-comm-cuda-lib"
-version = "0.0.0"
-dependencies = [
- "bincode",
- "libc",
- "openinfer-comm-cuda-sys",
- "openinfer-comm-cudart-sys",
- "openinfer-comm-gdrapi-sys",
- "openinfer-comm-proc-lib",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "openinfer-comm-cuda-sys"
-version = "0.0.0"
-dependencies = [
- "bindgen 0.72.1",
- "openinfer-build",
-]
-
-[[package]]
-name = "openinfer-comm-cudart-sys"
-version = "0.0.0"
-dependencies = [
- "bindgen 0.72.1",
- "openinfer-build",
-]
-
-[[package]]
-name = "openinfer-comm-fabric-debug"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "bytes",
- "openinfer-comm-cuda-lib",
- "openinfer-comm-fabric-lib",
- "openinfer-comm-logging-lib",
- "postcard",
- "serde",
-]
-
-[[package]]
-name = "openinfer-comm-fabric-lib"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "bytes",
- "crossbeam-channel",
- "dashmap",
- "libc",
- "mockall",
- "once_cell",
- "oneshot",
- "openinfer-comm-cuda-lib",
- "openinfer-comm-libibverbs-sys",
- "openinfer-comm-thread-lib",
- "parking_lot",
- "postcard",
- "serde",
- "smallvec",
- "syscalls",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "openinfer-comm-gdrapi-sys"
-version = "0.0.0"
-dependencies = [
- "bindgen 0.72.1",
- "openinfer-build",
-]
-
-[[package]]
-name = "openinfer-comm-libibverbs-sys"
-version = "0.0.0"
-dependencies = [
- "bindgen 0.72.1",
- "cc",
- "openinfer-build",
-]
-
-[[package]]
-name = "openinfer-comm-logging-lib"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "clap",
- "is-terminal",
- "tracing",
- "tracing-core",
- "tracing-log",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "openinfer-comm-p2p-all-to-all"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "nvtx",
- "oneshot",
- "openinfer-comm-a2a-kernels",
- "openinfer-comm-cuda-lib",
- "openinfer-comm-fabric-lib",
- "openinfer-comm-thread-lib",
- "tracing",
-]
-
-[[package]]
-name = "openinfer-comm-proc-lib"
-version = "0.0.0"
-dependencies = [
- "openinfer-comm-cudart-sys",
- "proc-macro2",
- "quote",
-]
-
-[[package]]
-name = "openinfer-comm-python-ext"
-version = "0.0.0"
-dependencies = [
- "bincode",
- "bytes",
- "openinfer-comm-cuda-lib",
- "openinfer-comm-fabric-lib",
- "openinfer-comm-logging-lib",
- "openinfer-comm-p2p-all-to-all",
- "openinfer-comm-torch-lib",
- "parking_lot",
- "postcard",
- "pyo3",
- "serde",
- "tracing",
-]
-
-[[package]]
-name = "openinfer-comm-thread-lib"
-version = "0.0.0"
-dependencies = [
- "libc",
- "syscalls",
- "tracing",
-]
-
-[[package]]
-name = "openinfer-comm-torch-lib"
-version = "0.0.0"
-dependencies = [
- "cxx",
- "cxx-build",
- "openinfer-build",
- "openinfer-comm-cuda-lib",
- "pkg-config",
- "pyo3",
-]
-
-[[package]]
 name = "openinfer-core"
 version = "0.1.0"
 dependencies = [
@@ -3466,27 +3170,6 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "tempfile",
- "tokio",
- "vllm-text",
-]
-
-[[package]]
-name = "openinfer-deepseek-v4"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "crossbeam-channel",
- "cudarc",
- "half",
- "log",
- "memmap2",
- "openinfer-comm",
- "openinfer-core",
- "openinfer-kernels",
- "safetensors",
- "serde",
- "serde_json",
  "tokio",
  "vllm-text",
 ]
@@ -3664,7 +3347,6 @@ dependencies = [
  "log",
  "openinfer-core",
  "openinfer-deepseek-v2-lite",
- "openinfer-deepseek-v4",
  "openinfer-glm52",
  "openinfer-kimi-k2",
  "openinfer-qwen3",
@@ -4410,68 +4092,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e0c5ccf5294c6ccd63a74f1565028353830a9c2f5eb0c682c355c471726a6e3f"
 
 [[package]]
-name = "pyo3"
-version = "0.27.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab53c047fcd1a1d2a8820fe84f05d6be69e9526be40cb03b73f86b6b03e6d87d"
-dependencies = [
- "anyhow",
- "indoc",
- "libc",
- "memoffset 0.9.1",
- "once_cell",
- "portable-atomic",
- "pyo3-build-config",
- "pyo3-ffi",
- "pyo3-macros",
- "unindent",
-]
-
-[[package]]
-name = "pyo3-build-config"
-version = "0.27.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b455933107de8642b4487ed26d912c2d899dec6114884214a0b3bb3be9261ea6"
-dependencies = [
- "target-lexicon",
-]
-
-[[package]]
-name = "pyo3-ffi"
-version = "0.27.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c85c9cbfaddf651b1221594209aed57e9e5cff63c4d11d1feead529b872a089"
-dependencies = [
- "libc",
- "pyo3-build-config",
-]
-
-[[package]]
-name = "pyo3-macros"
-version = "0.27.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0a5b10c9bf9888125d917fb4d2ca2d25c8df94c7ab5a52e13313a07e050a3b02"
-dependencies = [
- "proc-macro2",
- "pyo3-macros-backend",
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
-name = "pyo3-macros-backend"
-version = "0.27.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "03b51720d314836e53327f5871d4c0cfb4fb37cc2c4a11cc71907a86342c40f9"
-dependencies = [
- "heck",
- "proc-macro2",
- "pyo3-build-config",
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
 name = "quick-error"
 version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4642,7 +4262,7 @@ version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "56f8ead4d7835190d761b9365d9e53906a226d7699007b35bdca49d7edb89a15"
 dependencies = [
- "bindgen 0.66.1",
+ "bindgen",
  "cmake",
  "libc",
  "memoffset 0.9.1",
@@ -5072,12 +4692,6 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
-
-[[package]]
-name = "scratch"
-version = "1.0.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d68f2ec51b097e4c1a75b681a8bec621909b5e91f15bb7b840c4f2f7b01148b2"
 
 [[package]]
 name = "scroll"
@@ -5709,12 +5323,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "target-lexicon"
-version = "0.13.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
-
-[[package]]
 name = "task-local"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5756,15 +5364,6 @@ dependencies = [
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "termcolor"
-version = "1.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "06794f8f6c5c898b3275aebefa6b8a1cb24cd2c6c79397ab15774837a0bc5755"
-dependencies = [
- "winapi-util",
 ]
 
 [[package]]
@@ -6501,12 +6100,6 @@ name = "unicode_categories"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39ec24b3121d976906ece63c9daad25b85969647682eee313cb5779fdd69e14e"
-
-[[package]]
-name = "unindent"
-version = "0.2.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7264e107f553ccae879d21fbea1d6724ac785e8c3bfc762137959b5802826ef3"
 
 [[package]]
 name = "unit-prefix"

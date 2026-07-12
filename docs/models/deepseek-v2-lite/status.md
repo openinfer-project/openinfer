@@ -1,6 +1,6 @@
 # DeepSeek-V2-Lite Status And Benchmark Ledger
 
-> **TL;DR:** DeepSeek-V2-Lite has an EP2 correctness contract across HF, host-staged, and NCCL. The retained HTTP gates now cover mixed-request serving, traceable scheduler lifecycle, and a replayable reliability runner for cancel/disconnect/reject/overload recovery. This is reliability evidence only, not a vLLM parity, production serving, sparse dispatch, multi-node, or throughput-optimization claim.
+> **TL;DR:** DeepSeek-V2-Lite has an EP2 correctness contract across HF, host-staged, and NCCL. The current optimization groups repeated expert routes and computes NCCL gate logits on CUDA while preserving the host top-k/softmax rule. Exact token/text hashes are preserved; retained short-shape HTTP A/B shows host-staged and NCCL throughput gains under the documented request contract. This is not a production, broad-workload, or vLLM-parity claim.
 
 Last touched: 2026-07
 
@@ -21,7 +21,7 @@ Last touched: 2026-07
 | NCCL CUDA Graph readiness | Covered-shape diagnostic | Schema-2 `cuda_graph_readiness` now includes a fail-closed `full_decode_graph_probe`. The 2026-06-20 run reports capture, instantiate, replay, and verification success with `8/8` verified replays for the retained batch-1 NCCL decode step. |
 | First mixed-request serving gate | Available | Issue #281 adds greedy-only request admission, FCFS deferral, explicit request-local rejection/error/finish events, and one owned `DecodeCache` per active request. The 2026-06-23 2x RTX 5090 run passed HF / host-staged / NCCL exactness and the mixed-serving E2E for host-staged and NCCL. |
 | Long-shape NCCL collectives | Available | Issue #280 chunks large bf16 dense-exchange and f32 combine all-reduces. The 2026-06-24 2x RTX 5090 NCCL checks preserve HF / host-staged / NCCL exactness and complete 24/64/128-word direct long-shape probes. |
-| HTTP trace and position-subgroup decode batching | HTTP evidence | Issue #280 logs DeepSeek-V2-Lite `openinfer_http_trace` records and batches same-position decode subgroups while letting singleton or lagging positions decode independently. The 2026-06-24 2x RTX 5090 NCCL HTTP sweeps below complete short same-shape, 128-word smoke, and mixed 16/128-word cells with full trace coverage. |
+| HTTP trace and measured MoE throughput optimization | HTTP and direct evidence | Issue #280 logs DeepSeek-V2-Lite `openinfer_http_trace` records and batches same-position decode subgroups. Issue #464 extends phase/decode-step attribution, groups host-staged and NCCL routes by stable `(owner_rank, global_expert)`, and moves the NCCL gate GEMM to a bitwise-matched CUDA logits kernel while keeping host top-k/softmax. Diagnostic serial/host rollback switches remain available for retained A/B and emergency rollback; they are not production tuning knobs. |
 | HTTP reliability lifecycle gate | Available | Issue #453 adds `scripts/bench_dsv2lite_http_reliability.py`, which drives real streaming `/v1/completions` scenarios for client cancel/disconnect, unsupported params, active-cap overload, mixed short/long prompts with adjacent failures, and clean follow-up recovery. The 2026-07-04 2x RTX 5090 host-staged and NCCL runs both passed with terminal trace coverage, stable output hashes, active/pending/decode maxima, and healthy final scheduler baselines. |
 | Retained vLLM comparison matrix | Snapshot complete with clean failed setup rows and supplemental validation rows | The retained matrix for tracking issue #279 keeps HF/host/NCCL correctness, OpenInfer direct diagnostic batch, `vllm bench serve` HTTP pressure, OpenInfer trace rows, and failed setup rows separate. The 2026-06-28 clean full matrix passed HF / host-staged / NCCL correctness plus OpenInfer host-staged/NCCL direct, HTTP pressure, and trace rows; stock vLLM TP2 and TP2+EP2 failed during setup on the target FlashInfer SM120 path. A separate FlashInfer #3633-equivalent validation completed vLLM TP2 and TP2+EP2 under the same HTTP client/workload contract. |
 | vLLM production parity | Not claimed | The vLLM TP2 / TP2+EP2 rows are gap-finding evidence from a documented contract. The supplemental validation run is not serving parity or a stock-install claim. |
@@ -48,7 +48,7 @@ The Rust E2E accepts the known HF-confirmed RTX 5090 and A800 hash pairs for thi
 
 ### Retained vLLM TP2/EP2 Matrix
 
-The retained matrix lives in `docs/benchmarks/deepseek-v2-lite-vllm-tp2-ep2-2026-06.md` and tracks [#279](https://github.com/openinfer-project/openinfer/issues/279). It is the current source for OpenInfer host-staged/NCCL versus vLLM TP2/TP2+EP2 under the `64/64`, `num_prompts=32`, `max_concurrency=1/4/8`, `temperature=0`, `ignore_eos=true` HTTP pressure contract.
+The retained matrix lives in `docs/benchmarks/deepseek-v2-lite-vllm-tp2-ep2.md` and tracks [#279](https://github.com/openinfer-project/openinfer/issues/279). It is the current source for OpenInfer host-staged/NCCL versus vLLM TP2/TP2+EP2 under the `prompt_words=64`, `max_tokens=64`, `num_prompts=32`, `max_concurrency=1/4/8`, `temperature=0`, `ignore_eos=true` HTTP pressure contract. Prompt words are a workload-generator input, not a token count.
 
 Latest 2026-06-28 result on 2x RTX 5090:
 
@@ -59,6 +59,23 @@ Latest 2026-06-28 result on 2x RTX 5090:
 | HTTP pressure | Clean OpenInfer host-staged and NCCL completed all `1/4/8` concurrency cells; host-staged c4, NCCL c4, and NCCL c8 were noisy. Clean vLLM TP2 and vLLM TP2+EP2 failed server startup on the target FlashInfer SM120 path. | `--max-concurrency` is client pressure, not true internal batch size by itself. |
 | Supplemental vLLM validation | A separate FlashInfer #3633-equivalent validation run completed vLLM TP2 and TP2+EP2 for all `1/4/8` concurrency cells. | Not a clean stock vLLM package-stack claim; it only shares the HTTP client/workload contract. |
 | Trace pass | OpenInfer host-staged showed `decode_batch_size_max=1/4/5` and NCCL showed `1/2/5` for concurrency `1/4/8`. | OpenInfer-only trace evidence; no vLLM internal claim. |
+
+### HTTP Trace And MoE Optimization
+
+The corrected trace contract uses real `/v1/completions` traffic with `prompt_words=64`, observed prompt tokens `84..87`, `max_tokens=64`, concurrency `1/4/8`, greedy decoding, ignore-EOS, and no warmup. Host-staged and NCCL completed the retained trace cells with zero failures, timeouts, or missing traces. Active sets and batched decode steps formed, while decode time still grew with active rows, which ruled out scheduler admission as the final limiter.
+
+Backend attribution found two costs: repeated outer expert replay for routes sharing `(owner_rank, global_expert)`, and the NCCL path copying full hidden states to the host for the gate GEMM. The optimized path groups routes, preserves token-major contribution order, and computes NCCL logits on CUDA with bitwise coverage against the host accumulator. Top-k and softmax remain on the host. The rollback env switches are diagnostic only, used to reproduce serial/host-router A/B rows or recover the old path if a retained gate fails. Direct batch GEMM remains rejected because it changed the retained token hash.
+
+| Backend | c1 | c4 | c8 | Boundary |
+| --- | ---: | ---: | ---: | --- |
+| host-staged paired change | `+14.4%` | `+16.3%` | `+18.3%` | retained short-shape HTTP A/B |
+| NCCL paired median change | `+23.4%` | `+21.7%` | `+29.5%` | retained short-shape HTTP A/B; multiple paired runs |
+
+The retained A/B rows completed with zero failures, timeouts, or missing traces, and each paired baseline/optimized cell preserved its request output hash set. Direct `Hello`/16 attribution also preserved the exact retained token and text hashes.
+
+The remaining profiler direction is attention/KV host-side work. Moving attention and KV state fully device-side changes cache ownership, long-context capacity, request retirement, and CUDA Graph semantics, so it remains a separate change with its own artifact contract.
+
+These results cover direct `Hello`/16 and short fixed-shape HTTP traffic only. They do not prove mixed or long-prompt scaling, soak/SLO behavior, production readiness, multi-node EP, or vLLM parity.
 
 ### Direct Same-Prompt Diagnostic Batch
 
@@ -143,14 +160,14 @@ Retained 2026-07-04 no-regression benchmark for #453 used real `/v1/completions`
 
 | Backend | Shape | Completed | Failed/timeouts | Output tok/s | TTFT avg ms | TPOT/ITL avg ms | active max | decode batch max | traces | output hash |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |
-| host-staged | short `64/64`, c1 | 8/8 | 0/0 | 22.886 | 1226.8 | 24.9 | 1 | 1 | 8/8 | `fed09e819c83762a` |
-| host-staged | short `64/64`, c4 | 8/8 | 0/0 | 21.698 | 2612.8 | 145.1 | 4 | 3 | 8/8 | `fed09e819c83762a` |
-| host-staged | short `64/64`, c8 | 8/8 | 0/0 | 21.830 | 5439.8 | 284.2 | 8 | 5 | 8/8 | `fed09e819c83762a` |
+| host-staged | short `prompt_words=64/max_tokens=64`, c1 | 8/8 | 0/0 | 22.886 | 1226.8 | 24.9 | 1 | 1 | 8/8 | `fed09e819c83762a` |
+| host-staged | short `prompt_words=64/max_tokens=64`, c4 | 8/8 | 0/0 | 21.698 | 2612.8 | 145.1 | 4 | 3 | 8/8 | `fed09e819c83762a` |
+| host-staged | short `prompt_words=64/max_tokens=64`, c8 | 8/8 | 0/0 | 21.830 | 5439.8 | 284.2 | 8 | 5 | 8/8 | `fed09e819c83762a` |
 | host-staged | mixed `16/128`, c4 | 8/8 | 0/0 | 8.281 | 4543.3 | 210.0 | 4 | 2 | 8/8 | `88d8d31234d66978` |
 | host-staged | mixed `16/128`, c8 | 8/8 | 0/0 | 8.288 | 7897.1 | 496.9 | 8 | 3 | 8/8 | `88d8d31234d66978` |
-| NCCL | short `64/64`, c1 | 8/8 | 0/0 | 24.873 | 1034.2 | 24.4 | 1 | 1 | 8/8 | `fed09e819c83762a` |
-| NCCL | short `64/64`, c4 | 8/8 | 0/0 | 23.678 | 2210.0 | 135.8 | 4 | 3 | 8/8 | `fed09e819c83762a` |
-| NCCL | short `64/64`, c8 | 8/8 | 0/0 | 23.872 | 4594.4 | 266.1 | 8 | 6 | 8/8 | `fed09e819c83762a` |
+| NCCL | short `prompt_words=64/max_tokens=64`, c1 | 8/8 | 0/0 | 24.873 | 1034.2 | 24.4 | 1 | 1 | 8/8 | `fed09e819c83762a` |
+| NCCL | short `prompt_words=64/max_tokens=64`, c4 | 8/8 | 0/0 | 23.678 | 2210.0 | 135.8 | 4 | 3 | 8/8 | `fed09e819c83762a` |
+| NCCL | short `prompt_words=64/max_tokens=64`, c8 | 8/8 | 0/0 | 23.872 | 4594.4 | 266.1 | 8 | 6 | 8/8 | `fed09e819c83762a` |
 | NCCL | mixed `16/128`, c4 | 8/8 | 0/0 | 9.186 | 2216.6 | 314.9 | 4 | 1 | 8/8 | `88d8d31234d66978` |
 | NCCL | mixed `16/128`, c8 | 8/8 | 0/0 | 9.269 | 6920.1 | 453.0 | 8 | 3 | 8/8 | `88d8d31234d66978` |
 
@@ -213,9 +230,11 @@ Scenario summaries:
 
 ### Interpretation
 
-- direct same-prompt diagnostics show NCCL is still much slower than host-staged, although aggregate decode throughput improves with larger diagnostic batch size;
-- NCCL remains a correctness-first backend and is still significantly slower than host-staged;
+- older direct same-prompt snapshots showed NCCL behind host-staged; the #464 paired runs supersede that conclusion for the retained `Hello/16`, batch `1/4/8` shape only;
 - the #280 HTTP trace proves active request sets and subgroup decode batches, but throughput still scales only weakly on NCCL EP2 and long prompts have high TTFT;
+- the #464 trace refresh closes the phase/decode-step observability gap: batching forms, while decode mean/total grows with active rows, so scheduler admission is not the final throughput blocker;
+- the #464 host-staged and NCCL route grouping reduces repeated expert replay; the NCCL device logits router also removes the CPU gate GEMM and full-hidden D2H copy;
+- NCCL collectives are not the dominant measured limiter for the retained short shape; attention/KV host-side work requires a separate cache/ownership design;
 - the #453 runner and trace fields make failure isolation auditable; host-staged and NCCL live HTTP artifacts now prove cancel/disconnect/reject/overload/mixed-failure cleanup and clean follow-up recovery on the retained 2-GPU validation contract;
 - the 2026-06-28 clean matrix keeps stock vLLM startup failures visible because they are part of the reproducibility record;
 - the supplemental vLLM validation shows the HTTP contract can run after the FlashInfer SM120/CUDA 12.8 path is fixed, but it should stay separate from stock-package rows;
@@ -230,7 +249,9 @@ Use these labels consistently:
 | `direct single-row` | In-process batch `1` decode. | HTTP serving throughput. |
 | `direct same-prompt diagnostic batch` | Fixed same-prompt direct batch sizes `1/4/8`. | Production continuous batching or mixed-request scheduling. |
 | `first mixed-request serving gate` | Greedy-only EP2 scheduler path with explicit admission/rejection/deferral, per-request host-side decode `DecodeCache`, active cap `8`, and exact sequential-oracle E2E. | vLLM parity, sparse dispatch, production EP readiness, HTTP throughput scaling, non-greedy sampling, or logprobs support. |
-| `HTTP trace/subgroup evidence` | `/v1/completions` requests have per-request `openinfer_http_trace` rows, and HTTP sweeps show non-1 `active_set_size` and `decode_batch_size_max`. | Fair vLLM parity, long-prompt latency readiness, or a before/after percentage unless a paired baseline run is recorded. |
+| `HTTP trace/subgroup evidence` | `/v1/completions` requests have per-request `openinfer_http_trace` rows; HTTP sweeps show non-1 `active_set_size`, `decode_batch_size_max`, phase timing, and batched-vs-singleton decode-step counts. | Fair vLLM parity, long-prompt latency readiness, backend/kernel attribution, or a before/after percentage unless a paired baseline run is recorded. |
+| `route-grouped MoE slice` | Separate paired host-staged and NCCL direct/HTTP A/B for the retained #464 shapes, with exact token/text hashes and contribution accumulation in original route order. | Fewer per-row GEMM launches, broad workload scaling, soak/SLO readiness, production EP readiness, or vLLM parity. |
+| `NCCL device logits router slice` | The gate GEMM runs on CUDA with bitwise host-logit coverage; existing host top-k/softmax builds the route plan. | Fully device-resident routing, no routing D2H, general numerical equivalence, or non-NCCL improvement. |
 | `HTTP reliability lifecycle gate` | `/v1/completions` cancel/disconnect/reject/overload/mixed-failure scenarios have terminal reason counts, trace coverage, active/pending/decode maxima, output hashes, and clean follow-up recovery evidence. | Production EP readiness, soak stability, SLO latency, vLLM parity, throughput improvement, sparse dispatch, or multi-node EP support. |
 | `covered NCCL decode graph probe` | Probe-only batch-1 `Hello` decode step captured, instantiated, replayed, and token-verified under CUDA Graph. | Default serving graph coverage, multi-step graph replay, batch `4/8` graph coverage, or performance improvement. |
 | `HTTP concurrency pressure` | `vllm bench serve --max-concurrency N` against an HTTP endpoint. | True OpenInfer batch size unless the engine path proves it. |
@@ -242,7 +263,7 @@ Do not claim:
 - sparse dispatch readiness;
 - multi-node EP support;
 - vLLM serving parity;
-- performance improvement from the status tables alone.
+- performance improvement outside a recorded paired benchmark contract.
 
 ## Next Gates
 
@@ -271,13 +292,14 @@ The next implementation should be chosen from measured evidence:
    - vLLM TP2.
    - vLLM TP2+EP2 when supported.
    - default vLLM configuration plus a controlled configuration with cache/flag choices recorded.
+   - keep host-staged and NCCL measurements separately attributable even when one PR changes both.
 
 4. Widen the first mixed-request serving gate before broader throughput claims.
    - keep the fixed EP2 path and exact sequential oracle until a wider oracle replaces it;
    - keep greedy-only admission explicit until sampling/logprobs have their own gate;
    - keep direct same-prompt batch labeled diagnostic;
    - reduce long-prompt prefill and admission-queue TTFT before claiming long-prompt serving readiness;
-   - add paired baseline runs before claiming a percentage speedup from subgroup batching.
+   - require paired baseline runs for every future percentage speedup; #464 retains separate host-staged and NCCL paired results.
 
 5. Keep the #453 HTTP reliability evidence retained.
    - rerun the reliability runner for host-staged and NCCL when scheduler or HTTP lifecycle code changes;
@@ -287,3 +309,9 @@ The next implementation should be chosen from measured evidence:
 6. Keep MoE internals readable.
    - routing, dispatch, expert execution, and combine should remain distinguishable in code and attribution;
    - avoid introducing a generic EP framework before the DeepSeek-V2-Lite EP2 path has a measured reason to need it.
+
+7. Design the remaining attention optimization as a separate change.
+   - preserve explicit KV/cache ownership and request retirement semantics;
+   - prove long-context capacity before replacing the host path;
+   - define CUDA Graph pointer-stability and replay behavior before enabling it;
+   - keep exact HF / host-staged / NCCL gates and paired direct/HTTP evidence.

@@ -20,12 +20,15 @@ use half::bf16;
 #[cfg(test)]
 use openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_PAGE_SIZE;
 use openinfer_kernels::ops::{
-    GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW, GLM52_SPARSE_MLA_HEAD_SLOTS, Glm52FlashMlaSparseDecode,
+    GLM52_FLASHINFER_SPARSE_BYTES_PER_TOKEN, GLM52_FLASHINFER_SPARSE_WORKSPACE_BYTES,
+    GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN, GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW,
+    GLM52_SPARSE_MLA_HEAD_SLOTS, Glm52FlashInferSparseDecode, Glm52FlashMlaSparseDecode,
     Glm52MoeQuantShape, Glm52SparseMlaDecode, gemm_strided_batched_bf16,
+    glm52_flashinfer_sparse_mla_fp8_launch, glm52_flashinfer_sparse_mla_supported,
     glm52_flashmla_sparse_decode_launch, glm52_flashmla_sparse_decode_metadata_launch,
-    glm52_fp8_per_token_group_quant_bf16_launch, glm52_mla_cache_pack_launch,
-    glm52_mla_ckv_split_launch, glm52_mla_query_assemble_launch, glm52_sparse_mla_decode_launch,
-    rms_norm_rows_into,
+    glm52_fp8_per_token_group_quant_bf16_ue8m0_launch, glm52_mla_cache_pack_launch,
+    glm52_mla_ckv_split_launch, glm52_mla_front_pack_fp8_launch, glm52_mla_query_assemble_launch,
+    glm52_sparse_mla_decode_launch, rms_norm_rows_into,
 };
 use openinfer_kernels::tensor::{DeviceContext, DeviceVec};
 
@@ -36,6 +39,7 @@ use crate::config::{
 };
 use crate::fp8::{
     FP8_BLOCK, Glm52ProjBytes, ProjWeight, bytes_to_f32, e4m3_to_f32, fp8_linear_into,
+    fp8_linear_pair_into,
 };
 use crate::rows::Rows;
 
@@ -52,6 +56,29 @@ const KV_A_OUT: usize = GLM52_KV_A_OUT; // compressed_kv(512) + k_pe(64)
 const V_HEAD: usize = GLM52_V_HEAD_DIM;
 const KV_B_ROWS_PER_HEAD: usize = QK_NOPE + V_HEAD; // 448
 const QUERY_DIM: usize = KV_LORA + ROPE_DIM; // 576
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Glm52MlaBackend {
+    FlashMlaFp8Ds,
+    FlashInferFp8,
+}
+
+impl Glm52MlaBackend {
+    pub(crate) fn cache_bytes_per_token(self) -> usize {
+        match self {
+            Self::FlashMlaFp8Ds => GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN,
+            Self::FlashInferFp8 => GLM52_FLASHINFER_SPARSE_BYTES_PER_TOKEN,
+        }
+    }
+}
+
+pub(crate) fn glm52_select_mla_backend(heads: usize) -> Result<Glm52MlaBackend> {
+    if heads == 16 && glm52_flashinfer_sparse_mla_supported(heads)? {
+        Ok(Glm52MlaBackend::FlashInferFp8)
+    } else {
+        Ok(Glm52MlaBackend::FlashMlaFp8Ds)
+    }
+}
 
 /// One MLA layer's attention weights, device-resident. `heads` is the number
 /// of q/v heads THIS instance carries: the full 64, or an attention-TP head
@@ -275,7 +302,7 @@ pub(crate) struct Glm52MlaFront {
 impl Glm52MlaFront {
     pub(crate) fn new(ctx: &DeviceContext, tokens: usize, heads: usize) -> Result<Self> {
         ensure!(
-            heads >= 1 && heads <= HEADS,
+            (1..=HEADS).contains(&heads),
             "GLM5.2 MLA front heads {heads} out of 1..={HEADS}"
         );
         Ok(Self {
@@ -310,14 +337,27 @@ pub(crate) fn glm52_mla_front_q_into(
     front: &mut Glm52MlaFront,
 ) -> Result<()> {
     let t = front.tokens();
-    fp8_linear_into(
-        ctx,
-        &w.q_a,
-        t,
-        hidden.data(),
-        Some(&mut front.gemv_partial),
-        &mut front.q_a,
-    )?; // [T, 2048]
+    if t == 1 {
+        // q_a and kv_a share `hidden`. On bs=1 one concatenated grid removes
+        // a graph node while keeping both checkpoint weights/output buffers.
+        fp8_linear_pair_into(
+            ctx,
+            &w.q_a,
+            &w.kv_a,
+            hidden.data(),
+            &mut front.q_a,
+            &mut front.ckv,
+        )?;
+    } else {
+        fp8_linear_into(
+            ctx,
+            &w.q_a,
+            t,
+            hidden.data(),
+            Some(&mut front.gemv_partial),
+            &mut front.q_a,
+        )?;
+    }
     rms_norm_rows_into(
         ctx,
         &front.q_a,
@@ -331,11 +371,16 @@ pub(crate) fn glm52_mla_front_q_into(
 
 /// The remainder of the MLA front: q_b + kv_a projections and the kv_c/k_pe
 /// unpacking, over the front's `tokens` rows. Independent of the indexer.
+///
+/// `fold_kv_pack` (the FlashInfer backend): the ckv split and kv_a RMSNorm
+/// are fused into the attend-side `glm52_mla_front_pack_fp8_launch`, so this
+/// half leaves `front.ckv` raw and never touches kv_c/k_pe.
 pub(crate) fn glm52_mla_front_rest_into(
     ctx: &DeviceContext,
     w: &Glm52MlaLayerWeights,
     hidden: &Rows<HIDDEN>,
     front: &mut Glm52MlaFront,
+    fold_kv_pack: bool,
 ) -> Result<()> {
     let t = front.tokens();
     ensure!(
@@ -352,14 +397,19 @@ pub(crate) fn glm52_mla_front_rest_into(
         Some(&mut front.gemv_partial),
         &mut front.q_full,
     )?; // [T, heads, 256]
-    fp8_linear_into(
-        ctx,
-        &w.kv_a,
-        t,
-        hidden.data(),
-        Some(&mut front.gemv_partial),
-        &mut front.ckv,
-    )?; // [T, 576]
+    if t != 1 {
+        fp8_linear_into(
+            ctx,
+            &w.kv_a,
+            t,
+            hidden.data(),
+            Some(&mut front.gemv_partial),
+            &mut front.ckv,
+        )?;
+    }
+    if fold_kv_pack {
+        return Ok(());
+    }
     glm52_mla_ckv_split_launch(ctx, t, &front.ckv, &mut front.kv_c_raw, &mut front.k_pe)?;
     rms_norm_rows_into(
         ctx,
@@ -380,84 +430,117 @@ pub(crate) fn glm52_mla_front_into(
     w: &Glm52MlaLayerWeights,
     hidden: &Rows<HIDDEN>,
     front: &mut Glm52MlaFront,
+    fold_kv_pack: bool,
 ) -> Result<()> {
     glm52_mla_front_q_into(ctx, w, hidden, front)?;
-    glm52_mla_front_rest_into(ctx, w, hidden, front)
+    glm52_mla_front_rest_into(ctx, w, hidden, front, fold_kv_pack)
 }
 
-/// Sparse-attention backend scratch. A head shard (attention-TP, <= 16 head
-/// slots) runs the right-sized sparse MLA kernel — fixed 16-split grid plus a
-/// deterministic combine; the 64-head EP8 path stays on FlashMLA with its
-/// tile-scheduler split accumulators.
-enum Glm52SparseAttend {
+/// Persistent scratch for the MLA attend half: absorb/query-assemble/cache-
+/// pack intermediates and the FlashMLA output + split accumulators, sized for
+/// the contract's `batch_size` rows. Shared across all 78 layers, written in
+/// place every step.
+pub(crate) struct Glm52MlaAttendScratch {
+    // Compact head-shard buffers ([T, heads, .]): the absorb GEMM output and
+    // the W_UV output feeding o_proj.
+    ql_nope: CudaSlice<bf16>,
+    v: CudaSlice<bf16>,
+    backend: Glm52MlaBackendScratch,
+    heads: usize,
+    // Owned mma partial buffer for the o_proj projection (see Glm52MlaFront).
+    gemv_partial: CudaSlice<f32>,
+}
+
+enum Glm52MlaBackendScratch {
+    Fp8Ds(Box<Glm52Fp8DsScratch>),
+    FlashInfer(Box<Glm52FlashInferScratch>),
+}
+
+struct Glm52Fp8DsScratch {
+    query: CudaSlice<bf16>,
+    latent: CudaSlice<bf16>,
+    attend: Glm52Fp8DsAttendScratch,
+    ckv_fp8: CudaSlice<u8>,
+    ckv_scales: CudaSlice<f32>,
+}
+
+enum Glm52Fp8DsAttendScratch {
     Rightsize {
-        // Unnormalized split partials + (m, l) pairs for the combine.
         o_part: CudaSlice<f32>,
         ml_part: CudaSlice<f32>,
     },
-    Flash {
+    FlashMla {
         lse: CudaSlice<f32>,
         lse_accum: CudaSlice<f32>,
         o_accum: CudaSlice<f32>,
     },
 }
 
-/// Persistent scratch for the MLA attend half: absorb/query-assemble/cache-
-/// pack intermediates and the sparse-attention output + backend accumulators,
-/// sized for the contract's `batch_size` rows. Shared across all 78 layers,
-/// written in place every step.
-pub(crate) struct Glm52MlaAttendScratch {
-    // Compact head-shard buffers ([T, heads, .]): the absorb GEMM output and
-    // the W_UV output feeding o_proj.
-    ql_nope: CudaSlice<bf16>,
-    v: CudaSlice<bf16>,
-    // Full-width sparse-attention buffers ([T, 64, .]): both backends keep
-    // the 64-slot query/latent shape. Under a head shard the real heads
-    // occupy slots 0..heads and the pad slots keep this alloc's zero fill
-    // forever (never read back).
-    query: CudaSlice<bf16>,
+struct Glm52FlashInferScratch {
+    query: CudaSlice<u8>,
     latent: CudaSlice<bf16>,
-    attend: Glm52SparseAttend,
-    ckv_fp8: CudaSlice<u8>,
-    ckv_scales: CudaSlice<f32>,
-    heads: usize,
-    // Owned mma partial buffer for the o_proj projection (see Glm52MlaFront).
-    gemv_partial: CudaSlice<f32>,
+    workspace: CudaSlice<u8>,
 }
 
 impl Glm52MlaAttendScratch {
+    #[cfg(test)]
     pub(crate) fn new(
         ctx: &DeviceContext,
         contract: &Glm52FlashMlaSparseDecode,
         heads: usize,
     ) -> Result<Self> {
+        Self::new_for_backend(ctx, contract, heads, Glm52MlaBackend::FlashMlaFp8Ds)
+    }
+
+    pub(crate) fn new_for_backend(
+        ctx: &DeviceContext,
+        contract: &Glm52FlashMlaSparseDecode,
+        heads: usize,
+        backend: Glm52MlaBackend,
+    ) -> Result<Self> {
         ensure!(
-            heads >= 1 && heads <= HEADS,
+            (1..=HEADS).contains(&heads),
             "GLM5.2 MLA attend heads {heads} out of 1..={HEADS}"
         );
         let t = contract.batch_size;
-        let attend = if heads <= GLM52_SPARSE_MLA_HEAD_SLOTS {
-            let rightsize = rightsize_contract(contract, heads);
-            rightsize.validate()?;
-            Glm52SparseAttend::Rightsize {
-                o_part: ctx.stream.alloc_zeros::<f32>(rightsize.o_part_len())?,
-                ml_part: ctx.stream.alloc_zeros::<f32>(rightsize.ml_part_len())?,
+        let backend = match backend {
+            Glm52MlaBackend::FlashMlaFp8Ds => {
+                let attend = if heads <= GLM52_SPARSE_MLA_HEAD_SLOTS {
+                    let rightsize = rightsize_contract(contract, heads);
+                    rightsize.validate()?;
+                    Glm52Fp8DsAttendScratch::Rightsize {
+                        o_part: ctx.stream.alloc_zeros::<f32>(rightsize.o_part_len())?,
+                        ml_part: ctx.stream.alloc_zeros::<f32>(rightsize.ml_part_len())?,
+                    }
+                } else {
+                    Glm52Fp8DsAttendScratch::FlashMla {
+                        lse: ctx.stream.alloc_zeros::<f32>(contract.lse_len())?,
+                        lse_accum: ctx.stream.alloc_zeros::<f32>(contract.lse_accum_len())?,
+                        o_accum: ctx.stream.alloc_zeros::<f32>(contract.o_accum_len())?,
+                    }
+                };
+                Glm52MlaBackendScratch::Fp8Ds(Box::new(Glm52Fp8DsScratch {
+                    query: ctx.stream.alloc_zeros::<bf16>(t * HEADS * QUERY_DIM)?,
+                    latent: ctx.stream.alloc_zeros::<bf16>(contract.latent_len())?,
+                    attend,
+                    ckv_fp8: ctx.stream.alloc_zeros::<u8>(t * KV_LORA)?,
+                    ckv_scales: ctx.stream.alloc_zeros::<f32>(t * (KV_LORA / FP8_BLOCK))?,
+                }))
             }
-        } else {
-            Glm52SparseAttend::Flash {
-                lse: ctx.stream.alloc_zeros::<f32>(contract.lse_len())?,
-                lse_accum: ctx.stream.alloc_zeros::<f32>(contract.lse_accum_len())?,
-                o_accum: ctx.stream.alloc_zeros::<f32>(contract.o_accum_len())?,
+            Glm52MlaBackend::FlashInferFp8 => {
+                Glm52MlaBackendScratch::FlashInfer(Box::new(Glm52FlashInferScratch {
+                    query: ctx.stream.alloc_zeros::<u8>(t * heads * QUERY_DIM)?,
+                    latent: ctx.stream.alloc_zeros::<bf16>(t * heads * KV_LORA)?,
+                    workspace: ctx
+                        .stream
+                        .alloc_zeros::<u8>(GLM52_FLASHINFER_SPARSE_WORKSPACE_BYTES)?,
+                }))
             }
         };
         Ok(Self {
             ql_nope: ctx.stream.alloc_zeros::<bf16>(t * heads * KV_LORA)?,
             v: ctx.stream.alloc_zeros::<bf16>(t * heads * V_HEAD)?,
-            query: ctx.stream.alloc_zeros::<bf16>(t * HEADS * QUERY_DIM)?,
-            latent: ctx.stream.alloc_zeros::<bf16>(contract.latent_len())?,
-            attend,
-            ckv_fp8: ctx.stream.alloc_zeros::<u8>(t * KV_LORA)?,
-            ckv_scales: ctx.stream.alloc_zeros::<f32>(t * (KV_LORA / FP8_BLOCK))?,
+            backend,
             heads,
             gemv_partial: ctx
                 .stream
@@ -510,10 +593,11 @@ pub(crate) fn glm52_mla_decode_forward(
     let mut front = Glm52MlaFront::new(ctx, sched.batch(), w.heads)?;
     let mut attend = Glm52MlaAttendScratch::new(ctx, &sched.contract, w.heads)?;
     let mut slot_mapping = ctx.stream.alloc_zeros::<i64>(1)?;
+    let seq_lens = ctx.stream.clone_htod(&[(position + 1) as i32])?;
     ctx.stream
         .memcpy_htod(&[position as i64], &mut slot_mapping)?;
     let mut o = Rows::zeros(ctx, sched.batch())?;
-    glm52_mla_front_into(ctx, w, hidden, &mut front)?;
+    glm52_mla_front_into(ctx, w, hidden, &mut front, sched.folds_kv_pack())?;
     glm52_mla_attend_into(
         ctx,
         w,
@@ -523,6 +607,7 @@ pub(crate) fn glm52_mla_decode_forward(
         cache,
         &slot_mapping,
         topk,
+        &seq_lens,
         sched,
         &mut attend,
         &mut o,
@@ -530,49 +615,66 @@ pub(crate) fn glm52_mla_decode_forward(
     Ok(o)
 }
 
-enum Glm52MlaSchedBackend {
+/// A FlashMLA sparse decode contract paired with its tile-scheduler plan. The
+/// plan depends only on `batch_size`, `topk` and `num_sm_parts` — not on
+/// position, sequence length, or layer — so it is computed once (model build
+/// time) instead of per layer per step (78 × ~25 µs/step at bs=1). Owning the
+/// contract makes a plan/contract mismatch unrepresentable: every consumer
+/// reads both from the same object.
+pub(crate) struct Glm52MlaSchedMetadata {
+    contract: Glm52FlashMlaSparseDecode,
+    backend: Glm52MlaBackendSchedule,
+}
+
+enum Glm52MlaBackendSchedule {
     Rightsize,
-    Flash {
+    FlashMla {
         tile_scheduler_metadata: CudaSlice<i32>,
         num_splits: CudaSlice<i32>,
     },
-}
-
-/// Sparse MLA contract paired with only the selected backend's scheduler
-/// state. The 64-head EP8 FlashMLA path owns its precomputed tile plan; the
-/// right-sized attention-TP path has no FlashMLA metadata to allocate or
-/// initialize.
-pub(crate) struct Glm52MlaSchedMetadata {
-    contract: Glm52FlashMlaSparseDecode,
-    backend: Glm52MlaSchedBackend,
+    FlashInfer,
 }
 
 impl Glm52MlaSchedMetadata {
+    #[cfg(test)]
     pub(crate) fn new(
         ctx: &DeviceContext,
         contract: Glm52FlashMlaSparseDecode,
         heads: usize,
     ) -> Result<Self> {
-        let backend = if heads <= GLM52_SPARSE_MLA_HEAD_SLOTS {
-            rightsize_contract(&contract, heads).validate()?;
-            Glm52MlaSchedBackend::Rightsize
-        } else {
-            let mut tile_scheduler_metadata = ctx
-                .stream
-                .alloc_zeros::<i32>(contract.tile_scheduler_metadata_len())?;
-            let mut num_splits = ctx.stream.alloc_zeros::<i32>(contract.num_splits_len())?;
-            glm52_flashmla_sparse_decode_metadata_launch(
-                ctx,
-                contract.batch_size,
-                contract.topk,
-                contract.num_sm_parts,
-                &mut tile_scheduler_metadata,
-                &mut num_splits,
-            )?;
-            Glm52MlaSchedBackend::Flash {
-                tile_scheduler_metadata,
-                num_splits,
+        Self::new_for_backend(ctx, contract, heads, Glm52MlaBackend::FlashMlaFp8Ds)
+    }
+
+    pub(crate) fn new_for_backend(
+        ctx: &DeviceContext,
+        contract: Glm52FlashMlaSparseDecode,
+        heads: usize,
+        backend: Glm52MlaBackend,
+    ) -> Result<Self> {
+        let backend = match backend {
+            Glm52MlaBackend::FlashMlaFp8Ds if heads <= GLM52_SPARSE_MLA_HEAD_SLOTS => {
+                rightsize_contract(&contract, heads).validate()?;
+                Glm52MlaBackendSchedule::Rightsize
             }
+            Glm52MlaBackend::FlashMlaFp8Ds => {
+                let mut tile_scheduler_metadata = ctx
+                    .stream
+                    .alloc_zeros::<i32>(contract.tile_scheduler_metadata_len())?;
+                let mut num_splits = ctx.stream.alloc_zeros::<i32>(contract.num_splits_len())?;
+                glm52_flashmla_sparse_decode_metadata_launch(
+                    ctx,
+                    contract.batch_size,
+                    contract.topk,
+                    contract.num_sm_parts,
+                    &mut tile_scheduler_metadata,
+                    &mut num_splits,
+                )?;
+                Glm52MlaBackendSchedule::FlashMla {
+                    tile_scheduler_metadata,
+                    num_splits,
+                }
+            }
+            Glm52MlaBackend::FlashInferFp8 => Glm52MlaBackendSchedule::FlashInfer,
         };
         Ok(Self { contract, backend })
     }
@@ -589,6 +691,60 @@ impl Glm52MlaSchedMetadata {
     pub(crate) fn batch(&self) -> usize {
         self.contract.batch_size
     }
+
+    /// Whether the attend half packs the cache with the fused front kernel
+    /// (query assemble + kv_a RMSNorm + cache pack in one launch): the MLA
+    /// front must then leave `front.ckv` raw and skip the split/norm.
+    pub(crate) fn folds_kv_pack(&self) -> bool {
+        matches!(self.backend, Glm52MlaBackendSchedule::FlashInfer)
+    }
+}
+
+/// Eagerly load and launch the selected FlashInfer cubin before whole-step
+/// graph capture. Module loading and host-side kernel selection are not valid
+/// capture work; this also fails startup if a decode bucket lacks metadata.
+pub(crate) fn glm52_mla_backend_preflight(
+    ctx: &DeviceContext,
+    sched: &Glm52MlaSchedMetadata,
+    s: &mut Glm52MlaAttendScratch,
+    cache: &CudaSlice<u8>,
+) -> Result<()> {
+    let contract = sched.contract;
+    let heads = s.heads;
+    let (query, latent, workspace) = match (&sched.backend, &mut s.backend) {
+        (
+            Glm52MlaBackendSchedule::Rightsize | Glm52MlaBackendSchedule::FlashMla { .. },
+            Glm52MlaBackendScratch::Fp8Ds(_),
+        ) => {
+            return Ok(());
+        }
+        (Glm52MlaBackendSchedule::FlashInfer, Glm52MlaBackendScratch::FlashInfer(scratch)) => (
+            &mut scratch.query,
+            &mut scratch.latent,
+            &mut scratch.workspace,
+        ),
+        _ => anyhow::bail!("GLM5.2 MLA preflight schedule/scratch backend mismatch"),
+    };
+    let indices = ctx
+        .stream
+        .clone_htod(&vec![0i32; contract.batch_size * contract.topk])?;
+    let seq_lens = ctx.stream.clone_htod(&vec![1i32; contract.batch_size])?;
+    glm52_flashinfer_sparse_mla_fp8_launch(
+        ctx,
+        Glm52FlashInferSparseDecode {
+            batch_size: contract.batch_size,
+            heads,
+            num_blocks: contract.num_blocks,
+            topk: contract.topk,
+            sm_scale: contract.sm_scale,
+        },
+        query,
+        cache,
+        &indices,
+        &seq_lens,
+        latent,
+        workspace,
+    )
 }
 
 /// MLA attend half over the plan's `batch()` rows: consumes the front
@@ -608,6 +764,7 @@ pub(crate) fn glm52_mla_attend_into(
     cache: &mut CudaSlice<u8>,
     slot_mapping: &CudaSlice<i64>,
     topk: &CudaSlice<i32>,
+    seq_lens: &CudaSlice<i32>,
     sched: &Glm52MlaSchedMetadata,
     s: &mut Glm52MlaAttendScratch,
     out: &mut Rows<HIDDEN>,
@@ -654,86 +811,132 @@ pub(crate) fn glm52_mla_attend_into(
         heads,
     )?;
 
-    // ---- assemble query [T,64,576] = [ql_nope | rope(q_pe)] (q_pe in q_full @192) ----
-    // Compact shard in, full-width query out (FlashMLA's fixed shape).
-    glm52_mla_query_assemble_launch(
-        ctx,
-        t,
-        heads,
-        &s.ql_nope,
-        &front.q_full,
-        QK_NOPE,
-        Q_HEAD,
-        cos,
-        sin,
-        &mut s.query,
-    )?;
-
-    // ---- pack each row's new token into the cache: quant(kv_c) + rope(k_pe) ----
-    glm52_fp8_per_token_group_quant_bf16_launch(
-        ctx,
-        Glm52MoeQuantShape {
-            rows: t,
-            width: KV_LORA,
-            group_size: FP8_BLOCK,
-        },
-        &front.kv_c,
-        &mut s.ckv_fp8,
-        &mut s.ckv_scales,
-    )?;
-    glm52_mla_cache_pack_launch(
-        ctx,
-        t,
-        &s.ckv_fp8,
-        &s.ckv_scales,
-        &front.k_pe,
-        cos,
-        sin,
-        cache,
-        slot_mapping,
-    )?;
-
-    // ---- sparse decode -> latent[T,64,512] ----
-    match (&mut s.attend, &sched.backend) {
-        (Glm52SparseAttend::Rightsize { o_part, ml_part }, Glm52MlaSchedBackend::Rightsize) => {
-            glm52_sparse_mla_decode_launch(
-                ctx,
-                rightsize_contract(&contract, heads),
-                &s.query,
-                cache,
-                topk,
-                o_part,
-                ml_part,
-                &mut s.latent,
-            )?;
-        }
+    let (latent, latent_token_stride) = match (&sched.backend, &mut s.backend) {
         (
-            Glm52SparseAttend::Flash {
-                lse,
-                lse_accum,
-                o_accum,
-            },
-            Glm52MlaSchedBackend::Flash {
-                tile_scheduler_metadata,
-                num_splits,
-            },
+            schedule @ (Glm52MlaBackendSchedule::Rightsize
+            | Glm52MlaBackendSchedule::FlashMla { .. }),
+            Glm52MlaBackendScratch::Fp8Ds(scratch),
         ) => {
-            glm52_flashmla_sparse_decode_launch(
+            glm52_mla_query_assemble_launch(
                 ctx,
-                contract,
-                &s.query,
+                t,
+                heads,
+                &s.ql_nope,
+                &front.q_full,
+                QK_NOPE,
+                Q_HEAD,
+                cos,
+                sin,
+                &mut scratch.query,
+            )?;
+            // UE8M0 scales: the FlashMLA fp8_ds_mla cache contract — the sm100
+            // kernel truncates stored scales to powers of two (see the quant
+            // kernel's comment); amax/448 scales silently lose up to 1 bit of
+            // V/K magnitude per group on GB300.
+            glm52_fp8_per_token_group_quant_bf16_ue8m0_launch(
+                ctx,
+                Glm52MoeQuantShape {
+                    rows: t,
+                    width: KV_LORA,
+                    group_size: FP8_BLOCK,
+                },
+                &front.kv_c,
+                &mut scratch.ckv_fp8,
+                &mut scratch.ckv_scales,
+            )?;
+            glm52_mla_cache_pack_launch(
+                ctx,
+                t,
+                &scratch.ckv_fp8,
+                &scratch.ckv_scales,
+                &front.k_pe,
+                cos,
+                sin,
+                cache,
+                slot_mapping,
+            )?;
+            match (schedule, &mut scratch.attend) {
+                (
+                    Glm52MlaBackendSchedule::Rightsize,
+                    Glm52Fp8DsAttendScratch::Rightsize { o_part, ml_part },
+                ) => glm52_sparse_mla_decode_launch(
+                    ctx,
+                    rightsize_contract(&contract, heads),
+                    &scratch.query,
+                    cache,
+                    topk,
+                    o_part,
+                    ml_part,
+                    &mut scratch.latent,
+                )?,
+                (
+                    Glm52MlaBackendSchedule::FlashMla {
+                        tile_scheduler_metadata,
+                        num_splits,
+                    },
+                    Glm52Fp8DsAttendScratch::FlashMla {
+                        lse,
+                        lse_accum,
+                        o_accum,
+                    },
+                ) => glm52_flashmla_sparse_decode_launch(
+                    ctx,
+                    contract,
+                    &scratch.query,
+                    cache,
+                    topk,
+                    tile_scheduler_metadata,
+                    num_splits,
+                    &mut scratch.latent,
+                    lse,
+                    lse_accum,
+                    o_accum,
+                )?,
+                _ => anyhow::bail!("GLM5.2 FP8-DS MLA schedule/scratch backend mismatch"),
+            }
+            (&scratch.latent, HEADS * KV_LORA)
+        }
+        (Glm52MlaBackendSchedule::FlashInfer, Glm52MlaBackendScratch::FlashInfer(scratch)) => {
+            // One fused launch: query assemble + kv_a RMSNorm + cache pack
+            // (the split/norm were skipped in `glm52_mla_front_rest_into` for
+            // this backend — the raw kv_a output is consumed directly).
+            glm52_mla_front_pack_fp8_launch(
+                ctx,
+                t,
+                heads,
+                &s.ql_nope,
+                &front.q_full,
+                QK_NOPE,
+                Q_HEAD,
+                &front.ckv,
+                &w.kv_a_ln.data,
+                RMS_EPS,
+                cos,
+                sin,
+                &mut scratch.query,
+                cache,
+                slot_mapping,
+            )?;
+            glm52_flashinfer_sparse_mla_fp8_launch(
+                ctx,
+                Glm52FlashInferSparseDecode {
+                    batch_size: t,
+                    heads,
+                    num_blocks: contract.num_blocks,
+                    topk: contract.topk,
+                    sm_scale: contract.sm_scale,
+                },
+                &scratch.query,
                 cache,
                 topk,
-                tile_scheduler_metadata,
-                num_splits,
-                &mut s.latent,
-                lse,
-                lse_accum,
-                o_accum,
+                seq_lens,
+                &mut scratch.latent,
+                &mut scratch.workspace,
             )?;
+            (&scratch.latent, heads * KV_LORA)
         }
-        _ => anyhow::bail!("GLM5.2 sparse MLA scratch and scheduler backends disagree"),
-    }
+        _ => anyhow::bail!("GLM5.2 MLA schedule/scratch backend mismatch"),
+    };
 
     // ---- back: v[T,heads,256] = latent @ W_UV, then o_proj ----
     // latent stays full-width [T,64,512] (FlashMLA output); the batch count
@@ -749,8 +952,8 @@ pub(crate) fn glm52_mla_attend_into(
         &w.w_uv,
         KV_LORA,
         V_HEAD * KV_LORA,
-        &s.latent,
-        HEADS * KV_LORA,
+        latent,
+        latent_token_stride,
         KV_LORA,
         &mut s.v,
         heads * V_HEAD,

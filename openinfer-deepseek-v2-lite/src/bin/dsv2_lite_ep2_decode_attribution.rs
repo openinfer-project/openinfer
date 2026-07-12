@@ -62,7 +62,6 @@ fn main() -> Result<()> {
         &model_path,
         EngineLoadOptions {
             enable_cuda_graph: false,
-            enable_prefill_profile: false,
             device_ordinals: vec![0, 1],
             seed: 42,
             ..EngineLoadOptions::default()

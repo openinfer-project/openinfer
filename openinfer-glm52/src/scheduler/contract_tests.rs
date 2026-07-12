@@ -12,10 +12,25 @@ use openinfer_sample::SamplingParams;
 use crate::model::GLM52_MAX_BATCH_PER_RANK;
 
 use super::admission::lifetime_blocks;
+use super::graph::graph_dump_bucket;
 use super::slot::GLM52_DSPARK_EP8_SPAN_DRAFTS;
 use super::slot::{Glm52SlotState, Glm52StepOutcome};
 use super::testkit::{EOS, request};
 use super::{ActiveRequest, PAGE, RankSlots, admit_from_queue, publish_load};
+
+#[test]
+fn graph_dump_uses_a_serving_shape_for_each_topology() {
+    assert_eq!(
+        graph_dump_bucket(false),
+        1,
+        "EP8 and TP4 have a true bucket-1 graph"
+    );
+    assert_eq!(
+        graph_dump_bucket(true),
+        GLM52_MAX_BATCH_PER_RANK,
+        "full-bucket TP8 only captures its fixed bucket-8 shape"
+    );
+}
 
 #[test]
 fn load_snapshots_keep_rank_ownership() {

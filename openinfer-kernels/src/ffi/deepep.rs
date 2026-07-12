@@ -168,3 +168,57 @@ unsafe extern "C" {
         combined_x: *mut c_void,
     ) -> c_int;
 }
+
+/// GLM5.2 EP4 shim instantiation (csrc/deepep/deepep_glm52_ep4.h): the
+/// four-GPU layout (64 local experts/rank) with `glm52_ep4_deepep_` symbols
+/// and its own opaque context.
+#[cfg(feature = "glm52")]
+#[repr(C)]
+pub struct Glm52Ep4DeepEpCtx {
+    _opaque: [u8; 0],
+}
+
+#[cfg(feature = "glm52")]
+unsafe extern "C" {
+    pub fn glm52_ep4_deepep_last_error() -> *const c_char;
+
+    pub fn glm52_ep4_deepep_info(out: *mut DeepEpInfo);
+
+    pub fn glm52_ep4_deepep_unique_id(out: *mut u8) -> c_int;
+
+    pub fn glm52_ep4_deepep_ctx_create(
+        unique_id: *const u8,
+        num_ranks: i32,
+        rank_idx: i32,
+        out: *mut *mut Glm52Ep4DeepEpCtx,
+    ) -> c_int;
+
+    pub fn glm52_ep4_deepep_ctx_destroy(ctx: *mut Glm52Ep4DeepEpCtx) -> c_int;
+
+    pub fn glm52_ep4_deepep_decode_dispatch(
+        ctx: *mut Glm52Ep4DeepEpCtx,
+        stream: *mut c_void,
+        x: *const c_void,
+        topk_idx: *const i32,
+        topk_weights: *const f32,
+        num_tokens: i32,
+        rank_count_scratch: *mut i32,
+        dst_slot_scratch: *mut i32,
+        psum_rank: *mut i32,
+        psum_expert: *mut i32,
+        recv_x: *mut c_void,
+        recv_topk_weights: *mut f32,
+        recv_src_metadata: *mut i32,
+    ) -> c_int;
+
+    pub fn glm52_ep4_deepep_decode_combine(
+        ctx: *mut Glm52Ep4DeepEpCtx,
+        stream: *mut c_void,
+        x: *const c_void,
+        src_metadata: *const i32,
+        psum_rank: *const i32,
+        combined_topk_idx: *const i32,
+        num_tokens: i32,
+        combined_x: *mut c_void,
+    ) -> c_int;
+}

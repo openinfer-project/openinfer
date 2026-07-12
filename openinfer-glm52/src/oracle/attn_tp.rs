@@ -20,9 +20,10 @@ use std::sync::{Arc, Barrier, Mutex};
 use anyhow::{Result, ensure};
 use half::bf16;
 use openinfer_kernels::ops::{
-    GLM52_FLASHMLA_SPARSE_PAGE_SIZE, GLM52_FLASHMLA_SPARSE_TOPK, GLM52_TP8_AR_CHUNK_PACKETS,
-    Glm52FlashMlaSparseDecode, Glm52Tp8LlBuffer, glm52_flashmla_sparse_decode_num_sm_parts,
-    glm52_moe_tp8_epoch_advance, glm52_tp8_ar_buffer_bytes, glm52_tp8_ar_launch,
+    GLM52_FLASHMLA_SPARSE_PAGE_SIZE, GLM52_FLASHMLA_SPARSE_TOPK, Glm52FlashMlaSparseDecode,
+    Glm52TpLlBuffer, Glm52TpTopology, glm52_flashmla_sparse_decode_num_sm_parts,
+    glm52_moe_tp_epoch_advance, glm52_tp_ar_buffer_bytes, glm52_tp_ar_chunk_packets,
+    glm52_tp_ar_launch,
 };
 use openinfer_kernels::tensor::{DeviceContext, DeviceVec};
 
@@ -129,9 +130,10 @@ fn walk_positions(
         )?;
         let row = match ar.as_mut() {
             Some((epoch_dev, ar_local, peer_ar, rank)) => {
-                glm52_moe_tp8_epoch_advance(ctx, epoch_dev)?;
-                glm52_tp8_ar_launch(
+                glm52_moe_tp_epoch_advance(ctx, Glm52TpTopology::Tp8, epoch_dev)?;
+                glm52_tp_ar_launch(
                     ctx,
+                    Glm52TpTopology::Tp8,
                     0,
                     1,
                     o.data(),
@@ -175,13 +177,19 @@ fn attn_tp8_shard_matches_full() -> Result<()> {
                     let w = shard_layer0(&ctx, &tensors, rank)?;
                     ensure!(w.heads == 8, "shard derived {} heads, want 8", w.heads);
                     let ordinals: Vec<usize> = (0..RANKS).collect();
-                    let buf = Glm52Tp8LlBuffer::alloc(glm52_tp8_ar_buffer_bytes(1), &ordinals)?;
+                    let buf = Glm52TpLlBuffer::alloc(
+                        Glm52TpTopology::Tp8,
+                        glm52_tp_ar_buffer_bytes(Glm52TpTopology::Tp8, 1),
+                        &ordinals,
+                    )?;
                     vas.lock().unwrap()[rank] = (0..RANKS).map(|i| buf.addr_for(i)).collect();
                     barrier.wait();
                     let peer_ar: [u64; RANKS] = {
                         let published = vas.lock().unwrap();
                         std::array::from_fn(|dst| {
-                            published[dst][rank] + (rank * GLM52_TP8_AR_CHUNK_PACKETS * 16) as u64
+                            published[dst][rank]
+                                + (rank * glm52_tp_ar_chunk_packets(Glm52TpTopology::Tp8) * 16)
+                                    as u64
                         })
                     };
                     let mut epoch_dev = ctx.stream.alloc_zeros::<u64>(1)?;

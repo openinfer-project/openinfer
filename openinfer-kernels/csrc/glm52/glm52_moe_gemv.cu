@@ -33,10 +33,12 @@ constexpr int kVec          = 16;                             // 16 e4m3 = 128-b
 constexpr int kFp8Block     = 128;
 constexpr int kStep         = kWarpSize * kVec;               // 512 k per warp step
 
-// The plain path dispatches rows/warp on k: short-K (q_b k=2048) wants 4 to
-// amortise; long-K (o_proj k=16384) wants 1 to fill the single grid column.
-constexpr int kRowsPlainShortK     = 4;  // k <= 2048
-constexpr int kRowsPlainLongK      = 1;  // k  > 2048
+// The plain path dispatch follows the executing architecture. Hopper
+// amortises short-K launches with four rows/warp; Blackwell uses one row/warp
+// for the measured decode shapes. A row's accumulation order is unchanged.
+constexpr int kRowsPlainShortKHopper = 4;  // k <= 2048, measured on SM90
+constexpr int kRowsPlainBlackwell    = 1;  // all K, measured on SM103
+constexpr int kRowsPlainLongK        = 1;  // k > 2048 on every architecture
 
 CUresult map_cuda_error(cudaError_t err) {
   if (err == cudaSuccess) return CUDA_SUCCESS;
@@ -64,11 +66,11 @@ __device__ __forceinline__ void gemv_row_tile(
     const unsigned char* __restrict__ w_base,    // fp8 e4m3 [n, k] for this expert
     const float* __restrict__ scale_base,        // f32 [n/128, k/128] for this expert
     __nv_bfloat16* __restrict__ out_row,         // [n] output for this slot
-    int n, int k) {
+    int n, int k, int block_y) {
   constexpr int kRowsPerBlock = kWarpsPerBlk * ROWS;
   const int warp = threadIdx.x >> 5;
   const int lane = threadIdx.x & 31;
-  const int n0   = blockIdx.y * kRowsPerBlock + warp * ROWS;
+  const int n0   = block_y * kRowsPerBlock + warp * ROWS;
   const int scale_cols = k >> 7;                 // k/128
   // All ROWS rows share one weight-scale row: n0 is a multiple of ROWS and ROWS | 128,
   // so n0..n0+ROWS-1 never straddle a /128 boundary.
@@ -142,7 +144,30 @@ __global__ void glm52_fp8_weight_only_gemv_kernel(
     const float* __restrict__ weight_scale,        // [n/128, k/128]
     __nv_bfloat16* __restrict__ out,               // [n]
     int n, int k) {
-  gemv_row_tile<ROWS>(activation, weight, weight_scale, out, n, k);  // x straight from L2
+  gemv_row_tile<ROWS>(activation, weight, weight_scale, out, n, k,
+                      blockIdx.y);  // x straight from L2
+}
+
+// Two independent projections with one activation and one graph node. The
+// grids are concatenated, not the weights: q_a and kv_a keep their checkpoint
+// layout and write their existing output buffers. This removes the second
+// launch while preserving each row's exact dot-product order.
+__global__ void glm52_fp8_weight_only_gemv_pair_kernel(
+    const __nv_bfloat16* __restrict__ activation,
+    const unsigned char* __restrict__ weight_a,
+    const float* __restrict__ weight_scale_a,
+    __nv_bfloat16* __restrict__ out_a, int n_a,
+    const unsigned char* __restrict__ weight_b,
+    const float* __restrict__ weight_scale_b,
+    __nv_bfloat16* __restrict__ out_b, int n_b, int k) {
+  const int blocks_a = n_a / kWarpsPerBlk;
+  if (blockIdx.y < blocks_a) {
+    gemv_row_tile<1>(activation, weight_a, weight_scale_a, out_a, n_a, k,
+                     blockIdx.y);
+  } else {
+    gemv_row_tile<1>(activation, weight_b, weight_scale_b, out_b, n_b, k,
+                     blockIdx.y - blocks_a);
+  }
 }
 
 // Batched weight-stationary GEMV: a warp owns ROWS output rows and sweeps K once,
@@ -476,9 +501,23 @@ bool valid_tiling(int n, int k, int rpb) {
   return n > 0 && k > 0 && k % kFp8Block == 0 && n % rpb == 0 && k % kStep == 0;
 }
 
-// rows/warp the plain launcher will use for this k (see kRowsPlainShortK/LongK).
-int plain_rows_per_warp(int k) {
-  return k <= 2048 ? kRowsPlainShortK : kRowsPlainLongK;
+// Rows/warp follows the executing architecture. The original table was tuned
+// on H200; an exact production-kernel sweep on GB300 found ROWS=1 ahead for
+// 4096x2048 (3.70us vs 4.47us for ROWS=4).
+CUresult plain_rows_per_warp(int k, int* rows) {
+  // Attribute query only — this runs per projection launch during graph
+  // capture, and cudaGetDeviceProperties is orders of magnitude slower than
+  // the single cudaDevAttrComputeCapabilityMajor lookup needed here.
+  int device = 0;
+  int major = 0;
+  cudaError_t err = cudaGetDevice(&device);
+  if (err == cudaSuccess) {
+    err = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
+  }
+  if (err != cudaSuccess) return map_cuda_error(err);
+  *rows = major >= 10 ? kRowsPlainBlackwell
+                      : (k <= 2048 ? kRowsPlainShortKHopper : kRowsPlainLongK);
+  return CUDA_SUCCESS;
 }
 
 // The batched kernel's supported batches (one instantiation per decode
@@ -497,9 +536,11 @@ constexpr int kBatchedWarps = 4;
 bool whitelisted_linear_shape(int n, int k) {
   if (n == 2048  && k == 6144)  return true;  // q_a / shared gate,up
   if (n == 16384 && k == 2048)  return true;  // q_b
+  if (n == 4096  && k == 2048)  return true;  // q_b attention-TP 16-head shard
   if (n == 2048  && k == 2048)  return true;  // q_b attention-TP 8-head shard
   if (n == 576   && k == 6144)  return true;  // kv_a + rope (partial-N: 576%128!=0)
   if (n == 6144  && k == 16384) return true;  // o_proj
+  if (n == 6144  && k == 4096)  return true;  // o_proj attention-TP 16-head shard
   if (n == 24576 && k == 6144)  return true;  // dense gate|up (packed)
   if (n == 6144  && k == 12288) return true;  // dense down
   if (n == 4096  && k == 6144)  return true;  // shared gate|up (packed)
@@ -510,8 +551,8 @@ bool whitelisted_linear_shape(int n, int k) {
 }
 
 // Encoding these turns any future off-shape into a crash, not a silent read.
-bool valid_linear_shape(int n, int k) {
-  return valid_tiling(n, k, kWarpsPerBlk * plain_rows_per_warp(k)) &&
+bool valid_linear_shape(int n, int k, int rows) {
+  return valid_tiling(n, k, kWarpsPerBlk * rows) &&
          whitelisted_linear_shape(n, k);
 }
 
@@ -523,19 +564,43 @@ static CUresult fp8_weight_only_gemv(
     const __nv_bfloat16* activation, const unsigned char* weight,
     const float* weight_scale, __nv_bfloat16* out, int n, int k,
     cudaStream_t stream) {
+  int rows = 0;
+  CUresult rows_status = plain_rows_per_warp(k, &rows);
+  if (rows_status != CUDA_SUCCESS) return rows_status;
   if (activation == nullptr || weight == nullptr || weight_scale == nullptr ||
-      out == nullptr || !aligned16(activation) || !valid_linear_shape(n, k)) {
+      out == nullptr || !aligned16(activation) ||
+      !valid_linear_shape(n, k, rows)) {
     return CUDA_ERROR_INVALID_VALUE;
   }
-  const int rows = plain_rows_per_warp(k);
   const dim3 grid(1, n / (kWarpsPerBlk * rows), 1);
-  if (rows == kRowsPlainShortK) {
-    glm52_fp8_weight_only_gemv_kernel<kRowsPlainShortK>
+  if (rows == kRowsPlainShortKHopper) {
+    glm52_fp8_weight_only_gemv_kernel<kRowsPlainShortKHopper>
         <<<grid, kBlockThreads, 0, stream>>>(activation, weight, weight_scale, out, n, k);
   } else {
     glm52_fp8_weight_only_gemv_kernel<kRowsPlainLongK>
         <<<grid, kBlockThreads, 0, stream>>>(activation, weight, weight_scale, out, n, k);
   }
+  return consume_last_cuda_error();
+}
+
+CUresult glm52_fp8_weight_only_gemv_pair_cuda(
+    const __nv_bfloat16* activation, const unsigned char* weight_a,
+    const float* weight_scale_a, __nv_bfloat16* out_a, int n_a,
+    const unsigned char* weight_b, const float* weight_scale_b,
+    __nv_bfloat16* out_b, int n_b, int k, cudaStream_t stream) {
+  // This ABI is deliberately the one measured MLA fusion, not a generic
+  // paired-GEMV surface whose unmeasured shapes could silently spread.
+  if (activation == nullptr || weight_a == nullptr || weight_scale_a == nullptr ||
+      out_a == nullptr || weight_b == nullptr || weight_scale_b == nullptr ||
+      out_b == nullptr || !aligned16(activation) || n_a != 2048 || n_b != 576 ||
+      k != 6144 || !valid_tiling(n_a, k, kWarpsPerBlk) ||
+      !valid_tiling(n_b, k, kWarpsPerBlk)) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  const dim3 grid(1, (n_a + n_b) / kWarpsPerBlk, 1);
+  glm52_fp8_weight_only_gemv_pair_kernel<<<grid, kBlockThreads, 0, stream>>>(
+      activation, weight_a, weight_scale_a, out_a, n_a, weight_b,
+      weight_scale_b, out_b, n_b, k);
   return consume_last_cuda_error();
 }
 

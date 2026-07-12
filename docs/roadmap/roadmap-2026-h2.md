@@ -31,7 +31,7 @@ Formalize what "supported" means, so users know which model to run and every lin
 | Tier | Contract | Lines today |
 | --- | --- | --- |
 | **Stable** | Accuracy gate always green; bench-regression tracking per `conventions/bench-regression.md`; serving flags don't break without notice; a website recipe page; the reference implementation new models copy from | Qwen3-4B |
-| **Maturing** | Accuracy gate exists and passes; perf ledger active; serving contract may still move | Qwen3.5-4B, DeepSeek-V2-Lite, Kimi-K2, DeepSeek-V4 |
+| **Maturing** | Accuracy gate exists and passes; perf ledger active; serving contract may still move | Qwen3.5-4B, DeepSeek-V2-Lite, Kimi-K2 |
 | **Bring-up** | Under construction; correctness fixtures may be partial; no serving promises | GLM5.2, higgs-audio |
 
 Qwen3-4B earns Stable on evidence: golden-gate accuracy, full-sweep serving wins vs vLLM, prefix cache + KV offload + speculative decoding + TP all landed, regression tracking in place. Being Stable also means it is the **scaffolding reference**: a new model starts by copying the closest crate (per `direction.md`), and Qwen3-4B is the canonical one to copy.
@@ -91,7 +91,7 @@ Carried from `execution.md`. Qwen3 and Qwen3.5 already have `kernel_plan()` desc
 
 Prefill/decode disaggregation with KV transfer between workers, speaking the same NIXL semantics vLLM/Dynamo use, so openinfer workers drop into that ecosystem instead of inventing a transport protocol. PegaFlow remains the data plane.
 
-Design-first for the same reason the KV-cache crate was: it is load-bearing and under-specified. **One design issue**, merged with the existing P/D handoff design (`docs/models/deepseek-v4/prefix-paged-kv-pd-handoff.md`) — not two parallel efforts. Implementation needs multi-GPU/multi-node verification, so it stays Later until the design is settled and the GLM5.2 line supplies a real workload.
+Design-first for the same reason the KV-cache crate was: it is load-bearing and under-specified. **One design issue** — not two parallel efforts (an earlier per-model P/D handoff design doc was retired with its model line; its page-ownership/lease ideas live on in the issue). Implementation needs multi-GPU/multi-node verification, so it stays Later until the design is settled and the GLM5.2 line supplies a real workload.
 
 Related positioning: **multi-instance concerns (routing, P/D orchestration) are delegated to Dynamo; openinfer is a first-class worker.** The `openinfer-dynamo-backend`/`-frontend` crates and the verified KV-aware routing result (follow-up-turn TTFT ~45 ms vs ~165 ms round-robin) already point this way.
 

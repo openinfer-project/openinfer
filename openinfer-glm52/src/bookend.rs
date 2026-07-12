@@ -50,10 +50,10 @@ pub(crate) fn glm52_final_norm_into(
 }
 
 /// lm_head projection over the buffers' `tokens()` rows: `lm_head @ normed ->
-/// [T, VOCAB]` logits. The weight is bf16 `[VOCAB, HIDDEN]`; the caller feeds
-/// the final-normed hidden. One cuBLAS GEMM with the rows on the n dimension:
-/// the col-major `[VOCAB, T]` output IS the row-major `[T, VOCAB]` layout the
-/// argmax consumes, and the 1.9 GB weight is read once for all rows.
+/// [T, lm_head.rows]` compact logits. EP8 passes the full-vocabulary head;
+/// attention-TP decode passes this rank's contiguous vocabulary shard. One
+/// cuBLAS GEMM puts tokens on the n dimension, so the col-major
+/// `[lm_head.rows, T]` output is the compact row-major layout argmax consumes.
 pub(crate) fn glm52_lm_head_into(
     ctx: &DeviceContext,
     normed: &Rows<GLM52_HIDDEN>,
@@ -63,9 +63,9 @@ pub(crate) fn glm52_lm_head_into(
     let tokens = out.tokens();
     gemm_strided_batched_bf16(
         ctx,
-        true,  // lm_head [VOCAB, HIDDEN] row-major -> col-major via transpose
-        false, // normed [T, HIDDEN] row-major = [HIDDEN, T] col-major
-        GLM52_VOCAB,
+        true,
+        false,
+        lm_head.rows,
         tokens,
         GLM52_HIDDEN,
         &lm_head.data,
@@ -75,7 +75,7 @@ pub(crate) fn glm52_lm_head_into(
         GLM52_HIDDEN,
         0,
         out.data_mut(),
-        GLM52_VOCAB,
+        lm_head.rows,
         0,
         1,
     )

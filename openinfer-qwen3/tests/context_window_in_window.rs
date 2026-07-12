@@ -52,7 +52,6 @@ fn in_window_prompt_past_old_rope_table_is_served() {
         Path::new(&model_path),
         EngineLoadOptions {
             enable_cuda_graph: true,
-            enable_prefill_profile: false,
             device_ordinals: vec![0],
             seed: 42,
             ..EngineLoadOptions::default()

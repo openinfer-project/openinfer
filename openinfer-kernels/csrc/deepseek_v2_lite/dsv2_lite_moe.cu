@@ -10,6 +10,29 @@ constexpr int kMaxTopk = 8;
 constexpr int kRouterThreads = 128;
 constexpr int kAccumThreads = 256;
 
+__global__ void router_logits_kernel(
+    const __nv_bfloat16 *__restrict__ hidden,
+    const __nv_bfloat16 *__restrict__ gate_weight,
+    float *__restrict__ logits,
+    int seq_len,
+    int hidden_dim,
+    int n_experts) {
+  int token = blockIdx.x;
+  int expert = threadIdx.x;
+  if (token >= seq_len || expert >= n_experts) return;
+
+  float acc = 0.0f;
+  const int hidden_base = token * hidden_dim;
+  const int weight_base = expert * hidden_dim;
+  for (int dim = 0; dim < hidden_dim; ++dim) {
+    float product = __fmul_rn(
+        __bfloat162float(hidden[hidden_base + dim]),
+        __bfloat162float(gate_weight[weight_base + dim]));
+    acc = __fadd_rn(acc, product);
+  }
+  logits[token * n_experts + expert] = acc;
+}
+
 __device__ __forceinline__ bool better_prob_choice(float value, int expert, float best_value,
                                                    int best_expert) {
   return value > best_value || (value == best_value && expert < best_expert);
@@ -177,6 +200,27 @@ CUresult consume_last_cuda_error() {
 }  // namespace
 
 extern "C" {
+
+CUresult dsv2_lite_router_logits_cuda(
+    const __nv_bfloat16 *hidden,
+    const __nv_bfloat16 *gate_weight,
+    float *logits,
+    int seq_len,
+    int hidden_dim,
+    int n_experts,
+    cudaStream_t stream) {
+  if (hidden == nullptr || gate_weight == nullptr || logits == nullptr) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  if (seq_len <= 0 || hidden_dim <= 0 || n_experts <= 0 || n_experts > kMaxExperts) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+
+  cudaGetLastError();
+  router_logits_kernel<<<seq_len, kRouterThreads, 0, stream>>>(
+      hidden, gate_weight, logits, seq_len, hidden_dim, n_experts);
+  return consume_last_cuda_error();
+}
 
 CUresult dsv2_lite_router_softmax_topk_cuda(
     const __nv_bfloat16 *hidden,

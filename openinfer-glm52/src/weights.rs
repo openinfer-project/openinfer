@@ -24,6 +24,12 @@ pub(crate) use load::{Glm52RankGpuWeights, load_rank_weights_to_gpu};
 
 const GLM52_WEIGHT_INDEX: &str = "model.safetensors.index.json";
 pub(crate) const GLM52_MTP_LAYER: usize = GLM52_LAYERS;
+/// The EP8 production partition (8 ranks × 32 experts). Serving-path code
+/// derives rank/expert counts from the launch topology
+/// (`Glm52MoeTopo::ep_local_experts`); these constants remain the manifest
+/// coverage partition (`rank_tensor_names` / `validate_rank_coverage`, which
+/// only needs SOME partition covering every checkpoint tensor) and the EP8
+/// chain's shim contract check.
 pub(crate) const GLM52_EP_RANKS: usize = 8;
 pub(crate) const GLM52_LOCAL_EXPERTS: usize = GLM52_ROUTED_EXPERTS / GLM52_EP_RANKS;
 const FP8_BLOCK_SIZE: usize = 128;
@@ -63,12 +69,13 @@ impl Glm52ExpertRegionKind {
         Self::W2Scale,
     ];
 
-    /// Total bytes of this region for one layer's rank-local experts.
-    pub(crate) fn region_bytes(self) -> usize {
-        GLM52_LOCAL_EXPERTS * self.expert_stride()
+    /// Total bytes of this region for one layer's rank-local experts
+    /// (`local_experts` = 32 for EP8, 64 for EP4).
+    pub(crate) fn region_bytes(self, local_experts: usize) -> usize {
+        local_experts * self.expert_stride()
     }
 
-    fn expert_stride(self) -> usize {
+    pub(crate) fn expert_stride(self) -> usize {
         match self {
             Self::W13Weight => EXPERT_W13_WEIGHT_STRIDE,
             Self::W13Scale => EXPERT_W13_SCALE_STRIDE,
@@ -239,7 +246,7 @@ impl Glm52WeightManifest {
         &self,
         moe_topo: crate::Glm52MoeTopo,
     ) -> Result<Vec<Glm52RankLoadBundle>> {
-        (0..GLM52_EP_RANKS)
+        (0..moe_topo.device_count())
             .map(|rank| self.rank_load_bundle(rank, moe_topo))
             .collect()
     }
@@ -274,11 +281,18 @@ impl Glm52WeightManifest {
                 });
         }
         let tensor_count = by_shard.values().map(Vec::len).sum();
-        let expert_start = rank * GLM52_LOCAL_EXPERTS;
+        // Tensor-replicated topologies carry no expert tensors in the
+        // resident plan; their bundles get an empty range.
+        let expert_range = if moe_topo.uses_ep_expert_bundles() {
+            let local = moe_topo.ep_local_experts();
+            rank * local..(rank + 1) * local
+        } else {
+            0..0
+        };
         Ok(Glm52RankLoadBundle {
             plan: Glm52RankWeightPlan {
                 rank,
-                expert_range: expert_start..expert_start + GLM52_LOCAL_EXPERTS,
+                expert_range,
                 tensor_count,
             },
             shards: by_shard
@@ -316,14 +330,15 @@ impl Glm52WeightManifest {
         moe_topo: crate::Glm52MoeTopo,
     ) -> Result<Vec<String>> {
         ensure!(
-            rank < GLM52_EP_RANKS,
-            "GLM5.2 rank must be in 0..{GLM52_EP_RANKS}, got {rank}"
+            rank < moe_topo.device_count(),
+            "GLM5.2 rank must be in 0..{}, got {rank}",
+            moe_topo.device_count()
         );
         let mut names = Vec::new();
-        self.push_resident_non_expert_names(&mut names, moe_topo == crate::Glm52MoeTopo::Ep8);
-        if moe_topo == crate::Glm52MoeTopo::Ep8 {
-            let expert_start = rank * GLM52_LOCAL_EXPERTS;
-            let expert_range = expert_start..expert_start + GLM52_LOCAL_EXPERTS;
+        self.push_resident_non_expert_names(&mut names, moe_topo.uses_ep_expert_bundles());
+        if moe_topo.uses_ep_expert_bundles() {
+            let local = moe_topo.ep_local_experts();
+            let expert_range = rank * local..(rank + 1) * local;
             for layer_idx in GLM52_DENSE_LAYERS..GLM52_LAYERS {
                 push_routed_experts(&mut names, layer_idx, expert_range.clone());
             }
@@ -683,7 +698,11 @@ mod tests {
             }
         }
         for kind in Glm52ExpertRegionKind::ALL {
-            assert_eq!(cursor[&kind], kind.region_bytes(), "{kind:?}");
+            assert_eq!(
+                cursor[&kind],
+                kind.region_bytes(rank_experts.len()),
+                "{kind:?}"
+            );
         }
     }
 
@@ -724,5 +743,38 @@ mod tests {
                 .any(|name| name.contains(".mlp.experts.0.gate_proj.weight"))
         );
         assert!(tp8.iter().all(|name| !name.contains(".mlp.experts.")));
+    }
+
+    #[test]
+    fn ep4_resident_plan_carries_64_expert_bundles() {
+        let manifest = Glm52WeightManifest {
+            weight_map: BTreeMap::new(),
+        };
+        // Rank 1 of EP4 owns whole experts 64..128 on every MoE layer.
+        let ep4 = manifest
+            .rank_resident_tensor_names(1, crate::Glm52MoeTopo::Ep4)
+            .unwrap();
+        assert!(
+            ep4.iter()
+                .any(|name| name.contains(".mlp.experts.64.gate_proj.weight"))
+        );
+        assert!(
+            ep4.iter()
+                .any(|name| name.contains(".mlp.experts.127.down_proj.weight"))
+        );
+        assert!(ep4.iter().all(|name| {
+            name.split(".mlp.experts.")
+                .nth(1)
+                .and_then(|rest| rest.split('.').next())
+                .and_then(|e| e.parse::<usize>().ok())
+                .is_none_or(|e| (64..128).contains(&e))
+        }));
+        assert!(ep4.iter().any(|name| name.contains(".mlp.shared_experts.")));
+        // Four EP4 ranks cover the full routed set.
+        assert!(
+            manifest
+                .rank_resident_tensor_names(4, crate::Glm52MoeTopo::Ep4)
+                .is_err()
+        );
     }
 }

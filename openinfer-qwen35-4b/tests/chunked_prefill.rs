@@ -41,7 +41,6 @@ fn start_engine(model_path: &str, max_prefill_tokens: usize) -> EngineHandle {
         Path::new(model_path),
         EngineLoadOptions {
             enable_cuda_graph: true,
-            enable_prefill_profile: false,
             device_ordinals: vec![0],
             seed: 42,
             ..EngineLoadOptions::default()

@@ -98,8 +98,8 @@ impl Glm52RankModel {
             }
             ensure!(
                 bucket.graph.is_captured(),
-                "GLM5.2 launch-ahead lease granted before the bucket-{batch} graph was captured \
-                 — the startup pre-capture must cover every shape"
+                "GLM5.2 launch-ahead lease granted before the bucket {batch} graph was \
+                 captured — the startup pre-capture must cover every shape"
             );
             // From the first enqueue below onward, a host-side failure
             // (launch error) leaves the other ranks' speculative collectives

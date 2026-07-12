@@ -53,7 +53,8 @@ The engine is decode-only ("prompt tokens ride the decode path one position at a
 New step surface (contained): allow repeated slots with strictly increasing per-slot positions,
 per-row block-table gather for bucket 8, and an **aux-hidden capture buffer** — 5 dtod copies of
 the residual stream after layers {8,23,39,55,70} into a pre-allocated `[8, 30720]` buffer inside
-the whole-step graph (~480 KB/step; pointer-stable, graph-safe).
+the whole-step graph (~480 KB/step; pointer-stable, graph-safe). The buffer and copy nodes exist
+only when `--dspark-path` is present; ordinary decode graphs contain neither.
 
 ## Round cadence (M3)
 

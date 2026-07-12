@@ -2,10 +2,11 @@
 //! bucket-{1,2,4,8} decode ms/step in-process — no HTTP, no tokenizer, no
 //! 20-minute serve/probe cycle per kernel iteration.
 //!
-//! Slot placement is least-loaded-rank-first, so submitting `8 × bucket`
-//! concurrent requests pins every rank at `bucket` resident rows and the
-//! coordinator replays that bucket's whole-step graph with every row real
-//! (no padding). Each request gets distinct random prompt ids because
+//! EP8 slot placement is least-loaded-rank-first, so submitting `8 × bucket`
+//! concurrent requests pins every rank at `bucket` resident rows. Tensor-
+//! replicated topologies (`tp8`/`tp4`) have one logical rank with eight slots,
+//! so `--buckets 1` submits eight streams and fills the single mirrored
+//! bucket-8 shape. Each request gets distinct random prompt ids because
 //! identical prompts under-measure MoE decode via degenerate expert routing.
 //!
 //!   cargo run -r --bin glm52_step_bench --features glm52 -- \
@@ -57,9 +58,12 @@ struct Cli {
     /// full-load bucket sweep above. 0 = off.
     #[arg(long, default_value_t = 0)]
     ingest_tokens: usize,
-    /// MoE topology: ep8 (default, all buckets) or tp8 (8 mirrored
-    /// executors — 8 concurrent streams fill the logical slots, so only
-    /// --buckets 1 keeps the 8x-streams arithmetic meaningful).
+    /// MoE topology: ep8 (default, all buckets), tp8, or tp4. Tensor-
+    /// replicated topologies expose ONE logical rank with 8 slots, so a
+    /// bucket value there IS the concurrency (1..=8). TP4 maps it onto its
+    /// compact 1/2/4/8 decode graphs; TP8 always replays its single bucket-8
+    /// graph (pad rows ride free slots), so smaller values measure
+    /// bucket-8-with-pads.
     #[arg(long, default_value = "ep8")]
     moe_topo: String,
 }
@@ -71,13 +75,14 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     ensure!(!cli.buckets.is_empty(), "--buckets must be non-empty");
     let moe_topo: openinfer_glm52::Glm52MoeTopo = cli.moe_topo.parse().context("--moe-topo")?;
-    if moe_topo == openinfer_glm52::Glm52MoeTopo::Tp8 {
+    if is_tensor_replicated_moe(moe_topo) {
         ensure!(
-            cli.buckets.iter().all(|&b| b == 1),
-            "--moe-topo tp8 holds at most 8 concurrent requests (one logical rank); \
-             pass --buckets 1"
+            cli.buckets.iter().all(|&b| (1..=GLM52_RANKS).contains(&b)),
+            "--moe-topo {moe_topo:?} holds at most {GLM52_RANKS} concurrent requests (one \
+             logical rank); pass --buckets values in 1..={GLM52_RANKS}"
         );
     }
+    let (tp_size, dp_size) = (moe_topo.expected_tp_size(), moe_topo.default_dp_size());
     ensure!(
         cli.steps > cli.warmup_steps + 8,
         "--steps ({}) must exceed --warmup-steps ({}) with room for a steady window",
@@ -89,13 +94,14 @@ fn main() -> Result<()> {
     let handle = openinfer_glm52::launch(
         &cli.model_path,
         openinfer_glm52::Glm52LaunchOptions {
-            tp_size: 1,
-            dp_size: GLM52_RANKS,
+            tp_size,
+            dp_size,
             dspark_draft_model_path: None,
             max_model_len: None,
             no_prefix_cache: false,
             kv_offload: None,
             moe_topo,
+            dump_graph_png: None,
         },
     )
     .context("failed to start GLM5.2 engine")?;
@@ -108,7 +114,7 @@ fn main() -> Result<()> {
     for &bucket in &cli.buckets {
         let gaps = measure_bucket(&handle, bucket, &cli)
             .with_context(|| format!("bucket {bucket} failed"))?;
-        let conc = GLM52_RANKS * bucket;
+        let conc = bench_concurrency(bucket, moe_topo);
         let ms = |d: Duration| d.as_secs_f64() * 1e3;
         let p50 = ms(percentile(&gaps, 0.50));
         let mean = ms(gaps.iter().sum::<Duration>()) / gaps.len() as f64;
@@ -152,12 +158,17 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Run `8 × bucket` concurrent streams to completion and pool their steady
-/// inter-token gaps. Every stream has the same ctx and step count, so all
-/// slots stay resident together: after the admission ramp (dropped via
+/// Run [`bench_concurrency`] concurrent streams (`8 × bucket` on EP8, the
+/// bucket value itself on tensor-replicated TP) to completion and pool their
+/// steady inter-token gaps. Every stream has the same ctx and step count, so
+/// all slots stay resident together: after the admission ramp (dropped via
 /// --warmup-steps) each gap is one whole-step graph replay of `bucket`.
 fn measure_bucket(handle: &SchedulerHandle, bucket: usize, cli: &Cli) -> Result<Vec<Duration>> {
-    let conc = GLM52_RANKS * bucket;
+    let moe_topo: openinfer_glm52::Glm52MoeTopo = cli
+        .moe_topo
+        .parse()
+        .expect("moe_topo was parsed successfully in main");
+    let conc = bench_concurrency(bucket, moe_topo);
     let params = SamplingParams {
         ignore_eos: true,
         ..SamplingParams::default()
@@ -192,6 +203,26 @@ fn measure_bucket(handle: &SchedulerHandle, bucket: usize, cli: &Cli) -> Result<
     ensure!(!gaps.is_empty(), "no steady gaps collected");
     gaps.sort_unstable();
     Ok(gaps)
+}
+
+fn bench_concurrency(bucket: usize, moe_topo: openinfer_glm52::Glm52MoeTopo) -> usize {
+    if is_tensor_replicated_moe(moe_topo) {
+        // One logical rank: the bucket value is the concurrency, so TP4's
+        // compact bs=1 shape (the PR's headline latency) is directly iterable.
+        bucket
+    } else {
+        // One stream per (logical DP rank, slot): more would make the
+        // scheduler run a LARGER per-rank bucket than the label says (EP4
+        // has 4 logical ranks, not the EP8 constant).
+        moe_topo.default_dp_size() * bucket
+    }
+}
+
+fn is_tensor_replicated_moe(moe_topo: openinfer_glm52::Glm52MoeTopo) -> bool {
+    matches!(
+        moe_topo,
+        openinfer_glm52::Glm52MoeTopo::Tp8 | openinfer_glm52::Glm52MoeTopo::Tp4
+    )
 }
 
 fn run_stream(

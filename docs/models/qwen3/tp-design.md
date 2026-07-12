@@ -56,6 +56,7 @@ The first TP milestone does not aim to do the following:
 - preserve current CUDA Graph behavior from day one
 - introduce vocab-parallel embedding or vocab-parallel `lm_head` in the first pass
 - optimize every path for peak throughput before the basic design is proven correct
+- serve `--batch-invariant`, which the builder rejects for `tp_size > 1`: the prefill and unified all-reduces are eager and unbucketed, so NCCL can pick a different algorithm and protocol as the message size moves with batch composition, and that reduction order has never been audited
 
 ## Simplifications Allowed In First Pass
 

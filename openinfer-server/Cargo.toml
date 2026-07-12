@@ -26,7 +26,6 @@ required-features = ["glm52"]
 [dependencies]
 openinfer-core = { workspace = true }
 openinfer-deepseek-v2-lite = { workspace = true, optional = true }
-openinfer-deepseek-v4 = { workspace = true, optional = true }
 openinfer-glm52 = { workspace = true, optional = true }
 openinfer-kimi-k2 = { workspace = true, optional = true }
 openinfer-qwen3 = { workspace = true, optional = true }
@@ -54,15 +53,9 @@ default = ["qwen3"]
 qwen3 = ["dep:openinfer-qwen3"]
 # Qwen3.5 pulls in the Triton AOT kernels (Python + Triton at build time).
 qwen35-4b = ["dep:openinfer-qwen35-4b", "openinfer-qwen35-4b/qwen35-4b"]
-deepseek-v4 = ["dep:openinfer-deepseek-v4", "openinfer-deepseek-v4/deepseek-v4"]
 deepseek-v2-lite = ["dep:openinfer-deepseek-v2-lite", "openinfer-deepseek-v2-lite/deepseek-v2-lite"]
 glm52 = ["dep:openinfer-glm52"]
 kimi-k2 = ["dep:openinfer-kimi-k2", "openinfer-kimi-k2/kimi-k2"]
-pplx-ep = ["deepseek-v4", "openinfer-deepseek-v4/pplx-ep"]
-deepseek-v4-cutedsl-diagnostic = [
-    "deepseek-v4",
-    "openinfer-deepseek-v4/deepseek-v4-cutedsl-diagnostic",
-]
 
 [lints]
 workspace = true

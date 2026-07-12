@@ -75,7 +75,8 @@ fn layer_moe_ep8_oracle_gate() -> Result<()> {
                 .name(format!("ep8-gate-rank-{rank}"))
                 .spawn(move || -> Result<()> {
                     let ctx = DeviceContext::new_with_device(rank)?;
-                    let bank = load_rank_expert_bank(&ctx, &tensors, MOE_ORACLE_LAYER, rank)?;
+                    let bank =
+                        load_rank_expert_bank(&ctx, &tensors, MOE_ORACLE_LAYER, rank, EP_RANKS)?;
                     let mut ep8 = Glm52MoeEp8State::new(&ctx, &unique_id, EP_RANKS, rank)?;
                     for global_tokens in GLOBAL_TOKEN_BUCKETS {
                         for _position in 0..MOE_ORACLE_CTX {
@@ -193,7 +194,7 @@ fn run_layer_prefill_ep8(
     let mqa_shape =
         Glm52IndexerScratch::decode_shape(1, index_cache_layout, index_blocks, NUM_SMS, oracle_ctx);
     let mut scratch =
-        Glm52DecodeScratch::new(ctx, &contract, mqa_shape, crate::config::GLM52_HEADS)?;
+        Glm52DecodeScratch::new(ctx, &contract, mqa_shape, crate::config::GLM52_HEADS, false)?;
 
     let mut outputs = Vec::with_capacity(oracle_ctx * HIDDEN);
     for position in 0..oracle_ctx {
@@ -265,7 +266,7 @@ fn run_layer_prefill_ep8(
             HIDDEN,
             scratch.layer.mlp_out.data_mut(),
         )?;
-        glm52_layer_finish(ctx, &mut scratch, 0)?;
+        glm52_layer_finish(ctx, &mut scratch, 0, false)?;
         let out_host = ctx.stream.clone_dtoh(scratch.hidden.data())?;
         outputs.extend(out_host.iter().map(|v| v.to_f32()));
     }

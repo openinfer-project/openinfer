@@ -29,7 +29,10 @@ pub use deepep::{
     DeepEp, DeepEpDispatchScratch, DeepEpPrefillCounts, deepep_info, deepep_unique_id,
 };
 #[cfg(feature = "glm52")]
-pub use deepep::{Glm52DeepEp, glm52_deepep_info, glm52_deepep_unique_id};
+pub use deepep::{
+    Glm52DeepEp, Glm52Ep4DeepEp, glm52_deepep_info, glm52_deepep_unique_id, glm52_ep4_deepep_info,
+    glm52_ep4_deepep_unique_id,
+};
 #[cfg(feature = "deepseek-v2-lite")]
 pub use deepseek_v2_lite::*;
 pub use elementwise::{
@@ -48,8 +51,9 @@ pub use embedding::{
 pub use glm52::*;
 #[cfg(feature = "kimi-k2")]
 pub use kimi_k2::*;
+pub(crate) use linear::ensure_tuned_policy;
 pub use linear::{
-    GEMM_LT_MAX_N, NumericPolicy, gemm, gemm_graphsafe_into_checked,
+    GEMM_LT_MAX_N, NumericPolicy, PinAlgoConfig, gemm, gemm_graphsafe_into_checked,
     gemm_graphsafe_ref_into_checked, gemm_into, gemm_into_checked, gemm_lt_pin_check,
     gemm_lt_pin_into_checked, gemm_lt_pin_tune, gemm_lt_pin_warmup, gemm_lt_tune, gemm_per_token,
     gemm_per_token_into_checked, gemm_rows_into, gemm_rows_into_checked, gemm_strided_batched_bf16,

@@ -15,7 +15,7 @@ use half::bf16;
 
 use openinfer_kernels::ops::{
     GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW, glm52_fp8_weight_only_gemv_launch,
-    glm52_silu_and_mul_bf16_launch,
+    glm52_fp8_weight_only_gemv_pair_launch, glm52_silu_and_mul_bf16_launch,
 };
 use openinfer_kernels::tensor::DeviceContext;
 
@@ -266,6 +266,23 @@ pub(crate) fn fp8_linear_into(
     );
     glm52_fp8_weight_only_gemv_launch(
         ctx, rows, w.n, w.k, input, &w.weight, &w.scale, scratch, out,
+    )
+}
+
+/// Two bs=1 projections sharing one activation and one CUDA graph node.
+/// Restricted by the CUDA ABI to MLA q_a + kv_a; this helper owns the common
+/// shape and buffer checks without exposing raw projection storage elsewhere.
+pub(crate) fn fp8_linear_pair_into(
+    ctx: &DeviceContext,
+    a: &ProjWeight,
+    b: &ProjWeight,
+    input: &CudaSlice<bf16>,
+    out_a: &mut CudaSlice<bf16>,
+    out_b: &mut CudaSlice<bf16>,
+) -> Result<()> {
+    ensure!(a.k == b.k, "GLM5.2 paired projection k mismatch");
+    glm52_fp8_weight_only_gemv_pair_launch(
+        ctx, a.k, input, a.n, &a.weight, &a.scale, out_a, b.n, &b.weight, &b.scale, out_b,
     )
 }
 

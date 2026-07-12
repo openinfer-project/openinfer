@@ -123,5 +123,59 @@ pub fn glm52_fp8_weight_only_gemv_launch(
         )
     }
     .result()
-    .map_err(|err| anyhow!("GLM5.2 linear GEMV launch failed: {err}"))
+    .map_err(|err| anyhow!("GLM5.2 linear GEMV launch failed for rows={rows}, n={n}, k={k}: {err}"))
+}
+
+/// MLA's bs=1 q_a and kv_a projections in one graph node. The two weights and
+/// outputs remain separate; CUDA concatenates only their block grids.
+#[allow(clippy::too_many_arguments)]
+pub fn glm52_fp8_weight_only_gemv_pair_launch(
+    ctx: &DeviceContext,
+    k: usize,
+    activation: &CudaSlice<bf16>,
+    n_a: usize,
+    weight_a: &CudaSlice<u8>,
+    scale_a: &CudaSlice<u8>,
+    out_a: &mut CudaSlice<bf16>,
+    n_b: usize,
+    weight_b: &CudaSlice<u8>,
+    scale_b: &CudaSlice<u8>,
+    out_b: &mut CudaSlice<bf16>,
+) -> Result<()> {
+    let scale_len = |n: usize| n.div_ceil(FP8_BLOCK) * k.div_ceil(FP8_BLOCK) * 4;
+    ensure!(
+        k > 0
+            && activation.len() >= k
+            && weight_a.len() >= n_a * k
+            && scale_a.len() >= scale_len(n_a)
+            && out_a.len() >= n_a
+            && weight_b.len() >= n_b * k
+            && scale_b.len() >= scale_len(n_b)
+            && out_b.len() >= n_b,
+        "GLM5.2 paired GEMV buffers do not cover [{n_a},{k}] + [{n_b},{k}]"
+    );
+    let (act_ptr, _act) = activation.device_ptr(&ctx.stream);
+    let (wa_ptr, _wa) = weight_a.device_ptr(&ctx.stream);
+    let (sa_ptr, _sa) = scale_a.device_ptr(&ctx.stream);
+    let (oa_ptr, _oa) = out_a.device_ptr_mut(&ctx.stream);
+    let (wb_ptr, _wb) = weight_b.device_ptr(&ctx.stream);
+    let (sb_ptr, _sb) = scale_b.device_ptr(&ctx.stream);
+    let (ob_ptr, _ob) = out_b.device_ptr_mut(&ctx.stream);
+    unsafe {
+        ffi::glm52_fp8_weight_only_gemv_pair_cuda(
+            act_ptr as *const ffi::Half,
+            wa_ptr as *const u8,
+            sa_ptr as *const f32,
+            oa_ptr as *mut ffi::Half,
+            n_a as i32,
+            wb_ptr as *const u8,
+            sb_ptr as *const f32,
+            ob_ptr as *mut ffi::Half,
+            n_b as i32,
+            k as i32,
+            ctx.stream.cu_stream(),
+        )
+    }
+    .result()
+    .map_err(|err| anyhow!("GLM5.2 paired GEMV launch failed: {err}"))
 }
