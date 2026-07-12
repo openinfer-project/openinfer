@@ -575,22 +575,27 @@ impl Glm52RemoteRankWorker {
 // rank-host side
 // ---------------------------------------------------------------------------
 
-/// Serve rank-host connections forever (one at a time — a node hosts ranks
-/// for exactly one engine). Each connection spawns fresh workers and tears
-/// them down when the coordinator disconnects, so a crashed engine leaves a
-/// clean node behind.
+/// Serve exactly ONE rank-host connection, then return so the process exits.
+/// One process = one fleet incarnation: worker drop does not return all of
+/// the hosted GPU state (weights/arenas stay resident, measured 281 GiB/GPU
+/// after a cleanly closed connection), so process exit is the only reliable
+/// way to hand the GPUs back — the same reasoning as the teardown watchdog.
+/// Wrap in a restart loop (`while true; do openinfer --glm52-rank-host ...;
+/// done`) for a persistent node.
 pub fn serve_rank_host(listen: &str) -> Result<()> {
     let listener =
         TcpListener::bind(listen).with_context(|| format!("GLM5.2 rank-host bind {listen}"))?;
     log::info!("GLM5.2 rank-host listening on {listen}");
-    loop {
-        let (stream, peer) = listener.accept()?;
-        log::info!("GLM5.2 rank-host serving coordinator {peer}");
-        match serve_connection(stream) {
-            Ok(()) => log::info!("GLM5.2 rank-host connection {peer} closed cleanly"),
-            Err(err) => log::error!("GLM5.2 rank-host connection {peer} failed: {err:#}"),
-        }
+    let (stream, peer) = listener.accept()?;
+    log::info!("GLM5.2 rank-host serving coordinator {peer}");
+    let result = serve_connection(stream);
+    match &result {
+        Ok(()) => log::info!(
+            "GLM5.2 rank-host connection {peer} closed cleanly; exiting to release GPU state"
+        ),
+        Err(err) => log::error!("GLM5.2 rank-host connection {peer} failed: {err:#}"),
     }
+    result
 }
 
 /// A worker's queued in-flight responses: the forwarder drains them in

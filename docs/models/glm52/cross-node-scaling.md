@@ -61,7 +61,9 @@ Operational contract:
   own load bundles from the wire hello; nothing model-specific is configured on it.
 - Teardown: coordinator drop `shutdown()`s the socket → rank-host sees EOF → fail-stop
   worker teardown bounded by a 60 s watchdog (`exit(2)` if the collective destroy lacks
-  peers). Orderly shutdown leaves the rank-host alive for the next connection.
+  peers). The rank-host serves ONE connection and exits: worker drop does not return all
+  hosted GPU state (281 GiB/GPU stayed resident after a clean close), so process exit is
+  the release mechanism — wrap in a restart loop for a persistent node.
 - Container must receive the IMEX channel device (`dev-container.sh` does this): without
   `/dev/nvidia-caps-imex-channels/channel0`, NCCL init succeeds but DeepEP `ctx_create`
   fails cross-tray — some ranks error, others block in bootstrap.
