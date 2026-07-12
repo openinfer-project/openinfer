@@ -14,11 +14,13 @@
 //! polls its [`LoadHandle`] each scheduler tick.
 
 mod engine;
+mod vllm_hash;
 
 pub use engine::{
     HostConfig, KvArena, LoadHandle, OffloadConfig, OffloadEngine, OffloadHost, P2pConfig,
     QueryHit, QueryOutcome,
 };
+pub use vllm_hash::{VLLM_HASH_BYTES, VllmBlockHasher};
 
 // Re-exported so callers name pegaflow's engine types through this bridge.
 pub use pegaflow_core::{EngineError, PegaEngine, QueryLeaseId};

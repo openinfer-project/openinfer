@@ -61,8 +61,17 @@ pub(super) enum RemoteFetchAction<L> {
 /// this takes a closure rather than a pre-computed outcome. A query `Err` is
 /// already logged at the call site's level of context, so it folds into
 /// [`RemoteFetchAction::Scratch`] here.
+///
+/// `wait_on_miss` is the P/D handoff race guard: when the prefill peer's KV
+/// is *expected* (vLLM-prefill mode), a zero-hit means "the producer's save
+/// or MetaServer registration hasn't landed yet", not "nobody has it" — so
+/// the request stays parked and re-queries instead of prefilling from
+/// scratch. The caller bounds it with a miss deadline (passing `false` once
+/// that window closes); a query error still folds to `Scratch` — a broken
+/// local engine won't heal by waiting.
 pub(super) fn remote_fetch_action<L, E>(
     timed_out: bool,
+    wait_on_miss: bool,
     query: impl FnOnce() -> Result<QueryView<L>, E>,
     available_blocks: usize,
     reserve_floor: usize,
@@ -76,7 +85,11 @@ pub(super) fn remote_fetch_action<L, E>(
         Err(_) => return RemoteFetchAction::Scratch,
     };
     let Some(lease) = lease else {
-        return RemoteFetchAction::Scratch; // miss
+        return if wait_on_miss {
+            RemoteFetchAction::Wait // producer's registration not visible yet
+        } else {
+            RemoteFetchAction::Scratch // miss
+        };
     };
     // Blocks promised to admitted requests are off-limits: reserving into
     // them makes a later prefill chunk or decode growth fail allocation.
@@ -102,6 +115,7 @@ mod tests {
     fn timeout_gives_up_without_querying() {
         let action = remote_fetch_action::<u32, ()>(
             true,
+            false,
             || unreachable!("post-deadline tick must not query"),
             usize::MAX,
             0,
@@ -112,7 +126,7 @@ mod tests {
     /// A remote fetch still in flight keeps the request parked.
     #[test]
     fn loading_waits() {
-        let action = remote_fetch_action::<u32, ()>(false, || Ok(QueryView::Loading), 0, 0);
+        let action = remote_fetch_action::<u32, ()>(false, false, || Ok(QueryView::Loading), 0, 0);
         assert_eq!(action, Action::Wait);
     }
 
@@ -120,14 +134,14 @@ mod tests {
     /// the request just prefills from scratch.
     #[test]
     fn zero_hit_prefills_from_scratch() {
-        let action = remote_fetch_action(false, || ready(None, 0), usize::MAX, 0);
+        let action = remote_fetch_action(false, false, || ready(None, 0), usize::MAX, 0);
         assert_eq!(action, Action::Scratch);
     }
 
     /// A query error folds into prefill-from-scratch.
     #[test]
     fn query_error_prefills_from_scratch() {
-        let action = remote_fetch_action::<u32, &str>(false, || Err("rpc failed"), usize::MAX, 0);
+        let action = remote_fetch_action::<u32, &str>(false, false, || Err("rpc failed"), usize::MAX, 0);
         assert_eq!(action, Action::Scratch);
     }
 
@@ -135,28 +149,66 @@ mod tests {
     /// for release — the type makes dropping it silently unrepresentable.
     #[test]
     fn budget_guard_releases_the_lease() {
-        let action = remote_fetch_action(false, || ready(Some(7), 10), 12, 3);
+        let action = remote_fetch_action(false, false, || ready(Some(7), 10), 12, 3);
         assert_eq!(action, Action::Release(7));
     }
 
     /// `reserve_floor > available_blocks` must saturate, not underflow.
     #[test]
     fn budget_guard_saturates_when_floor_exceeds_available() {
-        let action = remote_fetch_action(false, || ready(Some(7), 1), 2, 5);
+        let action = remote_fetch_action(false, false, || ready(Some(7), 1), 2, 5);
         assert_eq!(action, Action::Release(7));
     }
 
     /// Exactly-at-budget reserves and loads: the guard is strict-less-than.
     #[test]
     fn exact_budget_boundary_loads() {
-        let action = remote_fetch_action(false, || ready(Some(7), 9), 12, 3);
+        let action = remote_fetch_action(false, false, || ready(Some(7), 9), 12, 3);
         assert_eq!(action, Action::Load(7, 9));
     }
 
     /// The normal path: leased hit within budget starts the H2D load.
     #[test]
     fn leased_hit_within_budget_loads() {
-        let action = remote_fetch_action(false, || ready(Some(42), 4), 64, 8);
+        let action = remote_fetch_action(false, false, || ready(Some(42), 4), 64, 8);
         assert_eq!(action, Action::Load(42, 4));
+    }
+
+    /// P/D handoff race: a zero-hit with remote KV expected keeps the request
+    /// parked — the producer's registration hasn't landed yet.
+    #[test]
+    fn expected_remote_miss_waits() {
+        let action = remote_fetch_action(false, true, || ready(None, 0), usize::MAX, 0);
+        assert_eq!(action, Action::Wait);
+    }
+
+    /// Once the miss window closes the caller passes `wait_on_miss = false`
+    /// and a still-missing prefix degrades to prefill-from-scratch.
+    #[test]
+    fn expected_remote_miss_window_closed_prefills_from_scratch() {
+        let action = remote_fetch_action(false, false, || ready(None, 0), usize::MAX, 0);
+        assert_eq!(action, Action::Scratch);
+    }
+
+    /// `wait_on_miss` guards only the miss branch: a query error is a broken
+    /// local engine, not a registration race, and never waits.
+    #[test]
+    fn query_error_never_waits_even_when_remote_expected() {
+        let action =
+            remote_fetch_action::<u32, &str>(false, true, || Err("rpc failed"), usize::MAX, 0);
+        assert_eq!(action, Action::Scratch);
+    }
+
+    /// `wait_on_miss` does not bypass the hard deadline.
+    #[test]
+    fn timeout_overrides_wait_on_miss() {
+        let action = remote_fetch_action::<u32, ()>(
+            true,
+            true,
+            || unreachable!("post-deadline tick must not query"),
+            usize::MAX,
+            0,
+        );
+        assert_eq!(action, Action::Scratch);
     }
 }

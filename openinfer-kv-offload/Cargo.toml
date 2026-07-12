@@ -21,6 +21,7 @@ half = { workspace = true }
 log = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true, features = ["net"] }
+xxhash-rust = { workspace = true }
 
 [lints]
 workspace = true

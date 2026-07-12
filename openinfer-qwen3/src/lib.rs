@@ -99,6 +99,10 @@ pub struct Qwen3OffloadOptions {
     /// MetaServer, peers pull missing prefixes over RDMA, and this engine
     /// serves theirs. The P/D disaggregation data plane.
     pub p2p: Option<Qwen3P2pOptions>,
+    /// `Some` when the P/D prefill peer is vLLM (pegaflow connector): offload
+    /// query keys switch from kvbm lineage hashes to vLLM's prefix-cache hash
+    /// scheme so this decode node can find the blocks vLLM registered.
+    pub vllm_compat: Option<Qwen3VllmCompatOptions>,
 }
 
 /// Cross-instance P2P KV sharing (see `openinfer_kv_offload::P2pConfig`).
@@ -120,6 +124,31 @@ pub struct Qwen3P2pOptions {
     pub flush_on_finish: bool,
 }
 
+/// Decode-node settings for a P/D deployment whose prefill node is vLLM with
+/// the pegaflow connector. vLLM registers KV under its own prefix-cache block
+/// hashes (`xxh3_128` over canonical-CBOR chained tuples — see
+/// `openinfer_kv_offload::VllmBlockHasher`); with this set, cold-request
+/// offload queries derive those keys instead of kvbm lineage hashes, and a
+/// zero hit waits out the producer's save/registration tail instead of
+/// immediately prefilling from scratch.
+///
+/// Requires on every vLLM prefill process: `--prefix-caching-hash-algo
+/// xxhash_cbor` and `PYTHONHASHSEED` set to `python_hash_seed` (unset, vLLM's
+/// chain root is `os.urandom` — unreproducible across processes).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Qwen3VllmCompatOptions {
+    /// The `PYTHONHASHSEED` value shared with every vLLM prefill process.
+    pub python_hash_seed: String,
+    /// The P side's pegaflow-connector namespace: an 8-hex digest the
+    /// connector derives from vLLM config and logs at startup
+    /// (`namespace=...`). Both sides must address the same content domain.
+    pub namespace: String,
+    /// How long a cold request keeps re-querying a zero hit before giving up
+    /// on the expected remote KV and prefilling locally. Covers the P side's
+    /// post-response save + MetaServer-registration tail (tens of ms).
+    pub miss_wait: std::time::Duration,
+}
+
 impl Qwen3OffloadOptions {
     /// 8 GiB host tier — a few thousand dense Qwen3-4B blocks.
     pub const DEFAULT_PINNED_POOL_BYTES: usize = 8 << 30;
@@ -130,6 +159,7 @@ impl Qwen3OffloadOptions {
             pinned_pool_bytes: 0,
             use_hugepages: false,
             p2p: None,
+            vllm_compat: None,
         }
     }
 
@@ -139,12 +169,19 @@ impl Qwen3OffloadOptions {
             pinned_pool_bytes,
             use_hugepages: false,
             p2p: None,
+            vllm_compat: None,
         }
     }
 
     #[must_use]
     pub fn with_p2p(mut self, p2p: Qwen3P2pOptions) -> Self {
         self.p2p = Some(p2p);
+        self
+    }
+
+    #[must_use]
+    pub fn with_vllm_compat(mut self, compat: Qwen3VllmCompatOptions) -> Self {
+        self.vllm_compat = Some(compat);
         self
     }
 }
