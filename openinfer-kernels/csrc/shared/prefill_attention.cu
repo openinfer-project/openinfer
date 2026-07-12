@@ -207,6 +207,69 @@ __global__ void dflash_qk_norm_rope_kernel(
     data[offset] = result;
 }
 
+// Plain RoPE (no QK-norm) for EAGLE-3, whose attention has no per-head q/k norm.
+__global__ void eagle3_rope_kernel(
+    __nv_bfloat16* __restrict__ q,
+    __nv_bfloat16* __restrict__ k,
+    const __nv_bfloat16* __restrict__ cos_cache,
+    const __nv_bfloat16* __restrict__ sin_cache,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int q_len,
+    int k_len,
+    int q_start_pos,
+    int k_start_pos,
+    int cos_max_pos
+) {
+    int head_global = blockIdx.x;
+    int token = blockIdx.y;
+    int d = threadIdx.x;
+
+    bool is_q = (head_global < num_q_heads);
+    int local_heads = is_q ? num_q_heads : num_kv_heads;
+    int seq_len = is_q ? q_len : k_len;
+    if (token >= seq_len) return;
+
+    int head_local = is_q ? head_global : (head_global - num_q_heads);
+    if (head_local >= local_heads) return;
+
+    __nv_bfloat16* data = is_q ? q : k;
+    int dim_stride = local_heads * head_dim;
+    int pos = (is_q ? q_start_pos : k_start_pos) + token;
+    if (pos < 0 || pos >= cos_max_pos) __trap();
+
+    int offset = token * dim_stride + head_local * head_dim + d;
+
+    // No QK-norm: the raw value goes straight into the RoPE rotation.
+    __shared__ __nv_bfloat16 smem[HEAD_DIM];
+    smem[d] = data[offset];
+    __syncthreads();
+
+    int half = head_dim / 2;
+    __nv_bfloat16 result;
+    if (d < half) {
+        float lo = __bfloat162float(smem[d]);
+        float hi = __bfloat162float(smem[d + half]);
+        float c = __bfloat162float(cos_cache[pos * head_dim + d]);
+        float s = __bfloat162float(sin_cache[pos * head_dim + d]);
+        float lo_cos = __bfloat162float(__float2bfloat16(lo * c));
+        float hi_sin = __bfloat162float(__float2bfloat16(hi * s));
+        result = __float2bfloat16(lo_cos - hi_sin);
+    } else {
+        int pair_d = d - half;
+        float lo = __bfloat162float(smem[pair_d]);
+        float hi = __bfloat162float(smem[d]);
+        float c = __bfloat162float(cos_cache[pos * head_dim + pair_d]);
+        float s = __bfloat162float(sin_cache[pos * head_dim + pair_d]);
+        float lo_sin = __bfloat162float(__float2bfloat16(lo * s));
+        float hi_cos = __bfloat162float(__float2bfloat16(hi * c));
+        result = __float2bfloat16(lo_sin + hi_cos);
+    }
+
+    data[offset] = result;
+}
+
 extern "C" {
 
 // ============================================================================
@@ -293,6 +356,37 @@ int dflash_qk_norm_rope_cuda(
         q, k, q_norm_weight, k_norm_weight, cos_cache, sin_cache,
         num_q_heads, num_kv_heads, head_dim, q_len, k_len,
         q_start_pos, k_start_pos, rms_eps, cos_max_pos);
+    return static_cast<int>(cudaGetLastError());
+}
+
+// Plain RoPE (no QK-norm) for EAGLE-3. Launches eagle3_rope_kernel.
+int eagle3_rope_cuda(
+    __nv_bfloat16* q,
+    __nv_bfloat16* k,
+    const __nv_bfloat16* cos_cache,
+    const __nv_bfloat16* sin_cache,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int q_len,
+    int k_len,
+    int q_start_pos,
+    int k_start_pos,
+    int cos_max_pos,
+    cudaStream_t stream
+) {
+    if (q == nullptr || k == nullptr || cos_cache == nullptr || sin_cache == nullptr ||
+        num_q_heads <= 0 || num_kv_heads <= 0 || head_dim != HEAD_DIM ||
+        q_len <= 0 || k_len <= 0 || q_start_pos < 0 || k_start_pos < 0 ||
+        q_start_pos + q_len > cos_max_pos || k_start_pos + k_len > cos_max_pos) {
+        return static_cast<int>(cudaErrorInvalidValue);
+    }
+
+    dim3 grid(num_q_heads + num_kv_heads, q_len > k_len ? q_len : k_len);
+    eagle3_rope_kernel<<<grid, head_dim, 0, stream>>>(
+        q, k, cos_cache, sin_cache,
+        num_q_heads, num_kv_heads, head_dim, q_len, k_len,
+        q_start_pos, k_start_pos, cos_max_pos);
     return static_cast<int>(cudaGetLastError());
 }
 

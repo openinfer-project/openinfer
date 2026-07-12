@@ -779,6 +779,112 @@ pub fn dflash_qk_norm_rope_into(
     Ok(())
 }
 
+/// Require a capacity-backed `HiddenStates` to physically hold its logical
+/// `hidden_dim * seq_len` extent. Every `HiddenStates` field is public, so a safe
+/// caller can inflate `.seq_len` past the backing allocation; this rejects that
+/// before it reaches the kernel as an out-of-bounds read. `>=` (not `==`) keeps
+/// the capacity-backed convention where buffers are allocated at a max and
+/// `.seq_len` is rewritten to the active size per step (e.g. `batch_decode_buffers`).
+fn ensure_hidden_capacity(t: &HiddenStates, name: &str) -> Result<()> {
+    let extent = t
+        .hidden_dim
+        .checked_mul(t.seq_len)
+        .ok_or_else(|| anyhow::anyhow!("{name} logical extent overflow"))?;
+    anyhow::ensure!(
+        t.data.len() >= extent,
+        "{name} backing len {} < hidden_dim {} * seq_len {}",
+        t.data.len(),
+        t.hidden_dim,
+        t.seq_len
+    );
+    Ok(())
+}
+
+/// Validate a `[offset, offset + span)` row window into `t` and return the byte
+/// offset of `offset`, all with checked arithmetic. Release builds leave
+/// `overflow-checks` off, so an adversarial `offset` (e.g. `usize::MAX`) would
+/// otherwise wrap the range check and the pointer past its allocation, faulting
+/// only at the next sync as `CUDA_ERROR_ILLEGAL_ADDRESS`. Returns `Err`, never panics.
+fn checked_row_offset(t: &HiddenStates, offset: usize, span: usize, name: &str) -> Result<u64> {
+    let end = offset
+        .checked_add(span)
+        .ok_or_else(|| anyhow::anyhow!("{name} row range overflow"))?;
+    anyhow::ensure!(
+        end <= t.seq_len,
+        "{name} row range [{offset}..{end}) exceeds seq_len {}",
+        t.seq_len
+    );
+    ensure_hidden_capacity(t, name)?;
+    let bytes = offset
+        .checked_mul(t.hidden_dim)
+        .and_then(|elems| elems.checked_mul(std::mem::size_of::<bf16>()))
+        .ok_or_else(|| anyhow::anyhow!("{name} byte offset overflow"))?;
+    Ok(bytes as u64)
+}
+
+/// Plain RoPE (no QK-norm) for one EAGLE-3 draft step, because EAGLE-3 has no per-head q/k norm
+/// we implement a new kernel for EAGLE-3
+#[allow(clippy::too_many_arguments)]
+pub fn eagle3_rope_into(
+    ctx: &DeviceContext,
+    q: &mut HiddenStates,
+    q_row_offset: usize,
+    q_seq_len: usize,
+    k: &mut HiddenStates,
+    cos_cache: &DeviceVec,
+    sin_cache: &DeviceVec,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    q_start_pos: usize,
+    k_start_pos: usize,
+) -> Result<()> {
+    assert_eq!(q.hidden_dim, num_q_heads * head_dim);
+    assert_eq!(k.hidden_dim, num_kv_heads * head_dim);
+    // `q`/`k` are capacity-backed and reachable from safe re-exported code;
+    // validate the row window and backing length before deriving raw pointers.
+    let q_byte_offset = checked_row_offset(q, q_row_offset, q_seq_len, "eagle3_rope q")?;
+    ensure_hidden_capacity(k, "eagle3_rope k")?;
+    // The kernel indexes both caches with the same `pos * head_dim + d`, and
+    // `cos_max_pos` is derived from `cos_cache` alone; a shorter `sin_cache`
+    // would let the kernel read out of bounds.
+    assert_eq!(
+        sin_cache.data.len(),
+        cos_cache.data.len(),
+        "eagle3_rope sin_cache len {} != cos_cache len {}",
+        sin_cache.data.len(),
+        cos_cache.data.len()
+    );
+
+    let (q_ptr, _gq) = q.data.device_ptr_mut(&ctx.stream);
+    let q_ptr = q_ptr + q_byte_offset;
+    let (k_ptr, _gk) = k.data.device_ptr_mut(&ctx.stream);
+    let (cos_ptr, _gc) = cos_cache.data.device_ptr(&ctx.stream);
+    let (sin_ptr, _gs) = sin_cache.data.device_ptr(&ctx.stream);
+
+    let result = unsafe {
+        ffi::eagle3_rope_cuda(
+            q_ptr as *mut ffi::Half,
+            k_ptr as *mut ffi::Half,
+            cos_ptr as *const ffi::Half,
+            sin_ptr as *const ffi::Half,
+            num_q_heads as i32,
+            num_kv_heads as i32,
+            head_dim as i32,
+            q_seq_len as i32,
+            k.seq_len as i32,
+            q_start_pos as i32,
+            k_start_pos as i32,
+            (cos_cache.data.len() / head_dim) as i32,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    if result != 0 {
+        anyhow::bail!("eagle3_rope_cuda failed with error {result}");
+    }
+    Ok(())
+}
+
 /// Non-causal prefill attention for one DFlash request's draft block.
 ///
 /// `q` and `output` share the SAME row sub-range of batched buffers: request
@@ -852,6 +958,137 @@ pub fn single_prefill_nhd_noncausal_into(
     if result != 0 {
         anyhow::bail!(
             "single_prefill_nhd_noncausal_cuda failed with error {result}{}",
+            crate::ops::ffi_exception_message(result)
+        );
+    }
+    Ok(())
+}
+
+/// Single-query **decode** over a contiguous NHD KV cache — the draft chain's
+/// per-step attention. One query (`q.seq_len == 1`) attends the whole `[0, kv_len)`
+/// prefix.
+///
+/// `q`/`output` are `[q_dim, 1]` and the k/v caches are the request's own whole
+/// buffers `[kv_dim, max_seq_len]` (NHD token-major). No RoPE inside — the caller
+/// applies [`eagle3_rope_into`] first.
+#[allow(clippy::too_many_arguments)]
+pub fn single_decode_nhd_into(
+    ctx: &DeviceContext,
+    q: &HiddenStates,
+    k_cache: &HiddenStates,
+    v_cache: &HiddenStates,
+    output: &mut HiddenStates,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    kv_len: usize,
+) -> Result<()> {
+    assert_eq!(
+        q.seq_len, 1,
+        "single_decode_nhd is single-query; got q.seq_len {}",
+        q.seq_len
+    );
+    assert_eq!(q.hidden_dim, num_q_heads * head_dim);
+    assert_eq!(output.hidden_dim, q.hidden_dim);
+    assert_eq!(output.seq_len, 1);
+    assert_eq!(k_cache.hidden_dim, num_kv_heads * head_dim);
+    assert_eq!(v_cache.hidden_dim, k_cache.hidden_dim);
+    assert_eq!(v_cache.seq_len, k_cache.seq_len);
+    assert!(kv_len <= k_cache.seq_len);
+    // Shape asserts only relate the public metadata; validate it against the
+    // backing allocations too, since safe callers can inflate `.seq_len` past a
+    // small buffer (all `HiddenStates` fields are public).
+    ensure_hidden_capacity(q, "single_decode q")?;
+    ensure_hidden_capacity(k_cache, "single_decode k_cache")?;
+    ensure_hidden_capacity(v_cache, "single_decode v_cache")?;
+    ensure_hidden_capacity(output, "single_decode output")?;
+
+    let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
+    let (k_ptr, _gk) = k_cache.data.device_ptr(&ctx.stream);
+    let (v_ptr, _gv) = v_cache.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::single_decode_nhd_cuda(
+            q_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            k_ptr as *const ffi::Half,
+            v_ptr as *const ffi::Half,
+            num_q_heads as i32,
+            num_kv_heads as i32,
+            head_dim as i32,
+            kv_len as i32,
+            k_cache.seq_len as i32,
+            1.0f32 / (head_dim as f32).sqrt(),
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    if result != 0 {
+        anyhow::bail!(
+            "single_decode_nhd_cuda failed with error {result}{}",
+            crate::ops::ffi_exception_message(result)
+        );
+    }
+    Ok(())
+}
+
+/// Causal NHD single-sequence prefill. Used for EAGLE-3's
+/// teacher-forced prefill in a single batched forward.
+#[allow(clippy::too_many_arguments)]
+pub fn single_prefill_nhd_causal_into(
+    ctx: &DeviceContext,
+    q: &HiddenStates,
+    row_offset: usize,
+    q_seq_len: usize,
+    k_cache: &HiddenStates,
+    v_cache: &HiddenStates,
+    output: &mut HiddenStates,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    kv_len: usize,
+) -> Result<()> {
+    assert_eq!(q.hidden_dim, num_q_heads * head_dim);
+    assert_eq!(output.hidden_dim, q.hidden_dim);
+    assert_eq!(output.seq_len, q.seq_len);
+    assert_eq!(k_cache.hidden_dim, num_kv_heads * head_dim);
+    assert_eq!(v_cache.hidden_dim, k_cache.hidden_dim);
+    assert_eq!(v_cache.seq_len, k_cache.seq_len);
+    assert!(kv_len <= k_cache.seq_len);
+    assert!(
+        q_seq_len <= kv_len,
+        "causal prefill q_seq_len {q_seq_len} exceeds kv_len {kv_len}"
+    );
+    // Validate the row window with checked arithmetic and every backing
+    // allocation before deriving pointers; `q`/`output` share the row sub-range.
+    let byte_offset = checked_row_offset(q, row_offset, q_seq_len, "single_prefill_causal q")?;
+    ensure_hidden_capacity(output, "single_prefill_causal output")?;
+    ensure_hidden_capacity(k_cache, "single_prefill_causal k_cache")?;
+    ensure_hidden_capacity(v_cache, "single_prefill_causal v_cache")?;
+    let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
+    let q_ptr = q_ptr + byte_offset;
+    let (k_ptr, _gk) = k_cache.data.device_ptr(&ctx.stream);
+    let (v_ptr, _gv) = v_cache.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+    let out_ptr = out_ptr + byte_offset;
+    let result = unsafe {
+        ffi::single_prefill_nhd_causal_cuda(
+            q_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            k_ptr as *const ffi::Half,
+            v_ptr as *const ffi::Half,
+            num_q_heads as i32,
+            num_kv_heads as i32,
+            head_dim as i32,
+            q_seq_len as i32,
+            kv_len as i32,
+            k_cache.seq_len as i32,
+            1.0f32 / (head_dim as f32).sqrt(),
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    if result != 0 {
+        anyhow::bail!(
+            "single_prefill_nhd_causal_cuda failed with error {result}{}",
             crate::ops::ffi_exception_message(result)
         );
     }

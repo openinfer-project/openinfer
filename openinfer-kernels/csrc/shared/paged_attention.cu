@@ -758,6 +758,141 @@ int single_prefill_nhd_noncausal_cuda_hd64(
   OPENINFER_FFI_GUARD_END(-1)
 }
 
+// Causal variant of single_prefill_nhd_noncausal_cuda: identical NHD token-major
+// layout (q/output [seq, q_dim], k/v [max_seq, kv_dim]) but a causal mask, so the
+// N query tokens at the tail of the cache attend only positions <= their own.
+// Used for EAGLE-3's teacher-forced prefill in one batched forward (query i at
+// absolute position kv_len - seq_len + i, FlashInfer's causal alignment).
+int single_prefill_nhd_causal_cuda(
+    void*    q,
+    void*    output,
+    void*    k_cache,
+    void*    v_cache,
+    int32_t  num_qo_heads,
+    int32_t  num_kv_heads,
+    int32_t  head_dim,
+    int32_t  seq_len,
+    int32_t  kv_len,
+    int32_t  max_seq_len,
+    float    sm_scale,
+    void*    stream)
+{
+  OPENINFER_FFI_GUARD_BEGIN
+    if (q == nullptr || output == nullptr || k_cache == nullptr || v_cache == nullptr ||
+        num_qo_heads <= 0 || num_kv_heads <= 0 || head_dim != 128 ||
+        num_qo_heads % num_kv_heads != 0 ||
+        seq_len <= 0 || kv_len <= 0 || max_seq_len < kv_len || seq_len > kv_len) {
+        return static_cast<int>(cudaErrorInvalidValue);
+    }
+
+    uint32_t q_stride_n  = num_qo_heads * head_dim;
+    uint32_t q_stride_h  = head_dim;
+    uint32_t kv_stride_n = num_kv_heads * head_dim;
+    uint32_t kv_stride_h = head_dim;
+
+    PrefillParamsT params(
+        reinterpret_cast<DType*>(q),
+        reinterpret_cast<DType*>(k_cache),
+        reinterpret_cast<DType*>(v_cache),
+        /*maybe_custom_mask=*/nullptr,
+        reinterpret_cast<DType*>(output),
+        /*lse=*/nullptr,
+        /*maybe_alibi_slopes=*/nullptr,
+        num_qo_heads,
+        num_kv_heads,
+        static_cast<uint32_t>(seq_len),
+        static_cast<uint32_t>(kv_len),
+        q_stride_n,
+        q_stride_h,
+        kv_stride_n,
+        kv_stride_h,
+        static_cast<uint32_t>(head_dim),
+        /*window_left=*/-1,
+        /*logits_soft_cap=*/0.0f,
+        sm_scale,
+        /*rope_scale=*/1.0f,
+        /*rope_theta=*/1e6f);
+
+    return static_cast<int>(
+        SinglePrefillWithKVCacheDispatched<
+            /*HEAD_DIM_QK=*/128,
+            /*HEAD_DIM_VO=*/128,
+            PosEncodingMode::kNone,
+            /*USE_FP16_QK_REDUCTION=*/false,
+            MaskMode::kCausal,
+            Variant,
+            PrefillParamsT>(
+            params,
+            /*tmp=*/nullptr,
+            reinterpret_cast<cudaStream_t>(stream)));
+  OPENINFER_FFI_GUARD_END(-1)
+}
+
+// ---------------------------------------------------------------------------
+// Single-query DECODE over the EAGLE-3 draft's contiguous NHD KV cache.
+//
+// The chain drafter advances one token per step, so each draft attention is a
+// pure decode: exactly ONE query attends the whole [0, kv_len) prefix. This uses
+// FlashInfer's dedicated single-query decode path (GEMV-style over the KV),
+// which is *structurally* single-query — SingleDecodeParams::get_qo_len() is
+// hard-wired to 1 — so, unlike single_prefill_nhd_noncausal_cuda (a prefill
+// template forced to qo_len==1), it cannot be silently misused for a multi-query
+// batch (a footgun once the draft chain is batched). Same NHD token-major layout
+// as the *_nhd_* prefill pair: q/output [1, q_dim], k/v [max_seq_len, kv_dim].
+// No RoPE inside (the caller applies eagle3_rope first).
+// ---------------------------------------------------------------------------
+using DecodeParamsT = SingleDecodeParams<DType, DType, DType>;
+
+int single_decode_nhd_cuda(
+    void*    q,            // [1, q_dim] token-major — the single decode query
+    void*    output,       // [1, q_dim]
+    void*    k_cache,      // [max_seq_len, kv_dim] NHD (k[pos, head, dim])
+    void*    v_cache,
+    int32_t  num_qo_heads,
+    int32_t  num_kv_heads,
+    int32_t  head_dim,
+    int32_t  kv_len,       // positions to attend: [0, kv_len)
+    int32_t  max_seq_len,  // allocated cache rows (validation parity with the *_nhd_* pair)
+    float    sm_scale,
+    void*    stream)
+{
+  OPENINFER_FFI_GUARD_BEGIN
+    if (q == nullptr || output == nullptr || k_cache == nullptr || v_cache == nullptr ||
+        num_qo_heads <= 0 || num_kv_heads <= 0 || head_dim != 128 ||
+        num_qo_heads % num_kv_heads != 0 ||
+        kv_len <= 0 || max_seq_len < kv_len) {
+        return static_cast<int>(cudaErrorInvalidValue);
+    }
+
+    DecodeParamsT params(
+        reinterpret_cast<DType*>(q),
+        reinterpret_cast<DType*>(k_cache),
+        reinterpret_cast<DType*>(v_cache),
+        reinterpret_cast<DType*>(output),
+        /*maybe_alibi_slopes=*/nullptr,
+        /*seq_len(=kv_len)=*/static_cast<uint32_t>(kv_len),
+        static_cast<uint32_t>(num_qo_heads),
+        static_cast<uint32_t>(num_kv_heads),
+        QKVLayout::kNHD,
+        static_cast<uint32_t>(head_dim),
+        /*window_left=*/-1,
+        /*logits_soft_cap=*/0.0f,
+        sm_scale,
+        /*rope_scale=*/1.0f,
+        /*rope_theta=*/1e6f);
+
+    return static_cast<int>(
+        SingleDecodeWithKVCacheDispatched<
+            /*HEAD_DIM=*/128,
+            PosEncodingMode::kNone,
+            Variant,
+            DecodeParamsT>(
+            params,
+            /*tmp=*/nullptr,
+            reinterpret_cast<cudaStream_t>(stream)));
+  OPENINFER_FFI_GUARD_END(-1)
+}
+
 // ---------------------------------------------------------------------------
 // Single-request prefill for HEAD_DIM=256 — wraps FlashInfer SinglePrefillWithKVCache.
 //
