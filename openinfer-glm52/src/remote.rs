@@ -677,9 +677,29 @@ fn serve_connection(stream: TcpStream) -> Result<()> {
     for handle in forwarders {
         let _ = handle.join();
     }
-    // workers drop here: Shutdown + join per rank (collective teardown safety
-    // is the same story as the in-process engine).
-    drop(workers);
+    // Worker drop runs the collective DeepEP destroy, which needs the
+    // coordinator-side ranks to rendezvous — and they may already be gone
+    // (fail-stop kills the engine process without ceremony). A node stuck in
+    // a dead fleet's destroy barrier is worthless, so bound the teardown:
+    // past the deadline, exit and let the operator restart a clean process —
+    // the GPU state dies with it either way.
+    let deadline = std::time::Duration::from_secs(60);
+    let (done_tx, done_rx) = bounded::<()>(0);
+    let teardown = thread::Builder::new()
+        .name("glm52-rank-host-teardown".to_string())
+        .spawn(move || {
+            drop(workers);
+            let _ = done_tx.send(());
+        })
+        .map_err(|err| anyhow!("failed to spawn GLM5.2 rank-host teardown: {err}"))?;
+    if done_rx.recv_timeout(deadline).is_err() {
+        log::error!(
+            "GLM5.2 rank-host teardown exceeded {deadline:?} (collective destroy \
+             missing peers?); exiting for a clean restart"
+        );
+        std::process::exit(2);
+    }
+    let _ = teardown.join();
     result
 }
 

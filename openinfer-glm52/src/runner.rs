@@ -956,6 +956,17 @@ fn rank_worker_loop(rx: &Receiver<Glm52RankCommand>, mut state: Glm52RankThreadS
             Glm52RankCommand::Shutdown => break,
         }
     }
+    // Worker exit is load-bearing for the fleet (a silently gone rank hangs
+    // every peer in the next collective) — always say why the loop ended.
+    log::info!(
+        "GLM5.2 rank {} worker loop exiting ({})",
+        state.placement.rank,
+        if rx.is_empty() {
+            "shutdown or channel closed"
+        } else {
+            "channel closed with queued commands"
+        }
+    );
     // TP8 LL buffers are peer-mapped on every device, and a speculative
     // launch-ahead replay can still be in flight when Shutdown lands (harvest
     // only blocks on the argmax D2H). Quiesce this rank, then rendezvous with
