@@ -30,6 +30,10 @@ inline constexpr int64_t kTimeoutCycles = 200'000'000'000;
 inline constexpr int kDeviceSms = 132;
 inline constexpr int kSmemBytes = 232448;
 
+// 128, not the current 8-slot protocol cap: deliberate headroom for
+// unibatch prefill tokens riding the decode dispatch (the NVL72 plan).
+// Fixed buffer cost scales with kNumRanks * kDecodeMaxTokens; revisit
+// per width if the headroom is never used.
 inline constexpr int kDecodeMaxTokens = 128;
 inline constexpr int kDecodeNumSms = 32;
 

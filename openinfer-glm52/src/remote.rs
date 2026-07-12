@@ -263,10 +263,12 @@ impl RemoteNodeShared {
                 *poison = Some(reason.to_string());
             }
         }
-        // Shut the socket down (unblocks the demux thread, EOFs the remote
-        // end) and fail everything still in flight.
-        *self.writer.lock().expect("writer lock") = None;
+        // Shut the socket down FIRST (unblocks the demux thread, EOFs the
+        // remote end, and unblocks any writer stuck in write_all — taking the
+        // writer lock before the shutdown would deadlock against it), then
+        // fail everything still in flight.
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
+        *self.writer.lock().expect("writer lock") = None;
         for queue in &self.pending {
             let mut queue = queue.lock().expect("pending lock");
             while let Some(slot) = queue.pop_front() {
@@ -338,6 +340,11 @@ impl Glm52RemoteNode {
                 rank_count,
             },
         )?;
+        // Handshake-only read deadline (the ack lands after the rank-host
+        // parses the weight manifest and spawns workers — seconds, not the
+        // minutes-long weight load, which happens later via commands).
+        // Cleared before the demux loop takes over the reader.
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
         let mut reader = BufReader::new(stream);
         match read_frame::<WireHelloAck>(&mut reader)
             .with_context(|| format!("GLM5.2 rank-host {addr} handshake"))?
@@ -347,6 +354,7 @@ impl Glm52RemoteNode {
                 bail!("GLM5.2 rank-host {addr} rejected: {reason}")
             }
         }
+        shutdown_handle.set_read_timeout(None)?;
         log::info!(
             "GLM5.2 rank-host {addr} ready: ranks {first_rank}..{}",
             first_rank + rank_count
@@ -634,10 +642,15 @@ impl HostPending {
 
 fn serve_connection(stream: TcpStream) -> Result<()> {
     stream.set_nodelay(true)?;
+    // Handshake-only read deadline: a connect-and-hold socket must not pin
+    // the (single-connection) rank-host. Cleared before the demux loop —
+    // long idle stretches between commands are the normal serving state.
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut hello_writer = BufWriter::new(stream.try_clone()?);
 
     let hello: WireHello = read_frame(&mut reader).context("GLM5.2 rank-host hello")?;
+    stream.set_read_timeout(None)?;
     if hello.version != GLM52_WIRE_VERSION {
         let reason = format!(
             "wire version mismatch: coordinator {}, rank-host {GLM52_WIRE_VERSION}",
@@ -687,7 +700,11 @@ fn serve_connection(stream: TcpStream) -> Result<()> {
                             body,
                         },
                     ) {
+                        // Fail-stop the CONNECTION, not just this thread: a
+                        // silently lost response would leave the lockstep
+                        // coordinator waiting forever on a healthy socket.
                         log::error!("GLM5.2 rank-host response write failed: {err:#}");
+                        let _ = writer.get_ref().shutdown(std::net::Shutdown::Both);
                         return;
                     }
                 }
@@ -702,29 +719,33 @@ fn serve_connection(stream: TcpStream) -> Result<()> {
     // the drops below tear the workers down.
     let result = host_demux_loop(&mut reader, &workers, &pending_txs);
 
-    drop(pending_txs); // forwarders drain and exit
-    for handle in forwarders {
-        let _ = handle.join();
-    }
-    // Worker drop runs the collective DeepEP destroy, which needs the
+    // The whole teardown — forwarder joins AND worker drops — must sit
+    // behind one deadline. A forwarder blocks in `pending.wait()` while its
+    // worker is stuck inside a collective (e.g. the coordinator died during
+    // NCCL init and `ctx_create` waits for ranks that will never come), and
+    // worker drop runs the collective DeepEP destroy, which needs the
     // coordinator-side ranks to rendezvous — and they may already be gone
     // (fail-stop kills the engine process without ceremony). A node stuck in
-    // a dead fleet's destroy barrier is worthless, so bound the teardown:
-    // past the deadline, exit and let the operator restart a clean process —
-    // the GPU state dies with it either way.
+    // a dead fleet's barrier is worthless, so bound it: past the deadline,
+    // exit and let the operator restart a clean process — the GPU state dies
+    // with it either way.
     let deadline = std::time::Duration::from_secs(60);
     let (done_tx, done_rx) = bounded::<()>(0);
     let teardown = thread::Builder::new()
         .name("glm52-rank-host-teardown".to_string())
         .spawn(move || {
+            drop(pending_txs); // forwarders drain and exit
+            for handle in forwarders {
+                let _ = handle.join();
+            }
             drop(workers);
             let _ = done_tx.send(());
         })
         .map_err(|err| anyhow!("failed to spawn GLM5.2 rank-host teardown: {err}"))?;
     if done_rx.recv_timeout(deadline).is_err() {
         log::error!(
-            "GLM5.2 rank-host teardown exceeded {deadline:?} (collective destroy \
-             missing peers?); exiting for a clean restart"
+            "GLM5.2 rank-host teardown exceeded {deadline:?} (worker stuck in a \
+             collective missing peers?); exiting for a clean restart"
         );
         std::process::exit(2);
     }
