@@ -422,7 +422,7 @@ impl MixedRequestScheduler {
             Ok(next_tokens) => {
                 retire_rows_with_error(
                     states,
-                    format!(
+                    &format!(
                         "DeepSeek-V2-Lite batched decode returned {} rows for {} active requests",
                         next_tokens.len(),
                         group_size
@@ -435,7 +435,7 @@ impl MixedRequestScheduler {
             Err(err) => {
                 retire_rows_with_error(
                     states,
-                    format!(
+                    &format!(
                         "DeepSeek-V2-Lite batched decode failed for {} active requests: {err}",
                         group_size
                     ),
@@ -509,13 +509,13 @@ fn apply_decoded_tokens_to_rows(
 
 fn retire_rows_with_error(
     states: Vec<ActiveRequestState>,
-    message: String,
+    message: &str,
     active_remaining: &mut usize,
     pending_queue_size: usize,
 ) {
     for state in states {
         *active_remaining = active_remaining.saturating_sub(1);
-        state.emit_error(message.clone(), *active_remaining, pending_queue_size);
+        state.emit_error(message.to_string(), *active_remaining, pending_queue_size);
     }
 }
 

@@ -325,8 +325,10 @@ fn diff_against_dump(outputs: &[f32], dump: &Path) -> Result<()> {
     let oracle: Vec<f32> = st
         .tensor("o")?
         .data()
-        .chunks_exact(2)
-        .map(|c| bf16::from_le_bytes([c[0], c[1]]).to_f32())
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| bf16::from_le_bytes(*c).to_f32())
         .collect();
     ensure!(
         oracle.len() == outputs.len(),

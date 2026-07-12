@@ -429,11 +429,10 @@ fn load_bf16_tensor_host(
     );
     Ok(tensor
         .data()
-        .chunks_exact(std::mem::size_of::<bf16>())
-        .map(|bytes| {
-            let bits = u16::from_le_bytes([bytes[0], bytes[1]]);
-            bf16::from_bits(bits).to_f32()
-        })
+        .as_chunks::<{ std::mem::size_of::<bf16>() }>()
+        .0
+        .iter()
+        .map(|bytes| bf16::from_bits(u16::from_le_bytes(*bytes)).to_f32())
         .collect())
 }
 

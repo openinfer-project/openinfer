@@ -78,10 +78,13 @@ fn device_router_matches_host_softmax_topk_rule() {
     let logits = gate_logits_host(&config, &hidden_host, &gate_host_f32);
     let expected = topk_softmax_routes(&config, &logits, hidden.seq_len);
 
-    for token in 0..hidden.seq_len {
-        for route in 0..config.num_experts_per_token {
+    for (token, expected_routes) in expected.iter().enumerate().take(hidden.seq_len) {
+        for (route, &(expected_idx, expected_weight)) in expected_routes
+            .iter()
+            .enumerate()
+            .take(config.num_experts_per_token)
+        {
             let offset = token * config.num_experts_per_token + route;
-            let (expected_idx, expected_weight) = expected[token][route];
             assert_eq!(got_idx[offset], expected_idx as i32);
             assert_close(got_weight[offset], expected_weight, 1.0e-6);
         }
@@ -170,7 +173,7 @@ fn router_logits_rejects_inflated_hidden_metadata() {
 
     let err = dsv2_lite_router_logits_into(&ctx, &hidden, &gate, &mut logits)
         .expect_err("inflated hidden metadata must fail before CUDA launch");
-    assert_error_contains(err, "router hidden backing buffer too small");
+    assert_error_contains(&err, "router hidden backing buffer too small");
 }
 
 #[test]
@@ -199,7 +202,7 @@ fn router_logits_rejects_inflated_gate_metadata() {
 
     let err = dsv2_lite_router_logits_into(&ctx, &hidden, &gate, &mut logits)
         .expect_err("inflated gate metadata must fail before CUDA launch");
-    assert_error_contains(err, "router gate backing buffer too small");
+    assert_error_contains(&err, "router gate backing buffer too small");
 }
 
 #[test]
@@ -235,7 +238,7 @@ fn router_topk_rejects_inflated_hidden_metadata() {
         },
     )
     .expect_err("inflated hidden metadata must fail before CUDA launch");
-    assert_error_contains(err, "router hidden backing buffer too small");
+    assert_error_contains(&err, "router hidden backing buffer too small");
 }
 
 #[test]
@@ -264,7 +267,7 @@ fn route_row_accumulation_rejects_inflated_rows_metadata() {
         &mut out,
     )
     .expect_err("inflated rows metadata must fail before CUDA launch");
-    assert_error_contains(err, "route rows backing buffer too small");
+    assert_error_contains(&err, "route rows backing buffer too small");
 }
 
 #[test]
@@ -302,7 +305,7 @@ fn fixed_expert_accumulate_rejects_inflated_output_metadata() {
         &mut accum,
     )
     .expect_err("inflated expert output metadata must fail before CUDA launch");
-    assert_error_contains(err, "fixed-expert output backing buffer too small");
+    assert_error_contains(&err, "fixed-expert output backing buffer too small");
 }
 
 #[test]
@@ -331,7 +334,7 @@ fn kv_norm_rejects_inflated_input_metadata() {
 
     let err = dsv2_lite_kv_norm_into(&ctx, &kv_a, &norm_weight, 2, 1.0e-6, &mut compressed)
         .expect_err("inflated kv_a metadata must fail before CUDA launch");
-    assert_error_contains(err, "kv norm kv_a backing buffer too small");
+    assert_error_contains(&err, "kv norm kv_a backing buffer too small");
 }
 
 #[test]
@@ -360,7 +363,7 @@ fn kv_norm_rejects_inflated_output_metadata() {
 
     let err = dsv2_lite_kv_norm_into(&ctx, &kv_a, &norm_weight, 2, 1.0e-6, &mut compressed)
         .expect_err("inflated compressed metadata must fail before CUDA launch");
-    assert_error_contains(err, "kv norm compressed backing buffer too small");
+    assert_error_contains(&err, "kv norm compressed backing buffer too small");
 }
 
 #[test]
@@ -399,7 +402,7 @@ fn decode_attention_rejects_inflated_q_metadata() {
         &mut out,
     )
     .expect_err("inflated q metadata must fail before CUDA launch");
-    assert_error_contains(err, "attention q backing buffer too small");
+    assert_error_contains(&err, "attention q backing buffer too small");
 }
 
 #[test]
@@ -435,7 +438,7 @@ fn decode_attention_rejects_inflated_output_metadata() {
         &mut out,
     )
     .expect_err("inflated out metadata must fail before CUDA launch");
-    assert_error_contains(err, "attention out backing buffer too small");
+    assert_error_contains(&err, "attention out backing buffer too small");
 }
 
 #[test]
@@ -657,7 +660,7 @@ fn assert_close(got: f32, expected: f32, tolerance: f32) {
     );
 }
 
-fn assert_error_contains(err: anyhow::Error, needle: &str) {
+fn assert_error_contains(err: &anyhow::Error, needle: &str) {
     let message = err.to_string();
     assert!(
         message.contains(needle),

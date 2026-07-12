@@ -872,7 +872,7 @@ mod tests {
             .expect("DFlash config should match target");
 
         assert_eq!(dflash.block_size, 16);
-        assert_eq!(dflash.mask_token_id, 151669);
+        assert_eq!(dflash.mask_token_id, 151_669);
         assert_eq!(dflash.target_layer_ids, vec![1, 9, 17, 25, 33]);
 
         // Pin the memory reservation the KV budget bills against. The per-token
