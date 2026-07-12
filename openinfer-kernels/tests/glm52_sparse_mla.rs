@@ -66,7 +66,13 @@ fn build_cache(rng: &mut XorShift) -> Vec<u8> {
             *byte = b;
         }
         for g in 0..4 {
-            let scale = 0.002f32 * (0.5 + 1.5 * (rng.unit() * 0.5 + 0.5));
+            // UE8M0 (power-of-two) scales — the fp8_ds_mla cache contract:
+            // the production writer rounds group scales up to the next power
+            // of two because the FlashMLA sm100 kernel truncates stored f32
+            // scales to e8m0 for its block-scaled MMA (arbitrary scales are
+            // silently read up to 2x too small on Blackwell).
+            let raw = 0.002f32 * (0.5 + 1.5 * (rng.unit() * 0.5 + 0.5));
+            let scale = f32::from_bits((raw.to_bits() + 0x007F_FFFF) & 0x7F80_0000);
             token[512 + 4 * g..512 + 4 * (g + 1)].copy_from_slice(&scale.to_le_bytes());
         }
         for r in 0..64 {
@@ -300,6 +306,96 @@ impl Rig {
         }
         Ok(())
     }
+}
+
+/// FlashMLA sparse decode vs the f64 reference on the CURRENT arch — isolates
+/// the arch-dispatched FlashMLA kernel (sm90 splitkv vs sm100 head64) from the
+/// model-level oracle gates. Runs everywhere the FlashMLA kernel dispatches.
+#[test]
+#[ignore = "requires a GPU + GLM5.2 feature"]
+fn flashmla_sparse_vs_reference_gate() -> Result<()> {
+    let rig = Rig::new()?;
+    let ctx = &rig.ctx;
+    let num_sm_parts = glm52_flashmla_sparse_decode_num_sm_parts()?;
+    for (label, batch, topk, valid) in [
+        ("b1 h16 topk2048 valid1", 1usize, 2048usize, vec![1usize]),
+        ("b1 h16 topk2048 valid8", 1, 2048, vec![8]),
+        ("b1 h16 topk2048 valid200", 1, 2048, vec![200]),
+        ("b1 h16 topk2048 full", 1, 2048, vec![2048]),
+        ("b8 h16 topk2048 mixed", 8, 2048, vec![2048, 1, 256, 64, 8, 512, 128, 1536]),
+    ] {
+        // The f64 reference contract caps heads at 16; per-head attention math
+        // is head-count independent and FlashMLA always fills all 64 slots
+        // (build_q zero-pads above `heads`, delta() compares real slots only).
+        let heads = 16;
+        let mut rng = XorShift(
+            0xd15c_0b01_0000_0000 ^ (batch as u64) << 32 ^ (heads as u64) << 16 ^ topk as u64,
+        );
+        let q_host = build_q(&mut rng, batch, heads);
+        let indices_host = build_indices(&mut rng, topk, &valid);
+        let mut q = ctx.stream.alloc_zeros::<bf16>(q_host.len())?;
+        ctx.stream.memcpy_htod(&q_host, &mut q)?;
+        let mut indices = ctx.stream.alloc_zeros::<i32>(indices_host.len())?;
+        ctx.stream.memcpy_htod(&indices_host, &mut indices)?;
+
+        let contract = Glm52SparseMlaDecode {
+            batch_size: batch,
+            num_blocks: MAX_SLOTS / GLM52_FLASHMLA_SPARSE_PAGE_SIZE,
+            topk,
+            heads,
+            sm_scale: SM_SCALE,
+        };
+        let mut latent_ref = ctx.stream.alloc_zeros::<bf16>(contract.latent_len())?;
+        glm52_sparse_mla_reference_launch(ctx, contract, &q, &rig.cache, &indices, &mut latent_ref)?;
+
+        let flash = Glm52FlashMlaSparseDecode {
+            batch_size: batch,
+            num_blocks: MAX_SLOTS / GLM52_FLASHMLA_SPARSE_PAGE_SIZE,
+            topk,
+            num_sm_parts,
+            sm_scale: SM_SCALE,
+        };
+        let mut sched = ctx
+            .stream
+            .alloc_zeros::<i32>(flash.tile_scheduler_metadata_len())?;
+        let mut num_splits = ctx.stream.alloc_zeros::<i32>(flash.num_splits_len())?;
+        glm52_flashmla_sparse_decode_metadata_launch(
+            ctx,
+            batch,
+            topk,
+            num_sm_parts,
+            &mut sched,
+            &mut num_splits,
+        )?;
+        let mut latent_flash = ctx.stream.alloc_zeros::<bf16>(flash.latent_len())?;
+        let mut lse = ctx.stream.alloc_zeros::<f32>(flash.lse_len())?;
+        let mut lse_accum = ctx.stream.alloc_zeros::<f32>(flash.lse_accum_len())?;
+        let mut o_accum = ctx.stream.alloc_zeros::<f32>(flash.o_accum_len())?;
+        glm52_flashmla_sparse_decode_launch(
+            ctx,
+            flash,
+            &q,
+            &rig.cache,
+            &indices,
+            &sched,
+            &num_splits,
+            &mut latent_flash,
+            &mut lse,
+            &mut lse_accum,
+            &mut o_accum,
+        )?;
+        let flash_host = ctx.stream.clone_dtoh(&latent_flash)?;
+        let ref_host = ctx.stream.clone_dtoh(&latent_ref)?;
+        ctx.stream.synchronize()?;
+        let d = delta(&flash_host, &ref_host, batch, heads);
+        println!("{label:>28}: flash-vs-ref mean-norm {:.3e} (max {:.3e})", d.mean_norm, d.max_abs);
+        ensure!(
+            d.mean_norm < 2e-2,
+            "{label}: flash-vs-ref mean-norm {:.3e} over gate 2e-2",
+            d.mean_norm
+        );
+    }
+    Ok(())
 }
 
 #[test]

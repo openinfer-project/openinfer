@@ -100,6 +100,7 @@ unsafe extern "C" {
         weight_scale: *const f32,
         tiles: *const i32,
         tile_count: *const i32,
+        row_weights: *const f32,
         out: *mut Half,
         n: i32,
         k: i32,
@@ -109,7 +110,6 @@ unsafe extern "C" {
 
     pub fn glm52_moe_ep_wo_silu_cuda(
         input: *const Half,
-        topk_weights: *const f32,
         tiles: *const i32,
         tile_count: *const i32,
         output: *mut Half,
@@ -184,6 +184,16 @@ unsafe extern "C" {
 
     // --- FP8 per-token-group quant (shared by MLA cache, MoE, dense) ----------
     pub fn glm52_fp8_per_token_group_quant_bf16_cuda(
+        input: *const Half,
+        output: *mut u8,
+        scales: *mut f32,
+        rows: i32,
+        hidden_dim: i32,
+        group_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn glm52_fp8_per_token_group_quant_bf16_ue8m0_cuda(
         input: *const Half,
         output: *mut u8,
         scales: *mut f32,
