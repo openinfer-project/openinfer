@@ -92,6 +92,7 @@ pub(super) fn dump_rank0_decode_graph(
     let bucket = graph_dump_bucket(full_bucket);
     let topology = match moe_topo {
         Glm52MoeTopo::Ep8 => "DP8/EP8",
+        Glm52MoeTopo::Ep4 => "DP4/EP4",
         Glm52MoeTopo::Tp8 => "MoE TP8 · mirrored",
         Glm52MoeTopo::Tp4 => "MoE TP4 · mirrored",
     };

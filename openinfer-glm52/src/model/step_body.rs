@@ -16,7 +16,8 @@ use crate::layer::{
     glm52_layer_attention_half, glm52_layer_finish, glm52_layer_finish_fused,
 };
 use crate::moe_decode::run_router_into;
-use crate::moe_ep8::{Glm52MoeEp8LayerWeights, Glm52MoeEp8State, glm52_moe_ep8_routed_forward};
+use crate::moe_ep4::Glm52MoeEpState;
+use crate::moe_ep8::Glm52MoeEp8LayerWeights;
 use crate::moe_tp::Glm52MoeTpRank;
 use crate::scratch::Glm52DecodeScratch;
 
@@ -31,7 +32,7 @@ use super::{GLM52_MAX_BATCH_PER_RANK, VOCAB_AR_SLOT};
 pub(super) fn run_step_body(
     ctx: &DeviceContext,
     aux: &DeviceContext,
-    mut ep8: Option<&mut Glm52MoeEp8State>,
+    mut ep8: Option<&mut Glm52MoeEpState>,
     mut tp: Option<&mut Glm52MoeTpRank>,
     layers: &[Glm52DecoderLayerWeights],
     caches: &mut [Glm52LayerCaches],
@@ -104,9 +105,9 @@ pub(super) fn run_step_body(
             Glm52LayerMlp::MoeEp8(moe) => {
                 let ep8 = ep8
                     .as_deref_mut()
-                    .context("GLM5.2 EP8 MoE layer reached without DeepEP state")?;
-                glm52_moe_ep8_layer(ctx, aux, ep8, moe, s, batch, global_tokens)
-                    .with_context(|| format!("GLM5.2 layer {layer} EP8 MoE"))?;
+                    .context("GLM5.2 EP MoE layer reached without DeepEP state")?;
+                glm52_moe_ep_layer(ctx, aux, ep8, moe, s, batch, global_tokens)
+                    .with_context(|| format!("GLM5.2 layer {layer} EP MoE"))?;
             }
             Glm52LayerMlp::MoeTp(router) => {
                 let (state, slot, bank) = tp
@@ -247,14 +248,15 @@ pub(super) fn run_step_body(
     Ok(())
 }
 
-/// One layer's EP8 MoE half: shared expert forked to the aux stream, routed
-/// path through router + DeepEP dispatch/grouped-GEMM/combine, joined by the
-/// closing add into `mlp_out`. The events recorded here during capture
-/// become graph edges; replay keeps the parallel branches.
-fn glm52_moe_ep8_layer(
+/// One layer's EP MoE half (EP8 or EP4 — the state carries the chain):
+/// shared expert forked to the aux stream, routed path through router +
+/// DeepEP dispatch/expert-GEMM/combine, joined by the closing add into
+/// `mlp_out`. The events recorded here during capture become graph edges;
+/// replay keeps the parallel branches.
+fn glm52_moe_ep_layer(
     ctx: &DeviceContext,
     aux: &DeviceContext,
-    ep8: &mut Glm52MoeEp8State,
+    ep8: &mut Glm52MoeEpState,
     moe: &Glm52MoeEp8LayerWeights,
     s: &mut Glm52DecodeScratch,
     batch: usize,
@@ -275,16 +277,15 @@ fn glm52_moe_ep8_layer(
     let shared_done = aux.stream.record_event(None)?;
 
     run_router_into(ctx, &moe.router, s.layer.normed2.data(), &mut s.router)?;
-    let dispatched = glm52_moe_ep8_routed_forward(
+    let dispatched = ep8.routed_forward(
         ctx,
-        ep8,
         &moe.bank,
         Some((s.layer.normed2.data(), &s.router.route, batch)),
         global_tokens,
     )?;
     ensure!(
         dispatched,
-        "EP8 MoE returned no combined output for the dispatched rows"
+        "EP MoE returned no combined output for the dispatched rows"
     );
     // Join: the closing add consumes both branches.
     ctx.stream.wait(&shared_done)?;

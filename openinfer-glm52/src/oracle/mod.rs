@@ -20,6 +20,7 @@ mod attn_tp;
 mod bookend;
 mod indexer;
 mod layer;
+mod layer_ep4;
 mod layer_ep8;
 mod layer_tp8;
 mod mla;

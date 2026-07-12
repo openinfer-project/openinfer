@@ -299,17 +299,20 @@ impl LayerTensors {
 pub(crate) enum GateLayerMlp {
     Dense,
     MoeEp8Rank0,
+    MoeEp4Rank0,
 }
 
-/// Pack one EP8 rank's 32 local experts from the layer's host tensors.
+/// Pack one EP rank's local experts from the layer's host tensors
+/// (`ranks` = 8 → 32 experts, 4 → 64 experts).
 pub(crate) fn load_rank_expert_bank(
     ctx: &DeviceContext,
     t: &LayerTensors,
     layer: usize,
     rank: usize,
+    ranks: usize,
 ) -> Result<crate::moe_decode::Glm52MoeExpertBank> {
     let mp = format!("model.layers.{layer}.mlp");
-    let local = EXPERTS / 8;
+    let local = EXPERTS / ranks;
     let experts: Vec<Glm52MoeRoutedExpertBytes<'_>> = (rank * local..(rank + 1) * local)
         .map(|e| {
             let ep = format!("{mp}.experts.{e}");
@@ -369,7 +372,12 @@ pub(crate) fn load_decoder_layer(
                 &t.proj(&format!("{mp}.down_proj"), HIDDEN, DENSE_INTERMEDIATE)?,
             )?))
         }
-        GateLayerMlp::MoeEp8Rank0 => {
+        GateLayerMlp::MoeEp8Rank0 | GateLayerMlp::MoeEp4Rank0 => {
+            let ep_ranks = if mlp_kind == GateLayerMlp::MoeEp8Rank0 {
+                8
+            } else {
+                4
+            };
             Glm52LayerMlp::MoeEp8(Box::new(crate::moe_ep8::Glm52MoeEp8LayerWeights {
                 router: crate::moe_decode::Glm52MoeRouterWeights::new(
                     upload_u8(ctx, t.bytes(&format!("{mp}.gate.weight"))?)?,
@@ -402,7 +410,7 @@ pub(crate) fn load_decoder_layer(
                         )?,
                     )?,
                 )?,
-                bank: load_rank_expert_bank(ctx, &t, layer, 0)?,
+                bank: load_rank_expert_bank(ctx, &t, layer, 0, ep_ranks)?,
             }))
         }
     };

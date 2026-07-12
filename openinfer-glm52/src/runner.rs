@@ -15,6 +15,7 @@ use crate::dspark::{
 };
 
 use crate::model::{GLM52_MAX_BATCH_PER_RANK, Glm52RankModel, Glm52StepKv, Glm52StepShape};
+use crate::moe_ep4::{Glm52MoeEp4State, Glm52MoeEpState};
 use crate::moe_ep8::Glm52MoeEp8State;
 use crate::moe_tp::{
     Glm52MoeTpRank, Glm52MoeTpSliceBank, Glm52MoeTpState, Glm52TpExchange, load_tp_slice_layer,
@@ -385,7 +386,7 @@ struct Glm52RankRuntime {
     /// collectives on it (fork/join via events inside the decode graph).
     aux_ctx: openinfer_kernels::tensor::DeviceContext,
     /// Populated by SetupComm (collective), after every rank's build succeeded.
-    ep8: Option<Glm52MoeEp8State>,
+    ep8: Option<Glm52MoeEpState>,
     /// Populated by SetupComm when the TP8 pilot is on (LL rendezvous is
     /// collective too): the runtime state plus the slice banks loaded in
     /// LoadWeights.
@@ -632,13 +633,28 @@ impl Glm52RankThreadState {
         // rank's TP setup fails below.
         runtime.tp_exchange = tp_exchange.cloned();
         if moe_topo.uses_ep_expert_bundles() {
-            // Collective: every EP rank calls this concurrently.
-            runtime.ep8 = Some(Glm52MoeEp8State::new(
-                &dev_ctx,
-                unique_id,
-                GLM52_EP_RANKS,
-                self.placement.rank,
-            )?);
+            // Collective: every EP rank calls this concurrently. The
+            // topology selects both the shim instantiation and the
+            // routed-expert GEMM chain.
+            runtime.ep8 = Some(match moe_topo {
+                crate::Glm52MoeTopo::Ep8 => {
+                    Glm52MoeEpState::MaskedFp8(Box::new(Glm52MoeEp8State::new(
+                        &dev_ctx,
+                        unique_id,
+                        moe_topo.expected_ep_size(),
+                        self.placement.rank,
+                    )?))
+                }
+                crate::Glm52MoeTopo::Ep4 => {
+                    Glm52MoeEpState::WeightOnly(Box::new(Glm52MoeEp4State::new(
+                        &dev_ctx,
+                        unique_id,
+                        moe_topo.expected_ep_size(),
+                        self.placement.rank,
+                    )?))
+                }
+                other => anyhow::bail!("GLM5.2 {other:?} is not an expert-bundle topology"),
+            });
         }
         if let Some(exchange) = tp_exchange {
             ensure!(
@@ -651,8 +667,8 @@ impl Glm52RankThreadState {
             let topology = match moe_topo {
                 crate::Glm52MoeTopo::Tp8 => openinfer_kernels::ops::Glm52TpTopology::Tp8,
                 crate::Glm52MoeTopo::Tp4 => openinfer_kernels::ops::Glm52TpTopology::Tp4,
-                crate::Glm52MoeTopo::Ep8 => {
-                    anyhow::bail!("GLM5.2 EP8 setup received a TP exchange")
+                crate::Glm52MoeTopo::Ep8 | crate::Glm52MoeTopo::Ep4 => {
+                    anyhow::bail!("GLM5.2 {moe_topo:?} setup received a TP exchange")
                 }
             };
             let state = Glm52MoeTpState::new(

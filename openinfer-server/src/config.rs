@@ -153,10 +153,12 @@ pub(crate) struct Args {
 
     /// GLM5.2 launch-time MoE sharding topology: `ep8` (default) is the
     /// high-throughput configuration (32 whole experts per rank, DeepEP
-    /// dispatch/combine, buckets 1-8); `tp8` is the low-latency
+    /// dispatch/combine, buckets 1-8); `ep4` is its four-GPU counterpart
+    /// (64 whole experts per rank, weight-only expert GEMMs — the GB300
+    /// high-throughput topology); `tp8` is the low-latency
     /// configuration (1/8-intermediate slice of ALL experts per rank on
     /// every MoE layer, bucket-1 only — at most one request per rank);
-    /// `tp4` is the GB300 four-GPU bring-up topology.
+    /// `tp4` is the GB300 four-GPU low-latency topology.
     #[arg(long, default_value = "ep8")]
     pub moe_topo: String,
 
@@ -741,6 +743,25 @@ mod tests {
         let error = args
             .validate(ModelType::Glm52, &provided)
             .expect_err("GLM5.2 should reject an unknown topology string");
-        assert!(error.to_string().contains("ep8, tp8, or tp4"));
+        assert!(error.to_string().contains("ep8, ep4, tp8, or tp4"));
+    }
+
+    #[cfg(feature = "glm52")]
+    #[test]
+    fn glm52_accepts_ep4_default_dp4() {
+        let (args, provided) = parse_with_provided(&["openinfer", "--moe-topo", "ep4"]);
+        args.validate(ModelType::Glm52, &provided)
+            .expect("GLM5.2 EP4 should default to DP4 with --tp-size=1");
+    }
+
+    #[cfg(feature = "glm52")]
+    #[test]
+    fn glm52_ep4_rejects_non_dp4() {
+        let (args, provided) =
+            parse_with_provided(&["openinfer", "--moe-topo", "ep4", "--dp-size", "8"]);
+        let error = args
+            .validate(ModelType::Glm52, &provided)
+            .expect_err("GLM5.2 EP4 should reject explicit non-DP4");
+        assert!(error.to_string().contains("--dp-size=4"));
     }
 }

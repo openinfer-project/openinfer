@@ -82,11 +82,7 @@ fn main() -> Result<()> {
              logical rank); pass --buckets values in 1..={GLM52_RANKS}"
         );
     }
-    let (tp_size, dp_size) = match moe_topo {
-        openinfer_glm52::Glm52MoeTopo::Ep8 => (1, GLM52_RANKS),
-        openinfer_glm52::Glm52MoeTopo::Tp8 => (1, GLM52_RANKS),
-        openinfer_glm52::Glm52MoeTopo::Tp4 => (4, 1),
-    };
+    let (tp_size, dp_size) = (moe_topo.expected_tp_size(), moe_topo.default_dp_size());
     ensure!(
         cli.steps > cli.warmup_steps + 8,
         "--steps ({}) must exceed --warmup-steps ({}) with room for a steady window",

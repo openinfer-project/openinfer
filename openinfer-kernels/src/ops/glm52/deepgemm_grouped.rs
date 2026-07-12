@@ -37,7 +37,8 @@ impl Glm52DeepGemmGroupedFp8Kind {
         }
     }
 
-    fn shape(self) -> (usize, usize) {
+    /// The operand's `(n, k)` (shared with the EP-WO weight-only chain).
+    pub fn shape(self) -> (usize, usize) {
         match self {
             Self::W13 => (4096, 6144),
             Self::W2 => (6144, 2048),
