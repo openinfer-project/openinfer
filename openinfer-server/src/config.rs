@@ -144,8 +144,10 @@ pub(crate) struct Args {
 
     /// Zero-hit wait window for --kv-pd-vllm-seed mode, in milliseconds: how
     /// long a cold request keeps re-querying before giving up on the expected
-    /// remote KV and prefilling locally. Must stay below the executor's 15s
-    /// remote-fetch deadline (enforced at engine startup).
+    /// remote KV. On give-up, Qwen3 prefills locally; GLM5.2 rejects for the
+    /// router to retry (see --kv-pd-allow-local-prefill). Must stay below the
+    /// executor's 15s remote-fetch deadline (both engines enforce this at
+    /// startup).
     #[arg(long, default_value_t = 5000, requires = "kv_pd_vllm_seed")]
     pub kv_pd_miss_wait_ms: u64,
 

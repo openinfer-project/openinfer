@@ -104,14 +104,6 @@ impl RankOffload {
     }
 }
 
-/// Restore the prompt-prefix blocks the GPU cache no longer holds from the
-/// host tier: probe → query → load into reserved pool pages → commit as
-/// matchable prefix. Blocks on the load — admission is a step boundary, and
-/// the request's first prefill chunk must not read half-restored pages.
-///
-/// Returns the probe, which holds the GPU-hit and freshly-committed blocks
-/// alive; the caller keeps it across `match_and_add_prefix` so the restored
-/// prefix cannot be evicted before it is re-matched.
 /// vLLM-compat P/D miss breaker: after this many consecutive requests each
 /// exhausted the whole zero-hit wait window, new requests park with the short
 /// [`BREAKER_PROBE_WINDOW`] instead of the full miss window (the prefill peer
@@ -134,7 +126,7 @@ const BREAKER_PROBE_WINDOW: Duration = Duration::from_millis(500);
 
 /// Hard ceiling on one request's remote-KV wait, covering an in-flight P2P
 /// fetch (`QueryOutcome::Loading`). Well above pegaflow's own fetch timeout.
-const REMOTE_FETCH_DEADLINE: Duration = Duration::from_secs(15);
+pub(crate) const REMOTE_FETCH_DEADLINE: Duration = Duration::from_secs(15);
 
 /// Decode-node admission state for a vLLM prefill peer (one per coordinator;
 /// see `crate::Glm52VllmCompatOptions` for the deployment contract). Tracks
@@ -230,9 +222,11 @@ impl VllmPdState {
             .is_none_or(|parked| parked.fingerprint != fingerprint);
         if stale {
             let now = Instant::now();
-            let query_key = req.request_id.clone().unwrap_or_else(|| {
-                format!("glm52-pd-{}", QUERY_SEQ.fetch_add(1, Ordering::Relaxed))
-            });
+            // Never the client-supplied request_id: pegaflow keys prefetch
+            // state and its failed-remote blacklist by this id, so a
+            // duplicate or reused external id would cross-consume another
+            // request's fetch or inherit its 5-minute blacklist entry.
+            let query_key = format!("glm52-pd-{}", QUERY_SEQ.fetch_add(1, Ordering::Relaxed));
             let (miss_wait, fetch_wait) =
                 if self.consecutive_miss_windows >= MISS_BREAKER_THRESHOLD {
                     (BREAKER_PROBE_WINDOW, BREAKER_PROBE_WINDOW)
@@ -262,13 +256,8 @@ impl VllmPdState {
     }
 }
 
-/// vLLM-compat P/D admission for one rank's front request. The router
-/// appended the prefill peer's first generated token to the prompt, so the
-/// peer's registered KV covers every prompt position except that last token:
-/// all full 64-token pages under vLLM's own block hashes, plus the partial
 /// Deinterleave the RoPE dims of freshly-restored pages on every executor
-/// holding an arena replica (one worker under EP8, all of them under the
-/// mirrored TP topologies). Blocking, but called only at step boundaries
+/// holding an arena replica. Blocking, but called only at step boundaries
 /// where the workers' command queues are idle.
 fn vllm_rope_fixup(
     workers: &[crate::runner::Glm52RankWorker],
@@ -282,6 +271,10 @@ fn vllm_rope_fixup(
     Ok(())
 }
 
+/// vLLM-compat P/D admission for one rank's front request. The router
+/// appended the prefill peer's first generated token to the prompt, so the
+/// peer's registered KV covers every prompt position except that last token:
+/// all full 64-token pages under vLLM's own block hashes, plus the partial
 /// tail page under the P-side connector extension's derived tail key. A
 /// complete restore leaves a one-token forward — a decode-shaped step — and
 /// zero prompt-position compute on this node.
@@ -308,9 +301,12 @@ pub(super) fn admit_vllm_pd(
     let mut probe = pool.probe_prefix(prompt.clone(), None);
     let gpu_hit = probe.gpu_hit_blocks();
     let window = probe.cpu_query_window();
-    // The one-token surplus makes the probe's reuse cap land exactly on the
-    // peer-prefilled full blocks: cacheable = (len(prompt)-1)/PAGE = chain.
-    debug_assert_eq!(gpu_hit + window, chain.len());
+    // The one-token surplus makes the probe's reuse cap land on the
+    // peer-prefilled full blocks (cacheable = (len(prompt)-1)/PAGE = chain),
+    // EXCEPT when the radix already holds the block containing the surplus
+    // token (a retried block-aligned prompt): gpu_hit then overshoots
+    // cacheable by one and the probe reports an empty query window — the
+    // same tolerated state as the plain path's gpu_hit >= cacheable guard.
 
     let mut shortfall: Option<Shortfall> = None;
     let mut saw_loading = false;
@@ -323,6 +319,12 @@ pub(super) fn admit_vllm_pd(
         match offload.engine.query(&query_key, keys) {
             Ok(QueryOutcome::Ready(hit)) => match hit.lease {
                 Some(lease) if hit.num_blocks == window => {
+                    // A full-window metadata hit proves the peer IS
+                    // publishing — close the breaker now, before the load,
+                    // so a restore that outlives one probe window parks
+                    // with full deadlines on its next attempt instead of
+                    // feeding the breaker forever.
+                    state.consecutive_miss_windows = 0;
                     match pool.reserve_loaded_blocks(hit.num_blocks) {
                         Some(reservation) => match offload.engine.load(lease, reservation.page_ids())
                         {
@@ -401,46 +403,55 @@ pub(super) fn admit_vllm_pd(
             .query(&format!("{query_key}-tail"), &[tail_key])
         {
             Ok(QueryOutcome::Ready(hit)) => match hit.lease {
-                Some(lease) => match kv.schedule_prefill(tail_len, pool) {
-                    Ok(()) => {
-                        // step_page_indices covers the whole sequence up to the
-                        // step end; the restored full blocks occupy all but the
-                        // last entry, and the tail page is that last entry (the
-                        // restore left kv_position block-aligned, so tail_len
-                        // tokens open exactly one fresh page).
-                        let pages = kv.step_page_indices(tail_len);
-                        let tail_page = *pages.last().expect("tail step has a page");
-                        match offload.engine.load(lease, vec![tail_page]) {
-                            Ok(handle) => {
-                                let landed = handle
-                                    .wait()
-                                    .map_err(|err| anyhow::anyhow!("tail KV load: {err}"))
-                                    .and_then(|()| vllm_rope_fixup(fixup_workers, &[tail_page]));
-                                match landed {
-                                    Ok(()) => {
-                                        kv.apply_prefill_chunk(pool)?;
-                                        cached_tokens += tail_len;
-                                    }
-                                    Err(err) => {
-                                        kv.revert_schedule()?;
-                                        shortfall = Some(Shortfall::Broken(format!("{err:#}")));
+                Some(lease) => {
+                    // Same publishing proof as the full-window hit — for a
+                    // sub-block prompt this is the only query that can give it.
+                    state.consecutive_miss_windows = 0;
+                    match kv.schedule_prefill(tail_len, pool) {
+                        Ok(()) => {
+                            // step_page_indices covers the whole sequence up to
+                            // the step end; the restored full blocks occupy all
+                            // but the last entry, and the tail page is that last
+                            // entry (the restore left kv_position block-aligned,
+                            // so tail_len tokens open exactly one fresh page).
+                            let pages = kv.step_page_indices(tail_len);
+                            let tail_page = *pages.last().expect("tail step has a page");
+                            match offload.engine.load(lease, vec![tail_page]) {
+                                Ok(handle) => {
+                                    let landed = handle
+                                        .wait()
+                                        .map_err(|err| anyhow::anyhow!("tail KV load: {err}"))
+                                        .and_then(|()| {
+                                            vllm_rope_fixup(fixup_workers, &[tail_page])
+                                        });
+                                    match landed {
+                                        Ok(()) => {
+                                            kv.apply_prefill_chunk(pool)?;
+                                            cached_tokens += tail_len;
+                                        }
+                                        Err(err) => {
+                                            kv.revert_schedule()?;
+                                            shortfall =
+                                                Some(Shortfall::Broken(format!("{err:#}")));
+                                        }
                                     }
                                 }
-                            }
-                            Err(err) => {
-                                offload.engine.release_query_lease(lease);
-                                kv.revert_schedule()?;
-                                shortfall =
-                                    Some(Shortfall::Broken(format!("tail KV load submit: {err}")));
+                                Err(err) => {
+                                    offload.engine.release_query_lease(lease);
+                                    kv.revert_schedule()?;
+                                    shortfall = Some(Shortfall::Broken(format!(
+                                        "tail KV load submit: {err}"
+                                    )));
+                                }
                             }
                         }
+                        Err(err) => {
+                            offload.engine.release_query_lease(lease);
+                            log::debug!("GLM5.2 P/D tail page allocation deferred: {err:?}");
+                            shortfall = Some(Shortfall::Racing);
+                        }
                     }
-                    Err(err) => {
-                        offload.engine.release_query_lease(lease);
-                        log::debug!("GLM5.2 P/D tail page allocation deferred: {err:?}");
-                        shortfall = Some(Shortfall::Racing);
-                    }
-                },
+                }
                 None => shortfall = Some(Shortfall::Racing),
             },
             Ok(QueryOutcome::Loading) => {
@@ -468,7 +479,12 @@ pub(super) fn admit_vllm_pd(
     drop(kv); // release matched/loaded holdings before parking or rejecting
 
     let parked = state.parked[rank].as_mut().expect("front is parked");
-    parked.saw_loading |= saw_loading;
+    // Phase reflects THIS attempt: pegaflow's first query always starts an
+    // async fetch and reports `Loading`, so a sticky flag would pin every
+    // request to the hard fetch deadline and the miss window would never
+    // bind. Once the fetch resolves to a miss, the registration window
+    // (still measured from parked_at) takes over.
+    parked.saw_loading = saw_loading;
     let (deadline, phase) = if parked.saw_loading {
         (parked.hard_deadline, "in-flight fetch")
     } else {
@@ -521,6 +537,14 @@ fn fail_or_fallback(state: &VllmPdState, message: String) -> VllmAdmitOutcome {
     }
 }
 
+/// Restore the prompt-prefix blocks the GPU cache no longer holds from the
+/// host tier: probe → query → load into reserved pool pages → commit as
+/// matchable prefix. Blocks on the load — admission is a step boundary, and
+/// the request's first prefill chunk must not read half-restored pages.
+///
+/// Returns the probe, which holds the GPU-hit and freshly-committed blocks
+/// alive; the caller keeps it across `match_and_add_prefix` so the restored
+/// prefix cannot be evicted before it is re-matched.
 pub(super) fn restore_host_prefix(
     engine: &OffloadEngine,
     pool: &BlockPool,
@@ -577,4 +601,87 @@ pub(super) fn restore_host_prefix(
         }
     }
     probe
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::testkit;
+    use super::*;
+
+    fn pd_state(miss_wait: Duration) -> VllmPdState {
+        VllmPdState::new(
+            &crate::Glm52VllmCompatOptions {
+                python_hash_seed: "0".to_string(),
+                namespace: "deadbeef".to_string(),
+                miss_wait,
+                allow_local_prefill: false,
+            },
+            1,
+        )
+    }
+
+    fn window_of(parked: &ParkedFront) -> (Duration, Duration) {
+        (
+            parked.miss_deadline - parked.parked_at,
+            parked.hard_deadline - parked.parked_at,
+        )
+    }
+
+    #[test]
+    fn closed_breaker_parks_with_configured_windows() {
+        let miss_wait = Duration::from_millis(3000);
+        let mut state = pd_state(miss_wait);
+        let req = testkit::request(vec![1, 2, 3], testkit::sampled(0.0), 8);
+        let (miss, hard) = window_of(state.parked_front(0, &req));
+        assert_eq!(miss, miss_wait);
+        assert_eq!(hard, REMOTE_FETCH_DEADLINE);
+    }
+
+    #[test]
+    fn open_breaker_parks_with_probe_window_on_both_deadlines() {
+        // Zero-wait rejection would starve every remote restore: pegaflow's
+        // first query only STARTS the async fetch, so the breaker could
+        // never close (the deadlock failure injection found).
+        let mut state = pd_state(Duration::from_millis(3000));
+        state.consecutive_miss_windows = MISS_BREAKER_THRESHOLD;
+        let req = testkit::request(vec![1, 2, 3], testkit::sampled(0.0), 8);
+        let (miss, hard) = window_of(state.parked_front(0, &req));
+        assert_eq!(miss, BREAKER_PROBE_WINDOW);
+        assert_eq!(hard, BREAKER_PROBE_WINDOW);
+    }
+
+    #[test]
+    fn reparking_the_same_front_keeps_its_deadlines_and_query_key() {
+        let mut state = pd_state(Duration::from_millis(3000));
+        let req = testkit::request(vec![1, 2, 3], testkit::sampled(0.0), 8);
+        let (first_key, first_at) = {
+            let parked = state.parked_front(0, &req);
+            (parked.query_key.clone(), parked.parked_at)
+        };
+        let parked = state.parked_front(0, &req);
+        assert_eq!(parked.query_key, first_key, "retries must poll the same fetch");
+        assert_eq!(parked.parked_at, first_at, "retries must not extend the window");
+    }
+
+    #[test]
+    fn a_new_front_resets_the_park() {
+        let mut state = pd_state(Duration::from_millis(3000));
+        let req = testkit::request(vec![1, 2, 3], testkit::sampled(0.0), 8);
+        let first_key = state.parked_front(0, &req).query_key.clone();
+        let other = testkit::request(vec![1, 2, 3, 4], testkit::sampled(0.0), 8);
+        let parked = state.parked_front(0, &other);
+        assert_ne!(parked.query_key, first_key);
+    }
+
+    #[test]
+    fn query_key_never_reuses_the_client_request_id() {
+        // pegaflow keys prefetch state and its failed-remote blacklist by
+        // this id; a client-controlled value could cross-consume another
+        // request's fetch or inherit a blacklist entry.
+        let mut state = pd_state(Duration::from_millis(3000));
+        let mut req = testkit::request(vec![1, 2, 3], testkit::sampled(0.0), 8);
+        req.request_id = Some("client-controlled".to_string());
+        let parked = state.parked_front(0, &req);
+        assert!(parked.query_key.starts_with("glm52-pd-"));
+    }
 }

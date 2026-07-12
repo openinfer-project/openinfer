@@ -340,6 +340,16 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
         "GLM5.2 --kv-pd-vllm-seed requires the KV P2P mesh (--kv-p2p-metaserver-addr, \
          --kv-p2p-advertise-addr, --kv-p2p-nics)"
     );
+    // The miss window must sit inside the in-flight-fetch ceiling, or the
+    // registration phase could never hand over to the fetch phase.
+    ensure!(
+        kv_offload
+            .as_ref()
+            .and_then(|kv| kv.vllm_compat.as_ref())
+            .is_none_or(|c| c.miss_wait < scheduler::REMOTE_FETCH_DEADLINE),
+        "GLM5.2 --kv-pd-miss-wait-ms must stay below the {}s remote-fetch deadline",
+        scheduler::REMOTE_FETCH_DEADLINE.as_secs(),
+    );
     start_engine(
         model_path,
         &Glm52LoadOptions {

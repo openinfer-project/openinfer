@@ -2,13 +2,19 @@
 //! the door (past it, a bad value only surfaces inside a collective and tears
 //! the engine down), then binds every request to one rank queue. HTTP requests
 //! arrive with the vLLM frontend's DP choice; direct requests are placed once
-//! using the same waiting-weighted least-load policy.
+//! using the same waiting-weighted least-load policy. [`admit_from_queue`]
+//! then fills each rank's free slots at step boundaries under the
+//! full-lifetime KV budget.
 
 use std::collections::VecDeque;
 
 use openinfer_core::engine::{GenerateRequest, TokenEvent, unix_now_s};
+use openinfer_kv_cache::BlockPool;
 
-use super::PAGE;
+use super::offload::{self, VllmAdmitOutcome, VllmPdState};
+use super::slot::Glm52SlotState;
+use super::{ActiveRequest, PAGE, RankSlots};
+use crate::runner::Glm52RankWorker;
 
 fn validate_request(req: &GenerateRequest, max_model_len: usize) -> Result<(), String> {
     if req.prompt_tokens.is_empty() {
@@ -129,6 +135,182 @@ pub(super) fn intake(
         None => least_loaded_rank(running, pending),
     };
     pending[rank].push_back(req);
+}
+
+/// Admission: fill each rank's free slots from its own FIFO queue while its
+/// full-lifetime KV budget permits. The frontend already selected the rank;
+/// admission must never move the request or its metrics/KV ownership diverge.
+/// New requests join the lock-step at the next step boundary. An `Err` is a
+/// kvbm invariant break — the caller fails the step (the affected request was
+/// already answered here).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn admit_from_queue(
+    pending: &mut [VecDeque<GenerateRequest>],
+    slots: &mut [RankSlots],
+    pools: &[BlockPool],
+    usable_blocks: &[usize],
+    offload: Option<&[offload::RankOffload]>,
+    vllm_pd: &mut Option<VllmPdState>,
+    workers: &[Glm52RankWorker],
+    mirrored: bool,
+    prefix_cache_enabled: bool,
+    dspark_enabled: bool,
+    pending_resets: &mut [Vec<usize>],
+    slots_changed: &mut bool,
+) -> anyhow::Result<()> {
+    assert_eq!(pending.len(), slots.len());
+    let mut committed: Vec<usize> = slots
+        .iter()
+        .map(|rank_slots| {
+            rank_slots
+                .iter()
+                .flatten()
+                .map(|active| {
+                    lifetime_blocks(active.req.prompt_tokens.len(), active.req.max_tokens)
+                })
+                .sum()
+        })
+        .collect();
+    // Pages pinned by in-flight release saves are physically unallocatable
+    // until their D2H lands. Hide them from each rank's full-lifetime budget
+    // so admission defers instead of promising pages a later schedule cannot
+    // get (which would fail the whole engine).
+    let usable: Vec<usize> = match offload {
+        Some(offload) => usable_blocks
+            .iter()
+            .zip(offload)
+            .map(|(&usable, rank)| usable.saturating_sub(rank.pinned_blocks()))
+            .collect(),
+        None => usable_blocks.to_vec(),
+    };
+
+    for rank in 0..slots.len() {
+        while let Some(slot) = slots[rank].iter().position(Option::is_none) {
+            let Some(front) = pending[rank].front() else {
+                break;
+            };
+            let need_blocks = lifetime_blocks(front.prompt_tokens.len(), front.max_tokens);
+            if committed[rank] + need_blocks > usable[rank] {
+                break;
+            }
+
+            let req = pending[rank].pop_front().expect("checked non-empty");
+            // The client left while the request sat in the queue — admitting
+            // it would burn a slot (and whole global steps) on a dead sink.
+            if req.token_tx.is_closed() {
+                if let Some(pd) = vllm_pd.as_mut() {
+                    pd.clear_parked(rank);
+                }
+                continue;
+            }
+            // vLLM-compat P/D admission: the full peer-prefilled prefix must
+            // restore (this node never computes prompt positions), a racing
+            // registration parks the request at the queue front for the next
+            // step boundary, and an exhausted wait window rejects it for the
+            // router to retry through the prefill peer.
+            let pd_admitted = match vllm_pd.as_mut() {
+                Some(pd) => {
+                    let offload = offload.expect("vLLM-compat P/D requires --kv-offload");
+                    // Launch validation pins vllm-compat to the EP topology
+                    // (kv-offload ⇒ EP8): each rank's executor owns the only
+                    // replica of its arenas, so it alone runs the fixup. A
+                    // mirrored topology would need every worker here.
+                    assert!(!mirrored, "vLLM-compat P/D admission assumes the EP topology");
+                    match offload::admit_vllm_pd(
+                        pd,
+                        rank,
+                        &offload[rank],
+                        &pools[rank],
+                        &req,
+                        std::slice::from_ref(&workers[rank]),
+                    ) {
+                        Ok(VllmAdmitOutcome::Admit { kv, cached_tokens }) => {
+                            Some((kv, cached_tokens))
+                        }
+                        Ok(VllmAdmitOutcome::Park) => {
+                            pending[rank].push_front(req);
+                            break; // head-of-line wait: retry next step boundary
+                        }
+                        Ok(VllmAdmitOutcome::Reject { message }) => {
+                            reject(&req, message);
+                            continue;
+                        }
+                        Ok(VllmAdmitOutcome::LocalFallback) => None,
+                        Err(err) => {
+                            let err = err.context("GLM5.2 P/D admission");
+                            let _ = req.token_tx.send(TokenEvent::Error {
+                                message: format!("{err:#}"),
+                                prompt_tokens: req.prompt_tokens.len(),
+                                completion_tokens: 0,
+                            });
+                            return Err(err);
+                        }
+                    }
+                }
+                None => None,
+            };
+            let (kv, cached_tokens) = match pd_admitted {
+                Some(admitted) => admitted,
+                None => {
+                    let mut kv =
+                        pools[rank].new_request(req.prompt_tokens.clone(), req.max_tokens, None);
+                    // Host-tier restore first, so the GPU prefix match sees the union
+                    // of HBM-resident and freshly-restored blocks. The probe stays
+                    // alive across the match to close the eviction window.
+                    let _restored_hold =
+                        offload
+                            .filter(|_| prefix_cache_enabled && vllm_pd.is_none())
+                            .map(|offload| {
+                                offload::restore_host_prefix(
+                                    &offload[rank].engine,
+                                    &pools[rank],
+                                    &req.prompt_tokens,
+                                )
+                            });
+                    let cached_tokens = if prefix_cache_enabled {
+                        match kv.match_and_add_prefix(&pools[rank]) {
+                            Ok(cached) => cached,
+                            Err(err) => {
+                                // The request is already out of `pending` and never
+                                // reaches a slot, so fail it explicitly before the
+                                // engine-fatal invariant error propagates.
+                                let err = err.context("GLM5.2 prefix match at admission");
+                                let _ = req.token_tx.send(TokenEvent::Error {
+                                    message: format!("{err:#}"),
+                                    prompt_tokens: req.prompt_tokens.len(),
+                                    completion_tokens: 0,
+                                });
+                                return Err(err);
+                            }
+                        }
+                    } else {
+                        0
+                    };
+                    (kv, cached_tokens)
+                }
+            };
+            let queued_at_unix_s = req.queued_at_unix_s.unwrap_or_else(unix_now_s);
+            let _ = req.token_tx.send(TokenEvent::Scheduled {
+                queued_at_unix_s,
+                scheduled_at_unix_s: unix_now_s(),
+                prompt_tokens: req.prompt_tokens.len(),
+                cached_tokens,
+            });
+            let state = Glm52SlotState::new(
+                req.prompt_tokens.clone(),
+                req.max_tokens,
+                req.params.ignore_eos,
+                cached_tokens,
+            );
+            if dspark_enabled {
+                pending_resets[rank].push(slot);
+            }
+            slots[rank][slot] = Some(ActiveRequest { req, state, kv });
+            committed[rank] += need_blocks;
+            *slots_changed = true;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
