@@ -139,7 +139,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | Path | TL;DR |
 | --- | --- |
 | `subsystems/frontend/simulated-inference-engine.md` | CPU-only simulated model crate for vLLM/OpenAI frontend and `vllm bench serve` validation without CUDA, real model weights, or real-model performance claims. |
-| `subsystems/frontend/chat-completions-e2e.md` | Simulated frontend now covers `/v1/chat/completions` E2E for non-streaming format, streaming chunks, usage chunks, and the minimal fixture `chat_template`. |
+| `subsystems/frontend/chat-completions-e2e.md` | Simulated `/v1/chat/completions` E2E strictly covers non-streaming format, streamed content, a unique terminal `[DONE]`, and the ordered usage-only chunk contract with token accounting. |
 | `subsystems/frontend/cpu-profiling-baseline.md` | Frontend CPU profiling baseline using `openinfer-sim` with fixed TTFT=5ms/TPOT=12ms: 200 req / concurrency=16 shows ~150ms TTFT overhead (no dominant hotspot), heap allocation ~10%, stream polling ~7.5%, IPC ~1%; reproducible benchmark command and perf evidence documented. |
 | `subsystems/frontend/startup-time.md` | Qwen3-4B warm startup-to-ready 3.25s → ~1.45s: frontend tokenizer load runs concurrently with the engine load (HTTP still binds only after the engine registers), and the source safetensors mmap is kept alive to dodge ~0.4s of munmap stalling the next cudaMalloc. |
 | `subsystems/frontend/prometheus-metrics.md` | `/metrics` for the Qwen3 line: request histograms come free from bridge events/PrefillStats; engine gauges (running/waiting/kv usage) ride the scheduler LoadSnapshot watch as stats-only batches. Which metrics deliberately read zero, and the recipe for wiring another model line. |

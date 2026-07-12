@@ -595,13 +595,7 @@ async fn chat_completions_streaming_emits_role_content_and_done() -> Result<()> 
         .text()
         .await?;
 
-    let chunks: Vec<Value> = stream_text
-        .lines()
-        .filter_map(|line| line.strip_prefix("data: "))
-        .filter(|data| *data != "[DONE]")
-        .map(serde_json::from_str)
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .context("failed to parse streaming chunks")?;
+    let chunks = parse_terminal_sse_chunks(&stream_text)?;
 
     assert!(
         !chunks.is_empty(),
@@ -623,11 +617,13 @@ async fn chat_completions_streaming_emits_role_content_and_done() -> Result<()> 
         chunks[0]
     );
 
-    assert!(
-        stream_text
-            .lines()
-            .any(|line| line.trim() == "data: [DONE]"),
-        "streaming response must end with data: [DONE]"
+    let content: String = chunks
+        .iter()
+        .filter_map(|chunk| chunk["choices"][0]["delta"]["content"].as_str())
+        .collect();
+    assert_eq!(
+        content, " alpha alpha",
+        "streaming response must emit the simulated content: {stream_text}"
     );
 
     let last_chunk = chunks.last().expect("at least one chunk");
@@ -661,17 +657,63 @@ async fn chat_completions_usage_with_stream_options() -> Result<()> {
         .text()
         .await?;
 
-    let chunks: Vec<Value> = stream_text
-        .lines()
-        .filter_map(|line| line.strip_prefix("data: "))
-        .filter(|data| *data != "[DONE]")
-        .map(serde_json::from_str)
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .context("failed to parse streaming chunks")?;
+    let chunks = parse_terminal_sse_chunks(&stream_text)?;
+    let usage_indices: Vec<usize> = chunks
+        .iter()
+        .enumerate()
+        .filter_map(|(index, chunk)| (!chunk["usage"].is_null()).then_some(index))
+        .collect();
+    assert_eq!(
+        usage_indices.len(),
+        1,
+        "stream_options.include_usage must emit exactly one usage chunk: {stream_text}"
+    );
 
+    let usage_index = usage_indices[0];
+    let usage_chunk = &chunks[usage_index];
+    assert_eq!(
+        usage_chunk["choices"].as_array().map(Vec::len),
+        Some(0),
+        "usage chunk must not contain choices: {usage_chunk}"
+    );
+
+    let finish_index = chunks
+        .iter()
+        .position(|chunk| chunk["choices"][0]["finish_reason"] == "length")
+        .ok_or_else(|| anyhow!("streaming response has no length finish chunk: {stream_text}"))?;
+    assert_eq!(
+        usage_index,
+        finish_index + 1,
+        "usage chunk must immediately follow the finish chunk: {stream_text}"
+    );
+    assert_eq!(
+        usage_index,
+        chunks.len() - 1,
+        "usage chunk must be the final JSON chunk before [DONE]: {stream_text}"
+    );
+
+    let usage = &usage_chunk["usage"];
+    let prompt_tokens = usage["prompt_tokens"]
+        .as_u64()
+        .ok_or_else(|| anyhow!("usage.prompt_tokens missing: {usage_chunk}"))?;
+    let completion_tokens = usage["completion_tokens"]
+        .as_u64()
+        .ok_or_else(|| anyhow!("usage.completion_tokens missing: {usage_chunk}"))?;
+    let total_tokens = usage["total_tokens"]
+        .as_u64()
+        .ok_or_else(|| anyhow!("usage.total_tokens missing: {usage_chunk}"))?;
     assert!(
-        chunks.iter().any(|chunk| !chunk["usage"].is_null()),
-        "stream_options.include_usage must emit a usage chunk: {stream_text}"
+        prompt_tokens > 0,
+        "usage.prompt_tokens must be positive: {usage_chunk}"
+    );
+    assert_eq!(
+        completion_tokens, 3,
+        "usage.completion_tokens must equal max_tokens: {usage_chunk}"
+    );
+    assert_eq!(
+        total_tokens,
+        prompt_tokens + completion_tokens,
+        "usage.total_tokens must equal prompt + completion: {usage_chunk}"
     );
 
     server.shutdown().await
@@ -805,6 +847,29 @@ fn completion_body(model_name: &str, stream: bool) -> Value {
     })
 }
 
+fn parse_terminal_sse_chunks(stream: &str) -> Result<Vec<Value>> {
+    let payloads: Vec<&str> = stream
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .collect();
+    let done_count = payloads
+        .iter()
+        .filter(|payload| **payload == "[DONE]")
+        .count();
+    if done_count != 1 {
+        bail!("streaming response must contain exactly one data: [DONE]: {stream}");
+    }
+    if payloads.last().copied() != Some("[DONE]") {
+        bail!("streaming response must end with data: [DONE]: {stream}");
+    }
+
+    payloads[..payloads.len() - 1]
+        .iter()
+        .map(|payload| serde_json::from_str(payload))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to parse streaming chunks")
+}
+
 async fn wait_for_health(client: &Client, base_url: &str) -> Result<()> {
     let health_url = format!("{base_url}/health");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
@@ -866,7 +931,7 @@ const TINY_TOKENIZER_JSON: &str = r#"{
 const TINY_TOKENIZER_CONFIG_JSON: &str = r#"{
   "unk_token": "<unk>",
   "tokenizer_class": "PreTrainedTokenizerFast",
-  "chat_template": "{% for message in messages %}{{ message.role }}\n{{ message.content }}{% endfor %}\nassistant\n"
+  "chat_template": "{% for message in messages %}{{ message.content }}{% endfor %}"
 }"#;
 
 const TINY_CONFIG_JSON: &str = r#"{
