@@ -66,6 +66,11 @@ struct Cli {
     /// bucket-8-with-pads.
     #[arg(long, default_value = "ep8")]
     moe_topo: String,
+    /// Remote rank-host nodes, comma-separated `host:port=ranks` — same
+    /// contract as the server flag (EP topologies only; remote ranks come
+    /// after the local ones).
+    #[arg(long, value_delimiter = ',')]
+    rank_hosts: Vec<String>,
 }
 
 const GLM52_RANKS: usize = 8;
@@ -102,6 +107,12 @@ fn main() -> Result<()> {
             kv_offload: None,
             moe_topo,
             dump_graph_png: None,
+            rank_hosts: cli
+                .rank_hosts
+                .iter()
+                .map(|spec| spec.parse())
+                .collect::<Result<Vec<_>>>()
+                .context("--rank-hosts")?,
         },
     )
     .context("failed to start GLM5.2 engine")?;

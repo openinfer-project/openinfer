@@ -55,7 +55,7 @@ use crate::model::{
     GLM52_MAX_BATCH_PER_RANK, GLM52_MODEL_LEN_ALIGN, Glm52StepKv, Glm52StepShape,
     glm52_pool_blocks, glm52_table_width,
 };
-use crate::runner::{Glm52RankWorker, Glm52StepFlags};
+use crate::runner::{Glm52StepFlags, Glm52Worker};
 
 use admission::{intake, lifetime_blocks};
 use graph::{GraphDumpRequest, dump_rank0_decode_graph, precapture_step_graphs};
@@ -109,7 +109,7 @@ enum SpanKind {
 #[allow(clippy::needless_pass_by_value)]
 pub(crate) fn run_dp8_coordinator(
     mut submit_rx: mpsc::UnboundedReceiver<GenerateRequest>,
-    workers: Vec<Glm52RankWorker>,
+    workers: Vec<Glm52Worker>,
     eos_token_ids: &[u32],
     dspark_enabled: bool,
     max_model_len: usize,
@@ -525,7 +525,7 @@ fn admit_from_queue(
 /// slot (`span_kinds[rank][slot]`), which the output walk pairs exactly.
 #[allow(clippy::type_complexity)]
 fn submit_and_join_step(
-    workers: &[Glm52RankWorker],
+    workers: &[Glm52Worker],
     pools: &[BlockPool],
     slots: &mut [RankSlots],
     shapes: &[Glm52StepShape],
@@ -636,7 +636,7 @@ fn submit_and_join_step(
             pages: pages.into_boxed_slice(),
             slot_mapping,
         };
-        let executors: &[Glm52RankWorker] = if mirrored {
+        let executors: &[Glm52Worker] = if mirrored {
             workers
         } else {
             std::slice::from_ref(&workers[rank])
@@ -851,7 +851,7 @@ fn apply_step_outputs(
 /// keeps the round cadence (draft sits between verify steps, ~2 ms against a
 /// 22-46 ms step).
 fn run_draft_round(
-    workers: &[Glm52RankWorker],
+    workers: &[Glm52Worker],
     slots: &mut [RankSlots],
     shapes: &[Glm52StepShape],
     pending_resets: &mut [Vec<usize>],
@@ -870,7 +870,7 @@ fn run_draft_round(
             continue;
         }
         let proposal_slots: Vec<usize> = proposals.iter().map(|&(slot, _, _)| slot).collect();
-        let executors: &[Glm52RankWorker] = if mirrored {
+        let executors: &[Glm52Worker] = if mirrored {
             workers
         } else {
             std::slice::from_ref(&workers[rank])

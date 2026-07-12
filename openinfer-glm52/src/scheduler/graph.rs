@@ -6,7 +6,7 @@ use openinfer_kv_cache::BlockPool;
 
 use crate::Glm52MoeTopo;
 use crate::model::{GLM52_DECODE_BUCKETS, GLM52_MAX_BATCH_PER_RANK, Glm52StepShape};
-use crate::runner::{Glm52RankWorker, Glm52StepFlags};
+use crate::runner::{Glm52StepFlags, Glm52Worker};
 
 use super::plan::padding_step_kv;
 use super::slot::GLM52_PADDING_STEP;
@@ -23,7 +23,7 @@ pub(super) type GraphDumpRequest = (
 /// pre-capturing also removes the old mid-serving capture stall. Every row
 /// is a padding write into the pool's padding page.
 pub(super) fn precapture_step_graphs(
-    workers: &[Glm52RankWorker],
+    workers: &[Glm52Worker],
     pools: &[BlockPool],
     table_width: usize,
     mirrored: bool,
@@ -81,7 +81,7 @@ pub(super) fn precapture_step_graphs(
 /// EP8 and TP4 have a true bucket-1 graph; TP8 always executes the mirrored
 /// full-bucket shape.
 pub(super) fn dump_rank0_decode_graph(
-    workers: &[Glm52RankWorker],
+    workers: &[Glm52Worker],
     moe_topo: Glm52MoeTopo,
     full_bucket: bool,
     png_path: PathBuf,

@@ -6,6 +6,7 @@ edition = "2024"
 
 [dependencies]
 log = { workspace = true }
+serde = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]

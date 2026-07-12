@@ -3179,6 +3179,7 @@ name = "openinfer-engine"
 version = "0.1.0"
 dependencies = [
  "log",
+ "serde",
  "tokio",
 ]
 
@@ -3187,6 +3188,7 @@ name = "openinfer-glm52"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bincode",
  "bytesize",
  "crossbeam-channel",
  "cudarc",
@@ -3200,6 +3202,7 @@ dependencies = [
  "openinfer-kv-offload",
  "openinfer-sample",
  "safetensors",
+ "serde",
  "serde_json",
  "sha2 0.11.0",
  "tokio",

@@ -164,7 +164,7 @@ const _: () = assert!(GLM52_MAX_BATCH_PER_RANK <= 32);
 /// a step, a later row of a span attends to the earlier rows' KV through the
 /// cache: per layer every row's cache write lands before any row's attention
 /// launches, and row `k`'s `seq_len` admits exactly the positions before it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Glm52StepShape {
     pub(crate) bucket: usize,
     pub(crate) slots: [u8; GLM52_MAX_BATCH_PER_RANK],
@@ -180,7 +180,7 @@ pub(crate) struct Glm52StepShape {
 /// attention/indexer walk. Uploaded by the step prologue into the bucket's
 /// device block table / slot mapping (the captured graphs read only those
 /// device buffers — a page's physical id is data, never baked).
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Glm52StepKv {
     /// `[bucket, table_width]` row-major page ids. Row `r` holds the pages
     /// covering its request's KV through this step (span rows repeat their

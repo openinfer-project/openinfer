@@ -44,7 +44,7 @@ impl Glm52RankPlacement {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Glm52RankWeightLoadReport {
     pub(crate) rank: usize,
     pub(crate) loaded_tensor_count: usize,
@@ -59,7 +59,7 @@ pub(crate) struct Glm52RankWeightLoadReport {
 /// The coordinator's launch-ahead directives for one step — both are GLOBAL
 /// claims (a speculative replay is a full set of collectives, so ranks must
 /// act on them together or not at all).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Glm52StepFlags {
     /// This step IS the speculative replay every rank enqueued last step.
     pub(crate) consume: bool,
@@ -86,7 +86,7 @@ impl Glm52StepFlags {
 /// token lands at — a seeded request's philox seed mixes it, so its tokens
 /// replay independently of batch composition AND of how many rows rode each
 /// speculative round (spec and plain produce the same seeded stream).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Glm52RowSample {
     pub(crate) row: usize,
     pub(crate) params: openinfer_sample::SamplingParams,
@@ -377,6 +377,126 @@ impl Glm52RankWorker {
 impl Drop for Glm52RankWorker {
     fn drop(&mut self) {
         let _ = self.shutdown();
+    }
+}
+
+/// One rank executor as the engine sees it: an in-process worker thread or a
+/// rank-host-side worker behind the wire. Same typed surface either way (the
+/// remote twin mirrors [`Glm52RankWorker`] method-for-method), so the
+/// coordinator and the load/build/probe paths never branch on locality.
+pub(crate) enum Glm52Worker {
+    Local(Glm52RankWorker),
+    Remote(crate::remote::Glm52RemoteRankWorker),
+}
+
+impl Glm52Worker {
+    pub(crate) fn load_weights_async(
+        &self,
+        model_path: &Path,
+        moe_topo: crate::Glm52MoeTopo,
+    ) -> Result<Receiver<Result<Glm52RankWeightLoadReport>>> {
+        match self {
+            Self::Local(worker) => worker.load_weights_async(model_path, moe_topo),
+            Self::Remote(worker) => worker.load_weights_async(model_path, moe_topo),
+        }
+    }
+
+    pub(crate) fn build_model_async(
+        &self,
+        max_model_len: usize,
+        moe_topo: crate::Glm52MoeTopo,
+        dspark_enabled: bool,
+    ) -> Result<Receiver<Result<Vec<KvArena>>>> {
+        match self {
+            Self::Local(worker) => {
+                worker.build_model_async(max_model_len, moe_topo, dspark_enabled)
+            }
+            Self::Remote(worker) => {
+                worker.build_model_async(max_model_len, moe_topo, dspark_enabled)
+            }
+        }
+    }
+
+    pub(crate) fn setup_comm_async(
+        &self,
+        unique_id: [u8; 128],
+        moe_topo: crate::Glm52MoeTopo,
+        tp_exchange: Option<Arc<Glm52TpExchange>>,
+    ) -> Result<Receiver<Result<()>>> {
+        match self {
+            Self::Local(worker) => worker.setup_comm_async(unique_id, moe_topo, tp_exchange),
+            Self::Remote(worker) => {
+                ensure!(
+                    tp_exchange.is_none(),
+                    "GLM5.2 tensor-replicated topologies are single-node"
+                );
+                worker.setup_comm_async(unique_id, moe_topo)
+            }
+        }
+    }
+
+    pub(crate) fn step_async(
+        &self,
+        inputs: [(u32, usize); GLM52_MAX_BATCH_PER_RANK],
+        shape: Glm52StepShape,
+        kv: Glm52StepKv,
+        flags: Glm52StepFlags,
+        sampling: Vec<Glm52RowSample>,
+        seed: u64,
+    ) -> Result<Receiver<Result<[u32; GLM52_MAX_BATCH_PER_RANK]>>> {
+        match self {
+            Self::Local(worker) => worker.step_async(inputs, shape, kv, flags, sampling, seed),
+            Self::Remote(worker) => worker.step_async(inputs, shape, kv, flags, sampling, seed),
+        }
+    }
+
+    pub(crate) fn load_dspark_async(&self, path: &Path) -> Result<Receiver<Result<()>>> {
+        match self {
+            Self::Local(worker) => worker.load_dspark_async(path),
+            Self::Remote(worker) => worker.load_dspark_async(path),
+        }
+    }
+
+    pub(crate) fn free_vram_async(&self) -> Result<Receiver<Result<usize>>> {
+        match self {
+            Self::Local(worker) => worker.free_vram_async(),
+            Self::Remote(worker) => worker.free_vram_async(),
+        }
+    }
+
+    pub(crate) fn draft_async(
+        &self,
+        bucket: usize,
+        resets: Vec<usize>,
+        appends: Vec<(usize, usize)>,
+        proposals: Vec<(usize, u32, usize)>,
+    ) -> Result<Receiver<Result<Vec<[u32; GLM52_DSPARK_DRAFTS]>>>> {
+        match self {
+            Self::Local(worker) => worker.draft_async(bucket, resets, appends, proposals),
+            Self::Remote(worker) => worker.draft_async(bucket, resets, appends, proposals),
+        }
+    }
+
+    pub(crate) fn dump_decode_graph_async(
+        &self,
+        bucket: usize,
+        png_path: PathBuf,
+        title: String,
+    ) -> Result<Receiver<Result<CudaGraphDumpSummary>>> {
+        match self {
+            Self::Local(worker) => worker.dump_decode_graph_async(bucket, png_path, title),
+            Self::Remote(worker) => anyhow::bail!(
+                "GLM5.2 rank {} is remote; the decode-graph dump is a local dev tool",
+                worker.rank()
+            ),
+        }
+    }
+
+    pub(crate) fn request_shutdown(&self) -> Result<()> {
+        match self {
+            Self::Local(worker) => worker.request_shutdown(),
+            Self::Remote(worker) => worker.request_shutdown(),
+        }
     }
 }
 

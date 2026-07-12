@@ -162,6 +162,21 @@ pub(crate) struct Args {
     #[arg(long, default_value = "ep8")]
     pub moe_topo: String,
 
+    /// GLM5.2 remote rank-host nodes for cross-node EP, comma-separated
+    /// `host:port=ranks` (e.g. `10.13.84.7:19000=4`). Each node contributes
+    /// its ranks AFTER this process's local ranks, in list order; the total
+    /// must equal the topology's rank count. Start the remote side with
+    /// `--glm52-rank-host`.
+    #[arg(long, value_delimiter = ',')]
+    pub rank_hosts: Vec<String>,
+
+    /// Serve as a GLM5.2 rank-host on this listen address (e.g.
+    /// `0.0.0.0:19000`) instead of running an engine: a coordinator started
+    /// with `--rank-hosts` connects and drives this node's GPUs. No HTTP
+    /// frontend, no scheduler — a dumb worker shell.
+    #[arg(long)]
+    pub glm52_rank_host: Option<String>,
+
     /// Fraction of total GPU memory the Qwen3 instance may use. The KV cache is
     /// sized from this budget after startup profiling accounts for weights,
     /// runtime buffers, activation peak, margin, and (single-GPU only) CUDA-graph
@@ -263,6 +278,7 @@ fn consumed_args(model_type: ModelType) -> &'static [&'static str] {
             "kv_offload_hugepages",
             "moe_topo",
             "dump_graph_png",
+            "rank_hosts",
         ],
         #[cfg(feature = "kimi-k2")]
         ModelType::KimiK2 => &["tp_size", "dp_size", "ep_backend", "cuda_graph"],
