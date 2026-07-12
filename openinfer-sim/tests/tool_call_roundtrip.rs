@@ -11,9 +11,10 @@
 //!
 //! Several non-obvious constraints make this work — including two real wiring
 //! gaps this test caught by failing (the frontend runs a *second* `Auto` parser
-//! for reasoning; the incremental detokenizer holds the final token back). Each
-//! is documented at the code site it justifies rather than in a list here, so
-//! the rationale stays next to the line it explains and can't drift from it.
+//! for reasoning; the upstream frontend suppresses the final token id on `Stop`,
+//! so the script must pad a trailing EOS the engine never actually emits — see
+//! #584). Each is documented at the code site it justifies rather than in a list
+//! here, so the rationale stays next to the line it explains and can't drift.
 
 use std::fs;
 use std::net::TcpListener;
@@ -198,7 +199,13 @@ struct ToolCallSimServer {
 impl ToolCallSimServer {
     async fn spawn() -> Result<Self> {
         // Script = the three tool-call chunks (ids 1/2/3, see fuse_tokenizer_json)
-        // plus 6(EOS)
+        // plus 6 (EOS). The trailing EOS is *not* incremental-detokenizer buffering:
+        // the upstream frontend's terminal-stop-token suppression drops the last
+        // token id whenever a request finishes with `Stop`. openinfer engines never
+        // emit an EOS token — they signal `Finished(Stop)` with no preceding token
+        // event — so without this pad the suppression would eat the final *content*
+        // token and truncate the JSON to `{"location": "S`. The throwaway EOS
+        // absorbs the suppression instead. Engine-side contract alignment: #584.
         let script = vec![1u32, 2, 3, 6];
         let model_dir = qwen_model_dir()?;
         let port = reserve_loopback_port()?;
