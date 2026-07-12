@@ -47,6 +47,7 @@ impl SimulatedEngineConfig {
     }
 
     /// Replay `ids` verbatim as the completion for every request
+    #[must_use]
     pub fn with_scripted_completion(mut self, ids: Vec<u32>) -> Self {
         self.scripted_completion = ids;
         self
