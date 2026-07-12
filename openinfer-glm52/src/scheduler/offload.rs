@@ -354,9 +354,14 @@ pub(super) fn admit_vllm_pd(
             Ok(QueryOutcome::Ready(hit)) => match hit.lease {
                 Some(lease) => match kv.schedule_prefill(tail_len, pool) {
                     Ok(()) => {
+                        // step_page_indices covers the whole sequence up to the
+                        // step end; the restored full blocks occupy all but the
+                        // last entry, and the tail page is that last entry (the
+                        // restore left kv_position block-aligned, so tail_len
+                        // tokens open exactly one fresh page).
                         let pages = kv.step_page_indices(tail_len);
-                        debug_assert_eq!(pages.len(), 1, "tail spans exactly one page");
-                        match offload.engine.load(lease, pages) {
+                        let tail_page = *pages.last().expect("tail step has a page");
+                        match offload.engine.load(lease, vec![tail_page]) {
                             Ok(handle) => match handle.wait() {
                                 Ok(()) => {
                                     kv.apply_prefill_chunk(pool)?;
