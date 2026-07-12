@@ -18,11 +18,21 @@
 //   64..128 pass through). The scale is per token, so the in-token
 //   permutation cannot cross a quantization group.
 
-#include <cuda_bf16.h>
-
 #include "../common.cuh"
 
+#include <cuda.h>
+#include <cuda_bf16.h>
+
 namespace {
+
+CUresult consume_last_cuda_error() {
+  const cudaError_t err = cudaGetLastError();
+  if (err == cudaSuccess) return CUDA_SUCCESS;
+  if (err == cudaErrorInvalidValue || err == cudaErrorInvalidDevicePointer) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  return CUDA_ERROR_LAUNCH_FAILED;
+}
 
 constexpr int kMlaRowBytes = 656;
 constexpr int kMlaRopeOffsetBytes = 528;
