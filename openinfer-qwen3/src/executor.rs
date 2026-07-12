@@ -1856,11 +1856,12 @@ impl Qwen3Executor {
         // The breaker cuts already-parked waiters short too: a request can
         // enter this phase past the breaker via a transient Loading answer,
         // and "the peer is evidently not publishing" applies to it as well.
-        let wait_on_miss = self
+        let breaker_closed = self
             .vllm_compat
             .as_ref()
-            .is_some_and(|c| c.consecutive_miss_windows < MISS_BREAKER_THRESHOLD)
-            && now <= *miss_deadline;
+            .is_none_or(|c| c.consecutive_miss_windows < MISS_BREAKER_THRESHOLD);
+        let wait_on_miss =
+            self.vllm_compat.is_some() && breaker_closed && now <= *miss_deadline;
         let miss_deadline = *miss_deadline;
         let parked_for = now.duration_since(*parked_at);
         let queried_blocks = query_hashes.len();
@@ -1877,6 +1878,7 @@ impl Qwen3Executor {
             remote_fetch_action(
                 timed_out,
                 wait_on_miss,
+                breaker_closed,
                 || {
                     offload
                         .query(&id.0.to_string(), &query_hashes)
@@ -2319,16 +2321,21 @@ impl ModelExecutor for Qwen3Executor {
             return false;
         }
         // Breaker open: the peer demonstrably isn't publishing, so treat a
-        // zero hit as a plain miss instead of parking for the whole window.
+        // zero hit as a plain miss instead of parking for the whole window,
+        // and don't park on `Loading` either — in compat mode the first shot
+        // is always `Loading` (the query only starts the async fetch), so
+        // parking would stall every cold request for the full fetch deadline.
         // The first-shot query below still runs — a hit re-arms waiting.
         let expect_remote = self
             .vllm_compat
             .as_ref()
             .is_some_and(|c| c.consecutive_miss_windows < MISS_BREAKER_THRESHOLD);
+        let park_on_loading = self.vllm_compat.is_none() || expect_remote;
         let available_blocks = self.kv_mgr.pool().available_blocks();
         let action = remote_fetch_action(
             false,
             expect_remote,
+            park_on_loading,
             || {
                 offload
                     .query(&request_id.0.to_string(), &query_hashes)
