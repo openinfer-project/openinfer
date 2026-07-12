@@ -113,10 +113,24 @@ impl RankOffload {
 /// alive; the caller keeps it across `match_and_add_prefix` so the restored
 /// prefix cannot be evicted before it is re-matched.
 /// vLLM-compat P/D miss breaker: after this many consecutive requests each
-/// exhausted the whole zero-hit wait window, new requests skip the wait (the
-/// prefill peer is evidently not publishing — misconfig or down) and reject
-/// immediately, so the router fails over fast. Any complete restore re-arms.
+/// exhausted the whole zero-hit wait window, new requests park with the short
+/// [`BREAKER_PROBE_WINDOW`] instead of the full miss window (the prefill peer
+/// is evidently not publishing — misconfig or down), so the router fails over
+/// fast. Any complete restore re-arms.
+///
+/// The probe window must stay wide enough for a healthy handoff to complete:
+/// pegaflow's `query` only STARTS an async metaserver resolve + fetch and
+/// reports a miss until it lands (~50 ms measured), so rejecting on the first
+/// shot would starve every remote restore and the breaker could never close.
 const MISS_BREAKER_THRESHOLD: u32 = 3;
+
+/// Wait window while the breaker is open, replacing BOTH the miss and the
+/// in-flight-fetch deadlines (a first-shot query already reports `Loading`,
+/// so the miss window alone would never bind). Covers the P-side save
+/// visibility pipeline (~46 ms measured) plus the async fetch of a healthy
+/// peer, while a still-down peer drains its queue at probe cadence instead
+/// of one full fetch window per request.
+const BREAKER_PROBE_WINDOW: Duration = Duration::from_millis(500);
 
 /// Hard ceiling on one request's remote-KV wait, covering an in-flight P2P
 /// fetch (`QueryOutcome::Loading`). Well above pegaflow's own fetch timeout.
@@ -131,8 +145,8 @@ pub(super) struct VllmPdState {
     miss_wait: Duration,
     allow_local_prefill: bool,
     /// Requests in a row that exhausted their whole wait window. At
-    /// [`MISS_BREAKER_THRESHOLD`] new requests stop parking (first-shot
-    /// queries still run; a complete restore resets this).
+    /// [`MISS_BREAKER_THRESHOLD`] new requests park with the short
+    /// [`BREAKER_PROBE_WINDOW`] instead (a complete restore resets this).
     consecutive_miss_windows: u32,
     parked: Vec<Option<ParkedFront>>,
 }
@@ -219,12 +233,18 @@ impl VllmPdState {
             let query_key = req.request_id.clone().unwrap_or_else(|| {
                 format!("glm52-pd-{}", QUERY_SEQ.fetch_add(1, Ordering::Relaxed))
             });
+            let (miss_wait, fetch_wait) =
+                if self.consecutive_miss_windows >= MISS_BREAKER_THRESHOLD {
+                    (BREAKER_PROBE_WINDOW, BREAKER_PROBE_WINDOW)
+                } else {
+                    (self.miss_wait, REMOTE_FETCH_DEADLINE)
+                };
             self.parked[rank] = Some(ParkedFront {
                 fingerprint,
                 query_key,
                 parked_at: now,
-                miss_deadline: now + self.miss_wait,
-                hard_deadline: now + REMOTE_FETCH_DEADLINE,
+                miss_deadline: now + miss_wait,
+                hard_deadline: now + fetch_wait,
                 saw_loading: false,
             });
         }
@@ -280,7 +300,6 @@ pub(super) fn admit_vllm_pd(
     let prompt_kv = &prompt[..prompt.len() - 1];
     let full_blocks = prompt_kv.len() / PAGE;
     let tail_len = prompt_kv.len() % PAGE;
-    let breaker_open = state.consecutive_miss_windows >= MISS_BREAKER_THRESHOLD;
     let query_key = state.parked_front(rank, req).query_key.clone();
 
     let chain = state.hasher.key_chain(prompt_kv);
@@ -463,15 +482,16 @@ pub(super) fn admit_vllm_pd(
                 format!("GLM5.2 P/D remote KV unavailable ({reason}); retry via the prefill peer"),
             ))
         }
-        _ if breaker_open || Instant::now() >= deadline => {
+        _ if Instant::now() >= deadline => {
             let waited = parked.parked_at.elapsed();
             state.clear_parked(rank);
             state.consecutive_miss_windows = state.consecutive_miss_windows.saturating_add(1);
             if state.consecutive_miss_windows == MISS_BREAKER_THRESHOLD {
                 log::warn!(
                     "GLM5.2 P/D miss breaker open: {MISS_BREAKER_THRESHOLD} consecutive requests \
-                     exhausted the remote-KV wait window; new requests now reject immediately \
-                     until a complete restore lands"
+                     exhausted the remote-KV wait window; new requests now park for \
+                     {BREAKER_PROBE_WINDOW:?} instead of the full window until a complete \
+                     restore lands"
                 );
             }
             Ok(fail_or_fallback(
