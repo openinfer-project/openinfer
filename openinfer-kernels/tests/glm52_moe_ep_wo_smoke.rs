@@ -1,7 +1,7 @@
 //! Device gate for the GLM5.2 weight-only routed-expert chain
 //! (tiles metadata + masked grouped bf16×fp8 mma GEMM + weighted SiLU),
-//! at both shim shapes: EP4 (64 local experts × 32 global tokens) and
-//! EP8 (32 local experts × 64 global tokens).
+//! at the boundary shim shapes: EP4 (64 local experts × 32 global tokens),
+//! EP8 (32 × 64), and EP64 (4 × 512, the local-experts < topk extreme).
 //!
 //! Single GPU, no DeepEP: a synthetic psum_expert drives the tile kernel and
 //! a randomized aligned receive layout drives the GEMM/SiLU, checked against
@@ -113,6 +113,14 @@ fn glm52_moe_ep_wo_chain_matches_host_reference_ep8_shape() {
         64,
         &[(0, 2), (1, 8), (4, 17), (13, 1), (22, 9), (31, 6)],
     );
+}
+
+/// The EP64 shim shape (4 local experts, 64 ranks x 8 slots global): the
+/// few-experts/deep-rows extreme where local experts (4) < topk (8) — the
+/// EP16/EP32 geometries interpolate between this and the EP8 case.
+#[test]
+fn glm52_moe_ep_wo_chain_matches_host_reference_ep64_shape() {
+    run_chain_case(4, 512, &[(0, 1), (1, 9), (2, 64), (3, 3)]);
 }
 
 fn run_chain_case(groups: usize, global_tokens: usize, expert_counts: &[(usize, usize)]) {
