@@ -93,6 +93,7 @@ fn admission_never_moves_a_rank_bound_request() {
         &pools,
         &[7, 7],
         None,
+        &mut None,
         false,
         false,
         &mut pending_resets,
