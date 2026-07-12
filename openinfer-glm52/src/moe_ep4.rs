@@ -175,8 +175,7 @@ pub(crate) fn glm52_moe_ep4_routed_forward(
     );
     let expanded_rows = global_tokens * TOPK;
     let bound_rows = expanded.min(
-        expanded_rows
-            + (GLM52_DEEPGEMM_GROUPED_EXPERT_ALIGNMENT - 1) * expanded_rows.min(n_local),
+        expanded_rows + (GLM52_DEEPGEMM_GROUPED_EXPERT_ALIGNMENT - 1) * expanded_rows.min(n_local),
     );
 
     // Collective dispatch: bf16 token rows → expert-major aligned recv slots.

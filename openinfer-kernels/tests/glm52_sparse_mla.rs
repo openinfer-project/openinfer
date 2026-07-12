@@ -322,7 +322,12 @@ fn flashmla_sparse_vs_reference_gate() -> Result<()> {
         ("b1 h16 topk2048 valid8", 1, 2048, vec![8]),
         ("b1 h16 topk2048 valid200", 1, 2048, vec![200]),
         ("b1 h16 topk2048 full", 1, 2048, vec![2048]),
-        ("b8 h16 topk2048 mixed", 8, 2048, vec![2048, 1, 256, 64, 8, 512, 128, 1536]),
+        (
+            "b8 h16 topk2048 mixed",
+            8,
+            2048,
+            vec![2048, 1, 256, 64, 8, 512, 128, 1536],
+        ),
     ] {
         // The f64 reference contract caps heads at 16; per-head attention math
         // is head-count independent and FlashMLA always fills all 64 slots
@@ -346,7 +351,14 @@ fn flashmla_sparse_vs_reference_gate() -> Result<()> {
             sm_scale: SM_SCALE,
         };
         let mut latent_ref = ctx.stream.alloc_zeros::<bf16>(contract.latent_len())?;
-        glm52_sparse_mla_reference_launch(ctx, contract, &q, &rig.cache, &indices, &mut latent_ref)?;
+        glm52_sparse_mla_reference_launch(
+            ctx,
+            contract,
+            &q,
+            &rig.cache,
+            &indices,
+            &mut latent_ref,
+        )?;
 
         let flash = Glm52FlashMlaSparseDecode {
             batch_size: batch,
@@ -388,7 +400,10 @@ fn flashmla_sparse_vs_reference_gate() -> Result<()> {
         let ref_host = ctx.stream.clone_dtoh(&latent_ref)?;
         ctx.stream.synchronize()?;
         let d = delta(&flash_host, &ref_host, batch, heads);
-        println!("{label:>28}: flash-vs-ref mean-norm {:.3e} (max {:.3e})", d.mean_norm, d.max_abs);
+        println!(
+            "{label:>28}: flash-vs-ref mean-norm {:.3e} (max {:.3e})",
+            d.mean_norm, d.max_abs
+        );
         ensure!(
             d.mean_norm < 2e-2,
             "{label}: flash-vs-ref mean-norm {:.3e} over gate 2e-2",

@@ -75,7 +75,11 @@ fn build_layout() -> Layout {
     let mut cursor = 0usize;
     let mut tiles = Vec::new();
     for e in 0..GROUPS {
-        let start = if e == 0 { 0 } else { cursor.div_ceil(ALIGN) * ALIGN };
+        let start = if e == 0 {
+            0
+        } else {
+            cursor.div_ceil(ALIGN) * ALIGN
+        };
         starts[e] = start;
         cursor = start + counts[e];
         psum[e] = cursor as i32;
@@ -215,8 +219,8 @@ fn glm52_moe_ep_wo_chain_matches_host_reference() {
                             let x = f64::from(f32::from(act[row * k + kk]));
                             partial += w * x;
                         }
-                        let scale =
-                            weight_scale[e * (n / 128) * (k / 128) + (col / 128) * (k / 128) + kb / 128];
+                        let scale = weight_scale
+                            [e * (n / 128) * (k / 128) + (col / 128) * (k / 128) + kb / 128];
                         acc += f64::from(scale) * partial;
                     }
                     let got = f32::from(out_host[row * n + col]);
