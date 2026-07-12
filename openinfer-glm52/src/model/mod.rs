@@ -23,9 +23,10 @@ use openinfer_core::cuda_graph::CudaGraphDumpSummary;
 use openinfer_core::cuda_graph::CudaGraphState;
 use openinfer_kernels::ops::{
     GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN, GLM52_FLASHMLA_SPARSE_PAGE_SIZE,
-    GLM52_FLASHMLA_SPARSE_TOPK, GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW, Glm52FlashMlaSparseDecode,
-    Glm52IndexerCacheLayout, embedding_rows_into, glm52_flashmla_sparse_decode_num_sm_parts,
-    glm52_fp8_weight_only_gemv_launch,
+    GLM52_FLASHMLA_SPARSE_TOPK, GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW, GLM52_MLA_CACHE_BYTES,
+    Glm52FlashMlaSparseDecode, Glm52IndexerCacheLayout, Glm52VllmFixupKind, embedding_rows_into,
+    glm52_flashmla_sparse_decode_num_sm_parts, glm52_fp8_weight_only_gemv_launch,
+    glm52_vllm_rope_fixup_launch,
 };
 use openinfer_kernels::tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStatesRef};
 use openinfer_kv_offload::KvArena;
@@ -415,6 +416,49 @@ impl Glm52RankModel {
             }
         }
         Ok(arenas)
+    }
+
+    /// Deinterleave the RoPE dims of vLLM-restored pages, across every MLA and
+    /// index-K arena (vLLM P/D: the peer stores rotated RoPE pairs interleaved,
+    /// openinfer's kernels read the block-out placement — same values, permuted
+    /// dims). Runs on the model's compute stream, so it orders after the
+    /// caller-synchronized pegaflow H2D and before any subsequent step kernels.
+    /// NOT idempotent — the scheduler calls it exactly once per restored page.
+    pub(crate) fn vllm_rope_fixup(&mut self, ctx: &DeviceContext, pages: &[i32]) -> Result<()> {
+        ensure!(!pages.is_empty(), "GLM5.2 vLLM rope fixup needs pages");
+        ensure!(
+            self.mla_cache_bytes_per_token == GLM52_MLA_CACHE_BYTES,
+            "GLM5.2 vLLM P/D requires the fp8_ds_mla cache row ({GLM52_MLA_CACHE_BYTES} B/token), \
+             this rank packs {} B/token",
+            self.mla_cache_bytes_per_token
+        );
+        let pages_dev = ctx
+            .stream
+            .clone_htod(pages)
+            .map_err(|err| anyhow::anyhow!("GLM5.2 vLLM rope fixup pages H2D: {err}"))?;
+        let mla_stride = GLM52_FLASHMLA_SPARSE_PAGE_SIZE * self.mla_cache_bytes_per_token;
+        let idxk_stride = INDEX_CACHE_BLOCK * (GLM52_INDEX_HEAD_DIM + 4);
+        for caches in &mut self.caches {
+            glm52_vllm_rope_fixup_launch(
+                ctx,
+                &mut caches.mla_cache,
+                mla_stride,
+                Glm52VllmFixupKind::Mla,
+                &pages_dev,
+                pages.len(),
+            )?;
+            if let Some(index_k) = &mut caches.index_k_cache {
+                glm52_vllm_rope_fixup_launch(
+                    ctx,
+                    index_k,
+                    idxk_stride,
+                    Glm52VllmFixupKind::IndexK,
+                    &pages_dev,
+                    pages.len(),
+                )?;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn build(

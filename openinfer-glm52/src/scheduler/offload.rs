@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use anyhow::Context as _;
 use openinfer_core::engine::GenerateRequest;
 use openinfer_kv_cache::{BlockPool, KvBlockGuard, PrefixProbe, RequestKv};
 use openinfer_kv_offload::{OffloadEngine, QueryOutcome, VLLM_HASH_BYTES, VllmBlockHasher};
@@ -245,6 +246,22 @@ impl VllmPdState {
 /// appended the prefill peer's first generated token to the prompt, so the
 /// peer's registered KV covers every prompt position except that last token:
 /// all full 64-token pages under vLLM's own block hashes, plus the partial
+/// Deinterleave the RoPE dims of freshly-restored pages on every executor
+/// holding an arena replica (one worker under EP8, all of them under the
+/// mirrored TP topologies). Blocking, but called only at step boundaries
+/// where the workers' command queues are idle.
+fn vllm_rope_fixup(
+    workers: &[crate::runner::Glm52RankWorker],
+    pages: &[i32],
+) -> anyhow::Result<()> {
+    for worker in workers {
+        worker
+            .vllm_rope_fixup(pages.to_vec())
+            .context("restored page rope fixup")?;
+    }
+    Ok(())
+}
+
 /// tail page under the P-side connector extension's derived tail key. A
 /// complete restore leaves a one-token forward — a decode-shaped step — and
 /// zero prompt-position compute on this node.
@@ -256,6 +273,7 @@ pub(super) fn admit_vllm_pd(
     offload: &RankOffload,
     pool: &BlockPool,
     req: &GenerateRequest,
+    fixup_workers: &[crate::runner::Glm52RankWorker],
 ) -> anyhow::Result<VllmAdmitOutcome> {
     let prompt = &req.prompt_tokens;
     // Positions the peer prefilled: everything but the router-appended token.
@@ -289,13 +307,25 @@ pub(super) fn admit_vllm_pd(
                     match pool.reserve_loaded_blocks(hit.num_blocks) {
                         Some(reservation) => match offload.engine.load(lease, reservation.page_ids())
                         {
-                            Ok(handle) => match handle.wait() {
-                                Ok(()) => pool.commit_loaded_blocks(&mut probe, reservation),
-                                Err(err) => {
-                                    shortfall =
-                                        Some(Shortfall::Broken(format!("remote KV load: {err}")));
+                            Ok(handle) => {
+                                // After the H2D lands, rewrite the pages'
+                                // RoPE dims from the peer's interleaved
+                                // placement to openinfer's block-out one —
+                                // before they become matchable (exactly-once:
+                                // radix hits skip this whole leg).
+                                let landed = handle
+                                    .wait()
+                                    .map_err(|err| anyhow::anyhow!("remote KV load: {err}"))
+                                    .and_then(|()| {
+                                        vllm_rope_fixup(fixup_workers, reservation.page_ids())
+                                    });
+                                match landed {
+                                    Ok(()) => pool.commit_loaded_blocks(&mut probe, reservation),
+                                    Err(err) => {
+                                        shortfall = Some(Shortfall::Broken(format!("{err:#}")));
+                                    }
                                 }
-                            },
+                            }
                             Err(err) => {
                                 offload.engine.release_query_lease(lease);
                                 shortfall =
@@ -362,17 +392,22 @@ pub(super) fn admit_vllm_pd(
                         let pages = kv.step_page_indices(tail_len);
                         let tail_page = *pages.last().expect("tail step has a page");
                         match offload.engine.load(lease, vec![tail_page]) {
-                            Ok(handle) => match handle.wait() {
-                                Ok(()) => {
-                                    kv.apply_prefill_chunk(pool)?;
-                                    cached_tokens += tail_len;
+                            Ok(handle) => {
+                                let landed = handle
+                                    .wait()
+                                    .map_err(|err| anyhow::anyhow!("tail KV load: {err}"))
+                                    .and_then(|()| vllm_rope_fixup(fixup_workers, &[tail_page]));
+                                match landed {
+                                    Ok(()) => {
+                                        kv.apply_prefill_chunk(pool)?;
+                                        cached_tokens += tail_len;
+                                    }
+                                    Err(err) => {
+                                        kv.revert_schedule()?;
+                                        shortfall = Some(Shortfall::Broken(format!("{err:#}")));
+                                    }
                                 }
-                                Err(err) => {
-                                    kv.revert_schedule()?;
-                                    shortfall =
-                                        Some(Shortfall::Broken(format!("tail KV load: {err}")));
-                                }
-                            },
+                            }
                             Err(err) => {
                                 offload.engine.release_query_lease(lease);
                                 kv.revert_schedule()?;

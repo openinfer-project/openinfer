@@ -107,6 +107,15 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn glm52_vllm_rope_fixup_cuda(
+        arena_base: *mut u8,
+        block_stride_bytes: i64,
+        kind: i32,
+        pages: *const i32,
+        num_pages: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn glm52_mla_front_pack_fp8_cuda(
         ql_nope: *const Half,
         q_pe_base: *const Half,

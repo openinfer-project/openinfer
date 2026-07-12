@@ -276,6 +276,8 @@ pub(crate) fn run_dp8_coordinator(
             &usable_blocks,
             offload.as_deref(),
             &mut vllm_pd,
+            &workers,
+            mirrored,
             prefix_cache_enabled,
             dspark_enabled,
             &mut pending_resets,
@@ -433,6 +435,8 @@ fn admit_from_queue(
     usable_blocks: &[usize],
     offload: Option<&[offload::RankOffload]>,
     vllm_pd: &mut Option<VllmPdState>,
+    workers: &[Glm52RankWorker],
+    mirrored: bool,
     prefix_cache_enabled: bool,
     dspark_enabled: bool,
     pending_resets: &mut [Vec<usize>],
@@ -491,7 +495,21 @@ fn admit_from_queue(
             let pd_admitted = match vllm_pd.as_mut() {
                 Some(pd) => {
                     let offload = offload.expect("vLLM-compat P/D requires --kv-offload");
-                    match offload::admit_vllm_pd(pd, rank, &offload[rank], &pools[rank], &req) {
+                    // Every executor holding an arena replica must rewrite the
+                    // restored pages (mirrored TP replicates them; EP owns one).
+                    let fixup_workers: &[Glm52RankWorker] = if mirrored {
+                        workers
+                    } else {
+                        std::slice::from_ref(&workers[rank])
+                    };
+                    match offload::admit_vllm_pd(
+                        pd,
+                        rank,
+                        &offload[rank],
+                        &pools[rank],
+                        &req,
+                        fixup_workers,
+                    ) {
                         Ok(VllmAdmitOutcome::Admit { kv, cached_tokens }) => {
                             Some((kv, cached_tokens))
                         }
