@@ -227,6 +227,12 @@ impl PendingResp {
 
 struct RemoteNodeShared {
     addr: String,
+    /// Socket handle held ONLY for `shutdown()`: dropping the writer clone
+    /// alone never sends a FIN while the demux reader clone keeps the fd
+    /// alive, so poisoning must shut the socket down explicitly — that both
+    /// unblocks the demux `read` and lets the rank-host see EOF and tear its
+    /// workers down.
+    stream: TcpStream,
     writer: Mutex<Option<BufWriter<TcpStream>>>,
     /// Per local worker index: responses fulfill front-to-back.
     pending: Vec<Mutex<VecDeque<PendingResp>>>,
@@ -235,17 +241,32 @@ struct RemoteNodeShared {
 }
 
 impl RemoteNodeShared {
+    /// Orderly teardown: same sealing as [`Self::poison`] without the alarm —
+    /// the coordinator closing its node is the normal last step of a run.
+    fn close(&self) {
+        self.seal("coordinator closed the connection", false);
+    }
+
     fn poison(&self, reason: &str) {
+        self.seal(reason, true);
+    }
+
+    fn seal(&self, reason: &str, failure: bool) {
         {
             let mut poison = self.poison.lock().expect("poison lock");
             if poison.is_none() {
-                log::error!("GLM5.2 remote node {} failed: {reason}", self.addr);
+                if failure {
+                    log::error!("GLM5.2 remote node {} failed: {reason}", self.addr);
+                } else {
+                    log::info!("GLM5.2 remote node {}: {reason}", self.addr);
+                }
                 *poison = Some(reason.to_string());
             }
         }
-        // Drop the stream (unblocks the demux thread) and fail everything
-        // still in flight.
+        // Shut the socket down (unblocks the demux thread, EOFs the remote
+        // end) and fail everything still in flight.
         *self.writer.lock().expect("writer lock") = None;
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
         for queue in &self.pending {
             let mut queue = queue.lock().expect("pending lock");
             while let Some(slot) = queue.pop_front() {
@@ -305,6 +326,7 @@ impl Glm52RemoteNode {
         let stream =
             TcpStream::connect(addr).with_context(|| format!("GLM5.2 rank-host connect {addr}"))?;
         stream.set_nodelay(true)?;
+        let shutdown_handle = stream.try_clone()?;
         let mut writer = BufWriter::new(stream.try_clone()?);
         write_frame(
             &mut writer,
@@ -331,6 +353,7 @@ impl Glm52RemoteNode {
         );
         let shared = Arc::new(RemoteNodeShared {
             addr: addr.to_string(),
+            stream: shutdown_handle,
             writer: Mutex::new(Some(writer)),
             pending: (0..rank_count)
                 .map(|_| Mutex::new(VecDeque::new()))
@@ -383,9 +406,10 @@ impl Glm52RemoteNode {
 
 impl Drop for Glm52RemoteNode {
     fn drop(&mut self) {
-        // Closing the writer makes the remote demux see EOF and tear down its
-        // workers; poisoning fails any stragglers locally.
-        self.shared.poison("coordinator closed the connection");
+        // The socket shutdown inside makes the rank-host see EOF and tear
+        // down its workers, and unblocks our demux read; sealing fails any
+        // stragglers locally.
+        self.shared.close();
         if let Some(handle) = self.demux.take() {
             let _ = handle.join();
         }
