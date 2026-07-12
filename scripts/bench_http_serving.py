@@ -13,6 +13,7 @@ import concurrent.futures
 import hashlib
 import http.client
 import json
+import random
 import re
 import socket
 import statistics
@@ -421,6 +422,41 @@ def make_prompt(index: int, prompt_words: int) -> str:
         for offset in range(prompt_words)
     ]
     return " ".join(words)
+
+
+def load_prompt_pool(args: argparse.Namespace) -> list[str] | None:
+    """Deterministic prompt pool from a ShareGPT-style JSON (--prompt-file).
+
+    Takes each conversation's first human turn, filters by length, then
+    seed-samples --prompt-count of them — the same protocol as the DSpark/DFlash
+    closing A/Bs (30 ShareGPT first-turn prompts), reproducible via
+    --prompt-seed. Synthetic --prompt-words prompts overstate speculative
+    accept rates (repetitive text drafts too well); use real text for any
+    spec-on number that will be quoted.
+    """
+    path = arg_value(args, "prompt_file", None)
+    if not path:
+        return None
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+    lo = int(arg_value(args, "prompt_min_chars", 32))
+    hi = int(arg_value(args, "prompt_max_chars", 2000))
+    firsts = []
+    for item in data:
+        conversations = item.get("conversations") or []
+        if not conversations:
+            continue
+        first = conversations[0]
+        if first.get("from") != "human":
+            continue
+        text = (first.get("value") or "").strip()
+        if lo <= len(text) <= hi:
+            firsts.append(text)
+    count = int(arg_value(args, "prompt_count", 30))
+    if len(firsts) < count:
+        raise SystemExit(f"prompt file has only {len(firsts)} usable first turns, need {count}")
+    rng = random.Random(int(arg_value(args, "prompt_seed", 512)))
+    return rng.sample(firsts, count)
 
 
 def parse_int_list(raw: str) -> list[int]:
@@ -962,16 +998,22 @@ def run_batch(
         request_id_prefix = f"openinfer-bench-{uuid.uuid4().hex}"
         args.request_id_prefix = request_id_prefix
     shapes = workload_shapes(args.prompt_words, args.max_tokens)
+    prompt_pool = load_prompt_pool(args)
     workloads = []
     for idx in range(count):
         global_index = offset + idx
         prompt_words, max_tokens = shapes[global_index % len(shapes)]
+        if prompt_pool is not None:
+            prompt = prompt_pool[global_index % len(prompt_pool)]
+            prompt_words = len(prompt.split())
+        else:
+            prompt = make_prompt(global_index, prompt_words)
         workloads.append(
             (
                 global_index,
                 prompt_words,
                 max_tokens,
-                make_prompt(global_index, prompt_words),
+                prompt,
                 sampling_profile_for(args, global_index),
             )
         )
@@ -1239,6 +1281,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--backend-runtime-version", help="Loaded backend runtime version."
     )
+    parser.add_argument(
+        "--prompt-file",
+        help="ShareGPT-style JSON; first human turns become the prompt pool (overrides --prompt-words)",
+    )
+    parser.add_argument("--prompt-count", type=int, default=30)
+    parser.add_argument("--prompt-seed", type=int, default=512)
+    parser.add_argument("--prompt-min-chars", type=int, default=32)
+    parser.add_argument("--prompt-max-chars", type=int, default=2000)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-k", type=int, default=-1)
     parser.add_argument("--top-p", type=float, default=1.0)

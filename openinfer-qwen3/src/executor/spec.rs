@@ -27,10 +27,6 @@ impl Qwen3Executor {
                 req.request_id
             );
             anyhow::ensure!(
-                req.params.is_greedy(),
-                "speculative verification currently supports greedy sampling only"
-            );
-            anyhow::ensure!(
                 self.dflash_ready_requests.contains(&req.request_id),
                 "speculative verification requested before DFlash state is ready for {:?}",
                 req.request_id
@@ -70,6 +66,7 @@ impl Qwen3Executor {
         let step = StepCommand::SpeculativeVerify {
             requests: plan.requests.to_vec(),
             kv_views,
+            sample_seed: plan.sample_seed,
         };
         let outcome = match self.run_step(&step) {
             Ok(outcome) => outcome,
@@ -146,10 +143,6 @@ impl Qwen3Executor {
             "speculative draft requested but no draft model is loaded"
         );
         for req in plan.requests {
-            anyhow::ensure!(
-                req.params.is_greedy(),
-                "speculative draft currently supports greedy sampling only"
-            );
             anyhow::ensure!(
                 self.dflash_ready_requests.contains(&req.request_id),
                 "speculative draft requested before DFlash state is ready for {:?}",

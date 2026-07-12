@@ -521,14 +521,18 @@ fn execute_step_on_lane(
                 Ok(WorkerStepOutcome::Ack)
             }
         }
-        StepCommand::SpeculativeVerify { requests, kv_views } => {
+        StepCommand::SpeculativeVerify {
+            requests,
+            kv_views,
+            sample_seed,
+        } => {
             // One target forward over each request's K+1 draft span with a
             // speculative KV view. The fixed-buffer verify path computes all-
-            // position logits (accept_greedy needs the target's posterior at
-            // each span position) and captures the target hidden states (at the
-            // DFlash layers) to seed the next draft — all into reused,
+            // position logits (accept_prefix_match needs the target's committed
+            // token at each span position) and captures the target hidden states
+            // (at the DFlash layers) to seed the next draft — all into reused,
             // pointer-stable scratch (`VerifyGraphBuffers`).
-            let result = lane.execute_dflash_verify(requests, kv_views)?;
+            let result = lane.execute_dflash_verify(requests, kv_views, *sample_seed)?;
             Ok(WorkerStepOutcome::SpeculativeVerify(result))
         }
         StepCommand::SpeculativeDraft { requests } => Ok(WorkerStepOutcome::SpeculativeDraft(
@@ -3351,6 +3355,7 @@ impl LocalQwen3Lane {
         &mut self,
         requests: &[VerifyStepItem],
         kv_views: &[KvView],
+        sample_seed: u64,
     ) -> Result<VerifyResult> {
         let capture_layer_ids = self.dflash_capture_layer_ids().ok_or_else(|| {
             anyhow::anyhow!("DFlash verify requested but no draft model is loaded")
@@ -3390,10 +3395,18 @@ impl LocalQwen3Lane {
                 &mut bufs,
             )?;
 
-            let total_tokens: usize = requests.iter().map(|req| req.as_slice().len()).sum();
-            let greedy = SamplingParams::default();
-            let params: Vec<&SamplingParams> = vec![&greedy; total_tokens];
-            let target_tokens = self.select_step_tokens(bufs.all_logits(), &params, 0)?;
+            // One committed token per span row, each row governed by ITS
+            // request's params — argmax rows batch through the fused path,
+            // sampled rows ride the regular batched sampler (sampled-verify,
+            // #512). Steps stay zeroed exactly like the plain-decode call:
+            // when sampling-parity 1b wires request-local decode steps
+            // through, verify rows must move with it (row k of a span is the
+            // request's step `completion + k`) or seeded replay breaks.
+            let params: Vec<&SamplingParams> = requests
+                .iter()
+                .flat_map(|req| std::iter::repeat_n(&req.params, req.as_slice().len()))
+                .collect();
+            let target_tokens = self.select_step_tokens(bufs.all_logits(), &params, sample_seed)?;
             let request_results = build_verify_results(requests, &target_tokens)?;
             self.record_verify_dflash_context(
                 requests,
@@ -3501,10 +3514,13 @@ enum StepCommand {
     },
     /// Speculative verify: one target forward over each request's `K + 1` draft
     /// span (with a speculative KV view), capturing target hidden states for the
-    /// next draft round. Greedy argmax per position drives [`accept_greedy`].
+    /// next draft round. Each position selects the request's *committed* token —
+    /// argmax for greedy rows, a regular sample for non-greedy rows — and the
+    /// tokens drive [`accept_prefix_match`] (sampled-verify, #512).
     SpeculativeVerify {
         requests: Vec<VerifyStepItem>,
         kv_views: Vec<KvView>,
+        sample_seed: u64,
     },
     /// Speculative draft: roll the DFlash draft model forward one block per
     /// request. Uses the draft's own KV — no target KV views.

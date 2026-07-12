@@ -66,7 +66,7 @@ pub(super) fn build_next_plan(
     let needs_dflash_capture = speculative
         && pending
             .iter()
-            .any(|r| r.lora_adapter.is_none() && r.logprobs == 0 && r.params.is_greedy());
+            .any(|r| r.lora_adapter.is_none() && r.logprobs == 0);
     if !pending.is_empty() && have_active && !needs_prompt_logprobs && !needs_dflash_capture {
         Some(ExecutionPlan::Unified { pending })
     } else if !pending.is_empty() {
@@ -124,6 +124,7 @@ pub(super) fn execute_plan(
             let verify_requests = build_speculative_verify_items(active, &draft.requests);
             let mut verify = executor.execute_speculative_verify(VerifyPlan {
                 requests: &verify_requests,
+                sample_seed: rand::RngExt::random(rng),
             })?;
             verify.requests.sort_by_key(|result| result.request_id);
             Ok(ExecutionArtifacts::SpeculativeDecode { verify })
@@ -151,8 +152,11 @@ pub(super) fn execute_plan(
 }
 
 /// All-or-nothing: speculate the whole active batch only when every request is
-/// draft-ready and greedy (no LoRA, no logprobs). A single non-ready request
-/// falls the batch back to plain decode rather than running a mixed step.
+/// draft-ready (no LoRA, no logprobs). A single non-ready request falls the
+/// batch back to plain decode rather than running a mixed step. Sampling
+/// params are NOT a gate: sampled-verify (#512) runs the regular sampler over
+/// the verify rows, so the full surface — temperature/top_k/top_p/min_p/seed —
+/// rides the speculative path.
 pub(super) fn should_speculative_decode(
     executor: &impl ModelExecutor,
     active: &[ActiveRequestState],
@@ -163,14 +167,13 @@ pub(super) fn should_speculative_decode(
             executor.speculative_request_ready(req.request_id)
                 && req.lora_adapter.is_none()
                 && req.logprobs == 0
-                && req.params.is_greedy()
         })
 }
 
 fn build_speculative_draft_items(active: &[ActiveRequestState]) -> Vec<DraftStepItem> {
     active
         .iter()
-        .map(|r| DraftStepItem::new(r.request_id, r.last_token, r.params))
+        .map(|r| DraftStepItem::new(r.request_id, r.last_token))
         .collect()
 }
 
@@ -354,7 +357,7 @@ mod tests {
             ),
             "active + pending echo-only request (no logprobs) can use unified"
         );
-        // Under DFlash speculation, an eligible (greedy) pending must capture its
+        // Under DFlash speculation, an eligible pending must capture its
         // target context during prefill — the unified forward skips that capture,
         // so route it to a dedicated prefill step rather than let DFlash silently
         // no-op for it.
@@ -365,19 +368,46 @@ mod tests {
             ),
             "spec + active + eligible pending routes to prefill so the drafter context is captured"
         );
-        // A non-greedy pending needs no draft capture, so unified fusion is still
-        // fine even under speculation.
-        let mut sampled = pending();
-        sampled.params = SamplingParams {
-            temperature: 1.0,
-            ..SamplingParams::default()
-        };
+        // Sampled-verify (#512): a non-greedy pending speculates too, so it
+        // needs the same capture — Prefill, not Unified (which would silently
+        // never make it draft-ready). This covers min_p and seeded params as
+        // well; nothing on the sampling surface opts a request out.
+        for params in [
+            SamplingParams {
+                temperature: 1.0,
+                ..SamplingParams::default()
+            },
+            SamplingParams {
+                temperature: 0.8,
+                min_p: 0.05,
+                ..SamplingParams::default()
+            },
+            SamplingParams {
+                temperature: 0.8,
+                seed: Some(42),
+                ..SamplingParams::default()
+            },
+        ] {
+            let mut sampled = pending();
+            sampled.params = params;
+            assert!(
+                matches!(
+                    build_next_plan(true, vec![sampled], true),
+                    Some(ExecutionPlan::Prefill { pending }) if pending.len() == 1
+                ),
+                "spec + active + sampled pending routes to prefill for draft capture"
+            );
+        }
+        // A LoRA pending never speculates, so no capture is needed and unified
+        // fusion is still fine under speculation.
+        let mut lora = pending();
+        lora.lora_adapter = Some("adapter".to_string());
         assert!(
             matches!(
-                build_next_plan(true, vec![sampled], true),
+                build_next_plan(true, vec![lora], true),
                 Some(ExecutionPlan::Unified { pending }) if pending.len() == 1
             ),
-            "spec + active + non-greedy pending (no capture needed) can still use unified"
+            "spec + active + LoRA pending (never speculates, no capture) can use unified"
         );
     }
 }

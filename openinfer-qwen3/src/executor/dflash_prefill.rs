@@ -1,17 +1,17 @@
 //! DFlash prefill-capture eligibility predicates.
 //!
 //! A request can seed the DFlash draft only if its prefill produces clean target
-//! hidden states: greedy, no LoRA, no prefix-cache hit, no echo, no logprobs.
+//! hidden states: no LoRA, no prefix-cache hit, no echo, no logprobs. Sampling
+//! params are irrelevant here — the prompt's hidden states are
+//! sampling-independent, and sampled-verify (#512) speculates the full
+//! sampling surface, so capture is as valid for a sampled request as for a
+//! greedy one.
 
 use super::{PrefillStepItem, RequestId};
 
 /// Whether a prefill request is eligible to capture DFlash target context.
 pub(super) fn dflash_prefill_supported(req: &PrefillStepItem) -> bool {
-    req.lora_adapter.is_none()
-        && req.cached_tokens == 0
-        && req.logprobs == 0
-        && !req.echo
-        && req.params.is_greedy()
+    req.lora_adapter.is_none() && req.cached_tokens == 0 && req.logprobs == 0 && !req.echo
 }
 
 /// Eligible AND continuous: either the first chunk, or a later chunk whose

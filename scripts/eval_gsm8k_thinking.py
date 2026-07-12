@@ -92,7 +92,13 @@ def main():
     parser.add_argument("--num-fewshot", type=int, default=8)
     parser.add_argument("--max-tokens", type=int, default=4096)
     parser.add_argument("--limit", type=int, default=0, help="0 = all samples")
-    parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("--seed", type=int, default=1234, help="per-request seed; -1 omits it (engine RNG)")
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.0,
+        help="sampling temperature (0 = greedy; >0 for sampled-score parity runs)",
+    )
     parser.add_argument("--output", default=None, help="Output JSON path")
     args = parser.parse_args()
 
@@ -117,10 +123,13 @@ def main():
             "prompt": prompt,
             "model": args.model,
             "max_tokens": args.max_tokens,
-            "temperature": 0,
+            "temperature": args.temperature,
             "stop": ["<|im_end|>"],
-            "seed": args.seed,
         }
+        # seed < 0 omits the per-request seed: sampled-parity runs want the
+        # engine RNG (three independent runs per arm), not a fixed replay.
+        if args.seed >= 0:
+            payload["seed"] = args.seed
         resp = requests.post(args.base_url, json=payload)
         resp.raise_for_status()
         result = resp.json()

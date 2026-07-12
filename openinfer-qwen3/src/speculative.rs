@@ -14,10 +14,14 @@
 //! today and is kept concrete; a proposer trait is deferred until a second
 //! implementation (n-gram / EAGLE) validates the shape.
 //!
-//! What is *not* generic yet: [`accept_greedy`] returns argmax-based acceptance,
-//! which is the *greedy* rule. Sampling-correct acceptance would need the target
-//! and draft distributions, touching both the verify path and the proposer — so
-//! it is left until a sampling method actually lands.
+//! Acceptance is [`accept_prefix_match`] for greedy and sampled requests alike
+//! (#512, the sampled-verify mechanism GLM5.2 landed in #589): the verify
+//! forward selects one *committed* token per span position — the fused argmax
+//! for a greedy request, a regular per-row sample from the target distribution
+//! for a non-greedy one — and the accepted prefix is simply the drafts that
+//! match those tokens. For a deterministic (one-hot) draft this is lossless
+//! speculative sampling: every committed token is a true sample from the
+//! target distribution; acceptance only decides how many ride one step.
 
 use anyhow::Result;
 
@@ -52,6 +56,9 @@ impl VerifyStepItem {
 #[derive(Clone, Copy)]
 pub(crate) struct VerifyPlan<'a> {
     pub requests: &'a [VerifyStepItem],
+    /// Engine step seed for the verify rows' sampler pass (same contract as
+    /// decode: fresh per step; seeded rows re-mix their own request seed).
+    pub sample_seed: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -72,19 +79,20 @@ pub(crate) struct VerifyResult {
 }
 
 /// One request's draft request: the proposer continues from `current_token`.
+/// Deliberately carries no sampling params — the draft rollout is argmax
+/// regardless of the request's sampler; sampled-verify applies the request's
+/// params on the verify side only.
 #[derive(Clone)]
 pub(crate) struct DraftStepItem {
     pub(crate) request_id: RequestId,
     pub(crate) current_token: u32,
-    pub(crate) params: SamplingParams,
 }
 
 impl DraftStepItem {
-    pub(crate) fn new(request_id: RequestId, current_token: u32, params: SamplingParams) -> Self {
+    pub(crate) fn new(request_id: RequestId, current_token: u32) -> Self {
         Self {
             request_id,
             current_token,
-            params,
         }
     }
 }
@@ -105,14 +113,15 @@ pub(crate) struct DraftResult {
     pub requests: Vec<DraftRequestResult>,
 }
 
-/// Greedy speculative acceptance — the shared seam every method reuses.
+/// Speculative acceptance — the shared seam every method and sampler reuses.
 ///
 /// * `proposed` — the `K` candidate tokens from the proposer.
-/// * `target_argmax` — the target model's greedy token at each of the `K + 1`
-///   verify positions. `target_argmax[i]` is the model's prediction *after*
-///   consuming verify input `i`; `target_argmax[0]` follows the last confirmed
-///   token and `target_argmax[K]` is the model's own continuation after the
-///   whole candidate run.
+/// * `target_tokens` — the target model's *committed* token at each of the
+///   `K + 1` verify positions: the argmax for a greedy request, the sampled
+///   token for a non-greedy one. `target_tokens[i]` is the model's pick
+///   *after* consuming verify input `i`; `target_tokens[0]` follows the last
+///   confirmed token and `target_tokens[K]` is the model's own continuation
+///   after the whole candidate run.
 ///
 /// Returns the longest accepted prefix of `proposed` followed by exactly one
 /// model token (the correction at the first divergence, or the bonus
@@ -121,36 +130,36 @@ pub(crate) struct DraftResult {
 /// # Panics
 /// Panics (debug builds) if `target_argmax.len() != proposed.len() + 1`.
 #[must_use]
-pub(crate) fn accept_greedy(proposed: &[u32], target_argmax: &[u32]) -> Vec<u32> {
+pub(crate) fn accept_prefix_match(proposed: &[u32], target_tokens: &[u32]) -> Vec<u32> {
     debug_assert_eq!(
-        target_argmax.len(),
+        target_tokens.len(),
         proposed.len() + 1,
-        "verify must produce one greedy token per candidate plus a bonus"
+        "verify must produce one committed token per candidate plus a bonus"
     );
-    let n = num_accepted(proposed, target_argmax);
+    let n = num_accepted(proposed, target_tokens);
     let mut committed = Vec::with_capacity(n + 1);
     committed.extend_from_slice(&proposed[..n]);
     // The model's own token at the first divergence (or the bonus continuation
     // when the whole run was accepted). `n <= proposed.len() < target_argmax.len()`
     // so this index is always valid.
-    committed.push(target_argmax[n]);
+    committed.push(target_tokens[n]);
     committed
 }
 
 /// Length of the accepted prefix: leading drafts whose token matches the
-/// target's argmax.
-fn num_accepted(proposed: &[u32], target_argmax: &[u32]) -> usize {
+/// target's committed pick.
+fn num_accepted(proposed: &[u32], target_tokens: &[u32]) -> usize {
     let mut i = 0;
-    while i < proposed.len() && proposed[i] == target_argmax[i] {
+    while i < proposed.len() && proposed[i] == target_tokens[i] {
         i += 1;
     }
     i
 }
 
-/// Batched greedy acceptance over a verify forward's flattened per-position
-/// argmax. `target_tokens` is the concatenation of each request's `K + 1`
+/// Batched acceptance over a verify forward's flattened per-position committed
+/// tokens. `target_tokens` is the concatenation of each request's `K + 1`
 /// posterior columns, in `requests` order. Each request applies the shared
-/// [`accept_greedy`] over its own span.
+/// [`accept_prefix_match`] over its own span.
 pub(crate) fn build_verify_results(
     requests: &[VerifyStepItem],
     target_tokens: &[u32],
@@ -171,8 +180,8 @@ pub(crate) fn build_verify_results(
         );
         let posterior = &target_tokens[offset..end];
         // proposed = the K drafts (span minus the leading confirmed token);
-        // posterior = the K + 1 argmax columns. accept_greedy ties them together.
-        let accepted_tokens = accept_greedy(&req.token_ids[1..], posterior);
+        // posterior = the K + 1 argmax columns. accept_prefix_match ties them together.
+        let accepted_tokens = accept_prefix_match(&req.token_ids[1..], posterior);
         outputs.push(VerifyRequestResult {
             request_id: req.request_id,
             matched_draft_tokens: accepted_tokens.len() - 1,
@@ -196,7 +205,10 @@ mod tests {
     fn accepts_full_run_plus_bonus() {
         let proposed = [10u32, 11, 12];
         let argmax = [10u32, 11, 12, 13];
-        assert_eq!(accept_greedy(&proposed, &argmax), vec![10, 11, 12, 13]);
+        assert_eq!(
+            accept_prefix_match(&proposed, &argmax),
+            vec![10, 11, 12, 13]
+        );
         assert_eq!(num_accepted(&proposed, &argmax), 3);
     }
 
@@ -204,7 +216,7 @@ mod tests {
     fn accepts_prefix_then_correction() {
         let proposed = [10u32, 11, 99];
         let argmax = [10u32, 11, 22, 33];
-        assert_eq!(accept_greedy(&proposed, &argmax), vec![10, 11, 22]);
+        assert_eq!(accept_prefix_match(&proposed, &argmax), vec![10, 11, 22]);
         assert_eq!(num_accepted(&proposed, &argmax), 2);
     }
 
@@ -212,7 +224,7 @@ mod tests {
     fn rejects_first_candidate_commits_one() {
         let proposed = [10u32, 11, 12];
         let argmax = [7u32, 8, 9, 10];
-        assert_eq!(accept_greedy(&proposed, &argmax), vec![7]);
+        assert_eq!(accept_prefix_match(&proposed, &argmax), vec![7]);
         assert_eq!(num_accepted(&proposed, &argmax), 0);
     }
 
@@ -220,7 +232,7 @@ mod tests {
     fn empty_proposal_commits_model_token() {
         let proposed: [u32; 0] = [];
         let argmax = [42u32];
-        assert_eq!(accept_greedy(&proposed, &argmax), vec![42]);
+        assert_eq!(accept_prefix_match(&proposed, &argmax), vec![42]);
         assert_eq!(num_accepted(&proposed, &argmax), 0);
     }
 
@@ -228,7 +240,7 @@ mod tests {
     fn always_commits_at_least_one_token() {
         let proposed = [1u32, 2];
         let argmax = [9u32, 9, 9];
-        assert!(!accept_greedy(&proposed, &argmax).is_empty());
+        assert!(!accept_prefix_match(&proposed, &argmax).is_empty());
     }
 
     #[test]
