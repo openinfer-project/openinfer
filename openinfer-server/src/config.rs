@@ -149,6 +149,15 @@ pub(crate) struct Args {
     #[arg(long, default_value_t = 5000, requires = "kv_pd_vllm_seed")]
     pub kv_pd_miss_wait_ms: u64,
 
+    /// Debug escape hatch for --kv-pd-vllm-seed mode on models whose decode
+    /// node has no prefill path (GLM5.2): admit with local prompt compute
+    /// when the remote KV never materializes, instead of rejecting for the
+    /// router to retry. Local prompt compute rides the decode kernels
+    /// token-by-token — leave off in production. Qwen3 ignores this flag
+    /// (its miss path always falls back to a real local prefill).
+    #[arg(long, default_value_t = false, requires = "kv_pd_vllm_seed")]
+    pub kv_pd_allow_local_prefill: bool,
+
     /// vLLM-style no-prefix-cache. Without --kv-offload it disables prefix
     /// matching outright (every prefill recomputes the full prompt). With
     /// --kv-offload it is the pure-L2 mode: no cross-request HBM reuse, so every

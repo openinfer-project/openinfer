@@ -143,6 +143,32 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
                             pinned_pool_bytes: (args.kv_offload_host_gib * f64::from(1u32 << 30))
                                 as usize,
                             use_hugepages: args.kv_offload_hugepages,
+                            p2p: match (
+                                args.kv_p2p_metaserver_addr.clone(),
+                                args.kv_p2p_advertise_addr.clone(),
+                            ) {
+                                (Some(metaserver_addr), Some(advertise_addr)) => {
+                                    Some(openinfer_glm52::Glm52P2pOptions {
+                                        metaserver_addr,
+                                        advertise_addr,
+                                        rdma_nics: args.kv_p2p_nics.clone(),
+                                    })
+                                }
+                                _ => None,
+                            },
+                            vllm_compat: args.kv_pd_vllm_seed.clone().map(|seed| {
+                                openinfer_glm52::Glm52VllmCompatOptions {
+                                    python_hash_seed: seed,
+                                    namespace: args
+                                        .kv_pd_vllm_namespace
+                                        .clone()
+                                        .expect("clap requires kv_pd_vllm_namespace"),
+                                    miss_wait: std::time::Duration::from_millis(
+                                        args.kv_pd_miss_wait_ms,
+                                    ),
+                                    allow_local_prefill: args.kv_pd_allow_local_prefill,
+                                }
+                            }),
                         }),
                     moe_topo,
                     dump_graph_png: args.dump_graph_png.clone(),

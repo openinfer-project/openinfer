@@ -225,6 +225,56 @@ pub struct Glm52KvOffloadOptions {
     /// Back the pool with hugepages (the box must hold a reservation —
     /// check `HugePages_Total`).
     pub use_hugepages: bool,
+    /// `Some` joins the cross-instance P2P mesh: saved block hashes register
+    /// with the MetaServer and missing prefixes are pulled from peer
+    /// instances over RDMA — the P/D disaggregation data plane.
+    pub p2p: Option<Glm52P2pOptions>,
+    /// `Some` when the P/D prefill peer is vLLM (pegaflow connector): offload
+    /// query keys switch from kvbm lineage hashes to vLLM's prefix-cache hash
+    /// scheme so this decode node can find the blocks vLLM registered.
+    /// Requires `p2p` (the peer's KV lives in its pegaflow-server's pool,
+    /// even on the same host).
+    pub vllm_compat: Option<Glm52VllmCompatOptions>,
+}
+
+/// Cross-instance P2P KV sharing (see `openinfer_kv_offload::P2pConfig`).
+#[derive(Clone, Debug)]
+pub struct Glm52P2pOptions {
+    /// MetaServer gRPC address, e.g. `http://10.0.0.100:50056`.
+    pub metaserver_addr: String,
+    /// This engine's routable `IP:port` (doubles as the embedded transfer
+    /// service's bind address). Must be reachable by every peer.
+    pub advertise_addr: String,
+    /// RDMA NIC device names to register the pinned pool on.
+    pub rdma_nics: Vec<String>,
+}
+
+/// Decode-node settings for a P/D deployment whose prefill node is vLLM with
+/// the pegaflow connector (see `openinfer_kv_offload::VllmBlockHasher` and
+/// `docs/models/glm52/pd-vllm-prefill.md`).
+///
+/// GLM5.2's decode node has no prefill path — prompt positions ride the
+/// decode kernels token-by-token (~worst case seconds per request) — so the
+/// contract here is stricter than qwen3's: the router appends the prefill
+/// peer's first generated token to the prompt, the full original prompt's KV
+/// (all full pages plus the partial tail page) must arrive from the peer, and
+/// a request whose remote KV never materializes is REJECTED for the router to
+/// retry, never silently prefilled locally.
+#[derive(Clone, Debug)]
+pub struct Glm52VllmCompatOptions {
+    /// The `PYTHONHASHSEED` value shared with every vLLM prefill process.
+    pub python_hash_seed: String,
+    /// The P side's pegaflow-connector namespace (8-hex digest logged by the
+    /// connector at startup as `namespace=...`).
+    pub namespace: String,
+    /// How long a cold request keeps re-querying a zero/partial hit before
+    /// giving up on the expected remote KV. Covers the P side's post-response
+    /// save + MetaServer-registration tail (tens of ms).
+    pub miss_wait: std::time::Duration,
+    /// Debug escape hatch: admit with local prompt compute when remote KV
+    /// never materializes, instead of rejecting. Leave OFF in production —
+    /// on GLM5.2 the fallback rides decode kernels token-by-token.
+    pub allow_local_prefill: bool,
 }
 
 pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHandle> {
@@ -278,6 +328,17 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
         kv_offload.is_none() || moe_topo == Glm52MoeTopo::Ep8,
         "GLM5.2 --kv-offload requires the EP8 topology (tp8 replicates KV on all ranks; \
          a host-tier restore would land on one)"
+    );
+    // The vLLM prefill peer's KV lives in its pegaflow-server's pool (a
+    // separate process even on the same host); without the P2P mesh the
+    // compat keys would query an empty local tier and every request would
+    // wait out the full miss window.
+    ensure!(
+        kv_offload
+            .as_ref()
+            .is_none_or(|kv| kv.vllm_compat.is_none() || kv.p2p.is_some()),
+        "GLM5.2 --kv-pd-vllm-seed requires the KV P2P mesh (--kv-p2p-metaserver-addr, \
+         --kv-p2p-advertise-addr, --kv-p2p-nics)"
     );
     start_engine(
         model_path,
@@ -525,6 +586,9 @@ fn start_engine(
                 return Err(err);
             }
         };
+    let vllm_compat = kv_offload
+        .as_ref()
+        .and_then(|opts| opts.vllm_compat.clone());
     let post_comm_startup = || -> Result<Option<Vec<OffloadEngine>>> {
         if let Some(dspark_path) = dspark_path {
             load_dspark_drafters(&loaded.workers, dspark_path)?;
@@ -573,6 +637,7 @@ fn start_engine(
                 max_model_len,
                 no_prefix_cache,
                 offload,
+                vllm_compat,
                 moe_topo,
                 load_txs,
                 graph_dump_request,
@@ -751,15 +816,26 @@ fn build_offload_engines(
         pinned_pool_bytes: opts.pinned_pool_bytes,
         use_hugepages: opts.use_hugepages,
         runtime_threads: 2,
-        p2p: None,
+        p2p: opts.p2p.as_ref().map(|p2p| openinfer_kv_offload::P2pConfig {
+            metaserver_addr: p2p.metaserver_addr.clone(),
+            advertise_addr: p2p.advertise_addr.clone(),
+            rdma_nics: p2p.rdma_nics.clone(),
+        }),
     })
     .map_err(|err| anyhow::anyhow!("GLM5.2 KV offload host: {err}"))?;
-    let namespace = format!(
-        "openinfer-glm52-l{GLM52_LAYERS}-p{}-mla{}-idxk{}",
-        mla_page_size,
-        mla_bytes_per_token,
-        config::GLM52_INDEX_HEAD_DIM + 4,
-    );
+    // vLLM-compat mode joins the *P side's* content domain: the pegaflow
+    // connector derives an 8-hex namespace from vLLM config (and logs it at
+    // startup); reproducing that derivation would mean chasing Python repr
+    // of vLLM internals, so the operator passes it through explicitly.
+    let namespace = match &opts.vllm_compat {
+        Some(compat) => compat.namespace.clone(),
+        None => format!(
+            "openinfer-glm52-l{GLM52_LAYERS}-p{}-mla{}-idxk{}",
+            mla_page_size,
+            mla_bytes_per_token,
+            config::GLM52_INDEX_HEAD_DIM + 4,
+        ),
+    };
     let engines = rank_arenas
         .into_iter()
         .zip(device_ordinals)
