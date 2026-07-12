@@ -55,7 +55,8 @@
   - remove the author-local Downloads path from this document.
 - The first focused content test exposed the tokenizer's expected leading-space decode: each simulated `alpha` token streams as `" alpha"`; the exact concatenated assertion is therefore `" alpha alpha"`.
 - Result:
-  - `cargo test --release -p openinfer-sim --test frontend_e2e`: pass, `8 passed; 0 failed`.
+  - Rebased onto upstream `main` at `6b6b6c37` without conflicts.
+  - `cargo test --release -p openinfer-sim --test frontend_e2e`: pass, `12 passed; 0 failed` on the rebased branch.
   - `cargo clippy -p openinfer-sim --tests`: pass; only the existing dependency future-incompatibility note remains.
   - `cargo fmt --all --check`: pass.
 
