@@ -19,7 +19,7 @@ use anyhow::{Context as _, Result, ensure};
 use half::bf16;
 use openinfer_kernels::ops::{
     GLM52_FLASHMLA_SPARSE_PAGE_SIZE, GLM52_FLASHMLA_SPARSE_TOPK, Glm52FlashMlaSparseDecode,
-    Glm52IndexerCacheLayout, add_into, glm52_ep4_deepep_unique_id,
+    Glm52IndexerCacheLayout, add_into, glm52_ep_deepep_unique_id,
     glm52_flashmla_sparse_decode_num_sm_parts,
 };
 use openinfer_kernels::tensor::DeviceContext;
@@ -63,7 +63,7 @@ fn layer_moe_ep4_oracle_gate() -> Result<()> {
         MOE_ORACLE_INPUT_SCALE,
         MOE_ORACLE_HIDDEN_DIGEST,
     )?;
-    let unique_id = glm52_ep4_deepep_unique_id()?;
+    let unique_id = glm52_ep_deepep_unique_id(4)?;
     let tensors = Arc::new(LayerTensors::load(&model_path(), MOE_ORACLE_LAYER)?);
 
     // Expert ranks: pack the 64 local experts, then replay one collective per

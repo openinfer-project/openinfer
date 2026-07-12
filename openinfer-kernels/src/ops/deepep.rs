@@ -339,6 +339,45 @@ deepep_abi!(
     decode_combine => ffi::glm52_ep4_deepep_decode_combine,
 );
 
+#[cfg(feature = "glm52")]
+deepep_abi!(
+    Glm52Ep16DeepEpAbi,
+    ffi::Glm52Ep16DeepEpCtx,
+    last_error => ffi::glm52_ep16_deepep_last_error,
+    info => ffi::glm52_ep16_deepep_info,
+    unique_id => ffi::glm52_ep16_deepep_unique_id,
+    ctx_create => ffi::glm52_ep16_deepep_ctx_create,
+    ctx_destroy => ffi::glm52_ep16_deepep_ctx_destroy,
+    decode_dispatch => ffi::glm52_ep16_deepep_decode_dispatch,
+    decode_combine => ffi::glm52_ep16_deepep_decode_combine,
+);
+
+#[cfg(feature = "glm52")]
+deepep_abi!(
+    Glm52Ep32DeepEpAbi,
+    ffi::Glm52Ep32DeepEpCtx,
+    last_error => ffi::glm52_ep32_deepep_last_error,
+    info => ffi::glm52_ep32_deepep_info,
+    unique_id => ffi::glm52_ep32_deepep_unique_id,
+    ctx_create => ffi::glm52_ep32_deepep_ctx_create,
+    ctx_destroy => ffi::glm52_ep32_deepep_ctx_destroy,
+    decode_dispatch => ffi::glm52_ep32_deepep_decode_dispatch,
+    decode_combine => ffi::glm52_ep32_deepep_decode_combine,
+);
+
+#[cfg(feature = "glm52")]
+deepep_abi!(
+    Glm52Ep64DeepEpAbi,
+    ffi::Glm52Ep64DeepEpCtx,
+    last_error => ffi::glm52_ep64_deepep_last_error,
+    info => ffi::glm52_ep64_deepep_info,
+    unique_id => ffi::glm52_ep64_deepep_unique_id,
+    ctx_create => ffi::glm52_ep64_deepep_ctx_create,
+    ctx_destroy => ffi::glm52_ep64_deepep_ctx_destroy,
+    decode_dispatch => ffi::glm52_ep64_deepep_decode_dispatch,
+    decode_combine => ffi::glm52_ep64_deepep_decode_combine,
+);
+
 fn shim_error<A: DeepEpAbi>(what: &str) -> anyhow::Error {
     // Safety: last_error returns a valid thread-local C string.
     let message = unsafe { CStr::from_ptr(A::last_error()) };
@@ -363,27 +402,22 @@ pub fn glm52_deepep_info() -> DeepEpInfo {
     Glm52DeepEpAbi::info()
 }
 
-/// Baked shim capacities of the GLM5.2 DP1/EP4 config.
-#[cfg(feature = "glm52")]
-pub fn glm52_ep4_deepep_info() -> DeepEpInfo {
-    Glm52Ep4DeepEpAbi::info()
-}
-
 /// NCCL unique id, generated on rank 0 and shared with all ranks.
 pub fn deepep_unique_id() -> Result<[u8; 128]> {
     deepep_unique_id_for::<KimiDeepEpAbi>()
 }
 
-/// NCCL unique id via the GLM5.2 shim instantiation.
+/// NCCL unique id via the GLM5.2 EP shim instantiation of the given width.
 #[cfg(feature = "glm52")]
-pub fn glm52_deepep_unique_id() -> Result<[u8; 128]> {
-    deepep_unique_id_for::<Glm52DeepEpAbi>()
-}
-
-/// NCCL unique id via the GLM5.2 EP4 shim instantiation.
-#[cfg(feature = "glm52")]
-pub fn glm52_ep4_deepep_unique_id() -> Result<[u8; 128]> {
-    deepep_unique_id_for::<Glm52Ep4DeepEpAbi>()
+pub fn glm52_ep_deepep_unique_id(ranks: usize) -> Result<[u8; 128]> {
+    match ranks {
+        4 => deepep_unique_id_for::<Glm52Ep4DeepEpAbi>(),
+        8 => deepep_unique_id_for::<Glm52DeepEpAbi>(),
+        16 => deepep_unique_id_for::<Glm52Ep16DeepEpAbi>(),
+        32 => deepep_unique_id_for::<Glm52Ep32DeepEpAbi>(),
+        64 => deepep_unique_id_for::<Glm52Ep64DeepEpAbi>(),
+        other => anyhow::bail!("GLM5.2 DeepEP has no shim instantiation for EP{other}"),
+    }
 }
 
 fn deepep_unique_id_for<A: DeepEpAbi>() -> Result<[u8; 128]> {
@@ -465,13 +499,11 @@ pub struct DeepEpBase<A: DeepEpAbi> {
 /// The Kimi-K2 shim instantiation (deepep_* symbols).
 pub type DeepEp = DeepEpBase<KimiDeepEpAbi>;
 
-/// The GLM5.2 shim instantiation (glm52_deepep_* symbols).
+/// The GLM5.2 EP8 shim instantiation (glm52_deepep_* symbols), named
+/// concretely for the masked-fp8 chain; the weight-only chain stays generic
+/// over [`DeepEpAbi`] instead.
 #[cfg(feature = "glm52")]
 pub type Glm52DeepEp = DeepEpBase<Glm52DeepEpAbi>;
-
-/// The GLM5.2 EP4 shim instantiation (glm52_ep4_deepep_* symbols).
-#[cfg(feature = "glm52")]
-pub type Glm52Ep4DeepEp = DeepEpBase<Glm52Ep4DeepEpAbi>;
 
 // One context per rank thread; the shim has no thread-affine state beyond
 // the thread-local error string.

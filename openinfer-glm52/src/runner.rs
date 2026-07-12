@@ -760,31 +760,27 @@ impl Glm52RankThreadState {
             let sm_major = dev_ctx.ctx.attribute(
                 cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
             )?;
+            let ranks = moe_topo.expected_ep_size();
+            let rank = self.placement.rank;
             runtime.ep8 = Some(match (moe_topo, sm_major) {
-                (crate::Glm52MoeTopo::Ep8, 9) => {
-                    Glm52MoeEpState::MaskedFp8(Box::new(Glm52MoeEp8State::new(
-                        &dev_ctx,
-                        unique_id,
-                        moe_topo.expected_ep_size(),
-                        self.placement.rank,
-                    )?))
-                }
-                (crate::Glm52MoeTopo::Ep8, _) => {
-                    Glm52MoeEpState::WeightOnlyEp8(Box::new(Glm52MoeEpWoState::new(
-                        &dev_ctx,
-                        unique_id,
-                        moe_topo.expected_ep_size(),
-                        self.placement.rank,
-                    )?))
-                }
-                (crate::Glm52MoeTopo::Ep4, _) => {
-                    Glm52MoeEpState::WeightOnlyEp4(Box::new(Glm52MoeEpWoState::new(
-                        &dev_ctx,
-                        unique_id,
-                        moe_topo.expected_ep_size(),
-                        self.placement.rank,
-                    )?))
-                }
+                (crate::Glm52MoeTopo::Ep8, 9) => Glm52MoeEpState::MaskedFp8(Box::new(
+                    Glm52MoeEp8State::new(&dev_ctx, unique_id, ranks, rank)?,
+                )),
+                (crate::Glm52MoeTopo::Ep8, _) => Glm52MoeEpState::WeightOnlyEp8(Box::new(
+                    Glm52MoeEpWoState::new(&dev_ctx, unique_id, ranks, rank)?,
+                )),
+                (crate::Glm52MoeTopo::Ep4, _) => Glm52MoeEpState::WeightOnlyEp4(Box::new(
+                    Glm52MoeEpWoState::new(&dev_ctx, unique_id, ranks, rank)?,
+                )),
+                (crate::Glm52MoeTopo::Ep16, _) => Glm52MoeEpState::WeightOnlyEp16(Box::new(
+                    Glm52MoeEpWoState::new(&dev_ctx, unique_id, ranks, rank)?,
+                )),
+                (crate::Glm52MoeTopo::Ep32, _) => Glm52MoeEpState::WeightOnlyEp32(Box::new(
+                    Glm52MoeEpWoState::new(&dev_ctx, unique_id, ranks, rank)?,
+                )),
+                (crate::Glm52MoeTopo::Ep64, _) => Glm52MoeEpState::WeightOnlyEp64(Box::new(
+                    Glm52MoeEpWoState::new(&dev_ctx, unique_id, ranks, rank)?,
+                )),
                 (other, _) => anyhow::bail!("GLM5.2 {other:?} is not an expert-bundle topology"),
             });
         }
@@ -799,9 +795,7 @@ impl Glm52RankThreadState {
             let topology = match moe_topo {
                 crate::Glm52MoeTopo::Tp8 => openinfer_kernels::ops::Glm52TpTopology::Tp8,
                 crate::Glm52MoeTopo::Tp4 => openinfer_kernels::ops::Glm52TpTopology::Tp4,
-                crate::Glm52MoeTopo::Ep8 | crate::Glm52MoeTopo::Ep4 => {
-                    anyhow::bail!("GLM5.2 {moe_topo:?} setup received a TP exchange")
-                }
+                _ => anyhow::bail!("GLM5.2 {moe_topo:?} setup received a TP exchange"),
             };
             let state = Glm52MoeTpState::new(
                 &dev_ctx,

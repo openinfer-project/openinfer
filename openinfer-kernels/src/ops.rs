@@ -31,8 +31,8 @@ pub use deepep::{
 };
 #[cfg(feature = "glm52")]
 pub use deepep::{
-    Glm52DeepEp, Glm52DeepEpAbi, Glm52Ep4DeepEp, Glm52Ep4DeepEpAbi, glm52_deepep_info,
-    glm52_deepep_unique_id, glm52_ep4_deepep_info, glm52_ep4_deepep_unique_id,
+    Glm52DeepEp, Glm52DeepEpAbi, Glm52Ep4DeepEpAbi, Glm52Ep16DeepEpAbi, Glm52Ep32DeepEpAbi,
+    Glm52Ep64DeepEpAbi, glm52_deepep_info, glm52_ep_deepep_unique_id,
 };
 #[cfg(feature = "deepseek-v2-lite")]
 pub use deepseek_v2_lite::*;

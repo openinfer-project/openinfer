@@ -149,6 +149,12 @@ pub enum Glm52MoeTopo {
     /// arch-portable weight-only mma chain instead of the sm_90a DeepGEMM
     /// masked chain.
     Ep4,
+    /// Cross-tray expert-parallel widths on GB300 NVL72 (4 GPUs per tray,
+    /// remote ranks behind `--rank-hosts`). Same DeepEP protocol with one
+    /// shim instantiation per width; all run the weight-only chain.
+    Ep16,
+    Ep32,
+    Ep64,
     Tp8,
     Tp4,
 }
@@ -157,9 +163,8 @@ impl Glm52MoeTopo {
     #[must_use]
     pub fn default_dp_size(self) -> usize {
         match self {
-            Self::Ep8 | Self::Tp8 => GLM52_EP_RANKS,
-            Self::Ep4 => 4,
             Self::Tp4 => 1,
+            _ => self.device_count(),
         }
     }
 
@@ -168,6 +173,9 @@ impl Glm52MoeTopo {
         match self {
             Self::Ep8 | Self::Tp8 => GLM52_EP_RANKS,
             Self::Ep4 | Self::Tp4 => 4,
+            Self::Ep16 => 16,
+            Self::Ep32 => 32,
+            Self::Ep64 => 64,
         }
     }
 
@@ -187,23 +195,23 @@ impl Glm52MoeTopo {
     #[must_use]
     pub fn expected_tp_size(self) -> usize {
         match self {
-            Self::Ep8 | Self::Ep4 | Self::Tp8 => 1,
             Self::Tp4 => 4,
+            _ => 1,
         }
     }
 
     #[must_use]
     pub(crate) fn expected_ep_size(self) -> usize {
         match self {
-            Self::Ep8 | Self::Tp8 => GLM52_EP_RANKS,
-            Self::Ep4 => 4,
+            Self::Tp8 => GLM52_EP_RANKS,
             Self::Tp4 => 1,
+            _ => self.device_count(),
         }
     }
 
     #[must_use]
     pub(crate) fn uses_ep_expert_bundles(self) -> bool {
-        matches!(self, Self::Ep8 | Self::Ep4)
+        !self.uses_tensor_replicated_moe()
     }
 
     /// Whole routed experts per rank of an expert-bundle topology (EP8 → 32,
@@ -225,12 +233,18 @@ impl std::str::FromStr for Glm52MoeTopo {
 
     fn from_str(s: &str) -> Result<Self> {
         match s {
-            "ep8" => Ok(Self::Ep8),
             "ep4" => Ok(Self::Ep4),
+            "ep8" => Ok(Self::Ep8),
+            "ep16" => Ok(Self::Ep16),
+            "ep32" => Ok(Self::Ep32),
+            "ep64" => Ok(Self::Ep64),
             "tp8" => Ok(Self::Tp8),
             "tp4" => Ok(Self::Tp4),
             other => {
-                anyhow::bail!("GLM5.2 MoE topology must be ep8, ep4, tp8, or tp4, got {other}")
+                anyhow::bail!(
+                    "GLM5.2 MoE topology must be ep4, ep8, ep16, ep32, ep64, tp8, or tp4, \
+                     got {other}"
+                )
             }
         }
     }
@@ -280,6 +294,25 @@ mod topology_tests {
         assert_eq!(Glm52MoeTopo::Ep4.ep_local_experts(), 64);
         assert_eq!("ep4".parse::<Glm52MoeTopo>().unwrap(), Glm52MoeTopo::Ep4);
     }
+
+    #[test]
+    fn cross_tray_ep_widths_shard_all_routed_experts() {
+        for (topo, ranks, local) in [
+            (Glm52MoeTopo::Ep16, 16, 16),
+            (Glm52MoeTopo::Ep32, 32, 8),
+            (Glm52MoeTopo::Ep64, 64, 4),
+        ] {
+            assert_eq!(topo.default_dp_size(), ranks);
+            assert_eq!(topo.device_count(), ranks);
+            assert_eq!(topo.logical_rank_count(), ranks);
+            assert_eq!(topo.expected_tp_size(), 1);
+            assert_eq!(topo.expected_ep_size(), ranks);
+            assert!(topo.uses_ep_expert_bundles());
+            assert!(!topo.uses_tensor_replicated_moe());
+            assert_eq!(topo.ep_local_experts(), local);
+            assert_eq!(format!("ep{ranks}").parse::<Glm52MoeTopo>().unwrap(), topo);
+        }
+    }
 }
 
 /// Host-tier KV offload knobs. One `PegaEngine` (one pinned pool) backs all
@@ -314,17 +347,6 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
         openinfer_core::cuda_graph::validate_graph_dump_request(path)?;
     }
     match moe_topo {
-        Glm52MoeTopo::Ep8 | Glm52MoeTopo::Ep4 | Glm52MoeTopo::Tp8 => {
-            ensure!(
-                tp_size == 1,
-                "GLM5.2 {moe_topo:?} requires --tp-size=1, got {tp_size}"
-            );
-            let expected_dp = moe_topo.default_dp_size();
-            ensure!(
-                dp_size == expected_dp,
-                "GLM5.2 {moe_topo:?} requires --dp-size={expected_dp} (or omitted), got {dp_size}"
-            );
-        }
         Glm52MoeTopo::Tp4 => {
             ensure!(
                 tp_size == 4,
@@ -333,6 +355,17 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
             ensure!(
                 dp_size == 1,
                 "GLM5.2 TP4 requires --dp-size=1 (or omitted), got {dp_size}"
+            );
+        }
+        _ => {
+            ensure!(
+                tp_size == 1,
+                "GLM5.2 {moe_topo:?} requires --tp-size=1, got {tp_size}"
+            );
+            let expected_dp = moe_topo.default_dp_size();
+            ensure!(
+                dp_size == expected_dp,
+                "GLM5.2 {moe_topo:?} requires --dp-size={expected_dp} (or omitted), got {dp_size}"
             );
         }
     }
@@ -799,9 +832,12 @@ fn build_rank_models(
                 .map_err(|_| anyhow::anyhow!("GLM5.2 rank {rank} dropped its build response"))??,
         );
     }
-    let unique_id = match moe_topo {
-        Glm52MoeTopo::Ep4 => openinfer_kernels::ops::glm52_ep4_deepep_unique_id()?,
-        _ => openinfer_kernels::ops::glm52_deepep_unique_id()?,
+    let unique_id = if moe_topo.uses_ep_expert_bundles() {
+        openinfer_kernels::ops::glm52_ep_deepep_unique_id(moe_topo.expected_ep_size())?
+    } else {
+        // TP allreduce bootstrap just needs one NCCL unique id; ride the EP8
+        // shim's generator.
+        openinfer_kernels::ops::glm52_ep_deepep_unique_id(8)?
     };
     let tp_exchange = moe_topo
         .uses_tensor_replicated_moe()

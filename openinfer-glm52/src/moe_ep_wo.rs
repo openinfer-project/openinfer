@@ -31,9 +31,9 @@ use half::bf16;
 use openinfer_kernels::ffi::DeepEpInfo;
 use openinfer_kernels::ops::{
     DeepEpAbi, DeepEpBase, DeepEpDispatchScratch, GLM52_DEEPGEMM_GROUPED_EXPERT_ALIGNMENT,
-    Glm52DeepEpAbi, Glm52DeepGemmGroupedFp8Kind, Glm52Ep4DeepEpAbi,
-    glm52_moe_ep_wo_masked_mma_launch, glm52_moe_ep_wo_max_tiles, glm52_moe_ep_wo_silu_launch,
-    glm52_moe_ep_wo_tiles_launch,
+    Glm52DeepEpAbi, Glm52DeepGemmGroupedFp8Kind, Glm52Ep4DeepEpAbi, Glm52Ep16DeepEpAbi,
+    Glm52Ep32DeepEpAbi, Glm52Ep64DeepEpAbi, glm52_moe_ep_wo_masked_mma_launch,
+    glm52_moe_ep_wo_max_tiles, glm52_moe_ep_wo_silu_launch, glm52_moe_ep_wo_tiles_launch,
 };
 use openinfer_kernels::tensor::DeviceContext;
 
@@ -282,11 +282,14 @@ pub(crate) fn glm52_moe_ep_wo_routed_forward<A: DeepEpAbi>(
 pub(crate) enum Glm52MoeEpState {
     /// EP8: sm_90a DeepGEMM masked grouped fp8 chain (8×H200 production).
     MaskedFp8(Box<Glm52MoeEp8State>),
-    /// EP4: arch-portable weight-only mma chain on the EP4 shim (4×GB300).
+    /// Arch-portable weight-only mma chain, one variant per shim
+    /// instantiation (EP8 uses it on Blackwell, where the masked DeepGEMM
+    /// chain's sm_90a kernels don't run).
     WeightOnlyEp4(Box<Glm52MoeEpWoState<Glm52Ep4DeepEpAbi>>),
-    /// EP8 on Blackwell: the same weight-only chain on the EP8 shim (the
-    /// masked DeepGEMM chain is sm_90a-only).
     WeightOnlyEp8(Box<Glm52MoeEpWoState<Glm52DeepEpAbi>>),
+    WeightOnlyEp16(Box<Glm52MoeEpWoState<Glm52Ep16DeepEpAbi>>),
+    WeightOnlyEp32(Box<Glm52MoeEpWoState<Glm52Ep32DeepEpAbi>>),
+    WeightOnlyEp64(Box<Glm52MoeEpWoState<Glm52Ep64DeepEpAbi>>),
 }
 
 impl Glm52MoeEpState {
@@ -307,6 +310,15 @@ impl Glm52MoeEpState {
             Self::WeightOnlyEp8(state) => {
                 glm52_moe_ep_wo_routed_forward(ctx, state, bank, token, global_tokens)
             }
+            Self::WeightOnlyEp16(state) => {
+                glm52_moe_ep_wo_routed_forward(ctx, state, bank, token, global_tokens)
+            }
+            Self::WeightOnlyEp32(state) => {
+                glm52_moe_ep_wo_routed_forward(ctx, state, bank, token, global_tokens)
+            }
+            Self::WeightOnlyEp64(state) => {
+                glm52_moe_ep_wo_routed_forward(ctx, state, bank, token, global_tokens)
+            }
         }
     }
 
@@ -317,6 +329,9 @@ impl Glm52MoeEpState {
             Self::MaskedFp8(state) => state.combined(),
             Self::WeightOnlyEp4(state) => state.combined(),
             Self::WeightOnlyEp8(state) => state.combined(),
+            Self::WeightOnlyEp16(state) => state.combined(),
+            Self::WeightOnlyEp32(state) => state.combined(),
+            Self::WeightOnlyEp64(state) => state.combined(),
         }
     }
 }
