@@ -82,4 +82,4 @@
   - SSE tests must preserve data-event order; filtering `[DONE]` before assertions makes terminal-contract regressions invisible.
   - SSE wire coverage must model event dispatch, not just scan `data:` lines; blank separators and EOF handling are part of the contract.
 - **Follow-ups**:
-  - Resolve the four PR #630 review threads after the strengthened tests are pushed.
+  - All five PR #630 review threads were answered and resolved; maintainer re-review remains.
