@@ -141,7 +141,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | `subsystems/frontend/simulated-inference-engine.md` | CPU-only simulated model crate for vLLM/OpenAI frontend and `vllm bench serve` validation without CUDA, real model weights, or real-model performance claims. |
 | `subsystems/frontend/cpu-profiling-baseline.md` | Frontend CPU profiling baseline using `openinfer-sim` with fixed TTFT=5ms/TPOT=12ms: 200 req / concurrency=16 shows ~150ms TTFT overhead (no dominant hotspot), heap allocation ~10%, stream polling ~7.5%, IPC ~1%; reproducible benchmark command and perf evidence documented. |
 | `subsystems/frontend/startup-time.md` | Qwen3-4B warm startup-to-ready 3.25s → ~1.45s: frontend tokenizer load runs concurrently with the engine load (HTTP still binds only after the engine registers), and the source safetensors mmap is kept alive to dodge ~0.4s of munmap stalling the next cudaMalloc. |
-| `subsystems/frontend/prometheus-metrics.md` | `/metrics` request histograms work for every model; Qwen3, Qwen3.5, and GLM5.2 schedulers also publish running/waiting/KV engine gauges through `LoadSnapshot` watches. |
+| `subsystems/frontend/prometheus-metrics.md` | `/metrics` request histograms come from bridge events/PrefillStats; scheduler stats ride `LoadSnapshot`. Qwen3 now reports real prefix-cache query/hit counters via monotonic totals differenced by the bridge, plus running/waiting/KV gauges. |
 | `subsystems/frontend/dashboards/README.md` | Grafana 10.4-validated dashboard for OpenInfer's live `/metrics` surface: HTTP traffic, request outcomes, scheduler/KV state, token throughput, and request latency. |
 
 ## subsystems / correctness

@@ -599,9 +599,20 @@ async fn publish_scheduler_stats(
     output_tx: mpsc::UnboundedSender<EngineCoreOutputs>,
     shutdown: CancellationToken,
 ) -> Result<()> {
+    let mut previous_prefix_cache_queries = 0;
+    let mut previous_prefix_cache_hits = 0;
     loop {
         let snapshot = *load_rx.borrow_and_update();
-        let stats = SchedulerStats {
+        let prefix_cache_queries = snapshot
+            .prefix_cache_queries_total
+            .saturating_sub(previous_prefix_cache_queries);
+        let prefix_cache_hits = snapshot
+            .prefix_cache_hits_total
+            .saturating_sub(previous_prefix_cache_hits);
+        previous_prefix_cache_queries = snapshot.prefix_cache_queries_total;
+        previous_prefix_cache_hits = snapshot.prefix_cache_hits_total;
+
+        let mut stats = SchedulerStats {
             num_running_reqs: snapshot.num_running_reqs,
             num_waiting_reqs: snapshot.num_waiting_reqs,
             kv_cache_usage: if snapshot.kv_total_blocks == 0 {
@@ -611,6 +622,12 @@ async fn publish_scheduler_stats(
             },
             ..SchedulerStats::default()
         };
+        // Upstream records these with Prometheus `inc_by`, so only the delta
+        // since this bridge's previous observation belongs in SchedulerStats.
+        // The scheduler-side values stay cumulative because watch updates may
+        // coalesce; differencing a jump preserves every skipped increment.
+        stats.prefix_cache_stats.base.queries = prefix_cache_queries;
+        stats.prefix_cache_stats.base.hits = prefix_cache_hits;
         let outputs = RequestBatchOutputs {
             engine_index,
             scheduler_stats: Some(Box::new(stats)),

@@ -225,6 +225,7 @@ fn build_prefill_items(pending: &[PendingRequest], indices: &[usize]) -> Vec<Pre
                 echo: r.echo,
                 lora_adapter: r.lora_adapter.clone(),
                 cached_tokens: r.cached_tokens,
+                prefix_cache_queried: false,
                 chunk_budget: r.step_chunk,
                 chunk_start: 0,
                 chunk_tokens: 0,

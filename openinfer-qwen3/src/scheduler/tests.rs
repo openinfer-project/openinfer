@@ -35,6 +35,7 @@ struct FakeExecutor {
     dropped: Arc<Mutex<Vec<u64>>>,
     prefetch_offers: Arc<Mutex<Vec<u64>>>,
     stop_token: Option<u32>,
+    prefix_cache_hits: VecDeque<usize>,
 }
 
 impl FakeExecutor {
@@ -52,6 +53,7 @@ impl FakeExecutor {
             dropped,
             prefetch_offers: Arc::new(Mutex::new(Vec::new())),
             stop_token: None,
+            prefix_cache_hits: VecDeque::new(),
         }
     }
 
@@ -75,6 +77,11 @@ impl FakeExecutor {
         self
     }
 
+    fn with_prefix_cache_hits(mut self, hits: &[usize]) -> Self {
+        self.prefix_cache_hits = hits.iter().copied().collect();
+        self
+    }
+
     /// Advance a request's prompt by one chunk, mirroring the real
     /// executor: clamp the scheduler's budget to the tokens remaining
     /// and report the new authoritative position.
@@ -92,12 +99,16 @@ impl FakeExecutor {
         } else {
             self.prefill_positions.insert(req.request_id, prefill_pos);
         }
+        let cached_tokens = (start == 0)
+            .then(|| self.prefix_cache_hits.pop_front())
+            .flatten();
         PrefillRequestResult {
             request_id: req.request_id,
             first_token: 100 + req.request_id.get() as u32,
             first_token_logprob: None,
             prompt_logprobs: None,
-            cached_tokens: 0,
+            cached_tokens: cached_tokens.unwrap_or(0),
+            prefix_cache_queried: cached_tokens.is_some(),
             completed,
             prefill_pos,
         }
@@ -839,6 +850,36 @@ fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
 }
 
 #[test]
+fn load_snapshot_accumulates_prefix_cache_query_and_hit_tokens() {
+    let dropped = Arc::new(Mutex::new(Vec::new()));
+    let executor = FakeExecutor::new(8, Arc::clone(&dropped)).with_prefix_cache_hits(&[0, 16]);
+    let handle = start_with_executor(executor, 42, DEFAULT_MAX_PREFILL_TOKENS);
+    let load_rx = handle.load_watch().expect("qwen3 publishes load snapshots");
+
+    for _ in 0..2 {
+        let (req, mut token_rx) = request(32, 1);
+        handle.submit(req).expect("submit cache-metrics request");
+        assert!(matches!(
+            recv_skipping_scheduled(&mut token_rx),
+            Some(TokenEvent::Token { .. })
+        ));
+        assert!(matches!(
+            recv_skipping_scheduled(&mut token_rx),
+            Some(TokenEvent::Finished { .. })
+        ));
+    }
+
+    assert!(
+        wait_until(Duration::from_secs(1), || {
+            let snapshot = *load_rx.borrow();
+            snapshot.prefix_cache_queries_total == 64 && snapshot.prefix_cache_hits_total == 16
+        }),
+        "two 32-token cache lookups should publish 64 queried and 16 hit tokens; got {:?}",
+        *load_rx.borrow()
+    );
+}
+
+#[test]
 fn unknown_lora_request_is_rejected_without_blocking_base_request() {
     let dropped = Arc::new(Mutex::new(Vec::new()));
     let executor = FakeExecutor::new(4, Arc::clone(&dropped));
@@ -962,6 +1003,7 @@ fn retiring_multiple_active_requests_tolerates_unsorted_indices() {
         &mut executor,
         &mut active,
         &mut Vec::new(),
+        &mut PrefixCacheTotals::default(),
         effects::StepEffects {
             scheduled: Vec::new(),
             prompt_echoes: Vec::new(),

@@ -456,8 +456,9 @@ fn rejected_request_is_reported_as_error() {
 
 /// The scheduler-stats task turns each load-watch snapshot into a stats-only
 /// batch (no request outputs, no finished set) with the queue gauges and the
-/// fractional KV usage the frontend records into Prometheus, sends the current
-/// snapshot up front, and follows every watch update with exactly one message.
+/// fractional KV usage and interval prefix-cache deltas the frontend records
+/// into Prometheus, sends the current snapshot up front, and follows every
+/// watch update with exactly one message.
 #[tokio::test]
 async fn load_snapshots_become_stats_only_batches() {
     let (load_tx, load_rx) = tokio::sync::watch::channel(LoadSnapshot {
@@ -465,6 +466,8 @@ async fn load_snapshots_become_stats_only_batches() {
         kv_total_blocks: 100,
         num_running_reqs: 2,
         num_waiting_reqs: 1,
+        prefix_cache_queries_total: 32,
+        prefix_cache_hits_total: 16,
     });
     let (output_tx, mut output_rx) = mpsc::unbounded_channel();
     let shutdown = CancellationToken::new();
@@ -486,8 +489,17 @@ async fn load_snapshots_become_stats_only_batches() {
     assert_eq!(stats.num_running_reqs, 2);
     assert_eq!(stats.num_waiting_reqs, 1);
     assert!((stats.kv_cache_usage - 0.25).abs() < 1e-9);
+    assert_eq!(stats.prefix_cache_stats.base.queries, 32);
+    assert_eq!(stats.prefix_cache_stats.base.hits, 16);
 
-    load_tx.send_replace(LoadSnapshot::default());
+    // The cumulative source jumps over multiple possible scheduler steps; the
+    // bridge must forward only the unobserved interval, without losing it to
+    // watch-channel coalescing or replaying the earlier totals.
+    load_tx.send_replace(LoadSnapshot {
+        prefix_cache_queries_total: 96,
+        prefix_cache_hits_total: 48,
+        ..LoadSnapshot::default()
+    });
     let batch = match output_rx.recv().await.expect("drained stats batch") {
         EngineCoreOutputs::RequestBatch(batch) => batch,
         other => panic!("expected a stats batch, got {other:?}"),
@@ -495,6 +507,8 @@ async fn load_snapshots_become_stats_only_batches() {
     let stats = batch.scheduler_stats.expect("scheduler stats");
     assert_eq!(stats.num_running_reqs, 0);
     assert_eq!(stats.kv_cache_usage.to_bits(), 0.0_f64.to_bits());
+    assert_eq!(stats.prefix_cache_stats.base.queries, 64);
+    assert_eq!(stats.prefix_cache_stats.base.hits, 32);
 
     shutdown.cancel();
     task.await
