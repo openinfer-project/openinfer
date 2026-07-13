@@ -1047,7 +1047,10 @@ fn load_rank_weights_to_gpu(
     );
     let mut workers = Vec::with_capacity(startup.rank_bundles.len());
     for (rank, &device_ordinal) in startup.device_ordinals.iter().enumerate() {
-        let placement = Glm52RankPlacement::new(rank, device_ordinal)?;
+        let placement = Glm52RankPlacement {
+            rank,
+            device_ordinal,
+        };
         workers.push(Glm52Worker::Local(Glm52RankWorker::spawn(
             placement,
             startup.rank_bundles[rank].clone(),

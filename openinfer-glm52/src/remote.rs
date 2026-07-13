@@ -767,7 +767,10 @@ fn spawn_hosted_workers(hello: &WireHello) -> Result<Vec<Glm52RankWorker>> {
     let mut workers = Vec::with_capacity(hello.rank_count);
     for index in 0..hello.rank_count {
         let rank = hello.first_rank + index;
-        let placement = Glm52RankPlacement::new(rank, index)?;
+        let placement = Glm52RankPlacement {
+            rank,
+            device_ordinal: index,
+        };
         workers.push(Glm52RankWorker::spawn(placement, bundles[rank].clone())?);
     }
     Ok(workers)

@@ -21,27 +21,17 @@ use crate::moe_tp::{
     Glm52MoeTpRank, Glm52MoeTpSliceBank, Glm52MoeTpState, Glm52TpExchange, load_tp_slice_layer,
 };
 use crate::weights::{
-    GLM52_EP_RANKS, Glm52RankGpuContext, Glm52RankGpuWeights, Glm52RankLoadBundle,
-    Glm52WeightManifest, load_rank_weights_to_gpu,
+    Glm52RankGpuContext, Glm52RankGpuWeights, Glm52RankLoadBundle, Glm52WeightManifest,
+    load_rank_weights_to_gpu,
 };
 
+/// Global rank + local CUDA device of one worker. Rank bounds are enforced
+/// where placements are built, against the launch topology's real width —
+/// there is no per-width invariant here.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Glm52RankPlacement {
     pub(crate) rank: usize,
     pub(crate) device_ordinal: usize,
-}
-
-impl Glm52RankPlacement {
-    pub(crate) fn new(rank: usize, device_ordinal: usize) -> Result<Self> {
-        ensure!(
-            rank < GLM52_EP_RANKS,
-            "GLM5.2 rank must be < {GLM52_EP_RANKS}, got {rank}"
-        );
-        Ok(Self {
-            rank,
-            device_ordinal,
-        })
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
