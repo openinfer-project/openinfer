@@ -1004,7 +1004,18 @@ def run_batch(
         global_index = offset + idx
         prompt_words, max_tokens = shapes[global_index % len(shapes)]
         if prompt_pool is not None:
-            prompt = prompt_pool[global_index % len(prompt_pool)]
+            # Paired design under mixed-greedy-sampled: the profile alternates
+            # by global_index parity, so indexing prompts by global_index //
+            # 2 gives each prompt to BOTH labels (greedy g=2k and sampled
+            # g=2k+1 share prompt k). Indexing by raw global_index would, with
+            # an even pool, permanently assign each prompt to one label and
+            # confound per-label comparisons with prompt content.
+            pidx = (
+                global_index // 2
+                if sampling_mode(args) == "mixed-greedy-sampled"
+                else global_index
+            )
+            prompt = prompt_pool[pidx % len(prompt_pool)]
             prompt_words = len(prompt.split())
         else:
             prompt = make_prompt(global_index, prompt_words)

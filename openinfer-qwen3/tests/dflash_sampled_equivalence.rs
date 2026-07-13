@@ -34,6 +34,7 @@
 //! offline scrutiny).
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -83,6 +84,9 @@ const CONFIGS: [(f32, i32, f32, f32); 4] = [
     (0.7, 20, 0.9, 0.0),
     (0.8, -1, 1.0, 0.05),
 ];
+
+/// One config's collected tokens: `[prompt][run][position]`.
+type ConfigTokens = Vec<Vec<Vec<u32>>>;
 
 /// Serialize engine-holding test bodies — one engine resident at a time.
 static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -229,7 +233,7 @@ fn collect_arm(
     encoded: &[Vec<u32>],
     runs: usize,
     batch: usize,
-) -> Vec<Vec<Vec<Vec<u32>>>> {
+) -> Vec<ConfigTokens> {
     CONFIGS
         .iter()
         .map(|&cfg| {
@@ -344,7 +348,7 @@ struct Cell {
 }
 
 /// Compare two collected arms cell by cell; returns every cell's TV and p.
-fn compare_arms(arm_a: &[Vec<Vec<Vec<u32>>>], arm_b: &[Vec<Vec<Vec<u32>>>]) -> Vec<Cell> {
+fn compare_arms(arm_a: &[ConfigTokens], arm_b: &[ConfigTokens]) -> Vec<Cell> {
     // Seeded: the verdict is a pure function of the collected tokens.
     let mut rng = StdRng::seed_from_u64(0x512_512);
     let mut cells = Vec::new();
@@ -398,13 +402,13 @@ fn assert_equivalent(cells: &[Cell], label: &str) {
 }
 
 /// Optional raw dump for offline scrutiny (`OPENINFER_EQ_OUT`).
-fn dump_json(path: &str, arms: [(&str, &[Vec<Vec<Vec<u32>>>]); 2]) {
+fn dump_json(path: &str, arms: [(&str, &[ConfigTokens]); 2]) {
     let mut out = String::from("{");
     for (a, (name, arm)) in arms.iter().enumerate() {
         if a > 0 {
             out.push(',');
         }
-        out.push_str(&format!("\"{name}\":["));
+        let _ = write!(out, "\"{name}\":[");
         for (c, per_prompt) in arm.iter().enumerate() {
             if c > 0 {
                 out.push(',');
@@ -419,10 +423,11 @@ fn dump_json(path: &str, arms: [(&str, &[Vec<Vec<Vec<u32>>>]); 2]) {
                     if r > 0 {
                         out.push(',');
                     }
-                    out.push_str(&format!(
+                    let _ = write!(
+                        out,
                         "[{}]",
                         row.iter().map(u32::to_string).collect::<Vec<_>>().join(",")
-                    ));
+                    );
                 }
                 out.push(']');
             }
@@ -537,7 +542,7 @@ fn dflash_sampled_seeded_determinism() {
     for (i, prompt) in PROMPTS.iter().enumerate() {
         let tokens = tokenizer.encode(prompt, false).expect("encode failed");
         let params = SamplingParams {
-            seed: Some(0xC0FFEE + i as u64),
+            seed: Some(0x00C0_FFEE + i as u64),
             ..sampling(CONFIGS[0])
         };
         let first = sample_wave(&handle, &tokens, &params, 1);
