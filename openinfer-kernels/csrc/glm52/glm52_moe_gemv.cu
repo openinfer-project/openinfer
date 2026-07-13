@@ -425,13 +425,16 @@ __global__ void glm52_gemv_batched_mma_reduce_kernel(
 }
 
 // (ksplit, ntiles) per (arch, batch, whitelisted shape); ksplit == 0 keeps the
-// register tile. Measured winners ONLY — Hopper table from jz-38 H200
-// 2026-07-05, Blackwell batch-8 table from GB300 sm_103 locked-clock sweep
-// 2026-07-13 (KSPLIT x NTILES grid, /work/gemv_mma_sweep.cu). Batch-4 has not
-// been re-swept on Blackwell and keeps the Hopper picks.
+// register tile. Measured winners ONLY — Hopper table from an 8xH200
+// locked-clock sweep 2026-07-05, Blackwell batch-8 table from a GB300 sm_103
+// locked-clock sweep 2026-07-13 (full KSPLIT x NTILES grid per shape; method
+// in docs/models/glm52/). Batch-4 has not been re-swept on Blackwell and
+// keeps the Hopper picks.
 struct MmaConfig { int ksplit; int ntiles; };
 
 bool arch_is_blackwell() {
+  // Config selection only — on a failed attribute query fall back to the
+  // Hopper table (still correct everywhere) instead of failing the launch.
   static const bool blackwell = [] {
     int device = 0;
     int major = 0;
@@ -712,6 +715,10 @@ static CUresult gemv_batched_dispatch(
     case kBatchedGemvBatch4: {
       const MmaConfig cfg = mma_config(batch, n, k);
       GLM52_MMA_CASE(kBatchedGemvBatch4, 16, 2)
+      // A table entry whose (ksplit, ntiles) has no case above is a config/
+      // dispatch drift — crash at capture, never silently take the register
+      // tile (the sweep winner would quietly not run).
+      if (cfg.ksplit != 0) return CUDA_ERROR_INVALID_VALUE;
       if (!valid_tiling(n, k, kBatchedWarps * kBatchedRows))
         return CUDA_ERROR_INVALID_VALUE;
       const dim3 grid(1, n / (kBatchedWarps * kBatchedRows), 1);
@@ -722,7 +729,8 @@ static CUresult gemv_batched_dispatch(
       break;
     }
     case kBatchedGemvBatchFull: {
-      // Every whitelisted shape runs the tensor-core path at batch 8.
+      // Table shapes route to the tensor-core path; anything off-table (e.g.
+      // the attention-TP shard shapes) keeps the register tile below.
       const MmaConfig cfg = mma_config(batch, n, k);
       GLM52_MMA_CASE(kBatchedGemvBatchFull, 16, 2)
       GLM52_MMA_CASE(kBatchedGemvBatchFull, 8, 4)
@@ -732,6 +740,8 @@ static CUresult gemv_batched_dispatch(
       GLM52_MMA_CASE(kBatchedGemvBatchFull, 16, 1)
       GLM52_MMA_CASE(kBatchedGemvBatchFull, 8, 2)
       GLM52_MMA_CASE(kBatchedGemvBatchFull, 4, 1)
+      // See the batch-4 arm: an uninstantiated table entry must crash here.
+      if (cfg.ksplit != 0) return CUDA_ERROR_INVALID_VALUE;
       if (!valid_tiling(n, k, kBatchedWarps * kBatchedRows))
         return CUDA_ERROR_INVALID_VALUE;
       const dim3 grid(1, n / (kBatchedWarps * kBatchedRows), 1);

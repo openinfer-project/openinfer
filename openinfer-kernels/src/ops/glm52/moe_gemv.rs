@@ -115,6 +115,69 @@ pub fn glm52_fp8_weight_only_gemv_launch(
     scratch: Option<&mut CudaSlice<f32>>,
     out: &mut CudaSlice<bf16>,
 ) -> Result<()> {
+    gemv_batched_launch(
+        ctx,
+        rows,
+        n,
+        k,
+        activation,
+        weight,
+        scale_bytes,
+        scratch,
+        out,
+        None,
+    )
+    .map(|_| ())
+}
+
+/// Partials-producing twin of [`glm52_fp8_weight_only_gemv_launch`]: when the
+/// (batch, shape) routes to the tensor-core mma path, the launch stops at the
+/// f32 k-slice partials in `scratch` and returns the split factor (`out` is
+/// untouched); otherwise it behaves exactly like the plain launch and returns
+/// 0. Callers pair a non-zero return with a fused reduce consumer.
+#[allow(clippy::too_many_arguments)]
+pub fn glm52_fp8_weight_only_gemv_partials_launch(
+    ctx: &DeviceContext,
+    rows: usize,
+    n: usize,
+    k: usize,
+    activation: &CudaSlice<bf16>,
+    weight: &CudaSlice<u8>,
+    scale_bytes: &CudaSlice<u8>,
+    scratch: &mut CudaSlice<f32>,
+    out: &mut CudaSlice<bf16>,
+) -> Result<usize> {
+    let mut ksplit: i32 = 0;
+    gemv_batched_launch(
+        ctx,
+        rows,
+        n,
+        k,
+        activation,
+        weight,
+        scale_bytes,
+        Some(scratch),
+        out,
+        Some(&mut ksplit),
+    )?;
+    Ok(ksplit as usize)
+}
+
+/// Shared body of the two entry points above: validation, pointer extraction,
+/// and the FFI call (plain when `ksplit_out` is `None`, partials otherwise).
+#[allow(clippy::too_many_arguments)]
+fn gemv_batched_launch(
+    ctx: &DeviceContext,
+    rows: usize,
+    n: usize,
+    k: usize,
+    activation: &CudaSlice<bf16>,
+    weight: &CudaSlice<u8>,
+    scale_bytes: &CudaSlice<u8>,
+    scratch: Option<&mut CudaSlice<f32>>,
+    out: &mut CudaSlice<bf16>,
+    ksplit_out: Option<&mut i32>,
+) -> Result<()> {
     ensure!(
         rows > 0 && n > 0 && k > 0,
         "GLM5.2 linear GEMV needs positive rows/n/k, got {rows}/{n}/{k}"
@@ -150,87 +213,39 @@ pub fn glm52_fp8_weight_only_gemv_launch(
     // rows 4/8 the tensor-core mma path on winning shapes (deterministic per
     // bucket, not bit-identical to m=1). The CUDA side whitelists the
     // supported batches — a drifted GLM52_DECODE_BUCKETS crashes here.
-    unsafe {
-        ffi::glm52_fp8_weight_only_gemv_batched_cuda(
-            act_ptr as *const ffi::Half,
-            w_ptr as *const u8,
-            s_ptr as *const f32,
-            out_ptr as *mut ffi::Half,
-            scr_ptr,
-            scr_floats,
-            rows as i32,
-            n as i32,
-            k as i32,
-            ctx.stream.cu_stream(),
-        )
+    match ksplit_out {
+        None => unsafe {
+            ffi::glm52_fp8_weight_only_gemv_batched_cuda(
+                act_ptr as *const ffi::Half,
+                w_ptr as *const u8,
+                s_ptr as *const f32,
+                out_ptr as *mut ffi::Half,
+                scr_ptr,
+                scr_floats,
+                rows as i32,
+                n as i32,
+                k as i32,
+                ctx.stream.cu_stream(),
+            )
+        },
+        Some(ksplit) => unsafe {
+            ffi::glm52_fp8_weight_only_gemv_partials_cuda(
+                act_ptr as *const ffi::Half,
+                w_ptr as *const u8,
+                s_ptr as *const f32,
+                out_ptr as *mut ffi::Half,
+                scr_ptr,
+                scr_floats,
+                rows as i32,
+                n as i32,
+                k as i32,
+                ctx.stream.cu_stream(),
+                ksplit,
+            )
+        },
     }
     .result()
     .map_err(|err| anyhow!("GLM5.2 linear GEMV launch failed for rows={rows}, n={n}, k={k}: {err}"))
-}
-
-/// Partials-producing twin of [`glm52_fp8_weight_only_gemv_launch`]: when the
-/// (batch, shape) routes to the tensor-core mma path, the launch stops at the
-/// f32 k-slice partials in `scratch` and returns the split factor (`out` is
-/// untouched); otherwise it behaves exactly like the plain launch and returns
-/// 0. Callers pair a non-zero return with a fused reduce consumer.
-#[allow(clippy::too_many_arguments)]
-pub fn glm52_fp8_weight_only_gemv_partials_launch(
-    ctx: &DeviceContext,
-    rows: usize,
-    n: usize,
-    k: usize,
-    activation: &CudaSlice<bf16>,
-    weight: &CudaSlice<u8>,
-    scale_bytes: &CudaSlice<u8>,
-    scratch: &mut CudaSlice<f32>,
-    out: &mut CudaSlice<bf16>,
-) -> Result<usize> {
-    ensure!(
-        rows > 0 && n > 0 && k > 0,
-        "GLM5.2 linear GEMV needs positive rows/n/k, got {rows}/{n}/{k}"
-    );
-    let scale_len = n.div_ceil(FP8_BLOCK) * k.div_ceil(FP8_BLOCK) * 4;
-    ensure!(
-        weight.len() >= n * k
-            && scale_bytes.len() >= scale_len
-            && activation.len() >= rows * k
-            && out.len() >= rows * n,
-        "GLM5.2 linear GEMV buffers too small: w {} (need {}), scale {} (need {scale_len}), act {} (need {}), out {} (need {})",
-        weight.len(),
-        n * k,
-        scale_bytes.len(),
-        activation.len(),
-        rows * k,
-        out.len(),
-        rows * n
-    );
-    let (act_ptr, _a) = activation.device_ptr(&ctx.stream);
-    let (w_ptr, _w) = weight.device_ptr(&ctx.stream);
-    let (s_ptr, _s) = scale_bytes.device_ptr(&ctx.stream);
-    let (out_ptr, _o) = out.device_ptr_mut(&ctx.stream);
-    let scr_floats = scratch.len();
-    let (scr_ptr, _scr) = scratch.device_ptr_mut(&ctx.stream);
-    let mut ksplit: i32 = 0;
-    unsafe {
-        ffi::glm52_fp8_weight_only_gemv_partials_cuda(
-            act_ptr as *const ffi::Half,
-            w_ptr as *const u8,
-            s_ptr as *const f32,
-            out_ptr as *mut ffi::Half,
-            scr_ptr as *mut f32,
-            scr_floats,
-            rows as i32,
-            n as i32,
-            k as i32,
-            ctx.stream.cu_stream(),
-            &mut ksplit,
-        )
-    }
-    .result()
-    .map_err(|err| {
-        anyhow!("GLM5.2 linear GEMV (partials) launch failed for rows={rows}, n={n}, k={k}: {err}")
-    })?;
-    Ok(ksplit as usize)
 }
 
 /// MLA's bs=1 q_a and kv_a projections in one graph node. The two weights and
