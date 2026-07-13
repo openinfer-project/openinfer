@@ -1,6 +1,6 @@
 # GLM5.2 × pegaflow: host-tier KV offload → P/D disaggregation
 
-> **TL;DR:** M1 is implemented by [#600](https://github.com/openinfer-project/openinfer/pull/600): shared `OffloadHost` + 8 rank instances on one namespace, 99 target-model arenas/rank (78 MLA + 21 index-K), restore at admission / save on release, behind `--kv-offload` (+`--kv-offload-hugepages`). Target-only M2 = cross-engine P/D (vLLM prefill → openinfer decode) via the #540 hash-compat pattern plus a byte-dump drift gate. Preserving any model-based speculative decoder with its own KV is a separate state-transfer problem. The dependency intentionally remains at pegaflow-core **v0.23.2 rev d46fd16**: #395 is merged, but stacked #540 also requires still-open #382; the next pin must be a Pegaflow `master` revision containing both.
+> **TL;DR:** M1 is implemented by [#600](https://github.com/openinfer-project/openinfer/pull/600): shared `OffloadHost` + 8 rank instances on one namespace, 99 target-model arenas/rank (78 MLA + 21 index-K), restore at admission / save on release, behind `--kv-offload` (+`--kv-offload-hugepages`). Target-only M2 = cross-engine P/D (vLLM prefill → openinfer decode) via the #540 hash-compat pattern plus a byte-dump drift gate. Preserving any model-based speculative decoder with its own KV is a separate state-transfer problem. `pegaflow-core` is pinned to **v0.23.3 rev 1473c53** (#395). The supported normal producers are Qwen3 on vLLM 0.23.0 default NHD and GLM on vLLM 0.24.0; both are already single-segment and do not need #382.
 >
 > **Last touched:** 2026-07
 
@@ -27,7 +27,9 @@ The standing decision is prefill-by-vLLM (no dedicated GLM5.2 prefill path). P/D
 The target-only handoff has two hard problems, both with prior art:
 
 - **Hash compat**: openinfer xxh3-lineage vs vLLM SHA-256 `block_hashes` never collide onto the same keys. PR #540 (qwen3) already built the pattern: compute vLLM-compatible hashes for the prompt at admission and query the vLLM-written namespace. Port that, plus the namespace derivation (vLLM side = SHA-256 over model/dtype/tp/heads/... — `connector/common.py:210`; ours must reproduce it byte-for-byte).
-- **Layout parity**: verified at source level 2026-07-06 against vLLM revision `cdab28319` — byte-for-byte MATCH on everything device-side, because our kernels are ports of vLLM's: 656 B/token field order `[512 fp8 NoPE][4×f32 scale, ÷448, group=128][64×bf16 RoPE]` (vLLM `cache_kernels.cu:447-547` ↔ ours `glm52_mla_assembly.cu:33-34`), index-K block-split `[64×128 fp8][64×4 B f32 scale]` (vLLM `cache_kernels.cu:550-607` ↔ ours `glm52_indexer.cu:69-87`, which cites the vLLM kernel by name), page=64, layer-outermost page-contiguous arenas both sides. Remaining gate before e2e: dump one block per arena from each engine for the same prefix and byte-compare (guards silent drift on either side's bumps). One structural note: vLLM keeps MLA and indexer caches as separate KV groups; we index both off one pool block id — irrelevant to byte parity, matters only for block-id translation.
+- **Layout parity**: verified at source level 2026-07-06 against vLLM revision `cdab28319` — byte-for-byte MATCH on everything device-side, because our kernels are ports of vLLM's: 656 B/token field order `[512 fp8 NoPE][4×f32 scale, ÷448, group=128][64×bf16 RoPE]` (vLLM `cache_kernels.cu:447-547` ↔ ours `glm52_mla_assembly.cu:33-34`), index-K block-split `[64×128 fp8][64×4 B f32 scale]` (vLLM `cache_kernels.cu:550-607` ↔ ours `glm52_indexer.cu:69-87`, which cites the vLLM kernel by name), page=64, layer-outermost page-contiguous arenas both sides. The subsequent aligned/tail e2e gates completed the planned byte-layout validation. One structural note: vLLM keeps MLA and indexer caches as separate KV groups; we index both off one pool block id — irrelevant to byte parity, matters only for block-id translation.
+
+For full-attention Qwen3, the supported normal producer is the gated vLLM 0.23.0 default NHD configuration: PR #42095 changed its shape from KV-first `(2, blocks, ...)` to block-first `(blocks, 2, ...)`, and Pegaflow maps each block to the same `[K|V]` copy unit OpenInfer restores. Other versions/layout modes are outside this PR rather than handled through #382.
 
 ### Model-based speculative state at the P/D boundary (vLLM audit, 2026-07-10)
 
@@ -48,7 +50,7 @@ The original sealed-block protocol capped reuse at `cacheable = (prompt−1)/64`
 
 ## Pitfalls pinned during the survey
 
-- pegaflow v0.22.6 **lacks the `*_inproc` and `_strided` APIs** this integration uses; inspect the pinned v0.23.2 revision `d46fd16` instead. Do not advance to #395 alone: GLM's page-first payload is single-segment, but the stacked Qwen3 path requires #382 to load split host K/V into a contiguous device page safely.
+- pegaflow v0.22.6 **lacks the `*_inproc` and `_strided` APIs** this integration uses; inspect the pinned v0.23.3 revision `1473c53` instead. The supported normal producers are Qwen3 vLLM 0.23.0 default NHD and GLM vLLM 0.24.0; neither needs #382.
 - The PyO3 package is a gRPC client — reference contract only, not our path.
 - vLLM connector requires `storage_offset()==0` and registers CUDA-IPC handles; our in-process path passes raw device pointers and skips IPC entirely.
 

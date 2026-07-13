@@ -8,7 +8,7 @@
 
 - **Read**:
   - `docs/index.md` — routed the investigation to the GLM5.2 model domain.
-  - `docs/models/glm52/pegaflow-offload-pd.md` — OpenInfer M2 currently plans to transfer target MLA + index-K arenas from vLLM prefill to OpenInfer decode; partial tail blocks remain local work on D.
+  - `docs/models/glm52/pegaflow-offload-pd.md` — OpenInfer M2 transfers target MLA + index-K arenas from vLLM prefill to OpenInfer decode; #395/#657 additionally restore the partial target tail so D admits at `suffix == 1`.
   - `docs/models/glm52/dspark-mtp.md` — OpenInfer DSpark owns separate draft KV and consumes five target aux-hidden captures; the current prefix-hit boundary is unsupported.
   - `docs/models/glm52/serving-status.md` — DSpark × prefix cache is the ordered non-perf follow-up after P/D M2.
 - **Relevant history**:
@@ -43,7 +43,7 @@
 
 For any model-based speculator with its own attention cache, vLLM's answer is state transfer, not drafter recovery. Its logical checkpoint contains all attention cache groups owned by the request: target state and the speculative model's K/V. P must load and execute the same speculator so those draft pages exist before connector finalization. Transient draft tokens and auxiliary hidden tensors are not handed off. Lookup-only methods such as ngram/suffix have no drafter KV to transfer; the rule is about state ownership, not the marketing name of the speculation algorithm.
 
-On vLLM NIXL's full-prompt-hit path, D still performs one target forward at the boundary. This is the ordinary full-cache-hit rule needed to regenerate logits from the last prompt token; it does not rebuild draft history. Running one more target step cannot recover old aux hidden from target KV, because the target KV representation has discarded those intermediate residual streams. OpenInfer's current sealed-block PegaFlow protocol instead leaves a 1–64-token suffix for D to prefill locally.
+On vLLM NIXL's full-prompt-hit path, D still performs one target forward at the boundary. This is the ordinary full-cache-hit rule needed to regenerate logits from the last prompt token; it does not rebuild draft history. Running one more target step cannot recover old aux hidden from target KV, because the target KV representation has discarded those intermediate residual streams. OpenInfer #657 reaches the same one-token target boundary by restoring the partial tail and forwarding P's first token; it still does not reconstruct historical draft KV.
 
 P and D therefore need compatible state ownership, not necessarily identical proposal widths. Static inspection of Qwen3.5 MTP shows that P-without-MTP and D-with-MTP have different KV region counts and fail NIXL handshake validation. Falling back to D-side recomputation is possible only when configured explicitly, and turns that request back into local prefill.
 
@@ -57,6 +57,6 @@ For OpenInfer, “give DSpark bad KV and let verification reject it” is the wr
 
 ### Follow-up gates
 
-1. Target-only M2: hash compatibility plus byte parity for the 99 target arenas.
-2. #590 cold-start probe: explicit empty draft cache, absolute positions preserved, current 1–64-token uncached suffix prefill, then acceptance split into first round and steady state versus full-context standalone.
+1. Target-only M2: complete in #657 — hash compatibility, byte parity, and partial-tail restore for the 99 target arenas.
+2. #590 cold-start probe: explicit empty draft cache after the full target prompt (including the restored tail), absolute positions preserved from the boundary token, then acceptance split into first round and steady state versus full-context standalone.
 3. Only if that loss is unacceptable: define a draft-KV namespace/layout contract and byte-compare vLLM P pages with OpenInfer D pages before measuring the 2.52× payload path.

@@ -6,18 +6,19 @@ edition = "2024"
 
 [dependencies]
 # Embedded in-process: pegaflow-core is the host/SSD/RDMA KV offload tier.
-# Pinned to the upstream master rev that landed PR #381 (metaserver flush
-# barrier + embeddable P2pTransferService + router max_completion_tokens cap)
+# Pinned to the upstream master rev that landed PR #395 (P-side partial-tail
+# save + first-token router forwarding), including PR #381's metaserver flush
+# barrier and embeddable P2pTransferService. The supported producer versions
+# and default layouts are pinned in the P/D deployment docs; they register the
+# same block-local bytes OpenInfer restores, so no cross-layout conversion is
+# required.
 # per the workflow in docs/subsystems/runtime/pegaflow-offload-integration.md
 # §5.2. default-features=false drops its `cuda-12` (which would pull a
 # clashing cudarc/cuda-12080 selector); the workspace cudarc already provides
 # cuda-12090 + nvrtc + runtime, which covers pegaflow-core and
 # pegaflow-transfer. `rdma` enables pegaflow-transfer: cross-node block fetch
 # (RDMA READ) + MetaServer discovery — the P/D disaggregation data plane.
-# Do not advance to the merged PR #395 revision alone: this branch is stacked
-# on OpenInfer #540, whose split-host K/V restore also requires Pegaflow #382.
-# The next pin must be a merged master revision containing both changes.
-pegaflow-core = { git = "https://github.com/novitalabs/pegaflow.git", rev = "d46fd1653154f3f895ff23e995b6efbf4e3e1e9a", default-features = false, features = ["rdma"] }
+pegaflow-core = { git = "https://github.com/novitalabs/pegaflow.git", rev = "1473c5355d879b4fea23101760cb2a0074642ada", default-features = false, features = ["rdma"] }
 openinfer-kv-cache = { workspace = true }
 cudarc = { workspace = true }
 half = { workspace = true }
