@@ -101,11 +101,11 @@ mod tests {
             num_attention_heads: 32,
             num_key_value_heads: 8,
             head_dim: 128,
-            vocab_size: 151936,
-            draft_vocab_size: 32000,
+            vocab_size: 151_936,
+            draft_vocab_size: 32_000,
             rms_norm_eps: 1e-6,
             rope_theta: 1e6,
-            max_position_embeddings: 40960,
+            max_position_embeddings: 40_960,
         }
     }
 

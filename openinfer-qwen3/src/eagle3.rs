@@ -40,18 +40,6 @@ pub(crate) fn aux_hidden_state_layers(target_num_layers: usize) -> Result<[usize
     Ok([low, mid, high])
 }
 
-#[cfg(test)]
-mod tests {
-    use super::aux_hidden_state_layers;
-
-    #[test]
-    fn aux_layers_reject_tiny_target() {
-        // Too few layers to place a strictly-increasing low/mid/high triple.
-        assert!(aux_hidden_state_layers(6).is_err());
-        assert!(aux_hidden_state_layers(4).is_err());
-    }
-}
-
 /// The single EAGLE-3 decoder block (`midlayer`).
 ///
 /// Differs from the Qwen3 target's [`crate::weights::TransformerBlock`] in two
@@ -98,4 +86,16 @@ pub(crate) struct Eagle3DraftModel {
     pub(crate) t2d: Vec<bool>,
     pub(crate) cos_cache: DeviceVec,
     pub(crate) sin_cache: DeviceVec,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::aux_hidden_state_layers;
+
+    #[test]
+    fn aux_layers_reject_tiny_target() {
+        // Too few layers to place a strictly-increasing low/mid/high triple.
+        assert!(aux_hidden_state_layers(6).is_err());
+        assert!(aux_hidden_state_layers(4).is_err());
+    }
 }
