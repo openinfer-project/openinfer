@@ -1,6 +1,6 @@
 # Qwen3.5 TP Implementation Record
 
-> **TL;DR:** Qwen3.5 TP Phase 1 is implemented as correctness-first eager dense TP: TP2 worker/scheduler execution, short/long HF logits gates, scheduler e2e, and real OpenAI-compatible HTTP serving smoke pass. Remaining TP work is tracked as follow-up, not a Phase 1 claim.
+> **TL;DR:** Qwen3.5 TP Phase 1 is implemented as correctness-first eager dense TP: TP2 worker/scheduler execution, short/long HF logits gates, scheduler e2e, and real OpenAI-compatible HTTP serving smoke pass. The branch is rebased onto current `main` with the newer engine, sampling, config, and golden-fixture contracts; remaining TP work is tracked as follow-up, not a Phase 1 claim.
 >
 > **Last touched:** 2026-07
 
@@ -78,6 +78,19 @@ NCCL comms are initialized inside rank worker threads after each worker binds it
 
 This matches the design contract: TP workers own rank-local CUDA/NCCL execution resources.
 
+### Current-main API compatibility
+
+Rebasing Phase 1 onto current `main` required preserving the TP execution boundary while adopting newer shared contracts:
+
+- Hybrid batch decode now builds `Vec<&mut RecurrentState>` from graph-owned slots before entering the common linear-attention helper. This keeps request state in place while satisfying the helper's mutable-reference slice contract.
+- `openinfer_sample::select_batch` now requires request-local sampling steps. Phase 1 TP still samples one row at a time and has no request-local sampling counter, so it passes step `0` and retains its existing per-row `sample_seed` offset. Do not substitute batch row indices for request-local steps: that would make seeded output depend on batch composition.
+- Qwen3.5 launch and tests use the current `EngineLoadOptions` surface; the removed `enable_prefill_profile` field is no longer supplied.
+- TP scheduler tests explicitly set the newer `GenerateRequest::data_parallel_rank` field to `None` because Phase 1 is TP-only, not DP.
+- Synthetic TP config/loader fixtures include `tie_word_embeddings`, matching the current `Config35` contract without changing production config loading.
+- TP2 short/long HF gates use `Golden::load_for(model_path, long)` and pass the complete `Golden` to metadata validation, matching the model-selected fixture flow used by TP1.
+
+These are compatibility changes, not extensions of Phase 1 scope. In particular, full seeded-sampling replay under TP should add a request-local completion counter rather than overloading batch position.
+
 ## Validation Evidence
 
 Phase 1 acceptance coverage:
@@ -106,6 +119,10 @@ Phase 1 acceptance coverage:
 - TP1 regression gates pass after the TP2 additions:
   - TP1 short/long HF logits gates
   - TP1 scheduler e2e
+- Current-main rebase verification passes:
+  - formatting check
+  - Qwen3.5 release compilation for all test targets
+  - `openinfer-server` release compilation with only the `qwen35-4b` model feature
 
 Known validation constraints:
 

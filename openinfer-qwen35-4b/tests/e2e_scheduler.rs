@@ -573,7 +573,6 @@ fn test_e2e_qwen35_scheduler_tp2() {
         Path::new(&model_path),
         EngineLoadOptions {
             enable_cuda_graph: false,
-            enable_prefill_profile: false,
             device_ordinals: common::tp2_device_ordinals(),
             seed: 42,
             ..EngineLoadOptions::default()

@@ -845,8 +845,10 @@ fn pega_logprobs_match_hf_golden_within_qwen35_tolerance_tp2() {
     let Some(model_path) = model_path_or_skip() else {
         return;
     };
-    let golden = Golden::load();
-    if !check_fixture_metadata(&model_path, &golden.metadata) {
+    let Some(golden) = Golden::load_for(&model_path, false) else {
+        return;
+    };
+    if !check_fixture_metadata(&model_path, &golden) {
         return;
     }
     report_fixture_shape(&golden);
@@ -872,8 +874,10 @@ fn pega_logprobs_match_hf_long_golden_within_qwen35_tolerance_tp2() {
     let Some(model_path) = model_path_or_skip() else {
         return;
     };
-    let golden = Golden::load_path(LONG_GOLDEN);
-    if !check_fixture_metadata(&model_path, &golden.metadata) {
+    let Some(golden) = Golden::load_for(&model_path, true) else {
+        return;
+    };
+    if !check_fixture_metadata(&model_path, &golden) {
         return;
     }
     report_fixture_shape(&golden);

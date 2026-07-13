@@ -63,7 +63,6 @@ fn tp_engine_rejects_cuda_graph_before_model_load() {
         Path::new("unused"),
         EngineLoadOptions {
             enable_cuda_graph: true,
-            enable_prefill_profile: false,
             device_ordinals: vec![0, 1],
             parallel_config: None,
             ep_backend: EpBackend::Nccl,
@@ -91,6 +90,7 @@ fn tp2_scheduler_chunked_prefill_then_decode_smoke() {
         .submit(SchedulerRequest {
             request_id: Some("tp2-scheduler-smoke".to_string()),
             queued_at_unix_s: None,
+            data_parallel_rank: None,
             prompt_tokens: vec![151_646, 9707],
             params: SamplingParams {
                 ignore_eos: true,

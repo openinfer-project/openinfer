@@ -457,8 +457,16 @@ impl Qwen35Model {
             self.config.num_key_value_heads,
             self.config.head_dim
         );
-        let slot_states = &mut graph_state.slot_states;
-        self.batch_decode_batched_hybrid_kernels(kv_buffer, &layout, &plan, bs, slot_states, bufs)
+        let mut slot_states: Vec<&mut RecurrentState> =
+            graph_state.slot_states.iter_mut().collect();
+        self.batch_decode_batched_hybrid_kernels(
+            kv_buffer,
+            &layout,
+            &plan,
+            bs,
+            &mut slot_states,
+            bufs,
+        )
     }
 
     fn batch_decode_kernels_graph(
@@ -567,7 +575,7 @@ impl Qwen35Model {
         layout: &KvLayout,
         plan: &ops::PrefillPagedPlan,
         bs: usize,
-        slot_states: &mut [RecurrentState],
+        slot_states: &mut [&mut RecurrentState],
         bufs: &mut BatchDecodeBuffers35,
     ) -> Result<()> {
         let eps = self.config.rms_norm_eps;

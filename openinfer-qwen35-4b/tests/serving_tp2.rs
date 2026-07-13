@@ -59,7 +59,6 @@ async fn spawn_ready_server(
             &engine_model_path,
             EngineLoadOptions {
                 enable_cuda_graph: false,
-                enable_prefill_profile: false,
                 device_ordinals,
                 seed: 42,
                 ..EngineLoadOptions::default()
@@ -183,7 +182,6 @@ fn assert_invalid_cuda_graph_tp_startup_fails(model_path: &str) -> Result<()> {
         Path::new(model_path),
         EngineLoadOptions {
             enable_cuda_graph: true,
-            enable_prefill_profile: false,
             device_ordinals: common::tp2_device_ordinals(),
             seed: 42,
             ..EngineLoadOptions::default()

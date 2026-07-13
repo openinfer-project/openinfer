@@ -624,6 +624,7 @@ impl TpWorkerState {
             self.model.device_ctx(),
             logits,
             &params_refs,
+            &[0],
             sample_seed,
             &mut self.sample_scratch,
         )?;
@@ -693,6 +694,7 @@ impl TpWorkerState {
                     self.model.device_ctx(),
                     &self.decode_buffers.logits,
                     &params_refs,
+                    &[0],
                     sample_seed.wrapping_add(row_idx as u64),
                     &mut self.sample_scratch,
                 )?;

@@ -320,7 +320,7 @@ impl TensorParallelConfig {
 }
 
 #[cfg(test)]
-mod tests {
+mod tp_tests {
     use super::*;
 
     fn test_config() -> Config35 {
@@ -342,6 +342,7 @@ mod tests {
             rope_theta: 10_000.0,
             rotary_dim: 64,
             max_position_embeddings: 262_144,
+            tie_word_embeddings: true,
             layer_types: vec![LayerType::LinearAttention; 32],
         }
     }
