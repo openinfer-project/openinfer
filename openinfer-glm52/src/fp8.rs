@@ -15,7 +15,8 @@ use half::bf16;
 
 use openinfer_kernels::ops::{
     GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW, glm52_fp8_weight_only_gemv_launch,
-    glm52_fp8_weight_only_gemv_pair_launch, glm52_silu_and_mul_bf16_launch,
+    glm52_fp8_weight_only_gemv_pair_launch, glm52_fp8_weight_only_gemv_partials_launch,
+    glm52_gemv_reduce_silu_mul_launch, glm52_silu_and_mul_bf16_launch,
 };
 use openinfer_kernels::tensor::DeviceContext;
 
@@ -356,16 +357,34 @@ pub(crate) fn fp8_mlp_into(
         "GLM5.2 fp8_mlp scratch sized for intermediate {} but weights have {intermediate}",
         s.intermediate
     );
-    fp8_linear_into(
+    // The gate|up projection stops at its f32 k-slice partials when the
+    // (rows, shape) routes to the mma path, and the SwiGLU absorbs the
+    // fixed-order reduce (one launch instead of two, bit-identical); the
+    // register-tile rows keep the bf16 GEMV -> standalone SwiGLU pair.
+    let ksplit = glm52_fp8_weight_only_gemv_partials_launch(
         ctx,
-        gate_up,
         s.rows,
+        gate_up.n,
+        gate_up.k,
         input,
-        Some(&mut s.gemv_partial),
+        &gate_up.weight,
+        &gate_up.scale,
+        &mut s.gemv_partial,
         &mut s.gate_up,
     )?;
-    // bf16 SwiGLU (no route weight, no activation quant) -> bf16 down input.
-    glm52_silu_and_mul_bf16_launch(ctx, s.rows, intermediate, &s.gate_up, &mut s.silu_out)?;
+    if ksplit == 0 {
+        // bf16 SwiGLU (no route weight, no activation quant) -> bf16 down input.
+        glm52_silu_and_mul_bf16_launch(ctx, s.rows, intermediate, &s.gate_up, &mut s.silu_out)?;
+    } else {
+        glm52_gemv_reduce_silu_mul_launch(
+            ctx,
+            s.rows,
+            intermediate,
+            ksplit,
+            &s.gemv_partial,
+            &mut s.silu_out,
+        )?;
+    }
     fp8_linear_into(
         ctx,
         down,

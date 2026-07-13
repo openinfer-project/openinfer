@@ -290,6 +290,29 @@ unsafe extern "C" {
         inter: i32,
         stream: CUstream,
     ) -> CUresult;
+
+    pub fn glm52_fp8_weight_only_gemv_partials_cuda(
+        activation: *const Half,
+        weight: *const u8,
+        weight_scale: *const f32,
+        out: *mut Half,
+        scratch: *mut f32,
+        scratch_floats: usize,
+        batch: i32,
+        n: i32,
+        k: i32,
+        stream: CUstream,
+        ksplit_out: *mut i32,
+    ) -> CUresult;
+
+    pub fn glm52_gemv_reduce_silu_mul_cuda(
+        partial: *const f32,
+        output: *mut Half,
+        rows: i32,
+        inter: i32,
+        ksplit: i32,
+        stream: CUstream,
+    ) -> CUresult;
 }
 
 macro_rules! declare_tp_ffi {
