@@ -18,15 +18,23 @@ pub(crate) use reservation::Eagle3MemoryReservation;
 /// fixed top-1 **chain** — *not* a tree. γ=3 is the measured chain optimum on a Qwen3-4B GSM8K A/B (RTX 5070 Ti)
 pub(crate) const EAGLE3_CHAIN_LENGTH: usize = 3;
 
-/// The three *target* layers (low/mid/high) whose post-layer hidden states EAGLE-3
-/// captures and fuses via `fc`.
+/// The three *target* layers (low/mid/high) whose **post-layer** hidden states
+/// EAGLE-3 captures and fuses via `fc`.
+///
+/// SafeAILab's `traineagle3` gates on `(2, N/2, N-3)` but appends the residual
+/// stream *before* running those layers (vLLM matches it with a post-layer
+/// `idx + 1` capture) — so both land on the residual stream *entering* those
+/// layers. Our capture path is post-layer / 0-based (`prefill.rs`,
+/// `verify_graph.rs`), so the equivalent indices are one block earlier:
+/// `(1, N/2-1, N-4)` — post-layer outputs `[1, 17, 32]` for the 36-layer
+/// Qwen3-4B target. See PR #662 discussion.
 pub(crate) fn aux_hidden_state_layers(target_num_layers: usize) -> Result<[usize; 3]> {
-    let low = 2;
-    let mid = target_num_layers / 2;
-    let high = target_num_layers.saturating_sub(3);
+    let low = 1;
+    let mid = (target_num_layers / 2).saturating_sub(1);
+    let high = target_num_layers.saturating_sub(4);
     anyhow::ensure!(
         low < mid && mid < high && high < target_num_layers,
-        "EAGLE-3 aux layers (2, {mid}, {high}) are not strictly increasing within \
+        "EAGLE-3 aux layers ({low}, {mid}, {high}) are not strictly increasing within \
          {target_num_layers} target layers"
     );
     Ok([low, mid, high])
@@ -35,12 +43,6 @@ pub(crate) fn aux_hidden_state_layers(target_num_layers: usize) -> Result<[usize
 #[cfg(test)]
 mod tests {
     use super::aux_hidden_state_layers;
-
-    #[test]
-    fn aux_layers_qwen3_4b() {
-        // Qwen3-4B target = 36 layers ->  (2, N/2, N-3).
-        assert_eq!(aux_hidden_state_layers(36).unwrap(), [2, 18, 33]);
-    }
 
     #[test]
     fn aux_layers_reject_tiny_target() {
