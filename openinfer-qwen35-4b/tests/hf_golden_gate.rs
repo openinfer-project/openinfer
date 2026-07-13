@@ -654,7 +654,7 @@ fn report_and_assert(label: &str, stats: &Stats) {
 }
 
 fn build_executor(model_path: &str) -> Qwen35Executor {
-    Qwen35Executor::from_runtime_with_capacity(model_path, true, &[0], MAX_EXECUTOR_BATCH)
+    Qwen35Executor::from_runtime(model_path, 0, MAX_EXECUTOR_BATCH)
         .expect("build Qwen3.5 logits executor")
 }
 

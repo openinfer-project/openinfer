@@ -29,7 +29,8 @@ pub(crate) struct Args {
     pub port: u16,
 
     /// Enable CUDA Graph capture/replay on decode path (`--cuda-graph=false` to
-    /// disable). Rejected for GLM5.2; forced off in Qwen3 LoRA mode.
+    /// disable). Rejected for GLM5.2; forced off in Qwen3 LoRA mode; Qwen3.5
+    /// always captures and rejects `false`.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub cuda_graph: bool,
 
@@ -180,6 +181,11 @@ pub(crate) struct Args {
     /// their own crate defaults.
     #[arg(long)]
     pub max_prefill_tokens: Option<usize>,
+
+    /// Decode-batch capacity, one of 1/2/4/8/16/32/64; lower it to fit
+    /// reduced-memory GPUs. Qwen3.5 only; defaults to 64.
+    #[arg(long)]
+    pub max_batch: Option<usize>,
 
     /// Per-request context cap: prompt + max_tokens - 1 must fit. GLM5.2 only;
     /// when omitted, GLM5.2 sizes it from post-weight-load free VRAM.
@@ -356,7 +362,12 @@ fn consumed_args(model_type: ModelType) -> &'static [&'static str] {
             "dflash_draft_model_path",
         ],
         #[cfg(feature = "qwen35-4b")]
-        ModelType::Qwen35 => &["device_ordinal", "cuda_graph", "max_prefill_tokens"],
+        ModelType::Qwen35 => &[
+            "device_ordinal",
+            "cuda_graph",
+            "max_prefill_tokens",
+            "max_batch",
+        ],
     }
 }
 

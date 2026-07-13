@@ -37,7 +37,7 @@ fn model_path_or_skip() -> Option<String> {
 }
 
 fn start_engine(model_path: &str, max_prefill_tokens: usize) -> EngineHandle {
-    openinfer_qwen35_4b::start_engine_with_capacity(
+    openinfer_qwen35_4b::start_engine(
         Path::new(model_path),
         EngineLoadOptions {
             enable_cuda_graph: true,

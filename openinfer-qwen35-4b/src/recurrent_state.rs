@@ -27,16 +27,20 @@ pub(crate) struct RecurrentState {
     pub(crate) seq_len: usize,
 }
 
+/// Per-layer element counts shared by allocation and reservation:
+/// (linear layers, f32 state elements, bf16 conv elements).
+fn per_layer_dims(config: &Config35) -> (usize, usize, usize) {
+    let num_linear_layers = config.num_hidden_layers - config.num_full_attention_layers();
+    let state_size =
+        config.linear_num_value_heads * config.linear_key_head_dim * config.linear_value_head_dim;
+    let conv_state_size = config.linear_attn_qkv_dim() * (config.linear_conv_kernel_dim - 1);
+    (num_linear_layers, state_size, conv_state_size)
+}
+
 impl RecurrentState {
     /// Allocate zeroed recurrent state for all linear attention layers.
     pub(crate) fn new(ctx: &DeviceContext, config: &Config35) -> Result<Self> {
-        let num_linear_layers = config.num_hidden_layers - config.num_full_attention_layers();
-
-        let state_size = config.linear_num_value_heads
-            * config.linear_key_head_dim
-            * config.linear_value_head_dim;
-        let qkv_dim = config.linear_attn_qkv_dim();
-        let conv_state_size = qkv_dim * (config.linear_conv_kernel_dim - 1);
+        let (num_linear_layers, state_size, conv_state_size) = per_layer_dims(config);
 
         let mut layers = Vec::with_capacity(num_linear_layers);
         for _ in 0..num_linear_layers {
@@ -52,4 +56,12 @@ impl RecurrentState {
 
         Ok(Self { layers, seq_len: 0 })
     }
+}
+
+/// Device bytes of one request's recurrent state.
+pub(crate) fn bytes_per_request(config: &Config35) -> usize {
+    let (num_linear_layers, state_size, conv_state_size) = per_layer_dims(config);
+    num_linear_layers
+        * (state_size * std::mem::size_of::<f32>()
+            + conv_state_size * std::mem::size_of::<half::bf16>())
 }

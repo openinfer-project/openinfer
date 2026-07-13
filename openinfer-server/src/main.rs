@@ -8,6 +8,8 @@ use log::info;
 use openinfer::logging;
 use openinfer::server_engine::{ModelType, detect_model_type};
 use openinfer_core::engine::EngineHandle;
+#[cfg(feature = "qwen35-4b")]
+use openinfer_core::engine::EngineLoadOptions;
 #[cfg(feature = "qwen3")]
 use openinfer_qwen3::{Qwen3LaunchOptions, Qwen3LoraOptions, Qwen3OffloadOptions};
 
@@ -301,10 +303,16 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
             .context("failed to start Qwen3 engine")?
         }
         #[cfg(feature = "qwen35-4b")]
-        ModelType::Qwen35 => openinfer_qwen35_4b::launch(
+        ModelType::Qwen35 => openinfer_qwen35_4b::start_engine(
             &args.model_path,
-            args.device_ordinal,
-            args.cuda_graph,
+            EngineLoadOptions {
+                enable_cuda_graph: args.cuda_graph,
+                device_ordinals: vec![args.device_ordinal],
+                seed: 42,
+                ..EngineLoadOptions::default()
+            },
+            args.max_batch
+                .unwrap_or(openinfer_qwen35_4b::runtime::MAX_BATCH),
             args.max_prefill_tokens
                 .unwrap_or(openinfer_qwen35_4b::DEFAULT_MAX_PREFILL_TOKENS),
         )

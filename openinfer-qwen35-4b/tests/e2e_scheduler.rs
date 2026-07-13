@@ -9,7 +9,8 @@ use log::info;
 
 use openinfer_core::engine::FinishReason;
 use openinfer_core::engine::{
-    EngineHandle, GenerateRequest, TokenEvent, TokenLogprob, TokenSink, TokenStreamReceiver,
+    EngineHandle, EngineLoadOptions, GenerateRequest, TokenEvent, TokenLogprob, TokenSink,
+    TokenStreamReceiver,
 };
 use openinfer_core::sampler::SamplingParams;
 use vllm_text::tokenizer::DynTokenizer;
@@ -329,14 +330,15 @@ fn test_e2e_qwen35_scheduler() {
 
     info!("Loading Qwen3.5 model for scheduler test...");
     let start = Instant::now();
-    let model =
-        openinfer_qwen35_4b::runtime::Qwen35Model::from_safetensors_with_options(&model_path, true)
-            .expect("Failed to load model");
     let tokenizer = common::load_tokenizer(&model_path);
-    // Use reduced batch capacity (8) to fit on 16GB GPUs alongside the model.
-    let handle = openinfer_qwen35_4b::runtime::start_with_capacity(
-        model,
-        42,
+    let handle = openinfer_qwen35_4b::start_engine(
+        std::path::Path::new(&model_path),
+        EngineLoadOptions {
+            enable_cuda_graph: true,
+            device_ordinals: vec![0],
+            seed: 42,
+            ..EngineLoadOptions::default()
+        },
         8,
         openinfer_qwen35_4b::DEFAULT_MAX_PREFILL_TOKENS,
     )

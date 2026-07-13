@@ -81,21 +81,27 @@ pub struct Qwen35Model {
     pub(super) sin_cache: DeviceVec,
     /// Shared paged KV pool for full-attention layers.
     pub(super) kv_pool: openinfer_core::kv_pool::KvPool,
+    /// Decode-slot count the recurrent-state reserve was sized for.
+    pub(super) reserved_decode_slots: usize,
 }
 
-impl Qwen35Model {
-    pub fn from_safetensors_with_options(
-        model_path: &str,
-        enable_cuda_graph: bool,
-    ) -> Result<Self> {
-        Self::from_safetensors_with_device_options(model_path, enable_cuda_graph, 0)
-    }
+/// Graph slot state + one in-flight prefill transient per decode slot.
+const STATES_PER_DECODE_SLOT: usize = 2;
+/// KV-pool floor, also the low-memory fail-fast threshold.
+const MIN_KV_PAGES: usize = 64;
 
-    pub fn from_safetensors_with_device_options(
+impl Qwen35Model {
+    /// `max_batch` must be a decode bucket ({1,2,4,8,16,32,64}).
+    pub fn from_safetensors(
         model_path: &str,
-        enable_cuda_graph: bool,
         device_ordinal: usize,
+        max_batch: usize,
     ) -> Result<Self> {
+        anyhow::ensure!(
+            super::batch_decode_graph::BATCH_BUCKETS.contains(&max_batch),
+            "decode batch capacity must be one of {:?}, got {max_batch}",
+            super::batch_decode_graph::BATCH_BUCKETS,
+        );
         info!("Loading Qwen3.5 model from: {}", model_path);
         debug!("Initializing GPU");
         let ctx = DeviceContext::new_with_device(device_ordinal)?;
@@ -342,12 +348,6 @@ impl Qwen35Model {
             "GPU model loaded in {:.0}ms",
             t_gpu.elapsed().as_secs_f64() * 1e3
         );
-        if enable_cuda_graph {
-            debug!("Decode path CUDA Graph is enabled");
-        } else {
-            debug!("Decode path CUDA Graph is disabled");
-        }
-
         // Paged KV pool for the 8 full-attention layers.
         let page_size = 16usize;
         let num_full_layers = config.num_full_attention_layers();
@@ -365,13 +365,28 @@ impl Qwen35Model {
         let max_prefill_len = super::prefill::SCRATCH_ESTIMATE_SEQ;
         let scratch_reserve =
             super::prefill_buffers::GdrChunkwiseScratch35::estimate_bytes(&config, max_prefill_len);
-        let available = free_bytes.saturating_sub(scratch_reserve);
+        let recurrent_reserve =
+            STATES_PER_DECODE_SLOT * max_batch * super::recurrent_state::bytes_per_request(&config);
+        let min_kv_bytes = MIN_KV_PAGES * bytes_per_page;
+        anyhow::ensure!(
+            free_bytes >= scratch_reserve + recurrent_reserve + min_kv_bytes,
+            "insufficient device memory for Qwen3.5: {} MB free, but prefill scratch needs {} MB, \
+             recurrent state needs {} MB ({STATES_PER_DECODE_SLOT} x {max_batch} decode slots), \
+             and the minimal KV pool needs {} MB; lower the decode batch capacity (--max-batch) \
+             or use a smaller model",
+            free_bytes / (1024 * 1024),
+            scratch_reserve / (1024 * 1024),
+            recurrent_reserve / (1024 * 1024),
+            min_kv_bytes / (1024 * 1024),
+        );
+        let available = free_bytes - scratch_reserve - recurrent_reserve;
         let kv_budget = (available as f64 * 0.85) as usize;
-        let num_pages = (kv_budget / bytes_per_page).max(64);
+        let num_pages = (kv_budget / bytes_per_page).max(MIN_KV_PAGES);
         let kv_mb = num_pages * bytes_per_page / (1024 * 1024);
         let scratch_mb = scratch_reserve / (1024 * 1024);
+        let recurrent_mb = recurrent_reserve / (1024 * 1024);
         info!(
-            "Qwen3.5 KV cache: {num_pages} pages ({kv_mb} MB), prefill scratch reserve: {scratch_mb} MB, {:.0}% of {:.0} MB free",
+            "Qwen3.5 KV cache: {num_pages} pages ({kv_mb} MB), prefill scratch reserve: {scratch_mb} MB, recurrent-state reserve: {recurrent_mb} MB ({STATES_PER_DECODE_SLOT} x {max_batch} slots), {:.0}% of {:.0} MB free",
             kv_budget as f64 / free_bytes as f64 * 100.0,
             free_bytes as f64 / 1024.0 / 1024.0
         );
@@ -394,6 +409,7 @@ impl Qwen35Model {
             cos_cache,
             sin_cache,
             kv_pool,
+            reserved_decode_slots: max_batch,
         })
     }
 
@@ -517,7 +533,9 @@ impl Qwen35Model {
 
         for &n in super::batch_decode_graph::BATCH_BUCKETS
             .iter()
-            .filter(|&&bucket| bucket <= crate::ops::GEMM_LT_MAX_N)
+            .filter(|&&bucket| {
+                bucket <= crate::ops::GEMM_LT_MAX_N && bucket <= self.reserved_decode_slots
+            })
         {
             tune_if_nonempty(ctx, &full_q_samples, full_q, n)?;
             tune_if_nonempty(ctx, &full_kv_samples, full_kv, n)?;
@@ -533,16 +551,15 @@ impl Qwen35Model {
         Ok(())
     }
 
-    /// Create a CUDA Graph batch decode state with a custom slot capacity.
-    pub(crate) fn create_batch_decode_graph_state_with_capacity(
+    /// Create the CUDA Graph batch decode state at the loaded capacity.
+    pub(crate) fn create_batch_decode_graph_state(
         &self,
-        max_batch: usize,
     ) -> anyhow::Result<super::batch_decode_graph::BatchDecodeGraphState> {
         super::batch_decode_graph::BatchDecodeGraphState::with_capacity(
             &self.ctx,
             &self.config,
             &self.kv_pool,
-            max_batch,
+            self.reserved_decode_slots,
         )
     }
 

@@ -207,7 +207,7 @@ fn main() -> Result<()> {
                 .max_prefill_tokens
                 .filter(|&v| v > 0)
                 .unwrap_or(openinfer_qwen35_4b::DEFAULT_MAX_PREFILL_TOKENS);
-            let handle = openinfer_qwen35_4b::start_engine_with_capacity(
+            let handle = openinfer_qwen35_4b::start_engine(
                 Path::new(&cli.model_path),
                 EngineLoadOptions {
                     enable_cuda_graph: cli.cuda_graph,

@@ -246,9 +246,9 @@ impl Qwen35Model {
         anyhow::ensure!(bs > 0, "batch_decode_graph requires at least one request");
         anyhow::ensure!(bs == kv_states.len(), "token_ids / kv_states len mismatch");
         anyhow::ensure!(
-            bs <= super::batch_decode_graph::MAX_BATCH,
-            "batch size {bs} exceeds MAX_BATCH={}",
-            super::batch_decode_graph::MAX_BATCH
+            bs <= graph_state.slot_states.len(),
+            "batch size {bs} exceeds decode capacity {}",
+            graph_state.slot_states.len()
         );
 
         if !self.config.decode_group_is_compiled() {
@@ -325,22 +325,6 @@ impl Qwen35Model {
         graph_state: &mut BatchDecodeGraphState,
     ) -> Result<()> {
         let bs = token_ids.len();
-        anyhow::ensure!(
-            bs > 0,
-            "batch_decode_batched_hybrid requires at least one request"
-        );
-        anyhow::ensure!(
-            bs == kv_states.len(),
-            "batch_decode_batched_hybrid token_ids / kv_states len mismatch: token_ids={}, kv_states={}",
-            bs,
-            kv_states.len()
-        );
-        anyhow::ensure!(
-            bs <= graph_state.buffers.max_batch_size,
-            "batch_decode_batched_hybrid bs={bs} exceeds buffer capacity {}",
-            graph_state.buffers.max_batch_size
-        );
-
         let mut positions_i32 = Vec::with_capacity(bs);
         let mut start_positions = Vec::with_capacity(bs);
         for (i, kv) in kv_states.iter_mut().enumerate() {

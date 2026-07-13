@@ -1,8 +1,4 @@
 //! CUDA Graph state for Qwen3.5 batched decode with bucket padding.
-//!
-//! Allocates MAX_BATCH=64 recurrent-state "slots" with stable GPU addresses.
-//! Callers pack active requests into positions 0..batch_size; the graph
-//! always replays over 0..bucket_size (padded), so GPU pointers never change.
 
 use anyhow::Result;
 
@@ -35,8 +31,8 @@ pub(crate) fn bucket_for(bs: usize) -> usize {
 
 /// CUDA Graph state for Qwen3.5 batch decode.
 ///
-/// Owns MAX_BATCH pre-allocated `RecurrentState` slots and shared decode
-/// buffers. Slot `i` always maps to position `i` in the batch — when a request
+/// Owns one pre-allocated `RecurrentState` slot per decode-batch capacity
+/// and shared decode buffers. Slot `i` always maps to position `i` in the batch — when a request
 /// occupies slot `i`, its recurrent state lives at `slot_states[i]` for the
 /// entire lifetime of that request in the batch. The CUDA Graph captured for
 /// a given bucket size always accesses `slot_states[0..bucket_size]`, so GPU
@@ -52,35 +48,28 @@ pub(crate) fn bucket_for(bs: usize) -> usize {
 /// ```
 /// and update the caller's slot-to-request mapping accordingly.
 pub(crate) struct BatchDecodeGraphState {
-    /// Shared decode buffers sized to MAX_BATCH.
     pub(crate) buffers: BatchDecodeBuffers35,
-    /// Stable-address per-slot recurrent state; slot_states[i] is always at
-    /// the same GPU address regardless of which request occupies slot i.
     pub(crate) slot_states: Vec<RecurrentState>,
     /// One `CudaGraphState` per BATCH_BUCKETS entry (indexed by position).
     pub(crate) graphs: Vec<CudaGraphState>,
 }
 
 impl BatchDecodeGraphState {
-    /// Create a graph state with a custom maximum batch size.
-    ///
-    /// `max_batch` is clamped to `MAX_BATCH` (64). Use this when GPU memory is
-    /// limited and fewer concurrent decode slots are acceptable.
+    /// Create a graph state at `max_batch` slots (loader-validated bucket).
     pub(crate) fn with_capacity(
         ctx: &DeviceContext,
         config: &Config35,
         kv_pool: &KvPool,
         max_batch: usize,
     ) -> Result<Self> {
-        let cap = max_batch.min(MAX_BATCH);
         let padding_page_id = kv_pool.padding_page_id();
         let max_total_pages = kv_pool.capacity_pages();
 
         let buffers =
-            BatchDecodeBuffers35::new(ctx, config, cap, max_total_pages, padding_page_id)?;
+            BatchDecodeBuffers35::new(ctx, config, max_batch, max_total_pages, padding_page_id)?;
 
-        let mut slot_states = Vec::with_capacity(cap);
-        for _ in 0..cap {
+        let mut slot_states = Vec::with_capacity(max_batch);
+        for _ in 0..max_batch {
             slot_states.push(RecurrentState::new(ctx, config)?);
         }
 
@@ -107,7 +96,6 @@ impl BatchDecodeGraphState {
         src: &RecurrentState,
         slot_idx: usize,
     ) -> Result<()> {
-        debug_assert!(slot_idx < MAX_BATCH, "slot_idx {slot_idx} out of range");
         let dst = &mut self.slot_states[slot_idx];
         for (dst_layer, src_layer) in dst.layers.iter_mut().zip(src.layers.iter()) {
             ctx.stream

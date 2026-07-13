@@ -69,14 +69,9 @@ pub const DEFAULT_MAX_PREFILL_TOKENS: usize = 1024;
 
 // ── Entry point ─────────────────────────────────────────────────────────
 
-/// Start the Qwen3.5 scheduler thread with a custom max batch size.
-///
-/// Lower `max_batch` reduces GPU memory usage (each slot holds a full
-/// RecurrentState for all linear attention layers).
-pub fn start_with_capacity(
+pub(crate) fn start(
     model: Qwen35Model,
     seed: u64,
-    max_batch: usize,
     max_prefill_tokens: usize,
 ) -> Result<SchedulerHandle> {
     assert!(
@@ -92,7 +87,7 @@ pub fn start_with_capacity(
         total_blocks,
         block_size,
     );
-    let graph_state = model.create_batch_decode_graph_state_with_capacity(max_batch)?;
+    let graph_state = model.create_batch_decode_graph_state()?;
 
     let (submit_tx, submit_rx) = mpsc::unbounded_channel();
     let (startup_tx, startup_rx) = std_mpsc::channel();

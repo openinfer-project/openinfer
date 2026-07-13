@@ -146,7 +146,7 @@ mod tests {
         let Some(model_path) = get_model_path_or_skip() else {
             return;
         };
-        let model = Qwen35Model::from_safetensors_with_options(&model_path, true).unwrap();
+        let model = Qwen35Model::from_safetensors(&model_path, 0, 2).unwrap();
 
         let prompt_a: Vec<u32> = vec![9707];
         let prompt_b: Vec<u32> = vec![3838, 374, 220, 17, 10, 17];
@@ -168,9 +168,7 @@ mod tests {
             let first_a = first[0];
             let first_b = first[1];
 
-            let mut gs = model
-                .create_batch_decode_graph_state_with_capacity(2)
-                .unwrap();
+            let mut gs = model.create_batch_decode_graph_state().unwrap();
             gs.copy_state_to_slot(&model.ctx, &rec_states[0], 0)
                 .unwrap();
             gs.copy_state_to_slot(&model.ctx, &rec_states[1], 1)
@@ -210,9 +208,7 @@ mod tests {
                     &mut rec_refs,
                     &[],
                     &mut [],
-                    &mut model
-                        .create_batch_decode_graph_state_with_capacity(2)
-                        .unwrap(),
+                    &mut model.create_batch_decode_graph_state().unwrap(),
                 )
                 .unwrap();
             let prefill_logits = output.prefill_logits.as_ref().unwrap();
@@ -221,9 +217,7 @@ mod tests {
             let first_b = first[1];
 
             // Transfer prefill states to decode graph slots
-            let mut gs = model
-                .create_batch_decode_graph_state_with_capacity(2)
-                .unwrap();
+            let mut gs = model.create_batch_decode_graph_state().unwrap();
             gs.copy_state_to_slot(&model.ctx, &rec_states[0], 0)
                 .unwrap();
             gs.copy_state_to_slot(&model.ctx, &rec_states[1], 1)
