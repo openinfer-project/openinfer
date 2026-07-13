@@ -4,9 +4,10 @@
 > `feat/glm52-rank-host` implements the framed-TCP hub-and-spoke below verbatim
 > (`--rank-hosts host:port=N` on the coordinator, `--glm52-rank-host addr` for the dumb
 > rank-host), and on GB300 NVL72 the whole rack is ONE NVLink/IMEX domain, so the existing
-> single-LSA DeepEP shim works cross-tray with **no GIN un-baking at all** — measured 2-tray
-> EP8 (4+4 GPUs) solo base TPOT p50 23.61 / p99 24.00 ms vs 23.45 loopback (cross-tray tax
-> ≈ nil), bucket-8 c64 1837 tok/s, greedy text coherent through the serving path. EP widths
+> single-LSA DeepEP shim works cross-tray with **no GIN un-baking at all** — live-verified
+> up to **EP32 across 8 trays**: bucket-1 solo p50 is flat at ~23.3-23.6 ms from EP4 loopback
+> through EP32 (intra-rack width tax ≈ nil), bucket-8 EP32 c256 9072 tok/s, greedy text
+> coherent through the serving path (EP8). EP widths
 > {4,8,16,32,64} each get a constexpr shim instantiation + `Glm52MoeTopo` variant; the
 > weight-only expert chain is ABI-generic so a new width is a config header, not new code.
 > The GIN scale-out sections below remain the design for IB/RoCE clusters beyond one rack.
@@ -50,9 +51,22 @@ glm52_step_bench --model-path <GLM-5.2-FP8> --moe-topo ep8 \
   --rank-hosts <tray04-ip>:19000=4 --buckets 1,8 --steps 96 --warmup-steps 24
 ```
 
-Measured (GB300, weight-only chain, whole-step graphs): bucket-1 solo p50 **23.61** /
-p90 23.70 / p99 **24.00** ms (loopback EP4 baseline 23.45 — cross-tray tax ≈ nil; per-rank
-expert bytes halve and cancel the wider a2a); bucket-8 c64 p50 34.85 ms, 1837 tok/s.
+Measured (GB300, weight-only chain, whole-step graphs), same command with only
+`--moe-topo`/`--rank-hosts` widened; EP16 = 4 trays, EP32 = 8 trays:
+
+| Topo | trays | bucket-1 p50/p99 ms | bucket-8 p50/p99 ms | bucket-8 tok/s |
+|------|-------|--------------------|---------------------|----------------|
+| EP4 (loopback) | 1 | 23.45 / – | – | – |
+| EP8 | 2 | 23.58 / 23.68 | 34.85 / 71.03 | 1837 (c64) |
+| EP16 | 4 | 23.29 / 23.91 | 28.90 / 57.83 | 4430 (c128) |
+| EP32 | 8 | 23.31 / 24.29 | 28.22 / 55.46 | 9072 (c256) |
+
+Bucket-1 p50 is flat across widths — intra-rack width tax ≈ nil (per-rank expert bytes
+shrink with width and cancel the wider a2a). 32-rank DeepEP contexts come up in ~7 s.
+Two open items: bucket-8 p99 has a reproducible ~2× bimodal tail at every width ≥ EP8,
+unexplained; and the context-cap ledger doesn't count width-scaled DeepEP buffers
+(`kNumRanks × kDecodeMaxTokens`), so wide-EP runs need an explicit `--max-model-len`
+until the ledger learns about comm buffers.
 `openinfer --rank-hosts ...` serves the same topology over HTTP (greedy prose + code checked).
 
 Operational contract:
