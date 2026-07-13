@@ -60,14 +60,26 @@
   - `cargo clippy -p openinfer-sim --tests`: pass; only the existing dependency future-incompatibility note remains.
   - `cargo fmt --all --check`: pass.
 
+### Step 5: Parse dispatched SSE events
+
+- A second review found that line-oriented `data:` parsing did not prove blank-line-delimited event dispatch and missed the valid no-space form `data:[DONE]`.
+- Reworked the helper to parse blank-line-delimited SSE events, join multi-line data fields, recognize optional post-colon spaces, and reject an undispatched event at EOF.
+- Added controlled negative checks for missing separators, duplicate mixed-spacing `[DONE]`, and an unterminated final event.
+- Added `Content-Type: text/event-stream` assertions to both chat streaming requests.
+- Result:
+  - `cargo test --release -p openinfer-sim --test frontend_e2e`: pass, `13 passed; 0 failed`.
+  - `cargo clippy -p openinfer-sim --tests`: pass; only the existing dependency future-incompatibility note remains.
+  - `cargo fmt --all --check`: pass.
+
 ## Debrief
 
-- **Outcome**: Implemented the chat-completions E2E coverage and addressed PR #630's requested changes. The streaming tests now fail if content disappears, `[DONE]` is duplicated or non-terminal, or the usage-only chunk is malformed, misplaced, or miscounted.
+- **Outcome**: Implemented the chat-completions E2E coverage and addressed both PR #630 review rounds. The streaming tests now fail if content disappears, SSE events are not independently dispatched, Content-Type is wrong, `[DONE]` is duplicated or non-terminal, or the usage-only chunk is malformed, misplaced, or miscounted.
 - **Pitfalls encountered**:
   - The first `cargo test` attempt failed during git dependency fetch for `dynamo` with `unexpected return value from ssl handshake -9806`.
   - Retrying with `CARGO_NET_GIT_FETCH_WITH_CLI=true` let Cargo fetch git dependencies through the system git client and proceed.
 - **Lessons learned**:
   - For this frontend test path, `openinfer-sim` still needs chat-capable tokenizer metadata even though it does not load model weights.
   - SSE tests must preserve data-event order; filtering `[DONE]` before assertions makes terminal-contract regressions invisible.
+  - SSE wire coverage must model event dispatch, not just scan `data:` lines; blank separators and EOF handling are part of the contract.
 - **Follow-ups**:
   - Resolve the four PR #630 review threads after the strengthened tests are pushed.

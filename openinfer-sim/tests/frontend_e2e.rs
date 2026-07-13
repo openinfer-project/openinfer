@@ -580,7 +580,7 @@ async fn chat_completions_streaming_emits_role_content_and_done() -> Result<()> 
     let server = SimServer::spawn().await?;
     let client = test_client()?;
 
-    let stream_text = client
+    let response = client
         .post(format!("{}/v1/chat/completions", server.base_url))
         .json(&json!({
             "model": MODEL_NAME,
@@ -591,9 +591,9 @@ async fn chat_completions_streaming_emits_role_content_and_done() -> Result<()> 
         }))
         .send()
         .await?
-        .error_for_status()?
-        .text()
-        .await?;
+        .error_for_status()?;
+    assert_event_stream_content_type(&response)?;
+    let stream_text = response.text().await?;
 
     let chunks = parse_terminal_sse_chunks(&stream_text)?;
 
@@ -641,7 +641,7 @@ async fn chat_completions_usage_with_stream_options() -> Result<()> {
     let server = SimServer::spawn().await?;
     let client = test_client()?;
 
-    let stream_text = client
+    let response = client
         .post(format!("{}/v1/chat/completions", server.base_url))
         .json(&json!({
             "model": MODEL_NAME,
@@ -653,9 +653,9 @@ async fn chat_completions_usage_with_stream_options() -> Result<()> {
         }))
         .send()
         .await?
-        .error_for_status()?
-        .text()
-        .await?;
+        .error_for_status()?;
+    assert_event_stream_content_type(&response)?;
+    let stream_text = response.text().await?;
 
     let chunks = parse_terminal_sse_chunks(&stream_text)?;
     let usage_indices: Vec<usize> = chunks
@@ -847,19 +847,54 @@ fn completion_body(model_name: &str, stream: bool) -> Value {
     })
 }
 
+fn assert_event_stream_content_type(response: &reqwest::Response) -> Result<()> {
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .ok_or_else(|| anyhow!("streaming response is missing Content-Type"))?
+        .to_str()
+        .context("streaming response has an invalid Content-Type")?;
+    let media_type = content_type.split(';').next().unwrap_or_default().trim();
+    if media_type != "text/event-stream" {
+        bail!("streaming response must use text/event-stream, got {content_type}");
+    }
+    Ok(())
+}
+
 fn parse_terminal_sse_chunks(stream: &str) -> Result<Vec<Value>> {
-    let payloads: Vec<&str> = stream
-        .lines()
-        .filter_map(|line| line.strip_prefix("data: "))
-        .collect();
+    let normalized = stream.replace("\r\n", "\n").replace('\r', "\n");
+    let mut payloads = Vec::new();
+    let mut data_lines = Vec::new();
+
+    for line in normalized.split('\n') {
+        if line.is_empty() {
+            if !data_lines.is_empty() {
+                payloads.push(data_lines.join("\n"));
+                data_lines.clear();
+            }
+            continue;
+        }
+        if line.starts_with(':') {
+            continue;
+        }
+
+        let (field, value) = line.split_once(':').unwrap_or((line, ""));
+        if field == "data" {
+            data_lines.push(value.strip_prefix(' ').unwrap_or(value));
+        }
+    }
+    if !data_lines.is_empty() {
+        bail!("streaming response ended before its final SSE event was dispatched: {stream}");
+    }
+
     let done_count = payloads
         .iter()
-        .filter(|payload| **payload == "[DONE]")
+        .filter(|payload| payload.as_str() == "[DONE]")
         .count();
     if done_count != 1 {
         bail!("streaming response must contain exactly one data: [DONE]: {stream}");
     }
-    if payloads.last().copied() != Some("[DONE]") {
+    if payloads.last().map(String::as_str) != Some("[DONE]") {
         bail!("streaming response must end with data: [DONE]: {stream}");
     }
 
@@ -868,6 +903,23 @@ fn parse_terminal_sse_chunks(stream: &str) -> Result<Vec<Value>> {
         .map(|payload| serde_json::from_str(payload))
         .collect::<std::result::Result<Vec<_>, _>>()
         .context("failed to parse streaming chunks")
+}
+
+#[test]
+fn sse_parser_requires_dispatched_events_and_unique_terminal_done() -> Result<()> {
+    let valid = "data: {\"object\":\"chat.completion.chunk\"}\n\ndata:[DONE]\n\n";
+    assert_eq!(parse_terminal_sse_chunks(valid)?.len(), 1);
+
+    let missing_separator = "data: {\"object\":\"chat.completion.chunk\"}\ndata:[DONE]\n\n";
+    assert!(parse_terminal_sse_chunks(missing_separator).is_err());
+
+    let duplicate_done = "data: {}\n\ndata:[DONE]\n\ndata: [DONE]\n\n";
+    assert!(parse_terminal_sse_chunks(duplicate_done).is_err());
+
+    let undispatched_done = "data: {}\n\ndata:[DONE]";
+    assert!(parse_terminal_sse_chunks(undispatched_done).is_err());
+
+    Ok(())
 }
 
 async fn wait_for_health(client: &Client, base_url: &str) -> Result<()> {
