@@ -73,6 +73,17 @@ pub struct Qwen35LaunchOptions {
     pub max_prefill_tokens: usize,
 }
 
+impl Qwen35LaunchOptions {
+    fn device_ordinals(&self) -> Result<Vec<usize>> {
+        anyhow::ensure!(self.tp_size >= 1, "Qwen3.5 tp_size must be >= 1");
+        Ok(if self.tp_size == 1 {
+            vec![self.device_ordinal]
+        } else {
+            (0..self.tp_size).collect()
+        })
+    }
+}
+
 /// Start the Qwen3.5 engine for the server. TP Phase 1 supports eager-only
 /// multi-GPU execution; single-GPU keeps the existing CUDA Graph-capable path.
 pub fn launch(
@@ -96,11 +107,7 @@ pub fn launch_with_options(
     model_path: &Path,
     options: Qwen35LaunchOptions,
 ) -> Result<EngineHandle> {
-    let device_ordinals = if options.tp_size == 1 {
-        vec![options.device_ordinal]
-    } else {
-        (0..options.tp_size).collect()
-    };
+    let device_ordinals = options.device_ordinals()?;
     start_engine_with_capacity(
         model_path,
         EngineLoadOptions {
@@ -164,4 +171,22 @@ pub fn start_engine_with_capacity(
         .ok_or_else(|| anyhow!("model path must be valid UTF-8"))?;
     let model = weights::Qwen35Model::from_safetensors(model_path, device_ordinal, max_batch)?;
     scheduler::start(model, seed, max_prefill_tokens)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Qwen35LaunchOptions;
+
+    #[test]
+    fn launch_options_reject_zero_tp_size() {
+        let options = Qwen35LaunchOptions {
+            device_ordinal: 3,
+            tp_size: 0,
+            cuda_graph: false,
+            max_prefill_tokens: 1,
+        };
+
+        let err = options.device_ordinals().unwrap_err().to_string();
+        assert!(err.contains("tp_size must be >= 1"));
+    }
 }
