@@ -53,6 +53,7 @@
   - `cargo test --release --locked -p openinfer-kv-offload -p openinfer-qwen3 --lib`: pass (8 + 72 tests).
   - GLM server feature compile: pass.
   - `cargo test --release --locked -p openinfer-glm52 --lib`: pass (70 passed, 15 ignored).
+- Post-push GitHub Actions for dependency commit `992a533e`: pass (12/12 checks, including sm_80 Qwen3 compile/Clippy and simulated frontend E2E).
   - GLM Clippy reaches only six warnings inherited unchanged from current `main`; branch-specific warnings in admission/offload are cleared.
 
 ### Step 3: advance the merged Pegaflow dependency
@@ -70,7 +71,7 @@
 - **Outcome:** #657 is reconciled with current `main`; its merge conflicts, formatting failure, Qwen3 Clippy failure, and GLM worker-shape integration error are repaired locally.
 - **Dependency decision:** pin `pegaflow-core` to merged #395 rev `1473c53`. The supported normal configurations are Qwen3 vLLM 0.23.0 default NHD and GLM vLLM 0.24.0; both use the gated single-segment block geometry, so #382 is neither required nor awaited.
 - **Landing order:** land #540, then remove its stacked commits from #657 and land #657. Pegaflow #395 is already merged and pinned.
-- **Remaining validation:** this maintenance pass does not replace the already recorded two-node performance/correctness gates. The pin advances to the merged revision containing the previously gated tail-save/router behavior; local locked compile/tests pass, while PR CI for the dependency move remains pending until push.
+- **Remaining validation:** this maintenance pass does not replace the already recorded two-node performance/correctness gates. The pin advances to the merged revision containing the previously gated tail-save/router behavior; local locked compile/tests and the 12-check GitHub Actions run on `992a533e` pass.
 
 ## 与 qwen3 里程碑 1 的差异（GLM 专属工作项)
 
