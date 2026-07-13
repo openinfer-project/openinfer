@@ -54,6 +54,18 @@ pub fn gemm_rows_into(
     x: &HiddenStates,
     out: &mut HiddenStates,
 ) {
+    gemm_rows_into_checked(ctx, weight, row_offset, num_rows, x, out)
+        .expect("GEMM row-range launch failed");
+}
+
+pub fn gemm_rows_into_checked(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    row_offset: usize,
+    num_rows: usize,
+    x: &HiddenStates,
+    out: &mut HiddenStates,
+) -> Result<()> {
     if call_trace::is_enabled() {
         let label = call_trace::current_label("gemm_rows");
         call_trace::record_call(gemm_rows_call::<OutDim>(
@@ -65,7 +77,7 @@ pub fn gemm_rows_into(
             x.seq_len,
         ));
     }
-    openinfer_kernels::ops::gemm_rows_into(ctx, weight, row_offset, num_rows, x, out);
+    openinfer_kernels::ops::gemm_rows_into_checked(ctx, weight, row_offset, num_rows, x, out)
 }
 
 pub fn gemm_into(

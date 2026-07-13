@@ -25,7 +25,7 @@ pub(crate) struct UnifiedStepOutput {
 impl Qwen35Model {
     /// Prefill `n` prompts sequentially, updating each request's KV and recurrent state.
     ///
-    /// Returns batched last-token logits `[vocab_size, n]` in request order.
+    /// Returns batched last-token logits `[selection_vocab, n]` in request order.
     /// Requests are independent — there is no cross-request batching in the prefill pass.
     pub(crate) fn batch_prefill_logits(
         &self,
@@ -61,7 +61,7 @@ impl Qwen35Model {
     ///
     /// Either `prefill_prompts` or `decode_tokens` may be empty (but not both).
     ///
-    /// Prefill logits are returned as `[vocab_size, n_prefill]` in request order.
+    /// Prefill logits are returned as `[selection_vocab, n_prefill]` in request order.
     /// Decode logits remain in `graph_state.buffers.logits`; callers sample from
     /// that batched buffer directly to avoid per-request extraction.
     pub(crate) fn unified_step(
@@ -133,7 +133,7 @@ mod tests {
         let params = vec![openinfer_core::sampler::SamplingParams::default(); rows];
         let params_refs: Vec<&openinfer_core::sampler::SamplingParams> = params.iter().collect();
         let mut scratch =
-            openinfer_sample::SampleScratch::new(&model.ctx, model.config.vocab_size, rows)
+            openinfer_sample::SampleScratch::new(&model.ctx, model.config.selection_vocab, rows)
                 .unwrap();
         let steps = vec![0u64; params_refs.len()];
         openinfer_sample::select_batch(&model.ctx, logits, &params_refs, &steps, 0, &mut scratch)

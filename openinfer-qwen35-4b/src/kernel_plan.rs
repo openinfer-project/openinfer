@@ -157,7 +157,7 @@ pub static KERNEL_PLAN: KernelPlan = KernelPlan {
                 },
                 KernelOp {
                     id: "lm_head_prefill",
-                    rust: "prefill::batch_last_hidden_logits -> ops::gemm (output_projection)",
+                    rust: "prefill::batch_last_hidden_logits -> ops::gemm_rows_into_checked (output_projection, selection_vocab rows)",
                     backend: "cuBLAS",
                     notes: "LM head: untied lm_head.weight when the config unties embeddings, else embed_tokens (one cuBLAS GEMM over request rows)",
                 },
@@ -274,7 +274,7 @@ pub static KERNEL_PLAN: KernelPlan = KernelPlan {
                 },
                 KernelOp {
                     id: "lm_head_decode",
-                    rust: "batch_decode::{batch_decode_kernels_graph,batch_decode_batched_hybrid_kernels} -> ops::gemm_into (output_projection)",
+                    rust: "batch_decode::{batch_decode_kernels_graph,batch_decode_batched_hybrid_kernels} -> ops::gemm_rows_into (output_projection, selection_vocab rows)",
                     backend: "cuBLAS",
                     notes: "LM head: untied lm_head.weight when configured, else embed_tokens; logits rows are dense 0..active_bs",
                 },
