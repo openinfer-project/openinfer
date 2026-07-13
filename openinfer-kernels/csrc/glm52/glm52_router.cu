@@ -4,23 +4,19 @@
 #include <cuda_runtime.h>
 #include <math_constants.h>
 
-// GLM5.2 is FP8 weights + FlashMLA: nothing below Hopper can run the model,
-// so a sub-sm_90 compilation target is a build misconfiguration, not a
-// support tier. Fail here instead of shipping kernels with the PDL calls
-// silently compiled out.
+// GLM5.2 (FP8 + FlashMLA) cannot run below Hopper; refuse the target.
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 900)
 #error "GLM5.2 kernels require sm_90+ (check OPENINFER_CUDA_SM / detected GPU targets)"
 #endif
 
 namespace {
 
-constexpr int kRouterSelectThreads = 512;
 constexpr int kGlm52Experts = 256;
+// One thread per expert; threads past n_experts only idled (512 was inherited).
+constexpr int kRouterSelectThreads = kGlm52Experts;
 constexpr int kGlm52Topk = 8;
 constexpr int kGlm52Hidden = 6144;
-// Production row bound: GLM52_MAX_BATCH_PER_RANK (= the largest decode
-// bucket; prefill and dspark verify spans ride the decode buckets, so no
-// call path exceeds it).
+// = GLM52_MAX_BATCH_PER_RANK; prefill/dspark spans ride the decode buckets.
 constexpr int kRouterGemvMaxTokens = 8;
 
 __device__ __forceinline__ bool better_router_choice(float value, int expert,
@@ -104,13 +100,9 @@ CUresult consume_last_cuda_error() {
   return map_cuda_error(err);
 }
 
-// Router logits GEMV, adapted from TensorRT-LLM's dsv3MinLatencyKernels
-// dsv3RouterGemm.cu (Apache-2.0) via SGLang sgl-kernel / vLLM. One block per
-// expert row; f32 accumulation in a fixed order (per-thread serial over the
-// k-chunks -> warp butterfly -> cross-warp smem sum), so logits are
-// deterministic run-to-run. Replaces cublasGemmEx, whose splitK plan cost 4
-// whole-step-graph nodes per layer (GEMM + splitKreduce + workspace
-// alloc/free) at decode row counts.
+// Adapted from TRT-LLM dsv3MinLatencyKernels dsv3RouterGemm.cu (Apache-2.0)
+// via SGLang/vLLM. One block per expert row, fixed f32 reduction order
+// (deterministic); replaces the 4-node-per-layer cublas splitK plan.
 template <int kNumTokens>
 __global__ __launch_bounds__(128, 1) void glm52_router_logits_gemv_kernel(
     float* __restrict__ out, const __nv_bfloat16* __restrict__ hidden,
@@ -173,10 +165,8 @@ __global__ __launch_bounds__(128, 1) void glm52_router_logits_gemv_kernel(
       out[m * kGlm52Experts + expert] = final_sum;
     }
   }
-  // No fence before the trigger, matching TRT-LLM/FlashInfer upstream: the
-  // trigger only lets a PDL-opted dependent grid LAUNCH early; that grid may
-  // not consume our stores until its cudaGridDependencySynchronize, which
-  // orders on this grid's full completion (memory visibility included).
+  // Fence-free like upstream TRT-LLM: dependents can only consume after
+  // their cudaGridDependencySynchronize, which orders on our full completion.
   cudaTriggerProgrammaticLaunchCompletion();
 }
 
@@ -185,9 +175,7 @@ cudaError_t launch_router_logits_gemv(float* logits,
                                       const __nv_bfloat16* hidden,
                                       const __nv_bfloat16* gate_weight,
                                       cudaStream_t stream) {
-  // PSS needs cc >= 9.0, which the #error guard above makes a build
-  // invariant — no host-side fallback (unlike argmax.cu, whose kernels also
-  // serve pre-Hopper models).
+  // PSS needs cc >= 9.0 — a build invariant here (see the #error above).
   cudaLaunchConfig_t config = {};
   config.gridDim = kGlm52Experts;
   config.blockDim = 128;
