@@ -1,10 +1,16 @@
 #include "../common.cuh"
 
-#include <atomic>
-
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <math_constants.h>
+
+// GLM5.2 is FP8 weights + FlashMLA: nothing below Hopper can run the model,
+// so a sub-sm_90 compilation target is a build misconfiguration, not a
+// support tier. Fail here instead of shipping kernels with the PDL calls
+// silently compiled out.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 900)
+#error "GLM5.2 kernels require sm_90+ (check OPENINFER_CUDA_SM / detected GPU targets)"
+#endif
 
 namespace {
 
@@ -125,9 +131,7 @@ __global__ __launch_bounds__(128, 1) void glm52_router_logits_gemv_kernel(
   float acc[kNumTokens] = {};
   __shared__ float sm_reduction[kNumTokens][kNumWarps];
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaGridDependencySynchronize();
-#endif
 
   for (int ki = 0; ki < kIters; ++ki) {
     const int k_base = ki * kElemsPerIter + tid * kVpt;
@@ -169,32 +173,11 @@ __global__ __launch_bounds__(128, 1) void glm52_router_logits_gemv_kernel(
       out[m * kGlm52Experts + expert] = final_sum;
     }
   }
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   // No fence before the trigger, matching TRT-LLM/FlashInfer upstream: the
   // trigger only lets a PDL-opted dependent grid LAUNCH early; that grid may
   // not consume our stores until its cudaGridDependencySynchronize, which
   // orders on this grid's full completion (memory visibility included).
   cudaTriggerProgrammaticLaunchCompletion();
-#endif
-}
-
-// PSS launch attribute needs cc >= 9.0; cached device gate mirrors
-// argmax.cu's markov_pdl_supported_on_current_device so dev boxes below
-// Hopper still run the plain launch.
-inline bool router_pdl_supported_on_current_device() {
-  static std::atomic<int> cached{-1};
-  int value = cached.load(std::memory_order_acquire);
-  if (value >= 0) return value != 0;
-  int device = 0;
-  int major = 0;
-  if (cudaGetDevice(&device) != cudaSuccess ||
-      cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor,
-                             device) != cudaSuccess) {
-    cached.store(0, std::memory_order_release);
-    return false;
-  }
-  cached.store(major >= 9 ? 1 : 0, std::memory_order_release);
-  return major >= 9;
 }
 
 template <int kNumTokens>
@@ -202,11 +185,9 @@ cudaError_t launch_router_logits_gemv(float* logits,
                                       const __nv_bfloat16* hidden,
                                       const __nv_bfloat16* gate_weight,
                                       cudaStream_t stream) {
-  if (!router_pdl_supported_on_current_device()) {
-    glm52_router_logits_gemv_kernel<kNumTokens>
-        <<<kGlm52Experts, 128, 0, stream>>>(logits, hidden, gate_weight);
-    return cudaGetLastError();
-  }
+  // PSS needs cc >= 9.0, which the #error guard above makes a build
+  // invariant — no host-side fallback (unlike argmax.cu, whose kernels also
+  // serve pre-Hopper models).
   cudaLaunchConfig_t config = {};
   config.gridDim = kGlm52Experts;
   config.blockDim = 128;
