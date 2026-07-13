@@ -155,6 +155,7 @@ impl Qwen35Model {
             &bufs.attn_out_full,
             &mut bufs.attn_results,
         );
+        self.all_reduce_hidden(&mut bufs.attn_results)?;
         Ok(())
     }
 
