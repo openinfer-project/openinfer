@@ -9,6 +9,8 @@ use openinfer_core::tensor::{DeviceMatrix, DeviceVec};
 mod loading;
 mod reservation;
 
+// Wired into the KV budget by the forward-pass PR; kept here as the skeleton lands.
+#[allow(unused_imports)]
 pub(crate) use reservation::Eagle3MemoryReservation;
 
 /// Number of tokens the EAGLE-3 chain drafts per speculative round (γ; the verify

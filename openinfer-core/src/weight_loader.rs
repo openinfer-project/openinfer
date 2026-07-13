@@ -286,8 +286,10 @@ pub fn load_tensor_i64_host(
         ));
     }
     Ok(data
-        .chunks_exact(8)
-        .map(|b| i64::from_le_bytes(b.try_into().unwrap()))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|&b| i64::from_le_bytes(b))
         .collect())
 }
 
