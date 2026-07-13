@@ -1,16 +1,16 @@
 #include "../common.cuh"
 
-#include <cublas_v2.h>
 #include <cuda.h>
+#include <cuda_runtime.h>
 #include <math_constants.h>
-
-extern thread_local cublasHandle_t g_cublas_handle;
 
 namespace {
 
 constexpr int kRouterSelectThreads = 512;
 constexpr int kGlm52Experts = 256;
 constexpr int kGlm52Topk = 8;
+constexpr int kGlm52Hidden = 6144;
+constexpr int kRouterGemvMaxTokens = 16;
 
 __device__ __forceinline__ bool better_router_choice(float value, int expert,
                                                      float best_value,
@@ -93,26 +93,138 @@ CUresult consume_last_cuda_error() {
   return map_cuda_error(err);
 }
 
+// Router logits GEMV, adapted from TensorRT-LLM's dsv3MinLatencyKernels
+// dsv3RouterGemm.cu (Apache-2.0) via SGLang sgl-kernel / vLLM. One block per
+// expert row; f32 accumulation in a fixed order (per-thread serial over the
+// k-chunks -> warp butterfly -> cross-warp smem sum), so logits are
+// deterministic run-to-run. Replaces cublasGemmEx, whose splitK plan cost 4
+// whole-step-graph nodes per layer (GEMM + splitKreduce + workspace
+// alloc/free) at decode row counts.
+template <int kNumTokens>
+__global__ __launch_bounds__(128, 1) void glm52_router_logits_gemv_kernel(
+    float* __restrict__ out, const __nv_bfloat16* __restrict__ hidden,
+    const __nv_bfloat16* __restrict__ gate_weight) {
+  constexpr int kBlockSize = 128;
+  constexpr int kVpt = 8;  // bf16 per uint4 vector load
+  constexpr int kWarpSize = 32;
+  constexpr int kNumWarps = kBlockSize / kWarpSize;
+  constexpr int kElemsPerIter = kVpt * kBlockSize;
+  constexpr int kIters = kGlm52Hidden / kElemsPerIter;
+  static_assert(kGlm52Hidden % kElemsPerIter == 0);
+
+  const int expert = blockIdx.x;
+  const int tid = threadIdx.x;
+  const __nv_bfloat16* w_row =
+      gate_weight + static_cast<size_t>(expert) * kGlm52Hidden;
+
+  float acc[kNumTokens] = {};
+  __shared__ float sm_reduction[kNumTokens][kNumWarps];
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaGridDependencySynchronize();
+#endif
+
+  for (int ki = 0; ki < kIters; ++ki) {
+    const int k_base = ki * kElemsPerIter + tid * kVpt;
+    const uint4 w_vec = *reinterpret_cast<const uint4*>(w_row + k_base);
+    const __nv_bfloat16* w_bf16 = reinterpret_cast<const __nv_bfloat16*>(&w_vec);
+#pragma unroll
+    for (int m = 0; m < kNumTokens; ++m) {
+      const uint4 h_vec = *reinterpret_cast<const uint4*>(
+          hidden + static_cast<size_t>(m) * kGlm52Hidden + k_base);
+      const __nv_bfloat16* h_bf16 =
+          reinterpret_cast<const __nv_bfloat16*>(&h_vec);
+#pragma unroll
+      for (int k = 0; k < kVpt; ++k) {
+        acc[m] += __bfloat162float(h_bf16[k]) * __bfloat162float(w_bf16[k]);
+      }
+    }
+  }
+
+  const int warp_id = tid / kWarpSize;
+  const int lane_id = tid % kWarpSize;
+#pragma unroll
+  for (int m = 0; m < kNumTokens; ++m) {
+    float sum = acc[m];
+    sum += __shfl_xor_sync(0xffffffff, sum, 16);
+    sum += __shfl_xor_sync(0xffffffff, sum, 8);
+    sum += __shfl_xor_sync(0xffffffff, sum, 4);
+    sum += __shfl_xor_sync(0xffffffff, sum, 2);
+    sum += __shfl_xor_sync(0xffffffff, sum, 1);
+    if (lane_id == 0) sm_reduction[m][warp_id] = sum;
+  }
+  __syncthreads();
+
+  if (tid == 0) {
+#pragma unroll
+    for (int m = 0; m < kNumTokens; ++m) {
+      float final_sum = 0.0f;
+#pragma unroll
+      for (int w = 0; w < kNumWarps; ++w) final_sum += sm_reduction[m][w];
+      out[m * kGlm52Experts + expert] = final_sum;
+    }
+  }
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
+template <int kNumTokens>
+cudaError_t launch_router_logits_gemv(float* logits,
+                                      const __nv_bfloat16* hidden,
+                                      const __nv_bfloat16* gate_weight,
+                                      cudaStream_t stream) {
+  cudaLaunchConfig_t config = {};
+  config.gridDim = kGlm52Experts;
+  config.blockDim = 128;
+  config.dynamicSmemBytes = 0;
+  config.stream = stream;
+  cudaLaunchAttribute attrs[1];
+  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[0].val.programmaticStreamSerializationAllowed = 1;
+  config.numAttrs = 1;
+  config.attrs = attrs;
+  return cudaLaunchKernelEx(&config,
+                            glm52_router_logits_gemv_kernel<kNumTokens>,
+                            logits, hidden, gate_weight);
+}
+
 CUresult glm52_router_logits_gemm(const __nv_bfloat16* hidden,
                                   const __nv_bfloat16* gate_weight,
                                   float* logits, int padded_tokens,
                                   int hidden_dim, int n_experts,
                                   cudaStream_t stream) {
-  if (g_cublas_handle == nullptr) return CUDA_ERROR_NOT_INITIALIZED;
-  const float alpha = 1.0f;
-  const float beta = 0.0f;
-  cublasStatus_t status = cublasSetStream(g_cublas_handle, stream);
-  if (status != CUBLAS_STATUS_SUCCESS) return CUDA_ERROR_INVALID_HANDLE;
-  // CUBLAS_COMPUTE_32F (NOT _PEDANTIC): the kimi router shipped PEDANTIC and
-  // measured 60x off roofline (kimi_router.cu:139 post-mortem). Tensor-op f32
-  // accumulation is the intended mode; bf16 inputs already bound the precision.
-  status = cublasGemmEx(
-      g_cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, n_experts, padded_tokens,
-      hidden_dim, &alpha, gate_weight, CUDA_R_16BF, hidden_dim, hidden,
-      CUDA_R_16BF, hidden_dim, &beta, logits, CUDA_R_32F, n_experts,
-      CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-  return status == CUBLAS_STATUS_SUCCESS ? CUDA_SUCCESS
-                                         : CUDA_ERROR_LAUNCH_FAILED;
+  if (hidden_dim != kGlm52Hidden || n_experts != kGlm52Experts ||
+      padded_tokens < 1 || padded_tokens > kRouterGemvMaxTokens) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  cudaError_t err = cudaSuccess;
+  switch (padded_tokens) {
+#define GLM52_ROUTER_GEMV_CASE(N)                                     \
+  case N:                                                             \
+    err = launch_router_logits_gemv<N>(logits, hidden, gate_weight, stream); \
+    break;
+    GLM52_ROUTER_GEMV_CASE(1)
+    GLM52_ROUTER_GEMV_CASE(2)
+    GLM52_ROUTER_GEMV_CASE(3)
+    GLM52_ROUTER_GEMV_CASE(4)
+    GLM52_ROUTER_GEMV_CASE(5)
+    GLM52_ROUTER_GEMV_CASE(6)
+    GLM52_ROUTER_GEMV_CASE(7)
+    GLM52_ROUTER_GEMV_CASE(8)
+    GLM52_ROUTER_GEMV_CASE(9)
+    GLM52_ROUTER_GEMV_CASE(10)
+    GLM52_ROUTER_GEMV_CASE(11)
+    GLM52_ROUTER_GEMV_CASE(12)
+    GLM52_ROUTER_GEMV_CASE(13)
+    GLM52_ROUTER_GEMV_CASE(14)
+    GLM52_ROUTER_GEMV_CASE(15)
+    GLM52_ROUTER_GEMV_CASE(16)
+#undef GLM52_ROUTER_GEMV_CASE
+    default:
+      return CUDA_ERROR_INVALID_VALUE;
+  }
+  return map_cuda_error(err);
 }
 
 }  // namespace
