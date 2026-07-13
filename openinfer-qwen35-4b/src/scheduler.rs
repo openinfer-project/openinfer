@@ -165,6 +165,10 @@ pub(crate) fn start_tp_with_capacity(
         backend.capacity_pages_for_requests(),
         backend.page_size(),
     );
+    let kv_capacity = KvCapacity {
+        total_blocks: backend.capacity_pages_for_requests(),
+        block_size: backend.page_size(),
+    };
 
     let (submit_tx, submit_rx) = mpsc::unbounded_channel();
     let join_handle = thread::Builder::new()
@@ -179,7 +183,11 @@ pub(crate) fn start_tp_with_capacity(
         })
         .expect("failed to spawn Qwen3.5 TP scheduler thread");
 
-    Ok(SchedulerHandle::new_with_join_handle(submit_tx, join_handle).with_servable_len(servable))
+    Ok(
+        SchedulerHandle::new_with_join_handle(submit_tx, join_handle)
+            .with_servable_len(servable)
+            .with_kv_capacity(kv_capacity),
+    )
 }
 
 struct SingleGpuBackend {
