@@ -866,7 +866,7 @@ fn parse_terminal_sse_chunks(stream: &str) -> Result<Vec<Value>> {
     let mut payloads = Vec::new();
     let mut data_lines = Vec::new();
 
-    for line in normalized.split('\n') {
+    for line in normalized.split_terminator('\n') {
         if line.is_empty() {
             if !data_lines.is_empty() {
                 payloads.push(data_lines.join("\n"));
@@ -918,6 +918,9 @@ fn sse_parser_requires_dispatched_events_and_unique_terminal_done() -> Result<()
 
     let undispatched_done = "data: {}\n\ndata:[DONE]";
     assert!(parse_terminal_sse_chunks(undispatched_done).is_err());
+
+    let line_terminated_but_undispatched_done = "data: {}\n\ndata:[DONE]\n";
+    assert!(parse_terminal_sse_chunks(line_terminated_but_undispatched_done).is_err());
 
     Ok(())
 }
