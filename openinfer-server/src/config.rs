@@ -364,6 +364,7 @@ fn consumed_args(model_type: ModelType) -> &'static [&'static str] {
         #[cfg(feature = "qwen35-4b")]
         ModelType::Qwen35 => &[
             "device_ordinal",
+            "tp_size",
             "cuda_graph",
             "max_prefill_tokens",
             "max_batch",
@@ -629,7 +630,7 @@ fn parse_lora_module_fields(name: &str, path: &str) -> Result<LoraModule, String
 mod tests {
     use super::*;
 
-    #[cfg(any(feature = "glm52", feature = "qwen3"))]
+    #[cfg(any(feature = "glm52", feature = "qwen3", feature = "qwen35-4b"))]
     fn parse_with_provided(argv: &[&str]) -> (Args, BTreeSet<String>) {
         use clap::FromArgMatches;
         let matches = Args::command()
@@ -672,6 +673,15 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[cfg(feature = "qwen35-4b")]
+    #[test]
+    fn qwen35_accepts_tp_size() {
+        let (args, provided) =
+            parse_with_provided(&["openinfer", "--tp-size", "2", "--cuda-graph=false"]);
+        args.validate(ModelType::Qwen35, &provided)
+            .expect("Qwen3.5 should accept --tp-size for eager TP startup");
     }
 
     #[test]
