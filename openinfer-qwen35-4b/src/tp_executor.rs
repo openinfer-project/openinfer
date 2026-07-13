@@ -4,7 +4,7 @@
 //! fails closed until the scheduler path can drive ordered eager decode.
 
 use std::collections::HashSet;
-use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 
 use anyhow::Result;
@@ -21,6 +21,8 @@ use crate::recurrent_state::RecurrentState;
 use crate::weights::{ModelRuntimeConfig, Qwen35Model};
 use openinfer_core::kv_pool::KvState;
 use openinfer_core::sampler::SamplingParams;
+
+const TP_NCCL_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[allow(dead_code)]
 enum TpWorkerCommand {
@@ -188,18 +190,67 @@ impl Qwen35TpExecutor {
 
         let nccl_id = cudarc::nccl::safe::Id::new()
             .map_err(|e| anyhow::anyhow!("failed to create Qwen3.5 TP NCCL id: {e:?}"))?;
+        let startup_gate = Arc::new(TpStartupGate::default());
         let mut workers = Vec::with_capacity(world_size);
+        let mut preflights = Vec::with_capacity(world_size);
         let mut startups = Vec::with_capacity(world_size);
         for (rank, model) in models.into_iter().enumerate() {
-            let (worker, startup) = TpWorker::spawn(rank, world_size, model, max_batch, nccl_id)?;
-            workers.push(worker);
-            startups.push(startup);
+            match TpWorker::spawn(
+                rank,
+                world_size,
+                model,
+                max_batch,
+                nccl_id,
+                Arc::clone(&startup_gate),
+            ) {
+                Ok((worker, preflight, startup)) => {
+                    workers.push(worker);
+                    preflights.push(preflight);
+                    startups.push(startup);
+                }
+                Err(err) => {
+                    startup_gate.cancel();
+                    return Err(err);
+                }
+            }
         }
-        for (rank, startup) in startups.into_iter().enumerate() {
-            startup
-                .recv()
-                .map_err(|_| anyhow::anyhow!("Qwen3.5 TP worker {rank} exited during startup"))??;
+        for (rank, preflight) in preflights.into_iter().enumerate() {
+            match preflight.recv() {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    startup_gate.cancel();
+                    return Err(err);
+                }
+                Err(_) => {
+                    startup_gate.cancel();
+                    return Err(anyhow::anyhow!(
+                        "Qwen3.5 TP worker {rank} exited during pre-NCCL startup"
+                    ));
+                }
+            }
         }
+        let (watchdog_done, watchdog) = match spawn_nccl_startup_watchdog() {
+            Ok(watchdog) => watchdog,
+            Err(err) => {
+                startup_gate.cancel();
+                return Err(err);
+            }
+        };
+        startup_gate.connect();
+        let startup_result = startups
+            .into_iter()
+            .enumerate()
+            .try_for_each(|(rank, startup)| {
+                startup.recv().map_err(|_| {
+                    anyhow::anyhow!("Qwen3.5 TP worker {rank} exited during startup")
+                })?
+            });
+        if let Err(err) = startup_result {
+            drop(workers);
+            disarm_nccl_startup_watchdog(watchdog_done, watchdog)?;
+            return Err(err);
+        }
+        disarm_nccl_startup_watchdog(watchdog_done, watchdog)?;
 
         Ok(Self {
             workers,
@@ -397,9 +448,86 @@ impl TpWorkerCommandKind {
     }
 }
 
+fn spawn_nccl_startup_watchdog() -> Result<(mpsc::SyncSender<()>, JoinHandle<()>)> {
+    let (done_tx, done_rx) = mpsc::sync_channel(1);
+    let watchdog = thread::Builder::new()
+        .name("qwen35-tp-nccl-startup-watchdog".into())
+        .spawn(move || {
+            if done_rx.recv_timeout(TP_NCCL_STARTUP_TIMEOUT).is_ok() {
+                return;
+            }
+            eprintln!(
+                "Qwen3.5 TP NCCL startup did not complete within {}s; aborting",
+                TP_NCCL_STARTUP_TIMEOUT.as_secs()
+            );
+            log::error!(
+                "Qwen3.5 TP NCCL startup did not complete within {}s; aborting",
+                TP_NCCL_STARTUP_TIMEOUT.as_secs()
+            );
+            std::process::abort();
+        })
+        .map_err(|err| anyhow::anyhow!("failed to spawn Qwen3.5 TP NCCL watchdog: {err}"))?;
+    Ok((done_tx, watchdog))
+}
+
+fn disarm_nccl_startup_watchdog(
+    done_tx: mpsc::SyncSender<()>,
+    watchdog: JoinHandle<()>,
+) -> Result<()> {
+    done_tx
+        .send(())
+        .map_err(|_| anyhow::anyhow!("Qwen3.5 TP NCCL watchdog exited unexpectedly"))?;
+    watchdog
+        .join()
+        .map_err(|_| anyhow::anyhow!("Qwen3.5 TP NCCL watchdog panicked"))
+}
+
 struct TpWorker {
     tx: mpsc::Sender<TpWorkerCommand>,
     handle: Option<JoinHandle<()>>,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum TpStartupDecision {
+    #[default]
+    Pending,
+    Connect,
+    Cancel,
+}
+
+#[derive(Default)]
+struct TpStartupGate {
+    decision: Mutex<TpStartupDecision>,
+    changed: Condvar,
+}
+
+impl TpStartupGate {
+    fn connect(&self) {
+        self.set(TpStartupDecision::Connect);
+    }
+
+    fn cancel(&self) {
+        self.set(TpStartupDecision::Cancel);
+    }
+
+    fn wait(&self) -> bool {
+        let mut decision = self.decision.lock().unwrap_or_else(|err| err.into_inner());
+        while *decision == TpStartupDecision::Pending {
+            decision = self
+                .changed
+                .wait(decision)
+                .unwrap_or_else(|err| err.into_inner());
+        }
+        *decision == TpStartupDecision::Connect
+    }
+
+    fn set(&self, next: TpStartupDecision) {
+        let mut decision = self.decision.lock().unwrap_or_else(|err| err.into_inner());
+        if *decision == TpStartupDecision::Pending {
+            *decision = next;
+            self.changed.notify_all();
+        }
+    }
 }
 
 impl TpWorker {
@@ -409,14 +537,29 @@ impl TpWorker {
         model: Qwen35Model,
         max_batch: usize,
         nccl_id: cudarc::nccl::safe::Id,
-    ) -> Result<(Self, mpsc::Receiver<Result<()>>)> {
+        startup_gate: Arc<TpStartupGate>,
+    ) -> Result<(Self, mpsc::Receiver<Result<()>>, mpsc::Receiver<Result<()>>)> {
         let (tx, rx) = mpsc::channel();
+        let (preflight_tx, preflight_rx) = mpsc::channel();
         let (startup_tx, startup_rx) = mpsc::channel();
         let handle = thread::Builder::new()
             .name(format!("qwen35-tp-rank-{rank}"))
             .spawn(move || {
-                let startup = TpWorkerState::new(rank, world_size, model, max_batch, nccl_id);
-                match startup {
+                let prepared = TpWorkerPrepared::new(rank, world_size, model, max_batch);
+                let prepared = match prepared {
+                    Ok(prepared) => {
+                        let _ = preflight_tx.send(Ok(()));
+                        prepared
+                    }
+                    Err(err) => {
+                        let _ = preflight_tx.send(Err(err));
+                        return;
+                    }
+                };
+                if !startup_gate.wait() {
+                    return;
+                }
+                match prepared.connect(nccl_id) {
                     Ok(mut state) => {
                         let _ = startup_tx.send(Ok(()));
                         state.run(rx);
@@ -433,6 +576,7 @@ impl TpWorker {
                 tx,
                 handle: Some(handle),
             },
+            preflight_rx,
             startup_rx,
         ))
     }
@@ -464,6 +608,16 @@ struct TpWorkerState {
     _cublas_guard: CublasThreadGuard,
 }
 
+struct TpWorkerPrepared {
+    rank: usize,
+    world_size: usize,
+    max_batch: usize,
+    model: Qwen35Model,
+    decode_buffers: BatchDecodeBuffers35,
+    sample_scratch: openinfer_sample::SampleScratch,
+    cublas_guard: CublasThreadGuard,
+}
+
 struct TpRequestState {
     request_id: RequestId,
     phase: TpRequestPhase,
@@ -477,15 +631,36 @@ enum TpRequestPhase {
     Decoding,
 }
 
-impl TpWorkerState {
-    fn new(
-        rank: usize,
-        world_size: usize,
-        mut model: Qwen35Model,
-        max_batch: usize,
-        nccl_id: cudarc::nccl::safe::Id,
-    ) -> Result<Self> {
+impl TpWorkerPrepared {
+    fn new(rank: usize, world_size: usize, model: Qwen35Model, max_batch: usize) -> Result<Self> {
         let cublas_guard = bind_worker_thread(&model)?;
+        let decode_buffers = model.create_batch_decode_buffers_with_capacity(max_batch)?;
+        let sample_scratch = openinfer_sample::SampleScratch::new(
+            model.device_ctx(),
+            model.config().vocab_size,
+            max_batch,
+        )?;
+        Ok(Self {
+            rank,
+            world_size,
+            max_batch,
+            model,
+            decode_buffers,
+            sample_scratch,
+            cublas_guard,
+        })
+    }
+
+    fn connect(self, nccl_id: cudarc::nccl::safe::Id) -> Result<TpWorkerState> {
+        let Self {
+            rank,
+            world_size,
+            max_batch,
+            mut model,
+            decode_buffers,
+            sample_scratch,
+            cublas_guard,
+        } = self;
         let comm = cudarc::nccl::safe::Comm::from_rank(
             model.device_ctx().stream.clone(),
             rank,
@@ -494,13 +669,7 @@ impl TpWorkerState {
         )
         .map_err(|e| anyhow::anyhow!("failed to initialize Qwen3.5 TP NCCL rank {rank}: {e:?}"))?;
         model.attach_tp_comm(comm);
-        let decode_buffers = model.create_batch_decode_buffers_with_capacity(max_batch)?;
-        let sample_scratch = openinfer_sample::SampleScratch::new(
-            model.device_ctx(),
-            model.config().vocab_size,
-            max_batch,
-        )?;
-        Ok(Self {
+        Ok(TpWorkerState {
             rank,
             _world_size: world_size,
             max_batch,
@@ -511,7 +680,9 @@ impl TpWorkerState {
             _cublas_guard: cublas_guard,
         })
     }
+}
 
+impl TpWorkerState {
     fn run(&mut self, rx: mpsc::Receiver<TpWorkerCommand>) {
         while let Ok(command) = rx.recv() {
             match command {
@@ -898,6 +1069,32 @@ fn bind_worker_thread(model: &Qwen35Model) -> Result<CublasThreadGuard> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_gate_cancel_releases_waiting_workers() {
+        let gate = Arc::new(TpStartupGate::default());
+        let worker_gate = Arc::clone(&gate);
+        let (done_tx, done_rx) = mpsc::channel();
+        let waiter = thread::spawn(move || {
+            let _ = done_tx.send(worker_gate.wait());
+        });
+
+        gate.cancel();
+
+        assert_eq!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("cancelled startup gate should release workers within one second"),
+            false
+        );
+        waiter.join().unwrap();
+    }
+
+    #[test]
+    fn nccl_startup_watchdog_disarms_after_success() {
+        let (done_tx, watchdog) = spawn_nccl_startup_watchdog().unwrap();
+        disarm_nccl_startup_watchdog(done_tx, watchdog).unwrap();
+    }
 
     #[test]
     fn rejects_single_device_topology() {
