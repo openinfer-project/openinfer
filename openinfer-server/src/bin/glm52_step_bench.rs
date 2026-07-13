@@ -71,6 +71,11 @@ struct Cli {
     /// after the local ones).
     #[arg(long, value_delimiter = ',')]
     rank_hosts: Vec<String>,
+    /// Override the VRAM-derived per-request context cap — same contract as
+    /// the server flag. Wide-EP topologies need this until the context-cap
+    /// ledger accounts for width-scaled DeepEP buffers.
+    #[arg(long)]
+    max_model_len: Option<usize>,
 }
 
 const GLM52_RANKS: usize = 8;
@@ -102,7 +107,7 @@ fn main() -> Result<()> {
             tp_size,
             dp_size,
             dspark_draft_model_path: None,
-            max_model_len: None,
+            max_model_len: cli.max_model_len,
             no_prefix_cache: false,
             kv_offload: None,
             moe_topo,
