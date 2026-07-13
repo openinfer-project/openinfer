@@ -147,6 +147,11 @@ const _: () = assert!(
         <= openinfer_kernels::ops::GLM52_DEEPGEMM_MASKED_CAP
 );
 
+// The min-latency GEMV (router logits, indexer weights_proj) dispatches
+// tokens 1..=8; a bucket bump must extend glm52_min_gemv.cuh first.
+const _: () =
+    assert!(GLM52_MAX_BATCH_PER_RANK <= openinfer_kernels::ops::GLM52_MIN_GEMV_MAX_TOKENS);
+
 // The decode feed kernel runs one 32-thread block (`glm52_decode_feed.cu`);
 // a batch-cap bump past it must widen the kernel, not silently truncate.
 const _: () = assert!(GLM52_MAX_BATCH_PER_RANK <= 32);

@@ -27,7 +27,7 @@ impl Lcg {
             .0
             .wrapping_mul(6_364_136_223_846_793_005)
             .wrapping_add(1_442_695_040_888_963_407);
-        (self.0 >> 33) as u32
+        (self.0 >> 32) as u32
     }
     fn unit_f32(&mut self) -> f32 {
         (self.next_u32() as f32 / u32::MAX as f32) * 2.0 - 1.0

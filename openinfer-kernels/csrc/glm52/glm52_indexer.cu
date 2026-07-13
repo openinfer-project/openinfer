@@ -9,6 +9,7 @@
 // int32 index-remap: page = block_table[t, off//bs]; slot = page*bs + off%bs.
 
 #include "../common.cuh"
+#include "glm52_min_gemv.cuh"
 
 #include <cfloat>
 #include <cuda.h>
@@ -208,6 +209,21 @@ CUresult glm52_indexer_k_quant_and_cache_cuda(
       k, indexer_cache, slot_mapping, tokens, cache_block_size,
       cache_block_stride_bytes);
   return consume_last_cuda_error();
+}
+
+// weights_proj [32, 6144] x hidden [tokens, 6144] -> bf16 [tokens, 32];
+// min-latency GEMV replaces the cublas splitK plan (4 graph nodes/call).
+CUresult glm52_indexer_weights_proj_cuda(const __nv_bfloat16* hidden,
+                                         const __nv_bfloat16* weights_proj,
+                                         __nv_bfloat16* out, int tokens,
+                                         int heads, int hidden_dim,
+                                         cudaStream_t stream) {
+  if (hidden == nullptr || weights_proj == nullptr || out == nullptr ||
+      heads != 32 || hidden_dim != glm52_min_gemv::kHidden) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  return map_cuda_error(glm52_min_gemv::launch_tokens<32, __nv_bfloat16>(
+      out, hidden, weights_proj, tokens, stream));
 }
 
 CUresult glm52_indexer_local_topk_to_slots_cuda(

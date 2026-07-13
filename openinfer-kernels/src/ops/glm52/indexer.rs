@@ -221,6 +221,62 @@ pub fn glm52_indexer_local_topk_to_slots_launch(
         .map_err(|err| anyhow!("GLM5.2 indexer local_topk_to_slots launch failed: {err}"))
 }
 
+/// Token bound baked into `glm52_min_gemv.cuh`'s `launch_tokens` switch.
+pub const GLM52_MIN_GEMV_MAX_TOKENS: usize = 8;
+
+/// weights_proj min-latency GEMV: `out[t, h] = dot(hidden[t], weights[h])`,
+/// bf16 in/out with fixed-order f32 accumulation. Replaces the cublas splitK
+/// plan (GEMM + splitKreduce + workspace alloc/free per call).
+pub fn glm52_indexer_weights_proj_launch(
+    ctx: &DeviceContext,
+    hidden: &CudaSlice<bf16>,
+    weights_proj: &CudaSlice<bf16>,
+    tokens: usize,
+    heads: usize,
+    hidden_dim: usize,
+    out: &mut CudaSlice<bf16>,
+) -> Result<()> {
+    ensure!(
+        (1..=GLM52_MIN_GEMV_MAX_TOKENS).contains(&tokens),
+        "GLM5.2 indexer weights_proj tokens {tokens} outside 1..={GLM52_MIN_GEMV_MAX_TOKENS}"
+    );
+    ensure!(
+        hidden.len() >= tokens * hidden_dim,
+        "GLM5.2 indexer weights_proj hidden too small: have {}, need {}",
+        hidden.len(),
+        tokens * hidden_dim
+    );
+    ensure!(
+        weights_proj.len() >= heads * hidden_dim,
+        "GLM5.2 indexer weights_proj weights too small: have {}, need {}",
+        weights_proj.len(),
+        heads * hidden_dim
+    );
+    ensure!(
+        out.len() >= tokens * heads,
+        "GLM5.2 indexer weights_proj out too small: have {}, need {}",
+        out.len(),
+        tokens * heads
+    );
+    let (h_ptr, _g0) = hidden.device_ptr(&ctx.stream);
+    let (w_ptr, _g1) = weights_proj.device_ptr(&ctx.stream);
+    let (o_ptr, _g2) = out.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::glm52_indexer_weights_proj_cuda(
+            h_ptr as *const ffi::Half,
+            w_ptr as *const ffi::Half,
+            o_ptr as *mut ffi::Half,
+            tokens as i32,
+            heads as i32,
+            hidden_dim as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result
+        .result()
+        .map_err(|err| anyhow!("GLM5.2 indexer weights_proj launch failed: {err}"))
+}
+
 /// Fold the per-head `weights_proj` output (bf16) with the per-head q quant
 /// scale and the two attention scale constants into f32 weights for the
 /// DeepGEMM MQA logits kernel: `out[h] = weights[h] * q_scale[h] *
