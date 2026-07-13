@@ -26,7 +26,7 @@ use openinfer_kernels::ops::{
     Glm52MoeQuantShape, Glm52SparseMlaDecode, gemm_strided_batched_bf16,
     glm52_flashinfer_sparse_mla_fp8_launch, glm52_flashinfer_sparse_mla_supported,
     glm52_flashmla_sparse_decode_launch, glm52_flashmla_sparse_decode_metadata_launch,
-    glm52_fp8_per_token_group_quant_bf16_launch, glm52_mla_cache_pack_launch,
+    glm52_fp8_per_token_group_quant_bf16_ue8m0_launch, glm52_mla_cache_pack_launch,
     glm52_mla_ckv_split_launch, glm52_mla_front_pack_fp8_launch, glm52_mla_query_assemble_launch,
     glm52_sparse_mla_decode_launch, rms_norm_rows_into,
 };
@@ -829,7 +829,11 @@ pub(crate) fn glm52_mla_attend_into(
                 sin,
                 &mut scratch.query,
             )?;
-            glm52_fp8_per_token_group_quant_bf16_launch(
+            // UE8M0 scales: the FlashMLA fp8_ds_mla cache contract — the sm100
+            // kernel truncates stored scales to powers of two (see the quant
+            // kernel's comment); amax/448 scales silently lose up to 1 bit of
+            // V/K magnitude per group on GB300.
+            glm52_fp8_per_token_group_quant_bf16_ue8m0_launch(
                 ctx,
                 Glm52MoeQuantShape {
                     rows: t,

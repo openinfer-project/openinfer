@@ -80,6 +80,44 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    // --- EP4 weight-only routed-expert chain (glm52_moe_ep_wo.cu) -------------
+    // `tiles` is an int2 array on the C side: pass an i32 buffer of len
+    // 2 * max_tiles (16-byte-aligned allocation bases satisfy int2 alignment).
+    pub fn glm52_moe_ep_wo_tiles_cuda(
+        psum_expert: *const i32,
+        tiles: *mut i32,
+        tile_count: *mut i32,
+        groups: i32,
+        m_capacity: i32,
+        masked_cap: i32,
+        max_tiles: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn glm52_moe_ep_wo_masked_mma_cuda(
+        activation: *const Half,
+        weight: *const u8,
+        weight_scale: *const f32,
+        tiles: *const i32,
+        tile_count: *const i32,
+        row_weights: *const f32,
+        out: *mut Half,
+        n: i32,
+        k: i32,
+        max_tiles: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn glm52_moe_ep_wo_silu_cuda(
+        input: *const Half,
+        tiles: *const i32,
+        tile_count: *const i32,
+        output: *mut Half,
+        inter: i32,
+        max_tiles: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     // --- MLA decode assembly (projections -> FlashMLA glue) -------------------
     pub fn glm52_mla_query_assemble_cuda(
         ql_nope: *const Half,
@@ -155,6 +193,16 @@ unsafe extern "C" {
 
     // --- FP8 per-token-group quant (shared by MLA cache, MoE, dense) ----------
     pub fn glm52_fp8_per_token_group_quant_bf16_cuda(
+        input: *const Half,
+        output: *mut u8,
+        scales: *mut f32,
+        rows: i32,
+        hidden_dim: i32,
+        group_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn glm52_fp8_per_token_group_quant_bf16_ue8m0_cuda(
         input: *const Half,
         output: *mut u8,
         scales: *mut f32,

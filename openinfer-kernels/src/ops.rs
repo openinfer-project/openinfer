@@ -26,10 +26,14 @@ pub use attention::{
 };
 #[cfg(feature = "moe")]
 pub use deepep::{
-    DeepEp, DeepEpDispatchScratch, DeepEpPrefillCounts, deepep_info, deepep_unique_id,
+    DeepEp, DeepEpAbi, DeepEpBase, DeepEpDispatchScratch, DeepEpPrefillCounts, deepep_info,
+    deepep_unique_id,
 };
 #[cfg(feature = "glm52")]
-pub use deepep::{Glm52DeepEp, glm52_deepep_info, glm52_deepep_unique_id};
+pub use deepep::{
+    Glm52DeepEp, Glm52DeepEpAbi, Glm52Ep4DeepEpAbi, Glm52Ep16DeepEpAbi, Glm52Ep32DeepEpAbi,
+    Glm52Ep64DeepEpAbi, glm52_deepep_info, glm52_ep_deepep_unique_id,
+};
 #[cfg(feature = "deepseek-v2-lite")]
 pub use deepseek_v2_lite::*;
 pub use elementwise::{

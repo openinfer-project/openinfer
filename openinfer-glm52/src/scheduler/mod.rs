@@ -55,13 +55,13 @@ use crate::model::{
     GLM52_MAX_BATCH_PER_RANK, GLM52_MODEL_LEN_ALIGN, Glm52StepKv, Glm52StepShape,
     glm52_pool_blocks, glm52_table_width,
 };
-use crate::runner::{Glm52RankWorker, Glm52StepFlags};
+use crate::runner::{Glm52StepFlags, Glm52Worker};
 
 use admission::{admit_from_queue, intake};
-use offload::VllmPdState;
-pub(crate) use offload::REMOTE_FETCH_DEADLINE;
 use graph::{GraphDumpRequest, dump_rank0_decode_graph, precapture_step_graphs};
 use load::{pending_is_empty, publish_load, running_counts};
+pub(crate) use offload::REMOTE_FETCH_DEADLINE;
+use offload::VllmPdState;
 use plan::{collect_sampling_rows, feed_wants, launch_ahead_flags, plan_step_shapes};
 use slot::{GLM52_PADDING_STEP, Glm52SlotState, Glm52StepOutcome};
 
@@ -112,7 +112,7 @@ enum SpanKind {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_dp8_coordinator(
     mut submit_rx: mpsc::UnboundedReceiver<GenerateRequest>,
-    workers: Vec<Glm52RankWorker>,
+    workers: Vec<Glm52Worker>,
     eos_token_ids: &[u32],
     dspark_enabled: bool,
     max_model_len: usize,
@@ -157,7 +157,8 @@ pub(crate) fn run_dp8_coordinator(
             .map(|engine| offload::RankOffload::new(engine, save_enabled))
             .collect()
     });
-    let mut vllm_pd = vllm_compat.map(|opts| VllmPdState::new(&opts, moe_topo.logical_rank_count()));
+    let mut vllm_pd =
+        vllm_compat.map(|opts| VllmPdState::new(&opts, moe_topo.logical_rank_count()));
     // One KV page pool per LOGICAL rank: pool block ids index the rank's
     // per-layer MLA and index-K arenas directly (the arenas were built for
     // `glm52_pool_blocks` blocks). Block 0-equivalent is the reserved
@@ -422,7 +423,6 @@ pub(crate) fn run_dp8_coordinator(
     drop(workers);
 }
 
-
 /// One lock-step step: per-rank submit — schedule each active span's KV
 /// (full-lifetime reservation makes every schedule succeed; a failure is an
 /// accounting bug and fails the step), build the row inputs, page rows and
@@ -433,7 +433,7 @@ pub(crate) fn run_dp8_coordinator(
 /// slot (`span_kinds[rank][slot]`), which the output walk pairs exactly.
 #[allow(clippy::type_complexity)]
 fn submit_and_join_step(
-    workers: &[Glm52RankWorker],
+    workers: &[Glm52Worker],
     pools: &[BlockPool],
     slots: &mut [RankSlots],
     shapes: &[Glm52StepShape],
@@ -544,7 +544,7 @@ fn submit_and_join_step(
             pages: pages.into_boxed_slice(),
             slot_mapping,
         };
-        let executors: &[Glm52RankWorker] = if mirrored {
+        let executors: &[Glm52Worker] = if mirrored {
             workers
         } else {
             std::slice::from_ref(&workers[rank])
@@ -759,7 +759,7 @@ fn apply_step_outputs(
 /// keeps the round cadence (draft sits between verify steps, ~2 ms against a
 /// 22-46 ms step).
 fn run_draft_round(
-    workers: &[Glm52RankWorker],
+    workers: &[Glm52Worker],
     slots: &mut [RankSlots],
     shapes: &[Glm52StepShape],
     pending_resets: &mut [Vec<usize>],
@@ -778,7 +778,7 @@ fn run_draft_round(
             continue;
         }
         let proposal_slots: Vec<usize> = proposals.iter().map(|&(slot, _, _)| slot).collect();
-        let executors: &[Glm52RankWorker] = if mirrored {
+        let executors: &[Glm52Worker] = if mirrored {
             workers
         } else {
             std::slice::from_ref(&workers[rank])

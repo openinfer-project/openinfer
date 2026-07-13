@@ -6,7 +6,7 @@ use openinfer_kv_cache::BlockPool;
 
 use crate::Glm52MoeTopo;
 use crate::model::{GLM52_DECODE_BUCKETS, GLM52_MAX_BATCH_PER_RANK, Glm52StepShape};
-use crate::runner::{Glm52RankWorker, Glm52StepFlags};
+use crate::runner::{Glm52StepFlags, Glm52Worker};
 
 use super::plan::padding_step_kv;
 use super::slot::GLM52_PADDING_STEP;
@@ -23,7 +23,7 @@ pub(super) type GraphDumpRequest = (
 /// pre-capturing also removes the old mid-serving capture stall. Every row
 /// is a padding write into the pool's padding page.
 pub(super) fn precapture_step_graphs(
-    workers: &[Glm52RankWorker],
+    workers: &[Glm52Worker],
     pools: &[BlockPool],
     table_width: usize,
     mirrored: bool,
@@ -81,7 +81,7 @@ pub(super) fn precapture_step_graphs(
 /// EP8 and TP4 have a true bucket-1 graph; TP8 always executes the mirrored
 /// full-bucket shape.
 pub(super) fn dump_rank0_decode_graph(
-    workers: &[Glm52RankWorker],
+    workers: &[Glm52Worker],
     moe_topo: Glm52MoeTopo,
     full_bucket: bool,
     png_path: PathBuf,
@@ -91,7 +91,11 @@ pub(super) fn dump_rank0_decode_graph(
         .context("GLM5.2 graph export requires rank 0")?;
     let bucket = graph_dump_bucket(full_bucket);
     let topology = match moe_topo {
+        Glm52MoeTopo::Ep4 => "DP4/EP4",
         Glm52MoeTopo::Ep8 => "DP8/EP8",
+        Glm52MoeTopo::Ep16 => "DP16/EP16",
+        Glm52MoeTopo::Ep32 => "DP32/EP32",
+        Glm52MoeTopo::Ep64 => "DP64/EP64",
         Glm52MoeTopo::Tp8 => "MoE TP8 · mirrored",
         Glm52MoeTopo::Tp4 => "MoE TP4 · mirrored",
     };

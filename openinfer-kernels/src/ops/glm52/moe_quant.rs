@@ -65,6 +65,40 @@ pub fn glm52_fp8_per_token_group_quant_bf16_launch(
         .map_err(|err| anyhow!("GLM5.2 FP8 per-token-group quant launch failed: {err}"))
 }
 
+/// UE8M0-scale (next power of two) per-token-group quant — the FlashMLA V3.2
+/// fp8 sparse KV-cache contract. The sm100 decode kernel truncates the stored
+/// f32 scales to e8m0 (round-toward-zero) for its block-scaled MMA, so a
+/// non-power-of-two scale is read up to 2x too small on Blackwell; sm90 reads
+/// f32 scales exactly. Power-of-two scales are exact on both. Use this for
+/// every write into the 656-byte fp8_ds_mla cache and nowhere else (the MoE
+/// and dense GEMM activations keep amax/448 scales).
+pub fn glm52_fp8_per_token_group_quant_bf16_ue8m0_launch(
+    ctx: &DeviceContext,
+    shape: Glm52MoeQuantShape,
+    input: &CudaSlice<bf16>,
+    output: &mut CudaSlice<u8>,
+    scales: &mut CudaSlice<f32>,
+) -> Result<()> {
+    validate_quant_buffers(shape, input, output, scales)?;
+    let (input_ptr, _input_guard) = input.device_ptr(&ctx.stream);
+    let (output_ptr, _output_guard) = output.device_ptr_mut(&ctx.stream);
+    let (scale_ptr, _scale_guard) = scales.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::glm52_fp8_per_token_group_quant_bf16_ue8m0_cuda(
+            input_ptr as *const ffi::Half,
+            output_ptr as *mut u8,
+            scale_ptr as *mut f32,
+            shape.rows as i32,
+            shape.width as i32,
+            shape.group_size as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result
+        .result()
+        .map_err(|err| anyhow!("GLM5.2 FP8 per-token-group UE8M0 quant launch failed: {err}"))
+}
+
 fn validate_quant_buffers(
     shape: Glm52MoeQuantShape,
     input: &CudaSlice<bf16>,

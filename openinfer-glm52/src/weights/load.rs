@@ -32,12 +32,12 @@ pub(crate) struct Glm52ExpertLayerRegions {
 }
 
 impl Glm52ExpertLayerRegions {
-    fn alloc(ctx: &Glm52RankGpuContext) -> Result<Self> {
+    fn alloc(ctx: &Glm52RankGpuContext, local_experts: usize) -> Result<Self> {
         // SAFETY: every byte of every region is written exactly once from a
         // validated safetensors view; the coverage counters below fail the
         // load if any byte is left unwritten.
         let alloc = |kind: Glm52ExpertRegionKind| -> Result<CudaSlice<u8>> {
-            unsafe { ctx.stream().alloc::<u8>(kind.region_bytes()) }
+            unsafe { ctx.stream().alloc::<u8>(kind.region_bytes(local_experts)) }
                 .with_context(|| format!("alloc GLM5.2 expert region {kind:?}"))
         };
         Ok(Self {
@@ -180,9 +180,9 @@ pub(crate) fn load_rank_weights_to_gpu(
             if let Some(placement) = expert_placement(&spec.name, &bundle.plan.expert_range)? {
                 let regions = match weights.expert_layers.entry(placement.layer) {
                     std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
-                    std::collections::btree_map::Entry::Vacant(entry) => {
-                        entry.insert(Glm52ExpertLayerRegions::alloc(ctx)?)
-                    }
+                    std::collections::btree_map::Entry::Vacant(entry) => entry.insert(
+                        Glm52ExpertLayerRegions::alloc(ctx, bundle.plan.expert_range.len())?,
+                    ),
                 };
                 let region = regions.region_mut(placement.region);
                 ensure!(
@@ -254,7 +254,7 @@ pub(crate) fn load_rank_weights_to_gpu(
     for layer in weights.expert_layers.keys() {
         for kind in Glm52ExpertRegionKind::ALL {
             let written = region_written.get(&(*layer, kind)).copied().unwrap_or(0);
-            let expected = kind.region_bytes();
+            let expected = kind.region_bytes(bundle.plan.expert_range.len());
             ensure!(
                 written == expected,
                 "GLM5.2 rank {} layer {layer} expert region {kind:?} incomplete: wrote {written} of {expected} bytes",

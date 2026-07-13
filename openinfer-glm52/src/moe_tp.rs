@@ -744,12 +744,19 @@ mod tests {
             // slice blocks 0..2 = gate blocks 2r..2r+2; 2..4 = up (same rows).
             for b in 0..4 {
                 let expect = (2 * rank + b % 2) as f32;
-                assert_eq!(read_f32(&s.w13_scale, b * 48), expect, "rank {rank} b {b}");
+                assert_eq!(
+                    read_f32(&s.w13_scale, b * 48).to_bits(),
+                    expect.to_bits(),
+                    "rank {rank} b {b}"
+                );
             }
             for row in [0usize, 47] {
                 for b in 0..2 {
                     let expect = (2 * rank + b) as f32;
-                    assert_eq!(read_f32(&s.w2_scale, row * 2 + b), expect);
+                    assert_eq!(
+                        read_f32(&s.w2_scale, row * 2 + b).to_bits(),
+                        expect.to_bits()
+                    );
                 }
             }
         }

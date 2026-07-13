@@ -14,7 +14,7 @@ use openinfer_kv_cache::BlockPool;
 use super::offload::{self, VllmAdmitOutcome, VllmPdState};
 use super::slot::Glm52SlotState;
 use super::{ActiveRequest, PAGE, RankSlots};
-use crate::runner::Glm52RankWorker;
+use crate::runner::Glm52Worker;
 
 fn validate_request(req: &GenerateRequest, max_model_len: usize) -> Result<(), String> {
     if req.prompt_tokens.is_empty() {
@@ -151,7 +151,7 @@ pub(super) fn admit_from_queue(
     usable_blocks: &[usize],
     offload: Option<&[offload::RankOffload]>,
     vllm_pd: &mut Option<VllmPdState>,
-    workers: &[Glm52RankWorker],
+    workers: &[Glm52Worker],
     mirrored: bool,
     prefix_cache_enabled: bool,
     dspark_enabled: bool,
@@ -215,17 +215,20 @@ pub(super) fn admit_from_queue(
                     // (kv-offload ⇒ EP8): each rank's executor owns the only
                     // replica of its arenas, so it alone runs the fixup. A
                     // mirrored topology would need every worker here.
-                    assert!(!mirrored, "vLLM-compat P/D admission assumes the EP topology");
+                    assert!(
+                        !mirrored,
+                        "vLLM-compat P/D admission assumes the EP topology"
+                    );
                     match offload::admit_vllm_pd(
                         pd,
                         rank,
                         &offload[rank],
                         &pools[rank],
                         &req,
-                        std::slice::from_ref(&workers[rank]),
+                        &workers[rank],
                     ) {
                         Ok(VllmAdmitOutcome::Admit { kv, cached_tokens }) => {
-                            Some((kv, cached_tokens))
+                            Some((*kv, cached_tokens))
                         }
                         Ok(VllmAdmitOutcome::Park) => {
                             pending[rank].push_front(req);
@@ -249,45 +252,43 @@ pub(super) fn admit_from_queue(
                 }
                 None => None,
             };
-            let (kv, cached_tokens) = match pd_admitted {
-                Some(admitted) => admitted,
-                None => {
-                    let mut kv =
-                        pools[rank].new_request(req.prompt_tokens.clone(), req.max_tokens, None);
-                    // Host-tier restore first, so the GPU prefix match sees the union
-                    // of HBM-resident and freshly-restored blocks. The probe stays
-                    // alive across the match to close the eviction window.
-                    let _restored_hold =
-                        offload
-                            .filter(|_| prefix_cache_enabled && vllm_pd.is_none())
-                            .map(|offload| {
-                                offload::restore_host_prefix(
-                                    &offload[rank].engine,
-                                    &pools[rank],
-                                    &req.prompt_tokens,
-                                )
+            let (kv, cached_tokens) = if let Some(admitted) = pd_admitted {
+                admitted
+            } else {
+                let mut kv =
+                    pools[rank].new_request(req.prompt_tokens.clone(), req.max_tokens, None);
+                // Host-tier restore first, so the GPU prefix match sees the union
+                // of HBM-resident and freshly-restored blocks. The probe stays
+                // alive across the match to close the eviction window.
+                let _restored_hold = offload
+                    .filter(|_| prefix_cache_enabled && vllm_pd.is_none())
+                    .map(|offload| {
+                        offload::restore_host_prefix(
+                            &offload[rank].engine,
+                            &pools[rank],
+                            &req.prompt_tokens,
+                        )
+                    });
+                let cached_tokens = if prefix_cache_enabled {
+                    match kv.match_and_add_prefix(&pools[rank]) {
+                        Ok(cached) => cached,
+                        Err(err) => {
+                            // The request is already out of `pending` and never
+                            // reaches a slot, so fail it explicitly before the
+                            // engine-fatal invariant error propagates.
+                            let err = err.context("GLM5.2 prefix match at admission");
+                            let _ = req.token_tx.send(TokenEvent::Error {
+                                message: format!("{err:#}"),
+                                prompt_tokens: req.prompt_tokens.len(),
+                                completion_tokens: 0,
                             });
-                    let cached_tokens = if prefix_cache_enabled {
-                        match kv.match_and_add_prefix(&pools[rank]) {
-                            Ok(cached) => cached,
-                            Err(err) => {
-                                // The request is already out of `pending` and never
-                                // reaches a slot, so fail it explicitly before the
-                                // engine-fatal invariant error propagates.
-                                let err = err.context("GLM5.2 prefix match at admission");
-                                let _ = req.token_tx.send(TokenEvent::Error {
-                                    message: format!("{err:#}"),
-                                    prompt_tokens: req.prompt_tokens.len(),
-                                    completion_tokens: 0,
-                                });
-                                return Err(err);
-                            }
+                            return Err(err);
                         }
-                    } else {
-                        0
-                    };
-                    (kv, cached_tokens)
-                }
+                    }
+                } else {
+                    0
+                };
+                (kv, cached_tokens)
             };
             let queued_at_unix_s = req.queued_at_unix_s.unwrap_or_else(unix_now_s);
             let _ = req.token_tx.send(TokenEvent::Scheduled {

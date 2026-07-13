@@ -54,7 +54,7 @@ fn bench_propose(
 
     let mut times_ms = Vec::with_capacity(ITERS);
     for round in 0..WARMUP + ITERS {
-        for state in states.iter_mut() {
+        for state in &mut states {
             state.append_captured_row(ctx, &captured, 0)?;
         }
         // Each round drains 1 pending row into committed, so the anchor sits
@@ -247,6 +247,7 @@ fn dspark_propose_graph_parity() -> Result<()> {
 #[test]
 #[ignore = "GPU isolation test — needs a CUDA device with ~11 GB free VRAM"]
 fn dspark_propose_batched_slot_isolation() -> Result<()> {
+    type SlotDrafts = Vec<[u32; GLM52_DSPARK_DRAFTS]>;
     const ROUNDS: usize = 6;
     let _env = ENV_LOCK.lock().unwrap();
     let ctx = DeviceContext::new()?;
@@ -277,12 +278,7 @@ fn dspark_propose_batched_slot_isolation() -> Result<()> {
     };
     let cap_a = captured_row(3)?;
 
-    let run = |cap_b_salt: u32,
-               anchor_b_base: u32|
-     -> Result<(
-        Vec<[u32; GLM52_DSPARK_DRAFTS]>,
-        Vec<[u32; GLM52_DSPARK_DRAFTS]>,
-    )> {
+    let run = |cap_b_salt: u32, anchor_b_base: u32| -> Result<(SlotDrafts, SlotDrafts)> {
         let cap_b = captured_row(cap_b_salt)?;
         let mut scratch = Glm52DsparkScratch::new(&ctx, cache_len)?;
         let mut a = Glm52DsparkSlotState::new(&ctx, cache_len)?;

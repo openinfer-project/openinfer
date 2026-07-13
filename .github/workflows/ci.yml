@@ -249,8 +249,20 @@ jobs:
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libibverbs-dev
 
+      # Clippy lints only the packages named here; dependencies are compiled, not linted.
+      # openinfer-cupti is out: building it needs CUPTI headers the toolkit above omits.
       - name: Run Qwen3 CUDA Clippy
-        run: cargo clippy --release --locked -p openinfer-server --all-targets -- -D warnings
+        run: >-
+          cargo clippy --release --locked
+          -p openinfer-server
+          -p openinfer-qwen3
+          -p openinfer-core
+          -p openinfer-kernels
+          -p openinfer-kv-cache
+          -p openinfer-kv-offload
+          -p openinfer-sample
+          -p openinfer-bench
+          --all-targets -- -D warnings
         env:
           CUDA_PATH: /usr/local/cuda
           OPENINFER_CUDA_SM: "80"

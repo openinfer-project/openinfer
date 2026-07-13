@@ -66,6 +66,16 @@ struct Cli {
     /// bucket-8-with-pads.
     #[arg(long, default_value = "ep8")]
     moe_topo: String,
+    /// Remote rank-host nodes, comma-separated `host:port=ranks` — same
+    /// contract as the server flag (EP topologies only; remote ranks come
+    /// after the local ones).
+    #[arg(long, value_delimiter = ',')]
+    rank_hosts: Vec<String>,
+    /// Override the VRAM-derived per-request context cap — same contract as
+    /// the server flag. Wide-EP topologies need this until the context-cap
+    /// ledger accounts for width-scaled DeepEP buffers.
+    #[arg(long)]
+    max_model_len: Option<usize>,
 }
 
 const GLM52_RANKS: usize = 8;
@@ -82,11 +92,7 @@ fn main() -> Result<()> {
              logical rank); pass --buckets values in 1..={GLM52_RANKS}"
         );
     }
-    let (tp_size, dp_size) = match moe_topo {
-        openinfer_glm52::Glm52MoeTopo::Ep8 => (1, GLM52_RANKS),
-        openinfer_glm52::Glm52MoeTopo::Tp8 => (1, GLM52_RANKS),
-        openinfer_glm52::Glm52MoeTopo::Tp4 => (4, 1),
-    };
+    let (tp_size, dp_size) = (moe_topo.expected_tp_size(), moe_topo.default_dp_size());
     ensure!(
         cli.steps > cli.warmup_steps + 8,
         "--steps ({}) must exceed --warmup-steps ({}) with room for a steady window",
@@ -101,11 +107,17 @@ fn main() -> Result<()> {
             tp_size,
             dp_size,
             dspark_draft_model_path: None,
-            max_model_len: None,
+            max_model_len: cli.max_model_len,
             no_prefix_cache: false,
             kv_offload: None,
             moe_topo,
             dump_graph_png: None,
+            rank_hosts: cli
+                .rank_hosts
+                .iter()
+                .map(|spec| spec.parse())
+                .collect::<Result<Vec<_>>>()
+                .context("--rank-hosts")?,
         },
     )
     .context("failed to start GLM5.2 engine")?;
@@ -215,7 +227,10 @@ fn bench_concurrency(bucket: usize, moe_topo: openinfer_glm52::Glm52MoeTopo) -> 
         // compact bs=1 shape (the PR's headline latency) is directly iterable.
         bucket
     } else {
-        GLM52_RANKS * bucket
+        // One stream per (logical DP rank, slot): more would make the
+        // scheduler run a LARGER per-rank bucket than the label says (EP4
+        // has 4 logical ranks, not the EP8 constant).
+        moe_topo.default_dp_size() * bucket
     }
 }
 

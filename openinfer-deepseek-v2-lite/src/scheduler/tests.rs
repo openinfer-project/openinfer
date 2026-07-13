@@ -273,10 +273,11 @@ fn send_scheduled_returns_trace_when_client_is_closed() {
     let scheduled = send_scheduled(&pending).expect_err("send should fail");
 
     assert_eq!(
-        scheduled.queued_at_unix_s,
+        scheduled.queued_at_unix_s.to_bits(),
         pending
             .queued_at_unix_s
             .unwrap_or(scheduled.scheduled_at_unix_s)
+            .to_bits()
     );
     assert!(scheduled.scheduled_at_unix_s > 0.0);
 }
@@ -394,7 +395,7 @@ fn batch_decode_error_retires_all_active_requests() {
     ];
 
     let mut active_remaining = 2;
-    retire_rows_with_error(active, "batch failed".to_string(), &mut active_remaining, 0);
+    retire_rows_with_error(active, "batch failed", &mut active_remaining, 0);
     assert_eq!(active_remaining, 0);
 
     match recv_event(&mut first_rx) {
@@ -434,12 +435,7 @@ fn subgroup_decode_error_retires_only_group_rows() {
     let third = active_state("third", third_tx, 3, 2, 13, &config);
 
     let mut active_remaining = 3;
-    retire_rows_with_error(
-        vec![first, third],
-        "group failed".to_string(),
-        &mut active_remaining,
-        0,
-    );
+    retire_rows_with_error(vec![first, third], "group failed", &mut active_remaining, 0);
     assert_eq!(active_remaining, 1);
 
     match recv_event(&mut first_rx) {
@@ -466,7 +462,7 @@ fn cross_group_terminal_accounting_uses_shared_active_remaining() {
     let mut active_remaining = 3;
     retire_rows_with_error(
         vec![first, second],
-        "group failed".to_string(),
+        "group failed",
         &mut active_remaining,
         0,
     );

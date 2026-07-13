@@ -34,7 +34,16 @@ __device__ __forceinline__ unsigned char quantize_e4m3(float value,
 // value goes to the fixed-stride masked row and the scale to the mn-major
 // TMA layout [g, scale_cols, masked_cap] the GEMM's SFA descriptor reads —
 // no separate scale-relayout kernel.
-template <bool kMasked>
+//
+// kUe8m0 rounds the group scale UP to the next power of two (exact bit
+// manipulation, no log2f rounding hazard). This is the FlashMLA V3.2 fp8
+// sparse KV-cache contract: the sm100 decode kernel converts the stored f32
+// scales to e8m0 with round-toward-zero for the tcgen05 block-scaled MMA
+// (upstream tests/quant.py `_cast_scale_inv_to_ue8m0`), so a non-power-of-two
+// scale is silently truncated — up to 2x too small — on Blackwell, while
+// sm90 reads the f32 scale exactly. Power-of-two scales make both archs read
+// the identical value.
+template <bool kMasked, bool kUe8m0 = false>
 __global__ void fp8_per_token_group_quant_bf16_k128_kernel(
     const __nv_bfloat16* __restrict__ input,
     unsigned char* __restrict__ output, float* __restrict__ scales, int rows,
@@ -74,7 +83,13 @@ __global__ void fp8_per_token_group_quant_bf16_k128_kernel(
     }
 
     if (tid == 0) {
-      shared[0] = fmaxf(shared[0], kPerTokenGroupQuantEps) / kFp8Max;
+      float s = fmaxf(shared[0], kPerTokenGroupQuantEps) / kFp8Max;
+      if constexpr (kUe8m0) {
+        // Next power of two >= s: bump the mantissa into the exponent field.
+        // s is always positive, normal, and far from f32 max here.
+        s = __uint_as_float((__float_as_uint(s) + 0x007FFFFFu) & 0x7F800000u);
+      }
+      shared[0] = s;
       if constexpr (kMasked) {
         const int g = out_row / masked_cap;
         const int r_local = out_row % masked_cap;
@@ -195,6 +210,25 @@ CUresult glm52_fp8_per_token_group_quant_bf16_cuda(
 
   dim3 grid(row_grid(rows), hidden_dim / kGroupSize, 1);
   fp8_per_token_group_quant_bf16_k128_kernel<false>
+      <<<grid, kGroupSize, 0, stream>>>(input, output, scales, rows,
+                                        hidden_dim, nullptr, nullptr, 0);
+  return consume_last_cuda_error();
+}
+
+// UE8M0-scale variant for the FlashMLA fp8 sparse KV cache (see the kernel
+// comment: sm100 truncates stored scales to powers of two).
+CUresult glm52_fp8_per_token_group_quant_bf16_ue8m0_cuda(
+    const __nv_bfloat16* input, unsigned char* output, float* scales, int rows,
+    int hidden_dim, int group_size, cudaStream_t stream) {
+  if (input == nullptr || output == nullptr || scales == nullptr) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  if (!valid_quant_shape(rows, hidden_dim, group_size)) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+
+  dim3 grid(row_grid(rows), hidden_dim / kGroupSize, 1);
+  fp8_per_token_group_quant_bf16_k128_kernel<false, true>
       <<<grid, kGroupSize, 0, stream>>>(input, output, scales, rows,
                                         hidden_dim, nullptr, nullptr, 0);
   return consume_last_cuda_error();

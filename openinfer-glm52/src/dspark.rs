@@ -696,9 +696,9 @@ impl Glm52DsparkModel {
                 context_projection!();
                 for l in 0..DSPARK_LAYERS {
                     layer_prolog!(l);
-                    for i in 0..active {
-                        state_prep!(l, i, &mut *states[i]);
-                        state_dynamic!(l, i, &mut *states[i]);
+                    for (i, state) in states.iter_mut().enumerate().take(active) {
+                        state_prep!(l, i, &mut **state);
+                        state_dynamic!(l, i, &mut **state);
                     }
                     layer_tail!(l);
                 }

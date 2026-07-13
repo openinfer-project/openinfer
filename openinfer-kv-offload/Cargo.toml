@@ -14,6 +14,9 @@ edition = "2024"
 # cuda-12090 + nvrtc + runtime, which covers pegaflow-core and
 # pegaflow-transfer. `rdma` enables pegaflow-transfer: cross-node block fetch
 # (RDMA READ) + MetaServer discovery — the P/D disaggregation data plane.
+# Do not advance to the merged PR #395 revision alone: this branch is stacked
+# on OpenInfer #540, whose split-host K/V restore also requires Pegaflow #382.
+# The next pin must be a merged master revision containing both changes.
 pegaflow-core = { git = "https://github.com/novitalabs/pegaflow.git", rev = "d46fd1653154f3f895ff23e995b6efbf4e3e1e9a", default-features = false, features = ["rdma"] }
 openinfer-kv-cache = { workspace = true }
 cudarc = { workspace = true }

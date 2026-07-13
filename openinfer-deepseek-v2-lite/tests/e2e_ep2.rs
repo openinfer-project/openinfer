@@ -635,13 +635,18 @@ fn run_mixed_serving_generation(model_path: &Path, model_path_label: &str) -> Re
         "mixed-serving output drift on {model_path_label}: actual={actual:?} expected={expected:?}"
     );
 
-    run_mixed_serving_position_fallback(&handle, fallback_encoded, fallback_expected, &mut actual)?;
+    run_mixed_serving_position_fallback(
+        &handle,
+        fallback_encoded,
+        &fallback_expected,
+        &mut actual,
+    )?;
 
     run_mixed_serving_rejection_isolation(
         &handle,
         isolation_id,
         isolation_prompt_tokens,
-        isolation_expected.tokens,
+        &isolation_expected.tokens,
         isolation_expected.finish_reason,
         &mut actual,
     )?;
@@ -673,7 +678,7 @@ fn run_mixed_serving_generation(model_path: &Path, model_path_label: &str) -> Re
 fn run_mixed_serving_position_fallback(
     handle: &openinfer_engine::engine::EngineHandle,
     encoded_cases: Vec<(String, Vec<u32>, usize, bool)>,
-    expected: Vec<(String, Vec<u32>, FinishReason)>,
+    expected: &[(String, Vec<u32>, FinishReason)],
     actual: &mut Vec<(String, Vec<u32>, FinishReason)>,
 ) -> Result<()> {
     let mut requests = Vec::with_capacity(encoded_cases.len());
@@ -744,7 +749,7 @@ fn run_mixed_serving_rejection_isolation(
     handle: &openinfer_engine::engine::EngineHandle,
     valid_id: &str,
     valid_prompt_tokens: Vec<u32>,
-    expected_tokens: Vec<u32>,
+    expected_tokens: &[u32],
     expected_finish_reason: FinishReason,
     actual: &mut Vec<(String, Vec<u32>, FinishReason)>,
 ) -> Result<()> {

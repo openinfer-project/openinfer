@@ -188,12 +188,29 @@ pub(crate) struct Args {
 
     /// GLM5.2 launch-time MoE sharding topology: `ep8` (default) is the
     /// high-throughput configuration (32 whole experts per rank, DeepEP
-    /// dispatch/combine, buckets 1-8); `tp8` is the low-latency
+    /// dispatch/combine, buckets 1-8); `ep4` is its four-GPU counterpart
+    /// (64 whole experts per rank, weight-only expert GEMMs — the GB300
+    /// high-throughput topology); `tp8` is the low-latency
     /// configuration (1/8-intermediate slice of ALL experts per rank on
     /// every MoE layer, bucket-1 only — at most one request per rank);
-    /// `tp4` is the GB300 four-GPU bring-up topology.
+    /// `tp4` is the GB300 four-GPU low-latency topology.
     #[arg(long, default_value = "ep8")]
     pub moe_topo: String,
+
+    /// GLM5.2 remote rank-host nodes for cross-node EP, comma-separated
+    /// `host:port=ranks` (e.g. `10.13.84.7:19000=4`). Each node contributes
+    /// its ranks AFTER this process's local ranks, in list order; the total
+    /// must equal the topology's rank count. Start the remote side with
+    /// `--glm52-rank-host`.
+    #[arg(long, value_delimiter = ',')]
+    pub rank_hosts: Vec<String>,
+
+    /// Serve as a GLM5.2 rank-host on this listen address (e.g.
+    /// `0.0.0.0:19000`) instead of running an engine: a coordinator started
+    /// with `--rank-hosts` connects and drives this node's GPUs. No HTTP
+    /// frontend, no scheduler — a dumb worker shell.
+    #[arg(long)]
+    pub glm52_rank_host: Option<String>,
 
     /// Fraction of total GPU memory the Qwen3 instance may use. The KV cache is
     /// sized from this budget after startup profiling accounts for weights,
@@ -303,6 +320,7 @@ fn consumed_args(model_type: ModelType) -> &'static [&'static str] {
             "kv_pd_allow_local_prefill",
             "moe_topo",
             "dump_graph_png",
+            "rank_hosts",
         ],
         #[cfg(feature = "kimi-k2")]
         ModelType::KimiK2 => &["tp_size", "dp_size", "ep_backend", "cuda_graph"],
@@ -557,8 +575,14 @@ fn parse_pythonhashseed(s: &str) -> Result<String, String> {
 
 /// A pegaflow namespace digest: exactly 8 lowercase hex chars.
 fn parse_pegaflow_namespace(s: &str) -> Result<String, String> {
-    if s.len() != 8 || !s.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) {
-        return Err(format!("namespace must be an 8-char lowercase hex digest, got {s:?}"));
+    if s.len() != 8
+        || !s
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return Err(format!(
+            "namespace must be an 8-char lowercase hex digest, got {s:?}"
+        ));
     }
     Ok(s.to_string())
 }
@@ -806,6 +830,25 @@ mod tests {
         let error = args
             .validate(ModelType::Glm52, &provided)
             .expect_err("GLM5.2 should reject an unknown topology string");
-        assert!(error.to_string().contains("ep8, tp8, or tp4"));
+        assert!(error.to_string().contains("ep8, ep4, tp8, or tp4"));
+    }
+
+    #[cfg(feature = "glm52")]
+    #[test]
+    fn glm52_accepts_ep4_default_dp4() {
+        let (args, provided) = parse_with_provided(&["openinfer", "--moe-topo", "ep4"]);
+        args.validate(ModelType::Glm52, &provided)
+            .expect("GLM5.2 EP4 should default to DP4 with --tp-size=1");
+    }
+
+    #[cfg(feature = "glm52")]
+    #[test]
+    fn glm52_ep4_rejects_non_dp4() {
+        let (args, provided) =
+            parse_with_provided(&["openinfer", "--moe-topo", "ep4", "--dp-size", "8"]);
+        let error = args
+            .validate(ModelType::Glm52, &provided)
+            .expect_err("GLM5.2 EP4 should reject explicit non-DP4");
+        assert!(error.to_string().contains("--dp-size=4"));
     }
 }

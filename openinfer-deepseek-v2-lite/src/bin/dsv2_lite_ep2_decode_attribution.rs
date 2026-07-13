@@ -130,7 +130,7 @@ fn main() -> Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
         }
-        fs::write(&path, format!("{text}\n"))
+        fs::write(path, format!("{text}\n"))
             .with_context(|| format!("write {}", path.display()))?;
         eprintln!("wrote {}", path.display());
     }

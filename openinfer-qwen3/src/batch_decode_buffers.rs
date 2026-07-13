@@ -251,9 +251,9 @@ pub(crate) struct BatchDecodeBuffers {
     /// `split_chunk_size`).
     max_context_tokens: usize,
 
-    /// `NumericPolicy` at construction; asserted unchanged at `batch_decode` entry. The split-KV
-    /// workspace is sized for it and decode graphs are keyed `(bucket, attention_path)` without it, so a
-    /// later switch would overflow the workspace or replay a stale graph — the policy-key-trap.
+    /// `NumericPolicy` snapshot at construction, asserted unchanged at `batch_decode` entry. Sizes the
+    /// split-KV workspace and feeds `attention_path`, so a later switch would overflow the workspace or
+    /// replay a stale `(bucket, path)` graph — the policy-key-trap.
     pub(crate) policy_at_construction: NumericPolicy,
 
     /// Padding page index for bucket CUDA Graph. Padding slots point here.
@@ -288,8 +288,19 @@ impl BatchDecodeBuffers {
         // One construction-time policy snapshot sizes the split-KV workspace and is recorded in
         // `policy_at_construction`; the `batch_decode` entry assert holds the live policy to it.
         let policy = numeric_policy();
-        let max_split_slots =
-            bs.min(SPLIT_KV_MAX_BATCH_SIZE) * split_kv_config(policy).max_chunks_per_request;
+        // Pin/PerToken pin SplitKv for every bucket, so the workspace must cover the full
+        // max batch, not just Tuned's `<= SPLIT_KV_MAX_BATCH_SIZE` cap.
+        let split_batch_cap = match policy {
+            NumericPolicy::Pin | NumericPolicy::PerToken => bs,
+            NumericPolicy::Tuned => bs.min(SPLIT_KV_MAX_BATCH_SIZE),
+        };
+        let max_split_slots = split_batch_cap * split_kv_config(policy).max_chunks_per_request;
+        if matches!(policy, NumericPolicy::Pin | NumericPolicy::PerToken) {
+            log::info!(
+                "batch-invariant decode: attention pinned to SplitKv for every bucket; \
+                 split-KV workspace sized for max batch {bs}"
+            );
+        }
         // The concatenated page-index list is counted by reference, not by
         // physical block: prefix-cached blocks are shared, so N views holding
         // the same cached prefix each list those page ids again. Sizing this
@@ -460,9 +471,12 @@ impl BatchDecodeBuffers {
         {
             self.synced_split_kv = None;
         }
-        // Past the batch cap the step always takes the non-partitioned path
-        // (see attention_path), and the workspace has no slots for it anyway.
-        if padded_bs > SPLIT_KV_MAX_BATCH_SIZE {
+        // Tuned skips split metadata past the cap (NonPartition); Pin/PerToken build the CSR for
+        // every bucket. The construction snapshot here and the live-policy `split_chunk_size`/
+        // `max_split_chunks` below are held equal by the `batch_decode` entry assert, so the CSR fits.
+        if padded_bs > SPLIT_KV_MAX_BATCH_SIZE
+            && matches!(self.policy_at_construction, NumericPolicy::Tuned)
+        {
             return Ok(());
         }
         let split_chunk_size = self.split_chunk_size();
@@ -490,7 +504,13 @@ impl BatchDecodeBuffers {
         Ok(())
     }
 
-    pub(crate) fn attention_path(padded_bs: usize) -> DecodeAttentionPath {
+    /// Decode attention kernel. Tuned selects on batch (SplitKv fills the SMs below the cap,
+    /// NonPartition above). Pin/PerToken pin SplitKv for every bucket so it never varies with
+    /// co-batched load — the chunk count is already request-local (`pin_chunk_size`).
+    pub(crate) fn attention_path(padded_bs: usize, policy: NumericPolicy) -> DecodeAttentionPath {
+        if matches!(policy, NumericPolicy::Pin | NumericPolicy::PerToken) {
+            return DecodeAttentionPath::SplitKv;
+        }
         if padded_bs <= SPLIT_KV_MAX_BATCH_SIZE {
             DecodeAttentionPath::SplitKv
         } else {

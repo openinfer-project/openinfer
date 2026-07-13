@@ -110,15 +110,12 @@ pub fn start_with_capacity(
         })
         .expect("failed to spawn Qwen3.5 scheduler thread");
 
-    let startup = match startup_rx.recv() {
-        Ok(startup) => startup,
-        Err(_) => {
-            let panic_note = match join_handle.join() {
-                Err(panic) => format!(" (thread panicked: {})", panic_message(panic.as_ref())),
-                Ok(()) => String::new(),
-            };
-            anyhow::bail!("Qwen3.5 scheduler exited during startup{panic_note}");
-        }
+    let Ok(startup) = startup_rx.recv() else {
+        let panic_note = match join_handle.join() {
+            Err(panic) => format!(" (thread panicked: {})", panic_message(panic.as_ref())),
+            Ok(()) => String::new(),
+        };
+        anyhow::bail!("Qwen3.5 scheduler exited during startup{panic_note}");
     };
     if let Err(err) = startup {
         let _ = join_handle.join();
@@ -348,7 +345,7 @@ fn prefill_batch(
     // Scope the borrows of `chunk` to the executor call so the error path can
     // move `chunk` into `fail_chunk`.
     let result = {
-        let window_refs: Vec<&[u32]> = chunk.windows.iter().map(|w| w.as_slice()).collect();
+        let window_refs: Vec<&[u32]> = chunk.windows.iter().map(Vec::as_slice).collect();
         let mut rec_refs: Vec<&mut RecurrentState> = chunk.recs.iter_mut().collect();
         model.batch_prefill_logits(&window_refs, &mut chunk.kvs, &mut rec_refs)
     };
@@ -435,7 +432,7 @@ fn unified_step_sched(
     // Scope the borrows of `chunk` / `active` to the executor call so the error
     // and decode-processing paths can use them afterwards.
     let result = {
-        let window_refs: Vec<&[u32]> = chunk.windows.iter().map(|w| w.as_slice()).collect();
+        let window_refs: Vec<&[u32]> = chunk.windows.iter().map(Vec::as_slice).collect();
         let mut rec_refs: Vec<&mut RecurrentState> = chunk.recs.iter_mut().collect();
         let decode_tokens: Vec<u32> = active.iter().map(|r| r.last_token).collect();
         let mut decode_kv_refs: Vec<&mut KvState> = active.iter_mut().map(|r| &mut r.kv).collect();

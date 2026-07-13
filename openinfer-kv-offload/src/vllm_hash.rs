@@ -103,19 +103,19 @@ fn write_head(out: &mut Vec<u8>, major: u8, value: u64) {
     match value {
         0..=23 => out.push(m | value as u8),
         24..=0xff => {
-            out.push(m | 24);
+            out.push(m | 0x18);
             out.push(value as u8);
         }
         0x100..=0xffff => {
-            out.push(m | 25);
+            out.push(m | 0x19);
             out.extend_from_slice(&(value as u16).to_be_bytes());
         }
         0x1_0000..=0xffff_ffff => {
-            out.push(m | 26);
+            out.push(m | 0x1a);
             out.extend_from_slice(&(value as u32).to_be_bytes());
         }
         _ => {
-            out.push(m | 27);
+            out.push(m | 0x1b);
             out.extend_from_slice(&value.to_be_bytes());
         }
     }
@@ -130,7 +130,13 @@ mod tests {
     // See docs/models/glm52/pd-vllm-prefill.md §3.
 
     fn hex(bytes: &[u8]) -> String {
-        bytes.iter().map(|b| format!("{b:02x}")).collect()
+        use std::fmt::Write as _;
+
+        let mut encoded = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        encoded
     }
 
     #[test]

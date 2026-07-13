@@ -163,7 +163,10 @@ struct ParkedFront {
 pub(super) enum VllmAdmitOutcome {
     /// All peer-prefilled positions restored; exactly one token (the router-
     /// appended first generated token) remains to forward.
-    Admit { kv: RequestKv, cached_tokens: usize },
+    Admit {
+        kv: Box<RequestKv>,
+        cached_tokens: usize,
+    },
     /// Remote KV not fully visible yet — leave the request at the queue
     /// front and retry at the next step boundary.
     Park,
@@ -193,14 +196,10 @@ impl VllmPdState {
         // peer's startup config.
         log::info!(
             "GLM5.2 vLLM-compat P/D active: seed={} namespace={} block_size={PAGE} \
-             none_hash={} miss_wait={:?} allow_local_prefill={}",
+             none_hash={:032x} miss_wait={:?} allow_local_prefill={}",
             opts.python_hash_seed,
             opts.namespace,
-            hasher
-                .none_hash()
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>(),
+            u128::from_be_bytes(hasher.none_hash()),
             opts.miss_wait,
             opts.allow_local_prefill,
         );
@@ -227,12 +226,12 @@ impl VllmPdState {
             // duplicate or reused external id would cross-consume another
             // request's fetch or inherit its 5-minute blacklist entry.
             let query_key = format!("glm52-pd-{}", QUERY_SEQ.fetch_add(1, Ordering::Relaxed));
-            let (miss_wait, fetch_wait) =
-                if self.consecutive_miss_windows >= MISS_BREAKER_THRESHOLD {
-                    (BREAKER_PROBE_WINDOW, BREAKER_PROBE_WINDOW)
-                } else {
-                    (self.miss_wait, REMOTE_FETCH_DEADLINE)
-                };
+            let (miss_wait, fetch_wait) = if self.consecutive_miss_windows >= MISS_BREAKER_THRESHOLD
+            {
+                (BREAKER_PROBE_WINDOW, BREAKER_PROBE_WINDOW)
+            } else {
+                (self.miss_wait, REMOTE_FETCH_DEADLINE)
+            };
             self.parked[rank] = Some(ParkedFront {
                 fingerprint,
                 query_key,
@@ -256,19 +255,19 @@ impl VllmPdState {
     }
 }
 
-/// Deinterleave the RoPE dims of freshly-restored pages on every executor
-/// holding an arena replica. Blocking, but called only at step boundaries
-/// where the workers' command queues are idle.
-fn vllm_rope_fixup(
-    workers: &[crate::runner::Glm52RankWorker],
-    pages: &[i32],
-) -> anyhow::Result<()> {
-    for worker in workers {
-        worker
+/// Deinterleave the RoPE dims of freshly-restored pages on their owning rank.
+/// Blocking, but called only at step boundaries where its command queue is
+/// idle. P/D is restricted to EP8, so each arena has exactly one executor.
+fn vllm_rope_fixup(worker: &crate::runner::Glm52Worker, pages: &[i32]) -> anyhow::Result<()> {
+    match worker {
+        crate::runner::Glm52Worker::Local(worker) => worker
             .vllm_rope_fixup(pages.to_vec())
-            .context("restored page rope fixup")?;
+            .context("restored page rope fixup"),
+        crate::runner::Glm52Worker::Remote(worker) => anyhow::bail!(
+            "GLM5.2 vLLM RoPE fixup cannot run on remote rank {}",
+            worker.rank()
+        ),
     }
-    Ok(())
 }
 
 /// vLLM-compat P/D admission for one rank's front request. The router
@@ -286,7 +285,7 @@ pub(super) fn admit_vllm_pd(
     offload: &RankOffload,
     pool: &BlockPool,
     req: &GenerateRequest,
-    fixup_workers: &[crate::runner::Glm52RankWorker],
+    fixup_worker: &crate::runner::Glm52Worker,
 ) -> anyhow::Result<VllmAdmitOutcome> {
     let prompt = &req.prompt_tokens;
     // Positions the peer prefilled: everything but the router-appended token.
@@ -325,9 +324,8 @@ pub(super) fn admit_vllm_pd(
                     // with full deadlines on its next attempt instead of
                     // feeding the breaker forever.
                     state.consecutive_miss_windows = 0;
-                    match pool.reserve_loaded_blocks(hit.num_blocks) {
-                        Some(reservation) => match offload.engine.load(lease, reservation.page_ids())
-                        {
+                    if let Some(reservation) = pool.reserve_loaded_blocks(hit.num_blocks) {
+                        match offload.engine.load(lease, reservation.page_ids()) {
                             Ok(handle) => {
                                 // After the H2D lands, rewrite the pages'
                                 // RoPE dims from the peer's interleaved
@@ -338,7 +336,7 @@ pub(super) fn admit_vllm_pd(
                                     .wait()
                                     .map_err(|err| anyhow::anyhow!("remote KV load: {err}"))
                                     .and_then(|()| {
-                                        vllm_rope_fixup(fixup_workers, &reservation.page_ids())
+                                        vllm_rope_fixup(fixup_worker, &reservation.page_ids())
                                     });
                                 match landed {
                                     Ok(()) => pool.commit_loaded_blocks(&mut probe, reservation),
@@ -349,16 +347,16 @@ pub(super) fn admit_vllm_pd(
                             }
                             Err(err) => {
                                 offload.engine.release_query_lease(lease);
-                                shortfall =
-                                    Some(Shortfall::Broken(format!("remote KV load submit: {err}")));
+                                shortfall = Some(Shortfall::Broken(format!(
+                                    "remote KV load submit: {err}"
+                                )));
                             }
-                        },
-                        None => {
-                            // Pool pressure: in-flight release saves free pages
-                            // within a few steps — a wait, not a failure.
-                            offload.engine.release_query_lease(lease);
-                            shortfall = Some(Shortfall::Racing);
                         }
+                    } else {
+                        // Pool pressure: in-flight release saves free pages
+                        // within a few steps — a wait, not a failure.
+                        offload.engine.release_query_lease(lease);
+                        shortfall = Some(Shortfall::Racing);
                     }
                 }
                 Some(lease) => {
@@ -421,9 +419,7 @@ pub(super) fn admit_vllm_pd(
                                     let landed = handle
                                         .wait()
                                         .map_err(|err| anyhow::anyhow!("tail KV load: {err}"))
-                                        .and_then(|()| {
-                                            vllm_rope_fixup(fixup_workers, &[tail_page])
-                                        });
+                                        .and_then(|()| vllm_rope_fixup(fixup_worker, &[tail_page]));
                                     match landed {
                                         Ok(()) => {
                                             kv.apply_prefill_chunk(pool)?;
@@ -431,8 +427,7 @@ pub(super) fn admit_vllm_pd(
                                         }
                                         Err(err) => {
                                             kv.revert_schedule()?;
-                                            shortfall =
-                                                Some(Shortfall::Broken(format!("{err:#}")));
+                                            shortfall = Some(Shortfall::Broken(format!("{err:#}")));
                                         }
                                     }
                                 }
@@ -474,7 +469,10 @@ pub(super) fn admit_vllm_pd(
              (gpu_hit={gpu_hit} pulled={window} tail={tail_len}, parked {parked_for:?})",
             prompt.len(),
         );
-        return Ok(VllmAdmitOutcome::Admit { kv, cached_tokens });
+        return Ok(VllmAdmitOutcome::Admit {
+            kv: Box::new(kv),
+            cached_tokens,
+        });
     }
     drop(kv); // release matched/loaded holdings before parking or rejecting
 
@@ -659,8 +657,14 @@ mod tests {
             (parked.query_key.clone(), parked.parked_at)
         };
         let parked = state.parked_front(0, &req);
-        assert_eq!(parked.query_key, first_key, "retries must poll the same fetch");
-        assert_eq!(parked.parked_at, first_at, "retries must not extend the window");
+        assert_eq!(
+            parked.query_key, first_key,
+            "retries must poll the same fetch"
+        );
+        assert_eq!(
+            parked.parked_at, first_at,
+            "retries must not extend the window"
+        );
     }
 
     #[test]

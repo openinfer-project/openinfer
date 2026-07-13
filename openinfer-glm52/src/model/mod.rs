@@ -44,7 +44,7 @@ use crate::layer::{Glm52DecodeStep, Glm52DecoderLayerWeights, Glm52LayerCaches};
 use crate::mla_decode::{
     Glm52MlaSchedMetadata, glm52_mla_backend_preflight, glm52_select_mla_backend,
 };
-use crate::moe_ep8::Glm52MoeEp8State;
+use crate::moe_ep_wo::Glm52MoeEpState;
 use crate::moe_tp::Glm52MoeTpRank;
 use crate::scratch::Glm52DecodeScratch;
 use crate::weights::{Glm52RankGpuWeights, retype_owned};
@@ -165,7 +165,7 @@ const _: () = assert!(GLM52_MAX_BATCH_PER_RANK <= 32);
 /// a step, a later row of a span attends to the earlier rows' KV through the
 /// cache: per layer every row's cache write lands before any row's attention
 /// launches, and row `k`'s `seq_len` admits exactly the positions before it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Glm52StepShape {
     pub(crate) bucket: usize,
     pub(crate) slots: [u8; GLM52_MAX_BATCH_PER_RANK],
@@ -181,7 +181,7 @@ pub(crate) struct Glm52StepShape {
 /// attention/indexer walk. Uploaded by the step prologue into the bucket's
 /// device block table / slot mapping (the captured graphs read only those
 /// device buffers — a page's physical id is data, never baked).
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Glm52StepKv {
     /// `[bucket, table_width]` row-major page ids. Row `r` holds the pages
     /// covering its request's KV through this step (span rows repeat their
@@ -257,6 +257,10 @@ pub(crate) struct Glm52RankModel {
     /// Token stride of this rank's MLA arena. FlashMLA fp8_ds_mla uses 656
     /// bytes; TP4 FlashInfer uses the standard 576-byte E4M3 layout.
     mla_cache_bytes_per_token: usize,
+    /// EP rank count of the launch topology (8 for EP8, 4 for EP4, 1 for the
+    /// tensor-replicated topologies): the factor between a step's per-rank
+    /// bucket and the MoE collectives' agreed `global_tokens`.
+    ep_ranks: usize,
     /// Built with `--moe-topo tp`: every MoE arm is `MoeTp`, bucket-8
     /// steps are span steps (all 8 rows one owner rank), and the
     /// coordinator must stage the span owner on every such step.
@@ -709,6 +713,7 @@ impl Glm52RankModel {
             table_width,
             max_model_len,
             mla_cache_bytes_per_token,
+            ep_ranks: moe_topo.expected_ep_size(),
             slot_mapping: ctx.stream.alloc_zeros::<i64>(batch)?,
             seq_lens: ctx.stream.alloc_zeros::<i32>(batch)?,
             cos_table: DeviceMatrix {
@@ -762,7 +767,7 @@ impl Glm52RankModel {
         &mut self,
         ctx: &DeviceContext,
         aux: &DeviceContext,
-        ep8: Option<&mut Glm52MoeEp8State>,
+        ep8: Option<&mut Glm52MoeEpState>,
         tp: Option<&mut Glm52MoeTpRank>,
         inputs: &[(u32, usize); GLM52_MAX_BATCH_PER_RANK],
         shape: Glm52StepShape,
@@ -918,7 +923,7 @@ impl Glm52RankModel {
         &mut self,
         ctx: &DeviceContext,
         aux: &DeviceContext,
-        ep8: Option<&mut Glm52MoeEp8State>,
+        ep8: Option<&mut Glm52MoeEpState>,
         mut tp: Option<&mut Glm52MoeTpRank>,
         inputs: &[(u32, usize); GLM52_MAX_BATCH_PER_RANK],
         shape: Glm52StepShape,
@@ -1042,7 +1047,9 @@ impl Glm52RankModel {
         };
         // Every rank must pass the same global token count into the MoE
         // collectives — guaranteed by the coordinator agreeing the bucket.
-        let global_tokens = crate::weights::GLM52_EP_RANKS * batch;
+        // (`ep_ranks` is 1 on tensor-replicated topologies, where the value
+        // is never consumed.)
+        let global_tokens = self.ep_ranks * batch;
 
         let s = &mut bucket.scratch;
         let decode_lm_head = self.decode_lm_head.as_ref().unwrap_or(&self.lm_head);

@@ -1131,15 +1131,11 @@ impl Qwen3Executor {
                 // operator diffs against the vLLM peer's startup config.
                 log::info!(
                     "vLLM-compat P/D active: seed={} namespace={} block_size={} \
-                     none_hash={} layers={} kv_heads={} head_dim={} miss_wait={:?}",
+                     none_hash={:032x} layers={} kv_heads={} head_dim={} miss_wait={:?}",
                     c.python_hash_seed,
                     c.namespace,
                     budget.block_size,
-                    hasher
-                        .none_hash()
-                        .iter()
-                        .map(|b| format!("{b:02x}"))
-                        .collect::<String>(),
+                    u128::from_be_bytes(hasher.none_hash()),
                     budget.num_layers,
                     budget.num_kv_heads,
                     budget.head_dim,
@@ -1860,8 +1856,7 @@ impl Qwen3Executor {
             .vllm_compat
             .as_ref()
             .is_none_or(|c| c.consecutive_miss_windows < MISS_BREAKER_THRESHOLD);
-        let wait_on_miss =
-            self.vllm_compat.is_some() && breaker_closed && now <= *miss_deadline;
+        let wait_on_miss = self.vllm_compat.is_some() && breaker_closed && now <= *miss_deadline;
         let miss_deadline = *miss_deadline;
         let parked_for = now.duration_since(*parked_at);
         let queried_blocks = query_hashes.len();
@@ -3146,7 +3141,10 @@ impl LocalQwen3Lane {
             }
             PrecapturePhase::Finalize => {
                 for (bucket_idx, &bucket) in BATCH_BUCKETS.iter().enumerate() {
-                    let path = BatchDecodeBuffers::attention_path(bucket);
+                    let path = BatchDecodeBuffers::attention_path(
+                        bucket,
+                        self.bufs.policy_at_construction,
+                    );
                     let graph_idx = BatchDecodeBuffers::graph_index(bucket_idx, path);
                     anyhow::ensure!(
                         self.bufs.graphs[graph_idx].is_captured(),
@@ -3184,7 +3182,8 @@ impl LocalQwen3Lane {
     fn dump_decode_graph_png(&mut self, png_path: &Path) -> Result<CudaGraphDumpSummary> {
         let bucket_idx = 0;
         let bucket = BATCH_BUCKETS[bucket_idx];
-        let attention_path = BatchDecodeBuffers::attention_path(bucket);
+        let attention_path =
+            BatchDecodeBuffers::attention_path(bucket, self.bufs.policy_at_construction);
         let graph_idx = BatchDecodeBuffers::graph_index(bucket_idx, attention_path);
         if !self.bufs.graphs[graph_idx].is_captured() {
             anyhow::ensure!(

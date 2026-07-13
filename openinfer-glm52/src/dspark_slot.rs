@@ -4,10 +4,13 @@
 
 use anyhow::{Result, ensure};
 use cudarc::driver::CudaSlice;
+use half::bf16;
 
 use openinfer_kernels::tensor::{DeviceContext, HiddenStates};
 
-use super::*;
+use super::{
+    DSPARK_LAYERS, DSPARK_QKV_DIM, GLM52_DSPARK_BLOCK, GLM52_DSPARK_CONTEXT_DIM, GLM52_HIDDEN,
+};
 
 pub(super) struct DsparkLayerKv {
     pub(super) k: HiddenStates,
@@ -71,7 +74,7 @@ impl Glm52DsparkSlotState {
     pub(crate) fn append_captured_row(
         &mut self,
         ctx: &DeviceContext,
-        captured: &CudaSlice<half::bf16>,
+        captured: &CudaSlice<bf16>,
         row: usize,
     ) -> Result<()> {
         let required = self.pending_len + 1;
