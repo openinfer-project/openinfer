@@ -1,5 +1,7 @@
 #include "../common.cuh"
 
+#include <atomic>
+
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <math_constants.h>
@@ -10,7 +12,10 @@ constexpr int kRouterSelectThreads = 512;
 constexpr int kGlm52Experts = 256;
 constexpr int kGlm52Topk = 8;
 constexpr int kGlm52Hidden = 6144;
-constexpr int kRouterGemvMaxTokens = 16;
+// Production row bound: GLM52_MAX_BATCH_PER_RANK (= the largest decode
+// bucket; prefill and dspark verify spans ride the decode buckets, so no
+// call path exceeds it).
+constexpr int kRouterGemvMaxTokens = 8;
 
 __device__ __forceinline__ bool better_router_choice(float value, int expert,
                                                      float best_value,
@@ -165,8 +170,31 @@ __global__ __launch_bounds__(128, 1) void glm52_router_logits_gemv_kernel(
     }
   }
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  // No fence before the trigger, matching TRT-LLM/FlashInfer upstream: the
+  // trigger only lets a PDL-opted dependent grid LAUNCH early; that grid may
+  // not consume our stores until its cudaGridDependencySynchronize, which
+  // orders on this grid's full completion (memory visibility included).
   cudaTriggerProgrammaticLaunchCompletion();
 #endif
+}
+
+// PSS launch attribute needs cc >= 9.0; cached device gate mirrors
+// argmax.cu's markov_pdl_supported_on_current_device so dev boxes below
+// Hopper still run the plain launch.
+inline bool router_pdl_supported_on_current_device() {
+  static std::atomic<int> cached{-1};
+  int value = cached.load(std::memory_order_acquire);
+  if (value >= 0) return value != 0;
+  int device = 0;
+  int major = 0;
+  if (cudaGetDevice(&device) != cudaSuccess ||
+      cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor,
+                             device) != cudaSuccess) {
+    cached.store(0, std::memory_order_release);
+    return false;
+  }
+  cached.store(major >= 9 ? 1 : 0, std::memory_order_release);
+  return major >= 9;
 }
 
 template <int kNumTokens>
@@ -174,6 +202,11 @@ cudaError_t launch_router_logits_gemv(float* logits,
                                       const __nv_bfloat16* hidden,
                                       const __nv_bfloat16* gate_weight,
                                       cudaStream_t stream) {
+  if (!router_pdl_supported_on_current_device()) {
+    glm52_router_logits_gemv_kernel<kNumTokens>
+        <<<kGlm52Experts, 128, 0, stream>>>(logits, hidden, gate_weight);
+    return cudaGetLastError();
+  }
   cudaLaunchConfig_t config = {};
   config.gridDim = kGlm52Experts;
   config.blockDim = 128;
@@ -212,14 +245,6 @@ CUresult glm52_router_logits_gemm(const __nv_bfloat16* hidden,
     GLM52_ROUTER_GEMV_CASE(6)
     GLM52_ROUTER_GEMV_CASE(7)
     GLM52_ROUTER_GEMV_CASE(8)
-    GLM52_ROUTER_GEMV_CASE(9)
-    GLM52_ROUTER_GEMV_CASE(10)
-    GLM52_ROUTER_GEMV_CASE(11)
-    GLM52_ROUTER_GEMV_CASE(12)
-    GLM52_ROUTER_GEMV_CASE(13)
-    GLM52_ROUTER_GEMV_CASE(14)
-    GLM52_ROUTER_GEMV_CASE(15)
-    GLM52_ROUTER_GEMV_CASE(16)
 #undef GLM52_ROUTER_GEMV_CASE
     default:
       return CUDA_ERROR_INVALID_VALUE;

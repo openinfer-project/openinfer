@@ -1,6 +1,7 @@
 //! Device gate for the GLM5.2 router: min-latency logits GEMV (which
 //! replaced the cublas splitK plan) + noaux-tc top-k selection, checked
-//! against an f64 host reference at padded_tokens 1, 3, 8, and 16.
+//! against an f64 host reference at every padded_tokens the runtime
+//! dispatch instantiates (1..=8; production buckets are 1/2/4/8).
 //!
 //! The selection contract is exact: topk_idx must match the reference
 //! sequential-argmax order position-for-position away from score near-ties,
@@ -92,18 +93,23 @@ fn router_gemv_and_select_match_host_reference() {
         .map(|_| bf16::from_f32(rng.unit_f32() * 0.05))
         .collect();
     let bias: Vec<f32> = (0..EXPERTS).map(|_| rng.unit_f32() * 0.01).collect();
-    let gate_bytes: &[u8] = bytemuck_cast_bf16(&gate);
-    let bias_bytes: &[u8] = bytemuck_cast_f32(&bias);
-    let gate_dev = ctx
-        .stream
-        .clone_htod(&gate_bytes.to_vec())
-        .expect("gate H2D");
-    let bias_dev = ctx
-        .stream
-        .clone_htod(&bias_bytes.to_vec())
-        .expect("bias H2D");
+    let gate_bytes = as_bytes(&gate).to_vec();
+    let bias_bytes = as_bytes(&bias).to_vec();
+    let gate_dev = ctx.stream.clone_htod(&gate_bytes).expect("gate H2D");
+    let bias_dev = ctx.stream.clone_htod(&bias_bytes).expect("bias H2D");
 
-    for &(active, padded) in &[(1usize, 1usize), (2, 3), (8, 8), (11, 16)] {
+    // Every instantiation the runtime switch dispatches, with active < padded
+    // coverage on the padded rows staying select-silent.
+    for &(active, padded) in &[
+        (1usize, 1usize),
+        (2, 2),
+        (2, 3),
+        (4, 4),
+        (3, 5),
+        (6, 6),
+        (5, 7),
+        (8, 8),
+    ] {
         let hidden: Vec<bf16> = (0..padded * HIDDEN)
             .map(|_| bf16::from_f32(rng.unit_f32()))
             .collect();
@@ -176,10 +182,8 @@ fn router_gemv_and_select_match_host_reference() {
     }
 }
 
-fn bytemuck_cast_bf16(v: &[bf16]) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v)) }
-}
-
-fn bytemuck_cast_f32(v: &[f32]) -> &[u8] {
+/// Plain byte view of a POD slice (the launch API takes weight/bias as raw
+/// byte buffers).
+fn as_bytes<T: Copy>(v: &[T]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v)) }
 }
