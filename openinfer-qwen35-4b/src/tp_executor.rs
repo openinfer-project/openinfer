@@ -4,6 +4,7 @@
 //! fails closed until the scheduler path can drive ordered eager decode.
 
 use std::collections::HashSet;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 
@@ -23,28 +24,30 @@ use openinfer_core::kv_pool::KvState;
 use openinfer_core::sampler::SamplingParams;
 
 const TP_NCCL_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const TP_RUNTIME_STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+const TP_WORKER_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[allow(dead_code)]
 enum TpWorkerCommand {
     Ping {
-        resp: mpsc::Sender<Result<TpWorkerReply>>,
+        resp: mpsc::Sender<TpWorkerResponse>,
     },
     RunPrefillChunks {
         chunks: Vec<TpPrefillChunkItem>,
         sample_seed: u64,
-        resp: mpsc::Sender<Result<TpWorkerReply>>,
+        resp: mpsc::Sender<TpWorkerResponse>,
     },
     RunDecodeStep {
         requests: Vec<TpDecodeStepItem>,
         sample_seed: u64,
-        resp: mpsc::Sender<Result<TpWorkerReply>>,
+        resp: mpsc::Sender<TpWorkerResponse>,
     },
     RunUnifiedStep {
-        resp: mpsc::Sender<Result<TpWorkerReply>>,
+        resp: mpsc::Sender<TpWorkerResponse>,
     },
     DropRequest {
         request_id: RequestId,
-        resp: mpsc::Sender<Result<TpWorkerReply>>,
+        resp: mpsc::Sender<TpWorkerResponse>,
     },
     Shutdown,
 }
@@ -56,10 +59,41 @@ enum TpWorkerReply {
     Decode(DecodeResult),
 }
 
+#[derive(Debug)]
+struct TpWorkerResponse {
+    rank: usize,
+    result: Result<TpWorkerReply>,
+}
+
+#[derive(Default)]
+struct TpRuntimePoison {
+    reason: Mutex<Option<String>>,
+}
+
+impl TpRuntimePoison {
+    fn poison(&self, reason: String) -> String {
+        let mut current = self.reason.lock().unwrap_or_else(|err| err.into_inner());
+        current.get_or_insert(reason).clone()
+    }
+
+    fn ensure_healthy(&self) -> Result<()> {
+        if let Some(reason) = self
+            .reason
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone()
+        {
+            anyhow::bail!("Qwen3.5 TP executor is poisoned: {reason}");
+        }
+        Ok(())
+    }
+}
+
 /// TP executor. Rank 0 is the primary worker and returns scheduler-visible
 /// artifacts; every rank runs the same ordered state-mutating commands.
 pub struct Qwen35TpExecutor {
     workers: Vec<TpWorker>,
+    poison: Arc<TpRuntimePoison>,
     world_size: usize,
     max_batch: usize,
     page_size: usize,
@@ -191,6 +225,7 @@ impl Qwen35TpExecutor {
         let nccl_id = cudarc::nccl::safe::Id::new()
             .map_err(|e| anyhow::anyhow!("failed to create Qwen3.5 TP NCCL id: {e:?}"))?;
         let startup_gate = Arc::new(TpStartupGate::default());
+        let poison = Arc::new(TpRuntimePoison::default());
         let mut workers = Vec::with_capacity(world_size);
         let mut preflights = Vec::with_capacity(world_size);
         let mut startups = Vec::with_capacity(world_size);
@@ -202,6 +237,7 @@ impl Qwen35TpExecutor {
                 max_batch,
                 nccl_id,
                 Arc::clone(&startup_gate),
+                Arc::clone(&poison),
             ) {
                 Ok((worker, preflight, startup)) => {
                     workers.push(worker);
@@ -254,6 +290,7 @@ impl Qwen35TpExecutor {
 
         Ok(Self {
             workers,
+            poison,
             world_size,
             max_batch,
             page_size,
@@ -288,6 +325,7 @@ impl Qwen35TpExecutor {
     }
 
     pub fn ping_all(&self) -> Result<()> {
+        self.poison.ensure_healthy()?;
         self.broadcast_ack(TpWorkerCommandKind::Ping)
     }
 
@@ -314,22 +352,25 @@ impl Qwen35TpExecutor {
         chunks: &[TpPrefillChunkItem],
         sample_seed: u64,
     ) -> Result<PrefillResult> {
+        self.poison.ensure_healthy()?;
         anyhow::ensure!(
             !chunks.is_empty(),
             "Qwen3.5 TP prefill chunk command requires at least one chunk"
         );
         let chunks = chunks.to_vec();
-        let mut pending = Vec::with_capacity(self.workers.len());
+        let (resp_tx, resp_rx) = mpsc::channel();
         for worker in &self.workers {
-            let (resp_tx, resp_rx) = mpsc::channel();
-            worker.send(TpWorkerCommand::RunPrefillChunks {
-                chunks: chunks.clone(),
-                sample_seed,
-                resp: resp_tx,
-            })?;
-            pending.push(resp_rx);
+            self.send_or_poison(
+                worker,
+                TpWorkerCommand::RunPrefillChunks {
+                    chunks: chunks.clone(),
+                    sample_seed,
+                    resp: resp_tx.clone(),
+                },
+            )?;
         }
-        wait_for_prefill(pending)
+        drop(resp_tx);
+        wait_for_prefill(resp_rx, self.workers.len(), &self.poison)
     }
 
     pub fn execute_decode(&self, plan: DecodePlan<'_>) -> Result<DecodeResult> {
@@ -357,61 +398,77 @@ impl Qwen35TpExecutor {
         requests: &[TpDecodeStepItem],
         sample_seed: u64,
     ) -> Result<DecodeResult> {
+        self.poison.ensure_healthy()?;
         anyhow::ensure!(
             !requests.is_empty(),
             "Qwen3.5 TP decode plan requires at least one request"
         );
         let requests = requests.to_vec();
-        let mut pending = Vec::with_capacity(self.workers.len());
+        let (resp_tx, resp_rx) = mpsc::channel();
         for worker in &self.workers {
-            let (resp_tx, resp_rx) = mpsc::channel();
-            worker.send(TpWorkerCommand::RunDecodeStep {
-                requests: requests.clone(),
-                sample_seed,
-                resp: resp_tx,
-            })?;
-            pending.push(resp_rx);
+            self.send_or_poison(
+                worker,
+                TpWorkerCommand::RunDecodeStep {
+                    requests: requests.clone(),
+                    sample_seed,
+                    resp: resp_tx.clone(),
+                },
+            )?;
         }
-        wait_for_decode(pending)
+        drop(resp_tx);
+        wait_for_decode(resp_rx, self.workers.len(), &self.poison)
     }
 
     pub fn drop_request(&self, request_id: RequestId) -> Result<()> {
-        let mut pending = Vec::with_capacity(self.workers.len());
+        self.poison.ensure_healthy()?;
+        let (resp_tx, resp_rx) = mpsc::channel();
         for worker in &self.workers {
-            let (resp_tx, resp_rx) = mpsc::channel();
-            worker.send(TpWorkerCommand::DropRequest {
-                request_id,
-                resp: resp_tx,
-            })?;
-            pending.push(resp_rx);
+            self.send_or_poison(
+                worker,
+                TpWorkerCommand::DropRequest {
+                    request_id,
+                    resp: resp_tx.clone(),
+                },
+            )?;
         }
-        wait_for_acks(pending, "drop request")
+        drop(resp_tx);
+        wait_for_acks(resp_rx, self.workers.len(), "drop request", &self.poison)
     }
 
     fn broadcast_ack(&self, kind: TpWorkerCommandKind) -> Result<()> {
-        let mut pending = Vec::with_capacity(self.workers.len());
+        let (resp_tx, resp_rx) = mpsc::channel();
         for worker in &self.workers {
-            let (resp_tx, resp_rx) = mpsc::channel();
             let command = match kind {
-                TpWorkerCommandKind::Ping => TpWorkerCommand::Ping { resp: resp_tx },
+                TpWorkerCommandKind::Ping => TpWorkerCommand::Ping {
+                    resp: resp_tx.clone(),
+                },
                 TpWorkerCommandKind::RunPrefillChunks => TpWorkerCommand::RunPrefillChunks {
                     chunks: Vec::new(),
                     sample_seed: 0,
-                    resp: resp_tx,
+                    resp: resp_tx.clone(),
                 },
                 TpWorkerCommandKind::RunDecodeStep => TpWorkerCommand::RunDecodeStep {
                     requests: Vec::new(),
                     sample_seed: 0,
-                    resp: resp_tx,
+                    resp: resp_tx.clone(),
                 },
-                TpWorkerCommandKind::RunUnifiedStep => {
-                    TpWorkerCommand::RunUnifiedStep { resp: resp_tx }
-                }
+                TpWorkerCommandKind::RunUnifiedStep => TpWorkerCommand::RunUnifiedStep {
+                    resp: resp_tx.clone(),
+                },
             };
-            worker.send(command)?;
-            pending.push(resp_rx);
+            self.send_or_poison(worker, command)?;
         }
-        wait_for_acks(pending, kind.name())
+        drop(resp_tx);
+        wait_for_acks(resp_rx, self.workers.len(), kind.name(), &self.poison)
+    }
+
+    fn send_or_poison(&self, worker: &TpWorker, command: TpWorkerCommand) -> Result<()> {
+        worker.send(command).map_err(|err| {
+            let reason = self
+                .poison
+                .poison(format!("failed to dispatch TP worker command: {err:#}"));
+            anyhow::anyhow!(reason)
+        })
     }
 }
 
@@ -421,9 +478,7 @@ impl Drop for Qwen35TpExecutor {
             let _ = worker.tx.send(TpWorkerCommand::Shutdown);
         }
         for worker in &mut self.workers {
-            if let Some(handle) = worker.handle.take() {
-                let _ = handle.join();
-            }
+            worker.join_bounded();
         }
     }
 }
@@ -485,6 +540,7 @@ fn disarm_nccl_startup_watchdog(
 struct TpWorker {
     tx: mpsc::Sender<TpWorkerCommand>,
     handle: Option<JoinHandle<()>>,
+    done: mpsc::Receiver<()>,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -538,36 +594,45 @@ impl TpWorker {
         max_batch: usize,
         nccl_id: cudarc::nccl::safe::Id,
         startup_gate: Arc<TpStartupGate>,
+        poison: Arc<TpRuntimePoison>,
     ) -> Result<(Self, mpsc::Receiver<Result<()>>, mpsc::Receiver<Result<()>>)> {
         let (tx, rx) = mpsc::channel();
         let (preflight_tx, preflight_rx) = mpsc::channel();
         let (startup_tx, startup_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let panic_poison = Arc::clone(&poison);
         let handle = thread::Builder::new()
             .name(format!("qwen35-tp-rank-{rank}"))
             .spawn(move || {
-                let prepared = TpWorkerPrepared::new(rank, world_size, model, max_batch);
-                let prepared = match prepared {
-                    Ok(prepared) => {
-                        let _ = preflight_tx.send(Ok(()));
-                        prepared
-                    }
-                    Err(err) => {
-                        let _ = preflight_tx.send(Err(err));
+                let outcome = catch_unwind(AssertUnwindSafe(|| {
+                    let prepared = TpWorkerPrepared::new(rank, world_size, model, max_batch);
+                    let prepared = match prepared {
+                        Ok(prepared) => {
+                            let _ = preflight_tx.send(Ok(()));
+                            prepared
+                        }
+                        Err(err) => {
+                            let _ = preflight_tx.send(Err(err));
+                            return;
+                        }
+                    };
+                    if !startup_gate.wait() {
                         return;
                     }
-                };
-                if !startup_gate.wait() {
-                    return;
-                }
-                match prepared.connect(nccl_id) {
-                    Ok(mut state) => {
-                        let _ = startup_tx.send(Ok(()));
-                        state.run(rx);
+                    match prepared.connect(nccl_id, poison) {
+                        Ok(mut state) => {
+                            let _ = startup_tx.send(Ok(()));
+                            state.run(rx);
+                        }
+                        Err(err) => {
+                            let _ = startup_tx.send(Err(err));
+                        }
                     }
-                    Err(err) => {
-                        let _ = startup_tx.send(Err(err));
-                    }
+                }));
+                if outcome.is_err() {
+                    panic_poison.poison(format!("worker rank {rank} panicked"));
                 }
+                let _ = done_tx.send(());
             })
             .map_err(|e| anyhow::anyhow!("failed to spawn Qwen3.5 TP worker {rank}: {e}"))?;
 
@@ -575,6 +640,7 @@ impl TpWorker {
             Self {
                 tx,
                 handle: Some(handle),
+                done: done_rx,
             },
             preflight_rx,
             startup_rx,
@@ -586,14 +652,24 @@ impl TpWorker {
             .send(command)
             .map_err(|_| anyhow::anyhow!("Qwen3.5 TP worker channel closed"))
     }
+
+    fn join_bounded(&mut self) {
+        if self.handle.is_none() {
+            return;
+        }
+        if self.done.recv_timeout(TP_WORKER_SHUTDOWN_TIMEOUT).is_err() {
+            fatal_tp_abort("Qwen3.5 TP worker did not exit during bounded shutdown");
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 impl Drop for TpWorker {
     fn drop(&mut self) {
         let _ = self.tx.send(TpWorkerCommand::Shutdown);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
+        self.join_bounded();
     }
 }
 
@@ -606,6 +682,7 @@ struct TpWorkerState {
     decode_buffers: BatchDecodeBuffers35,
     sample_scratch: openinfer_sample::SampleScratch,
     _cublas_guard: CublasThreadGuard,
+    poison: Arc<TpRuntimePoison>,
 }
 
 struct TpWorkerPrepared {
@@ -651,7 +728,11 @@ impl TpWorkerPrepared {
         })
     }
 
-    fn connect(self, nccl_id: cudarc::nccl::safe::Id) -> Result<TpWorkerState> {
+    fn connect(
+        self,
+        nccl_id: cudarc::nccl::safe::Id,
+        poison: Arc<TpRuntimePoison>,
+    ) -> Result<TpWorkerState> {
         let Self {
             rank,
             world_size,
@@ -678,6 +759,7 @@ impl TpWorkerPrepared {
             decode_buffers,
             sample_scratch,
             _cublas_guard: cublas_guard,
+            poison,
         })
     }
 }
@@ -685,9 +767,9 @@ impl TpWorkerPrepared {
 impl TpWorkerState {
     fn run(&mut self, rx: mpsc::Receiver<TpWorkerCommand>) {
         while let Ok(command) = rx.recv() {
-            match command {
+            let fatal = match command {
                 TpWorkerCommand::Ping { resp } => {
-                    let _ = resp.send(Ok(TpWorkerReply::Ack));
+                    self.respond(resp, "ping", Ok(TpWorkerReply::Ack))
                 }
                 TpWorkerCommand::RunPrefillChunks {
                     chunks,
@@ -695,7 +777,7 @@ impl TpWorkerState {
                     resp,
                 } => {
                     let result = self.execute_prefill_chunks(&chunks, sample_seed);
-                    let _ = resp.send(result);
+                    self.respond(resp, "prefill", result)
                 }
                 TpWorkerCommand::RunDecodeStep {
                     requests,
@@ -703,19 +785,54 @@ impl TpWorkerState {
                     resp,
                 } => {
                     let result = self.execute_decode(&requests, sample_seed);
-                    let _ = resp.send(result);
+                    self.respond(resp, "decode", result)
                 }
                 TpWorkerCommand::RunUnifiedStep { resp } => {
-                    let _ = resp.send(Err(anyhow::anyhow!(
-                        "Qwen3.5 TP worker rank {} has no TP unified implementation yet",
-                        self.rank
-                    )));
+                    let rank = self.rank;
+                    self.respond(
+                        resp,
+                        "unified step",
+                        Err(anyhow::anyhow!(
+                            "Qwen3.5 TP worker rank {rank} has no TP unified implementation yet"
+                        )),
+                    )
                 }
                 TpWorkerCommand::DropRequest { request_id, resp } => {
                     self.drop_request(request_id);
-                    let _ = resp.send(Ok(TpWorkerReply::Ack));
+                    self.respond(resp, "drop request", Ok(TpWorkerReply::Ack))
                 }
                 TpWorkerCommand::Shutdown => break,
+            };
+            if fatal {
+                break;
+            }
+        }
+    }
+
+    fn respond(
+        &self,
+        resp: mpsc::Sender<TpWorkerResponse>,
+        operation: &'static str,
+        result: Result<TpWorkerReply>,
+    ) -> bool {
+        match result {
+            Ok(reply) => {
+                let _ = resp.send(TpWorkerResponse {
+                    rank: self.rank,
+                    result: Ok(reply),
+                });
+                false
+            }
+            Err(err) => {
+                let reason = self.poison.poison(format!(
+                    "rank {} failed during {operation}: {err:#}",
+                    self.rank
+                ));
+                let _ = resp.send(TpWorkerResponse {
+                    rank: self.rank,
+                    result: Err(anyhow::anyhow!(reason)),
+                });
+                true
             }
         }
     }
@@ -969,14 +1086,14 @@ impl From<DecodeStepItem> for TpDecodeStepItem {
 }
 
 fn wait_for_acks(
-    pending: Vec<mpsc::Receiver<Result<TpWorkerReply>>>,
+    responses: mpsc::Receiver<TpWorkerResponse>,
+    expected: usize,
     op_name: &'static str,
+    poison: &TpRuntimePoison,
 ) -> Result<()> {
-    for recv in pending {
-        match recv
-            .recv()
-            .map_err(|_| anyhow::anyhow!("Qwen3.5 TP {op_name} worker dropped"))??
-        {
+    for _ in 0..expected {
+        let response = recv_runtime_response(&responses, op_name, poison)?;
+        match response.result? {
             TpWorkerReply::Ack => {}
             TpWorkerReply::Prefill(_) => {
                 anyhow::bail!("Qwen3.5 TP {op_name} unexpectedly returned prefill result")
@@ -989,15 +1106,22 @@ fn wait_for_acks(
     Ok(())
 }
 
-fn wait_for_prefill(pending: Vec<mpsc::Receiver<Result<TpWorkerReply>>>) -> Result<PrefillResult> {
+fn wait_for_prefill(
+    responses: mpsc::Receiver<TpWorkerResponse>,
+    expected: usize,
+    poison: &TpRuntimePoison,
+) -> Result<PrefillResult> {
     let mut result = None;
-    for (rank, recv) in pending.into_iter().enumerate() {
-        match recv
-            .recv()
-            .map_err(|_| anyhow::anyhow!("Qwen3.5 TP prefill worker {rank} dropped"))??
-        {
+    for _ in 0..expected {
+        let response = recv_runtime_response(&responses, "prefill", poison)?;
+        match response.result? {
             TpWorkerReply::Ack => {}
             TpWorkerReply::Prefill(prefill) => {
+                anyhow::ensure!(
+                    response.rank == 0,
+                    "Qwen3.5 TP prefill returned a primary result from rank {}",
+                    response.rank
+                );
                 anyhow::ensure!(
                     result.is_none(),
                     "Qwen3.5 TP prefill returned multiple primary results"
@@ -1012,15 +1136,22 @@ fn wait_for_prefill(pending: Vec<mpsc::Receiver<Result<TpWorkerReply>>>) -> Resu
     result.ok_or_else(|| anyhow::anyhow!("Qwen3.5 TP prefill returned no primary result"))
 }
 
-fn wait_for_decode(pending: Vec<mpsc::Receiver<Result<TpWorkerReply>>>) -> Result<DecodeResult> {
+fn wait_for_decode(
+    responses: mpsc::Receiver<TpWorkerResponse>,
+    expected: usize,
+    poison: &TpRuntimePoison,
+) -> Result<DecodeResult> {
     let mut result = None;
-    for (rank, recv) in pending.into_iter().enumerate() {
-        match recv
-            .recv()
-            .map_err(|_| anyhow::anyhow!("Qwen3.5 TP decode worker {rank} dropped"))??
-        {
+    for _ in 0..expected {
+        let response = recv_runtime_response(&responses, "decode", poison)?;
+        match response.result? {
             TpWorkerReply::Ack => {}
             TpWorkerReply::Decode(decode) => {
+                anyhow::ensure!(
+                    response.rank == 0,
+                    "Qwen3.5 TP decode returned a primary result from rank {}",
+                    response.rank
+                );
                 anyhow::ensure!(
                     result.is_none(),
                     "Qwen3.5 TP decode returned multiple primary results"
@@ -1033,6 +1164,30 @@ fn wait_for_decode(pending: Vec<mpsc::Receiver<Result<TpWorkerReply>>>) -> Resul
         }
     }
     result.ok_or_else(|| anyhow::anyhow!("Qwen3.5 TP decode returned no primary result"))
+}
+
+fn recv_runtime_response(
+    responses: &mpsc::Receiver<TpWorkerResponse>,
+    operation: &'static str,
+    poison: &TpRuntimePoison,
+) -> Result<TpWorkerResponse> {
+    match responses.recv_timeout(TP_RUNTIME_STEP_TIMEOUT) {
+        Ok(response) => Ok(response),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            let reason = poison.poison(format!("response channel disconnected during {operation}"));
+            Err(anyhow::anyhow!(reason))
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => fatal_tp_abort(&format!(
+            "Qwen3.5 TP {operation} did not complete within {}s",
+            TP_RUNTIME_STEP_TIMEOUT.as_secs()
+        )),
+    }
+}
+
+fn fatal_tp_abort(message: &str) -> ! {
+    eprintln!("{message}; aborting");
+    log::error!("{message}; aborting");
+    std::process::abort();
 }
 
 struct CublasThreadGuard;
@@ -1094,6 +1249,45 @@ mod tests {
     fn nccl_startup_watchdog_disarms_after_success() {
         let (done_tx, watchdog) = spawn_nccl_startup_watchdog().unwrap();
         disarm_nccl_startup_watchdog(done_tx, watchdog).unwrap();
+    }
+
+    #[test]
+    fn runtime_poison_preserves_first_failure() {
+        let poison = TpRuntimePoison::default();
+        assert_eq!(poison.poison("rank 1 OOM".into()), "rank 1 OOM");
+        assert_eq!(poison.poison("rank 0 NCCL error".into()), "rank 1 OOM");
+        let err = poison.ensure_healthy().unwrap_err().to_string();
+        assert!(err.contains("rank 1 OOM"));
+        assert!(!err.contains("rank 0 NCCL error"));
+    }
+
+    #[test]
+    fn runtime_response_reports_any_rank_failure_immediately() {
+        let poison = TpRuntimePoison::default();
+        let (tx, rx) = mpsc::channel();
+        tx.send(TpWorkerResponse {
+            rank: 1,
+            result: Err(anyhow::anyhow!("rank 1 failed")),
+        })
+        .unwrap();
+
+        let err = wait_for_acks(rx, 2, "test", &poison)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("rank 1 failed"));
+    }
+
+    #[test]
+    fn disconnected_runtime_response_poisons_executor() {
+        let poison = TpRuntimePoison::default();
+        let (tx, rx) = mpsc::channel();
+        drop(tx);
+
+        let err = recv_runtime_response(&rx, "test", &poison)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("response channel disconnected during test"));
+        assert!(poison.ensure_healthy().is_err());
     }
 
     #[test]
