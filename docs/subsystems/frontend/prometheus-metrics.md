@@ -1,6 +1,6 @@
 # Prometheus /metrics via the vLLM frontend
 
-**TL;DR:** `/metrics` exposes request histograms for every model and engine gauges for schedulers that publish `LoadSnapshot`: Qwen3 uses one engine, GLM5.2 EP8/DP8 uses eight rank-local engines, and GLM5.2 TP8 uses one logical engine. The bridge forwards each partition's stats under the same identity the vLLM frontend uses for least-load routing.
+**TL;DR:** `/metrics` exposes request histograms for every model and engine gauges for schedulers that publish `LoadSnapshot`: Qwen3 and Qwen3.5 use one engine, GLM5.2 EP8/DP8 uses eight rank-local engines, and GLM5.2 TP8 uses one logical engine. The bridge forwards each partition's stats under the same identity the vLLM frontend uses for least-load routing.
 
 Last touched: 2026-07
 
@@ -22,8 +22,8 @@ Measured cost is noise in both covered configurations:
 
 - `prefix_cache_queries/hits` and the by-reason waiting split (`reason="deferred"` is driven by a skipped-request counter we don't report; all waiting shows as `reason="capacity"`).
 - Spec-decode counters, per-GPU FLOPs/bytes estimates, KV-block residency histograms, cudagraph stats — the bridge sends `SchedulerStats::default()` for these fields.
-- Every model crate whose scheduler doesn't publish a `LoadSnapshot` watch (qwen35, deepseek, kimi) gets path 1 only; its engine gauges are absent, not lying-zero — the bridge skips the stats task for that partition when no watch exists.
+- Every model crate whose scheduler doesn't publish a `LoadSnapshot` watch (deepseek, kimi) gets path 1 only; its engine gauges are absent, not lying-zero — the bridge skips the stats task for that partition when no watch exists.
 
 ## Next step
 
-Wire `LoadSnapshot` publishing into the qwen35 scheduler (the other schedulers can follow the same recipe), and report real prefix-cache query/hit counters instead of zeros. A future partitioned model must expose its logical scheduler partitions instead of averaging them behind engine 0.
+Wire `LoadSnapshot` publishing into the remaining schedulers (deepseek, kimi) following the Qwen3/Qwen3.5 recipe, and report real prefix-cache query/hit counters instead of zeros. A future partitioned model must expose its logical scheduler partitions instead of averaging them behind engine 0.

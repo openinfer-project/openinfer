@@ -13,7 +13,7 @@ use anyhow::Result;
 use log::{debug, info, warn};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::batch_decode_graph::BatchDecodeGraphState;
 use crate::logprobs::snapshot_requested_logprobs;
@@ -21,7 +21,7 @@ use crate::recurrent_state::RecurrentState;
 use crate::weights::Qwen35Model;
 use openinfer_core::engine::{
     EngineHandle as SchedulerHandle, FinishReason, GenerateRequest as SchedulerRequest, KvCapacity,
-    TokenEvent, TokenLogprob, TokenSink, panic_message,
+    LoadSnapshot, TokenEvent, TokenLogprob, TokenSink, panic_message,
 };
 use openinfer_core::kv_pool::KvState;
 use openinfer_core::sampler::SamplingParams;
@@ -94,7 +94,12 @@ pub fn start_with_capacity(
     );
     let graph_state = model.create_batch_decode_graph_state_with_capacity(max_batch)?;
 
+    let kv_total = total_blocks as u64;
     let (submit_tx, submit_rx) = mpsc::unbounded_channel();
+    let (load_tx, load_rx) = watch::channel(LoadSnapshot {
+        kv_total_blocks: kv_total,
+        ..LoadSnapshot::default()
+    });
     let (startup_tx, startup_rx) = std_mpsc::channel();
 
     let join_handle = thread::Builder::new()
@@ -102,7 +107,15 @@ pub fn start_with_capacity(
         .spawn(move || match bind_model_thread(&model) {
             Ok(_guard) => {
                 let _ = startup_tx.send(Ok(()));
-                scheduler_loop(model, graph_state, submit_rx, seed, max_prefill_tokens);
+                scheduler_loop(
+                    model,
+                    graph_state,
+                    submit_rx,
+                    seed,
+                    max_prefill_tokens,
+                    kv_total,
+                    &load_tx,
+                );
             }
             Err(err) => {
                 let _ = startup_tx.send(Err(err));
@@ -127,7 +140,8 @@ pub fn start_with_capacity(
             .with_kv_capacity(KvCapacity {
                 total_blocks,
                 block_size,
-            }),
+            })
+            .with_load_watch(load_rx),
     )
 }
 
@@ -172,6 +186,31 @@ fn bind_model_thread(model: &Qwen35Model) -> Result<CublasThreadGuard> {
 
 // ── Main loop ───────────────────────────────────────────────────────────
 
+/// Republish live KV occupancy to the load-watch feed. Called once at the top of
+/// every loop iteration (before this step admits/allocates), so it reports the
+/// resident occupancy *between* steps — the steady-state load a router wants,
+/// not a transient in-step peak. Top-of-loop placement guarantees exactly one
+/// publish per iteration regardless of which `continue` the step takes, and the
+/// post-completion free shows up at the next iteration's top before the loop
+/// parks idle. `watch` coalesces (a consumer wakes at most once per step and
+/// reads the latest); `send_replace` ignores a dropped receiver, so the
+/// scheduler runs whether or not anyone is watching.
+fn publish_load(
+    load_tx: &watch::Sender<LoadSnapshot>,
+    kv_total: u64,
+    model: &Qwen35Model,
+    num_running_reqs: u64,
+    num_waiting_reqs: u64,
+) {
+    let kv_used = kv_total.saturating_sub(model.kv_pool().available_pages() as u64);
+    load_tx.send_replace(LoadSnapshot {
+        kv_used_blocks: kv_used,
+        kv_total_blocks: kv_total,
+        num_running_reqs,
+        num_waiting_reqs,
+    });
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn scheduler_loop(
     model: Qwen35Model,
@@ -179,6 +218,8 @@ fn scheduler_loop(
     mut submit_rx: mpsc::UnboundedReceiver<SchedulerRequest>,
     seed: u64,
     prefill_budget: usize,
+    kv_total: u64,
+    load_tx: &watch::Sender<LoadSnapshot>,
 ) {
     let mut rng = StdRng::seed_from_u64(seed);
     let mut active: Vec<ActiveRequest35> = Vec::new();
@@ -189,6 +230,14 @@ fn scheduler_loop(
     info!("scheduler ready (max_batch={})", max_batch);
 
     loop {
+        publish_load(
+            load_tx,
+            kv_total,
+            &model,
+            (active.len() + prefilling.len()) as u64,
+            deferred.len() as u64,
+        );
+
         // 1. Drain all pending requests (deferred from last iteration + channel)
         let mut pending = std::mem::take(&mut deferred);
         while let Ok(req) = submit_rx.try_recv() {
