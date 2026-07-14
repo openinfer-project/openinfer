@@ -19,6 +19,7 @@ mod indexer;
 mod indexer_smoke;
 mod layer;
 mod mla_decode;
+mod mla_front;
 mod model;
 mod moe_decode;
 mod moe_ep8;
@@ -685,18 +686,27 @@ fn start_engine(
         .copied()
         .min()
         .expect("at least one rank loaded");
-    let budget =
-        derive_max_model_len(requested_max_model_len, min_free_vram_bytes, dspark_enabled)?;
+    // The q_a|kv_a packed twins allocate during rank-model build, after this
+    // probe — charge them to the budget here so the derived cap still leaves
+    // the post-build headroom floor.
+    let qa_kva_twin_bytes = mla_front::glm52_qa_kva_twin_bytes()?;
+    let budget = derive_max_model_len(
+        requested_max_model_len,
+        min_free_vram_bytes.saturating_sub(qa_kva_twin_bytes),
+        dspark_enabled,
+    )?;
     let max_model_len = budget.max_model_len;
     log::info!(
-        "GLM5.2 max_model_len={max_model_len} ({}): min rank free VRAM {} after weights, \
-         cap-scaled arenas {} across {} slots{}, reserve {}, budget {}",
+        "GLM5.2 max_model_len={max_model_len} ({}): min rank free VRAM {} after weights \
+         (qa|kv_a twins {} charged), cap-scaled arenas {} across {} slots{}, reserve {}, \
+         budget {}",
         if requested_max_model_len.is_some() {
             "--max-model-len"
         } else {
             "VRAM-derived"
         },
         ByteSize(min_free_vram_bytes as u64),
+        ByteSize(qa_kva_twin_bytes as u64),
         ByteSize(budget.arena_bytes as u64),
         model::GLM52_MAX_BATCH_PER_RANK,
         if dspark_enabled {

@@ -451,6 +451,7 @@ bool arch_is_blackwell() {
 MmaConfig mma_config(int batch, int n, int k) {
   if (batch == 8 && arch_is_blackwell()) {
     if (n == 2048  && k == 6144)  return {48, 2};  // q_a / shared gate,up
+    if (n == 2624  && k == 6144)  return {16, 1};  // q_a|kv_a pack (7.3us vs 12.6 separate)
     if (n == 16384 && k == 2048)  return {4, 1};   // q_b
     if (n == 576   && k == 6144)  return {16, 1};  // kv_a
     if (n == 6144  && k == 16384) return {16, 2};  // o_proj
@@ -552,6 +553,31 @@ __global__ void glm52_gemv_reduce_silu_mul_kernel(
   output[(size_t)row * inter + col] = __float2bfloat16(g * sg * u);
 }
 
+// Fixed-order k-slice reduce for a horizontally packed projection pair:
+// partials are [ksplit, rows, n_a + n_b] (one mma launch over the packed
+// weight); the reduce de-interleaves into the two compact per-projection
+// outputs so every downstream consumer keeps its contiguous [rows, n] layout.
+// Same summation order and rounding as the plain reduce kernel.
+__global__ void glm52_gemv_split_reduce_kernel(
+    const float* __restrict__ partial,   // [ksplit, rows, n_a + n_b]
+    __nv_bfloat16* __restrict__ out_a,   // [rows, n_a]
+    __nv_bfloat16* __restrict__ out_b,   // [rows, n_b]
+    int rows, int n_a, int n_b, int ksplit) {
+  const int n = n_a + n_b;
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= rows * n) return;
+  const int row = i / n;
+  const int col = i % n;
+  float v = partial[i];
+  for (int s = 1; s < ksplit; ++s) v += partial[(size_t)s * rows * n + i];
+  const __nv_bfloat16 h = __float2bfloat16(v);
+  if (col < n_a) {
+    out_a[(size_t)row * n_a + col] = h;
+  } else {
+    out_b[(size_t)row * n_b + (col - n_a)] = h;
+  }
+}
+
 // Kernel-coverage + scale-index invariants. k%128 keeps the scale column stride
 // exact; n%rpb and k%512 keep the row-tile / lane sweep exact (no tail masking). n
 // need NOT be %128: a warp owns ROWS consecutive rows from an rpb-row block based at a
@@ -596,6 +622,7 @@ constexpr int kBatchedWarps = 4;
 // or 16 (batch 4/8) for batched — so it is applied by each launcher, not here).
 bool whitelisted_linear_shape(int n, int k) {
   if (n == 2048  && k == 6144)  return true;  // q_a / shared gate,up
+  if (n == 2624  && k == 6144)  return true;  // q_a|kv_a horizontal pack
   if (n == 16384 && k == 2048)  return true;  // q_b
   if (n == 4096  && k == 2048)  return true;  // q_b attention-TP 16-head shard
   if (n == 2048  && k == 2048)  return true;  // q_b attention-TP 8-head shard
@@ -806,6 +833,35 @@ CUresult glm52_gemv_reduce_silu_mul_cuda(
   glm52_gemv_reduce_silu_mul_kernel<<<grid, threads, 0, stream>>>(
       partial, output, rows, inter, ksplit);
   return consume_last_cuda_error();
+}
+
+CUresult glm52_gemv_split_reduce_cuda(
+    const float* partial, __nv_bfloat16* out_a, __nv_bfloat16* out_b, int rows,
+    int n_a, int n_b, int ksplit, cudaStream_t stream) {
+  if (partial == nullptr || out_a == nullptr || out_b == nullptr || rows <= 0 ||
+      n_a <= 0 || n_b <= 0 || ksplit < 1) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  const int threads = 256;
+  const int total = rows * (n_a + n_b);
+  glm52_gemv_split_reduce_kernel<<<(total + threads - 1) / threads, threads, 0,
+                                   stream>>>(partial, out_a, out_b, rows, n_a,
+                                             n_b, ksplit);
+  return consume_last_cuda_error();
+}
+
+// Capability query for the horizontal-pack route: reports the ksplit the mma
+// table would pick for (batch, n, k), 0 when the shape would take the
+// register tile. The rust side must NOT run a packed batched launch without a
+// table entry — the register tile would write the packed interleaved layout
+// no consumer understands.
+CUresult glm52_gemv_mma_ksplit_cuda(int batch, int n, int k, int* ksplit_out) {
+  if (ksplit_out == nullptr) return CUDA_ERROR_INVALID_VALUE;
+  *ksplit_out =
+      (batch == kBatchedGemvBatch4 || batch == kBatchedGemvBatchFull)
+          ? mma_config(batch, n, k).ksplit
+          : 0;
+  return CUDA_SUCCESS;
 }
 
 }  // extern "C"

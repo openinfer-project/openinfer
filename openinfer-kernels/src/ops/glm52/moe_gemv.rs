@@ -92,6 +92,69 @@ pub fn glm52_gemv_reduce_silu_mul_launch(
     .map_err(|err| anyhow!("GLM5.2 reduce-SiLU launch failed: {err}"))
 }
 
+/// Fixed-order k-slice reduce for a horizontally packed projection pair:
+/// de-interleaves the packed `[ksplit, rows, n_a + n_b]` partials into the two
+/// compact per-projection bf16 outputs. Same summation order and rounding as
+/// the plain reduce.
+#[allow(clippy::too_many_arguments)]
+pub fn glm52_gemv_split_reduce_launch(
+    ctx: &DeviceContext,
+    rows: usize,
+    n_a: usize,
+    n_b: usize,
+    ksplit: usize,
+    partial: &CudaSlice<f32>,
+    out_a: &mut CudaSlice<bf16>,
+    out_b: &mut CudaSlice<bf16>,
+) -> Result<()> {
+    ensure!(
+        rows > 0 && n_a > 0 && n_b > 0 && ksplit >= 1,
+        "GLM5.2 split-reduce needs positive rows/n_a/n_b/ksplit, got {rows}/{n_a}/{n_b}/{ksplit}"
+    );
+    ensure!(
+        partial.len() >= ksplit * rows * (n_a + n_b)
+            && out_a.len() >= rows * n_a
+            && out_b.len() >= rows * n_b,
+        "GLM5.2 split-reduce buffers too small: partial {} (need {}), out_a {} (need {}), out_b {} (need {})",
+        partial.len(),
+        ksplit * rows * (n_a + n_b),
+        out_a.len(),
+        rows * n_a,
+        out_b.len(),
+        rows * n_b
+    );
+    let (p_ptr, _p) = partial.device_ptr(&ctx.stream);
+    let (a_ptr, _a) = out_a.device_ptr_mut(&ctx.stream);
+    let (b_ptr, _b) = out_b.device_ptr_mut(&ctx.stream);
+    unsafe {
+        ffi::glm52_gemv_split_reduce_cuda(
+            p_ptr as *const f32,
+            a_ptr as *mut ffi::Half,
+            b_ptr as *mut ffi::Half,
+            rows as i32,
+            n_a as i32,
+            n_b as i32,
+            ksplit as i32,
+            ctx.stream.cu_stream(),
+        )
+    }
+    .result()
+    .map_err(|err| anyhow!("GLM5.2 split-reduce launch failed: {err}"))
+}
+
+/// Whether the batched GEMV mma table has an entry for (batch, n, k) — the
+/// gate for routing a horizontally packed projection through one batched
+/// launch. Without an entry the packed launch would take the register tile
+/// and write an interleaved layout no consumer understands, so callers fall
+/// back to separate per-projection launches.
+pub fn glm52_gemv_mma_routes(batch: usize, n: usize, k: usize) -> Result<bool> {
+    let mut ksplit: i32 = 0;
+    unsafe { ffi::glm52_gemv_mma_ksplit_cuda(batch as i32, n as i32, k as i32, &raw mut ksplit) }
+        .result()
+        .map_err(|err| anyhow!("GLM5.2 mma ksplit query failed: {err}"))?;
+    Ok(ksplit > 0)
+}
+
 /// Plain weight-only fp8 GEMV (bs=1): `out[n] = deq(weight[n,k]) @ activation[k]`
 /// with the bf16 activation read directly (no activation quant, no scale
 /// relayout) and the e4m3 block-scale weight dequanted on the fly. Replaces

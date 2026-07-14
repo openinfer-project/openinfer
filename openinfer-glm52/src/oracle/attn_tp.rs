@@ -30,7 +30,8 @@ use openinfer_kernels::tensor::{DeviceContext, DeviceVec};
 use super::mla::{Layer0Tensors, load_layer0, seeded_hidden};
 use crate::config::{GLM52_ROPE_HALF, GLM52_SM_SCALE};
 use crate::fp8::ProjWeight;
-use crate::mla_decode::{Glm52MlaLayerWeights, Glm52MlaSchedMetadata, glm52_mla_decode_forward};
+use crate::mla_decode::{Glm52MlaSchedMetadata, glm52_mla_decode_forward};
+use crate::mla_front::Glm52MlaLayerWeights;
 use crate::model::rope_tables;
 use crate::rows::Rows;
 

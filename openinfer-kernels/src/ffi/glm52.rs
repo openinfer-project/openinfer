@@ -313,6 +313,20 @@ unsafe extern "C" {
         ksplit: i32,
         stream: CUstream,
     ) -> CUresult;
+
+    pub fn glm52_gemv_split_reduce_cuda(
+        partial: *const f32,
+        out_a: *mut Half,
+        out_b: *mut Half,
+        rows: i32,
+        n_a: i32,
+        n_b: i32,
+        ksplit: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn glm52_gemv_mma_ksplit_cuda(batch: i32, n: i32, k: i32, ksplit_out: *mut i32)
+    -> CUresult;
 }
 
 macro_rules! declare_tp_ffi {
