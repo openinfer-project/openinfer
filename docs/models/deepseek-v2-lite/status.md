@@ -1,6 +1,6 @@
 # DeepSeek-V2-Lite Status And Benchmark Ledger
 
-> **TL;DR:** DeepSeek-V2-Lite has an EP2 correctness contract across HF, host-staged, and NCCL. The current optimization groups repeated expert routes and computes NCCL gate logits on CUDA while preserving the host top-k/softmax rule. Exact token/text hashes are preserved; retained short-shape HTTP A/B shows host-staged and NCCL throughput gains under the documented request contract. This is not a production, broad-workload, or vLLM-parity claim.
+> **TL;DR:** DeepSeek-V2-Lite keeps correctness, direct decode diagnostics, retained HTTP SLO reports, and soak readiness as separate gates. HF/host-staged/NCCL exactness and HTTP lifecycle evidence are retained; issue #466 adds fixed host-staged/NCCL SLO artifacts without claiming production readiness.
 
 Last touched: 2026-07
 
@@ -23,6 +23,7 @@ Last touched: 2026-07
 | Long-shape NCCL collectives | Available | Issue #280 chunks large bf16 dense-exchange and f32 combine all-reduces. The 2026-06-24 2x RTX 5090 NCCL checks preserve HF / host-staged / NCCL exactness and complete 24/64/128-word direct long-shape probes. |
 | HTTP trace and measured MoE throughput optimization | HTTP and direct evidence | Issue #280 logs DeepSeek-V2-Lite `openinfer_http_trace` records and batches same-position decode subgroups. Issue #464 extends phase/decode-step attribution, groups host-staged and NCCL routes by stable `(owner_rank, global_expert)`, and moves the NCCL gate GEMM to a bitwise-matched CUDA logits kernel while keeping host top-k/softmax. Diagnostic serial/host rollback switches remain available for retained A/B and emergency rollback; they are not production tuning knobs. |
 | HTTP reliability lifecycle gate | Available | Issue #453 adds `scripts/bench_dsv2lite_http_reliability.py`, which drives real streaming `/v1/completions` scenarios for client cancel/disconnect, unsupported params, active-cap overload, mixed short/long prompts with adjacent failures, and clean follow-up recovery. The 2026-07-04 2x RTX 5090 host-staged and NCCL runs both passed with terminal trace coverage, stable output hashes, active/pending/decode maxima, and healthy final scheduler baselines. |
+| Retained HTTP serving SLO report | Retained HTTP evidence | Issue #466 adds model-owned short/mixed/long profiles on the shared HTTP benchmark scripts. The current retained run covered all six host-staged/NCCL children with zero failures/timeouts and full trace coverage. This is HTTP pressure/SLO evidence only; command details and the aggregate hash live in `benchmarking.md`. |
 | Retained vLLM comparison matrix | Snapshot complete with clean failed setup rows and supplemental validation rows | The retained matrix for tracking issue #279 keeps HF/host/NCCL correctness, OpenInfer direct diagnostic batch, `vllm bench serve` HTTP pressure, OpenInfer trace rows, and failed setup rows separate. The 2026-06-28 clean full matrix passed HF / host-staged / NCCL correctness plus OpenInfer host-staged/NCCL direct, HTTP pressure, and trace rows; stock vLLM TP2 and TP2+EP2 failed during setup on the target FlashInfer SM120 path. A separate FlashInfer #3633-equivalent validation completed vLLM TP2 and TP2+EP2 under the same HTTP client/workload contract. |
 | vLLM production parity | Not claimed | The vLLM TP2 / TP2+EP2 rows are gap-finding evidence from a documented contract. The supplemental validation run is not serving parity or a stock-install claim. |
 
@@ -44,7 +45,25 @@ The HTTP reliability gate is intentionally separate from the mixed-serving E2E. 
 
 The Rust E2E accepts the known HF-confirmed RTX 5090 and A800 hash pairs for this narrow shape, because the same model snapshot has produced different exact greedy text on those hosts while still matching HF on each host. Do not use the static hash pair list as a substitute for the same-host HF comparison when changing accuracy-sensitive code.
 
+`e2e_ep2.rs` is a correctness/integration gate. Its JSON uses `report_intent=correctness_integration`; timing percentiles, throughput, SLO budgets, and soak claims are intentionally absent. The direct attribution binary and HTTP report commands are mapped in `benchmarking.md`.
+
 ## Benchmark Ledger
+
+### Issue #466 Retained HTTP SLO Report
+
+The retained SLO layer uses model-owned `scripts/bench_dsv2lite_http_slo.py` over the generic `bench_http_serving.py` and `bench_http_sweep.py` harnesses. The model line owns three fixed contracts:
+
+| Contract | Shape | Boundary |
+| --- | --- | --- |
+| short decode-heavy | `prompt_words=64`, `max_tokens=64`, 240 s timeout | Repeated short HTTP pressure/SLO evidence |
+| mixed prompt shape | alternating `prompt_words=64,512`, `max_tokens=64`, 240 s timeout | Mixed-shape tails and trace evidence |
+| long-prompt smoke | `prompt_words=2048`, `max_tokens=64`, 900 s timeout | One long boundary cell, no broad long-context claim |
+
+Every retained profile fixes shape, timeout, request count, concurrency, repeats, greedy sampling, ignore-EOS, and full trace coverage. Repeat summaries report median/min/max and a stable/noisy/failure marker. `benchmarking.md` is the command and artifact-schema source of truth.
+
+On Blackwell (`sm_120`), DSV2-Lite NCCL rejects runtimes older than `2.26.2` before communicator creation and reports how to select a compatible NCCL library. NCCL 2.26.2 is the first upstream release containing NVIDIA's recent-Blackwell shared-memory fix. This floor does not apply to non-SM120 GPUs.
+
+The current-source #466 aggregate is retained under `artifacts/bench/dsv2-lite/<run-id>/` (gitignored). `benchmarking.md` contains the command, artifact fields, aggregate hash, and claim boundary.
 
 ### Retained vLLM TP2/EP2 Matrix
 
@@ -253,6 +272,7 @@ Use these labels consistently:
 | `route-grouped MoE slice` | Separate paired host-staged and NCCL direct/HTTP A/B for the retained #464 shapes, with exact token/text hashes and contribution accumulation in original route order. | Fewer per-row GEMM launches, broad workload scaling, soak/SLO readiness, production EP readiness, or vLLM parity. |
 | `NCCL device logits router slice` | The gate GEMM runs on CUDA with bitwise host-logit coverage; existing host top-k/softmax builds the route plan. | Fully device-resident routing, no routing D2H, general numerical equivalence, or non-NCCL improvement. |
 | `HTTP reliability lifecycle gate` | `/v1/completions` cancel/disconnect/reject/overload/mixed-failure scenarios have terminal reason counts, trace coverage, active/pending/decode maxima, output hashes, and clean follow-up recovery evidence. | Production EP readiness, soak stability, SLO latency, vLLM parity, throughput improvement, sparse dispatch, or multi-node EP support. |
+| `retained HTTP serving SLO` | Named short/mixed/long `/v1/completions` contracts report latency percentiles, throughput, outcomes, full trace coverage, hashes, and repeat spread for one backend/hardware/toolchain. | Direct attribution, sustained soak, production readiness, vLLM parity, or performance outside a matched contract. |
 | `covered NCCL decode graph probe` | Probe-only batch-1 `Hello` decode step captured, instantiated, replayed, and token-verified under CUDA Graph. | Default serving graph coverage, multi-step graph replay, batch `4/8` graph coverage, or performance improvement. |
 | `HTTP concurrency pressure` | `vllm bench serve --max-concurrency N` against an HTTP endpoint. | True OpenInfer batch size unless the engine path proves it. |
 | `vLLM comparison from documented environment` | vLLM TP2 / TP2+EP2 from the retained matrix or the separate FlashInfer-fixed validation. | Stock vLLM install support, OpenInfer serving parity, or production readiness. |
@@ -304,7 +324,7 @@ The next implementation should be chosen from measured evidence:
 5. Keep the #453 HTTP reliability evidence retained.
    - rerun the reliability runner for host-staged and NCCL when scheduler or HTTP lifecycle code changes;
    - keep the JSON artifact hashes and server-log trace coverage in the PR evidence;
-   - keep #452 long/mixed-prompt latency, #465 soak, #466 SLO report, and #467 benchmark manifest separate.
+   - keep #452 long/mixed-prompt latency, #465 soak, the completed #466 SLO report layer, and #467 benchmark manifest separate.
 
 6. Keep MoE internals readable.
    - routing, dispatch, expert execution, and combine should remain distinguishable in code and attribution;

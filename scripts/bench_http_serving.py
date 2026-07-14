@@ -16,13 +16,26 @@ import json
 import re
 import socket
 import statistics
+import sys
+import threading
 import time
 import urllib.parse
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field as dataclass_field
 from itertools import product
 from pathlib import Path
 from typing import Any
+
+from bench_http_common import (
+    artifact_command,
+    combined_output_hash,
+    current_commit,
+    detect_hardware_toolchain,
+    model_fingerprint,
+    sha256_file,
+    value_counts,
+    write_json,
+)
 
 
 DEFAULT_PROMPT_WORDS = (
@@ -55,6 +68,9 @@ class RequestResult:
     output_chars: int
     output_hash: str
     text_prefix: str
+    stream_chunk_tpot_ms: float | None = None
+    stream_chunk_itl_ms: list[float] = dataclass_field(default_factory=list)
+    token_timing_valid: bool | None = None
     sampling_label: str = "single"
     temperature: float = 0.0
     top_k: int = -1
@@ -68,6 +84,16 @@ class SamplingProfile:
     temperature: float
     top_k: int
     top_p: float
+
+
+@dataclass
+class StreamCapture:
+    chunks: list[str] = dataclass_field(default_factory=list)
+    inter_chunk_ms: list[float] = dataclass_field(default_factory=list)
+    first_chunk_s: float | None = None
+    first_chunk_wall_s: float | None = None
+    last_chunk_s: float | None = None
+    done_received: bool = False
 
 
 def arg_value(args: argparse.Namespace, name: str, default: Any) -> Any:
@@ -100,13 +126,17 @@ def sampled_profile(args: argparse.Namespace) -> SamplingProfile:
     )
 
 
-def sampling_profile_for(args: argparse.Namespace, global_index: int) -> SamplingProfile:
+def sampling_profile_for(
+    args: argparse.Namespace, global_index: int
+) -> SamplingProfile:
     if sampling_mode(args) == "mixed-greedy-sampled":
         return greedy_profile() if global_index % 2 == 0 else sampled_profile(args)
     return single_profile(args)
 
 
-def sampling_profiles_for_report(args: argparse.Namespace) -> dict[str, dict[str, float | int | str]]:
+def sampling_profiles_for_report(
+    args: argparse.Namespace,
+) -> dict[str, dict[str, float | int | str]]:
     if sampling_mode(args) == "mixed-greedy-sampled":
         profiles = [greedy_profile(), sampled_profile(args)]
     else:
@@ -134,14 +164,19 @@ def validate_sampling_args(args: argparse.Namespace) -> None:
     validate_top_p("--top-p", args.top_p)
     validate_top_p("--sample-top-p", args.sample_top_p)
     if args.sampling_mode == "mixed-greedy-sampled" and args.sample_temperature <= 0.0:
-        raise SystemExit("--sample-temperature must be positive in mixed-greedy-sampled mode")
+        raise SystemExit(
+            "--sample-temperature must be positive in mixed-greedy-sampled mode"
+        )
 
 
 def percentile(sorted_values: list[float], pct: float) -> float:
     if not sorted_values:
         return 0.0
-    idx = round((pct / 100.0) * (len(sorted_values) - 1))
-    return sorted_values[idx]
+    rank = (pct / 100.0) * (len(sorted_values) - 1)
+    lower = int(rank)
+    upper = min(lower + 1, len(sorted_values) - 1)
+    weight = rank - lower
+    return sorted_values[lower] * (1.0 - weight) + sorted_values[upper] * weight
 
 
 def summarize(values: list[float]) -> dict[str, float | int | None]:
@@ -181,6 +216,52 @@ def summarize_counts(values: list[int]) -> dict[str, int | None]:
     }
 
 
+def build_retention_gate(report: dict[str, Any]) -> dict[str, Any]:
+    required_trace = report.get("contract", {}).get("required_trace_coverage_ratio")
+    if required_trace is None:
+        return {"required": False, "passed": None}
+    required_trace = float(required_trace)
+    trace = report["server_trace"]
+    outcomes_passed = (
+        report["summary"]["completed"] == report["workload"]["num_requests"]
+        and report["summary"]["failed"] == 0
+        and report["summary"]["timeouts"] == 0
+    )
+    trace_passed = all(
+        float(trace.get(field) or 0.0) >= required_trace
+        for field in (
+            "coverage_ratio",
+            "active_set_coverage_ratio",
+            "decode_batch_coverage_ratio",
+            "token_timing_coverage_ratio",
+        )
+    )
+    return {
+        "required": True,
+        "passed": outcomes_passed and trace_passed,
+        "request_outcomes_passed": outcomes_passed,
+        "trace_coverage_passed": trace_passed,
+        "required_trace_coverage_ratio": required_trace,
+    }
+
+
+def is_full_server_trace(trace: dict[str, Any] | None) -> bool:
+    if trace is None:
+        return False
+    trace_fields = {
+        "queued_at_unix_s",
+        "scheduled_at_unix_s",
+        "first_token_emit_unix_s",
+        "prompt_tokens",
+        "completion_tokens",
+        "active_set_size",
+        "decode_batch_size_max",
+        "decode_step_count",
+        "batch_decode_steps",
+    }
+    return any(field in trace for field in trace_fields)
+
+
 def summarize_trace_ms(measured: list[RequestResult]) -> dict[str, Any]:
     fields = [
         "frontend_to_queue_ms",
@@ -199,10 +280,35 @@ def summarize_trace_ms(measured: list[RequestResult]) -> dict[str, Any]:
         values = [
             float(result.server_trace[field])
             for result in measured
-            if result.server_trace is not None and isinstance(result.server_trace.get(field), (int, float))
+            if is_full_server_trace(result.server_trace)
+            and isinstance(result.server_trace.get(field), (int, float))
         ]
         phase_summary[field] = summarize(values)
-    traced = [result for result in measured if result.server_trace is not None]
+    attached = [result for result in measured if result.server_trace is not None]
+    traced = [
+        result for result in measured if is_full_server_trace(result.server_trace)
+    ]
+    server_error_records = [
+        result
+        for result in measured
+        if result.server_trace is not None
+        and isinstance(result.server_trace.get("server_error"), str)
+    ]
+    token_timing_requests = [
+        result
+        for result in measured
+        if getattr(result, "token_timing_valid", None) is True
+    ]
+    token_timing_mismatches = [
+        result.request_id
+        for result in measured
+        if getattr(result, "token_timing_valid", None) is False
+    ]
+    token_timing_unknown = [
+        result.request_id
+        for result in measured
+        if getattr(result, "token_timing_valid", None) is None
+    ]
     prompt_tokens = [
         int(result.server_trace["prompt_tokens"])
         for result in traced
@@ -261,15 +367,45 @@ def summarize_trace_ms(measured: list[RequestResult]) -> dict[str, Any]:
         batched_total = None
         singleton_total = None
         batched_share = None
+    active_set_counts = value_counts([str(value) for value in active_set_sizes])
+    decode_batch_counts = value_counts([str(value) for value in decode_batch_sizes])
     return {
         "source": "server log lines matching `openinfer_http_trace`; frontend_to_queue includes HTTP ingress, tokenization, and vLLM submit before engine queue",
         "traced_requests": len(traced),
-        "missing_traces": [result.request_id for result in measured if result.server_trace is None],
+        "attached_server_records": len(attached),
+        "server_error_records": len(server_error_records),
+        "missing_traces": [
+            result.request_id
+            for result in measured
+            if not is_full_server_trace(result.server_trace)
+        ],
+        "missing_server_records": [
+            result.request_id for result in measured if result.server_trace is None
+        ],
+        "coverage_ratio": len(traced) / len(measured) if measured else 0.0,
+        "server_record_coverage_ratio": len(attached) / len(measured)
+        if measured
+        else 0.0,
         "prompt_tokens": summarize_counts(prompt_tokens),
         "completion_tokens": summarize_counts(completion_tokens),
         "phases_ms": phase_summary,
+        "active_set_sizes": active_set_counts,
+        "active_set_coverage_ratio": len(active_set_sizes) / len(measured)
+        if measured
+        else 0.0,
         "active_set_size_max": max(active_set_sizes) if active_set_sizes else None,
-        "decode_batch_size_max": max(decode_batch_sizes) if decode_batch_sizes else None,
+        "decode_batch_sizes": decode_batch_counts,
+        "decode_batch_coverage_ratio": len(decode_batch_sizes) / len(measured)
+        if measured
+        else 0.0,
+        "decode_batch_size_max": max(decode_batch_sizes)
+        if decode_batch_sizes
+        else None,
+        "token_timing_coverage_ratio": (
+            len(token_timing_requests) / len(measured) if measured else 0.0
+        ),
+        "token_timing_mismatches": token_timing_mismatches,
+        "token_timing_unknown": token_timing_unknown,
         "decode_steps": {
             "per_request": summarize_counts(decode_step_counts),
             "batched_request_steps_total": batched_total,
@@ -306,7 +442,9 @@ def single_or_list(values: list[int]) -> int | list[int]:
     return values[0] if len(values) == 1 else values
 
 
-def workload_shapes(prompt_words: list[int], max_tokens: list[int]) -> list[tuple[int, int]]:
+def workload_shapes(
+    prompt_words: list[int], max_tokens: list[int]
+) -> list[tuple[int, int]]:
     return list(product(prompt_words, max_tokens))
 
 
@@ -341,6 +479,162 @@ def parse_sse_error(payload: dict[str, Any]) -> str | None:
     return None
 
 
+def set_deadline_timeout(conn: http.client.HTTPConnection, deadline_s: float) -> None:
+    remaining_s = deadline_s - time.perf_counter()
+    if remaining_s <= 0.0:
+        raise TimeoutError("request exceeded its absolute timeout")
+    conn.timeout = remaining_s
+    if conn.sock is not None:
+        conn.sock.settimeout(remaining_s)
+
+
+def iter_response_lines(
+    response: http.client.HTTPResponse,
+    conn: http.client.HTTPConnection,
+    deadline_s: float,
+):
+    buffered = b""
+    while True:
+        set_deadline_timeout(conn, deadline_s)
+        chunk = response.read1(4096)
+        if not chunk:
+            if buffered:
+                yield buffered
+            return
+        buffered += chunk
+        while b"\n" in buffered:
+            line, buffered = buffered.split(b"\n", 1)
+            yield line
+
+
+def parse_sse_line(raw: bytes) -> tuple[bool, str]:
+    line = raw.decode("utf-8", errors="replace").strip()
+    if not line or not line.startswith("data:"):
+        return False, ""
+    data = line.removeprefix("data:").strip()
+    if data == "[DONE]":
+        return True, ""
+    payload = json.loads(data)
+    stream_error = parse_sse_error(payload)
+    if stream_error is not None:
+        raise RuntimeError(f"SSE error: {stream_error}")
+    if parse_sse_finish_reason(payload) == "error":
+        raise RuntimeError("SSE finish_reason=error")
+    return False, parse_sse_text(payload)
+
+
+def consume_sse_stream(
+    response: http.client.HTTPResponse,
+    conn: http.client.HTTPConnection,
+    deadline_s: float,
+) -> StreamCapture:
+    capture = StreamCapture()
+    for raw in iter_response_lines(response, conn, deadline_s):
+        done, text = parse_sse_line(raw)
+        if done:
+            capture.done_received = True
+            break
+        if not text:
+            continue
+        now = time.perf_counter()
+        if capture.first_chunk_s is None:
+            capture.first_chunk_s = now
+            capture.first_chunk_wall_s = time.time()
+        if capture.last_chunk_s is not None:
+            capture.inter_chunk_ms.append((now - capture.last_chunk_s) * 1000.0)
+        capture.last_chunk_s = now
+        capture.chunks.append(text)
+    if not capture.done_received:
+        raise RuntimeError("SSE stream ended before [DONE]")
+    return capture
+
+
+def start_deadline_watchdog(
+    conn: http.client.HTTPConnection,
+    deadline_s: float,
+    expired: threading.Event,
+) -> threading.Timer:
+    def interrupt_at_deadline() -> None:
+        expired.set()
+        if conn.sock is None:
+            return
+        try:
+            conn.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    timer = threading.Timer(
+        max(0.0, deadline_s - time.perf_counter()), interrupt_at_deadline
+    )
+    timer.daemon = True
+    timer.start()
+    return timer
+
+
+def successful_result(
+    *,
+    index: int,
+    request_id: str,
+    prompt_words: int,
+    max_tokens: int,
+    sampling_label: str,
+    temperature: float,
+    top_k: int,
+    top_p: float,
+    status: int,
+    start_s: float,
+    start_wall_s: float,
+    capture: StreamCapture,
+) -> RequestResult:
+    end_s = time.perf_counter()
+    text = "".join(capture.chunks)
+    chunk_tpot_ms = None
+    if (
+        capture.first_chunk_s is not None
+        and capture.last_chunk_s is not None
+        and len(capture.chunks) > 1
+    ):
+        chunk_tpot_ms = (
+            (capture.last_chunk_s - capture.first_chunk_s)
+            * 1000.0
+            / (len(capture.chunks) - 1)
+        )
+    return RequestResult(
+        index=index,
+        request_id=request_id,
+        prompt_words=prompt_words,
+        max_tokens=max_tokens,
+        ok=True,
+        status=status,
+        error=None,
+        timed_out=False,
+        start_s=start_s,
+        start_wall_s=start_wall_s,
+        first_token_s=capture.first_chunk_s,
+        first_token_wall_s=capture.first_chunk_wall_s,
+        end_s=end_s,
+        end_wall_s=time.time(),
+        latency_ms=(end_s - start_s) * 1000.0,
+        ttft_ms=(
+            None
+            if capture.first_chunk_s is None
+            else (capture.first_chunk_s - start_s) * 1000.0
+        ),
+        tpot_ms=None,
+        itl_ms=[],
+        output_chunks=len(capture.chunks),
+        output_chars=len(text),
+        output_hash=hashlib.sha256(text.encode("utf-8")).hexdigest()[:16],
+        text_prefix=text[:80],
+        stream_chunk_tpot_ms=chunk_tpot_ms,
+        stream_chunk_itl_ms=capture.inter_chunk_ms,
+        sampling_label=sampling_label,
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
+    )
+
+
 def request_once(
     index: int,
     request_id: str,
@@ -357,18 +651,24 @@ def request_once(
     sampling_label: str = "single",
 ) -> RequestResult:
     start = time.perf_counter()
+    deadline = start + timeout
     start_wall = time.time()
-    first_token: float | None = None
-    first_token_wall: float | None = None
-    last_token: float | None = None
-    inter_token_ms: list[float] = []
-    chunks: list[str] = []
     status: int | None = None
+    conn: http.client.HTTPConnection | None = None
+    deadline_expired = threading.Event()
+    deadline_timer: threading.Timer | None = None
 
     try:
-        conn_cls = http.client.HTTPSConnection if url.scheme == "https" else http.client.HTTPConnection
+        conn_cls = (
+            http.client.HTTPSConnection
+            if url.scheme == "https"
+            else http.client.HTTPConnection
+        )
         port = url.port
         conn = conn_cls(url.hostname, port=port, timeout=timeout)
+
+        deadline_timer = start_deadline_watchdog(conn, deadline, deadline_expired)
+        set_deadline_timeout(conn, deadline)
         path = (url.path.rstrip("/") or "") + "/v1/completions"
         body = {
             "model": model,
@@ -387,100 +687,37 @@ def request_once(
             body=json.dumps(body).encode("utf-8"),
             headers={"Content-Type": "application/json"},
         )
+        set_deadline_timeout(conn, deadline)
         response = conn.getresponse()
         status = response.status
         if status != 200:
             error_body = response.read(4096).decode("utf-8", errors="replace")
             raise RuntimeError(f"HTTP {status}: {error_body}")
 
-        while True:
-            raw = response.readline()
-            if not raw:
-                break
-            line = raw.decode("utf-8", errors="replace").strip()
-            if not line or not line.startswith("data:"):
-                continue
-            data = line.removeprefix("data:").strip()
-            if data == "[DONE]":
-                break
-            payload = json.loads(data)
-            stream_error = parse_sse_error(payload)
-            if stream_error is not None:
-                raise RuntimeError(f"SSE error: {stream_error}")
-            finish_reason = parse_sse_finish_reason(payload)
-            if finish_reason == "error":
-                raise RuntimeError("SSE finish_reason=error")
-            text = parse_sse_text(payload)
-            if not text:
-                continue
-            now = time.perf_counter()
-            if first_token is None:
-                first_token = now
-                first_token_wall = time.time()
-            if last_token is not None:
-                inter_token_ms.append((now - last_token) * 1000.0)
-            last_token = now
-            chunks.append(text)
-        conn.close()
-        if max_tokens > 0 and not chunks:
+        capture = consume_sse_stream(response, conn, deadline)
+        if deadline_expired.is_set() or time.perf_counter() > deadline:
+            raise TimeoutError("request exceeded its absolute timeout")
+        if max_tokens > 0 and not capture.chunks:
             raise RuntimeError("stream completed without streamed text chunks")
-        end = time.perf_counter()
-        end_wall = time.time()
-        text = "".join(chunks)
-        output_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
-        latency_ms = (end - start) * 1000.0
-        ttft_ms = None if first_token is None else (first_token - start) * 1000.0
-        tpot_ms = None
-        if first_token is not None and last_token is not None and len(chunks) > 1:
-            tpot_ms = (last_token - first_token) * 1000.0 / (len(chunks) - 1)
-        return RequestResult(
+        return successful_result(
             index=index,
             request_id=request_id,
             prompt_words=prompt_words,
             max_tokens=max_tokens,
-            ok=True,
-            status=status,
-            error=None,
-            timed_out=False,
-            start_s=start,
-            start_wall_s=start_wall,
-            first_token_s=first_token,
-            first_token_wall_s=first_token_wall,
-            end_s=end,
-            end_wall_s=end_wall,
-            latency_ms=latency_ms,
-            ttft_ms=ttft_ms,
-            tpot_ms=tpot_ms,
-            itl_ms=inter_token_ms,
-            output_chunks=len(chunks),
-            output_chars=len(text),
-            output_hash=output_hash,
-            text_prefix=text[:80],
             sampling_label=sampling_label,
             temperature=temperature,
             top_k=top_k,
             top_p=top_p,
-        )
-    except (TimeoutError, socket.timeout) as exc:
-        end = time.perf_counter()
-        return failed_result(
-            index,
-            request_id,
-            prompt_words,
-            max_tokens,
-            sampling_label,
-            temperature,
-            top_k,
-            top_p,
-            status,
-            start,
-            start_wall,
-            end,
-            str(exc),
-            timed_out=True,
+            status=status,
+            start_s=start,
+            start_wall_s=start_wall,
+            capture=capture,
         )
     except Exception as exc:  # noqa: BLE001 - benchmark reports the error string.
         end = time.perf_counter()
+        timed_out = deadline_expired.is_set() or isinstance(
+            exc, (TimeoutError, socket.timeout)
+        )
         return failed_result(
             index,
             request_id,
@@ -495,8 +732,13 @@ def request_once(
             start_wall,
             end,
             str(exc),
-            timed_out=False,
+            timed_out=timed_out,
         )
+    finally:
+        if deadline_timer is not None:
+            deadline_timer.cancel()
+        if conn is not None:
+            conn.close()
 
 
 def failed_result(
@@ -574,7 +816,9 @@ def load_server_traces(
         stream_error_match = STREAM_ERROR_RE.search(line)
         if stream_error_match:
             request_id = stream_error_match.group(1)
-            traces.setdefault(request_id, {"request_id": request_id})["server_error"] = line.strip()
+            traces.setdefault(request_id, {"request_id": request_id})[
+                "server_error"
+            ] = line.strip()
             continue
         match = TRACE_RE.search(line)
         if not match:
@@ -592,7 +836,9 @@ def load_server_traces(
     return traces
 
 
-def attach_server_traces(results: list[RequestResult], traces: dict[str, dict[str, Any]]) -> None:
+def attach_server_traces(
+    results: list[RequestResult], traces: dict[str, dict[str, Any]]
+) -> None:
     for result in results:
         trace = find_server_trace(
             result.request_id,
@@ -606,14 +852,39 @@ def attach_server_traces(results: list[RequestResult], traces: dict[str, dict[st
         if result.ok and result.first_token_wall_s is not None:
             emit_at = trace.get("first_token_emit_unix_s")
             if isinstance(emit_at, (int, float)):
-                trace["stream_flush_ms"] = max(0.0, (result.first_token_wall_s - float(emit_at)) * 1000.0)
+                trace["stream_flush_ms"] = max(
+                    0.0, (result.first_token_wall_s - float(emit_at)) * 1000.0
+                )
             queued_at = trace.get("queued_at_unix_s")
             if isinstance(queued_at, (int, float)):
-                trace["frontend_to_queue_ms"] = max(0.0, (float(queued_at) - result.start_wall_s) * 1000.0)
+                trace["frontend_to_queue_ms"] = max(
+                    0.0, (float(queued_at) - result.start_wall_s) * 1000.0
+                )
             scheduled_at = trace.get("scheduled_at_unix_s")
-            if isinstance(queued_at, (int, float)) and isinstance(scheduled_at, (int, float)):
-                trace["admission_queue_ms"] = max(0.0, (float(scheduled_at) - float(queued_at)) * 1000.0)
+            if isinstance(queued_at, (int, float)) and isinstance(
+                scheduled_at, (int, float)
+            ):
+                trace["admission_queue_ms"] = max(
+                    0.0, (float(scheduled_at) - float(queued_at)) * 1000.0
+                )
         apply_server_error_gate(result)
+        finalize_token_timing(result)
+
+
+def finalize_token_timing(result: RequestResult) -> None:
+    trace = result.server_trace
+    if trace is None or not isinstance(trace.get("completion_tokens"), int):
+        return
+    completion_tokens = int(trace["completion_tokens"])
+    result.token_timing_valid = result.output_chunks == completion_tokens
+    if result.token_timing_valid:
+        if result.stream_chunk_tpot_ms is not None:
+            result.tpot_ms = result.stream_chunk_tpot_ms
+        if result.stream_chunk_itl_ms:
+            result.itl_ms = list(result.stream_chunk_itl_ms)
+        return
+    result.tpot_ms = None
+    result.itl_ms = []
 
 
 def apply_server_error_gate(result: RequestResult) -> None:
@@ -645,7 +916,9 @@ def find_server_trace(
     matches = [
         trace
         for trace_id, trace in traces.items()
-        if trace_id == request_id or trace_id == f"cmpl-{request_id}" or trace_id.startswith(prefix)
+        if trace_id == request_id
+        or trace_id == f"cmpl-{request_id}"
+        or trace_id.startswith(prefix)
     ]
     timed_matches = []
     for trace in matches:
@@ -674,7 +947,9 @@ def find_server_trace(
     return None
 
 
-def run_batch(args: argparse.Namespace, measured: bool) -> tuple[list[RequestResult], float]:
+def run_batch(
+    args: argparse.Namespace, measured: bool
+) -> tuple[list[RequestResult], float]:
     url = urllib.parse.urlparse(args.base_url)
     if url.scheme not in {"http", "https"} or not url.hostname:
         raise SystemExit(f"invalid --base-url: {args.base_url}")
@@ -719,36 +994,64 @@ def run_batch(args: argparse.Namespace, measured: bool) -> tuple[list[RequestRes
                 top_p=profile.top_p,
                 sampling_label=profile.label,
             )
-            for idx, (_global_index, prompt_words, max_tokens, prompt, profile) in enumerate(workloads)
+            for idx, (
+                _global_index,
+                prompt_words,
+                max_tokens,
+                prompt,
+                profile,
+            ) in enumerate(workloads)
         ]
-        results = [future.result() for future in concurrent.futures.as_completed(futures)]
+        results = [
+            future.result() for future in concurrent.futures.as_completed(futures)
+        ]
     ended = time.perf_counter()
     results.sort(key=lambda result: result.index)
     return results, ended - started
 
 
-def build_report(args: argparse.Namespace, measured: list[RequestResult], wall_s: float) -> dict[str, Any]:
+def build_report(
+    args: argparse.Namespace, measured: list[RequestResult], wall_s: float
+) -> dict[str, Any]:
+    backend = getattr(args, "backend", None)
+    contract_name = getattr(args, "contract_name", None)
+    contract_description = getattr(args, "contract_description", None)
+    claim_boundary = getattr(args, "claim_boundary", None)
+    required_trace_coverage = getattr(args, "required_trace_coverage", None)
+    for result in measured:
+        finalize_token_timing(result)
     successes = [result for result in measured if result.ok]
     failures = [result for result in measured if not result.ok]
     latencies = [result.latency_ms for result in successes]
     ttfts = [result.ttft_ms for result in successes if result.ttft_ms is not None]
     tpots = [result.tpot_ms for result in successes if result.tpot_ms is not None]
     itls: list[float] = []
+    stream_chunk_tpots = [
+        result.stream_chunk_tpot_ms
+        for result in successes
+        if result.stream_chunk_tpot_ms is not None
+    ]
+    stream_chunk_itls = [
+        value for result in successes for value in result.stream_chunk_itl_ms
+    ]
     output_chunks = [result.output_chunks for result in successes]
     output_chars = [result.output_chars for result in successes]
     hashes = [result.output_hash for result in successes]
     input_tokens = [
         int(result.server_trace["prompt_tokens"])
-        if result.server_trace is not None and isinstance(result.server_trace.get("prompt_tokens"), int)
+        if result.server_trace is not None
+        and isinstance(result.server_trace.get("prompt_tokens"), int)
         else result.prompt_words
         for result in successes
     ]
     output_tokens = [
         int(result.server_trace["completion_tokens"])
-        if result.server_trace is not None and isinstance(result.server_trace.get("completion_tokens"), int)
-        else (result.max_tokens if args.ignore_eos else result.output_chunks)
         for result in successes
+        if result.server_trace is not None
+        and isinstance(result.server_trace.get("completion_tokens"), int)
     ]
+    output_token_counts_complete = len(output_tokens) == len(successes)
+    output_tokens_total = sum(output_tokens) if output_token_counts_complete else None
     shape_counts: dict[str, int] = {}
     for result in measured:
         key = f"prompt_words={result.prompt_words},max_tokens={result.max_tokens}"
@@ -757,11 +1060,39 @@ def build_report(args: argparse.Namespace, measured: list[RequestResult], wall_s
     for result in successes:
         itls.extend(result.itl_ms)
 
-    return {
+    report = {
         "schema_version": 1,
         "kind": "openai_http_completions_stream_benchmark",
+        "report_intent": "http_serving_slo"
+        if contract_name
+        else "http_serving_benchmark",
         "base_url": args.base_url,
         "model": args.model,
+        "backend": backend,
+        "contract": {
+            "name": contract_name,
+            "backend": backend,
+            "description": contract_description,
+            "required_trace_coverage_ratio": required_trace_coverage,
+            "claim_boundary": claim_boundary
+            or "HTTP streaming benchmark evidence only; direct, profiler, soak, and production-readiness claims require separate artifacts.",
+        },
+        "metadata": {
+            "commit": getattr(args, "commit", None) or current_commit(),
+            "backend": backend,
+            "contract_name": contract_name,
+            "model_path": getattr(args, "model_path", None),
+            "server_command": getattr(args, "server_command", None),
+            "source_revision": getattr(args, "source_revision", None),
+            "model_revision": getattr(args, "model_revision", None),
+            "model_fingerprint": model_fingerprint(getattr(args, "model_path", None)),
+            "server_binary_sha256": sha256_file(Path(getattr(args, "server_binary")))
+            if getattr(args, "server_binary", None)
+            else None,
+            "backend_runtime_version": getattr(args, "backend_runtime_version", None),
+            "benchmark_command": artifact_command(sys.argv),
+            "hardware_toolchain": detect_hardware_toolchain(),
+        },
         "workload": {
             "num_requests": args.num_requests,
             "concurrency": args.concurrency,
@@ -777,6 +1108,7 @@ def build_report(args: argparse.Namespace, measured: list[RequestResult], wall_s
             "sampling_counts": count_sampling(measured),
             "ignore_eos": args.ignore_eos,
             "timeout_s": args.timeout,
+            "timeout_kind": "absolute_request_deadline",
         },
         "summary": {
             "wall_s": wall_s,
@@ -788,10 +1120,24 @@ def build_report(args: argparse.Namespace, measured: list[RequestResult], wall_s
             "failed_sampling_counts": count_sampling(failures),
             "qps": len(successes) / wall_s if wall_s > 0 else 0.0,
             "input_tokens_total": sum(input_tokens),
-            "output_tokens_total": sum(output_tokens),
+            "output_tokens_total": output_tokens_total,
             "input_tokens_per_s": sum(input_tokens) / wall_s if wall_s > 0 else 0.0,
-            "output_tokens_per_s": sum(output_tokens) / wall_s if wall_s > 0 else 0.0,
-            "error_rate": len(failures) / args.num_requests if args.num_requests else 0.0,
+            "output_tokens_per_s": (
+                output_tokens_total / wall_s
+                if output_tokens_total is not None and wall_s > 0
+                else None
+            ),
+            "output_token_count_source": (
+                "server_trace.completion_tokens"
+                if output_token_counts_complete
+                else "unavailable"
+            ),
+            "output_token_count_coverage_ratio": (
+                len(output_tokens) / len(successes) if successes else 0.0
+            ),
+            "error_rate": len(failures) / args.num_requests
+            if args.num_requests
+            else 0.0,
             "timeout_rate": (
                 sum(1 for result in failures if result.timed_out) / args.num_requests
                 if args.num_requests
@@ -800,37 +1146,98 @@ def build_report(args: argparse.Namespace, measured: list[RequestResult], wall_s
             "output_chunks_total": sum(output_chunks),
             "output_chars_total": sum(output_chars),
             "unique_output_hashes": len(set(hashes)),
-            "combined_output_hash": hashlib.sha256("".join(hashes).encode("utf-8")).hexdigest()[:16],
+            "output_hash_distribution": value_counts(hashes),
+            "combined_output_hash": combined_output_hash(hashes),
         },
         "metrics": {
             "latency": summarize(latencies),
             "ttft": summarize(ttfts),
             "tpot": summarize(tpots),
             "itl": summarize(itls),
+            "stream_chunk_tpot": summarize(stream_chunk_tpots),
+            "stream_chunk_itl": summarize(stream_chunk_itls),
+        },
+        "metric_definitions": {
+            "percentile_method": "R7 linear interpolation over sorted samples",
+            "ttft": "request start to first non-empty streamed text chunk",
+            "tpot": "mean inter-token time per request, emitted only when streamed text chunk count equals server completion_tokens",
+            "itl": "inter-token latency, emitted only when streamed text chunk count equals server completion_tokens",
+            "stream_chunk_tpot": "mean inter-chunk time per request; diagnostic when a chunk can contain multiple tokens",
+            "stream_chunk_itl": "inter-chunk latency; diagnostic when a chunk can contain multiple tokens",
+            "output_tokens": "server trace completion_tokens only; unavailable when any successful request lacks a trusted token count",
         },
         "server_trace": summarize_trace_ms(measured),
         "requests": [asdict(result) for result in measured],
     }
+    report["retention_gate"] = build_retention_gate(report)
+    report["latency_budget"] = {
+        "configured": False,
+        "passed": None,
+        "reason": "This retained report records latency distributions but does not define a production latency budget.",
+    }
+    return report
 
 
-def main() -> None:
+def write_report(args: argparse.Namespace, report: dict[str, Any]) -> None:
+    if args.out:
+        rendered = write_json(args.out, report)
+    else:
+        rendered = json.dumps(report, indent=2, sort_keys=True)
+    print(rendered)
+
+
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
     parser.add_argument("--model", required=True)
     parser.add_argument("--num-requests", type=int, default=8)
     parser.add_argument("--concurrency", type=int, default=2)
-    parser.add_argument("--warmup", type=int, default=1)
+    parser.add_argument("--warmup", type=int)
     parser.add_argument(
         "--prompt-words",
         type=parse_int_list,
-        default=[16],
+        default=None,
         help="Prompt word count, or comma-separated counts for a mixed workload.",
     )
     parser.add_argument(
         "--max-tokens",
         type=parse_int_list,
-        default=[16],
+        default=None,
         help="Completion token count, or comma-separated counts for a mixed workload.",
+    )
+    parser.add_argument("--contract-name", help="Stable report contract name.")
+    parser.add_argument(
+        "--contract-description", help="Contract description written into JSON."
+    )
+    parser.add_argument(
+        "--claim-boundary", help="Claim boundary written into the JSON report."
+    )
+    parser.add_argument(
+        "--required-trace-coverage",
+        type=float,
+        help="Require request, active-set, and decode-batch trace coverage at this ratio.",
+    )
+    parser.add_argument(
+        "--backend", help="Backend label, for example host-staged or nccl."
+    )
+    parser.add_argument("--model-path", help="Server model path used for this run.")
+    parser.add_argument(
+        "--server-command", help="Server launch command used for this run."
+    )
+    parser.add_argument(
+        "--commit", help="OpenInfer commit for this run; defaults to git HEAD."
+    )
+    parser.add_argument(
+        "--source-revision", help="Exact source-tree revision identifier."
+    )
+    parser.add_argument(
+        "--model-revision", help="Model snapshot or revision identifier."
+    )
+    parser.add_argument(
+        "--server-binary", type=Path, help="Server binary used for this run."
+    )
+    parser.add_argument(
+        "--backend-runtime-version", help="Loaded backend runtime version."
     )
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-k", type=int, default=-1)
@@ -847,8 +1254,10 @@ def main() -> None:
     parser.add_argument("--sample-temperature", type=float, default=0.8)
     parser.add_argument("--sample-top-k", type=int, default=40)
     parser.add_argument("--sample-top-p", type=float, default=0.95)
-    parser.add_argument("--timeout", type=float, default=120.0)
-    parser.add_argument("--ignore-eos", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--timeout", type=float)
+    parser.add_argument(
+        "--ignore-eos", action=argparse.BooleanOptionalAction, default=True
+    )
     parser.add_argument(
         "--server-log",
         type=Path,
@@ -856,29 +1265,62 @@ def main() -> None:
     )
     parser.add_argument("--out", type=Path)
     args = parser.parse_args()
+    if args.prompt_words is None:
+        args.prompt_words = [16]
+    if args.max_tokens is None:
+        args.max_tokens = [16]
+    if args.timeout is None:
+        args.timeout = 120.0
+    if args.warmup is None:
+        args.warmup = 1
+    return args
+
+
+def validate_args(args: argparse.Namespace) -> None:
+    if args.contract_name and not args.backend:
+        raise SystemExit("--backend is required when --contract-name is set")
+    if args.required_trace_coverage is not None:
+        if args.required_trace_coverage <= 0.0 or args.required_trace_coverage > 1.0:
+            raise SystemExit("--required-trace-coverage must be in (0, 1]")
+        if args.server_log is None:
+            raise SystemExit("--server-log is required with --required-trace-coverage")
 
     if args.concurrency <= 0:
         raise SystemExit("--concurrency must be positive")
     if args.num_requests <= 0:
         raise SystemExit("--num-requests must be positive")
+    if args.timeout <= 0.0:
+        raise SystemExit("--timeout must be positive")
     validate_sampling_args(args)
-    if args.warmup > 0:
-        warmup_results, _ = run_batch(args, measured=False)
-        failed = [result for result in warmup_results if not result.ok]
-        if failed:
-            raise SystemExit(f"warmup failed: {failed[0].error}")
+
+
+def run_warmup(args: argparse.Namespace) -> None:
+    if args.warmup <= 0:
+        return
+    warmup_results, _ = run_batch(args, measured=False)
+    attach_server_traces(warmup_results, load_server_traces(args.server_log))
+    if any(not result.ok for result in warmup_results):
+        report = build_report(args, warmup_results, wall_s=0.0)
+        report["report_intent"] = "http_serving_slo_warmup_failure"
+        report["warmup_failed"] = True
+        write_report(args, report)
+        raise SystemExit(1)
+
+
+def main() -> None:
+    args = parse_args()
+    validate_args(args)
+    run_warmup(args)
 
     trace_offset = server_log_offset(args.server_log)
     measured, wall_s = run_batch(args, measured=True)
-    attach_server_traces(measured, load_server_traces(args.server_log, start_offset=trace_offset))
+    attach_server_traces(
+        measured, load_server_traces(args.server_log, start_offset=trace_offset)
+    )
     report = build_report(args, measured, wall_s)
-    rendered = json.dumps(report, indent=2, sort_keys=True)
-    if args.out:
-        args.out.parent.mkdir(parents=True, exist_ok=True)
-        args.out.write_text(rendered + "\n", encoding="utf-8")
-    print(rendered)
+    write_report(args, report)
 
-    if report["summary"]["failed"]:
+    if report["summary"]["failed"] or report["retention_gate"].get("passed") is False:
         raise SystemExit(1)
 
 

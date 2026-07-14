@@ -1,3 +1,10 @@
+//! DeepSeek-V2-Lite EP2 correctness and integration gate.
+//!
+//! This test verifies model loading, host-staged/NCCL generation, request-flow
+//! isolation, token/text hashes, and EP route/collective accounting. It does
+//! not measure serving latency, throughput, SLO compliance, soak behavior, or
+//! production readiness; those claims belong to retained benchmark artifacts.
+
 use std::{
     env, fs,
     path::{Path, PathBuf},
@@ -227,6 +234,9 @@ fn run_rust_generation(model_path_label: &str, model_path: &Path) -> Result<()> 
     let matched_output_oracle =
         matched_expected_output_oracle(&result.stats.output_token_sha256, &output_text_sha256);
     let payload = serde_json::json!({
+        "schema_version": 1,
+        "kind": "deepseek_v2_lite_ep2_correctness",
+        "report_intent": "correctness_integration",
         "model_path": model_path_label,
         "gpu_count": 2,
         "ep_size": result.stats.ep_size,
@@ -258,6 +268,7 @@ fn run_rust_generation(model_path_label: &str, model_path: &Path) -> Result<()> 
         "nccl_dense_exchange_elements": result.stats.nccl_dense_exchange_elements,
         "nccl_combine_elements": result.stats.nccl_combine_elements,
         "output_text": &output_text,
+        "claim_boundary": "Correctness and integration evidence for the covered DeepSeek-V2-Lite EP2 generation path. This artifact makes no latency, throughput, serving SLO, soak, or production-readiness claim.",
     });
     let payload_text = serde_json::to_string_pretty(&payload)?;
     if let Ok(path) = env::var(E2E_JSON_OUT_ENV) {
@@ -313,6 +324,9 @@ fn run_case_set_generation(
     }
 
     let payload = serde_json::json!({
+        "schema_version": 1,
+        "kind": "deepseek_v2_lite_ep2_correctness_case_set",
+        "report_intent": "correctness_integration",
         "schema": 2,
         "report_type": "deepseek-v2-lite-ep2-rust-e2e-case-set",
         "model_path": model_path_label,
@@ -325,6 +339,7 @@ fn run_case_set_generation(
         "token_sha256_algorithm": "sha256 over generated token ids encoded as little-endian u32",
         "text_sha256_algorithm": "sha256 over UTF-8 generated text bytes",
         "cases": case_payloads,
+        "claim_boundary": "Correctness and integration evidence for the covered DeepSeek-V2-Lite EP2 case set. This artifact makes no latency, throughput, serving SLO, soak, or production-readiness claim.",
     });
     let payload_text = serde_json::to_string_pretty(&payload)?;
     write_payload_if_requested(&payload_text)?;
@@ -654,6 +669,9 @@ fn run_mixed_serving_generation(model_path: &Path, model_path_label: &str) -> Re
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "kind": "deepseek_v2_lite_ep2_mixed_serving_correctness",
+            "report_intent": "correctness_integration",
             "schema": 1,
             "report_type": "deepseek-v2-lite-ep2-mixed-serving-e2e",
             "model_path": model_path_label,
@@ -670,6 +688,7 @@ fn run_mixed_serving_generation(model_path: &Path, model_path_label: &str) -> Re
                     })
                 })
                 .collect::<Vec<_>>(),
+            "claim_boundary": "Correctness and integration evidence for mixed DeepSeek-V2-Lite EP2 request flow and failure isolation. This artifact makes no latency, throughput, serving SLO, soak, or production-readiness claim.",
         }))?
     );
     Ok(())

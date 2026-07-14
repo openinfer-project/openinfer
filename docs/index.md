@@ -87,10 +87,12 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 
 | Path | TL;DR |
 | --- | --- |
-| `models/deepseek-v2-lite/status.md` | DeepSeek-V2-Lite EP2 status ledger: HF/host-staged/NCCL exactness, mixed-request serving, #464 trace attribution plus host-staged/NCCL route grouping and NCCL device-router evidence, reliability gates, and retained vLLM boundaries; no broad-workload, parity, or production claim. |
+| `models/deepseek-v2-lite/status.md` | DeepSeek-V2-Lite EP2 status ledger: correctness, direct attribution, lifecycle reliability, and the #466 six-child host-staged/NCCL HTTP SLO report remain separate evidence buckets; no soak, parity, or production claim. |
+| `models/deepseek-v2-lite/benchmarking.md` | Verification ladder and commands for DSV2-Lite correctness, direct decode diagnostics, retained host-staged/NCCL HTTP SLO profiles, and the separate soak/production boundary. |
+| `models/deepseek-v2-lite/roadmap.md` | Single-node EP2 roadmap: #466 retained SLO reporting is an evidence layer; soak, device KV/attention, long-prefill scheduling, and Stable promotion remain separate gates. |
 | `models/deepseek-v2-lite/benchmark-artifact-manifest.md` | Issue #467 implemented: the retained DeepSeek-V2-Lite benchmark matrix emits `artifact_manifest.json` and `regression_summary.json`, with CPU-only summarize-only tests. |
 | `models/deepseek-v2-lite/hf-accuracy-gate.md` | DeepSeek-V2-Lite EP2 HF accuracy gate after PR #149/#150/#274: HF `generate(use_cache=true)`, host-staged EP2, and NCCL EP2 are compared across the committed small case set. |
-| `models/deepseek-v2-lite/decode-attribution-gate.md` | DeepSeek-V2-Lite EP2 decode attribution gate for `Hello`/16-token batch sizes 1/4/8: structured JSON with accuracy hashes, timing/counters, separated NCCL all-reduce smoke, and fail-closed full-decode graph probe evidence for the retained batch-1 shape. |
+| `models/deepseek-v2-lite/decode-attribution-gate.md` | Direct diagnostic benchmark for DeepSeek-V2-Lite EP2 `Hello`/16-token batch sizes 1/4/8: structured timing/counters and graph probes with no HTTP SLO or production claim. |
 | `models/deepseek-v2-lite/source-layout.md` | DeepSeek-V2-Lite runtime layout refactor: `runtime.rs` split by responsibility, HF/host-staged/NCCL EP2 E2E exact on 2x RTX 5090; NCCL CUDA Graph smoke remains a diagnostic blocker on that host, independent of the passed correctness gate. |
 | `models/deepseek-v2-lite/device-resident-nccl-combine.md` | Issue #275 record: NCCL decode combine uses reusable device-resident f32 scratch; current NCCL graph-readiness blockers live in `status.md`. |
 

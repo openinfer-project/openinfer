@@ -61,15 +61,15 @@ cargo fmt --all --check
 Both passed.
 
 Remote validation ran on Ubuntu 22.04 with 2x NVIDIA GeForce RTX 5090, driver
-580.105.08, CUDA 12.8, `OPENINFER_CUDA_SM=120`, and
-`OPENINFER_TRITON_PYTHON=/root/autodl-tmp/openinfer-triton-venv/bin/python`.
+580.105.08, CUDA 12.8, `OPENINFER_CUDA_SM=120`, and a configured
+`OPENINFER_TRITON_PYTHON` environment.
 
 Passed gates:
 
 - `cargo check --offline --release -p openinfer-deepseek-v2-lite --features deepseek-v2-lite --lib --tests`
 - HF oracle dump with `tools/accuracy/hf_dump_dsv2_lite_ep2_greedy.py`
 - host-staged `tests/e2e_ep2.rs`
-- NCCL `tests/e2e_ep2.rs` using `LD_LIBRARY_PATH=/root/autodl-tmp/nccl-2.27.7/nvidia/nccl/lib`
+- NCCL `tests/e2e_ep2.rs` using an explicit compatible NCCL library selector
 - `tools/accuracy/compare_dsv2_lite_ep2_outputs.py --require-all-exact`
 - NCCL attribution without graph smoke
 

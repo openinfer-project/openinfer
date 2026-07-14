@@ -51,6 +51,7 @@ type NcclAllReduce = unsafe extern "C" fn(
     ncclComm_t,
     CUstream,
 ) -> ncclResult_t;
+type NcclGetVersion = unsafe extern "C" fn(*mut c_int) -> ncclResult_t;
 type NcclGetErrorString = unsafe extern "C" fn(ncclResult_t) -> *const c_char;
 
 // Keep the correctness-first NCCL bridge below the long-prompt failure band
@@ -60,6 +61,9 @@ type NcclGetErrorString = unsafe extern "C" fn(ncclResult_t) -> *const c_char;
 // that previously failed in prefill.
 const NCCL_BF16_ALL_REDUCE_MAX_ELEMS_PER_CALL: usize = 64 * 1024;
 const NCCL_F32_ALL_REDUCE_MAX_ELEMS_PER_CALL: usize = 48 * 1024;
+// NCCL 2.26.2 contains NVIDIA's reduced collective-unroll fix for the
+// shared-memory limit on recent sm_120 Blackwell GPUs (NVIDIA/nccl#1637).
+const MIN_SM120_NCCL_VERSION: c_int = 22_602;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct AllReduceChunk {
@@ -129,6 +133,7 @@ struct RawNcclLib {
     group_start: NcclGroupStart,
     group_end: NcclGroupEnd,
     all_reduce: NcclAllReduce,
+    version_code: c_int,
     get_error_string: NcclGetErrorString,
 }
 
@@ -317,6 +322,16 @@ impl NaiveNcclEp2Backend {
             [rank0.device_ordinal, rank1.device_ordinal]
         );
         let lib = Arc::new(RawNcclLib::load()?);
+        let compute_capabilities = [
+            rank0.ctx.compute_capability()?,
+            rank1.ctx.compute_capability()?,
+        ];
+        validate_nccl_version_for_compute_capabilities(lib.version_code, &compute_capabilities)?;
+        log::info!(
+            "DeepSeek-V2-Lite NCCL backend loaded: version={}, version_code={}",
+            format_nccl_version(lib.version_code),
+            lib.version_code
+        );
         let ordinals = [rank0.device_ordinal as i32, rank1.device_ordinal as i32];
         let mut comms = vec![ptr::null_mut(); 2];
         let status = unsafe {
@@ -1342,6 +1357,22 @@ impl RawNcclLib {
     }
 
     unsafe fn from_library(library: Library, source: String) -> Result<Self> {
+        let get_version: NcclGetVersion = unsafe { load_symbol(&library, b"ncclGetVersion\0")? };
+        let get_error_string: NcclGetErrorString =
+            unsafe { load_symbol(&library, b"ncclGetErrorString\0")? };
+        let mut version_code = 0;
+        let status = unsafe { get_version(&raw mut version_code) };
+        if status != ncclResult_t::ncclSuccess {
+            let message = unsafe {
+                let ptr = get_error_string(status);
+                if ptr.is_null() {
+                    format!("{status:?}")
+                } else {
+                    CStr::from_ptr(ptr).to_string_lossy().into_owned()
+                }
+            };
+            bail!("query NCCL version from {source} failed: {message} ({status:?})");
+        }
         Ok(Self {
             comm_init_all: unsafe { load_symbol(&library, b"ncclCommInitAll\0")? },
             comm_count: unsafe { load_symbol(&library, b"ncclCommCount\0")? },
@@ -1350,7 +1381,8 @@ impl RawNcclLib {
             group_start: unsafe { load_symbol(&library, b"ncclGroupStart\0")? },
             group_end: unsafe { load_symbol(&library, b"ncclGroupEnd\0")? },
             all_reduce: unsafe { load_symbol(&library, b"ncclAllReduce\0")? },
-            get_error_string: unsafe { load_symbol(&library, b"ncclGetErrorString\0")? },
+            version_code,
+            get_error_string,
             source,
             _library: library,
         })
@@ -1371,8 +1403,9 @@ impl RawNcclLib {
             }
         };
         bail!(
-            "{context} failed with NCCL library {}: {message} ({status:?})",
-            self.source
+            "{context} failed with NCCL library {} version {}: {message} ({status:?})",
+            self.source,
+            format_nccl_version(self.version_code)
         )
     }
 
@@ -1397,6 +1430,29 @@ impl RawNcclLib {
         self.check(status, context)?;
         Ok(device)
     }
+}
+
+fn validate_nccl_version_for_compute_capabilities(
+    version_code: c_int,
+    compute_capabilities: &[(i32, i32)],
+) -> Result<()> {
+    let has_sm120 = compute_capabilities
+        .iter()
+        .any(|compute_capability| *compute_capability == (12, 0));
+    ensure!(
+        !has_sm120 || version_code >= MIN_SM120_NCCL_VERSION,
+        "DeepSeek-V2-Lite NCCL EP2 on sm_120 requires NCCL >= {}, loaded {}. Set OPENINFER_NCCL_LIB_DIR to a compatible wheel lib directory or OPENINFER_NCCL_PYTHON to its Python executable",
+        format_nccl_version(MIN_SM120_NCCL_VERSION),
+        format_nccl_version(version_code)
+    );
+    Ok(())
+}
+
+fn format_nccl_version(version_code: c_int) -> String {
+    let major = version_code / 10_000;
+    let minor = (version_code % 10_000) / 100;
+    let patch = version_code % 100;
+    format!("{major}.{minor}.{patch}")
 }
 
 fn nccl_library_candidates() -> Vec<String> {
@@ -1477,6 +1533,19 @@ fn python_env_roots() -> Vec<PathBuf> {
 }
 
 fn add_python_env_root(roots: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, python: &Path) {
+    add_python_env_root_candidate(roots, seen, python);
+    if let Ok(resolved) = fs::canonicalize(python)
+        && resolved != python
+    {
+        add_python_env_root_candidate(roots, seen, &resolved);
+    }
+}
+
+fn add_python_env_root_candidate(
+    roots: &mut Vec<PathBuf>,
+    seen: &mut HashSet<PathBuf>,
+    python: &Path,
+) {
     if python.is_dir() {
         add_pathbuf_once(roots, seen, python.to_path_buf());
         return;

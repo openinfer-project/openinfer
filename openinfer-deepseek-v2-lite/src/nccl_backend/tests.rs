@@ -1,8 +1,12 @@
 use std::{collections::HashSet, fs};
 
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
+
 use super::{
     AllReduceChunk, NCCL_BF16_ALL_REDUCE_MAX_ELEMS_PER_CALL,
     NCCL_F32_ALL_REDUCE_MAX_ELEMS_PER_CALL, bf16_all_reduce_chunks, f32_all_reduce_chunks,
+    format_nccl_version, validate_nccl_version_for_compute_capabilities,
 };
 use super::{add_python_env_root, nccl_python_wheel_lib_dirs_from_root};
 
@@ -84,6 +88,33 @@ fn finds_nccl_python_wheel_lib_dir_from_python_executable() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn keeps_symlinked_python_venv_root_before_resolved_root() {
+    let real_root = tempfile::tempdir().expect("create real Python root");
+    let link_root = tempfile::tempdir().expect("create symlink root");
+    let real_bin = real_root.path().join("bin");
+    let link_bin = link_root.path().join("bin");
+    fs::create_dir_all(&real_bin).expect("create real bin dir");
+    fs::create_dir_all(&link_bin).expect("create symlink bin dir");
+    let real_python = real_bin.join("python3.12");
+    fs::write(&real_python, []).expect("create Python marker");
+    let linked_python = link_bin.join("python3");
+    symlink(&real_python, &linked_python).expect("create Python symlink");
+
+    let mut roots = Vec::new();
+    let mut seen = HashSet::new();
+    add_python_env_root(&mut roots, &mut seen, &linked_python);
+
+    assert_eq!(
+        roots,
+        vec![
+            link_root.path().to_path_buf(),
+            real_root.path().to_path_buf()
+        ]
+    );
+}
+
 #[test]
 fn finds_nccl_python_wheel_lib_dir_with_unversioned_soname() {
     let root = tempfile::tempdir().expect("create temp root");
@@ -97,4 +128,33 @@ fn finds_nccl_python_wheel_lib_dir_with_unversioned_soname() {
         nccl_python_wheel_lib_dirs_from_root(root.path()),
         vec![wheel_dir]
     );
+}
+
+#[test]
+fn formats_nccl_version_code() {
+    assert_eq!(format_nccl_version(22_602), "2.26.2");
+    assert_eq!(format_nccl_version(22_707), "2.27.7");
+    assert_eq!(format_nccl_version(22_501), "2.25.1");
+}
+
+#[test]
+fn sm120_rejects_nccl_before_shared_memory_fix() {
+    let error = validate_nccl_version_for_compute_capabilities(22_601, &[(12, 0)])
+        .expect_err("NCCL 2.26.1 predates the sm_120 shared-memory fix");
+    let message = error.to_string();
+    assert!(message.contains("requires NCCL >= 2.26.2"));
+    assert!(message.contains("loaded 2.26.1"));
+    assert!(message.contains("OPENINFER_NCCL_LIB_DIR"));
+}
+
+#[test]
+fn sm120_accepts_nccl_2_26_2() {
+    validate_nccl_version_for_compute_capabilities(22_602, &[(12, 0), (12, 0)])
+        .expect("NCCL 2.26.2 contains the sm_120 shared-memory fix");
+}
+
+#[test]
+fn non_sm120_capabilities_do_not_inherit_the_sm120_floor() {
+    validate_nccl_version_for_compute_capabilities(22_501, &[(8, 0), (10, 0), (12, 1)])
+        .expect("the sm_120 workaround must stay scoped to compute capability 12.0");
 }

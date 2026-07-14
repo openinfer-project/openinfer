@@ -130,7 +130,7 @@ Model type is auto-detected from `config.json` — just point `--model-path` at 
 
 DeepSeek support is intentionally narrower than the Qwen paths:
 
-- **DeepSeek-V2-Lite** requires `--features deepseek-v2-lite` and the 2-GPU EP2 path. Its current gate is correctness and attribution only: HF, host-staged, and NCCL are token/text exact for the narrow `Hello`/16-token greedy contract; same-prompt batch and HTTP/vLLM data are diagnostic and do not claim production continuous batching or serving parity. Evidence: [`status.md`](docs/models/deepseek-v2-lite/status.md) and [`hf-accuracy-gate.md`](docs/models/deepseek-v2-lite/hf-accuracy-gate.md).
+- **DeepSeek-V2-Lite** requires `--features deepseek-v2-lite` and the 2-GPU EP2 path. Correctness, direct decode diagnostics, and retained HTTP SLO reports use separate entry points and claim boundaries; see [`benchmarking.md`](docs/models/deepseek-v2-lite/benchmarking.md), [`status.md`](docs/models/deepseek-v2-lite/status.md), and [`hf-accuracy-gate.md`](docs/models/deepseek-v2-lite/hf-accuracy-gate.md).
 
 ## API
 
@@ -327,7 +327,10 @@ cargo test --release --workspace --lib
 OPENINFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release -p openinfer-qwen3 --test hf_golden_gate
 OPENINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p openinfer-qwen35-4b --features qwen35-4b --test hf_golden_gate
 OPENINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p openinfer-qwen35-4b --features qwen35-4b --test e2e_scheduler
+OPENINFER_TEST_MODEL_PATH=models/DeepSeek-V2-Lite cargo test --release -p openinfer-deepseek-v2-lite --features deepseek-v2-lite --test e2e_ep2 -- --nocapture
 ```
+
+The DeepSeek-V2-Lite E2E is a correctness/integration gate. Direct diagnostics and HTTP SLO report commands live in [`benchmarking.md`](docs/models/deepseek-v2-lite/benchmarking.md).
 
 ## License
 
