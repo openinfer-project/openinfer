@@ -5,6 +5,7 @@
 
 use std::collections::HashSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 
@@ -26,6 +27,7 @@ use openinfer_core::sampler::SamplingParams;
 const TP_NCCL_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const TP_RUNTIME_STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 const TP_WORKER_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const TP_RUNTIME_MEMORY_RESERVE_BYTES: usize = 512 * 1024 * 1024;
 
 #[allow(dead_code)]
 enum TpWorkerCommand {
@@ -225,6 +227,7 @@ impl Qwen35TpExecutor {
         let nccl_id = cudarc::nccl::safe::Id::new()
             .map_err(|e| anyhow::anyhow!("failed to create Qwen3.5 TP NCCL id: {e:?}"))?;
         let startup_gate = Arc::new(TpStartupGate::default());
+        let effective_max_batch = Arc::new(AtomicUsize::new(0));
         let poison = Arc::new(TpRuntimePoison::default());
         let mut workers = Vec::with_capacity(world_size);
         let mut preflights = Vec::with_capacity(world_size);
@@ -237,6 +240,7 @@ impl Qwen35TpExecutor {
                 max_batch,
                 nccl_id,
                 Arc::clone(&startup_gate),
+                Arc::clone(&effective_max_batch),
                 Arc::clone(&poison),
             ) {
                 Ok((worker, preflight, startup)) => {
@@ -250,9 +254,12 @@ impl Qwen35TpExecutor {
                 }
             }
         }
+        let mut min_rank_max_batch = max_batch;
         for (rank, preflight) in preflights.into_iter().enumerate() {
             match preflight.recv() {
-                Ok(Ok(())) => {}
+                Ok(Ok(rank_max_batch)) => {
+                    min_rank_max_batch = min_rank_max_batch.min(rank_max_batch);
+                }
                 Ok(Err(err)) => {
                     startup_gate.cancel();
                     return Err(err);
@@ -264,6 +271,16 @@ impl Qwen35TpExecutor {
                     ));
                 }
             }
+        }
+        anyhow::ensure!(
+            min_rank_max_batch > 0,
+            "Qwen3.5 TP has no memory capacity for one recurrent request state"
+        );
+        effective_max_batch.store(min_rank_max_batch, Ordering::Release);
+        if min_rank_max_batch < max_batch {
+            log::warn!(
+                "Qwen3.5 TP max_batch reduced from {max_batch} to {min_rank_max_batch} by rank-local recurrent-state memory capacity"
+            );
         }
         let (watchdog_done, watchdog) = match spawn_nccl_startup_watchdog() {
             Ok(watchdog) => watchdog,
@@ -292,7 +309,7 @@ impl Qwen35TpExecutor {
             workers,
             poison,
             world_size,
-            max_batch,
+            max_batch: min_rank_max_batch,
             page_size,
             capacity_pages_for_requests,
             max_position_embeddings,
@@ -594,8 +611,13 @@ impl TpWorker {
         max_batch: usize,
         nccl_id: cudarc::nccl::safe::Id,
         startup_gate: Arc<TpStartupGate>,
+        effective_max_batch: Arc<AtomicUsize>,
         poison: Arc<TpRuntimePoison>,
-    ) -> Result<(Self, mpsc::Receiver<Result<()>>, mpsc::Receiver<Result<()>>)> {
+    ) -> Result<(
+        Self,
+        mpsc::Receiver<Result<usize>>,
+        mpsc::Receiver<Result<()>>,
+    )> {
         let (tx, rx) = mpsc::channel();
         let (preflight_tx, preflight_rx) = mpsc::channel();
         let (startup_tx, startup_rx) = mpsc::channel();
@@ -607,8 +629,8 @@ impl TpWorker {
                 let outcome = catch_unwind(AssertUnwindSafe(|| {
                     let prepared = TpWorkerPrepared::new(rank, world_size, model, max_batch);
                     let prepared = match prepared {
-                        Ok(prepared) => {
-                            let _ = preflight_tx.send(Ok(()));
+                        Ok((prepared, rank_max_batch)) => {
+                            let _ = preflight_tx.send(Ok(rank_max_batch));
                             prepared
                         }
                         Err(err) => {
@@ -619,7 +641,8 @@ impl TpWorker {
                     if !startup_gate.wait() {
                         return;
                     }
-                    match prepared.connect(nccl_id, poison) {
+                    let max_batch = effective_max_batch.load(Ordering::Acquire);
+                    match prepared.connect(nccl_id, max_batch, poison) {
                         Ok(mut state) => {
                             let _ = startup_tx.send(Ok(()));
                             state.run(rx);
@@ -709,28 +732,63 @@ enum TpRequestPhase {
 }
 
 impl TpWorkerPrepared {
-    fn new(rank: usize, world_size: usize, model: Qwen35Model, max_batch: usize) -> Result<Self> {
+    fn new(
+        rank: usize,
+        world_size: usize,
+        model: Qwen35Model,
+        requested_max_batch: usize,
+    ) -> Result<(Self, usize)> {
         let cublas_guard = bind_worker_thread(&model)?;
+        let (free_bytes, total_bytes) = model
+            .device_ctx()
+            .ctx
+            .mem_get_info()
+            .map_err(|err| anyhow::anyhow!("failed to query TP rank {rank} memory: {err}"))?;
+        let recurrent_bytes = RecurrentState::allocation_bytes(model.config());
+        let max_batch = effective_recurrent_capacity(
+            requested_max_batch,
+            free_bytes,
+            recurrent_bytes,
+            TP_RUNTIME_MEMORY_RESERVE_BYTES,
+        );
+        anyhow::ensure!(
+            max_batch > 0,
+            "Qwen3.5 TP rank {rank} has {} MiB free after fixed buffers, but one recurrent request needs {} MiB plus {} MiB runtime reserve",
+            free_bytes / (1024 * 1024),
+            recurrent_bytes / (1024 * 1024),
+            TP_RUNTIME_MEMORY_RESERVE_BYTES / (1024 * 1024),
+        );
+        log::info!(
+            "Qwen3.5 TP rank {rank} recurrent capacity: requested={requested_max_batch}, effective={max_batch}, per_request={:.3} MiB, free={:.0} MiB/{:.0} MiB, runtime_reserve={} MiB",
+            recurrent_bytes as f64 / 1024.0 / 1024.0,
+            free_bytes as f64 / 1024.0 / 1024.0,
+            total_bytes as f64 / 1024.0 / 1024.0,
+            TP_RUNTIME_MEMORY_RESERVE_BYTES / (1024 * 1024),
+        );
         let decode_buffers = model.create_batch_decode_buffers_with_capacity(max_batch)?;
         let sample_scratch = openinfer_sample::SampleScratch::new(
             model.device_ctx(),
             model.config().vocab_size,
             max_batch,
         )?;
-        Ok(Self {
-            rank,
-            world_size,
+        Ok((
+            Self {
+                rank,
+                world_size,
+                max_batch,
+                model,
+                decode_buffers,
+                sample_scratch,
+                cublas_guard,
+            },
             max_batch,
-            model,
-            decode_buffers,
-            sample_scratch,
-            cublas_guard,
-        })
+        ))
     }
 
     fn connect(
         self,
         nccl_id: cudarc::nccl::safe::Id,
+        effective_max_batch: usize,
         poison: Arc<TpRuntimePoison>,
     ) -> Result<TpWorkerState> {
         let Self {
@@ -742,6 +800,10 @@ impl TpWorkerPrepared {
             sample_scratch,
             cublas_guard,
         } = self;
+        anyhow::ensure!(
+            effective_max_batch > 0 && effective_max_batch <= max_batch,
+            "Qwen3.5 TP rank {rank} effective max_batch {effective_max_batch} exceeds local capacity {max_batch}"
+        );
         let comm = cudarc::nccl::safe::Comm::from_rank(
             model.device_ctx().stream.clone(),
             rank,
@@ -753,7 +815,7 @@ impl TpWorkerPrepared {
         Ok(TpWorkerState {
             rank,
             _world_size: world_size,
-            max_batch,
+            max_batch: effective_max_batch,
             model,
             requests: Vec::new(),
             decode_buffers,
@@ -762,6 +824,19 @@ impl TpWorkerPrepared {
             poison,
         })
     }
+}
+
+fn effective_recurrent_capacity(
+    requested_max_batch: usize,
+    free_bytes: usize,
+    recurrent_bytes_per_request: usize,
+    runtime_reserve_bytes: usize,
+) -> usize {
+    if recurrent_bytes_per_request == 0 {
+        return requested_max_batch;
+    }
+    requested_max_batch
+        .min(free_bytes.saturating_sub(runtime_reserve_bytes) / recurrent_bytes_per_request)
 }
 
 impl TpWorkerState {
@@ -1291,6 +1366,28 @@ mod tests {
     }
 
     #[test]
+    fn recurrent_capacity_reserves_runtime_headroom() {
+        const MIB: usize = 1024 * 1024;
+        assert_eq!(
+            effective_recurrent_capacity(64, 4_000 * MIB, 50 * MIB, 512 * MIB),
+            64
+        );
+        assert_eq!(
+            effective_recurrent_capacity(64, 2_000 * MIB, 50 * MIB, 512 * MIB),
+            29
+        );
+        assert_eq!(
+            effective_recurrent_capacity(64, 550 * MIB, 50 * MIB, 512 * MIB),
+            0
+        );
+    }
+
+    #[test]
+    fn zero_sized_recurrent_state_keeps_requested_capacity() {
+        assert_eq!(effective_recurrent_capacity(64, 0, 0, usize::MAX), 64);
+    }
+
+    #[test]
     fn rejects_single_device_topology() {
         let err = match Qwen35TpExecutor::from_runtime_with_capacity("unused", false, &[0], 1) {
             Ok(_) => panic!("single-device TP topology should fail"),
@@ -1355,6 +1452,21 @@ mod tests {
         executor
             .drop_request(RequestId::new(7))
             .expect("drop request");
+    }
+
+    #[test]
+    #[ignore = "requires two CUDA devices and Qwen3.5 weights"]
+    fn tp2_default_capacity_is_memory_safe() {
+        let model_path = std::env::var("OPENINFER_TEST_MODEL_PATH")
+            .unwrap_or_else(|_| "/home/data/mgj/qwen35weights".to_string());
+        let executor = Qwen35TpExecutor::from_runtime(&model_path, false, &[0, 1])
+            .expect("start TP2 executor with memory-derived capacity");
+        eprintln!(
+            "Qwen3.5 TP2 memory-derived max_batch={}",
+            executor.max_batch()
+        );
+        assert!(executor.max_batch() > 0);
+        assert!(executor.max_batch() <= MAX_BATCH);
     }
 
     #[test]
