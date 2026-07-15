@@ -9,7 +9,11 @@ capture so every graph vLLM captures is retained and printed via
 
 How it works (each step is load-bearing):
   - `VLLM_ENABLE_V1_MULTIPROCESSING=0` keeps EngineCore in-process so the
-    monkeypatch reaches the worker.
+    monkeypatch reaches the worker. TP/DP workers are still separate
+    processes, and vLLM forces `spawn` for them once CUDA is initialized in
+    the parent — a spawned interpreter has no monkeypatches, so the CLI also
+    writes a `sitecustomize.py` and prepends it to PYTHONPATH; every child
+    python process then installs the hooks at interpreter startup.
   - torch >= 2.10 frees the underlying `cudaGraph_t` at capture_end unless
     `CUDAGraph(keep_graph=True)`. The pybind C++ object is constructed in
     `__init__`, so a subclass must override BOTH `__new__` and `__init__`;
@@ -99,6 +103,25 @@ def install_graph_dump_hooks(out_dir):
     tg.CUDAGraph = KeepGraph
 
 
+def prepare_child_injection(out_dir):
+    """Spawned worker processes start from a fresh interpreter, so the hooks
+    must be installed by sitecustomize at startup rather than inherited."""
+    inject_dir = Path(out_dir).resolve() / ".inject"
+    inject_dir.mkdir(parents=True, exist_ok=True)
+    tool_dir = Path(__file__).resolve().parent
+    (inject_dir / "sitecustomize.py").write_text(
+        "import sys, traceback\n"
+        f"sys.path.insert(0, {str(tool_dir)!r})\n"
+        "try:\n"
+        "    import vllm_graph_dump\n"
+        f"    vllm_graph_dump.install_graph_dump_hooks({str(Path(out_dir).resolve())!r})\n"
+        "except Exception:\n"
+        "    traceback.print_exc()\n"
+    )
+    existing = os.environ.get("PYTHONPATH", "")
+    os.environ["PYTHONPATH"] = f"{inject_dir}:{existing}" if existing else str(inject_dir)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("model", help="model path or HF id for vllm.LLM")
@@ -120,9 +143,7 @@ def main():
     args = ap.parse_args()
 
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
-    # TP/DP workers must inherit the hooks installed below, so they have to be
-    # forked, not spawned
-    os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "fork"
+    prepare_child_injection(args.out_dir)
     install_graph_dump_hooks(args.out_dir)
 
     from vllm import LLM, SamplingParams
