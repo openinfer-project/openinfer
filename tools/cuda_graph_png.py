@@ -24,6 +24,7 @@ import re
 import subprocess
 import sys
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from pathlib import Path
 
 def pick_dpi(kept_nodes):
@@ -202,23 +203,146 @@ def detect_folds(signatures, max_period=512, min_cover=12):
     return folds
 
 
+LANE_COLORS = ["#c0392b", "#2471a3", "#7d3c98", "#b9770e", "#148f77", "#5d6d7e"]
+
+
+def compact_ranges(indices):
+    """[0, 1, 2, 17] -> 'L0-2,L17'."""
+    runs, start = [], None
+    for i, v in enumerate(indices):
+        if start is None:
+            start = v
+        if i + 1 == len(indices) or indices[i + 1] != v + 1:
+            runs.append(f"L{start}" if v == start else f"L{start}-{v}")
+            start = None
+    return ",".join(runs)
+
+
+def find_layer_family(sigs, fold):
+    """Segment the sequence into instances of the dominant layer block.
+
+    The fold's phase is arbitrary, so re-anchor the canonical block on a
+    signature that occurs exactly once per block; every occurrence of that
+    anchor then marks an instance start. Near-matches (compiler-specialized
+    first layers, sequence-shifted last layers) join the family by similarity
+    instead of exact equality."""
+    start, period, reps = fold
+    canon = sigs[start : start + period]
+    counts = {}
+    for s in canon:
+        counts[s] = counts.get(s, 0) + 1
+    unique = [s for s in canon if counts[s] == 1 and sigs.count(s) >= reps]
+    if not unique:
+        return None
+    anchor = min(unique, key=sigs.count)
+    off = canon.index(anchor)
+    canon = sigs[start + off : start + off + period]
+
+    anchors = [i for i, s in enumerate(sigs) if s == anchor]
+    instances = []
+    for k, st in enumerate(anchors):
+        en = anchors[k + 1] if k + 1 < len(anchors) else min(len(sigs), st + 2 * period)
+        block = sigs[st:en]
+        if SequenceMatcher(None, canon, block, autojunk=False).ratio() >= 0.6:
+            instances.append((st, en))
+    if len(instances) < 4:
+        return None
+
+    classes = {}  # block content -> [instance indices]
+    for i, (st, en) in enumerate(instances):
+        classes.setdefault(tuple(sigs[st:en]), []).append(i)
+    class_list = sorted(classes.items(), key=lambda kv: -len(kv[1]))
+    return {"instances": instances, "classes": class_list, "canon_period": period}
+
+
+def emit_family_dot(order, lines, family):
+    """Emit the merged layer block: majority class as the spine, every other
+    class as colored divergence lanes labeled with its layer indices."""
+    instances, class_list = family["instances"], family["classes"]
+    spine_content, spine_members = class_list[0]
+    spine_st, spine_en = instances[spine_members[0]]
+    spine = order[spine_st:spine_en]
+    kept = {n.nid for n in spine}
+    spine_ids = [n.nid for n in spine]
+    for n in spine:
+        lines.append(f'  "{n.nid}" [label="{n.label}", fillcolor="{COLORS[n.category]}"];')
+
+    for ci, (content, members) in enumerate(class_list[1:]):
+        color = LANE_COLORS[ci % len(LANE_COLORS)]
+        ex_st, ex_en = instances[members[0]]
+        exemplar = order[ex_st:ex_en]
+        who = compact_ranges(members)
+        first_stitch = True
+        for tag, i1, i2, j1, j2 in SequenceMatcher(
+            None, list(spine_content), list(content), autojunk=False
+        ).get_opcodes():
+            if tag == "equal":
+                continue
+            lane = exemplar[j1:j2]
+            for n in lane:
+                kept.add(n.nid)
+                lines.append(
+                    f'  "{n.nid}" [label="{n.label}", fillcolor="{COLORS[n.category]}",'
+                    f' color="{color}", penwidth=2];'
+                )
+            label = f', label="{who}", fontcolor="{color}"' if first_stitch else ""
+            first_stitch = False
+            entry = spine_ids[i1 - 1] if i1 > 0 else None
+            exit_ = spine_ids[i2] if i2 < len(spine_ids) else None
+            if not lane:  # pure deletion: this class skips spine nodes i1..i2
+                if entry and exit_:
+                    lines.append(f'  "{entry}" -> "{exit_}" [color="{color}"{label}];')
+                continue
+            if entry:
+                lines.append(f'  "{entry}" -> "{lane[0].nid}" [color="{color}"{label}];')
+            if exit_:
+                lines.append(f'  "{lane[-1].nid}" -> "{exit_}" [color="{color}"];')
+    return kept
+
+
 def emit_folded_dot(nodes, edges, title, folds):
     order = sorted(nodes.values(), key=lambda x: x.order)
+    sigs = [n.signature for n in order]
+
+    family = None
+    if folds:
+        family = find_layer_family(sigs, max(folds, key=lambda f: f[1] * f[2]))
+
     removed = set()
+    body = []
+    fam_ids = set()
+    notes = []
+    if family:
+        instances = family["instances"]
+        for st, en in instances:
+            removed.update(range(st, en))
+        folds = [
+            f for f in folds
+            if not any(st < f[0] + f[1] * f[2] and f[0] < en for st, en in instances)
+        ]
+        fam_ids = emit_family_dot(order, body, family)
+        notes.append(
+            f"{len(instances)} layer blocks merged into 1"
+            f" ({len(family['classes'])} variants)"
+        )
     for start, period, reps in folds:
         removed.update(range(start + period, start + period * reps))
+        notes.append(f"x{reps} blocks of {period} folded")
 
-    kept = [n for i, n in enumerate(order) if i not in removed]
-    kept_ids = {n.nid for n in kept}
-    note = "; ".join(f"x{reps} blocks of {period} folded" for _, period, reps in folds)
+    kept = [n for i, n in enumerate(order) if i not in removed or n.nid in fam_ids]
+    kept_ids = {n.nid for n in kept} | fam_ids
+    edge_set = set(edges)
     lines = [
         "digraph folded {",
         f'  graph [label="{title}\\n{len(nodes)} nodes / {len(edges)} edges'
-        f'{"; " + note if note else ""}", labelloc=t, fontsize=20, fontname="Helvetica"];',
+        f'{"; " + "; ".join(notes) if notes else ""}", labelloc=t, fontsize=20,'
+        ' fontname="Helvetica"];',
         '  node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11];',
     ]
     for n in kept:
-        lines.append(f'  "{n.nid}" [label="{n.label}", fillcolor="{COLORS[n.category]}"];')
+        if n.nid not in fam_ids:
+            lines.append(f'  "{n.nid}" [label="{n.label}", fillcolor="{COLORS[n.category]}"];')
+    lines.extend(body)
     for a, b in edges:
         if a in kept_ids and b in kept_ids:
             lines.append(f'  "{a}" -> "{b}";')
@@ -232,6 +356,19 @@ def emit_folded_dot(nodes, edges, title, folds):
         after = start + period * reps
         if after < len(order):
             lines.append(f'  "fold{k}" -> "{order[after].nid}";')
+    if family:
+        # stitch the merged block to its neighbours when the spine exemplar is
+        # not the instance the original edges connect to
+        spine_content, spine_members = family["classes"][0]
+        sp_st, sp_en = family["instances"][spine_members[0]]
+        first_st = family["instances"][0][0]
+        last_en = family["instances"][-1][1]
+        prev = next((order[i] for i in range(first_st - 1, -1, -1) if order[i].nid in kept_ids), None)
+        nxt = next((order[i] for i in range(last_en, len(order)) if order[i].nid in kept_ids), None)
+        if prev and (prev.nid, order[sp_st].nid) not in edge_set:
+            lines.append(f'  "{prev.nid}" -> "{order[sp_st].nid}" [style=dashed];')
+        if nxt and (order[sp_en - 1].nid, nxt.nid) not in edge_set:
+            lines.append(f'  "{order[sp_en - 1].nid}" -> "{nxt.nid}" [style=dashed];')
     lines.append("}")
     return "\n".join(lines), len(kept)
 
