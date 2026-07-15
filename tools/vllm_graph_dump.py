@@ -8,12 +8,11 @@ capture so every graph vLLM captures is retained and printed via
 `cudaGraphDebugDotPrint` — no vLLM or torch source changes.
 
 How it works (each step is load-bearing):
-  - `VLLM_ENABLE_V1_MULTIPROCESSING=0` keeps EngineCore in-process so the
-    monkeypatch reaches the worker. TP/DP workers are still separate
-    processes, and vLLM forces `spawn` for them once CUDA is initialized in
-    the parent — a spawned interpreter has no monkeypatches, so the CLI also
-    writes a `sitecustomize.py` and prepends it to PYTHONPATH; every child
-    python process then installs the hooks at interpreter startup.
+  - vLLM runs EngineCore and TP/DP workers in child processes, spawned (not
+    forked) once CUDA is initialized in the parent — and a spawned
+    interpreter has no monkeypatches. The CLI therefore writes a
+    `sitecustomize.py` and prepends it to PYTHONPATH, so every child python
+    process installs the hooks at interpreter startup.
   - torch >= 2.10 frees the underlying `cudaGraph_t` at capture_end unless
     `CUDAGraph(keep_graph=True)`. The pybind C++ object is constructed in
     `__init__`, so a subclass must override BOTH `__new__` and `__init__`;
@@ -57,8 +56,9 @@ def _load_cudart():
 
 def install_graph_dump_hooks(out_dir):
     """Patch torch so every CUDA graph captured after this call is dumped to
-    `out_dir/gNNN_<nodes>n.dot`. Must run before the capturing code executes;
-    for vLLM also set VLLM_ENABLE_V1_MULTIPROCESSING=0 before importing it."""
+    `out_dir/gNNN_<nodes>n.dot`. Must run in the process that captures, before
+    the capturing code executes; vLLM captures in spawned children, so call
+    `prepare_child_injection` as well (the CLI does both)."""
     import torch
     import torch.cuda.graphs as tg
 
@@ -142,7 +142,6 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=4)
     args = ap.parse_args()
 
-    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     prepare_child_injection(args.out_dir)
     install_graph_dump_hooks(args.out_dir)
 

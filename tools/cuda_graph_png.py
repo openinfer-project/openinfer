@@ -11,7 +11,8 @@ Repeated per-layer kernel blocks are detected by label signature and folded
 into one representative block plus an explicit fold marker, because an
 unfolded 36-layer chain exceeds Graphviz's ~32767px raster ceiling
 (docs/models/qwen3/cuda-graph-png.md). Rendering is pinned to the Cairo PNG
-backend at 192 DPI; a missing renderer is a hard error, not a degraded image.
+backend, with DPI auto-scaled down for graphs that stay tall after folding;
+a missing renderer is a hard error, not a degraded image.
 
 Usage: uv run python tools/cuda_graph_png.py INPUT.dot [-o OUT.png] [--title TITLE] [--no-fold]
 
@@ -25,7 +26,14 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-DPI = 192
+def pick_dpi(kept_nodes):
+    """Graphviz PNG rasters cap at 32767px; a folded chain runs ~105px/node
+    at 192 DPI, so tall graphs must drop DPI to stay renderable."""
+    if kept_nodes <= 300:
+        return 192
+    if kept_nodes <= 600:
+        return 96
+    return 72
 
 # category -> fill color; category is derived from the kernel's provenance
 COLORS = {
@@ -161,55 +169,71 @@ def parse_openinfer_dot(text):
     return nodes, edges
 
 
-def detect_fold(signatures, max_period=64, max_start=64):
-    """Find (start, period, repeats) of the dominant repeated run, or None."""
-    best = None
-    n = len(signatures)
-    for period in range(4, max_period + 1):
-        for start in range(0, min(max(n - 2 * period, 0), max_start) + 1):
-            reps = 1
+def detect_folds(signatures, max_period=512, min_cover=12):
+    """Scan for every maximal periodic run and return [(start, period, repeats)].
+
+    Real decode graphs are multi-phase (a few dense layers, then a long MoE
+    run, then an MTP tail), so a single dominant period misses most of the
+    graph; each phase gets its own fold."""
+    interned = {}
+    ids = [interned.setdefault(s, len(interned)) for s in signatures]
+    n = len(ids)
+    folds, i = [], 0
+    while i < n:
+        best = None
+        for period in range(4, max_period + 1):
+            if i + 2 * period > n:
+                break
+            if ids[i : i + period] != ids[i + period : i + 2 * period]:
+                continue
+            reps = 2
             while (
-                start + (reps + 1) * period <= n
-                and signatures[start + reps * period : start + (reps + 1) * period]
-                == signatures[start : start + period]
+                i + (reps + 1) * period <= n
+                and ids[i + reps * period : i + (reps + 1) * period] == ids[i : i + period]
             ):
                 reps += 1
-            if reps > 1 and (best is None or period * reps > best[1] * best[2]):
-                best = (start, period, reps)
-    return best
+            if best is None or period * reps > best[1] * best[2]:
+                best = (i, period, reps)
+        if best and best[1] * best[2] >= min_cover:
+            folds.append(best)
+            i = best[0] + best[1] * best[2]
+        else:
+            i += 1
+    return folds
 
 
-def emit_folded_dot(nodes, edges, title, fold):
+def emit_folded_dot(nodes, edges, title, folds):
     order = sorted(nodes.values(), key=lambda x: x.order)
-    if fold:
-        start, period, reps = fold
-        keep = order[: start + period]
-        tail = order[start + reps * period :]
-        fold_note = f"; layer block folded x{reps} ({period} nodes/block)"
-    else:
-        keep, tail, reps = order, [], 0
-        fold_note = ""
+    removed = set()
+    for start, period, reps in folds:
+        removed.update(range(start + period, start + period * reps))
 
-    kept_ids = {n.nid for n in keep} | {n.nid for n in tail}
+    kept = [n for i, n in enumerate(order) if i not in removed]
+    kept_ids = {n.nid for n in kept}
+    note = "; ".join(f"x{reps} blocks of {period} folded" for _, period, reps in folds)
     lines = [
         "digraph folded {",
-        f'  graph [label="{title}\\n{len(nodes)} nodes / {len(edges)} edges{fold_note}",'
-        '  labelloc=t, fontsize=20, fontname="Helvetica"];',
+        f'  graph [label="{title}\\n{len(nodes)} nodes / {len(edges)} edges'
+        f'{"; " + note if note else ""}", labelloc=t, fontsize=20, fontname="Helvetica"];',
         '  node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11];',
     ]
-    for n in keep + tail:
+    for n in kept:
         lines.append(f'  "{n.nid}" [label="{n.label}", fillcolor="{COLORS[n.category]}"];')
     for a, b in edges:
         if a in kept_ids and b in kept_ids:
             lines.append(f'  "{a}" -> "{b}";')
-    if fold and tail:
+    for k, (start, period, reps) in enumerate(folds):
+        prev = order[start + period - 1]
         lines.append(
-            f'  "fold" [label="... x{reps - 1} more identical blocks ...",'
+            f'  "fold{k}" [label="... x{reps - 1} more identical blocks ...",'
             ' shape=box, style="dashed,rounded", fontsize=14];'
         )
-        lines.append(f'  "{keep[-1].nid}" -> "fold"; "fold" -> "{tail[0].nid}";')
+        lines.append(f'  "{prev.nid}" -> "fold{k}";')
+        after = start + period * reps
+        if after < len(order):
+            lines.append(f'  "fold{k}" -> "{order[after].nid}";')
     lines.append("}")
-    return "\n".join(lines)
+    return "\n".join(lines), len(kept)
 
 
 def main():
@@ -230,21 +254,24 @@ def main():
     if not nodes:
         sys.exit("error: no graph nodes parsed")
 
-    fold = None
+    folds = []
     if not args.no_fold:
         ordered = sorted(nodes.values(), key=lambda x: x.order)
-        fold = detect_fold([n.signature for n in ordered])
-        if fold:
-            print(f"fold: {fold[1]} nodes/block x{fold[2]} (start offset {fold[0]})")
+        folds = detect_folds([n.signature for n in ordered])
+        if folds:
+            for start, period, reps in folds:
+                print(f"fold: {period} nodes/block x{reps} (start offset {start})")
         else:
             print("fold: no repeated block detected, rendering unfolded")
 
     out = args.output or args.input.with_suffix(".png")
     title = args.title or args.input.name
-    folded = emit_folded_dot(nodes, edges, title, fold)
+    folded, kept_nodes = emit_folded_dot(nodes, edges, title, folds)
 
+    dpi = pick_dpi(kept_nodes)
+    print(f"{kept_nodes} nodes after folding, rendering at {dpi} dpi")
     r = subprocess.run(
-        ["dot", "-Tpng:cairo", f"-Gdpi={DPI}", "-o", str(out)],
+        ["dot", "-Tpng:cairo", f"-Gdpi={dpi}", "-o", str(out)],
         input=folded, capture_output=True, text=True,
     )
     if r.returncode != 0:
