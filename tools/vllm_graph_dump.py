@@ -78,7 +78,9 @@ def install_graph_dump_hooks(out_dir):
         cudart.cudaGraphGetNodes(raw, None, ctypes.byref(num_nodes))
         idx = state["count"]
         state["count"] += 1
-        path = out / f"g{idx:03d}_{num_nodes.value}n.dot"
+        # TP/DP workers are separate processes sharing out_dir; the pid keeps
+        # per-rank dumps from overwriting each other
+        path = out / f"g{idx:03d}_p{os.getpid()}_{num_nodes.value}n.dot"
         rc = cudart.cudaGraphDebugDotPrint(
             raw, str(path).encode(), ctypes.c_uint(CUDA_GRAPH_DEBUG_DOT_FLAGS_VERBOSE)
         )
@@ -100,11 +102,20 @@ def main():
                          "use FULL_AND_PIECEWISE to also dump per-fragment graphs")
     ap.add_argument("--max-model-len", type=int, default=2048)
     ap.add_argument("--gpu-memory-utilization", type=float, default=0.85)
+    ap.add_argument("-tp", "--tensor-parallel-size", type=int, default=1)
+    ap.add_argument("-dp", "--data-parallel-size", type=int, default=1)
+    ap.add_argument("--enable-expert-parallel", action="store_true")
+    ap.add_argument("--load-format", default="auto",
+                    help="use 'dummy' to skip weight loading; graph topology does not "
+                         "depend on weight values")
     ap.add_argument("--prompt", default="The capital of France is")
     ap.add_argument("--max-tokens", type=int, default=4)
     args = ap.parse_args()
 
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+    # TP/DP workers must inherit the hooks installed below, so they have to be
+    # forked, not spawned
+    os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "fork"
     install_graph_dump_hooks(args.out_dir)
 
     from vllm import LLM, SamplingParams
@@ -113,6 +124,10 @@ def main():
         model=args.model,
         max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
+        tensor_parallel_size=args.tensor_parallel_size,
+        data_parallel_size=args.data_parallel_size,
+        enable_expert_parallel=args.enable_expert_parallel,
+        load_format=args.load_format,
         compilation_config={
             "cudagraph_mode": args.cudagraph_mode,
             "cudagraph_capture_sizes": [int(s) for s in args.capture_sizes.split(",")],
