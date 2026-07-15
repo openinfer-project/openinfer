@@ -14,8 +14,11 @@ How it works (each step is load-bearing):
     `CUDAGraph(keep_graph=True)`. The pybind C++ object is constructed in
     `__init__`, so a subclass must override BOTH `__new__` and `__init__`;
     overriding `__new__` alone is silently ignored.
-  - `torch.cuda.graphs.graph.__exit__` is hooked to dot-print the raw graph
-    right after capture. torch's own `debug_dump()` is a silent no-op here.
+  - `CUDAGraph.capture_end` is overridden to dot-print the raw graph right
+    after capture; hooking the `torch.cuda.graph` context manager instead
+    misses captures that drive capture_begin/capture_end directly (vLLM's
+    breakable piecewise wrapper). torch's own `debug_dump()` is a silent
+    no-op here.
 
 By default vLLM captures FULL_AND_PIECEWISE: one big graph per decode batch
 size plus one small graph per compiled fragment. The CLI pins cudagraph_mode
@@ -60,20 +63,8 @@ def install_graph_dump_hooks(out_dir):
     cudart = _load_cudart()
     state = {"count": 0}
 
-    class KeepGraph(tg.CUDAGraph):
-        def __new__(cls, *args, **kwargs):
-            return super().__new__(cls, keep_graph=True)
-
-        def __init__(self, *args, **kwargs):
-            super().__init__(keep_graph=True)
-
-    torch.cuda.CUDAGraph = KeepGraph
-
-    orig_exit = tg.graph.__exit__
-
-    def exit_and_dump(self, *args):
-        result = orig_exit(self, *args)
-        raw = ctypes.c_void_p(self.cuda_graph.raw_cuda_graph())
+    def dump(graph):
+        raw = ctypes.c_void_p(graph.raw_cuda_graph())
         num_nodes = ctypes.c_size_t()
         cudart.cudaGraphGetNodes(raw, None, ctypes.byref(num_nodes))
         idx = state["count"]
@@ -87,9 +78,25 @@ def install_graph_dump_hooks(out_dir):
         if rc != 0:
             raise RuntimeError(f"cudaGraphDebugDotPrint failed with cudaError {rc} for {path}")
         print(f"[graph-dump] #{idx}: {num_nodes.value} nodes -> {path}")
-        return result
 
-    tg.graph.__exit__ = exit_and_dump
+    # Dumping from capture_end covers every capture style: `with
+    # torch.cuda.graph(...)` calls it from __exit__, and code that drives
+    # capture_begin/capture_end by hand (e.g. vLLM's breakable piecewise
+    # wrapper) never enters the context manager at all.
+    class KeepGraph(tg.CUDAGraph):
+        def __new__(cls, *args, **kwargs):
+            return super().__new__(cls, keep_graph=True)
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(keep_graph=True)
+
+        def capture_end(self, *args, **kwargs):
+            result = super().capture_end(*args, **kwargs)
+            dump(self)
+            return result
+
+    torch.cuda.CUDAGraph = KeepGraph
+    tg.CUDAGraph = KeepGraph
 
 
 def main():
