@@ -19,6 +19,8 @@ use crate::executor::{
     PrefillRequestResult, PrefillResult, PrefillStepItem, RequestId,
 };
 use crate::logprobs::snapshot_requested_logprobs;
+use crate::prefill::PREFILL_CHUNK_LEN;
+use crate::prefill_buffers::GdrChunkwiseScratch35;
 use crate::recurrent_state::RecurrentState;
 use crate::weights::{ModelRuntimeConfig, Qwen35Model};
 use openinfer_core::kv_pool::KvState;
@@ -185,6 +187,22 @@ impl Qwen35TpExecutor {
         device_ordinals: &[usize],
         max_batch: usize,
     ) -> Result<Self> {
+        Self::from_runtime_with_limits(
+            model_path,
+            enable_cuda_graph,
+            device_ordinals,
+            max_batch,
+            PREFILL_CHUNK_LEN,
+        )
+    }
+
+    pub(crate) fn from_runtime_with_limits(
+        model_path: &str,
+        enable_cuda_graph: bool,
+        device_ordinals: &[usize],
+        max_batch: usize,
+        max_prefill_tokens: usize,
+    ) -> Result<Self> {
         anyhow::ensure!(
             device_ordinals.len() > 1,
             "Qwen3.5 TP executor requires at least two CUDA devices, got {}",
@@ -193,6 +211,10 @@ impl Qwen35TpExecutor {
         anyhow::ensure!(
             !enable_cuda_graph,
             "Qwen3.5 TP Phase 1 supports eager execution only; disable CUDA Graph"
+        );
+        anyhow::ensure!(
+            max_prefill_tokens > 0,
+            "Qwen3.5 TP max_prefill_tokens must be positive"
         );
 
         let world_size = device_ordinals.len();
@@ -238,6 +260,7 @@ impl Qwen35TpExecutor {
                 world_size,
                 model,
                 max_batch,
+                max_prefill_tokens,
                 nccl_id,
                 Arc::clone(&startup_gate),
                 Arc::clone(&effective_max_batch),
@@ -609,6 +632,7 @@ impl TpWorker {
         world_size: usize,
         model: Qwen35Model,
         max_batch: usize,
+        max_prefill_tokens: usize,
         nccl_id: cudarc::nccl::safe::Id,
         startup_gate: Arc<TpStartupGate>,
         effective_max_batch: Arc<AtomicUsize>,
@@ -627,7 +651,13 @@ impl TpWorker {
             .name(format!("qwen35-tp-rank-{rank}"))
             .spawn(move || {
                 let outcome = catch_unwind(AssertUnwindSafe(|| {
-                    let prepared = TpWorkerPrepared::new(rank, world_size, model, max_batch);
+                    let prepared = TpWorkerPrepared::new(
+                        rank,
+                        world_size,
+                        model,
+                        max_batch,
+                        max_prefill_tokens,
+                    );
                     let prepared = match prepared {
                         Ok((prepared, rank_max_batch)) => {
                             let _ = preflight_tx.send(Ok(rank_max_batch));
@@ -737,6 +767,7 @@ impl TpWorkerPrepared {
         world_size: usize,
         model: Qwen35Model,
         requested_max_batch: usize,
+        max_prefill_tokens: usize,
     ) -> Result<(Self, usize)> {
         let cublas_guard = bind_worker_thread(&model)?;
         let (free_bytes, total_bytes) = model
@@ -745,25 +776,33 @@ impl TpWorkerPrepared {
             .mem_get_info()
             .map_err(|err| anyhow::anyhow!("failed to query TP rank {rank} memory: {err}"))?;
         let recurrent_bytes = RecurrentState::allocation_bytes(model.config());
+        let prefill_scratch_tokens = prefill_scratch_tokens(max_prefill_tokens);
+        let prefill_scratch_bytes =
+            GdrChunkwiseScratch35::estimate_bytes(model.config(), prefill_scratch_tokens);
         let max_batch = effective_recurrent_capacity(
             requested_max_batch,
             free_bytes,
             recurrent_bytes,
             TP_RUNTIME_MEMORY_RESERVE_BYTES,
+            prefill_scratch_bytes,
         );
         anyhow::ensure!(
             max_batch > 0,
-            "Qwen3.5 TP rank {rank} has {} MiB free after fixed buffers, but one recurrent request needs {} MiB plus {} MiB runtime reserve",
+            "Qwen3.5 TP rank {rank} has {} MiB free after fixed buffers, but one recurrent request needs {} MiB plus {} MiB runtime reserve and {} MiB prefill scratch for {} tokens",
             free_bytes / (1024 * 1024),
             recurrent_bytes / (1024 * 1024),
             TP_RUNTIME_MEMORY_RESERVE_BYTES / (1024 * 1024),
+            prefill_scratch_bytes / (1024 * 1024),
+            prefill_scratch_tokens,
         );
         log::info!(
-            "Qwen3.5 TP rank {rank} recurrent capacity: requested={requested_max_batch}, effective={max_batch}, per_request={:.3} MiB, free={:.0} MiB/{:.0} MiB, runtime_reserve={} MiB",
+            "Qwen3.5 TP rank {rank} recurrent capacity: requested={requested_max_batch}, effective={max_batch}, per_request={:.3} MiB, free={:.0} MiB/{:.0} MiB, runtime_reserve={} MiB, prefill_tokens={}, prefill_scratch={:.0} MiB",
             recurrent_bytes as f64 / 1024.0 / 1024.0,
             free_bytes as f64 / 1024.0 / 1024.0,
             total_bytes as f64 / 1024.0 / 1024.0,
             TP_RUNTIME_MEMORY_RESERVE_BYTES / (1024 * 1024),
+            prefill_scratch_tokens,
+            prefill_scratch_bytes as f64 / 1024.0 / 1024.0,
         );
         let decode_buffers = model.create_batch_decode_buffers_with_capacity(max_batch)?;
         let sample_scratch = openinfer_sample::SampleScratch::new(
@@ -826,17 +865,26 @@ impl TpWorkerPrepared {
     }
 }
 
+fn prefill_scratch_tokens(max_prefill_tokens: usize) -> usize {
+    max_prefill_tokens.min(PREFILL_CHUNK_LEN)
+}
+
 fn effective_recurrent_capacity(
     requested_max_batch: usize,
     free_bytes: usize,
     recurrent_bytes_per_request: usize,
     runtime_reserve_bytes: usize,
+    prefill_scratch_bytes: usize,
 ) -> usize {
     if recurrent_bytes_per_request == 0 {
         return requested_max_batch;
     }
-    requested_max_batch
-        .min(free_bytes.saturating_sub(runtime_reserve_bytes) / recurrent_bytes_per_request)
+    requested_max_batch.min(
+        free_bytes
+            .saturating_sub(runtime_reserve_bytes)
+            .saturating_sub(prefill_scratch_bytes)
+            / recurrent_bytes_per_request,
+    )
 }
 
 impl TpWorkerState {
@@ -1366,25 +1414,44 @@ mod tests {
     }
 
     #[test]
-    fn recurrent_capacity_reserves_runtime_headroom() {
+    fn prefill_scratch_tokens_follow_budget_and_chunk_cap() {
+        assert_eq!(prefill_scratch_tokens(1_024), 1_024);
+        assert_eq!(prefill_scratch_tokens(PREFILL_CHUNK_LEN), 20_000);
+        assert_eq!(prefill_scratch_tokens(40_000), 20_000);
+    }
+
+    #[test]
+    fn recurrent_capacity_reserves_runtime_and_prefill_headroom() {
         const MIB: usize = 1024 * 1024;
         assert_eq!(
-            effective_recurrent_capacity(64, 4_000 * MIB, 50 * MIB, 512 * MIB),
+            effective_recurrent_capacity(64, 10_000 * MIB, 50 * MIB, 512 * MIB, 1_000 * MIB,),
             64
         );
         assert_eq!(
-            effective_recurrent_capacity(64, 2_000 * MIB, 50 * MIB, 512 * MIB),
-            29
+            effective_recurrent_capacity(64, 2_061 * MIB, 50 * MIB, 512 * MIB, 1_000 * MIB,),
+            10
         );
         assert_eq!(
-            effective_recurrent_capacity(64, 550 * MIB, 50 * MIB, 512 * MIB),
+            effective_recurrent_capacity(64, 1_511 * MIB, 50 * MIB, 512 * MIB, 1_000 * MIB,),
             0
         );
     }
 
     #[test]
     fn zero_sized_recurrent_state_keeps_requested_capacity() {
-        assert_eq!(effective_recurrent_capacity(64, 0, 0, usize::MAX), 64);
+        assert_eq!(
+            effective_recurrent_capacity(64, 0, 0, usize::MAX, usize::MAX),
+            64
+        );
+    }
+
+    #[test]
+    fn limits_constructor_rejects_zero_prefill_budget_before_loading() {
+        let err = match Qwen35TpExecutor::from_runtime_with_limits("unused", false, &[0, 1], 1, 0) {
+            Ok(_) => panic!("zero TP prefill budget should fail"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("max_prefill_tokens must be positive"));
     }
 
     #[test]

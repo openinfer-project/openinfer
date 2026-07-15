@@ -159,7 +159,8 @@ pub(crate) fn start_tp_with_capacity(
         max_prefill_tokens > 0,
         "max_prefill_tokens must be positive: a zero budget can never schedule a prefill chunk"
     );
-    let backend = TpSchedulerBackend::new(model_path, device_ordinals, max_batch)?;
+    let backend =
+        TpSchedulerBackend::new(model_path, device_ordinals, max_batch, max_prefill_tokens)?;
     let servable = servable_len(
         backend.max_position_embeddings(),
         backend.capacity_pages_for_requests(),
@@ -432,12 +433,18 @@ impl SingleGpuBackend {
 }
 
 impl TpSchedulerBackend {
-    fn new(model_path: &str, device_ordinals: &[usize], max_batch: usize) -> Result<Self> {
-        let executor = Qwen35TpExecutor::from_runtime_with_capacity(
+    fn new(
+        model_path: &str,
+        device_ordinals: &[usize],
+        max_batch: usize,
+        max_prefill_tokens: usize,
+    ) -> Result<Self> {
+        let executor = Qwen35TpExecutor::from_runtime_with_limits(
             model_path,
             false,
             device_ordinals,
             max_batch,
+            max_prefill_tokens,
         )?;
         Ok(Self {
             executor,
