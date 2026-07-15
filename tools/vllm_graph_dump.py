@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+"""Dump vLLM's captured CUDA graphs to Graphviz .dot files.
+
+vLLM never exposes its captured `cudaGraph_t`, but the full decode-step
+kernel sequence (names, launch dims, dependency DAG) is the ground truth for
+comparing engines kernel-by-kernel. This tool monkeypatches torch's graph
+capture so every graph vLLM captures is retained and printed via
+`cudaGraphDebugDotPrint` — no vLLM or torch source changes.
+
+How it works (each step is load-bearing):
+  - `VLLM_ENABLE_V1_MULTIPROCESSING=0` keeps EngineCore in-process so the
+    monkeypatch reaches the worker.
+  - torch >= 2.10 frees the underlying `cudaGraph_t` at capture_end unless
+    `CUDAGraph(keep_graph=True)`. The pybind C++ object is constructed in
+    `__init__`, so a subclass must override BOTH `__new__` and `__init__`;
+    overriding `__new__` alone is silently ignored.
+  - `torch.cuda.graphs.graph.__exit__` is hooked to dot-print the raw graph
+    right after capture. torch's own `debug_dump()` is a silent no-op here.
+
+By default vLLM captures FULL_AND_PIECEWISE: one big graph per decode batch
+size plus one small graph per compiled fragment. The CLI pins cudagraph_mode
+to FULL_DECODE_ONLY so only the whole-step decode graphs are captured; pass
+--cudagraph-mode FULL_AND_PIECEWISE to also dump the per-fragment graphs.
+Render the output with tools/cuda_graph_png.py.
+
+Run inside a Python environment that has vLLM:
+
+    uv run python tools/vllm_graph_dump.py MODEL_PATH -o dots/
+
+or import `install_graph_dump_hooks()` before any vLLM import in your own
+script to attach the dumper to an arbitrary vLLM workload.
+"""
+
+import argparse
+import ctypes
+import os
+from pathlib import Path
+
+CUDA_GRAPH_DEBUG_DOT_FLAGS_VERBOSE = 1 << 0
+
+
+def _load_cudart():
+    for lib in ("libcudart.so.13", "libcudart.so.12"):
+        try:
+            return ctypes.CDLL(lib)
+        except OSError:
+            continue
+    raise RuntimeError("libcudart.so.12/.13 not found; is CUDA installed?")
+
+
+def install_graph_dump_hooks(out_dir):
+    """Patch torch so every CUDA graph captured after this call is dumped to
+    `out_dir/gNNN_<nodes>n.dot`. Must run before the capturing code executes;
+    for vLLM also set VLLM_ENABLE_V1_MULTIPROCESSING=0 before importing it."""
+    import torch
+    import torch.cuda.graphs as tg
+
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    cudart = _load_cudart()
+    state = {"count": 0}
+
+    class KeepGraph(tg.CUDAGraph):
+        def __new__(cls, *args, **kwargs):
+            return super().__new__(cls, keep_graph=True)
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(keep_graph=True)
+
+    torch.cuda.CUDAGraph = KeepGraph
+
+    orig_exit = tg.graph.__exit__
+
+    def exit_and_dump(self, *args):
+        result = orig_exit(self, *args)
+        raw = ctypes.c_void_p(self.cuda_graph.raw_cuda_graph())
+        num_nodes = ctypes.c_size_t()
+        cudart.cudaGraphGetNodes(raw, None, ctypes.byref(num_nodes))
+        idx = state["count"]
+        state["count"] += 1
+        path = out / f"g{idx:03d}_{num_nodes.value}n.dot"
+        rc = cudart.cudaGraphDebugDotPrint(
+            raw, str(path).encode(), ctypes.c_uint(CUDA_GRAPH_DEBUG_DOT_FLAGS_VERBOSE)
+        )
+        if rc != 0:
+            raise RuntimeError(f"cudaGraphDebugDotPrint failed with cudaError {rc} for {path}")
+        print(f"[graph-dump] #{idx}: {num_nodes.value} nodes -> {path}")
+        return result
+
+    tg.graph.__exit__ = exit_and_dump
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("model", help="model path or HF id for vllm.LLM")
+    ap.add_argument("-o", "--out-dir", default="vllm_graph_dots", help="output dir for .dot files")
+    ap.add_argument("--capture-sizes", default="1", help="comma-separated cudagraph capture sizes")
+    ap.add_argument("--cudagraph-mode", default="FULL_DECODE_ONLY",
+                    help="vLLM cudagraph_mode; the default skips piecewise fragments entirely, "
+                         "use FULL_AND_PIECEWISE to also dump per-fragment graphs")
+    ap.add_argument("--max-model-len", type=int, default=2048)
+    ap.add_argument("--gpu-memory-utilization", type=float, default=0.85)
+    ap.add_argument("--prompt", default="The capital of France is")
+    ap.add_argument("--max-tokens", type=int, default=4)
+    args = ap.parse_args()
+
+    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+    install_graph_dump_hooks(args.out_dir)
+
+    from vllm import LLM, SamplingParams
+
+    llm = LLM(
+        model=args.model,
+        max_model_len=args.max_model_len,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+        compilation_config={
+            "cudagraph_mode": args.cudagraph_mode,
+            "cudagraph_capture_sizes": [int(s) for s in args.capture_sizes.split(",")],
+        },
+    )
+    out = llm.generate([args.prompt], SamplingParams(max_tokens=args.max_tokens))
+    print("generated:", out[0].outputs[0].text)
+    print(f"done; render with: uv run python tools/cuda_graph_png.py {args.out_dir}/<file>.dot")
+
+
+if __name__ == "__main__":
+    main()
