@@ -93,7 +93,7 @@ impl BatchDecodeBuffers35 {
             gate_up_out: HiddenStates::zeros(ctx, 2 * config.intermediate_size, bs)?,
             act_out: HiddenStates::zeros(ctx, config.intermediate_size, bs)?,
             mlp_out: HiddenStates::zeros(ctx, h, bs)?,
-            logits: HiddenStates::zeros(ctx, config.vocab_size, bs)?,
+            logits: HiddenStates::zeros(ctx, config.selection_vocab, bs)?,
 
             q_full: HiddenStates::zeros(ctx, q_proj_dim, bs)?,
             q_attn: HiddenStates::zeros(ctx, q_dim, bs)?,
@@ -124,7 +124,7 @@ impl BatchDecodeBuffers35 {
             kv_tile_indices_d: ctx.stream.alloc_zeros(bs)?,
             kv_chunk_size_d: ctx.stream.alloc_zeros(bs)?,
 
-            sample: openinfer_sample::SampleScratch::new(ctx, config.vocab_size, bs)?,
+            sample: openinfer_sample::SampleScratch::new(ctx, config.selection_vocab, bs)?,
             steps: Vec::new(),
 
             padding_page_id,

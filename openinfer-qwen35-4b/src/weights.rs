@@ -100,7 +100,7 @@ impl Qwen35Model {
         debug!("Initializing GPU");
         let ctx = DeviceContext::new_with_device(device_ordinal)?;
 
-        let config = Config35::from_file(model_path)?;
+        let mut config = Config35::from_file(model_path)?;
         debug!(
             "Config: hidden_size={}, num_layers={}, full_attn={}, linear_attn={}, max_position_embeddings={}",
             config.hidden_size,
@@ -109,6 +109,20 @@ impl Qwen35Model {
             config.num_hidden_layers - config.num_full_attention_layers(),
             config.max_position_embeddings
         );
+        let effective_vocab = super::config::tokenizer_effective_vocab(model_path)?;
+        anyhow::ensure!(
+            effective_vocab <= config.vocab_size,
+            "tokenizer defines ids up to {} but checkpoint vocab_size is {}",
+            effective_vocab - 1,
+            config.vocab_size,
+        );
+        if effective_vocab < config.vocab_size {
+            config.selection_vocab = effective_vocab;
+            info!(
+                "output projection: selection bounded to decodable vocab {} (checkpoint pads to {})",
+                effective_vocab, config.vocab_size
+            );
+        }
 
         let (shard_paths, weight_map) = load_shard_info_fixed(model_path)?;
         debug!("Loading {} safetensor shard(s)", shard_paths.len());
@@ -421,7 +435,7 @@ impl Qwen35Model {
     pub(crate) fn tune_decode_gemm_algos(&self) -> Result<()> {
         let ctx = &self.ctx;
         let hidden = self.config.hidden_size;
-        let vocab = self.config.vocab_size;
+        let vocab = self.config.selection_vocab;
         let full_q = self.config.full_attn_q_proj_dim();
         let full_kv = self.config.full_attn_kv_dim();
         let linear_qkv = self.config.linear_attn_qkv_dim();
