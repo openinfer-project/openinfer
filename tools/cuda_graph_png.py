@@ -30,7 +30,7 @@ from pathlib import Path
 def pick_dpi(kept_nodes):
     """Graphviz PNG rasters cap at 32767px; a folded chain runs ~105px/node
     at 192 DPI, so tall graphs must drop DPI to stay renderable."""
-    if kept_nodes <= 300:
+    if kept_nodes <= 120:
         return 192
     if kept_nodes <= 600:
         return 96
@@ -204,6 +204,7 @@ def detect_folds(signatures, max_period=512, min_cover=12):
 
 
 LANE_COLORS = ["#c0392b", "#2471a3", "#7d3c98", "#b9770e", "#148f77", "#5d6d7e"]
+LANE_MAX = 10  # longer divergence lanes collapse into one summary node
 
 
 def compact_ranges(indices):
@@ -279,12 +280,6 @@ def emit_family_dot(order, lines, family):
             if tag == "equal":
                 continue
             lane = exemplar[j1:j2]
-            for n in lane:
-                kept.add(n.nid)
-                lines.append(
-                    f'  "{n.nid}" [label="{n.label}", fillcolor="{COLORS[n.category]}",'
-                    f' color="{color}", penwidth=2];'
-                )
             label = f', label="{who}", fontcolor="{color}"' if first_stitch else ""
             first_stitch = False
             entry = spine_ids[i1 - 1] if i1 > 0 else None
@@ -293,10 +288,32 @@ def emit_family_dot(order, lines, family):
                 if entry and exit_:
                     lines.append(f'  "{entry}" -> "{exit_}" [color="{color}"{label}];')
                 continue
+            if len(lane) > LANE_MAX:
+                # a long lane is usually a sequence-shifted whole block; a
+                # summary node keeps the picture browsable, the detail stays
+                # in the input dot
+                top = ", ".join(
+                    sorted({n.signature.split("\\n")[0] for n in lane})[:3]
+                )
+                nid = f"lanesum_{ci}_{i1}"
+                kept.add(nid)
+                lines.append(
+                    f'  "{nid}" [label="{len(lane)} divergent nodes\\n({top}, ...)",'
+                    f' style="dashed,rounded", color="{color}", fontcolor="{color}"];'
+                )
+                lane_ids = [nid]
+            else:
+                for n in lane:
+                    kept.add(n.nid)
+                    lines.append(
+                        f'  "{n.nid}" [label="{n.label}", fillcolor="{COLORS[n.category]}",'
+                        f' color="{color}", penwidth=2];'
+                    )
+                lane_ids = [n.nid for n in lane]
             if entry:
-                lines.append(f'  "{entry}" -> "{lane[0].nid}" [color="{color}"{label}];')
+                lines.append(f'  "{entry}" -> "{lane_ids[0]}" [color="{color}"{label}];')
             if exit_:
-                lines.append(f'  "{lane[-1].nid}" -> "{exit_}" [color="{color}"];')
+                lines.append(f'  "{lane_ids[-1]}" -> "{exit_}" [color="{color}"];')
     return kept
 
 
@@ -336,8 +353,9 @@ def emit_folded_dot(nodes, edges, title, folds):
         "digraph folded {",
         f'  graph [label="{title}\\n{len(nodes)} nodes / {len(edges)} edges'
         f'{"; " + "; ".join(notes) if notes else ""}", labelloc=t, fontsize=20,'
-        ' fontname="Helvetica"];',
-        '  node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11];',
+        ' fontname="Helvetica", ranksep=0.22, nodesep=0.18];',
+        '  node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11,'
+        ' margin="0.1,0.04"];',
     ]
     for n in kept:
         if n.nid not in fam_ids:
