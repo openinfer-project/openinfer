@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet,
     env,
-    ffi::{CStr, c_char, c_int, c_void},
+    ffi::{CStr, OsStr, c_char, c_int, c_void},
     fs,
     path::{Path, PathBuf},
     ptr,
@@ -321,12 +321,11 @@ impl NaiveNcclEp2Backend {
             "DeepSeek-V2-Lite NCCL EP=2 requires distinct CUDA devices, got {:?}",
             [rank0.device_ordinal, rank1.device_ordinal]
         );
-        let lib = Arc::new(RawNcclLib::load()?);
         let compute_capabilities = [
             rank0.ctx.compute_capability()?,
             rank1.ctx.compute_capability()?,
         ];
-        validate_nccl_version_for_compute_capabilities(lib.version_code, &compute_capabilities)?;
+        let lib = Arc::new(RawNcclLib::load(&compute_capabilities)?);
         log::info!(
             "DeepSeek-V2-Lite NCCL backend loaded: version={}, version_code={}",
             format_nccl_version(lib.version_code),
@@ -1332,27 +1331,52 @@ impl Drop for NaiveNcclEp2Backend {
 }
 
 impl RawNcclLib {
-    fn load() -> Result<Self> {
+    fn load(compute_capabilities: &[(i32, i32)]) -> Result<Self> {
         let mut tried = Vec::new();
+        let mut skipped = Vec::new();
         for candidate in nccl_library_candidates() {
-            tried.push(candidate.clone());
+            tried.push(candidate.path.clone());
             let Ok(library) = (unsafe {
                 // SAFETY: Loading NCCL is required to create the selected
                 // runtime backend. All symbols are validated immediately below.
-                Library::new(&candidate)
+                Library::new(&candidate.path)
             }) else {
                 continue;
             };
-            return unsafe {
+            let loaded = unsafe {
                 // SAFETY: The library is kept alive inside `RawNcclLib`; copied
                 // function pointers do not outlive it.
-                Self::from_library(library, candidate.clone())
+                Self::from_library(library, candidate.path.clone())
             }
-            .with_context(|| format!("load DeepSeek-V2-Lite NCCL backend from {candidate}"));
+            .and_then(|lib| {
+                validate_nccl_version_for_compute_capabilities(
+                    lib.version_code,
+                    compute_capabilities,
+                )?;
+                Ok(lib)
+            })
+            .with_context(|| format!("load DeepSeek-V2-Lite NCCL backend from {}", candidate.path));
+            match loaded {
+                Ok(lib) => return Ok(lib),
+                Err(error) if !candidate.explicit => {
+                    skipped.push(format!("{}: {error:#}", candidate.path));
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
         }
+        let skipped_summary = if skipped.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "; skipped incompatible auto candidates: {}",
+                skipped.join("; ")
+            )
+        };
         bail!(
-            "DeepSeek-V2-Lite NCCL backend could not load libnccl; tried {}",
-            tried.join(", ")
+            "DeepSeek-V2-Lite NCCL backend could not load a compatible libnccl; tried {}{}",
+            tried.join(", "),
+            skipped_summary
         )
     }
 
@@ -1455,81 +1479,195 @@ fn format_nccl_version(version_code: c_int) -> String {
     format!("{major}.{minor}.{patch}")
 }
 
-fn nccl_library_candidates() -> Vec<String> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NcclLibraryCandidate {
+    path: String,
+    explicit: bool,
+}
+
+fn nccl_library_candidates() -> Vec<NcclLibraryCandidate> {
     let mut candidates = Vec::new();
     let mut seen = HashSet::new();
 
     add_env_file_candidates(&mut candidates, &mut seen, "OPENINFER_NCCL_LIB");
     add_env_dir_candidates(&mut candidates, &mut seen, "OPENINFER_NCCL_LIB_DIR");
     add_env_dir_candidates(&mut candidates, &mut seen, "OPENINFER_NCCL_LIBRARY_PATH");
-    for lib_dir in nccl_python_wheel_lib_dirs() {
-        add_nccl_dir_candidates(&mut candidates, &mut seen, &lib_dir);
-    }
+    add_nccl_python_wheel_candidates(
+        &mut candidates,
+        &mut seen,
+        explicit_nccl_python_wheel_lib_dirs(),
+        true,
+    );
+    add_nccl_python_wheel_candidates(
+        &mut candidates,
+        &mut seen,
+        auto_nccl_python_wheel_lib_dirs(),
+        false,
+    );
 
-    add_candidate(&mut candidates, &mut seen, "libnccl.so.2".to_string());
-    add_candidate(&mut candidates, &mut seen, "libnccl.so".to_string());
+    add_candidate(
+        &mut candidates,
+        &mut seen,
+        "libnccl.so.2".to_string(),
+        false,
+    );
+    add_candidate(&mut candidates, &mut seen, "libnccl.so".to_string(), false);
     candidates
 }
 
-fn add_env_file_candidates(candidates: &mut Vec<String>, seen: &mut HashSet<String>, key: &str) {
+fn add_env_file_candidates(
+    candidates: &mut Vec<NcclLibraryCandidate>,
+    seen: &mut HashSet<String>,
+    key: &str,
+) {
     let Ok(value) = env::var(key) else {
         return;
     };
     for path in env::split_paths(&value) {
-        add_candidate(candidates, seen, path.to_string_lossy().into_owned());
+        add_candidate(candidates, seen, path.to_string_lossy().into_owned(), true);
     }
 }
 
-fn add_env_dir_candidates(candidates: &mut Vec<String>, seen: &mut HashSet<String>, key: &str) {
+fn add_env_dir_candidates(
+    candidates: &mut Vec<NcclLibraryCandidate>,
+    seen: &mut HashSet<String>,
+    key: &str,
+) {
     let Ok(value) = env::var(key) else {
         return;
     };
     for dir in env::split_paths(&value) {
-        add_nccl_dir_candidates(candidates, seen, &dir);
+        add_nccl_dir_candidates(candidates, seen, &dir, true);
     }
 }
 
-fn add_nccl_dir_candidates(candidates: &mut Vec<String>, seen: &mut HashSet<String>, dir: &Path) {
+fn add_nccl_python_wheel_candidates(
+    candidates: &mut Vec<NcclLibraryCandidate>,
+    seen: &mut HashSet<String>,
+    lib_dirs: Vec<PathBuf>,
+    explicit: bool,
+) {
+    for lib_dir in lib_dirs {
+        add_nccl_dir_candidates(candidates, seen, &lib_dir, explicit);
+    }
+}
+
+fn add_nccl_dir_candidates(
+    candidates: &mut Vec<NcclLibraryCandidate>,
+    seen: &mut HashSet<String>,
+    dir: &Path,
+    explicit: bool,
+) {
     add_candidate(
         candidates,
         seen,
         dir.join("libnccl.so.2").to_string_lossy().into_owned(),
+        explicit,
     );
     add_candidate(
         candidates,
         seen,
         dir.join("libnccl.so").to_string_lossy().into_owned(),
+        explicit,
     );
 }
 
-fn add_candidate(candidates: &mut Vec<String>, seen: &mut HashSet<String>, candidate: String) {
+fn add_candidate(
+    candidates: &mut Vec<NcclLibraryCandidate>,
+    seen: &mut HashSet<String>,
+    candidate: String,
+    explicit: bool,
+) {
     if !candidate.is_empty() && seen.insert(candidate.clone()) {
-        candidates.push(candidate);
+        candidates.push(NcclLibraryCandidate {
+            path: candidate,
+            explicit,
+        });
     }
 }
 
-fn nccl_python_wheel_lib_dirs() -> Vec<PathBuf> {
-    python_env_roots()
+fn explicit_nccl_python_wheel_lib_dirs() -> Vec<PathBuf> {
+    explicit_nccl_python_env_roots()
         .into_iter()
         .flat_map(|root| nccl_python_wheel_lib_dirs_from_root(&root))
         .collect()
 }
 
-fn python_env_roots() -> Vec<PathBuf> {
+fn auto_nccl_python_wheel_lib_dirs() -> Vec<PathBuf> {
+    auto_python_env_roots()
+        .into_iter()
+        .flat_map(|root| nccl_python_wheel_lib_dirs_from_root(&root))
+        .collect()
+}
+
+fn explicit_nccl_python_env_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     let mut seen = HashSet::new();
 
-    for key in ["OPENINFER_NCCL_PYTHON", "OPENINFER_TRITON_PYTHON"] {
-        if let Ok(value) = env::var(key) {
-            add_python_env_root(&mut roots, &mut seen, Path::new(&value));
-        }
+    if let Ok(value) = env::var("OPENINFER_NCCL_PYTHON") {
+        add_python_env_root(&mut roots, &mut seen, Path::new(&value));
+    }
+    roots
+}
+
+fn auto_python_env_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let mut seen = HashSet::new();
+
+    if let Ok(value) = env::var("OPENINFER_TRITON_PYTHON") {
+        add_python_env_root(&mut roots, &mut seen, Path::new(&value));
     }
     for key in ["VIRTUAL_ENV", "CONDA_PREFIX"] {
         if let Ok(value) = env::var(key) {
             add_pathbuf_once(&mut roots, &mut seen, PathBuf::from(value));
         }
     }
+    add_path_python_env_roots(&mut roots, &mut seen, env::var_os("PATH").as_deref());
     roots
+}
+
+fn add_path_python_env_roots(
+    roots: &mut Vec<PathBuf>,
+    seen: &mut HashSet<PathBuf>,
+    path_env: Option<&OsStr>,
+) {
+    let Some(path_env) = path_env else {
+        return;
+    };
+    for dir in env::split_paths(path_env) {
+        for binary in python_binary_names() {
+            let python = dir.join(binary);
+            if is_executable_python(&python) {
+                add_python_env_root(roots, seen, &python);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn is_executable_python(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    path.is_file()
+        && path
+            .metadata()
+            .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable_python(path: &Path) -> bool {
+    path.is_file()
+}
+
+#[cfg(windows)]
+fn python_binary_names() -> &'static [&'static str] {
+    &["python.exe", "python3.exe", "python", "python3"]
+}
+
+#[cfg(not(windows))]
+fn python_binary_names() -> &'static [&'static str] {
+    &["python3", "python"]
 }
 
 fn add_python_env_root(roots: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, python: &Path) {

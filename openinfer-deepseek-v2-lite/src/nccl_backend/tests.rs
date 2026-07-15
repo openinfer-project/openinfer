@@ -1,14 +1,15 @@
-use std::{collections::HashSet, fs};
+use std::{collections::HashSet, env, fs};
 
 #[cfg(unix)]
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{PermissionsExt, symlink};
 
 use super::{
     AllReduceChunk, NCCL_BF16_ALL_REDUCE_MAX_ELEMS_PER_CALL,
-    NCCL_F32_ALL_REDUCE_MAX_ELEMS_PER_CALL, bf16_all_reduce_chunks, f32_all_reduce_chunks,
-    format_nccl_version, validate_nccl_version_for_compute_capabilities,
+    NCCL_F32_ALL_REDUCE_MAX_ELEMS_PER_CALL, add_nccl_python_wheel_candidates,
+    bf16_all_reduce_chunks, f32_all_reduce_chunks, format_nccl_version, nccl_library_candidates,
+    validate_nccl_version_for_compute_capabilities,
 };
-use super::{add_python_env_root, nccl_python_wheel_lib_dirs_from_root};
+use super::{add_path_python_env_roots, add_python_env_root, nccl_python_wheel_lib_dirs_from_root};
 
 #[test]
 fn f32_all_reduce_chunks_preserve_short_counts_and_split_long_counts() {
@@ -113,6 +114,128 @@ fn keeps_symlinked_python_venv_root_before_resolved_root() {
             real_root.path().to_path_buf()
         ]
     );
+}
+
+#[test]
+fn finds_nccl_python_wheel_lib_dir_from_path_python() {
+    let root = tempfile::tempdir().expect("create Python root");
+    let bin = root.path().join("bin");
+    let wheel_dir = root
+        .path()
+        .join("lib/python3.12/site-packages/nvidia/nccl/lib");
+    fs::create_dir_all(&bin).expect("create python bin dir");
+    fs::create_dir_all(&wheel_dir).expect("create NCCL wheel dir");
+    fs::write(bin.join("python3"), []).expect("create Python marker");
+    #[cfg(unix)]
+    {
+        let python = bin.join("python3");
+        let mut perms = fs::metadata(&python)
+            .expect("stat Python marker")
+            .permissions();
+        perms.set_mode(perms.mode() | 0o755);
+        fs::set_permissions(&python, perms).expect("mark Python executable");
+    }
+    fs::write(wheel_dir.join("libnccl.so.2"), []).expect("create fake NCCL lib marker");
+    let path = env::join_paths([bin]).expect("join PATH");
+
+    let mut roots = Vec::new();
+    let mut seen = HashSet::new();
+    add_path_python_env_roots(&mut roots, &mut seen, Some(path.as_os_str()));
+
+    assert_eq!(roots, vec![root.path().to_path_buf()]);
+    assert_eq!(
+        nccl_python_wheel_lib_dirs_from_root(root.path()),
+        vec![wheel_dir]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn ignores_non_executable_path_python_marker() {
+    let root = tempfile::tempdir().expect("create Python root");
+    let bin = root.path().join("bin");
+    let wheel_dir = root
+        .path()
+        .join("lib/python3.12/site-packages/nvidia/nccl/lib");
+    fs::create_dir_all(&bin).expect("create python bin dir");
+    fs::create_dir_all(&wheel_dir).expect("create NCCL wheel dir");
+    fs::write(bin.join("python3"), []).expect("create non-executable Python marker");
+    fs::write(wheel_dir.join("libnccl.so.2"), []).expect("create fake NCCL lib marker");
+    let path = env::join_paths([bin]).expect("join PATH");
+
+    let mut roots = Vec::new();
+    let mut seen = HashSet::new();
+    add_path_python_env_roots(&mut roots, &mut seen, Some(path.as_os_str()));
+
+    assert!(roots.is_empty());
+}
+
+#[test]
+fn explicit_nccl_candidates_keep_fail_fast_priority_over_auto_roots() {
+    let explicit = tempfile::tempdir().expect("create explicit NCCL dir");
+    let auto = tempfile::tempdir().expect("create auto NCCL dir");
+    let mut candidates = Vec::new();
+    let mut seen = HashSet::new();
+
+    add_nccl_python_wheel_candidates(
+        &mut candidates,
+        &mut seen,
+        vec![explicit.path().to_path_buf()],
+        true,
+    );
+    add_nccl_python_wheel_candidates(
+        &mut candidates,
+        &mut seen,
+        vec![auto.path().to_path_buf()],
+        false,
+    );
+
+    assert_eq!(candidates.len(), 4);
+    assert_eq!(
+        candidates[0].path,
+        explicit.path().join("libnccl.so.2").to_string_lossy()
+    );
+    assert!(candidates[0].explicit);
+    assert_eq!(
+        candidates[2].path,
+        auto.path().join("libnccl.so.2").to_string_lossy()
+    );
+    assert!(!candidates[2].explicit);
+}
+
+#[test]
+fn duplicate_nccl_candidates_keep_first_source_classification() {
+    let root = tempfile::tempdir().expect("create NCCL dir");
+    let mut candidates = Vec::new();
+    let mut seen = HashSet::new();
+
+    add_nccl_python_wheel_candidates(
+        &mut candidates,
+        &mut seen,
+        vec![root.path().to_path_buf()],
+        true,
+    );
+    add_nccl_python_wheel_candidates(
+        &mut candidates,
+        &mut seen,
+        vec![root.path().to_path_buf()],
+        false,
+    );
+
+    assert_eq!(candidates.len(), 2);
+    assert!(candidates.iter().all(|candidate| candidate.explicit));
+}
+
+#[test]
+fn generic_nccl_candidates_remain_auto_fallbacks() {
+    let candidates = nccl_library_candidates();
+    let generic = candidates
+        .iter()
+        .filter(|candidate| candidate.path == "libnccl.so.2" || candidate.path == "libnccl.so")
+        .collect::<Vec<_>>();
+
+    assert_eq!(generic.len(), 2);
+    assert!(generic.iter().all(|candidate| !candidate.explicit));
 }
 
 #[test]

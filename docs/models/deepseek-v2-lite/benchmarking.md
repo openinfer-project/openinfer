@@ -1,6 +1,6 @@
 # DeepSeek-V2-Lite Verification And Benchmarking
 
-> **TL;DR:** Use `e2e_ep2` for correctness, `dsv2_lite_ep2_decode_attribution` for direct decode diagnostics, and `bench_dsv2lite_http_slo.py` for retained HTTP SLO evidence. These artifacts answer different questions; none of them alone proves production readiness.
+> **TL;DR:** Use `e2e_ep2` for correctness, `dsv2_lite_ep2_decode_attribution` for direct decode diagnostics, and `bench_dsv2lite_http_slo.py` for retained HTTP SLO evidence. The #466 follow-up NCCL readiness fix lets the backend discover a compatible Python-wheel NCCL runtime from `PATH`; these artifacts still answer different questions, and none of them alone proves production readiness.
 >
 > Last touched: 2026-07
 
@@ -33,7 +33,7 @@ OPENINFER_NCCL_LIB_DIR=NCCL_LIB_DIR \
 
 The JSON emitted by this test uses `report_intent=correctness_integration` and carries an explicit no-performance claim boundary. Use the same-host HF comparison in `hf-accuracy-gate.md` for accuracy-sensitive changes.
 
-On `sm_120`, the DSV2-Lite NCCL backend fails before communicator creation when the loaded NCCL is older than `2.26.2`. NCCL 2.26.2 contains NVIDIA's shared-memory fix for recent Blackwell GPUs ([NVIDIA/nccl#1637](https://github.com/NVIDIA/nccl/issues/1637)); older releases can exceed the device/function shared-memory limit when launching collectives. Set `OPENINFER_NCCL_LIB_DIR` or `OPENINFER_NCCL_PYTHON` to select a compatible runtime. This startup floor is specific to `sm_120`, not older GPU architectures.
+On `sm_120`, the DSV2-Lite NCCL backend fails before communicator creation when the loaded NCCL is older than `2.26.2`. NCCL 2.26.2 contains NVIDIA's shared-memory fix for recent Blackwell GPUs ([NVIDIA/nccl#1637](https://github.com/NVIDIA/nccl/issues/1637)); older releases can exceed the device/function shared-memory limit when launching collectives. Set `OPENINFER_NCCL_LIB_DIR` or `OPENINFER_NCCL_PYTHON` to select a compatible runtime when the process environment does not already expose one. The backend also scans Python executables on `PATH` for `nvidia/nccl/lib/libnccl.so.2`, so a conda or venv Python with the `nvidia-nccl-cu12` wheel can satisfy the floor without an extra selector. This startup floor is specific to `sm_120`, not older GPU architectures.
 
 ## Direct Diagnostic Benchmark
 
@@ -146,6 +146,21 @@ cargo metadata --locked --no-deps --format-version 1
 ## Current-Source Evidence
 
 Regenerate the retained report when its profile, schema, or measurement contract changes. The current retained 2x RTX 5090 evidence completed all six host-staged/NCCL children with zero failures/timeouts and full required trace coverage. The gitignored local copy is under `artifacts/bench/dsv2-lite/<run-id>/`; aggregate SHA-256: `a7e677c63d1ce92ad0c069f83acfcc8b381e07d06bed9364ab899adecef8d317`.
+
+### Issue #466 Follow-Up NCCL Readiness Smoke
+
+The retained #466 report exposed a runtime blocker outside the report tooling: with `OPENINFER_DSV2_LITE_EP_BACKEND=nccl` and no explicit NCCL selector, the server could load the system `libnccl.so.2` `2.25.1` on 2x RTX 5090 and fail before readiness. The focused fix keeps explicit `OPENINFER_NCCL_*` selectors fail-fast, then scans executable Python binaries found on `PATH` for NCCL wheel roots before falling back to generic library names. If an auto-discovered PATH candidate loads but fails the sm_120 NCCL version floor, the loader records it and continues to the next auto candidate. On the validation host, that resolved `<conda-root>/lib/python3.12/site-packages/nvidia/nccl/lib/libnccl.so.2` and loaded NCCL `2.26.2`.
+
+Validation was run on `upstream/main@d083b745699f527186baed1e61225e4c86965486` plus the focused fix, with `OPENINFER_CUDA_SM=120`, 2x RTX 5090, and no `OPENINFER_NCCL_PYTHON`, `OPENINFER_NCCL_LIB_DIR`, `OPENINFER_NCCL_LIB`, `OPENINFER_NCCL_LIBRARY_PATH`, `CONDA_PREFIX`, or `VIRTUAL_ENV` for the NCCL runs:
+
+| Gate | Artifact basename | SHA-256 / key result | Boundary |
+| --- | --- | --- | --- |
+| HF / host-staged / NCCL correctness compare | `comparison.json` | `3e5e324f97171a35db682b4a2ebe4e08724b159e06516df19728ac4a482d0760`; `classification=all_token_text_exact`, `case_count=5`, `warnings=[]` | correctness only |
+| NCCL direct diagnostic batch 1 | `nccl-b1.json` | `40753081bacbac3fbfa0da82a5c65961369138b46cedc26e7cf5170aca0f45e4`; token/text hash exact, `gpu_timing_failure_count=0` | direct Hello/16 attribution only |
+| NCCL HTTP c1 short smoke | `pw64_c1_mt64_r0.json` | `9c84d60f889b4e90f805541870a45b22ab29737876b185b79f429d63fe38a3ff`; `completed=4`, `failed=0`, `timeouts=0`, `combined_output_hash=2e74c01cfdd4dc75`, `retention_gate.passed=true` | one-cell short smoke only |
+| Host-staged HTTP c1 short smoke | `pw64_c1_mt64_r0.json` | `c8b83b72ca47829d943262a96f6b8ea898344f5c84e427c3232176b63778b36c`; `completed=4`, `failed=0`, `timeouts=0`, `combined_output_hash=2e74c01cfdd4dc75`, `retention_gate.passed=true` | host-staged no-regression smoke only |
+
+The NCCL server log for the final HTTP smoke includes `DeepSeek-V2-Lite NCCL backend loaded: version=2.26.2, version_code=22602` and reached readiness in 17 seconds. This fixes the readiness/runtime blocker for the short 64-token NCCL HTTP path. It does not complete the #465 sustained soak, #452 long-prompt scheduler work, #635 device attention/KV work, or #636 device route plan.
 
 ## Claim Boundary
 
