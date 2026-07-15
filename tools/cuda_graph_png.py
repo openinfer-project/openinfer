@@ -256,18 +256,18 @@ def find_layer_family(sigs, fold):
     return {"instances": instances, "classes": class_list, "canon_period": period}
 
 
-def emit_family_dot(order, lines, family):
-    """Emit the merged layer block: majority class as the spine, every other
-    class as colored divergence lanes labeled with its layer indices."""
+def emit_family_lanes(order, family):
+    """Collect divergence lanes: every non-majority class contributes colored
+    lane nodes plus stitch edges into the spine, labeled with its layers.
+
+    Returns (lane_lines, stitch_edges, lane_node_count); stitch endpoints are
+    raw spine nids, to be remapped after BPE grouping."""
     instances, class_list = family["instances"], family["classes"]
     spine_content, spine_members = class_list[0]
     spine_st, spine_en = instances[spine_members[0]]
-    spine = order[spine_st:spine_en]
-    kept = {n.nid for n in spine}
-    spine_ids = [n.nid for n in spine]
-    for n in spine:
-        lines.append(f'  "{n.nid}" [label="{n.label}", fillcolor="{COLORS[n.category]}"];')
+    spine_ids = [n.nid for n in order[spine_st:spine_en]]
 
+    lane_lines, stitches, lane_count = [], [], 0
     for ci, (content, members) in enumerate(class_list[1:]):
         color = LANE_COLORS[ci % len(LANE_COLORS)]
         ex_st, ex_en = instances[members[0]]
@@ -286,35 +286,92 @@ def emit_family_dot(order, lines, family):
             exit_ = spine_ids[i2] if i2 < len(spine_ids) else None
             if not lane:  # pure deletion: this class skips spine nodes i1..i2
                 if entry and exit_:
-                    lines.append(f'  "{entry}" -> "{exit_}" [color="{color}"{label}];')
+                    stitches.append(f'  "{entry}" -> "{exit_}" [color="{color}"{label}, constraint=false];')
                 continue
             if len(lane) > LANE_MAX:
                 # a long lane is usually a sequence-shifted whole block; a
                 # summary node keeps the picture browsable, the detail stays
                 # in the input dot
-                top = ", ".join(
-                    sorted({n.signature.split("\\n")[0] for n in lane})[:3]
-                )
+                top = ", ".join(sorted({n.signature.split("\\n")[0] for n in lane})[:3])
                 nid = f"lanesum_{ci}_{i1}"
-                kept.add(nid)
-                lines.append(
+                lane_lines.append(
                     f'  "{nid}" [label="{len(lane)} divergent nodes\\n({top}, ...)",'
                     f' style="dashed,rounded", color="{color}", fontcolor="{color}"];'
                 )
                 lane_ids = [nid]
+                lane_count += 1
             else:
                 for n in lane:
-                    kept.add(n.nid)
-                    lines.append(
+                    lane_lines.append(
                         f'  "{n.nid}" [label="{n.label}", fillcolor="{COLORS[n.category]}",'
                         f' color="{color}", penwidth=2];'
                     )
                 lane_ids = [n.nid for n in lane]
+                lane_count += len(lane)
             if entry:
-                lines.append(f'  "{entry}" -> "{lane_ids[0]}" [color="{color}"{label}];')
+                stitches.append(f'  "{entry}" -> "{lane_ids[0]}" [color="{color}"{label}];')
             if exit_:
-                lines.append(f'  "{lane_ids[-1]}" -> "{exit_}" [color="{color}"];')
-    return kept
+                stitches.append(f'  "{lane_ids[-1]}" -> "{exit_}" [color="{color}", constraint=false];')
+    return lane_lines, stitches, lane_count
+
+
+def bpe_group(kept, min_pair=3, max_iter=80):
+    """Fuse the kept chain by BPE-style pair merging on kernel signatures:
+    the most frequent adjacent pair becomes one composite node per occurrence,
+    iterated until no pair repeats min_pair times. Fixed idioms (quant->GEMM,
+    the trtllm MoE chain) collapse without any model-specific knowledge.
+    Pairs never merge across a fold gap (non-consecutive original order)."""
+    groups = [[n] for n in kept]
+    sym = [n.signature for n in kept]
+
+    def adjacent(i):
+        return groups[i][-1].order + 1 == groups[i + 1][0].order
+
+    for _ in range(max_iter):
+        counts = {}
+        for i in range(len(sym) - 1):
+            if adjacent(i):
+                counts[(sym[i], sym[i + 1])] = counts.get((sym[i], sym[i + 1]), 0) + 1
+        if not counts:
+            break
+        pair, cnt = max(counts.items(), key=lambda kv: kv[1])
+        if cnt < min_pair:
+            break
+        merged = pair[0] + "\x00" + pair[1]
+        out_g, out_s, i = [], [], 0
+        while i < len(sym):
+            if i + 1 < len(sym) and (sym[i], sym[i + 1]) == pair and adjacent(i):
+                out_g.append(groups[i] + groups[i + 1])
+                out_s.append(merged)
+                i += 2
+            else:
+                out_g.append(groups[i])
+                out_s.append(sym[i])
+                i += 1
+        groups, sym = out_g, out_s
+    return groups
+
+
+def group_label(members):
+    """Composite label: kernel kinds in execution order with repeat counts."""
+    if len(members) == 1:
+        return members[0].label, members[0].category
+    parts, last = [], None
+    for n in members:
+        name = n.signature.split("\\n")[0]
+        if parts and parts[-1][0] == name:
+            parts[-1][1] += 1
+        else:
+            parts.append([name, 1])
+    shown = [f"{k} x{v}" if v > 1 else k for k, v in parts[:4]]
+    if len(parts) > 4:
+        shown.append("...")
+    label = f"[{len(members)} kernels]\\n" + "\\n".join(shown)
+    cat = next(
+        (n.category for n in members if n.category not in ("other", "memop")),
+        members[0].category,
+    )
+    return label, cat
 
 
 def emit_folded_dot(nodes, edges, title, folds):
@@ -326,8 +383,8 @@ def emit_folded_dot(nodes, edges, title, folds):
         family = find_layer_family(sigs, max(folds, key=lambda f: f[1] * f[2]))
 
     removed = set()
-    body = []
-    fam_ids = set()
+    lane_lines, stitches, lane_count = [], [], 0
+    spine_range = None
     notes = []
     if family:
         instances = family["instances"]
@@ -337,7 +394,8 @@ def emit_folded_dot(nodes, edges, title, folds):
             f for f in folds
             if not any(st < f[0] + f[1] * f[2] and f[0] < en for st, en in instances)
         ]
-        fam_ids = emit_family_dot(order, body, family)
+        lane_lines, stitches, lane_count = emit_family_lanes(order, family)
+        spine_range = family["instances"][family["classes"][0][1][0]]
         notes.append(
             f"{len(instances)} layer blocks merged into 1"
             f" ({len(family['classes'])} variants)"
@@ -346,9 +404,19 @@ def emit_folded_dot(nodes, edges, title, folds):
         removed.update(range(start + period, start + period * reps))
         notes.append(f"x{reps} blocks of {period} folded")
 
-    kept = [n for i, n in enumerate(order) if i not in removed or n.nid in fam_ids]
-    kept_ids = {n.nid for n in kept} | fam_ids
-    edge_set = set(edges)
+    # main chain = literals + spine, in original order, lanes excluded
+    kept = [
+        n for i, n in enumerate(order)
+        if i not in removed or (spine_range and spine_range[0] <= i < spine_range[1])
+    ]
+    groups = bpe_group(kept)
+    nid2gid = {}
+    for g in groups:
+        for n in g:
+            nid2gid[n.nid] = g[0].nid
+    if len(groups) < len(kept):
+        notes.append(f"{len(kept)} -> {len(groups)} via idiom fusion")
+
     lines = [
         "digraph folded {",
         f'  graph [label="{title}\\n{len(nodes)} nodes / {len(edges)} edges'
@@ -357,38 +425,49 @@ def emit_folded_dot(nodes, edges, title, folds):
         '  node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11,'
         ' margin="0.1,0.04"];',
     ]
-    for n in kept:
-        if n.nid not in fam_ids:
-            lines.append(f'  "{n.nid}" [label="{n.label}", fillcolor="{COLORS[n.category]}"];')
-    lines.extend(body)
+    for g in groups:
+        label, cat = group_label(g)
+        border = ', penwidth=1.6, color="#555555"' if len(g) > 1 else ""
+        lines.append(f'  "{g[0].nid}" [label="{label}", fillcolor="{COLORS[cat]}"{border}];')
+    lines.extend(lane_lines)
+
+    def gid(nid):
+        return nid2gid.get(nid, nid)
+
+    lane_ids = {m.group(1) for line in lane_lines for m in [re.match(r'\s*"([^"]+)"', line)] if m}
+    known = set(nid2gid) | lane_ids
+    drawn = set()
     for a, b in edges:
-        if a in kept_ids and b in kept_ids:
-            lines.append(f'  "{a}" -> "{b}";')
+        if a in known and b in known and gid(a) != gid(b):
+            drawn.add(f'  "{gid(a)}" -> "{gid(b)}";')
+    lines.extend(sorted(drawn))
+    for line in stitches:
+        lines.append(re.sub(r'"([^"]+)"', lambda m: f'"{gid(m.group(1))}"', line, count=2))
     for k, (start, period, reps) in enumerate(folds):
         prev = order[start + period - 1]
         lines.append(
             f'  "fold{k}" [label="... x{reps - 1} more identical blocks ...",'
             ' shape=box, style="dashed,rounded", fontsize=14];'
         )
-        lines.append(f'  "{prev.nid}" -> "fold{k}";')
+        lines.append(f'  "{gid(prev.nid)}" -> "fold{k}";')
         after = start + period * reps
         if after < len(order):
-            lines.append(f'  "fold{k}" -> "{order[after].nid}";')
+            lines.append(f'  "fold{k}" -> "{gid(order[after].nid)}";')
     if family:
         # stitch the merged block to its neighbours when the spine exemplar is
         # not the instance the original edges connect to
-        spine_content, spine_members = family["classes"][0]
-        sp_st, sp_en = family["instances"][spine_members[0]]
+        sp_st, sp_en = spine_range
         first_st = family["instances"][0][0]
         last_en = family["instances"][-1][1]
-        prev = next((order[i] for i in range(first_st - 1, -1, -1) if order[i].nid in kept_ids), None)
-        nxt = next((order[i] for i in range(last_en, len(order)) if order[i].nid in kept_ids), None)
+        edge_set = set(edges)
+        prev = next((order[i] for i in range(first_st - 1, -1, -1) if order[i].nid in nid2gid), None)
+        nxt = next((order[i] for i in range(last_en, len(order)) if order[i].nid in nid2gid), None)
         if prev and (prev.nid, order[sp_st].nid) not in edge_set:
-            lines.append(f'  "{prev.nid}" -> "{order[sp_st].nid}" [style=dashed];')
+            lines.append(f'  "{gid(prev.nid)}" -> "{gid(order[sp_st].nid)}" [style=dashed];')
         if nxt and (order[sp_en - 1].nid, nxt.nid) not in edge_set:
-            lines.append(f'  "{order[sp_en - 1].nid}" -> "{nxt.nid}" [style=dashed];')
+            lines.append(f'  "{gid(order[sp_en - 1].nid)}" -> "{gid(nxt.nid)}" [style=dashed];')
     lines.append("}")
-    return "\n".join(lines), len(kept)
+    return "\n".join(lines), len(groups) + lane_count
 
 
 def main():
