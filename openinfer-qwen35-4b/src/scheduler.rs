@@ -13,7 +13,7 @@ use anyhow::Result;
 use log::{debug, info, warn};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::batch_decode_graph::BatchDecodeGraphState;
 use crate::executor::{
@@ -25,7 +25,7 @@ use crate::tp_executor::{Qwen35TpExecutor, TpDecodeStepItem, TpPrefillChunkItem}
 use crate::weights::Qwen35Model;
 use openinfer_core::engine::{
     EngineHandle as SchedulerHandle, FinishReason, GenerateRequest as SchedulerRequest, KvCapacity,
-    TokenEvent, TokenLogprob, TokenSink, panic_message,
+    LoadSnapshot, TokenEvent, TokenLogprob, TokenSink, panic_message,
 };
 use openinfer_core::kv_pool::KvState;
 use openinfer_core::sampler::SamplingParams;
@@ -108,6 +108,7 @@ pub fn start_with_capacity(
     // Static instance cap for the vLLM bridge's max_model_len. Live admission
     // still uses the current page budget inside the scheduler loop.
     let total_blocks = model.kv_pool().capacity_pages().saturating_sub(1);
+    let kv_total = total_blocks as u64;
     let block_size = model.kv_pool().layout().page_size;
     let servable = servable_len(
         model.config().max_position_embeddings,
@@ -118,6 +119,10 @@ pub fn start_with_capacity(
 
     let (submit_tx, submit_rx) = mpsc::unbounded_channel();
     let (startup_tx, startup_rx) = std_mpsc::channel();
+    let (load_tx, load_rx) = watch::channel(LoadSnapshot {
+        kv_total_blocks: kv_total,
+        ..LoadSnapshot::default()
+    });
 
     let join_handle = thread::Builder::new()
         .name("scheduler-qwen35".into())
@@ -129,6 +134,7 @@ pub fn start_with_capacity(
                     submit_rx,
                     seed,
                     max_prefill_tokens,
+                    load_tx,
                 );
             }
             Err(err) => {
@@ -154,7 +160,8 @@ pub fn start_with_capacity(
             .with_kv_capacity(KvCapacity {
                 total_blocks,
                 block_size,
-            }),
+            })
+            .with_load_watch(load_rx),
     )
 }
 
@@ -182,6 +189,10 @@ pub(crate) fn start_tp_with_capacity(
     };
 
     let (submit_tx, submit_rx) = mpsc::unbounded_channel();
+    let (load_tx, load_rx) = watch::channel(LoadSnapshot {
+        kv_total_blocks: kv_capacity.total_blocks as u64,
+        ..LoadSnapshot::default()
+    });
     let join_handle = thread::Builder::new()
         .name("scheduler-qwen35-tp".into())
         .spawn(move || {
@@ -190,6 +201,7 @@ pub(crate) fn start_tp_with_capacity(
                 submit_rx,
                 seed,
                 max_prefill_tokens,
+                load_tx,
             );
         })
         .expect("failed to spawn Qwen3.5 TP scheduler thread");
@@ -197,7 +209,8 @@ pub(crate) fn start_tp_with_capacity(
     Ok(
         SchedulerHandle::new_with_join_handle(submit_tx, join_handle)
             .with_servable_len(servable)
-            .with_kv_capacity(kv_capacity),
+            .with_kv_capacity(kv_capacity)
+            .with_load_watch(load_rx),
     )
 }
 
@@ -752,12 +765,44 @@ fn bind_model_thread(model: &Qwen35Model) -> Result<CublasThreadGuard> {
 
 // ── Main loop ───────────────────────────────────────────────────────────
 
+fn load_snapshot(
+    kv_total: u64,
+    kv_available: u64,
+    num_active_reqs: usize,
+    num_prefilling_reqs: usize,
+    num_waiting_reqs: usize,
+) -> LoadSnapshot {
+    LoadSnapshot {
+        kv_used_blocks: kv_total.saturating_sub(kv_available),
+        kv_total_blocks: kv_total,
+        num_running_reqs: (num_active_reqs + num_prefilling_reqs) as u64,
+        num_waiting_reqs: num_waiting_reqs as u64,
+    }
+}
+
+fn publish_load(
+    load_tx: &watch::Sender<LoadSnapshot>,
+    backend: &SchedulerBackend,
+    active: &[ActiveRequest35],
+    prefilling: &[PrefillingRequest35],
+    num_waiting_reqs: usize,
+) {
+    load_tx.send_replace(load_snapshot(
+        backend.capacity_pages_for_requests() as u64,
+        backend.available_pages(active, prefilling) as u64,
+        active.len(),
+        prefilling.len(),
+        num_waiting_reqs,
+    ));
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn scheduler_loop(
     mut backend: SchedulerBackend,
     mut submit_rx: mpsc::UnboundedReceiver<SchedulerRequest>,
     seed: u64,
     prefill_budget: usize,
+    load_tx: watch::Sender<LoadSnapshot>,
 ) {
     let mut rng = StdRng::seed_from_u64(seed);
     let mut active: Vec<ActiveRequest35> = Vec::new();
@@ -768,6 +813,11 @@ fn scheduler_loop(
     info!("scheduler ready (max_batch={})", max_batch);
 
     loop {
+        // Publish the settled state between scheduler steps. If the prior step
+        // retired its final requests, their KV pages have already returned via
+        // RAII, so this snapshot reaches idle before the channel blocks below.
+        publish_load(&load_tx, &backend, &active, &prefilling, deferred.len());
+
         // 1. Drain all pending requests (deferred from last iteration + channel)
         let mut pending = std::mem::take(&mut deferred);
         while let Ok(req) = submit_rx.try_recv() {
@@ -786,6 +836,11 @@ fn scheduler_loop(
             while let Ok(req) = submit_rx.try_recv() {
                 pending.push(req);
             }
+            // Create an observable queue boundary before admission. The next
+            // iteration publishes these requests as waiting, then preserves
+            // the existing FCFS admission and prefill order.
+            deferred = pending;
+            continue;
         }
 
         // 3. Admit new prompts. In-flight prefills reserve their promotion slot

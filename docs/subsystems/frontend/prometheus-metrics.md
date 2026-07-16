@@ -1,6 +1,6 @@
 # Prometheus /metrics via the vLLM frontend
 
-**TL;DR:** `/metrics` exposes request histograms for every model and engine gauges for schedulers that publish `LoadSnapshot`: Qwen3 uses one engine, GLM5.2 EP8/DP8 uses eight rank-local engines, and GLM5.2 TP8 uses one logical engine. The bridge forwards each partition's stats under the same identity the vLLM frontend uses for least-load routing.
+**TL;DR:** `/metrics` exposes request histograms for every model and engine gauges for schedulers that publish `LoadSnapshot`: Qwen3 and Qwen3.5 use one logical engine, while GLM5.2 EP8/DP8 uses eight rank-local engines and GLM5.2 TP8 uses one logical engine. The bridge forwards each partition's stats under the same identity the vLLM frontend uses for least-load routing.
 
 Last touched: 2026-07
 
@@ -11,7 +11,7 @@ Two independent paths feed the upstream Prometheus registry (`vllm-metrics`, ser
 1. **Per-request path (works for every model crate).** The bridge stamps each request's first output with `Queued`/`Scheduled` timestamps and `PrefillStats` (prompt/computed/cached token split). The upstream `RequestMetricsTracker` turns those into `time_to_first_token_seconds`, `inter_token_latency_seconds`, `request_queue_time_seconds`, `prompt_tokens_total`, `generation_tokens_total`, `request_success_total`, `prompt_tokens_by_source_total`, … unconditionally — `disable_log_stats` only gates the periodic *text* logger, not Prometheus.
 2. **Engine-gauge path (needs one `LoadSnapshot` watch per scheduler partition).** The scheduler publishes `LoadSnapshot { kv_used_blocks, kv_total_blocks, num_running_reqs, num_waiting_reqs }` at scheduler boundaries; one bridge identity per partition forwards its snapshot as a stats-only `RequestBatchOutputs`. The enclosing `engine_index` is both the routing identity and the Prometheus `engine` label. Watches coalesce to ≤1 message per scheduler step, and the scheduler's final idle publish settles the gauges back to 0.
 
-For a single-partition model, `EngineHandle::with_load_watch` keeps the original one-engine contract. A partitioned scheduler uses `with_load_watches`, and the frontend launch declares the same engine count; a mismatch fails startup. GLM5.2 EP8 therefore registers engines 0–7, each bound to its own pending queue and KV pool. TP8 registers only engine 0 because its eight workers mirror one logical request stream.
+For a single-partition model, `EngineHandle::with_load_watch` keeps the original one-engine contract. Qwen3.5 uses that contract for both its single-GPU backend and its TP backend because both execute one logical request stream through one scheduler. A partitioned scheduler uses `with_load_watches`, and the frontend launch declares the same engine count; a mismatch fails startup. GLM5.2 EP8 therefore registers engines 0–7, each bound to its own pending queue and KV pool. TP8 registers only engine 0 because its eight workers mirror one logical request stream.
 
 Measured cost is noise in both covered configurations:
 
@@ -22,8 +22,8 @@ Measured cost is noise in both covered configurations:
 
 - `prefix_cache_queries/hits` and the by-reason waiting split (`reason="deferred"` is driven by a skipped-request counter we don't report; all waiting shows as `reason="capacity"`).
 - Spec-decode counters, per-GPU FLOPs/bytes estimates, KV-block residency histograms, cudagraph stats — the bridge sends `SchedulerStats::default()` for these fields.
-- Every model crate whose scheduler doesn't publish a `LoadSnapshot` watch (qwen35, deepseek, kimi) gets path 1 only; its engine gauges are absent, not lying-zero — the bridge skips the stats task for that partition when no watch exists.
+- Every model crate whose scheduler doesn't publish a `LoadSnapshot` watch (currently deepseek and kimi) gets path 1 only; its engine gauges are absent, not lying-zero — the bridge skips the stats task for that partition when no watch exists.
 
 ## Next step
 
-Wire `LoadSnapshot` publishing into the qwen35 scheduler (the other schedulers can follow the same recipe), and report real prefix-cache query/hit counters instead of zeros. A future partitioned model must expose its logical scheduler partitions instead of averaging them behind engine 0.
+Validate Qwen3.5 running, waiting, KV usage, and idle-zero behavior on a live GPU endpoint. Then wire the remaining model schedulers using the same recipe, and report real prefix-cache query/hit counters instead of zeros. A future partitioned model must expose its logical scheduler partitions instead of averaging them behind engine 0.

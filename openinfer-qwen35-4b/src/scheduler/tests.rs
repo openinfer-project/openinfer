@@ -4,6 +4,20 @@ use std::path::Path;
 use openinfer_core::engine::{EngineLoadOptions, EpBackend};
 
 #[test]
+fn load_snapshot_maps_scheduler_queues() {
+    assert_eq!(
+        load_snapshot(100, 76, 2, 1, 5),
+        LoadSnapshot {
+            kv_used_blocks: 24,
+            kv_total_blocks: 100,
+            num_running_reqs: 3,
+            num_waiting_reqs: 5,
+        }
+    );
+    assert_eq!(load_snapshot(100, 101, 0, 0, 0).kv_used_blocks, 0);
+}
+
+#[test]
 fn send_rejection_reports_kv_lifetime_request_tokens() {
     let (token_tx, mut token_rx) = TokenSink::standalone();
     let req = SchedulerRequest {

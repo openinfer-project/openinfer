@@ -46,6 +46,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | Path | TL;DR |
 | --- | --- |
 | `models/qwen35/roadmap.md` | Qwen3.5 dense roadmap v2 (#654): core correctness/admission/chunked-prefill/sampling/step-tail gates are landed; current 4B HTTP boundary is the retained #469 RTX 5090 sweep, which completed with zero failed requests but trails vLLM at high concurrency. Next: HTTP gap attribution, mixed-load ITL (#470), lifecycle recovery (#471), joint-state prefix reuse (#257), and design-first TP (#446). |
+| `models/qwen35/load-snapshot.md` | Issue #605 publishes Qwen3.5 logical running, waiting, and KV load through the shared single-GPU/TP scheduler backend and `EngineHandle::with_load_watch`. |
 | `models/qwen35/kv-admission.md` | Issue #254 complete: Qwen3.5 now uses full-lifetime KV admission, deferred pressure handling, impossible-request rejection, explicit error semantics, direct rejection-event coverage, RTX 5090 e2e, and real HTTP pressure/post-pressure validation. |
 | `models/qwen35/optimization.md` | Hybrid 24 linear + 8 full attn optimization ledger. Decode-tuning refresh fuses MLP gate/up and tunes decode cublasLt buckets, improving direct TPOT by 2-3%; vLLM still leads 1024/256 HTTP decode. |
 | `models/qwen35/accuracy.md` | Qwen3.5 HF bf16 logits goldens, size-keyed (4b, 9b committed; 27b once dumped), through `past_key_values`: short replay covers sequential graph, bucket-straddling batched graph, and slot-compaction; long replay covers 4097/8192-token prompts; full GSM8K 8-shot now matches the HF baseline within 0.15 percentage points. |
@@ -147,7 +148,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | `subsystems/frontend/simulated-inference-engine.md` | CPU-only simulated model crate for vLLM/OpenAI frontend and `vllm bench serve` validation without CUDA, real model weights, or real-model performance claims. |
 | `subsystems/frontend/cpu-profiling-baseline.md` | Frontend CPU profiling baseline using `openinfer-sim` with fixed TTFT=5ms/TPOT=12ms: 200 req / concurrency=16 shows ~150ms TTFT overhead (no dominant hotspot), heap allocation ~10%, stream polling ~7.5%, IPC ~1%; reproducible benchmark command and perf evidence documented. |
 | `subsystems/frontend/startup-time.md` | Qwen3-4B warm startup-to-ready 3.25s → ~1.45s: frontend tokenizer load runs concurrently with the engine load (HTTP still binds only after the engine registers), and the source safetensors mmap is kept alive to dodge ~0.4s of munmap stalling the next cudaMalloc. |
-| `subsystems/frontend/prometheus-metrics.md` | `/metrics` for the Qwen3 line: request histograms come free from bridge events/PrefillStats; engine gauges (running/waiting/kv usage) ride the scheduler LoadSnapshot watch as stats-only batches. Which metrics deliberately read zero, and the recipe for wiring another model line. |
+| `subsystems/frontend/prometheus-metrics.md` | `/metrics` request histograms work for every model; Qwen3, Qwen3.5, and GLM5.2 schedulers also publish running/waiting/KV engine gauges through `LoadSnapshot` watches. |
 | `subsystems/frontend/dashboards/README.md` | Grafana 10.4-validated dashboard for OpenInfer's live `/metrics` surface: HTTP traffic, request outcomes, scheduler/KV state, token throughput, and request latency. |
 
 ## subsystems / correctness
