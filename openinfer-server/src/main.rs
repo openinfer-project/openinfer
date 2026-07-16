@@ -309,6 +309,9 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
                 device_ordinal: args.device_ordinal,
                 tp_size: args.tp_size,
                 cuda_graph: args.cuda_graph,
+                max_batch: args
+                    .max_batch
+                    .unwrap_or(openinfer_qwen35_4b::runtime::MAX_BATCH),
                 max_prefill_tokens: args
                     .max_prefill_tokens
                     .unwrap_or(openinfer_qwen35_4b::DEFAULT_MAX_PREFILL_TOKENS),

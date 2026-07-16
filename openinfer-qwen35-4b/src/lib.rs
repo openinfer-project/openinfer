@@ -75,6 +75,7 @@ pub struct Qwen35LaunchOptions {
     pub tp_size: usize,
     /// TP Phase 1 supports eager-only multi-GPU execution.
     pub cuda_graph: bool,
+    pub max_batch: usize,
     pub max_prefill_tokens: usize,
 }
 
@@ -103,6 +104,7 @@ pub fn launch(
             device_ordinal,
             tp_size: 1,
             cuda_graph,
+            max_batch: batch_decode_graph::MAX_BATCH,
             max_prefill_tokens,
         },
     )
@@ -122,7 +124,7 @@ pub fn launch_with_options(
             ep_backend: EpBackend::Nccl,
             seed: 42,
         },
-        batch_decode_graph::MAX_BATCH,
+        options.max_batch,
         options.max_prefill_tokens,
     )
 }
@@ -188,6 +190,7 @@ mod tests {
             device_ordinal: 3,
             tp_size: 0,
             cuda_graph: false,
+            max_batch: 1,
             max_prefill_tokens: 1,
         };
 
