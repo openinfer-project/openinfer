@@ -59,12 +59,7 @@ pub fn start_engine(
     max_batch: usize,
     max_prefill_tokens: usize,
 ) -> Result<EngineHandle> {
-    start_engine_with_capacity(
-        model_path,
-        options,
-        max_batch,
-        max_prefill_tokens,
-    )
+    start_engine_with_capacity(model_path, options, max_batch, max_prefill_tokens)
 }
 
 #[derive(Clone, Debug)]

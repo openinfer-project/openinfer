@@ -76,8 +76,9 @@ impl RecurrentState {
 mod tests {
     #[test]
     fn qwen35_4b_recurrent_allocation_is_49_125_mib() {
-        let bytes = 24 * (32 * 128 * 128 * std::mem::size_of::<f32>()
-            + 8192 * 3 * std::mem::size_of::<half::bf16>());
+        let bytes = 24
+            * (32 * 128 * 128 * std::mem::size_of::<f32>()
+                + 8192 * 3 * std::mem::size_of::<half::bf16>());
         assert_eq!(bytes, 49 * 1024 * 1024 + 128 * 1024);
     }
 }
