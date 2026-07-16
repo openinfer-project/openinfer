@@ -1,6 +1,7 @@
 //! CUDA Graph state for Qwen3.5 batched decode with bucket padding.
 
 use anyhow::Result;
+use cudarc::driver::{CudaSlice, DevicePtrMut};
 
 use openinfer_core::cuda_graph::CudaGraphState;
 use openinfer_core::kv_pool::KvPool;
@@ -51,6 +52,8 @@ pub(crate) fn bucket_for(bs: usize) -> usize {
 pub(crate) struct BatchDecodeGraphState {
     pub(crate) buffers: BatchDecodeBuffers35,
     pub(crate) slot_states: Vec<RecurrentState>,
+    pub(crate) linear_state_ptrs: Vec<CudaSlice<u64>>,
+    pub(crate) linear_conv_state_ptrs: Vec<CudaSlice<u64>>,
     /// One `CudaGraphState` per BATCH_BUCKETS entry (indexed by position).
     pub(crate) graphs: Vec<CudaGraphState>,
 }
@@ -80,6 +83,34 @@ impl BatchDecodeGraphState {
         for _ in 0..max_batch {
             slot_states.push(RecurrentState::new(ctx, config)?);
         }
+        let num_linear_layers = config.num_hidden_layers - config.num_full_attention_layers();
+        let mut linear_state_ptrs = Vec::with_capacity(num_linear_layers);
+        let mut linear_conv_state_ptrs = Vec::with_capacity(num_linear_layers);
+        for layer_idx in 0..num_linear_layers {
+            let mut state_ptrs = Vec::with_capacity(max_batch);
+            let mut conv_state_ptrs = Vec::with_capacity(max_batch);
+            for slot in &mut slot_states {
+                let state_ptr = {
+                    let (ptr, _guard) = slot.layers[layer_idx].state.device_ptr_mut(&ctx.stream);
+                    ptr as u64
+                };
+                let conv_ptr = {
+                    let (ptr, _guard) = slot.layers[layer_idx]
+                        .conv_state
+                        .data
+                        .device_ptr_mut(&ctx.stream);
+                    ptr as u64
+                };
+                state_ptrs.push(state_ptr);
+                conv_state_ptrs.push(conv_ptr);
+            }
+            linear_state_ptrs.push(ctx.stream.clone_htod(&state_ptrs).map_err(|e| {
+                anyhow::anyhow!("copy Qwen3.5 linear state pointer table {layer_idx}: {e}")
+            })?);
+            linear_conv_state_ptrs.push(ctx.stream.clone_htod(&conv_state_ptrs).map_err(|e| {
+                anyhow::anyhow!("copy Qwen3.5 conv state pointer table {layer_idx}: {e}")
+            })?);
+        }
 
         let graphs = BATCH_BUCKETS
             .iter()
@@ -89,6 +120,8 @@ impl BatchDecodeGraphState {
         Ok(Self {
             buffers,
             slot_states,
+            linear_state_ptrs,
+            linear_conv_state_ptrs,
             graphs,
         })
     }

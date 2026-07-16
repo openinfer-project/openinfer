@@ -2,11 +2,10 @@
 //! and per-request recurrent-state updates for linear attention.
 
 use anyhow::{Context, Result};
-use cudarc::driver::{DevicePtr, DevicePtrMut};
+use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 
 use super::batch_decode_graph::{BATCH_BUCKETS, BatchDecodeGraphState, bucket_for};
 use super::decode_buffers::BatchDecodeBuffers35;
-use super::recurrent_state::RecurrentState;
 use super::weights::{
     FullAttentionLayer, LayerKind, LinearAttentionLayer, Qwen35Model, TransformerBlock35,
 };
@@ -279,7 +278,56 @@ impl Qwen35Model {
 
         let kv_buffer = kv_states[0].buffer();
         let layout = *kv_states[0].layout();
-        self.batch_decode_kernels_graph(kv_buffer, &layout, bs, recurrent_states, bufs)
+        let (linear_state_ptrs, linear_conv_state_ptrs) =
+            self.linear_state_pointer_tables(recurrent_states, bs)?;
+        self.batch_decode_kernels_graph(
+            kv_buffer,
+            &layout,
+            bs,
+            &linear_state_ptrs,
+            &linear_conv_state_ptrs,
+            bufs,
+        )
+    }
+
+    fn linear_state_pointer_tables(
+        &self,
+        recurrent_states: &mut [&mut RecurrentState],
+        batch_size: usize,
+    ) -> Result<(Vec<CudaSlice<u64>>, Vec<CudaSlice<u64>>)> {
+        let num_linear_layers =
+            self.config.num_hidden_layers - self.config.num_full_attention_layers();
+        let mut linear_state_ptrs = Vec::with_capacity(num_linear_layers);
+        let mut linear_conv_state_ptrs = Vec::with_capacity(num_linear_layers);
+        for layer_idx in 0..num_linear_layers {
+            let mut state_ptrs = Vec::with_capacity(batch_size);
+            let mut conv_state_ptrs = Vec::with_capacity(batch_size);
+            for slot in recurrent_states.iter_mut().take(batch_size) {
+                let state_ptr = {
+                    let (ptr, _guard) = slot.layers[layer_idx]
+                        .state
+                        .device_ptr_mut(&self.ctx.stream);
+                    ptr as u64
+                };
+                let conv_ptr = {
+                    let (ptr, _guard) = slot.layers[layer_idx]
+                        .conv_state
+                        .data
+                        .device_ptr_mut(&self.ctx.stream);
+                    ptr as u64
+                };
+                state_ptrs.push(state_ptr);
+                conv_state_ptrs.push(conv_ptr);
+            }
+            linear_state_ptrs.push(self.ctx.stream.clone_htod(&state_ptrs).map_err(|e| {
+                anyhow::anyhow!("copy Qwen3.5 eager linear state pointer table {layer_idx}: {e}")
+            })?);
+            linear_conv_state_ptrs.push(self.ctx.stream.clone_htod(&conv_state_ptrs).map_err(
+                |e| anyhow::anyhow!("copy Qwen3.5 eager conv state pointer table {layer_idx}: {e}"),
+            )?);
+        }
+
+        Ok((linear_state_ptrs, linear_conv_state_ptrs))
     }
 
     // =========================================================================
@@ -364,14 +412,15 @@ impl Qwen35Model {
 
         // Take graphs out of graph_state to avoid split-borrow in the closure.
         let mut graphs = std::mem::take(&mut graph_state.graphs);
+        let linear_state_ptrs = &graph_state.linear_state_ptrs;
+        let linear_conv_state_ptrs = &graph_state.linear_conv_state_ptrs;
         let result = graphs[bucket_idx].run_or_capture(&self.ctx, || {
-            let mut slot_refs: Vec<&mut RecurrentState> =
-                graph_state.slot_states.iter_mut().collect();
             self.batch_decode_kernels_graph(
                 kv_buffer,
                 &layout,
                 padded_bs,
-                &mut slot_refs,
+                linear_state_ptrs,
+                linear_conv_state_ptrs,
                 &mut graph_state.buffers,
             )
         });
@@ -458,14 +507,13 @@ impl Qwen35Model {
             self.config.num_key_value_heads,
             self.config.head_dim
         );
-        let mut slot_states: Vec<&mut RecurrentState> =
-            graph_state.slot_states.iter_mut().collect();
         self.batch_decode_batched_hybrid_kernels(
             kv_buffer,
             &layout,
             &plan,
             bs,
-            &mut slot_states,
+            &graph_state.linear_state_ptrs,
+            &graph_state.linear_conv_state_ptrs,
             bufs,
         )
     }
@@ -475,7 +523,8 @@ impl Qwen35Model {
         kv_buffer: &cudarc::driver::CudaSlice<half::bf16>,
         layout: &KvLayout,
         padded_bs: usize,
-        slot_states: &mut [&mut RecurrentState],
+        linear_state_ptrs: &[CudaSlice<u64>],
+        linear_conv_state_ptrs: &[CudaSlice<u64>],
         bufs: &mut BatchDecodeBuffers35,
     ) -> Result<()> {
         let eps = self.config.rms_norm_eps;
@@ -508,8 +557,8 @@ impl Qwen35Model {
                 LayerKind::LinearAttention(attn) => {
                     self.batch_decode_linear_attention_slots(
                         attn,
-                        slot_states,
-                        linear_idx,
+                        &linear_state_ptrs[linear_idx],
+                        &linear_conv_state_ptrs[linear_idx],
                         padded_bs,
                         bufs,
                     )?;
@@ -576,7 +625,8 @@ impl Qwen35Model {
         layout: &KvLayout,
         plan: &ops::PrefillPagedPlan,
         bs: usize,
-        slot_states: &mut [&mut RecurrentState],
+        linear_state_ptrs: &[CudaSlice<u64>],
+        linear_conv_state_ptrs: &[CudaSlice<u64>],
         bufs: &mut BatchDecodeBuffers35,
     ) -> Result<()> {
         let eps = self.config.rms_norm_eps;
@@ -611,7 +661,11 @@ impl Qwen35Model {
                 }
                 LayerKind::LinearAttention(attn) => {
                     self.batch_decode_linear_attention_slots(
-                        attn, slot_states, linear_idx, bs, bufs,
+                        attn,
+                        &linear_state_ptrs[linear_idx],
+                        &linear_conv_state_ptrs[linear_idx],
+                        bs,
+                        bufs,
                     )
                         .with_context(|| {
                             format!("hybrid decode linear-attn layer_idx={layer_idx}, linear_idx={linear_idx}, bs={bs}")
@@ -691,8 +745,8 @@ impl Qwen35Model {
     fn batch_decode_linear_attention_slots(
         &self,
         attn: &LinearAttentionLayer,
-        slot_states: &mut [&mut RecurrentState],
-        layer_idx: usize,
+        state_ptrs: &CudaSlice<u64>,
+        conv_state_ptrs: &CudaSlice<u64>,
         padded_bs: usize,
         bufs: &mut BatchDecodeBuffers35,
     ) -> Result<()> {
@@ -701,38 +755,29 @@ impl Qwen35Model {
         ops::gemm_into(&self.ctx, &attn.in_proj_b, &bufs.normed, &mut bufs.b_proj);
         ops::gemm_into(&self.ctx, &attn.in_proj_a, &bufs.normed, &mut bufs.a_proj);
 
-        for (slot_idx, slot_state) in slot_states.iter_mut().enumerate().take(padded_bs) {
-            let slot_state = &mut **slot_state;
-            let layer_state = &mut slot_state.layers[layer_idx];
-
-            ops::extract_vec_into(&self.ctx, &bufs.qkv, slot_idx, &mut bufs.qkv_tmp)?;
-            ops::conv1d_decode_into(
-                &self.ctx,
-                &bufs.qkv_tmp,
-                &attn.conv1d_weight,
-                &mut layer_state.conv_state,
-                &mut bufs.qkv_conv_tmp,
-                self.config.linear_conv_kernel_dim,
-            );
-            ops::extract_vec_into(&self.ctx, &bufs.b_proj, slot_idx, &mut bufs.b_tmp)?;
-            ops::extract_vec_into(&self.ctx, &bufs.a_proj, slot_idx, &mut bufs.a_tmp)?;
-
-            ops::gated_delta_rule_decode_vec_into(
-                &self.ctx,
-                &bufs.qkv_conv_tmp,
-                &bufs.b_tmp,
-                &bufs.a_tmp,
-                &attn.dt_bias,
-                &attn.a_log,
-                &mut layer_state.state,
-                &mut bufs.gdr_tmp,
-                self.config.linear_num_key_heads,
-                self.config.linear_num_value_heads,
-                self.config.linear_key_head_dim,
-                self.config.linear_value_head_dim,
-            );
-            ops::write_vec_into(&self.ctx, &bufs.gdr_tmp, &mut bufs.gdr_out, slot_idx)?;
-        }
+        ops::conv1d_decode_batch_into(
+            &self.ctx,
+            &bufs.qkv,
+            &attn.conv1d_weight,
+            conv_state_ptrs,
+            &mut bufs.qkv_conv,
+            self.config.linear_conv_kernel_dim,
+        );
+        ops::gated_delta_rule_decode_batch_into(
+            &self.ctx,
+            &bufs.qkv_conv,
+            &bufs.b_proj,
+            &bufs.a_proj,
+            &attn.dt_bias,
+            &attn.a_log,
+            state_ptrs,
+            &mut bufs.gdr_out,
+            padded_bs,
+            self.config.linear_num_key_heads,
+            self.config.linear_num_value_heads,
+            self.config.linear_key_head_dim,
+            self.config.linear_value_head_dim,
+        );
 
         ops::rms_norm_gated_batch_into(
             &self.ctx,

@@ -99,8 +99,9 @@ pub(crate) struct Config35 {
 }
 
 /// Head dims baked into the kernels; head counts are runtime parameters.
-const GDN_AOT_KEY_HEAD_DIM: usize = 128;
-const GDN_AOT_VALUE_HEAD_DIM: usize = 128;
+pub(crate) const GDN_AOT_KEY_HEAD_DIM: usize = 128;
+pub(crate) const GDN_AOT_VALUE_HEAD_DIM: usize = 128;
+pub(crate) const LINEAR_CONV_MAX_KERNEL_DIM: usize = 4;
 const FULL_ATTN_HEAD_DIM: usize = 256;
 
 impl Config35 {
@@ -160,6 +161,12 @@ impl Config35 {
             "Qwen3.5 full-attention kernels are baked for head_dim {}; config has {}.",
             FULL_ATTN_HEAD_DIM,
             t.head_dim,
+        );
+        anyhow::ensure!(
+            (1..=LINEAR_CONV_MAX_KERNEL_DIM).contains(&t.linear_conv_kernel_dim),
+            "Qwen3.5 linear conv decode kernels support kernel_dim in 1..={}; config has {}.",
+            LINEAR_CONV_MAX_KERNEL_DIM,
+            t.linear_conv_kernel_dim,
         );
         anyhow::ensure!(
             t.linear_num_key_heads > 0
@@ -565,6 +572,41 @@ mod tests {
 }"#;
         std::fs::write(dir.path().join("config.json"), json).unwrap();
         Config35::from_file(dir.path().to_str().unwrap()).expect("48 value heads must load");
+    }
+
+    #[test]
+    fn guard_rejects_wide_linear_conv_decode_kernel() {
+        let dir = tempfile::tempdir().unwrap();
+        let json = r#"{
+  "max_position_embeddings": 4096,
+  "tie_word_embeddings": true,
+  "text_config": {
+    "hidden_size": 512,
+    "intermediate_size": 1024,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "head_dim": 256,
+    "vocab_size": 1000,
+    "rms_norm_eps": 1e-6,
+    "layer_types": ["linear_attention", "full_attention"],
+    "linear_conv_kernel_dim": 5,
+    "linear_key_head_dim": 128,
+    "linear_num_key_heads": 16,
+    "linear_num_value_heads": 48,
+    "linear_value_head_dim": 128,
+    "rope_parameters": { "rope_theta": 10000.0, "partial_rotary_factor": 0.25 },
+    "eos_token_id": 0
+  }
+}"#;
+        std::fs::write(dir.path().join("config.json"), json).unwrap();
+
+        let err = Config35::from_file(dir.path().to_str().unwrap())
+            .expect_err("wide conv decode kernels must be rejected");
+        assert!(
+            err.to_string().contains("linear conv decode kernels"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

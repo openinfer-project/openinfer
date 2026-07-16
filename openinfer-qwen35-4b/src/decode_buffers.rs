@@ -6,7 +6,7 @@ use cudarc::driver::CudaSlice;
 
 use super::config::{Config35, TensorParallelConfig};
 use openinfer_core::kv_pool::KvState;
-use openinfer_core::tensor::{DeviceContext, DeviceVec, HiddenStates};
+use openinfer_core::tensor::{DeviceContext, HiddenStates};
 
 /// Pre-allocated GPU buffers for Qwen3.5 batch decode (N requests, 1 token each).
 pub(crate) struct BatchDecodeBuffers35 {
@@ -34,15 +34,9 @@ pub(crate) struct BatchDecodeBuffers35 {
     pub(crate) z: HiddenStates,
     pub(crate) b_proj: HiddenStates,
     pub(crate) a_proj: HiddenStates,
+    pub(crate) qkv_conv: HiddenStates,
     pub(crate) gdr_out: HiddenStates,
     pub(crate) normed_gated: HiddenStates,
-
-    // Per-request reusable scratch for linear-attention serial decode
-    pub(crate) qkv_tmp: DeviceVec,
-    pub(crate) qkv_conv_tmp: DeviceVec,
-    pub(crate) b_tmp: DeviceVec,
-    pub(crate) a_tmp: DeviceVec,
-    pub(crate) gdr_tmp: DeviceVec,
 
     // Metadata
     pub(crate) token_ids_d: CudaSlice<u32>,
@@ -107,14 +101,9 @@ impl BatchDecodeBuffers35 {
             z: HiddenStates::zeros(ctx, z_dim, bs)?,
             b_proj: HiddenStates::zeros(ctx, b_dim, bs)?,
             a_proj: HiddenStates::zeros(ctx, a_dim, bs)?,
+            qkv_conv: HiddenStates::zeros(ctx, qkv_dim, bs)?,
             gdr_out: HiddenStates::zeros(ctx, z_dim, bs)?,
             normed_gated: HiddenStates::zeros(ctx, z_dim, bs)?,
-
-            qkv_tmp: DeviceVec::zeros(ctx, qkv_dim)?,
-            qkv_conv_tmp: DeviceVec::zeros(ctx, qkv_dim)?,
-            b_tmp: DeviceVec::zeros(ctx, b_dim)?,
-            a_tmp: DeviceVec::zeros(ctx, a_dim)?,
-            gdr_tmp: DeviceVec::zeros(ctx, z_dim)?,
 
             token_ids_d: ctx.stream.alloc_zeros(bs)?,
             positions_d: ctx.stream.alloc_zeros(bs)?,
@@ -154,6 +143,7 @@ impl BatchDecodeBuffers35 {
         self.z.seq_len = bs;
         self.b_proj.seq_len = bs;
         self.a_proj.seq_len = bs;
+        self.qkv_conv.seq_len = bs;
         self.gdr_out.seq_len = bs;
         self.normed_gated.seq_len = bs;
     }

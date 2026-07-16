@@ -230,15 +230,15 @@ pub static KERNEL_PLAN: KernelPlan = KernelPlan {
                 },
                 KernelOp {
                     id: "conv1d_decode",
-                    rust: "batch_decode::batch_decode_linear_attention_slots -> ops::conv1d_decode_into",
+                    rust: "batch_decode::batch_decode_linear_attention_slots -> ops::conv1d_decode_batch_into",
                     backend: "CUDA",
-                    notes: "depthwise conv1d on per-slot recurrent conv state",
+                    notes: "batched depthwise conv1d over slot-indexed recurrent conv states",
                 },
                 KernelOp {
                     id: "gated_delta_rule_decode",
-                    rust: "batch_decode::batch_decode_linear_attention_slots -> ops::gated_delta_rule_decode_vec_into",
+                    rust: "batch_decode::batch_decode_linear_attention_slots -> ops::gated_delta_rule_decode_batch_into",
                     backend: "CUDA",
-                    notes: "GDR per-slot decode — fixed-budget recurrent state update",
+                    notes: "batched GDR decode over slot-indexed recurrent states",
                 },
                 KernelOp {
                     id: "rms_norm_gated_decode",
