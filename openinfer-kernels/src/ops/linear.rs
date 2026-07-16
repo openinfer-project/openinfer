@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use anyhow::{Result, bail, ensure};
@@ -591,6 +592,46 @@ pub enum NumericPolicy {
     PerToken = 2,
 }
 
+thread_local! {
+    static GEMM_LT_DISABLE_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+struct GemmLtDisableGuard;
+
+impl Drop for GemmLtDisableGuard {
+    fn drop(&mut self) {
+        GEMM_LT_DISABLE_DEPTH.with(|depth| {
+            depth.set(
+                depth
+                    .get()
+                    .checked_sub(1)
+                    .expect("unbalanced GEMM Lt guard"),
+            );
+        });
+    }
+}
+
+/// Run `f` with timing-tuned cublasLt plans disabled on the current thread.
+///
+/// Transaction replay uses the stable cuBLAS fallback so its canonical state
+/// does not depend on which near-equal small-N algorithm won startup timing.
+pub fn with_gemm_lt_disabled<T>(f: impl FnOnce() -> T) -> T {
+    GEMM_LT_DISABLE_DEPTH.with(|depth| {
+        depth.set(
+            depth
+                .get()
+                .checked_add(1)
+                .expect("GEMM Lt disable depth overflow"),
+        );
+    });
+    let _guard = GemmLtDisableGuard;
+    f()
+}
+
+fn gemm_lt_disabled() -> bool {
+    GEMM_LT_DISABLE_DEPTH.with(|depth| depth.get() != 0)
+}
+
 static NUMERIC_POLICY: AtomicU8 = AtomicU8::new(NumericPolicy::Tuned as u8);
 static PIN_SERVED: AtomicU64 = AtomicU64::new(0);
 static PER_TOKEN_SERVED: AtomicU64 = AtomicU64::new(0);
@@ -760,19 +801,20 @@ fn launch_gemm(
         // NOTE: gemm_lt is disabled when a stream override is active (SM-partition
         // concurrent mode). cuBLASLt has device-global state that conflicts when
         // two green-ctx streams run cublasLtMatmul concurrently, causing Xid 31.
-        let mut status = if n <= GEMM_LT_MAX_N && !crate::tensor::has_stream_override() {
-            ffi::gemm_lt_cuda(
-                w_ptr,
-                x_ptr,
-                y_ptr,
-                m as i32,
-                n as i32,
-                k as i32,
-                crate::tensor::active_cu_stream(ctx),
-            )
-        } else {
-            GEMM_LT_UNTUNED
-        };
+        let mut status =
+            if n <= GEMM_LT_MAX_N && !crate::tensor::has_stream_override() && !gemm_lt_disabled() {
+                ffi::gemm_lt_cuda(
+                    w_ptr,
+                    x_ptr,
+                    y_ptr,
+                    m as i32,
+                    n as i32,
+                    k as i32,
+                    crate::tensor::active_cu_stream(ctx),
+                )
+            } else {
+                GEMM_LT_UNTUNED
+            };
         if status == GEMM_LT_UNTUNED {
             status = if graphsafe {
                 ffi::gemm_graphsafe_cuda(

@@ -205,7 +205,7 @@ pub static KERNEL_PLAN: KernelPlan = KernelPlan {
                 },
                 KernelOp {
                     id: "paged_decode_attention_uncompiled_group",
-                    rust: "batch_decode::batch_decode_full_attention_via_prefill -> ops::paged_attention_batch_decode_via_prefill_hd256_into",
+                    rust: "batch_decode::batch_decode_full_attention_via_prefill -> ops::paged_attention_batch_prefill_hd256_into",
                     backend: "CUDA",
                     notes: "uncompiled GQA groups: shared paged_kv_scatter + ffi::batch_prefill_paged_cuda_hd256, eager only",
                 },
@@ -274,7 +274,7 @@ pub static KERNEL_PLAN: KernelPlan = KernelPlan {
                 },
                 KernelOp {
                     id: "lm_head_decode",
-                    rust: "batch_decode::{batch_decode_kernels_graph,batch_decode_batched_hybrid_kernels} -> ops::gemm_rows_into (output_projection, selection_vocab rows)",
+                    rust: "batch_decode::{batch_decode_kernels_graph,batch_decode_batched_hybrid_kernels} -> ops::gemm_rows_into_checked (output_projection, selection_vocab rows)",
                     backend: "cuBLAS",
                     notes: "LM head: untied lm_head.weight when configured, else embed_tokens; logits rows are dense 0..active_bs",
                 },
