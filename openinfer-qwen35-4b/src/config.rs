@@ -329,6 +329,7 @@ mod tp_tests {
             intermediate_size: 9216,
             num_hidden_layers: 32,
             vocab_size: 248320,
+            selection_vocab: 248320,
             rms_norm_eps: 1e-6,
             eos_token_id: 151645,
             num_attention_heads: 16,

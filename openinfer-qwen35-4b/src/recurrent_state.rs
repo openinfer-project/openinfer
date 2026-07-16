@@ -38,18 +38,6 @@ fn per_layer_dims(config: &Config35) -> (usize, usize, usize) {
 }
 
 impl RecurrentState {
-    pub(crate) fn allocation_bytes(config: &Config35) -> usize {
-        let num_linear_layers = config.num_hidden_layers - config.num_full_attention_layers();
-        allocation_bytes_for_shape(
-            num_linear_layers,
-            config.linear_num_value_heads,
-            config.linear_key_head_dim,
-            config.linear_value_head_dim,
-            config.linear_attn_qkv_dim(),
-            config.linear_conv_kernel_dim,
-        )
-    }
-
     /// Allocate zeroed recurrent state for all linear attention layers.
     pub(crate) fn new(ctx: &DeviceContext, config: &Config35) -> Result<Self> {
         let (num_linear_layers, state_size, conv_state_size) = per_layer_dims(config);
@@ -86,8 +74,6 @@ impl RecurrentState {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn qwen35_4b_recurrent_allocation_is_49_125_mib() {
         let bytes = 24 * (32 * 128 * 128 * std::mem::size_of::<f32>()

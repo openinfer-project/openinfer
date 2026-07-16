@@ -53,12 +53,17 @@ pub mod runtime_ops {
     };
 }
 
-pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<EngineHandle> {
+pub fn start_engine(
+    model_path: &Path,
+    options: EngineLoadOptions,
+    max_batch: usize,
+    max_prefill_tokens: usize,
+) -> Result<EngineHandle> {
     start_engine_with_capacity(
         model_path,
         options,
-        batch_decode_graph::MAX_BATCH,
-        DEFAULT_MAX_PREFILL_TOKENS,
+        max_batch,
+        max_prefill_tokens,
     )
 }
 

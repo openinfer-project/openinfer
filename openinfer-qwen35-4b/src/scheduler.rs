@@ -91,6 +91,16 @@ pub(crate) fn start(
     seed: u64,
     max_prefill_tokens: usize,
 ) -> Result<SchedulerHandle> {
+    let max_batch = model.reserved_decode_slots;
+    start_with_capacity(model, seed, max_batch, max_prefill_tokens)
+}
+
+pub fn start_with_capacity(
+    model: Qwen35Model,
+    seed: u64,
+    max_batch: usize,
+    max_prefill_tokens: usize,
+) -> Result<SchedulerHandle> {
     assert!(
         max_prefill_tokens > 0,
         "max_prefill_tokens must be positive: a zero budget can never schedule a prefill chunk"
