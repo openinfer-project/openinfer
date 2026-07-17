@@ -62,7 +62,7 @@ The live gate uses the repository's existing `scripts/bench_http_serving.py` to 
 
 ## Validation Boundary
 
-The NVIDIA run exercised metrics commit `a033258c1de1944469d6c6335d4a36d4a80192cf` on an RTX 5090 with driver `580.105.08`, CUDA toolkit `12.8.93`, Rust nightly `1.99.0`, Triton `3.6.0`, and model revision `851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a`. The later scheduler refactor only inlined the same snapshot expression; its publication point, state inputs, and control flow are unchanged.
+The NVIDIA evidence validates the current scheduler implementation at `6c9b7d2b8464a846414605fdbde9020887f18ee7`. It was captured on an RTX 5090 with driver `580.105.08`, CUDA toolkit `12.8.93`, Rust nightly `1.99.0`, Triton `3.6.0`, and model revision `851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a`. The raw artifacts record source revision `a033258c1de1944469d6c6335d4a36d4a80192cf`; between that revision and `6c9b7d2`, the scheduler change only inlined the same snapshot expression, leaving its publication point, state inputs, and control flow unchanged.
 
 Build and existing scheduler E2E:
 
@@ -97,7 +97,7 @@ while :; do
 done > metrics-pressure.log
 ```
 
-Real batch-slot pressure used the repository's existing benchmark:
+Real batch-slot pressure used the repository's existing benchmark. The provenance arguments below are preserved exactly as recorded in the raw artifact:
 
 ```bash
 python3 scripts/bench_http_serving.py \
