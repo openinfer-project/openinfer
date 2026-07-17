@@ -5,7 +5,7 @@ use cudarc::driver::CudaSlice;
 use half::bf16;
 use log::info;
 use memmap2::Mmap;
-use safetensors::SafeTensors;
+use safetensors::{Dtype, SafeTensors};
 use std::collections::HashMap;
 use std::fs;
 
@@ -277,6 +277,21 @@ pub fn load_tensor_i64_host(
     name: &str,
 ) -> Result<Vec<i64>> {
     let tensor = find_tensor(shards, weight_map, name)?;
+
+    if tensor.dtype() != Dtype::I64 {
+        return Err(anyhow::anyhow!(
+            "I64 tensor '{}': expected dtype I64, got {:?}",
+            name,
+            tensor.dtype()
+        ));
+    }
+    if tensor.shape().len() != 1 {
+        return Err(anyhow::anyhow!(
+            "I64 tensor '{}': expected 1D, got shape {:?}",
+            name,
+            tensor.shape()
+        ));
+    }
     let data = tensor.data();
     if data.len() % 8 != 0 {
         return Err(anyhow::anyhow!(
@@ -301,6 +316,20 @@ pub fn load_tensor_bool_host(
     name: &str,
 ) -> Result<Vec<bool>> {
     let tensor = find_tensor(shards, weight_map, name)?;
+    if tensor.dtype() != Dtype::BOOL {
+        return Err(anyhow::anyhow!(
+            "BOOL tensor '{}': expected dtype BOOL, got {:?}",
+            name,
+            tensor.dtype()
+        ));
+    }
+    if tensor.shape().len() != 1 {
+        return Err(anyhow::anyhow!(
+            "BOOL tensor '{}': expected 1D, got shape {:?}",
+            name,
+            tensor.shape()
+        ));
+    }
     Ok(tensor.data().iter().map(|&b| b != 0).collect())
 }
 

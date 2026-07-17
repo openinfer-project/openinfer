@@ -41,9 +41,9 @@ impl Eagle3MemoryReservation {
         max_decode_batch_size: usize,
     ) -> Self {
         const BF16: usize = 2;
-        let hidden = config.hidden_size;
         let kv_dim = config.num_key_value_heads * config.head_dim;
         let q_dim = config.num_attention_heads * config.head_dim;
+        let hidden = config.hidden_size;
         let inter = config.intermediate_size;
         // EAGLE-3 fuses low/mid/high target hidden, so `fc` takes 3 * hidden in.
         let fc_in = 3 * hidden;
@@ -65,6 +65,8 @@ impl Eagle3MemoryReservation {
         let weights = midlayer + fc + head;
         let weights = weights + weights / 10;
 
+        let rope = 2 * config.max_position_embeddings * config.head_dim * BF16;
+
         // Dense forward scratch, summed over the buffers `prefill_batched` /
         // `draft_step` allocate, per token column. Conservative upper bound: the
         // prefill (one-shot, `max_prefill_tokens` wide) and decode (single-token,
@@ -83,7 +85,7 @@ impl Eagle3MemoryReservation {
 
         Self {
             kv_bytes_per_token,
-            fixed_bytes: weights + prefill_scratch + decode_scratch + capture_scratch,
+            fixed_bytes: weights + rope + prefill_scratch + decode_scratch + capture_scratch,
         }
     }
 }
@@ -122,20 +124,36 @@ mod tests {
             "single-layer draft K/V (k+v) per token"
         );
 
-        // Weights alone (no scratch): midlayer + fc + lm_head ≈ 437 MB — matches
-        // the shipped model.safetensors (436,899,680 B) — and +10% slack ≈ 480 MB.
-        let weights_only = Eagle3MemoryReservation::from_config(&config, 0, 0).fixed_bytes;
+        // No-scratch floor: weights (midlayer + fc + lm_head ≈ 437 MB, +10% ≈ 480 MB)
+        // plus the two BF16 RoPE caches (2 * 40960 * 128 * 2B ≈ 21 MB) ≈ 501 MB.
+        let no_scratch = Eagle3MemoryReservation::from_config(&config, 0, 0).fixed_bytes;
         assert!(
-            (470_000_000..500_000_000).contains(&weights_only),
-            "draft weights+10% ~480MB, got {weights_only}"
+            (495_000_000..515_000_000).contains(&no_scratch),
+            "draft weights+10%+RoPE ~501MB, got {no_scratch}"
         );
 
-        // Scratch adds on top of weights and scales with the prefill/decode bounds.
+        // The RoPE term must scale with max_position_embeddings, not hide in the
+        // fixed 10% weight slack. `validate_for_target` only lower-bounds the draft
+        // limit to the target's, so a 131072-position draft (identical geometry
+        // otherwise) allocates 67 MB of caches — 23 MB past the ~44 MB slack.
+        // Pin the exact delta = 2 * Δpos * head_dim * 2B.
+        let long = Eagle3Config {
+            max_position_embeddings: 131_072,
+            ..config
+        };
+        let long_no_scratch = Eagle3MemoryReservation::from_config(&long, 0, 0).fixed_bytes;
+        assert_eq!(
+            long_no_scratch - no_scratch,
+            2 * (131_072 - config.max_position_embeddings) * config.head_dim * 2,
+            "RoPE cache growth must be billed exactly, not absorbed by weight slack"
+        );
+
+        // Scratch adds on top of the no-scratch floor and scales with the bounds.
         assert!(
-            r.fixed_bytes > weights_only,
-            "fixed_bytes {} should exceed weights-only {}",
+            r.fixed_bytes > no_scratch,
+            "fixed_bytes {} should exceed no-scratch floor {}",
             r.fixed_bytes,
-            weights_only
+            no_scratch
         );
     }
 }

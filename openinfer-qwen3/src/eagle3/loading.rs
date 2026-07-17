@@ -3,7 +3,7 @@ use log::debug;
 
 use crate::config::Eagle3Config;
 use crate::weights::Qwen3Model;
-use openinfer_core::tensor::{DeviceContext, DeviceMatrix};
+use openinfer_core::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
 use openinfer_core::weight_loader::{
     deserialize_shards, load_shard_info, load_tensor_1d, load_tensor_2d, load_tensor_bool_host,
     load_tensor_i64_host, mmap_shards, precompute_rope,
@@ -31,6 +31,29 @@ impl Eagle3DraftModel {
         let mmaps = mmap_shards(&shard_paths)?;
         let shards = deserialize_shards(&mmaps)?;
 
+        let hidden = config.hidden_size;
+        let attn_in = 2 * hidden; // embed ++ hidden concat
+        let q_dim = config.num_attention_heads * config.head_dim;
+        let kv_dim = config.num_key_value_heads * config.head_dim;
+        let inter = config.intermediate_size;
+        let check2d = |m: &DeviceMatrix, name: &str, rows: usize, cols: usize| -> Result<()> {
+            anyhow::ensure!(
+                m.rows == rows && m.cols == cols,
+                "EAGLE-3 {name} must be [{rows}, {cols}], got [{}, {}]",
+                m.rows,
+                m.cols
+            );
+            Ok(())
+        };
+        let check1d = |v: &DeviceVec, name: &str, len: usize| -> Result<()> {
+            anyhow::ensure!(
+                v.len == len,
+                "EAGLE-3 {name} must be [{len}], got [{}]",
+                v.len
+            );
+            Ok(())
+        };
+
         // ---- the single "midlayer" decoder block ----
         // q/k/v share `2 * hidden_size` input columns (embed ++ hidden concat).
         let q_proj = load_tensor_2d(
@@ -39,54 +62,66 @@ impl Eagle3DraftModel {
             &weight_map,
             "midlayer.self_attn.q_proj.weight",
         )?;
+        check2d(&q_proj, "q_proj", q_dim, attn_in)?;
         let k_proj = load_tensor_2d(
             ctx,
             &shards,
             &weight_map,
             "midlayer.self_attn.k_proj.weight",
         )?;
+        check2d(&k_proj, "k_proj", kv_dim, attn_in)?;
         let v_proj = load_tensor_2d(
             ctx,
             &shards,
             &weight_map,
             "midlayer.self_attn.v_proj.weight",
         )?;
-        let q_dim = q_proj.rows;
-        let kv_dim = k_proj.rows;
+        check2d(&v_proj, "v_proj", kv_dim, attn_in)?;
         let qkv_proj = DeviceMatrix::vstack(ctx, &[&q_proj, &k_proj, &v_proj])?;
         drop(q_proj);
         drop(k_proj);
         drop(v_proj);
 
         let gate_proj = load_tensor_2d(ctx, &shards, &weight_map, "midlayer.mlp.gate_proj.weight")?;
+        check2d(&gate_proj, "gate_proj", inter, hidden)?;
         let up_proj = load_tensor_2d(ctx, &shards, &weight_map, "midlayer.mlp.up_proj.weight")?;
+        check2d(&up_proj, "up_proj", inter, hidden)?;
         let gate_up_proj = DeviceMatrix::vstack(ctx, &[&gate_proj, &up_proj])?;
         drop(gate_proj);
         drop(up_proj);
 
+        let o_proj = load_tensor_2d(
+            ctx,
+            &shards,
+            &weight_map,
+            "midlayer.self_attn.o_proj.weight",
+        )?;
+        check2d(&o_proj, "o_proj", hidden, q_dim)?;
+        let down_proj = load_tensor_2d(ctx, &shards, &weight_map, "midlayer.mlp.down_proj.weight")?;
+        check2d(&down_proj, "down_proj", hidden, inter)?;
+
+        let input_layernorm =
+            load_tensor_1d(ctx, &shards, &weight_map, "midlayer.input_layernorm.weight")?;
+        check1d(&input_layernorm, "input_layernorm", hidden)?;
+        let hidden_norm =
+            load_tensor_1d(ctx, &shards, &weight_map, "midlayer.hidden_norm.weight")?;
+        check1d(&hidden_norm, "hidden_norm", hidden)?;
+        let post_attention_layernorm = load_tensor_1d(
+            ctx,
+            &shards,
+            &weight_map,
+            "midlayer.post_attention_layernorm.weight",
+        )?;
+        check1d(&post_attention_layernorm, "post_attention_layernorm", hidden)?;
+
         let midlayer = Eagle3Layer {
-            input_layernorm: load_tensor_1d(
-                ctx,
-                &shards,
-                &weight_map,
-                "midlayer.input_layernorm.weight",
-            )?,
-            hidden_norm: load_tensor_1d(ctx, &shards, &weight_map, "midlayer.hidden_norm.weight")?,
+            input_layernorm,
+            hidden_norm,
             qkv_proj,
-            o_proj: load_tensor_2d(
-                ctx,
-                &shards,
-                &weight_map,
-                "midlayer.self_attn.o_proj.weight",
-            )?,
-            post_attention_layernorm: load_tensor_1d(
-                ctx,
-                &shards,
-                &weight_map,
-                "midlayer.post_attention_layernorm.weight",
-            )?,
+            o_proj,
+            post_attention_layernorm,
             gate_up_proj,
-            down_proj: load_tensor_2d(ctx, &shards, &weight_map, "midlayer.mlp.down_proj.weight")?,
+            down_proj,
             q_dim,
             kv_dim,
         };
@@ -95,16 +130,11 @@ impl Eagle3DraftModel {
         let fc = load_tensor_2d(ctx, &shards, &weight_map, "fc.weight")?;
         // Capture-compatibility invariant: EAGLE-3 fuses exactly THREE captured
         // target layers (low/mid/high) — `fc` maps `[3 * hidden] -> [hidden]`.
-        anyhow::ensure!(
-            fc.rows == config.hidden_size && fc.cols == 3 * config.hidden_size,
-            "EAGLE-3 fc must be [hidden {}, 3*hidden {}] (fuses 3 captured layers), got [{}, {}]",
-            config.hidden_size,
-            3 * config.hidden_size,
-            fc.rows,
-            fc.cols
-        );
+        check2d(&fc, "fc", hidden, 3 * hidden)?;
         let norm = load_tensor_1d(ctx, &shards, &weight_map, "norm.weight")?;
+        check1d(&norm, "norm", hidden)?;
         let lm_head = load_tensor_2d(ctx, &shards, &weight_map, "lm_head.weight")?;
+        check2d(&lm_head, "lm_head", config.draft_vocab_size, hidden)?;
 
         let d2t = load_tensor_i64_host(&shards, &weight_map, "d2t")?;
         let t2d = load_tensor_bool_host(&shards, &weight_map, "t2d")?;
