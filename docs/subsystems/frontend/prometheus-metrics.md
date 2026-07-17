@@ -26,4 +26,4 @@ Measured cost is noise in both covered configurations:
 
 ## Next step
 
-Validate Qwen3.5 running, waiting, KV usage, and idle-zero behavior on a live GPU endpoint. Then wire the remaining model schedulers using the same recipe, and report real prefix-cache query/hit counters instead of zeros. A future partitioned model must expose its logical scheduler partitions instead of averaging them behind engine 0.
+Validate Qwen3.5 running, waiting, KV usage, and idle-zero behavior on a live GPU endpoint. If real pressure never retains Qwen3.5 requests in `deferred`, track any scheduler-policy change separately instead of changing the metrics integration. Then wire the remaining model schedulers using the same recipe, and report real prefix-cache query/hit counters instead of zeros. A future partitioned model must expose its logical scheduler partitions instead of averaging them behind engine 0.

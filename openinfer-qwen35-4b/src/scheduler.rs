@@ -108,7 +108,7 @@ pub fn start_with_capacity(
     // Static instance cap for the vLLM bridge's max_model_len. Live admission
     // still uses the current page budget inside the scheduler loop.
     let total_blocks = model.kv_pool().capacity_pages().saturating_sub(1);
-    let kv_total = total_blocks as u64;
+    let kv_total_blocks = total_blocks as u64;
     let block_size = model.kv_pool().layout().page_size;
     let servable = servable_len(
         model.config().max_position_embeddings,
@@ -120,7 +120,7 @@ pub fn start_with_capacity(
     let (submit_tx, submit_rx) = mpsc::unbounded_channel();
     let (startup_tx, startup_rx) = std_mpsc::channel();
     let (load_tx, load_rx) = watch::channel(LoadSnapshot {
-        kv_total_blocks: kv_total,
+        kv_total_blocks,
         ..LoadSnapshot::default()
     });
 
@@ -766,15 +766,15 @@ fn bind_model_thread(model: &Qwen35Model) -> Result<CublasThreadGuard> {
 // ── Main loop ───────────────────────────────────────────────────────────
 
 fn load_snapshot(
-    kv_total: u64,
-    kv_available: u64,
+    kv_total_blocks: u64,
+    kv_available_blocks: u64,
     num_active_reqs: usize,
     num_prefilling_reqs: usize,
     num_waiting_reqs: usize,
 ) -> LoadSnapshot {
     LoadSnapshot {
-        kv_used_blocks: kv_total.saturating_sub(kv_available),
-        kv_total_blocks: kv_total,
+        kv_used_blocks: kv_total_blocks.saturating_sub(kv_available_blocks),
+        kv_total_blocks,
         num_running_reqs: (num_active_reqs + num_prefilling_reqs) as u64,
         num_waiting_reqs: num_waiting_reqs as u64,
     }
@@ -836,11 +836,6 @@ fn scheduler_loop(
             while let Ok(req) = submit_rx.try_recv() {
                 pending.push(req);
             }
-            // Create an observable queue boundary before admission. The next
-            // iteration publishes these requests as waiting, then preserves
-            // the existing FCFS admission and prefill order.
-            deferred = pending;
-            continue;
         }
 
         // 3. Admit new prompts. In-flight prefills reserve their promotion slot
