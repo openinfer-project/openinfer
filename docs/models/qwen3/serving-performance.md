@@ -1,6 +1,6 @@
 # Qwen3 Serving Performance (RTX 5090)
 
-**TL;DR:** openinfer Qwen3-4B TP1 on one RTX 5090 (32 GB): beats vLLM 0.24.0 at every QPS point from QPS 8 up — at QPS 16 it's +17% throughput (1980 vs 1688 tok/s), 19× lower TTFT (204 ms vs 3832 ms), 40% lower TPOT (47 ms vs 79 ms). Qwen3-8B runs on the same binary, same GPU. DSpark speculative decoding drops single-stream TPOT from 6.5 ms to 3.7 ms (~2× decode speedup). All numbers reproducible via `tools/bench/run_serving_bench.sh`.
+**TL;DR:** openinfer Qwen3-4B TP1 on one RTX 5090 (32 GB): beats vLLM 0.24.0 at every QPS point from QPS 8 up — at QPS 16 it's +17% throughput (1980 vs 1688 tok/s), 19× lower TTFT (204 ms vs 3832 ms), 40% lower TPOT (47 ms vs 79 ms). Qwen3-8B runs on the same binary, same GPU. DSpark speculative decoding drops single-stream TPOT from 6.5 ms to 3.7 ms (~2× decode speedup). Measured with the earlier fixed-seed harness (see the note under Reproduce).
 
 Last touched: 2026-07
 
@@ -113,7 +113,9 @@ At 16k: HBM hit 26 ms < host-tier L2 restore 126 ms ≪ cold prefill 1140 ms.
 
 ## Reproduce
 
-All QPS sweep and DSpark concurrency data above is reproducible via one script:
+Harness note: these tables were measured with the earlier fixed-seed harness — one seed (42) for every sweep point against one long-lived server with the prefix cache on, so later points can replay earlier points' prompts as warm-prefix hits and results are order-dependent. The script now seeds each point independently; re-runs are not directly comparable to the tables above.
+
+The current workload entry point is:
 
 ```bash
 # openinfer Qwen3-4B QPS sweep
