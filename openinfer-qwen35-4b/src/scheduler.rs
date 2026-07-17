@@ -765,21 +765,6 @@ fn bind_model_thread(model: &Qwen35Model) -> Result<CublasThreadGuard> {
 
 // ── Main loop ───────────────────────────────────────────────────────────
 
-fn load_snapshot(
-    kv_total_blocks: u64,
-    kv_available_blocks: u64,
-    num_active_reqs: usize,
-    num_prefilling_reqs: usize,
-    num_waiting_reqs: usize,
-) -> LoadSnapshot {
-    LoadSnapshot {
-        kv_used_blocks: kv_total_blocks.saturating_sub(kv_available_blocks),
-        kv_total_blocks,
-        num_running_reqs: (num_active_reqs + num_prefilling_reqs) as u64,
-        num_waiting_reqs: num_waiting_reqs as u64,
-    }
-}
-
 fn publish_load(
     load_tx: &watch::Sender<LoadSnapshot>,
     backend: &SchedulerBackend,
@@ -787,13 +772,14 @@ fn publish_load(
     prefilling: &[PrefillingRequest35],
     num_waiting_reqs: usize,
 ) {
-    load_tx.send_replace(load_snapshot(
-        backend.capacity_pages_for_requests() as u64,
-        backend.available_pages(active, prefilling) as u64,
-        active.len(),
-        prefilling.len(),
-        num_waiting_reqs,
-    ));
+    let kv_total_blocks = backend.capacity_pages_for_requests() as u64;
+    load_tx.send_replace(LoadSnapshot {
+        kv_used_blocks: kv_total_blocks
+            .saturating_sub(backend.available_pages(active, prefilling) as u64),
+        kv_total_blocks,
+        num_running_reqs: (active.len() + prefilling.len()) as u64,
+        num_waiting_reqs: num_waiting_reqs as u64,
+    });
 }
 
 #[allow(clippy::needless_pass_by_value)]

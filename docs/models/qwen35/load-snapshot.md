@@ -18,7 +18,7 @@
 - **Plan**:
   1. Publish backend-neutral snapshots from existing Qwen3.5 scheduler boundaries.
   2. Attach one load watch to the single-GPU and TP engine handles without adding scheduler transitions or iterations.
-  3. Cover the scheduler-state mapping with pure accounting tests and document the live NVIDIA acceptance gate.
+  3. Construct `LoadSnapshot` directly in `publish_load`, matching Qwen3, and rely on shared bridge/sim coverage plus the live NVIDIA acceptance gate.
   4. Add a repository-native HTTP `/metrics` runner that retains machine-readable results and paste-ready community evidence without depending on an external benchmark client.
 - **Risks / open questions**:
   - Real `/metrics` validation requires a CUDA-capable host and Qwen3.5 weights.
@@ -59,7 +59,7 @@ Instrumentation only reads these states. It does not move newly received request
 - Added load watches to `start_with_capacity` and `start_tp_with_capacity` and attached each receiver to its engine handle.
 - Added backend-neutral snapshot publication to the shared scheduler loop.
 - Kept the original Qwen3.5 idle receive and same-iteration admission flow; removed the draft-only `deferred = pending; continue;` transition after maintainer review.
-- Added pure accounting coverage for active plus prefilling running requests, deferred waiting requests, normal KV subtraction, and saturating inconsistent capacity input.
+- Constructed `LoadSnapshot` directly in `publish_load`, matching Qwen3 instead of adding a test-only mapping helper.
 - Added the HTTP metrics runner and regression coverage for Prometheus parsing, acceptance failures, evidence selection/rendering, server-command pressure validation, and the complete traffic-to-drain-to-recovery flow against a local fake endpoint.
 - Updated the shared Prometheus documentation for Qwen3.5's one-logical-engine contract.
 - Preserved the unrelated `docs/models/qwen35/source-walkthrough.md` outside the change set.
