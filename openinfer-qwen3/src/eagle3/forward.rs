@@ -14,9 +14,10 @@ pub(crate) struct Eagle3RequestState {
     v: HiddenStates,
     cached_len: usize,
     max_cache_len: usize,
-    /// Boundary target feature `[3 * hidden, 1]` at the last committed position
-    /// For target injection
-    seed_feature: Option<HiddenStates>,
+    /// Boundary target aux hidden state `[3 * hidden, 1]` at the last committed
+    /// position, kept pre-`fc` (vLLM's `aux_hidden_states`). Seeds the next chain
+    /// round via `fc(..)`.
+    aux_hidden_states: Option<HiddenStates>,
 }
 
 impl Eagle3RequestState {
@@ -25,8 +26,8 @@ impl Eagle3RequestState {
     }
 
     /// The boundary target feature `[3 * hidden, 1]` (`None` until captured).
-    pub(crate) fn seed_feature(&self) -> Option<&HiddenStates> {
-        self.seed_feature.as_ref()
+    pub(crate) fn aux_hidden_states(&self) -> Option<&HiddenStates> {
+        self.aux_hidden_states.as_ref()
     }
 }
 
@@ -83,7 +84,7 @@ impl Eagle3DraftModel {
             v,
             cached_len: 0,
             max_cache_len,
-            seed_feature: None,
+            aux_hidden_states: None,
         })
     }
 
@@ -595,7 +596,7 @@ impl Eagle3DraftModel {
             0,
             1,
         )?;
-        state.seed_feature = Some(seed);
+        state.aux_hidden_states = Some(seed);
         Ok(())
     }
 
@@ -653,7 +654,7 @@ impl Eagle3DraftModel {
     }
 
     /// One speculative draft round for a single request: fuse the boundary feature
-    /// (`fc(seed_feature)`) into the chain seed, draft `k` tokens, then **rewind**
+    /// (`fc(aux_hidden_states)`) into the chain seed, draft `k` tokens, then **rewind**
     /// the draft KV to the round-start slot so the round is side-effect-free except
     /// for the returned tokens.
     ///
@@ -672,11 +673,11 @@ impl Eagle3DraftModel {
     ) -> Result<Vec<u32>> {
         let ctx = target.device_ctx();
         // Chain seed = fc(boundary target feature). Scope the immutable borrow of
-        // `state.seed_feature` so the `&mut state` for `draft_chain` is free after.
+        // `state.aux_hidden_states` so the `&mut state` for `draft_chain` is free after.
         let mut seed = HiddenStates::zeros(ctx, self.config.hidden_size, 1)?;
         {
             let feature = state
-                .seed_feature
+                .aux_hidden_states
                 .as_ref()
                 .context("EAGLE-3 draft chain has no seed feature (prompt not captured?)")?;
             ops::gemm_into(ctx, &self.fc, feature, &mut seed);
@@ -700,7 +701,7 @@ impl Eagle3DraftModel {
     /// tokens `span_tokens[0..n+1]` — into slots `[C, C+n+1)` (`C == cached_len`,
     /// rewound by `chain_round`), rebuilding the committed prefix's draft KV; and
     /// (2) set the new boundary feature to `f_{pos+n} = captured[:, n]`. The
-    /// boundary `f_{pos-1}` is the previous round's `seed_feature` (kept pre-`fc`).
+    /// boundary `f_{pos-1}` is the previous round's `aux_hidden_states` (kept pre-`fc`).
     pub(crate) fn reseed_after_verify(
         &self,
         target: &Qwen3Model,
@@ -740,7 +741,7 @@ impl Eagle3DraftModel {
         let mut feat = HiddenStates::zeros(ctx, dim, len)?;
         {
             let boundary = state
-                .seed_feature
+                .aux_hidden_states
                 .as_ref()
                 .context("EAGLE-3 re-seed has no boundary feature")?;
             ops::copy_hidden_token_range_into(ctx, boundary, 0, &mut feat, 0, 1)?;
@@ -756,7 +757,7 @@ impl Eagle3DraftModel {
         // position), kept pre-fc for the next round's re-seed.
         let mut new_seed = HiddenStates::zeros(ctx, dim, 1)?;
         ops::copy_hidden_token_range_into(ctx, captured, token_offset + n, &mut new_seed, 0, 1)?;
-        state.seed_feature = Some(new_seed);
+        state.aux_hidden_states = Some(new_seed);
         Ok(())
     }
 
