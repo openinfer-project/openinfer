@@ -580,21 +580,27 @@ impl Eagle3DraftModel {
         Ok((logits, last_hidden))
     }
 
-    /// Capture hook: build the draft KV for a freshly-prefilled prompt and record
-    /// the boundary feature, applying the EAGLE feature↔token **shift**.
+    /// Build the draft KV for a freshly-prefilled prompt and record the boundary
+    /// feature, applying the EAGLE feature↔token shift.
     ///
-    /// EAGLE pairs target feature `f_j` with the *next* token's embedding
-    /// `e_{j+1}` (predicting `t_{j+2}`). So over a prompt `t_0..t_{P-1}` with
-    /// captured features `f_0..f_{P-1}` we teacher-force the `P-1` pairs
-    /// `(f_j, e_{j+1})` for `j = 0..P-2` (features = captured cols `0..P-1`, tokens
-    /// = `prompt[1..P]`) into draft slots `0..P-2`, and keep the last feature
-    /// `f_{P-1}` as the chain's boundary seed (it pairs with the first *generated*
-    /// token in the first chain step). `captured_all` is the batch-wide capture;
-    /// `token_offset` is this request's first column.
+    /// The shift: at each position the draft consumes target feature `f_j` paired
+    /// with the *next* token's embedding `e_{j+1}` (predicting `t_{j+2}`). So for a
+    /// prompt `t_0..t_{P-1}` with captured features `f_0..f_{P-1}`, teacher-forcing
+    /// the `P-1` pairs `(f_j, e_{j+1})`, `j = 0..P-2`, means:
+    ///   - features: captured columns `0..P-1`
+    ///   - tokens:   `prompt[1..P]`
+    ///   - written to draft KV slots `0..P-2`
     ///
-    /// v1 requires the whole prompt in one prefill chunk (`state.cached_len == 0`),
-    /// so the shift never crosses a chunk boundary; longer prompts are skipped by
-    /// the caller and fall back to plain decode.
+    /// The last feature `f_{P-1}` is not consumed here — it is kept as the chain's
+    /// boundary seed, pairing with the first *generated* token in the first chain
+    /// step.
+    ///
+    /// `captured_all` is the batch-wide capture; `token_offset` is this request's
+    /// first column in it.
+    ///
+    /// v1 requires the whole prompt in one prefill chunk (`cached_len == 0`) so the
+    /// shift never crosses a chunk boundary; the caller skips longer prompts and
+    /// falls back to plain decode.
     pub(crate) fn prefill_prompt(
         &self,
         target: &Qwen3Model,
