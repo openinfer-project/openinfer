@@ -26,6 +26,7 @@ pub(super) enum QueryView<L> {
     Ready { lease: Option<L>, num_blocks: usize },
 }
 
+#[cfg(feature = "kv-offload")]
 impl From<openinfer_kv_offload::QueryOutcome> for QueryView<openinfer_kv_offload::QueryLeaseId> {
     fn from(outcome: openinfer_kv_offload::QueryOutcome) -> Self {
         match outcome {

@@ -18,21 +18,16 @@ use openinfer_core::engine::panic_message;
 use openinfer_core::kv_pool::KvLayout;
 use openinfer_core::ops;
 use openinfer_core::sampler::SamplingParams;
-use openinfer_core::tensor::DeviceContext;
-use openinfer_core::tensor::HiddenStates;
-use openinfer_core::weight_loader::WeightPrefetch;
-use openinfer_core::weight_loader::load_shard_info;
-use openinfer_kv_cache::KvBlockGuard;
-use openinfer_kv_cache::KvBuffer;
-use openinfer_kv_cache::KvCacheEvent;
-use openinfer_kv_cache::KvCacheManager;
-use openinfer_kv_cache::KvView;
-use openinfer_kv_cache::LoadReservation;
-use openinfer_kv_cache::PrefixProbe;
-use openinfer_kv_cache::RegisteredBlock;
-use openinfer_kv_offload::LoadHandle;
-use openinfer_kv_offload::OffloadConfig;
-use openinfer_kv_offload::OffloadEngine;
+use openinfer_core::tensor::{DeviceContext, DeviceVec, HiddenStates};
+use openinfer_kv_cache::{
+    KvBuffer, KvCacheEvent, KvCacheManager, KvView, RegisteredBlock,
+};
+#[cfg(feature = "kv-offload")]
+use openinfer_kv_cache::{KvBlockGuard, LoadReservation, PrefixProbe};
+#[cfg(feature = "kv-offload")]
+use openinfer_kv_offload::{LoadHandle, OffloadConfig, OffloadEngine};
+#[cfg(not(feature = "kv-offload"))]
+type OffloadEngine = ();
 use tokio::sync::broadcast;
 
 use crate::Qwen3LoraOptions;
@@ -49,10 +44,10 @@ use crate::weights::Qwen3Model;
 
 mod dflash_lane;
 mod dflash_prefill;
+#[cfg(feature = "kv-offload")]
 mod remote_fetch;
-use remote_fetch::QueryView;
-use remote_fetch::RemoteFetchAction;
-use remote_fetch::remote_fetch_action;
+#[cfg(feature = "kv-offload")]
+use remote_fetch::{QueryView, RemoteFetchAction, remote_fetch_action};
 mod spec;
 
 use dflash_lane::DFlashLaneState;
@@ -1084,6 +1079,7 @@ struct SendEvent(cudarc::driver::sys::CUevent);
 unsafe impl Send for SendEvent {}
 
 /// One request's in-flight CPU-tier KV prefetch.
+#[cfg(feature = "kv-offload")]
 ///
 /// `probe` holds the GPU-hit prefix resident for the request's whole parked
 /// life; `phase` tracks where the missing prefix currently is.
@@ -1092,6 +1088,10 @@ struct PrefetchState {
     phase: PrefetchPhase,
 }
 
+#[cfg(not(feature = "kv-offload"))]
+struct PrefetchState;
+
+#[cfg(feature = "kv-offload")]
 enum PrefetchPhase {
     /// pegaflow is pulling the missing prefix from a remote peer (P2P RDMA)
     /// into the local host tier; the executor re-queries each scheduler tick
@@ -1141,6 +1141,7 @@ const MISS_BREAKER_THRESHOLD: u32 = 3;
 
 /// vLLM-compat P/D mode, derived from [`crate::Qwen3VllmCompatOptions`] at
 /// executor build time (the hasher needs the resolved KV block size).
+#[cfg(feature = "kv-offload")]
 struct VllmCompatState {
     hasher: openinfer_kv_offload::VllmBlockHasher,
     /// Zero-hit wait window: how long a cold request re-queries before
@@ -1151,6 +1152,9 @@ struct VllmCompatState {
     /// the wait; any remote hit resets it.
     consecutive_miss_windows: u32,
 }
+
+#[cfg(not(feature = "kv-offload"))]
+struct VllmCompatState;
 
 impl Qwen3Executor {
     pub(crate) fn dump_decode_graph_png(&self, png_path: &Path) -> Result<CudaGraphDumpSummary> {
@@ -1210,6 +1214,7 @@ impl Qwen3Executor {
         let offload = build_offload(offload_opts, &kv_mgr, model.config(), model.device_ctx())?;
         let total_blocks = kv_mgr.pool().total_blocks();
         let padding_block_id = kv_mgr.pool().padding_block_id();
+        #[cfg(feature = "kv-offload")]
         let vllm_compat = match offload_opts.vllm_compat.as_ref() {
             None => None,
             Some(c) => {
@@ -1247,6 +1252,8 @@ impl Qwen3Executor {
                 })
             }
         };
+        #[cfg(not(feature = "kv-offload"))]
+        let vllm_compat = None;
         Ok(Self {
             metadata,
             kv_mgr,
@@ -1748,6 +1755,7 @@ impl Qwen3Executor {
     /// query can see them. A persistence barrier for handoff and tests; no-op
     /// without offload.
     pub fn flush_offload_saves(&self) {
+        #[cfg(feature = "kv-offload")]
         if let Some(offload) = &self.offload {
             offload.flush_saves();
         }
@@ -1791,6 +1799,7 @@ impl Qwen3Executor {
     /// tier (fire-and-forget). Safe to call right after `apply_prefill`/
     /// `apply_decode`: the producing step's token read-back has already
     /// synchronized the compute stream, so the sealed KV is fully written.
+    #[cfg(feature = "kv-offload")]
     fn save_sealed_blocks(&mut self, request_id: RequestId) {
         if self.offload.is_none() {
             return;
@@ -1833,6 +1842,9 @@ impl Qwen3Executor {
             .expect("offload present")
             .save(&block_ids, &block_hashes, pins);
     }
+
+    #[cfg(not(feature = "kv-offload"))]
+    fn save_sealed_blocks(&mut self, _request_id: RequestId) {}
 
     // ── Chunked prefill ────────────────────────────────────────────────
 
@@ -1907,6 +1919,7 @@ impl Qwen3Executor {
     /// reserved blocks are staged + registered (held by the probe until the
     /// request prefills); on failure the state is dropped so the request
     /// prefills from scratch.
+    #[cfg(feature = "kv-offload")]
     fn settle_prefetch(
         &mut self,
         id: RequestId,
@@ -1933,6 +1946,7 @@ impl Qwen3Executor {
     /// answer either starts the H2D load (probe → Loading, still parked → and
     /// so returns `false`) or, on zero hit / reservation pressure / deadline,
     /// drops the prefetch so the request prefills from scratch.
+    #[cfg(feature = "kv-offload")]
     fn poll_remote_fetch(&mut self, id: RequestId, reserve_floor: usize) -> bool {
         let Some(st) = self.prefetch.get(&id) else {
             return true;
@@ -2046,6 +2060,7 @@ impl Qwen3Executor {
     /// Miss-breaker bookkeeping: one more request exhausted the whole
     /// zero-hit wait window. At the threshold the breaker opens and
     /// [`Self::begin_kv_prefetch`] stops parking new requests.
+    #[cfg(feature = "kv-offload")]
     fn note_miss_window_exhausted(&mut self) {
         let Some(compat) = self.vllm_compat.as_mut() else {
             return;
@@ -2062,6 +2077,7 @@ impl Qwen3Executor {
 
     /// Miss-breaker bookkeeping: remote content is visible again (leased
     /// hit), so cold requests may wait on the P/D handoff race once more.
+    #[cfg(feature = "kv-offload")]
     fn note_remote_hit(&mut self) {
         if let Some(compat) = self.vllm_compat.as_mut() {
             compat.consecutive_miss_windows = 0;
@@ -2073,6 +2089,7 @@ impl Qwen3Executor {
     /// of `probe`, which keeps the GPU-hit prefix resident meanwhile).
     /// `Err(())` means the prefetch was abandoned (lease released, no state
     /// kept) and the request should prefill from scratch.
+    #[cfg(feature = "kv-offload")]
     fn start_prefetch_load(
         &mut self,
         id: RequestId,
@@ -2182,6 +2199,7 @@ fn profile_kv_budget_on_worker(
 /// is disabled. Registers the fused KV buffer with pegaflow against the model's
 /// device/stream — must be called while that stream is still owned by the model
 /// (before it moves into the `RankWorker`).
+#[cfg(feature = "kv-offload")]
 fn build_offload(
     opts: &Qwen3OffloadOptions,
     kv_mgr: &KvCacheManager,
@@ -2241,6 +2259,21 @@ fn build_offload(
     Ok(Some(engine))
 }
 
+#[cfg(not(feature = "kv-offload"))]
+fn build_offload(
+    opts: &Qwen3OffloadOptions,
+    _kv_mgr: &KvCacheManager,
+    _config: &Config,
+    _ctx: &DeviceContext,
+) -> Result<Option<OffloadEngine>> {
+    anyhow::ensure!(
+        !opts.enabled && opts.p2p.is_none() && opts.vllm_compat.is_none(),
+        "Qwen3 KV offload is not compiled in; rebuild with `--features qwen3-kv-offload` \
+         for the server or `--features kv-offload` for openinfer-qwen3"
+    );
+    Ok(None)
+}
+
 fn ensure_lora_capacity(
     loaded_lora_adapters: &HashSet<String>,
     lora_name: &str,
@@ -2297,12 +2330,19 @@ impl ModelExecutor for Qwen3Executor {
         self.metadata.stop_token_ids.contains(&token_id)
     }
 
+    #[cfg(feature = "kv-offload")]
     fn prefetched_blocks(&self, request_id: RequestId) -> usize {
         self.prefetch
             .get(&request_id)
             .map_or(0, |st| st.probe.held_blocks())
     }
 
+    #[cfg(not(feature = "kv-offload"))]
+    fn prefetched_blocks(&self, _request_id: RequestId) -> usize {
+        0
+    }
+
+    #[cfg(feature = "kv-offload")]
     fn release_finished_events(&self, finishes: Vec<(TokenSink, TokenEvent)>) {
         match &self.offload {
             // P/D prefill role: the peer treats our HTTP response as the
@@ -2314,6 +2354,11 @@ impl ModelExecutor for Qwen3Executor {
             }
             _ => send_finished_events(finishes),
         }
+    }
+
+    #[cfg(not(feature = "kv-offload"))]
+    fn release_finished_events(&self, finishes: Vec<(TokenSink, TokenEvent)>) {
+        send_finished_events(finishes);
     }
 
     fn drop_request(&mut self, request_id: RequestId) -> Result<()> {
@@ -2340,9 +2385,12 @@ impl ModelExecutor for Qwen3Executor {
         // phase has no local reservation yet — pegaflow owns that fetch and its
         // pinned-pool destination; dropping the state simply orphans the query,
         // which pegaflow's own req-scoped prefetch GC cleans up.)
-        if let Some(state) = self.prefetch.remove(&request_id) {
-            if let PrefetchPhase::Loading { handle, .. } = state.phase {
-                let _ = handle.wait();
+        #[cfg(feature = "kv-offload")]
+        {
+            if let Some(state) = self.prefetch.remove(&request_id) {
+                if let PrefetchPhase::Loading { handle, .. } = state.phase {
+                    let _ = handle.wait();
+                }
             }
         }
         self.saved_cursor.remove(&request_id);
@@ -2372,6 +2420,7 @@ impl ModelExecutor for Qwen3Executor {
         runs
     }
 
+    #[cfg(feature = "kv-offload")]
     fn begin_kv_prefetch(
         &mut self,
         request_id: RequestId,
@@ -2492,6 +2541,18 @@ impl ModelExecutor for Qwen3Executor {
         }
     }
 
+    #[cfg(not(feature = "kv-offload"))]
+    fn begin_kv_prefetch(
+        &mut self,
+        _request_id: RequestId,
+        _prompt_tokens: &[u32],
+        _lora_adapter: Option<&str>,
+        _reserve_floor: usize,
+    ) -> bool {
+        false
+    }
+
+    #[cfg(feature = "kv-offload")]
     fn drain_ready_prefetch(&mut self, reserve_floor: usize) -> Vec<RequestId> {
         let ids: Vec<RequestId> = self.prefetch.keys().copied().collect();
         let mut done = Vec::new();
@@ -2521,6 +2582,12 @@ impl ModelExecutor for Qwen3Executor {
         done
     }
 
+    #[cfg(not(feature = "kv-offload"))]
+    fn drain_ready_prefetch(&mut self, _reserve_floor: usize) -> Vec<RequestId> {
+        Vec::new()
+    }
+
+    #[cfg(feature = "kv-offload")]
     fn wait_ready_prefetch(&mut self, reserve_floor: usize) -> Vec<RequestId> {
         let mut done = Vec::new();
         if let Some(id) = self
@@ -2560,6 +2627,11 @@ impl ModelExecutor for Qwen3Executor {
             }
         }
         done
+    }
+
+    #[cfg(not(feature = "kv-offload"))]
+    fn wait_ready_prefetch(&mut self, _reserve_floor: usize) -> Vec<RequestId> {
+        Vec::new()
     }
 
     fn execute_prefill(&mut self, plan: PrefillPlan<'_>) -> Result<PrefillResult> {
