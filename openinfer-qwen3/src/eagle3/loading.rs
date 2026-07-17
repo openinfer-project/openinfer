@@ -103,8 +103,7 @@ impl Eagle3DraftModel {
         let input_layernorm =
             load_tensor_1d(ctx, &shards, &weight_map, "midlayer.input_layernorm.weight")?;
         check1d(&input_layernorm, "input_layernorm", hidden)?;
-        let hidden_norm =
-            load_tensor_1d(ctx, &shards, &weight_map, "midlayer.hidden_norm.weight")?;
+        let hidden_norm = load_tensor_1d(ctx, &shards, &weight_map, "midlayer.hidden_norm.weight")?;
         check1d(&hidden_norm, "hidden_norm", hidden)?;
         let post_attention_layernorm = load_tensor_1d(
             ctx,
@@ -112,7 +111,11 @@ impl Eagle3DraftModel {
             &weight_map,
             "midlayer.post_attention_layernorm.weight",
         )?;
-        check1d(&post_attention_layernorm, "post_attention_layernorm", hidden)?;
+        check1d(
+            &post_attention_layernorm,
+            "post_attention_layernorm",
+            hidden,
+        )?;
 
         let midlayer = Eagle3Layer {
             input_layernorm,
