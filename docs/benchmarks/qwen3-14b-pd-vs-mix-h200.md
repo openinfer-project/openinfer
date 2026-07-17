@@ -84,6 +84,10 @@ pegaflow-router 原生支持 `--prefill/--decode` 各传多个端点（round-rob
 - 任意 D 发现任意 P 已实测（2P+2D 下 D0/D1 均从两个 P 拉过块）；亲和只是把"能跑"变成"跑得好"。
 - D 侧仍有 ~60 次 evict 后全量重拉（320 MiB@9ms，已不撞 decode）；进一步压掉靠 M3 layer-wise push / D 侧 save 策略。
 
+### 4.1 restore 撞 decode 的机制（nsys 实锤，openinfer [#704](https://github.com/openinfer-project/openinfer/issues/704)）
+
+单独探测（8 路 decode + 1 个 16k 冷 restore 共存）复现出全部流**同一毫秒**同步 hiccup ~110ms。nsys 排除了直觉解释：GPU kernel 占空比全程 ~95%、无 >10ms gap（launch-ahead 在喂队列）——不是 HBM 带宽也不是 SM 争抢（DMA 上限 64GB/s 仅为 HBM 4.8TB/s 的 ~1.3%）。真实机制：restore 注入是 ~1.4 万个平均 63KB 的碎片 H2D，把拷贝路径塞满；executor 线程每步的 greedy token 回读（`openinfer-sample/src/lib.rs:184` 的 `clone_dtoh`，pageable 目的地 → async 退化为同步）从亚毫秒涨到恒定 23.6ms，连续 8 步 ≈190ms——**step loop 被卡，GPU 没停，token 交付停**。修复方向：token 回读 pinned 化 + 独立 stream（碰 sampling 热路径，需重跑精度 gate）；pegaflow 侧合并/限流注入拷贝；M3 layer-wise push 结构性缩小暴露窗口。
+
 ## 5. 正确性与故障门（14B 复验）
 
 - **逐字节一致**：3 档 prompt（<1 page / 跨页 / ~600 tok），temp=0，router P/D vs 直连 D baseline 输出 IDENTICAL ×3。
