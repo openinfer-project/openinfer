@@ -63,6 +63,46 @@ impl Eagle3DraftModel {
         self.midlayer.kv_dim
     }
 
+    /// Assert a request state was allocated for this drafter's geometry. The
+    /// forward path writes K/V into `state` through *unchecked* gemms/copies, so a
+    /// state built for a differently-shaped drafter would silently corrupt the KV
+    /// cache instead of erroring.
+    fn ensure_state_geometry(&self, state: &Eagle3RequestState) -> Result<()> {
+        let kv_dim = self.kv_dim();
+        anyhow::ensure!(
+            state.k.hidden_dim == kv_dim && state.v.hidden_dim == kv_dim,
+            "EAGLE-3 request-state K/V dim [{}, {}] does not match drafter kv_dim {}",
+            state.k.hidden_dim,
+            state.v.hidden_dim,
+            kv_dim
+        );
+        Ok(())
+    }
+
+    /// Assert a scratch buffer set was allocated for this drafter's geometry. One
+    /// representative buffer per distinct dimension is enough: `new_scratch`
+    /// allocates them all from the same config, so any mismatch means a foreign
+    /// scratch. Same rationale as `ensure_state_geometry` — the gemms don't check.
+    fn ensure_scratch_geometry(&self, scratch: &Eagle3Scratch) -> Result<()> {
+        let hidden = self.config.hidden_size;
+        let q_dim = self.q_dim();
+        let kv_dim = self.kv_dim();
+        let inter = self.config.intermediate_size;
+        let vocab = self.config.draft_vocab_size;
+        anyhow::ensure!(
+            scratch.q.hidden_dim == q_dim
+                && scratch.k.hidden_dim == kv_dim
+                && scratch.v.hidden_dim == kv_dim
+                && scratch.attn_input.hidden_dim == 2 * hidden
+                && scratch.hidden.hidden_dim == hidden
+                && scratch.gate.hidden_dim == inter
+                && scratch.logits.hidden_dim == vocab,
+            "EAGLE-3 scratch geometry does not match drafter \
+             (hidden {hidden}, q_dim {q_dim}, kv_dim {kv_dim}, inter {inter}, vocab {vocab})"
+        );
+        Ok(())
+    }
+
     /// Allocate the single-layer K/V cache for one request. `max_cache_len` bounds
     /// the total drafted+committed positions and must fit the rope cache.
     pub(crate) fn new_request_state(
@@ -134,6 +174,7 @@ impl Eagle3DraftModel {
             "EAGLE-3 seed expects one position, got {}",
             context_features.seq_len
         );
+        self.ensure_scratch_geometry(scratch)?;
         ops::gemm_into(ctx, &self.fc, context_features, &mut scratch.hidden);
         Ok(())
     }
@@ -175,6 +216,8 @@ impl Eagle3DraftModel {
             position,
             state.cached_len
         );
+        self.ensure_state_geometry(state)?;
+        self.ensure_scratch_geometry(scratch)?;
 
         // 1. Embed the current token (reuses the target's embed_tokens).
         {
@@ -364,6 +407,7 @@ impl Eagle3DraftModel {
             num_tokens,
             state.max_cache_len
         );
+        self.ensure_state_geometry(state)?;
 
         let ctx = target.device_ctx();
         let hidden = self.config.hidden_size;
@@ -625,6 +669,14 @@ impl Eagle3DraftModel {
             seed_hidden.hidden_dim == self.config.hidden_size && seed_hidden.seq_len == 1,
             "EAGLE-3 chain seed must be [hidden, 1]"
         );
+        // Fail before writing any speculative KV rather than mid-chain in `draft_step`.
+        anyhow::ensure!(
+            start_position + k <= state.max_cache_len,
+            "EAGLE-3 draft chain [{}, {}) overflows cache {}",
+            start_position,
+            start_position + k,
+            state.max_cache_len
+        );
         let ctx = target.device_ctx();
 
         // Seed the residual stream with the prefill's last decoder output.
@@ -680,6 +732,11 @@ impl Eagle3DraftModel {
                 .aux_hidden_states
                 .as_ref()
                 .context("EAGLE-3 draft chain has no seed feature (prompt not captured?)")?;
+            debug_assert_eq!(
+                feature.hidden_dim,
+                self.fc_input_dim(),
+                "aux_hidden_states must be [fc_input_dim, 1]"
+            );
             ops::gemm_into(ctx, &self.fc, feature, &mut seed);
         }
         let start = state.cached_len;
@@ -744,6 +801,10 @@ impl Eagle3DraftModel {
                 .aux_hidden_states
                 .as_ref()
                 .context("EAGLE-3 re-seed has no boundary feature")?;
+            debug_assert_eq!(
+                boundary.hidden_dim, dim,
+                "aux_hidden_states must be [fc_input_dim, 1]"
+            );
             ops::copy_hidden_token_range_into(ctx, boundary, 0, &mut feat, 0, 1)?;
         }
         if n > 0 {
