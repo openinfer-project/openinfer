@@ -340,13 +340,13 @@ impl Eagle3DraftModel {
         tokens: &[u32],
         start_position: usize,
     ) -> Result<(HiddenStates, HiddenStates)> {
-        let n = tokens.len();
-        anyhow::ensure!(n > 0, "EAGLE-3 prefill needs tokens");
+        let num_tokens = tokens.len();
+        anyhow::ensure!(num_tokens > 0, "EAGLE-3 prefill needs tokens");
         anyhow::ensure!(
-            features.hidden_dim == self.fc_input_dim() && features.seq_len == n,
+            features.hidden_dim == self.fc_input_dim() && features.seq_len == num_tokens,
             "EAGLE-3 batched prefill needs features [{}, {}], got [{}, {}]",
             self.fc_input_dim(),
-            n,
+            num_tokens,
             features.hidden_dim,
             features.seq_len
         );
@@ -357,10 +357,10 @@ impl Eagle3DraftModel {
             state.cached_len
         );
         anyhow::ensure!(
-            start_position + n <= state.max_cache_len,
+            start_position + num_tokens <= state.max_cache_len,
             "EAGLE-3 batched prefill overflows cache: {} + {} > {}",
             start_position,
-            n,
+            num_tokens,
             state.max_cache_len
         );
 
@@ -375,17 +375,17 @@ impl Eagle3DraftModel {
         let head_dim = self.config.head_dim;
 
         // Embed all N tokens.
-        let mut token_ids_d = ctx.stream.alloc_zeros::<u32>(n)?;
+        let mut token_ids_d = ctx.stream.alloc_zeros::<u32>(num_tokens)?;
         ctx.stream.memcpy_htod(tokens, &mut token_ids_d)?;
-        let mut embed = HiddenStates::zeros(ctx, hidden, n)?;
+        let mut embed = HiddenStates::zeros(ctx, hidden, num_tokens)?;
         target.get_embeddings_batch_into(&token_ids_d, &mut embed)?;
 
         // Residual stream = fc(per-position target features) — teacher forcing.
-        let mut residual = HiddenStates::zeros(ctx, hidden, n)?;
+        let mut residual = HiddenStates::zeros(ctx, hidden, num_tokens)?;
         ops::gemm_into(ctx, &self.fc, features, &mut residual);
 
-        let mut normed_embed = HiddenStates::zeros(ctx, hidden, n)?;
-        let mut normed_hidden = HiddenStates::zeros(ctx, hidden, n)?;
+        let mut normed_embed = HiddenStates::zeros(ctx, hidden, num_tokens)?;
+        let mut normed_hidden = HiddenStates::zeros(ctx, hidden, num_tokens)?;
         ops::rms_norm_batch_into(
             ctx,
             &embed,
@@ -402,21 +402,28 @@ impl Eagle3DraftModel {
         );
 
         // attn_input = [normed_embed (rows 0..h) | normed_hidden (rows h..2h)].
-        let mut attn_input = HiddenStates::zeros(ctx, 2 * hidden, n)?;
+        let mut attn_input = HiddenStates::zeros(ctx, 2 * hidden, num_tokens)?;
         ops::copy_hidden_rows_into(ctx, &normed_embed, &mut attn_input, 0)?;
         ops::copy_hidden_rows_into(ctx, &normed_hidden, &mut attn_input, hidden)?;
 
-        let mut q = HiddenStates::zeros(ctx, q_dim, n)?;
-        let mut k = HiddenStates::zeros(ctx, kv_dim, n)?;
-        let mut v = HiddenStates::zeros(ctx, kv_dim, n)?;
-        ops::gemm_rows_into(ctx, &self.midlayer.qkv_proj, 0, q_dim, &attn_input, &mut q);
+        let mut query = HiddenStates::zeros(ctx, q_dim, num_tokens)?;
+        let mut key = HiddenStates::zeros(ctx, kv_dim, num_tokens)?;
+        let mut value = HiddenStates::zeros(ctx, kv_dim, num_tokens)?;
+        ops::gemm_rows_into(
+            ctx,
+            &self.midlayer.qkv_proj,
+            0,
+            q_dim,
+            &attn_input,
+            &mut query,
+        );
         ops::gemm_rows_into(
             ctx,
             &self.midlayer.qkv_proj,
             q_dim,
             kv_dim,
             &attn_input,
-            &mut k,
+            &mut key,
         );
         ops::gemm_rows_into(
             ctx,
@@ -424,16 +431,16 @@ impl Eagle3DraftModel {
             q_dim + kv_dim,
             kv_dim,
             &attn_input,
-            &mut v,
+            &mut value,
         );
 
         // RoPE all N q/k at positions [start, start+N).
         ops::eagle3_rope_into(
             ctx,
-            &mut q,
+            &mut query,
             0,
-            n,
-            &mut k,
+            num_tokens,
+            &mut key,
             &self.cos_cache,
             &self.sin_cache,
             num_q,
@@ -444,16 +451,23 @@ impl Eagle3DraftModel {
         )?;
 
         // Append all N k/v into the cache, then one causal attention over [0, kv_len).
-        ops::copy_hidden_token_range_into(ctx, &k, 0, &mut state.k, start_position, n)?;
-        ops::copy_hidden_token_range_into(ctx, &v, 0, &mut state.v, start_position, n)?;
-        let kv_len = start_position + n;
+        ops::copy_hidden_token_range_into(ctx, &key, 0, &mut state.k, start_position, num_tokens)?;
+        ops::copy_hidden_token_range_into(
+            ctx,
+            &value,
+            0,
+            &mut state.v,
+            start_position,
+            num_tokens,
+        )?;
+        let kv_len = start_position + num_tokens;
 
-        let mut attn_out = HiddenStates::zeros(ctx, q_dim, n)?;
+        let mut attn_out = HiddenStates::zeros(ctx, q_dim, num_tokens)?;
         ops::single_prefill_nhd_causal_into(
             ctx,
-            &q,
+            &query,
             0,
-            n,
+            num_tokens,
             &state.k,
             &state.v,
             &mut attn_out,
@@ -463,23 +477,23 @@ impl Eagle3DraftModel {
             kv_len,
         )?;
 
-        let mut o = HiddenStates::zeros(ctx, hidden, n)?;
-        ops::gemm_into(ctx, &self.midlayer.o_proj, &attn_out, &mut o);
+        let mut attn_proj = HiddenStates::zeros(ctx, hidden, num_tokens)?;
+        ops::gemm_into(ctx, &self.midlayer.o_proj, &attn_out, &mut attn_proj);
 
-        // residual += o; normed_post = norm(residual).
-        let mut normed_post = HiddenStates::zeros(ctx, hidden, n)?;
+        // residual += attn_proj; normed_post = norm(residual).
+        let mut normed_post = HiddenStates::zeros(ctx, hidden, num_tokens)?;
         openinfer_kernels::ops::fused_add_rms_norm_round_batch_into(
             ctx,
             &mut residual,
-            &o,
+            &attn_proj,
             &self.midlayer.post_attention_layernorm,
             eps,
             &mut normed_post,
         )?;
 
-        let mut gate = HiddenStates::zeros(ctx, inter, n)?;
-        let mut up = HiddenStates::zeros(ctx, inter, n)?;
-        let mut act = HiddenStates::zeros(ctx, inter, n)?;
+        let mut gate = HiddenStates::zeros(ctx, inter, num_tokens)?;
+        let mut up = HiddenStates::zeros(ctx, inter, num_tokens)?;
+        let mut act = HiddenStates::zeros(ctx, inter, num_tokens)?;
         ops::gemm_rows_into(
             ctx,
             &self.midlayer.gate_up_proj,
@@ -497,11 +511,11 @@ impl Eagle3DraftModel {
             &mut up,
         );
         ops::silu_mul_batch_into(ctx, &gate, &up, &mut act)?;
-        let mut mlp_out = HiddenStates::zeros(ctx, hidden, n)?;
+        let mut mlp_out = HiddenStates::zeros(ctx, hidden, num_tokens)?;
         ops::gemm_into(ctx, &self.midlayer.down_proj, &act, &mut mlp_out);
 
         // residual += mlp_out; normed_final = norm(residual).
-        let mut normed_final = HiddenStates::zeros(ctx, hidden, n)?;
+        let mut normed_final = HiddenStates::zeros(ctx, hidden, num_tokens)?;
         openinfer_kernels::ops::fused_add_rms_norm_round_batch_into(
             ctx,
             &mut residual,
@@ -511,12 +525,12 @@ impl Eagle3DraftModel {
             &mut normed_final,
         )?;
 
-        let mut logits = HiddenStates::zeros(ctx, self.config.draft_vocab_size, n)?;
+        let mut logits = HiddenStates::zeros(ctx, self.config.draft_vocab_size, num_tokens)?;
         ops::gemm_into(ctx, &self.lm_head, &normed_final, &mut logits);
 
         // The last position's decoder output (post-mlp residual) seeds the chain.
         let mut last_hidden = HiddenStates::zeros(ctx, hidden, 1)?;
-        ops::copy_hidden_token_range_into(ctx, &residual, n - 1, &mut last_hidden, 0, 1)?;
+        ops::copy_hidden_token_range_into(ctx, &residual, num_tokens - 1, &mut last_hidden, 0, 1)?;
 
         state.cached_len = kv_len;
         Ok((logits, last_hidden))
@@ -756,4 +770,3 @@ impl Eagle3DraftModel {
             .then_some(target_id as u32)
     }
 }
-
