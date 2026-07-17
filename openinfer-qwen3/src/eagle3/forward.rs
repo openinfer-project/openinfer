@@ -14,9 +14,7 @@ pub(crate) struct Eagle3RequestState {
     v: HiddenStates,
     cached_len: usize,
     max_cache_len: usize,
-    /// Boundary target aux hidden state `[3 * hidden, 1]` at the last committed
-    /// position, kept pre-`fc` (vLLM's `aux_hidden_states`). Seeds the next chain
-    /// round via `fc(..)`.
+    /// Boundary target feature `[3 * hidden, 1]` at the last committed position
     aux_hidden_states: Option<HiddenStates>,
 }
 
@@ -63,10 +61,7 @@ impl Eagle3DraftModel {
         self.midlayer.kv_dim
     }
 
-    /// Assert a request state was allocated for this drafter's geometry. The
-    /// forward path writes K/V into `state` through *unchecked* gemms/copies, so a
-    /// state built for a differently-shaped drafter would silently corrupt the KV
-    /// cache instead of erroring.
+    /// Assert a request state was allocated for this drafter's geometry.
     fn ensure_state_geometry(&self, state: &Eagle3RequestState) -> Result<()> {
         let kv_dim = self.kv_dim();
         anyhow::ensure!(
@@ -79,10 +74,7 @@ impl Eagle3DraftModel {
         Ok(())
     }
 
-    /// Assert a scratch buffer set was allocated for this drafter's geometry. One
-    /// representative buffer per distinct dimension is enough: `new_scratch`
-    /// allocates them all from the same config, so any mismatch means a foreign
-    /// scratch. Same rationale as `ensure_state_geometry` — the gemms don't check.
+    /// Assert a scratch buffer set was allocated for this drafter's geometry.
     fn ensure_scratch_geometry(&self, scratch: &Eagle3Scratch) -> Result<()> {
         let hidden = self.config.hidden_size;
         let q_dim = self.q_dim();
@@ -419,16 +411,18 @@ impl Eagle3DraftModel {
         let num_kv = self.config.num_key_value_heads;
         let head_dim = self.config.head_dim;
 
-        // Embed all N tokens.
+        // 1. Embed all N tokens (reuses the target's embed_tokens).
         let mut token_ids_d = ctx.stream.alloc_zeros::<u32>(num_tokens)?;
         ctx.stream.memcpy_htod(tokens, &mut token_ids_d)?;
         let mut embed = HiddenStates::zeros(ctx, hidden, num_tokens)?;
         target.get_embeddings_batch_into(&token_ids_d, &mut embed)?;
 
-        // Residual stream = fc(per-position target features) — teacher forcing.
+        // 2. Residual stream = fc(per-position target features) — teacher forcing.
+        //    (draft_step gets this seeded in `scratch.hidden` instead.)
         let mut residual = HiddenStates::zeros(ctx, hidden, num_tokens)?;
         ops::gemm_into(ctx, &self.fc, features, &mut residual);
 
+        // 3. Norm the embedding and the teacher-forced hidden separately.
         let mut normed_embed = HiddenStates::zeros(ctx, hidden, num_tokens)?;
         let mut normed_hidden = HiddenStates::zeros(ctx, hidden, num_tokens)?;
         ops::rms_norm_batch_into(
@@ -446,11 +440,12 @@ impl Eagle3DraftModel {
             &mut normed_hidden,
         );
 
-        // attn_input = [normed_embed (rows 0..h) | normed_hidden (rows h..2h)].
+        // 4. attn_input = [normed_embed (rows 0..h) | normed_hidden (rows h..2h)].
         let mut attn_input = HiddenStates::zeros(ctx, 2 * hidden, num_tokens)?;
         ops::copy_hidden_rows_into(ctx, &normed_embed, &mut attn_input, 0)?;
         ops::copy_hidden_rows_into(ctx, &normed_hidden, &mut attn_input, hidden)?;
 
+        // 5. q/k/v projections (qkv_proj input is 2 * hidden).
         let mut query = HiddenStates::zeros(ctx, q_dim, num_tokens)?;
         let mut key = HiddenStates::zeros(ctx, kv_dim, num_tokens)?;
         let mut value = HiddenStates::zeros(ctx, kv_dim, num_tokens)?;
@@ -479,7 +474,7 @@ impl Eagle3DraftModel {
             &mut value,
         );
 
-        // RoPE all N q/k at positions [start, start+N).
+        // 6. Plain RoPE (no QK-norm) on all N q/k at positions [start, start+N).
         ops::eagle3_rope_into(
             ctx,
             &mut query,
@@ -495,7 +490,7 @@ impl Eagle3DraftModel {
             start_position,
         )?;
 
-        // Append all N k/v into the cache, then one causal attention over [0, kv_len).
+        // 7. Append all N rotated k/v into the cache at [start, start+N).
         ops::copy_hidden_token_range_into(ctx, &key, 0, &mut state.k, start_position, num_tokens)?;
         ops::copy_hidden_token_range_into(
             ctx,
@@ -507,6 +502,7 @@ impl Eagle3DraftModel {
         )?;
         let kv_len = start_position + num_tokens;
 
+        // 8. One causal attention over the [0, kv_len) prefix.
         let mut attn_out = HiddenStates::zeros(ctx, q_dim, num_tokens)?;
         ops::single_prefill_nhd_causal_into(
             ctx,
@@ -522,10 +518,11 @@ impl Eagle3DraftModel {
             kv_len,
         )?;
 
+        // 9. Output projection.
         let mut attn_proj = HiddenStates::zeros(ctx, hidden, num_tokens)?;
         ops::gemm_into(ctx, &self.midlayer.o_proj, &attn_out, &mut attn_proj);
 
-        // residual += attn_proj; normed_post = norm(residual).
+        // 10. residual += attn_proj; normed_post = norm(residual).
         let mut normed_post = HiddenStates::zeros(ctx, hidden, num_tokens)?;
         openinfer_kernels::ops::fused_add_rms_norm_round_batch_into(
             ctx,
@@ -536,6 +533,7 @@ impl Eagle3DraftModel {
             &mut normed_post,
         )?;
 
+        // 11. MLP (SwiGLU).
         let mut gate = HiddenStates::zeros(ctx, inter, num_tokens)?;
         let mut up = HiddenStates::zeros(ctx, inter, num_tokens)?;
         let mut act = HiddenStates::zeros(ctx, inter, num_tokens)?;
@@ -559,7 +557,7 @@ impl Eagle3DraftModel {
         let mut mlp_out = HiddenStates::zeros(ctx, hidden, num_tokens)?;
         ops::gemm_into(ctx, &self.midlayer.down_proj, &act, &mut mlp_out);
 
-        // residual += mlp_out; normed_final = norm(residual).
+        // 12. residual += mlp_out; normed_final = norm(residual).
         let mut normed_final = HiddenStates::zeros(ctx, hidden, num_tokens)?;
         openinfer_kernels::ops::fused_add_rms_norm_round_batch_into(
             ctx,
@@ -570,10 +568,11 @@ impl Eagle3DraftModel {
             &mut normed_final,
         )?;
 
+        // 13. Draft head over the reduced vocabulary.
         let mut logits = HiddenStates::zeros(ctx, self.config.draft_vocab_size, num_tokens)?;
         ops::gemm_into(ctx, &self.lm_head, &normed_final, &mut logits);
 
-        // The last position's decoder output (post-mlp residual) seeds the chain.
+        // 14. The last position's decoder output (post-mlp residual) seeds the chain.
         let mut last_hidden = HiddenStates::zeros(ctx, hidden, 1)?;
         ops::copy_hidden_token_range_into(ctx, &residual, num_tokens - 1, &mut last_hidden, 0, 1)?;
 
