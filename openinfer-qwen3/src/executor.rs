@@ -19,11 +19,9 @@ use openinfer_core::kv_pool::KvLayout;
 use openinfer_core::ops;
 use openinfer_core::sampler::SamplingParams;
 use openinfer_core::tensor::{DeviceContext, DeviceVec, HiddenStates};
-use openinfer_kv_cache::{
-    KvBuffer, KvCacheEvent, KvCacheManager, KvView, RegisteredBlock,
-};
 #[cfg(feature = "kv-offload")]
 use openinfer_kv_cache::{KvBlockGuard, LoadReservation, PrefixProbe};
+use openinfer_kv_cache::{KvBuffer, KvCacheEvent, KvCacheManager, KvView, RegisteredBlock};
 #[cfg(feature = "kv-offload")]
 use openinfer_kv_offload::{LoadHandle, OffloadConfig, OffloadEngine};
 #[cfg(not(feature = "kv-offload"))]
