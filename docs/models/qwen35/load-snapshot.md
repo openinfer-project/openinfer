@@ -1,6 +1,6 @@
 # Qwen3.5 Scheduler LoadSnapshot
 
-> **TL;DR:** Issue #605 publishes Qwen3.5 logical running, waiting, and KV load through `EngineHandle::with_load_watch` for single-GPU and TP backends without changing scheduler behavior; NVIDIA `/metrics` proof remains required.
+> **TL;DR:** Issue #605 publishes Qwen3.5 logical running, waiting, and KV load without changing scheduler behavior; a repository-native HTTP runner now produces the required NVIDIA `/metrics` evidence, but the real GPU run remains open.
 >
 > **Last touched:** 2026-07
 
@@ -19,6 +19,7 @@
   1. Publish backend-neutral snapshots from existing Qwen3.5 scheduler boundaries.
   2. Attach one load watch to the single-GPU and TP engine handles without adding scheduler transitions or iterations.
   3. Cover the scheduler-state mapping with pure accounting tests and document the live NVIDIA acceptance gate.
+  4. Add a repository-native HTTP `/metrics` runner that retains machine-readable results and paste-ready community evidence without depending on an external benchmark client.
 - **Risks / open questions**:
   - Real `/metrics` validation requires a CUDA-capable host and Qwen3.5 weights.
   - The unrelated untracked `docs/models/qwen35/source-walkthrough.md` must remain outside this change.
@@ -51,12 +52,15 @@ Snapshot accounting is:
 
 Instrumentation only reads these states. It does not move newly received requests into `deferred`, force a request to appear as waiting, or alter admission, prefill, decode, and idle wake-up control flow.
 
+`scripts/validate_qwen35_load_metrics.py` is the acceptance runner. It drives deterministic non-streaming completions through the public endpoint, samples the three scheduler gauges by exact `model_name` and `engine` labels, and requires concurrency to exceed the recorded server `--max-batch`. It writes a complete JSON artifact plus paste-ready Markdown containing the server and runner commands, hardware/toolchain metadata, model revision and fingerprint, request counts, peaks, and raw metric lines. It has no external benchmark-client dependency.
+
 ## Execution Log
 
 - Added load watches to `start_with_capacity` and `start_tp_with_capacity` and attached each receiver to its engine handle.
 - Added backend-neutral snapshot publication to the shared scheduler loop.
 - Kept the original Qwen3.5 idle receive and same-iteration admission flow; removed the draft-only `deferred = pending; continue;` transition after maintainer review.
 - Added pure accounting coverage for active plus prefilling running requests, deferred waiting requests, normal KV subtraction, and saturating inconsistent capacity input.
+- Added the HTTP metrics runner and regression coverage for Prometheus parsing, acceptance failures, evidence selection/rendering, server-command pressure validation, and the complete traffic-to-drain-to-recovery flow against a local fake endpoint.
 - Updated the shared Prometheus documentation for Qwen3.5's one-logical-engine contract.
 - Preserved the unrelated `docs/models/qwen35/source-walkthrough.md` outside the change set.
 
@@ -67,6 +71,9 @@ Local checks completed:
 - `cargo fmt --all --check`: passed with `nightly-2026-07-10`.
 - `cargo metadata --no-deps --format-version 1`: passed.
 - `git diff --check`: passed.
+- `python3 -m unittest tests.test_validate_qwen35_load_metrics -v`: `7/7` passed, including the local HTTP orchestration test.
+- `python3 -m py_compile scripts/validate_qwen35_load_metrics.py tests/test_validate_qwen35_load_metrics.py`: passed.
+- `python3 -m unittest discover -s tests -p 'test_*.py'`: `151/151` passed.
 - The targeted `load_snapshot` test did not reach assertions on this Apple Silicon host: `vllm-server` could not find `protoc`, and `openinfer-kernels` could not run NVIDIA `nvcc`.
 - `cargo test --release --workspace --lib` did not reach tests because the workspace `moe` build requires NCCL 2.30.4 or newer, which is not installed on this host.
 
@@ -81,7 +88,7 @@ If real pressure never retains requests in `deferred`, investigate the actual pa
 
 ## Debrief
 
-- **Outcome**: The local implementation exposes Qwen3.5 scheduler gauges for single-GPU and TP without changing scheduler behavior.
+- **Outcome**: The local implementation exposes Qwen3.5 scheduler gauges for single-GPU and TP without changing scheduler behavior, and includes a reproducible runner for the remaining community acceptance evidence.
 - **Pitfalls encountered**:
   - The TP scheduler rebase required KV accounting through `SchedulerBackend`; retaining model-specific `model.kv_pool()` access would not compile against the shared loop.
   - Copying Qwen3's deferred-plus-continue transition would mix scheduler policy into an observability PR.
@@ -89,5 +96,5 @@ If real pressure never retains requests in `deferred`, investigate the actual pa
   - Reuse Qwen3's watch contract, not model-specific control flow.
   - Observability should consume the scheduler backend contract when one loop serves multiple execution topologies.
 - **Follow-ups**:
-  - Run the Qwen3.5 feature build and scheduler tests on an NVIDIA development host.
-  - Attach live active, pressure, idle-zero, and recovery evidence before marking the PR ready.
+  - Run the Qwen3.5 feature build, scheduler tests, and `scripts/validate_qwen35_load_metrics.py` on an NVIDIA development host with the server constrained to `--max-batch 1`.
+  - Attach the runner-generated Markdown evidence before marking the PR ready.
