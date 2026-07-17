@@ -21,7 +21,7 @@ use crate::executor::{
 use crate::logprobs::snapshot_requested_logprobs;
 use crate::prefill::PREFILL_CHUNK_LEN;
 use crate::prefill_buffers::GdrChunkwiseScratch35;
-use crate::recurrent_state::RecurrentState;
+use crate::recurrent_state::{LinearStatePointerTables, RecurrentState};
 use crate::weights::{ModelRuntimeConfig, Qwen35Model};
 use openinfer_core::kv_pool::KvState;
 use openinfer_core::sampler::SamplingParams;
@@ -753,6 +753,7 @@ struct TpRequestState {
     phase: TpRequestPhase,
     kv: KvState,
     recurrent: RecurrentState,
+    linear_pointer_tables: LinearStatePointerTables,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1084,12 +1085,13 @@ impl TpWorkerState {
 
             {
                 let state = &mut self.requests[state_idx];
-                let mut kv_refs = vec![&mut state.kv];
-                let mut recurrent_refs = vec![&mut state.recurrent];
+                let mut kv_refs = [&mut state.kv];
+                let mut recurrent_refs = [&mut state.recurrent];
                 self.model.batch_decode_eager_logits(
                     &[request.token_id],
                     &mut kv_refs,
                     &mut recurrent_refs,
+                    &state.linear_pointer_tables,
                     &mut self.decode_buffers,
                 )?;
             }
@@ -1134,11 +1136,23 @@ impl TpWorkerState {
         if let Some(idx) = self.request_index(request_id) {
             return Ok(idx);
         }
+        let mut recurrent = RecurrentState::new(self.model.device_ctx(), self.model.config())?;
+        let linear_pointer_tables = {
+            let mut recurrent_refs = [&mut recurrent];
+            LinearStatePointerTables::from_recurrent_refs(
+                self.model.device_ctx(),
+                self.model.config(),
+                &mut recurrent_refs,
+                1,
+                "Qwen3.5 TP eager",
+            )?
+        };
         let state = TpRequestState {
             request_id,
             phase: TpRequestPhase::Prefilling,
             kv: self.model.alloc_kv(),
-            recurrent: RecurrentState::new(self.model.device_ctx(), self.model.config())?,
+            recurrent,
+            linear_pointer_tables,
         };
         self.requests.push(state);
         Ok(self.requests.len() - 1)

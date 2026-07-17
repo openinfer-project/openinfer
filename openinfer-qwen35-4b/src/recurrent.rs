@@ -544,11 +544,12 @@ pub fn gated_delta_rule_prefill_chunkwise_into(
 #[cfg(test)]
 mod tests {
     use anyhow::Result;
+    use cudarc::driver::DevicePtrMut;
     use half::bf16;
 
     use super::{
-        conv1d_prefill_batch_into, gated_delta_rule_decode_vec_into,
-        gated_delta_rule_prefill_chunkwise_into,
+        conv1d_prefill_batch_into, gated_delta_rule_decode_batch_into,
+        gated_delta_rule_decode_vec_into, gated_delta_rule_prefill_chunkwise_into,
     };
     use crate::prefill_buffers::GdrChunkwiseScratch35;
     use openinfer_core::tensor::{DeviceContext, DeviceVec, HiddenStates};
@@ -691,6 +692,150 @@ mod tests {
 
         assert!(max_out_diff < 0.02, "output diff {max_out_diff}");
         assert!(max_state_diff < 0.02, "state diff {max_state_diff}");
+        Ok(())
+    }
+
+    #[test]
+    fn gdr_decode_batch_matches_single_slot_reference() -> Result<()> {
+        let ctx = DeviceContext::new()?;
+        let batch_size = 3usize;
+        let num_key_heads = 16usize;
+        let num_value_heads = 48usize;
+        let key_dim = 128usize;
+        let val_dim = 128usize;
+
+        let qkv_dim = 2 * num_key_heads * key_dim + num_value_heads * val_dim;
+        let out_dim = num_value_heads * val_dim;
+        let state_len = num_value_heads * key_dim * val_dim;
+
+        let qkv_host = bf16_vec(
+            &(0..batch_size * qkv_dim)
+                .map(|i| ((i % 89) as f32 - 44.0) * 0.0078125)
+                .collect::<Vec<_>>(),
+        );
+        let b_host = bf16_vec(
+            &(0..batch_size * num_value_heads)
+                .map(|i| ((i % 11) as f32 - 5.0) * 0.03125)
+                .collect::<Vec<_>>(),
+        );
+        let a_host = bf16_vec(
+            &(0..batch_size * num_value_heads)
+                .map(|i| ((i % 13) as f32 - 6.0) * 0.03125)
+                .collect::<Vec<_>>(),
+        );
+        let dt_host = bf16_vec(
+            &(0..num_value_heads)
+                .map(|i| ((i % 7) as f32 - 3.0) * 0.0625)
+                .collect::<Vec<_>>(),
+        );
+        let alog_host: Vec<f32> = (0..num_value_heads)
+            .map(|i| ((i % 5) as f32 - 2.0) * 0.125)
+            .collect();
+
+        let qkv_batch = HiddenStates {
+            data: ctx.stream.clone_htod(&qkv_host)?,
+            hidden_dim: qkv_dim,
+            seq_len: batch_size,
+        };
+        let b_batch = HiddenStates {
+            data: ctx.stream.clone_htod(&b_host)?,
+            hidden_dim: num_value_heads,
+            seq_len: batch_size,
+        };
+        let a_batch = HiddenStates {
+            data: ctx.stream.clone_htod(&a_host)?,
+            hidden_dim: num_value_heads,
+            seq_len: batch_size,
+        };
+        let dt_bias = DeviceVec::from_host(&ctx, &dt_host)?;
+        let a_log = ctx.stream.clone_htod(&alog_host)?;
+
+        let mut batch_states: Vec<cudarc::driver::CudaSlice<f32>> = (0..batch_size)
+            .map(|_| ctx.stream.alloc_zeros(state_len))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut state_ptrs = Vec::with_capacity(batch_size);
+        for state in &mut batch_states {
+            let (ptr, _guard) = state.device_ptr_mut(&ctx.stream);
+            state_ptrs.push(ptr as u64);
+        }
+        let state_ptrs_d = ctx.stream.clone_htod(&state_ptrs)?;
+
+        let mut out_batch = HiddenStates::zeros(&ctx, out_dim, batch_size)?;
+        gated_delta_rule_decode_batch_into(
+            &ctx,
+            &qkv_batch,
+            &b_batch,
+            &a_batch,
+            &dt_bias,
+            &a_log,
+            &state_ptrs_d,
+            &mut out_batch,
+            batch_size,
+            num_key_heads,
+            num_value_heads,
+            key_dim,
+            val_dim,
+        );
+
+        let mut out_ref_rows: Vec<f32> = Vec::with_capacity(batch_size * out_dim);
+        let mut ref_states = Vec::with_capacity(batch_size);
+        for row in 0..batch_size {
+            let qkv_row =
+                DeviceVec::from_host(&ctx, &qkv_host[row * qkv_dim..(row + 1) * qkv_dim])?;
+            let b_row = DeviceVec::from_host(
+                &ctx,
+                &b_host[row * num_value_heads..(row + 1) * num_value_heads],
+            )?;
+            let a_row = DeviceVec::from_host(
+                &ctx,
+                &a_host[row * num_value_heads..(row + 1) * num_value_heads],
+            )?;
+            let mut state_ref: cudarc::driver::CudaSlice<f32> =
+                ctx.stream.alloc_zeros(state_len)?;
+            let mut out_row = DeviceVec::zeros(&ctx, out_dim)?;
+            gated_delta_rule_decode_vec_into(
+                &ctx,
+                &qkv_row,
+                &b_row,
+                &a_row,
+                &dt_bias,
+                &a_log,
+                &mut state_ref,
+                &mut out_row,
+                num_key_heads,
+                num_value_heads,
+                key_dim,
+                val_dim,
+            );
+            out_ref_rows.extend_from_slice(&out_row.to_host(&ctx)?);
+            ref_states.push(state_ref);
+        }
+
+        let out_batch_host = ctx.stream.clone_dtoh(&out_batch.data)?;
+        ctx.sync()?;
+        let out_batch_host: Vec<f32> = out_batch_host.iter().map(|x| x.to_f32()).collect();
+        let max_out_diff = out_batch_host
+            .iter()
+            .zip(out_ref_rows.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+
+        let mut max_state_diff = 0.0_f32;
+        for (batch_state, ref_state) in batch_states.iter().zip(ref_states.iter()) {
+            let batch_state_host = ctx.stream.clone_dtoh(batch_state)?;
+            let ref_state_host = ctx.stream.clone_dtoh(ref_state)?;
+            ctx.sync()?;
+            max_state_diff = max_state_diff.max(
+                batch_state_host
+                    .iter()
+                    .zip(ref_state_host.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0_f32, f32::max),
+            );
+        }
+
+        assert!(max_out_diff < 0.05, "output diff {max_out_diff}");
+        assert!(max_state_diff < 0.05, "state diff {max_state_diff}");
         Ok(())
     }
 
