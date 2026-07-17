@@ -2,6 +2,12 @@ name: CI
 
 on:
   pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+      - converted_to_draft
   push:
     branches:
       - main
@@ -55,6 +61,7 @@ jobs:
         run: cargo metadata --locked --no-deps --format-version 1
 
   cpu-unit-tests:
+    if: github.event_name == 'push' || github.event.pull_request.draft == false
     name: CPU unit tests (${{ matrix.package }})
     runs-on: ubuntu-latest
     env:
@@ -101,6 +108,7 @@ jobs:
         run: cargo test --release --locked -p ${{ matrix.package }} --lib
 
   cpu-clippy:
+    if: github.event_name == 'push' || github.event.pull_request.draft == false
     name: CPU Clippy
     runs-on: ubuntu-latest
     env:
@@ -139,6 +147,7 @@ jobs:
           --all-targets -- -D warnings
 
   simulated-frontend-e2e:
+    if: github.event_name == 'push' || github.event.pull_request.draft == false
     name: Simulated frontend E2E
     runs-on: ubuntu-latest
     env:
@@ -168,6 +177,7 @@ jobs:
         run: cargo test --release --locked -p openinfer-sim --test frontend_e2e
 
   qwen3-cuda-compile:
+    if: github.event_name == 'push' || github.event.pull_request.draft == false
     name: Qwen3 CUDA compile (sm_80)
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -212,6 +222,7 @@ jobs:
           OPENINFER_NVCC_JOBS: "2"
 
   qwen3-cuda-clippy:
+    if: github.event_name == 'push' || github.event.pull_request.draft == false
     name: Qwen3 CUDA Clippy (sm_80)
     runs-on: ubuntu-latest
     timeout-minutes: 45
