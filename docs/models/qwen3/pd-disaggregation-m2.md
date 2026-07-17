@@ -1,6 +1,6 @@
 # P/D 分离 M2：pegaflow metaserver P2P 数据面
 
-> **TL;DR**: Qwen3-8B 1P+1D 双 openinfer 实例 P/D 分离**已在单机 2×H200（每卡 1 块 400G IB NIC）端到端验证**：KV 经 pegaflow 内容寻址 P2P 从 P 流向 D（metaserver 发现 + 单边 RDMA READ + H2D restore），greedy 输出与单实例 baseline 逐 token 一致（3 档 prompt 长度），33/33 块 74.2 MiB 拉取 rdma_wait 仅 2.6ms，杀 metaserver / 杀 P 均优雅退化为本地 prefill。无 handle 协议——D 从同一 prompt 推出同一组 kvbm lineage hash 直接查询。**多轮并发压测已过**：turn2+ TTFT 恒定 ~107ms、TPOT p99 全轮 <10.1ms，与 mixed 部署的完整 A/B 见 `../../benchmarks/qwen3-8b-pd-vs-mix-h200.md`；先修掉 §4 的 `max_completion_tokens` 坑。openinfer 分支 `feat/pd-pegaflow-p2p`，pegaflow 侧 PR [#381](https://github.com/novitalabs/pegaflow/pull/381)。
+> **TL;DR**: Qwen3-8B 1P+1D 双 openinfer 实例 P/D 分离**已在单机 2×H200（每卡 1 块 400G IB NIC）端到端验证**：KV 经 pegaflow 内容寻址 P2P 从 P 流向 D（metaserver 发现 + 单边 RDMA READ + H2D restore），greedy 输出与单实例 baseline 逐 token 一致（3 档 prompt 长度），33/33 块 74.2 MiB 拉取 rdma_wait 仅 2.6ms，杀 metaserver / 杀 P 均优雅退化为本地 prefill。无 handle 协议——D 从同一 prompt 推出同一组 kvbm lineage hash 直接查询。**多轮并发压测已过**：turn2+ TTFT 恒定 ~107ms、TPOT p99 全轮 <10.1ms，与 mixed 部署的完整 A/B 见 `../../benchmarks/qwen3-8b-pd-vs-mix-h200.md`。**2026-07-17 用 Qwen3-14B 在 8×H200 全量复验并扩展**（正确性/故障门 + hugepage 大池 + 弹性 2P+2D + router 前缀亲和 pegaflow [#405](https://github.com/novitalabs/pegaflow/pull/405)），完整数据见 `../../benchmarks/qwen3-14b-pd-vs-mix-h200.md`——长输入下 P/D 等卡吞吐也反超 mixed（+17%），ITL p99 差距 4.5×。M2 代码已随 #522 合入 main。
 >
 > Last touched: 2026-07
 
@@ -47,7 +47,8 @@ pegaflow #381 已合入 master（squash 为 `d46fd16`，含 router `max_completi
 - **P2P/RDMA 依赖未做 feature gate**（openinfer #523）：`rdma` feature 无条件开，默认构建也拉 pegaflow-transfer + vendored rdma-core；运行时无影响（不带 `--kv-p2p-*` 不激活），是打包卫生欠账。
 - P 侧冷 prompt 多付一轮 RemoteFetch 往返（本地全 miss 先 `Loading` 再空手 prefill）——设计使然。
 - 单机验证 ≠ 跨机：跨机需确认 dma-buf/GID/路由；目标集群 GPU↔NIC 同构（8×400G 1:1 PIX）预期直接成立。
-- 多 P 多 D 纯 router 事务（内容寻址保证任意 D 发现任意 P 的 KV），M2 架构无障碍。
+- 多 P 多 D 纯 router 事务（内容寻址保证任意 D 发现任意 P 的 KV）——**14B 战役已实测 2P+2D**：任意 D↔任意 P 拉取成立，甚至 P 会从 D 拉前缀（mesh 全向）；但 router round-robin 会打碎前缀局部性，重负载 ITL p99 从 23→85ms，**必须配前缀亲和选路**（pegaflow #405，P+D 都要亲和）。
+- host 池大小是 decode 纯净性的一部分：池装不下工作集时 P 侧 evict → D 查询 miss → D 本地 prefill 兜底污染 decode（14B 重负载实测 ITL p99 23.6→84.6ms）。大池用 `--kv-offload-hugepages`（2MiB hugepages，200GiB NUMA 感知池 ~5s/池分配）。
 - prefill-only 请求模式（省掉 max_tokens=1 的一步 decode）：`PendingEffect::EmitAndFinish` 缝上加,未做。
 - M3（延后）：pd-rdma-push 逐层 GPU→GPU WRITE Rust 化,P prefill 与传输流水。
 
