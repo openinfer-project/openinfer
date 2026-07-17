@@ -11,6 +11,7 @@
   - `docs/models/qwen35/model-crate.md` — confirmed that the model crate owns the scheduler and exposes it through the generic `EngineHandle`.
   - `docs/models/qwen35/roadmap.md` — confirmed the serving and lifecycle observability context.
   - `docs/subsystems/frontend/prometheus-metrics.md` — confirmed the existing `LoadSnapshot` bridge contract.
+  - `docs/conventions/coding-style.md` — confirmed that existing E2E coverage should be preferred over adding ceremonial tests.
   - `openinfer-qwen35-4b/src/scheduler.rs` on this branch and `origin/main` — compared the metrics wiring with the shared single-GPU/TP scheduler flow.
 - **Relevant history**:
   - Qwen3 already publishes `LoadSnapshot`, but its deferred-plus-continue idle transition predates metrics and is model scheduler behavior, not part of the shared observability recipe.
@@ -19,9 +20,6 @@
   1. Publish backend-neutral snapshots from existing Qwen3.5 scheduler boundaries.
   2. Attach one load watch to the single-GPU and TP engine handles without adding scheduler transitions or iterations.
   3. Use the existing Qwen3.5 scheduler E2E, generic HTTP benchmark, and raw `/metrics` sampling for validation; retain commands and results in this document and the PR body.
-- **Risks / open questions**:
-  - The cleaned scheduler implementation is an inline, Qwen3-shaped form of the code tested at `a033258`; run the retained NVIDIA gate against the final code commit before marking the PR ready.
-  - The unrelated untracked `docs/models/qwen35/source-walkthrough.md` must remain outside this change.
 
 ## Design
 
@@ -56,35 +54,106 @@ The live gate uses the repository's existing `scripts/bench_http_serving.py` to 
 ## Execution Log
 
 - Added load watches to `start_with_capacity` and `start_tp_with_capacity` and attached each receiver to its engine handle.
-- Added backend-neutral snapshot publication to the shared scheduler loop.
+- Added direct, backend-neutral `LoadSnapshot` publication at the top of the shared scheduler loop, following Qwen3's instrumentation shape.
 - Kept the original Qwen3.5 idle receive and same-iteration admission flow; removed the draft-only `deferred = pending; continue;` transition after maintainer review.
-- Validated `a033258c1de1944469d6c6335d4a36d4a80192cf` on one RTX 5090 with exact Qwen3.5-4B model revision `851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a`.
-- Used the existing generic HTTP benchmark with `--max-batch 1`, four concurrent 512-token completions, and raw 100 ms metric sampling. No scheduler transition or Qwen3.5-specific test runner was needed to expose waiting.
-- Removed `scripts/validate_qwen35_load_metrics.py` and `tests/test_validate_qwen35_load_metrics.py`; the final diff contains no new runner or test framework.
-- Kept the runtime implementation confined to `openinfer-qwen35-4b/src/scheduler.rs`, matching Qwen3's direct `LoadSnapshot` construction inside `publish_load`.
+- Derived KV capacity and availability through `SchedulerBackend`, so the same publication logic serves single-GPU and TP.
+- Used the existing scheduler E2E and generic HTTP benchmark for validation; no model-specific runner or new test file is part of the change.
 - Updated the shared Prometheus documentation for Qwen3.5's one-logical-engine contract.
-- Preserved the unrelated `docs/models/qwen35/source-walkthrough.md` outside the change set.
 
 ## Validation Boundary
 
-Local checks completed:
+The NVIDIA run exercised metrics commit `a033258c1de1944469d6c6335d4a36d4a80192cf` on an RTX 5090 with driver `580.105.08`, CUDA toolkit `12.8.93`, Rust nightly `1.99.0`, Triton `3.6.0`, and model revision `851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a`. The later scheduler refactor only inlined the same snapshot expression; its publication point, state inputs, and control flow are unchanged.
 
-- `cargo fmt --all --check`: passed with `nightly-2026-07-10`.
-- `cargo metadata --no-deps --format-version 1`: passed.
-- `git diff --check`: passed.
+Build and existing scheduler E2E:
 
-RTX 5090 checks completed against the exact metrics-only commit `a033258`:
+```bash
+export OPENINFER_CUDA_SM=120
+export OPENINFER_TRITON_PYTHON="$PWD/.venv/bin/python"
+export OPENINFER_TEST_MODEL_PATH="$PWD/models/Qwen3.5-4B"
 
-- Release Qwen3.5 server build: passed.
-- Existing `test_e2e_qwen35_scheduler`: `1 passed; 0 failed`.
-- Real HTTP pressure: `4 completed; 0 failed; 0 timeouts`.
-- Peaks: running `1`, waiting `3`, KV usage ratio `0.0010026245171183392`.
-- Idle before pressure, after drain, and after recovery: all three gauges were zero.
-- Follow-up completion: returned eight tokens successfully.
+cargo build --release -p openinfer-server --features qwen35-4b
+cargo test --release -p openinfer-qwen35-4b --features qwen35-4b \
+  --test e2e_scheduler test_e2e_qwen35_scheduler -- --exact --nocapture
+```
 
-The raw commands, environment, model hashes, server logs, benchmark JSON, and metric samples are retained locally under `docs/private/qwen35-load-metrics-evidence/`.
+The release build passed and the existing E2E reported `1 passed; 0 failed`.
 
-The dedicated runner and tests are removed in the local working tree. The same GPU gate must now be associated with the final cleaned code commit before the branch is pushed or the PR is marked ready.
+Server and 100 ms metric sampler:
+
+```bash
+RUST_LOG=info target/release/openinfer \
+  --model-path models/Qwen3.5-4B \
+  --served-model-name qwen35-metrics \
+  --port 18080 --device-ordinal 0 --tp-size 1 \
+  --cuda-graph=true --max-batch 1 --max-prefill-tokens 1024
+
+while :; do
+  date -Ins
+  curl -fsS http://127.0.0.1:18080/metrics \
+    | grep -E '^vllm:(num_requests_running|num_requests_waiting|kv_cache_usage_perc)\{' \
+    | grep -F 'engine="0"' \
+    | grep -F 'model_name="qwen35-metrics"'
+  sleep 0.1
+done > metrics-pressure.log
+```
+
+Real batch-slot pressure used the repository's existing benchmark:
+
+```bash
+python3 scripts/bench_http_serving.py \
+  --base-url http://127.0.0.1:18080 \
+  --model qwen35-metrics \
+  --num-requests 4 --concurrency 4 --warmup 0 \
+  --prompt-words 32 --max-tokens 512 \
+  --temperature 0 --top-k 0 --top-p 1 --ignore-eos \
+  --timeout 300 \
+  --model-path models/Qwen3.5-4B \
+  --commit a033258c1de1944469d6c6335d4a36d4a80192cf \
+  --source-revision a033258c1de1944469d6c6335d4a36d4a80192cf \
+  --model-revision 851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a \
+  --server-binary target/release/openinfer \
+  --claim-boundary "Qwen3.5 LoadSnapshot live metrics pressure and recovery only" \
+  --out pressure.json
+```
+
+Traffic completed without failures or timeouts:
+
+```text
+completed=4
+failed=0
+timeouts=0
+wall_s=12.9674
+```
+
+One pressure sample and the observed peaks were:
+
+```text
+vllm:num_requests_running{model_name="qwen35-metrics",engine="0"} 1
+vllm:num_requests_waiting{model_name="qwen35-metrics",engine="0"} 3
+vllm:kv_cache_usage_perc{model_name="qwen35-metrics",engine="0"} 0.00008846686915750052
+
+max_running=1
+max_waiting=3
+max_kv_cache_usage_perc=0.0010026245171183392
+```
+
+After the workload drained, all three gauges returned to zero. A follow-up request then validated recovery:
+
+```bash
+curl -fsS http://127.0.0.1:18080/v1/completions \
+  -H 'Content-Type: application/json' \
+  --data-binary '{"model":"qwen35-metrics","prompt":"Hello","max_tokens":8,"temperature":0,"top_k":0,"top_p":1,"ignore_eos":true,"stream":false}'
+```
+
+```text
+usage={"completion_tokens":8,"prompt_tokens":1,"total_tokens":9}
+
+vllm:num_requests_running{model_name="qwen35-metrics",engine="0"} 0
+vllm:num_requests_waiting{model_name="qwen35-metrics",engine="0"} 0
+vllm:kv_cache_usage_perc{model_name="qwen35-metrics",engine="0"} 0.0
+```
+
+The server exited cleanly and the metric sampler reported no errors. Raw logs, benchmark JSON, hashes, and metric samples remain in the gitignored `docs/private/qwen35-load-metrics-evidence/` directory.
 
 If real pressure never retains requests in `deferred`, investigate the actual parked state and track any scheduler-policy change in a separate issue. Do not add a scheduler transition as a metrics workaround.
 
@@ -99,6 +168,5 @@ If real pressure never retains requests in `deferred`, investigate the actual pa
   - Observability should consume the scheduler backend contract when one loop serves multiple execution topologies.
   - Existing repository E2E and HTTP tooling is sufficient for one-off GPU evidence; a model-specific runner would add more maintenance cost than coverage.
 - **Follow-ups**:
-  - Run the retained RTX 5090 gate against the cleaned code commit.
-  - Correct the PR description's stale idle-wake-up wording.
-  - Paste the retained commands and raw metric output before marking the PR ready.
+  - Keep PR #692 focused on metrics and retain the NVIDIA commands and output in its description.
+  - Track any future Qwen3.5 scheduler-policy alignment separately from issue #605.
