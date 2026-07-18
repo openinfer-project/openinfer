@@ -96,7 +96,7 @@ pub fn transpose_state(
     check_cuda(result, "GDN state transpose")
 }
 
-/// Convert cumulative log-gates to FlashInfer's positive alpha factors.
+/// Convert per-token log-gates to FlashInfer's positive alpha factors.
 pub fn exp_gate(input: *const f32, output: *mut f32, length: i32, stream: CUstream) -> Result<()> {
     let result =
         unsafe { ffi::gated_delta_rule_prefill_gate_exp_cuda(input, output, length, stream) };

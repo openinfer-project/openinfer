@@ -55,7 +55,7 @@ pub struct GdrChunkwiseScratch35 {
     /// the initial state while writing the final state.
     #[cfg(feature = "flashinfer-gdn-prefill")]
     pub flashinfer_init_state: CudaSlice<f32>,
-    /// FlashInfer alpha input, fp32: exp(prefix-summed gate), [seq_len, num_value_heads].
+    /// FlashInfer alpha input, fp32: exp(per-token gate), [seq_len, num_value_heads].
     #[cfg(feature = "flashinfer-gdn-prefill")]
     pub flashinfer_alpha: CudaSlice<f32>,
     /// FlashInfer varlen metadata: device-side [0, seq_len] int64.

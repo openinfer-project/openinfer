@@ -242,28 +242,6 @@ fn gated_delta_rule_prefill_chunk_cumsum_inplace(
     Ok(())
 }
 
-fn gated_delta_rule_prefill_chunk_cumsum_into(
-    ctx: &DeviceContext,
-    g_in: &CudaSlice<f32>,
-    g_out: &mut CudaSlice<f32>,
-    seq_len: usize,
-    num_value_heads: usize,
-) -> Result<()> {
-    let (g_in_ptr, _g_in_guard) = g_in.device_ptr(&ctx.stream);
-    let (g_out_ptr, _g_out_guard) = g_out.device_ptr_mut(&ctx.stream);
-    let result = unsafe {
-        ffi::gated_delta_rule_prefill_chunk_cumsum_cuda(
-            g_in_ptr as *const f32,
-            g_out_ptr as *mut f32,
-            seq_len as i32,
-            num_value_heads as i32,
-            ctx.stream.cu_stream(),
-        )
-    };
-    result.result()?;
-    Ok(())
-}
-
 fn gated_delta_rule_prefill_chunk_a_into(
     ctx: &DeviceContext,
     k: &HiddenStates,
@@ -461,21 +439,15 @@ fn gated_delta_rule_prefill_flashinfer_into(
         return Ok(false);
     }
 
-    // FlashInfer receives positive cumulative decay factors, while the
-    // fallback pipeline keeps cumulative log-gates for its exp-difference
-    // formulas. Build the former in a separate buffer so fallback semantics
-    // remain unchanged when the optional artifact is unavailable.
-    gated_delta_rule_prefill_chunk_cumsum_into(
-        ctx,
-        &scratch.g_cumsum,
-        &mut scratch.flashinfer_alpha,
-        scratch.q_expanded.seq_len,
-        num_value_heads,
-    )?;
+    // FlashInfer receives per-token positive decay factors and performs the
+    // prefix/cumprod processing internally. The fallback pipeline keeps the
+    // prepared per-token log-gates for its own cumsum and exp-difference
+    // formulas, so write the exponentiated values to a separate buffer.
     {
+        let (g_ptr, _g_guard) = scratch.g_cumsum.device_ptr(&ctx.stream);
         let (alpha_ptr, _alpha_guard) = scratch.flashinfer_alpha.device_ptr_mut(&ctx.stream);
         openinfer_kernels::flashinfer_gdn::exp_gate(
-            alpha_ptr as *const f32,
+            g_ptr as *const f32,
             alpha_ptr as *mut f32,
             (scratch.q_expanded.seq_len * num_value_heads) as i32,
             ctx.stream.cu_stream(),
