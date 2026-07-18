@@ -18,7 +18,7 @@ use openinfer_core::engine::{
 use openinfer_core::kv_pool::KvLayout;
 use openinfer_core::ops;
 use openinfer_core::sampler::SamplingParams;
-use openinfer_core::tensor::{DeviceContext, DeviceVec, HiddenStates};
+use openinfer_core::tensor::{DeviceContext, HiddenStates};
 use openinfer_kv_cache::{
     KvBlockGuard, KvBuffer, KvCacheEvent, KvCacheManager, KvView, LoadReservation, PrefixProbe,
     RegisteredBlock,
@@ -162,44 +162,110 @@ impl DecodeStepItem {
     }
 }
 
+fn gather_decode_logprobs(
+    lane: &LocalQwen3Lane,
+    requests: &[DecodeStepItem],
+    logits: &HiddenStates,
+    row_offset: usize,
+    tokens: &[u32],
+) -> Result<Vec<Option<TokenLogprob>>> {
+    let wanted: Vec<usize> = requests
+        .iter()
+        .enumerate()
+        .filter(|(_, req)| req.logprobs > 0)
+        .map(|(i, _)| i)
+        .collect();
+    let lp_requests: Vec<openinfer_sample::LogprobRequest> = wanted
+        .iter()
+        .map(|&i| openinfer_sample::LogprobRequest {
+            row: row_offset + i,
+            picked: tokens[row_offset + i],
+            top_k: requests[i].logprobs,
+        })
+        .collect();
+    let results =
+        openinfer_sample::token_logprobs_batch(lane.model.device_ctx(), logits, &lp_requests)?;
+    let mut logprobs: Vec<Option<TokenLogprob>> = vec![None; requests.len()];
+    for (i, lp) in wanted.into_iter().zip(results) {
+        logprobs[i] = Some(lp);
+    }
+    Ok(logprobs)
+}
+
 fn build_prefill_request_results(
-    lane: &mut LocalQwen3Lane,
+    lane: &LocalQwen3Lane,
     requests: &[PrefillStepItem],
     logits: &HiddenStates,
     tokens: &[u32],
     all_position_logits: Option<&HiddenStates>,
     compute_prompt_logprobs: bool,
 ) -> Result<Vec<PrefillRequestResult>> {
-    let mut token_offset = 0usize;
+    let ctx = lane.model.device_ctx();
+
+    let first_token_wanted: Vec<usize> = requests
+        .iter()
+        .enumerate()
+        .filter(|(_, req)| req.is_final_chunk() && req.logprobs > 0)
+        .map(|(i, _)| i)
+        .collect();
+    let first_token_requests: Vec<openinfer_sample::LogprobRequest> = first_token_wanted
+        .iter()
+        .map(|&i| openinfer_sample::LogprobRequest {
+            row: i,
+            picked: tokens[i],
+            top_k: requests[i].logprobs,
+        })
+        .collect();
+    let mut first_token_logprobs: Vec<Option<TokenLogprob>> = vec![None; requests.len()];
+    for (i, lp) in first_token_wanted
+        .into_iter()
+        .zip(openinfer_sample::token_logprobs_batch(
+            ctx,
+            logits,
+            &first_token_requests,
+        )?)
+    {
+        first_token_logprobs[i] = Some(lp);
+    }
+
+    let mut prompt_requests: Vec<openinfer_sample::LogprobRequest> = Vec::new();
+    if compute_prompt_logprobs && all_position_logits.is_some() {
+        let mut token_offset = 0usize;
+        for req in requests {
+            if req.echo {
+                for j in 1..req.prompt_tokens.len() {
+                    prompt_requests.push(openinfer_sample::LogprobRequest {
+                        row: token_offset + j - 1,
+                        picked: req.prompt_tokens[j],
+                        top_k: req.logprobs,
+                    });
+                }
+            }
+            token_offset += req.chunk_tokens;
+        }
+    }
+    let mut prompt_results = match all_position_logits {
+        Some(all_logits) if !prompt_requests.is_empty() => Some(
+            openinfer_sample::token_logprobs_batch(ctx, all_logits, &prompt_requests)?.into_iter(),
+        ),
+        _ => None,
+    };
+
     let mut outputs = Vec::with_capacity(requests.len());
     for (i, req) in requests.iter().enumerate() {
         let completed = req.is_final_chunk();
-        let first_token = tokens[i];
-        let first_token_logprob = if completed && req.logprobs > 0 {
-            let logits_i = ops::extract_vec(lane.model.device_ctx(), logits, i)?;
-            Some(lane.extract_logprobs(&logits_i, first_token, req.logprobs)?)
-        } else {
-            None
-        };
         let prompt_logprobs = if req.echo {
             if compute_prompt_logprobs {
-                let mut echo_logprobs = Vec::with_capacity(req.prompt_tokens.len());
+                let mut echo_logprobs: Vec<Option<TokenLogprob>> =
+                    Vec::with_capacity(req.prompt_tokens.len());
                 echo_logprobs.push(None);
-                if let Some(all_logits) = all_position_logits {
-                    for j in 1..req.prompt_tokens.len() {
-                        let prev_pos = token_offset + j - 1;
-                        let target_token = req.prompt_tokens[j];
-                        echo_logprobs.push(lane.extract_prompt_logprobs(
-                            all_logits,
-                            prev_pos,
-                            target_token,
-                            req.logprobs,
-                        ));
+                match &mut prompt_results {
+                    Some(results) => {
+                        for _ in 1..req.prompt_tokens.len() {
+                            echo_logprobs.push(results.next());
+                        }
                     }
-                } else {
-                    for _ in 1..req.prompt_tokens.len() {
-                        echo_logprobs.push(None);
-                    }
+                    None => echo_logprobs.resize(req.prompt_tokens.len(), None),
                 }
                 Some(echo_logprobs)
             } else {
@@ -208,11 +274,10 @@ fn build_prefill_request_results(
         } else {
             None
         };
-        token_offset += req.chunk_tokens;
         outputs.push(PrefillRequestResult {
             request_id: req.request_id,
-            first_token,
-            first_token_logprob,
+            first_token: tokens[i],
+            first_token_logprob: first_token_logprobs[i].take(),
             prompt_logprobs,
             cached_tokens: req.cached_tokens,
             completed,
@@ -223,28 +288,22 @@ fn build_prefill_request_results(
 }
 
 fn build_decode_request_results(
-    lane: &mut LocalQwen3Lane,
+    lane: &LocalQwen3Lane,
     requests: &[DecodeStepItem],
     logits: &HiddenStates,
     row_offset: usize,
     tokens: &[u32],
 ) -> Result<Vec<DecodeRequestResult>> {
-    let mut outputs = Vec::with_capacity(requests.len());
-    for (i, req) in requests.iter().enumerate() {
-        let token = tokens[row_offset + i];
-        let logprob = if req.logprobs > 0 {
-            let logits_i = ops::extract_vec(lane.model.device_ctx(), logits, row_offset + i)?;
-            Some(lane.extract_logprobs(&logits_i, token, req.logprobs)?)
-        } else {
-            None
-        };
-        outputs.push(DecodeRequestResult {
+    let mut logprobs = gather_decode_logprobs(lane, requests, logits, row_offset, tokens)?;
+    Ok(requests
+        .iter()
+        .enumerate()
+        .map(|(i, req)| DecodeRequestResult {
             request_id: req.request_id,
-            token,
-            logprob,
-        });
-    }
-    Ok(outputs)
+            token: tokens[row_offset + i],
+            logprob: logprobs[i].take(),
+        })
+        .collect())
 }
 
 fn build_batch_decode_request_results(
@@ -264,22 +323,16 @@ fn build_batch_decode_request_results(
         &mut lane.sample_scratch,
     )?;
 
-    let mut outputs = Vec::with_capacity(requests.len());
-    for (i, req) in requests.iter().enumerate() {
-        let token = tokens[i];
-        let logprob = if req.logprobs > 0 {
-            let logits_i = ops::extract_vec(lane.model.device_ctx(), &lane.bufs.logits, i)?;
-            Some(lane.extract_logprobs(&logits_i, token, req.logprobs)?)
-        } else {
-            None
-        };
-        outputs.push(DecodeRequestResult {
+    let mut logprobs = gather_decode_logprobs(lane, requests, &lane.bufs.logits, 0, &tokens)?;
+    Ok(requests
+        .iter()
+        .enumerate()
+        .map(|(i, req)| DecodeRequestResult {
             request_id: req.request_id,
-            token,
-            logprob,
-        });
-    }
-    Ok(outputs)
+            token: tokens[i],
+            logprob: logprobs[i].take(),
+        })
+        .collect())
 }
 
 fn execute_step_on_lane(
@@ -3300,32 +3353,6 @@ impl LocalQwen3Lane {
             sample_seed,
             &mut self.sample_scratch,
         )
-    }
-
-    fn extract_logprobs(
-        &self,
-        logits: &DeviceVec,
-        sampled_token: u32,
-        top_k: usize,
-    ) -> Result<TokenLogprob> {
-        let logits_f32 = logits.to_host(self.model.device_ctx())?;
-        openinfer_sample::token_logprob_from_row(&logits_f32, sampled_token, top_k)
-            .ok_or_else(|| anyhow::anyhow!("logprobs computation failed"))
-    }
-
-    fn extract_prompt_logprobs(
-        &self,
-        all_logits: &HiddenStates,
-        prev_pos: usize,
-        target_token: u32,
-        top_k: usize,
-    ) -> Option<TokenLogprob> {
-        openinfer_core::ops::extract_vec(self.model.device_ctx(), all_logits, prev_pos)
-            .ok()
-            .and_then(|logits_vec| {
-                let logits_f32 = logits_vec.to_host(self.model.device_ctx()).ok()?;
-                openinfer_sample::token_logprob_from_row(&logits_f32, target_token, top_k)
-            })
     }
 
     fn execute_prefill(

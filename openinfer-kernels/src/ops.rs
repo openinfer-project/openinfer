@@ -75,7 +75,8 @@ pub use sampling::{
     BatchSamplingRow, BatchSamplingScratch, argmax, argmax_batch_bf16_into,
     argmax_batch_bf16_split_indexed_into, argmax_batch_bf16_split_partials_len, argmax_bf16_into,
     argmax_bf16_split_into, flashinfer_top1_batch_into, flashinfer_top1_row_states_bytes,
-    gpu_sample_batch_into, markov_step_argmax_into, markov_step_argmax_partials_len,
+    gpu_sample_batch_into, logprob_topk_batch_bf16_into, markov_step_argmax_into,
+    markov_step_argmax_partials_len,
 };
 
 /// Calling thread's last FFI exception message, ready to append to an error;

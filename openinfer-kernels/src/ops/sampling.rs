@@ -542,6 +542,96 @@ pub fn argmax_batch_bf16_split_indexed_into(
     Ok(())
 }
 
+/// Launch the per-row logprob reduction into pre-allocated buffers laid out
+/// `[rows]` / `[rows * k_max]` row-major; each row writes `top_k[i] <= k_max`
+/// entries and leaves the tail untouched.
+///
+/// # Safety
+///
+/// The device-resident contents of `row_indices`, `picked`, and `top_k`
+/// cannot be validated here: for every `i < rows`, `row_indices[i]` must lie
+/// in `[0, logits.seq_len)`, `picked[i]` in `[0, logits.hidden_dim)`, and
+/// `top_k[i]` in `[0, min(k_max, logits.hidden_dim)]`. The launch goes to
+/// `active_cu_stream(ctx)`: input buffers must be populated before the
+/// launch and outputs read back after it, in that stream's order.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn logprob_topk_batch_bf16_into(
+    ctx: &DeviceContext,
+    logits: HiddenStatesRef<'_>,
+    row_indices: &CudaSlice<i32>,
+    picked: &CudaSlice<i32>,
+    top_k: &CudaSlice<i32>,
+    rows: usize,
+    k_max: usize,
+    out_picked_lp: &mut CudaSlice<f32>,
+    out_topk_vals: &mut CudaSlice<f32>,
+    out_topk_ids: &mut CudaSlice<i32>,
+) -> Result<()> {
+    ensure!(
+        rows > 0 && logits.hidden_dim > 0,
+        "logprob_topk requires rows > 0 and a non-empty vocab"
+    );
+    let backing = logits
+        .hidden_dim
+        .checked_mul(logits.seq_len)
+        .ok_or_else(|| anyhow!("logprob_topk arena extent overflows"))?;
+    ensure!(
+        logits.data.len() >= backing,
+        "logprob_topk arena backing too small: have {}, need {backing}",
+        logits.data.len()
+    );
+    ensure!(
+        row_indices.len() >= rows && picked.len() >= rows && top_k.len() >= rows,
+        "logprob_topk inputs must hold {rows} elements: have {}/{}/{}",
+        row_indices.len(),
+        picked.len(),
+        top_k.len()
+    );
+    ensure!(
+        out_picked_lp.len() >= rows,
+        "logprob_topk picked output too small: have {}, need {rows}",
+        out_picked_lp.len()
+    );
+    let topk_needed = rows
+        .checked_mul(k_max)
+        .ok_or_else(|| anyhow!("logprob_topk rows * k_max overflows"))?;
+    ensure!(
+        out_topk_vals.len() >= topk_needed && out_topk_ids.len() >= topk_needed,
+        "logprob_topk top-k outputs too small: have {}/{}, need {topk_needed}",
+        out_topk_vals.len(),
+        out_topk_ids.len()
+    );
+    let rows_i32 = i32::try_from(rows)?;
+    let vocab_i32 = i32::try_from(logits.hidden_dim)?;
+    let k_max_i32 = i32::try_from(k_max)?;
+
+    let (x_ptr, _gx) = logits.data.device_ptr(&ctx.stream);
+    let (rows_ptr, _gr) = row_indices.device_ptr(&ctx.stream);
+    let (picked_ptr, _gp) = picked.device_ptr(&ctx.stream);
+    let (k_ptr, _gk) = top_k.device_ptr(&ctx.stream);
+    let (lp_ptr, _gl) = out_picked_lp.device_ptr_mut(&ctx.stream);
+    let (vals_ptr, _gv) = out_topk_vals.device_ptr_mut(&ctx.stream);
+    let (ids_ptr, _gi) = out_topk_ids.device_ptr_mut(&ctx.stream);
+
+    unsafe {
+        ffi::logprob_topk_batch_bf16_cuda(
+            x_ptr as *const ffi::Half,
+            rows_ptr as *const i32,
+            picked_ptr as *const i32,
+            k_ptr as *const i32,
+            lp_ptr as *mut f32,
+            vals_ptr as *mut f32,
+            ids_ptr as *mut i32,
+            rows_i32,
+            vocab_i32,
+            k_max_i32,
+            crate::tensor::active_cu_stream(ctx),
+        );
+    }
+
+    Ok(())
+}
+
 /// DSpark Markov-head step argmax. For each request `row`, argmax over
 /// `base[row*block_size + step] + bias[row]` and write the chosen token id as
 /// u32 (so it feeds straight back as the next step's prev-token lookup).

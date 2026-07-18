@@ -115,6 +115,20 @@ unsafe extern "C" {
 
     pub fn argmax_cuda(x: *const Half, out: *mut i32, n: i32, stream: CUstream);
 
+    pub fn logprob_topk_batch_bf16_cuda(
+        x: *const Half,
+        row_indices: *const i32,
+        picked: *const i32,
+        top_k: *const i32,
+        out_picked_lp: *mut f32,
+        out_topk_vals: *mut f32,
+        out_topk_ids: *mut i32,
+        rows: i32,
+        n: i32,
+        k_max: i32,
+        stream: CUstream,
+    );
+
     pub fn flashinfer_top1_cuda(
         logits: *const Half,
         top1_value_scratch: *mut Half,
