@@ -1,8 +1,8 @@
 # Qwen3-14B P/D 分离 vs mixed vs vLLM（8×H200，多轮长输入负载）
 
-> **TL;DR**: Qwen3-14B bf16 多轮长输入（首轮 8k + 每轮 2k）A/B（2026-07-17）：等卡数下 P/D 全面胜出——2 卡 1P+1D 比 mixed×2 吞吐 +17%（354 vs 303 tok/s）、TPOT p99 -42%（22.8 vs 39.4ms）、**ITL p99 23.5 vs 105ms（-78%）**；对 vLLM 0.25.1×2，vLLM 吞吐/decode 内核更快（453 tok/s、TPOT p50 16.7ms），但 ITL p99 141ms 是 P/D 的 6 倍。重负载（60 会话，KV 1.9× 超 D 的 HBM）下 200GiB hugepage host 池 vs 16GiB 小池：小池丢 decode 纯净性（ITL p99 23.6→84.6ms）+吞吐 -9%。弹性 2P+2D 重负载（openinfer [#705](https://github.com/openinfer-project/openinfer/pull/705) 修复后、每配置冷启动重测）：router round-robin ITL p99 86ms → **前缀亲和 22.8ms + 268 tok/s**（pegaflow [#405](https://github.com/novitalabs/pegaflow/pull/405)），达到 1P+1D 的隔离度和 1.4× 其吞吐；裸吞吐仍低于 2 卡 mixed 的 359——重负载下 P/D 买的是 decode 纯净性（ITL p99 22.8 vs 107.5），不是每卡吞吐。⚠️ 首版 ladder 数据（437/465/495 tok/s）因同栈固定 seed 复跑全量前缀命中而虚高，已作废（见 §6）。
+> **TL;DR**: Qwen3-14B bf16 多轮长输入（首轮 8k + 每轮 2k）A/B（2026-07-17）：等卡数下 P/D 全面胜出——2 卡 1P+1D 比 mixed×2 吞吐 +17%（354 vs 303 tok/s）、TPOT p99 -42%（22.8 vs 39.4ms）、**ITL p99 23.5 vs 105ms（-78%）**；对 vLLM 0.25.1×2，vLLM 吞吐/decode 内核更快（453 tok/s、TPOT p50 16.7ms），但 ITL p99 141ms 是 P/D 的 6 倍。重负载（60 会话，KV 1.9× 超 D 的 HBM）下 200GiB hugepage host 池 vs 16GiB 小池：小池丢 decode 纯净性（ITL p99 23.6→84.6ms）+吞吐 -9%。弹性 2P+2D 重负载（openinfer [#705](https://github.com/openinfer-project/openinfer/pull/705) 修复后、每配置冷启动重测）：router round-robin ITL p99 76ms → **前缀亲和 22.9ms + 338 tok/s**（pegaflow [#405](https://github.com/novitalabs/pegaflow/pull/405)），达到 1P+1D 的隔离度和 1.7× 其吞吐；裸吞吐距 2 卡 mixed 的 359 只差 6%,而 ITL p99 是其 1/4.7——重负载下 P/D 买的是 decode 纯净性,不是每卡吞吐。⚠️ 首版 ladder 数据（437/465/495 tok/s）因同栈固定 seed 复跑全量前缀命中而虚高，已作废（见 §6）。
 
-环境：单机 8×NVIDIA H200，每 GPU 1×400G IB NIC（P2P KV 走单边 RDMA READ），Qwen3-14B bf16（40L/40H/8KV/head 128，KV 160 KiB/token；单卡 HBM KV 容量 626k tokens），openinfer main `c116077`（§4 复测用 [#705](https://github.com/openinfer-project/openinfer/pull/705) 分支 `2a1f885`），pegaflow `111ea34`（0.23.4）+ 亲和 router 补丁（#405），vLLM 0.25.1。每实例 `--kv-offload --kv-offload-host-gib <N> --kv-offload-hugepages`（机器预留 1.5 TB 2MiB hugepages，200 GiB 池 NUMA 感知 2×100GiB，分配 ~5s/池）。
+环境：单机 8×NVIDIA H200，每 GPU 1×400G IB NIC（P2P KV 走单边 RDMA READ），Qwen3-14B bf16（40L/40H/8KV/head 128，KV 160 KiB/token；单卡 HBM KV 容量 626k tokens），openinfer main `c116077`（§4 复测用 [#705](https://github.com/openinfer-project/openinfer/pull/705) 分支 `1812d6bc`），pegaflow `111ea34`（0.23.4）+ 亲和 router 补丁（#405），vLLM 0.25.1。每实例 `--kv-offload --kv-offload-host-gib <N> --kv-offload-hugepages`（机器预留 1.5 TB 2MiB hugepages，200 GiB 池 NUMA 感知 2×100GiB，分配 ~5s/池）。
 
 ## 1. 负载与压测方法
 
@@ -71,17 +71,18 @@ vllm-bench \
 
 ## 4. 弹性 xP+yD：router 亲和是必要条件（60 会话，并发 12，2P+2D）
 
-pegaflow-router 原生支持 `--prefill/--decode` 各传多个端点（round-robin）。直接上 2P+2D 重负载暴露了 round-robin 的问题：同一会话的不同 turn 落到不同 P/D，前缀局部性被打碎，退化成跨节点全量 KV 搬运——P 从别的 P（甚至从 D！内容寻址 mesh 是全向的）拉 2.2 GiB 前缀（300 请求 ~80 次），D 每轮全量重拉而非增量。修复 = 前缀亲和选路（pegaflow [#405](https://github.com/novitalabs/pegaflow/pull/405)）。下表为**每配置冷启动**、openinfer [#705](https://github.com/openinfer-project/openinfer/pull/705)（`2a1f885`）复测：
+pegaflow-router 原生支持 `--prefill/--decode` 各传多个端点（round-robin）。直接上 2P+2D 重负载暴露了 round-robin 的问题：同一会话的不同 turn 落到不同 P/D，前缀局部性被打碎，退化成跨节点全量 KV 搬运——P 从别的 P（甚至从 D！内容寻址 mesh 是全向的）拉 2.2 GiB 前缀（300 请求 ~80 次），D 每轮全量重拉而非增量。修复 = 前缀亲和选路（pegaflow [#405](https://github.com/novitalabs/pegaflow/pull/405)）。下表为**每配置冷启动**、openinfer [#705](https://github.com/openinfer-project/openinfer/pull/705)（`1812d6bc`,最终 review 后代码）复测：
 
 | 选路策略 | out tok/s | TTFT p50/p99 (ms) | TPOT p99 (ms) | ITL p99 (ms) |
 |---|---|---|---|---|
-| round-robin | 259 | 1267 / 11717 | 37.9 | 86.0 |
-| **前缀亲和（P+D）** | **268** | 1911 / 18095 | **22.5** | **22.8** |
+| round-robin | 241 | 1365 / 18311 | 30.6 | 76.2 |
+| **前缀亲和（P+D）** | **338** | **1357** / 11445 | **22.5** | **22.9** |
 
-- 亲和后 ITL p99 回到 1P+1D 的 23ms 隔离度，吞吐 1.4×（268 vs 194），TTFT p50 从 1P+1D 的 3695ms 降到 1911ms（双 P 分摊 prefill 洪峰）。round-robin 的 TTFT p50 更低（会话摊到两个 P），但代价是决定性的：跨节点搬运把 decode 平滑度打回 86ms。
-- 对照 2 卡重负载 mixed×2（359 tok/s、TPOT p99 47ms、ITL p99 107.5ms）：**4 卡 P/D 亲和栈裸吞吐仍不敌 2 卡 mixed**（268 vs 359）——重负载下单 P prefill 饱和是瓶颈，P/D 买到的是 TPOT/ITL 纯净性（22.5/22.8 vs 47/107.5），适合 SLO 约束的服务而非吞吐最大化。
+- 亲和后 ITL p99 回到 1P+1D 的 23ms 隔离度，吞吐 1.7×（338 vs 194），TTFT p50 从 1P+1D 的 3695ms 降到 1357ms（双 P 分摊 prefill 洪峰）。
+- 对照 2 卡重负载 mixed×2（359 tok/s、TPOT p99 47ms、ITL p99 107.5ms）：4 卡 P/D 亲和栈裸吞吐 -6%（338 vs 359）——重负载下 prefill 算力是吞吐瓶颈，P/D 买到的是 TPOT/ITL 纯净性（22.5/22.9 vs 47/107.5），适合 SLO 约束的服务而非吞吐最大化。
 - 任意 D 发现任意 P 已实测（2P+2D 下 D0/D1 均从两个 P 拉过块）；亲和只是把"能跑"变成"跑得好"。
-- 剩余的 round-robin ITL 86ms 不再是 bug：restore 后的 suffix prefill 与 decode 共享 unified step，step 被真实计算拉长（nsys：GPU 占空比 ~95% 无空洞）。亲和从源头消掉搬运，故 22.8ms。
+- 剩余的 round-robin ITL 76ms 不再是 bug：restore 后的 suffix prefill 与 decode 共享 unified step，step 被真实计算拉长（nsys：GPU 占空比 ~95% 无空洞）。亲和从源头消掉搬运，故 22.9ms。
+- #705 修复前（`2a1f885`,分块 commit 但 per-request 预算 + executor 侧残影判据）同协议亲和只有 268 tok/s：全局预算 + scheduler 亲手传 `!active.is_empty()` 的最终版多出 26% 吞吐。
 
 ### 4.1 restore 冻结 decode 的机制（nsys + A/B 实锤，openinfer [#704](https://github.com/openinfer-project/openinfer/issues/704) → [#705](https://github.com/openinfer-project/openinfer/pull/705) 已修复）
 
@@ -94,7 +95,7 @@ pegaflow-router 原生支持 `--prefill/--decode` 各传多个端点（round-rob
 
 ## 5. 正确性与故障门（14B 复验）
 
-- **逐字节一致**：3 档 prompt（<1 page / 跨页 / ~600 tok），temp=0，router P/D vs 直连 D baseline 输出 IDENTICAL ×3。
+- **逐字节一致（限定条件）**：3 档 prompt（<1 page / 跨页 / ~600 tok），temp=0，router P/D vs 直连 D baseline。大传输档（33 块 82.5 MiB RDMA）与 <1 page 档稳定 IDENTICAL；跨页短 prompt 档在 #705 复验中暴露一个**非 P/D 缺陷**的近平局翻转——P/D 路径的 D 侧做 restore 后 suffix prefill，与本地整段 prefill 的 chunk 边界/GEMM shape 不同,Tuned 数值策略下 bf16 近平局 token 可各自合法翻转（换回修复前二进制冷跑同样复现,两个变体都连贯正确）。这与单机 prefix-cache 命中 vs 冷 prefill 的差异同类;engine 也因此拒绝 `--batch-invariant` + `--kv-offload` 组合（前缀命中会把 chunk 边界移出 request-local 网格）。字节级门只对数值路径一致的档位成立;传输无损性由大传输档 + logits 级 golden gate 保证。
 - **P2P 实证**：~600 tok prompt D 侧 `RDMA fetch summary: blocks=33/33 bytes_mib=82.5`，连接复用后 rdma_wait 1.80ms（30.4 GiB/s）。
 - **故障退化**：杀 metaserver → router 请求 WARN 后本地 prefill 正常完成；杀 P → D 冷请求正常完成。无 crash 无 hang。
 - 全部压测 0 失败请求（含 300 请求重负载 ×5 组）。
@@ -103,7 +104,7 @@ pegaflow-router 原生支持 `--prefill/--decode` 各传多个端点（round-rob
 
 - vllm-bench `accept-dist-20260709` 之后的私有构建在 multi-turn synthetic 模式下生成完对话即 **segfault**（"timeout: the monitored command dumped core"，exit 0 且无输出，极易误判为静默无请求）；用 `before-accept-dist-20260709` 构建正常。
 - vLLM 0.25.1 起服务需 `ninja` 在 PATH（venv 里 pip 装的 ninja 要把 venv/bin export 进 PATH），且 `--disable-log-requests` 已移除。
-- **同栈复跑 = warm 污染**：vllm-bench synthetic 模式 seed 固定，同一栈上按顺序测多个配置时，后面的配置全量命中前面留下的前缀（host 池 + GPU cache），吞吐可虚高 ~70%（本文首版 2P+2D ladder 437/465/495 即此坑，冷启动复测实为 259/268）。协议必须是**每配置重启栈**（清 GPU/host 池 + metaserver），或换 seed。warm 复跑只可用于刻意的 restore 压力测试，并须标注。
+- **同栈复跑 = warm 污染**：vllm-bench synthetic 模式 seed 固定，同一栈上按顺序测多个配置时，后面的配置全量命中前面留下的前缀（host 池 + GPU cache），吞吐可虚高 ~70%（本文首版 2P+2D ladder 437/465/495 即此坑，冷启动复测实为 241/338）。协议必须是**每配置重启栈**（清 GPU/host 池 + metaserver），或换 seed。warm 复跑只可用于刻意的 restore 压力测试，并须标注。
 
 ## 7. 关联
 
