@@ -368,6 +368,10 @@ impl Eagle3DraftModel {
     /// Returns `(logits [draft_vocab, N], last_hidden [hidden, 1])`
     /// Buffers are allocated inline (prefill is one-shot, `N` varies). Does not use
     /// the single-token `Eagle3Scratch`. `tokens[i]` sits at `start_position + i`.
+    ///
+    /// NOTE: the returned `(logits, last_hidden)` is not consumed yet — the current
+    /// callers only need the KV/boundary side effects. It is reserved for the
+    /// scheduler PR that drives prompt prefill (first-token logits / chain seed).
     pub(crate) fn prefill_batched(
         &self,
         target: &Qwen3Model,
@@ -638,9 +642,10 @@ impl Eagle3DraftModel {
         Ok(())
     }
 
-    /// Autoregressive **chain** draft (v1, top-1): from the prefill's last decoder
-    /// output (`seed_hidden`) and the last committed token, draft `k` tokens one at
-    /// a time — each `draft_step` produces logits, greedy-argmax picks a draft id,
+    /// Autoregressive **chain** draft (v1, top-1): from the fused target boundary
+    /// hidden (`fused_target_hidden` = `fc(last_aux_hidden_states)`) and the last
+    /// committed token, draft `k` tokens one at a time — each `draft_step` produces
+    /// logits, greedy-argmax picks a draft id,
     /// `d2t` maps it to the target vocab, and that token feeds the next step while
     /// the residual stream carries forward. Returns the `k` drafted target-vocab
     /// tokens (the tail of the verify span `[last_token, draft_1, …, draft_k]`).
@@ -653,15 +658,16 @@ impl Eagle3DraftModel {
         target: &Qwen3Model,
         state: &mut Eagle3RequestState,
         scratch: &mut Eagle3Scratch,
-        seed_hidden: &HiddenStates,
+        fused_target_hidden: &HiddenStates,
         last_token: u32,
         start_position: usize,
         k: usize,
     ) -> Result<Vec<u32>> {
         anyhow::ensure!(k > 0, "EAGLE-3 draft chain needs k > 0");
         anyhow::ensure!(
-            seed_hidden.hidden_dim == self.config.hidden_size && seed_hidden.seq_len == 1,
-            "EAGLE-3 chain seed must be [hidden, 1]"
+            fused_target_hidden.hidden_dim == self.config.hidden_size
+                && fused_target_hidden.seq_len == 1,
+            "EAGLE-3 fused_target_hidden must be [hidden, 1]"
         );
         // Fail before writing any speculative KV rather than mid-chain in `draft_step`.
         anyhow::ensure!(
@@ -673,8 +679,8 @@ impl Eagle3DraftModel {
         );
         let ctx = target.device_ctx();
 
-        // Seed the residual stream with the prefill's last decoder output.
-        ops::copy_hidden_token_range_into(ctx, seed_hidden, 0, &mut scratch.hidden, 0, 1)?;
+        // Seed the residual stream with the fused target boundary hidden.
+        ops::copy_hidden_token_range_into(ctx, fused_target_hidden, 0, &mut scratch.hidden, 0, 1)?;
 
         let mut span = Vec::with_capacity(k);
         let mut token = last_token;
