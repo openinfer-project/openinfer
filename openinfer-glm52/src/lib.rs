@@ -1183,13 +1183,16 @@ fn load_rank_weights_to_gpu(
             startup.rank_bundles[rank].clone(),
         )?));
     }
-    let mut next_rank = startup.device_ordinals.len();
-    for host in &startup.rank_hosts {
-        let remote =
-            Glm52RemoteNode::connect(&host.addr, model_path, moe_topo, next_rank, host.ranks)?;
-        next_rank += host.ranks;
-        workers.extend(remote.into_iter().map(Glm52Worker::Remote));
-    }
+    workers.extend(
+        connect_rank_hosts(
+            &startup.rank_hosts,
+            model_path,
+            moe_topo,
+            startup.device_ordinals.len(),
+        )?
+        .into_iter()
+        .map(Glm52Worker::Remote),
+    );
     log::info!(
         "spawn GLM5.2 rank workers cost {:.2}s: ranks={}",
         spawn_started.elapsed().as_secs_f64(),
@@ -1246,6 +1249,75 @@ fn load_rank_weights_to_gpu(
             free_vram_bytes: rank_free_vram_bytes,
         },
     })
+}
+
+/// Connect all remote rank-hosts concurrently while preserving the global
+/// rank order declared by `--rank-hosts`.
+///
+/// A rank-host handshake includes manifest parsing and worker creation on the
+/// remote node. These operations are independent across hosts, so serializing
+/// them makes wide-EP startup grow linearly with the number of trays. The
+/// scoped threads keep the borrowed model path valid and guarantee that all
+/// in-flight handshakes have finished before an error is returned. Dropping
+/// successful worker vectors on an error closes their shared connections.
+fn connect_rank_hosts(
+    hosts: &[Glm52RankHostSpec],
+    model_path: &Path,
+    moe_topo: Glm52MoeTopo,
+    first_remote_rank: usize,
+) -> Result<Vec<Glm52RemoteRankWorker>> {
+    let spans = rank_host_spans(first_remote_rank, hosts);
+    let results = std::thread::scope(|scope| {
+        let handles = spans
+            .iter()
+            .map(|&(host_index, first_rank, rank_count)| {
+                let host = &hosts[host_index];
+                scope.spawn(move || {
+                    Glm52RemoteNode::connect(
+                        &host.addr,
+                        model_path,
+                        moe_topo,
+                        first_rank,
+                        rank_count,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .enumerate()
+            .map(|(index, handle)| {
+                handle
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("GLM5.2 rank-host thread panicked: {index}"))?
+            })
+            .collect::<Vec<_>>()
+    });
+
+    let mut workers = Vec::with_capacity(spans.iter().map(|span| span.2).sum());
+    for (span, result) in spans.iter().zip(results) {
+        let host = &hosts[span.0];
+        let remote = result.with_context(|| format!("connect GLM5.2 rank-host {}", host.addr))?;
+        workers.extend(remote);
+    }
+    Ok(workers)
+}
+
+/// Return `(host index, first global rank, rank count)` in CLI order.
+fn rank_host_spans(
+    first_remote_rank: usize,
+    hosts: &[Glm52RankHostSpec],
+) -> Vec<(usize, usize, usize)> {
+    let mut next_rank = first_remote_rank;
+    hosts
+        .iter()
+        .enumerate()
+        .map(|(host_index, host)| {
+            let span = (host_index, next_rank, host.ranks);
+            next_rank += host.ranks;
+            span
+        })
+        .collect()
 }
 
 fn format_bytes(values: &[usize]) -> Vec<String> {
@@ -1331,5 +1403,38 @@ mod max_model_len_tests {
     fn requested_cap_below_the_minimum_fails() {
         derive_max_model_len(Some(1024), free_for(100_032, false), false)
             .expect_err("sub-minimum cap must fail");
+    }
+}
+
+#[cfg(test)]
+mod rank_host_startup_tests {
+    use super::*;
+
+    #[test]
+    fn rank_host_spans_keep_cli_order_and_contiguous_global_ranks() {
+        let hosts = vec![
+            Glm52RankHostSpec {
+                addr: "tray-a:19000".to_string(),
+                ranks: 4,
+            },
+            Glm52RankHostSpec {
+                addr: "tray-b:19000".to_string(),
+                ranks: 4,
+            },
+            Glm52RankHostSpec {
+                addr: "tray-c:19000".to_string(),
+                ranks: 8,
+            },
+        ];
+
+        assert_eq!(
+            rank_host_spans(4, &hosts),
+            vec![(0, 4, 4), (1, 8, 4), (2, 12, 8)]
+        );
+    }
+
+    #[test]
+    fn rank_host_spans_are_empty_without_remote_hosts() {
+        assert!(rank_host_spans(8, &[]).is_empty());
     }
 }
