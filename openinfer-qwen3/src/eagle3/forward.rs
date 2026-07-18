@@ -642,7 +642,7 @@ impl Eagle3DraftModel {
         Ok(())
     }
 
-    /// Autoregressive **chain** draft (v1): from the fused target boundary  
+    /// Autoregressive **chain** draft (v1): from the fused target boundary
     /// hidden (`fused_target_hidden` = `fc(last_aux_hidden_states)`) and the last
     /// committed token, draft `k` tokens one at a time — each `draft_step` produces
     /// logits, greedy-argmax picks a draft id, `d2t` maps it to the target vocab.
