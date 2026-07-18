@@ -191,7 +191,23 @@ cargo metadata --locked --no-deps --format-version 1
 
 ## Current-Source Evidence
 
-Regenerate the retained report when its profile, schema, or measurement contract changes. The current retained 2x RTX 5090 evidence completed all six host-staged/NCCL children with zero failures/timeouts and full required trace coverage. The gitignored local copy is under `artifacts/bench/dsv2-lite/<run-id>/`; aggregate SHA-256: `a7e677c63d1ce92ad0c069f83acfcc8b381e07d06bed9364ab899adecef8d317`.
+Regenerate retained reports when their profile, schema, or measurement contract changes. The gitignored local copies live under `artifacts/bench/dsv2-lite/<run-id>/`; keep public docs to artifact basenames, hashes, contract shape, and claim boundaries.
+
+### Issue #465 Retained HTTP Soak
+
+The retained #465 run used commit `2b33b02ede965beeae1eb717b801378cc31f2c93`, model revision `604d5664dddd88a0433dbae533b7fe9472482de0`, 2x RTX 5090, `prompt_words=64`, `max_tokens=64`, greedy sampling, ignore-EOS, concurrency `4,8`, `duration_s=120`, `bucket_s=60`, `num_requests=8`, and full required trace coverage. The combined report SHA-256 is `1aff1d2030d43ea372faf9828ca4dd922931870d6989aef8f93bb24e9fe154ea`.
+
+| Artifact basename | Backend | SHA-256 | Result | Boundary |
+| --- | --- | --- | --- | --- |
+| `soak_summary.json` | host-staged | `2e8c13d3257446cd2f9643fbcb74de12c77962dc62bba3d4a2e1733c49ce4517` | `completed=104`, `failed=0`, `timeouts=0`, `soak_gate.passed=true`, clean follow-up passed, combined output hash `0b465ee14dbf4ab6` | Host-staged sustained HTTP soak evidence |
+| `soak_summary.json` | NCCL | `7b2379bc818199d23c96455c43c20169d59bfd7e1343d2d86bb2428929bf3d20` | `completed=128`, `failed=0`, `timeouts=0`, `soak_gate.passed=true`, clean follow-up passed, combined output hash `24f2db9fc47acc10` | NCCL sustained HTTP soak evidence with NCCL `2.26.2`, `NCCL_IB_DISABLE=1`, `NCCL_P2P_DISABLE=1` |
+| `retained_soak_report.json` | combined | `1aff1d2030d43ea372faf9828ca4dd922931870d6989aef8f93bb24e9fe154ea` | `coverage_gate.passed=true`, `child_gates={host-staged:true,nccl:true}`, commit/model provenance consistent | Combined host-staged/NCCL #465 report |
+
+Resource and drift fields are retained for diagnosis, not hard budgets. Host-staged max device memory stayed flat in both concurrency buckets, with output-token throughput drift `-0.7%` at c4 and `-0.4%` at c8; RSS moved `+9.1%` at c4 and `-4.8%` at c8. NCCL max device memory stayed flat, with output-token throughput drift `-0.5%` at c4 and `+0.9%` at c8; RSS moved `+5.6%` at c4 and `+2.9%` at c8. The NCCL server used a conservative single-node runtime selection and reached readiness after the NCCL communicator init path completed; do not turn this row into a default-runtime speed claim.
+
+### Issue #466 Retained HTTP SLO Evidence
+
+The current retained #466 2x RTX 5090 evidence completed all six host-staged/NCCL children with zero failures/timeouts and full required trace coverage. The gitignored local copy is under `artifacts/bench/dsv2-lite/<run-id>/`; aggregate SHA-256: `a7e677c63d1ce92ad0c069f83acfcc8b381e07d06bed9364ab899adecef8d317`.
 
 ### Issue #466 Follow-Up NCCL Readiness Smoke
 

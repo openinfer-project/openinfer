@@ -1,6 +1,6 @@
 # DeepSeek-V2-Lite Serving Roadmap
 
-> **TL;DR:** DeepSeek-V2-Lite has single-node EP2 correctness, request-lifecycle reliability, direct diagnostics, and retained HTTP SLO reporting. Production readiness still requires sustained soak, bounded device KV ownership, long-prefill scheduling, and explicit deployment limits.
+> **TL;DR:** DeepSeek-V2-Lite has single-node EP2 correctness, request-lifecycle reliability, direct diagnostics, retained HTTP SLO reporting, and a retained #465 short-shape soak baseline. Production readiness still requires bounded device KV ownership, long-prefill scheduling, ratified budgets, and explicit deployment limits.
 >
 > Last touched: 2026-07
 
@@ -15,7 +15,7 @@ Evidence stays in four buckets:
 3. HTTP serving SLO: fixed `/v1/completions` contracts, tails, throughput, failures/timeouts, trace coverage, hashes, repeat spread.
 4. Soak and production readiness: sustained memory/tail drift, recovery, capacity, deployment and support limits.
 
-The first three can be green while the fourth remains open.
+The first three can be green while the fourth is only a retained baseline. A passing soak report records sustained behavior for a named contract; it does not define production budgets by itself.
 
 ## Current Gates
 
@@ -25,7 +25,7 @@ The first three can be green while the fourth remains open.
 | Direct decode attribution | Retained | `decode-attribution-gate.md` | Direct diagnostic only |
 | HTTP lifecycle reliability | Retained | `status.md`, issue #453 | Failure isolation and recovery scenarios, no long-duration claim |
 | HTTP SLO report | Retained for #466 | `benchmarking.md`, `bench_dsv2lite_http_slo.py` | Fixed host-staged/NCCL HTTP contracts retained; no soak or production claim |
-| Sustained soak | Open | issue #465 | Required before Stable promotion |
+| Sustained soak | Retained baseline for #465 | `benchmarking.md`, `bench_dsv2lite_http_soak.py` | Fixed short-shape host-staged/NCCL soak retained; drift is reported, not a ratified production budget |
 | Long-prefill scheduling | Open | issue #452 | Current long smoke records the boundary; it does not close latency work |
 | Device attention and KV | Open | issue #635 | Required for bounded device lifetime and stronger scaling |
 
@@ -34,6 +34,12 @@ The first three can be green while the fourth remains open.
 Issue #466 is an evidence and reporting milestone. It provides named DSV2-Lite profiles for short decode-heavy, mixed prompt-shape, and long-prompt smoke workloads across host-staged and NCCL. The retained JSON carries the model/backend metadata, TTFT/TPOT/ITL tails, throughput, failures/timeouts, trace coverage, output hashes, repeat spread, and an HTTP-only claim boundary.
 
 This closes the missing report layer. It does not optimize latency or throughput and does not close issue #465.
+
+## Issue #465 Position
+
+Issue #465 is the sustained evidence milestone. The retained 2026-07-18 run covered host-staged and NCCL under the fixed short-shape HTTP soak contract with zero failures/timeouts, full required trace coverage, clean follow-up recovery, output hashes, resource samples, and first/last-quartile drift fields. The NCCL row used NCCL `2.26.2` with `NCCL_IB_DISABLE=1` and `NCCL_P2P_DISABLE=1`; keep that runtime boundary attached to the evidence.
+
+This closes the first retained soak baseline. It does not set hard latency or drift budgets, does not cover long-prefill scheduling, and does not claim production readiness.
 
 ## Sequence
 
@@ -44,13 +50,13 @@ This closes the missing report layer. It does not optimize latency or throughput
 - Fail retained runs on request failures, timeouts, missing traces, or missing active/decode coverage.
 - Keep startup failures as structured artifacts instead of dropping failed cells.
 
-### 2. Close Sustained Availability
+### 2. Extend Sustained Availability
 
 Primary issue: #465.
 
-- Run host-staged and NCCL for ratified short and long durations.
-- Track first/last-quartile tails and throughput, RSS/VRAM drift, active/pending state, terminal reasons, and clean follow-up recovery.
-- Calibrate budgets from retained variance before promoting numeric thresholds to hard gates.
+- Keep the retained host-staged/NCCL short-shape soak reproducible after scheduler, frontend, trace, or backend changes.
+- Extend from the short-shape baseline into ratified long-duration and long/mixed-prompt soaks only when those contracts have explicit support limits.
+- Calibrate latency, throughput, RSS, and VRAM budgets from repeated retained variance before promoting numeric thresholds to hard gates.
 
 ### 3. Move Decode State To The Device
 
