@@ -26,7 +26,7 @@
 //! [`token_logprob_from_row`].
 
 use anyhow::{Result, anyhow, ensure};
-use cudarc::driver::CudaSlice;
+use cudarc::driver::{CudaSlice, PinnedHostSlice};
 
 use openinfer_engine::engine::TokenLogprob;
 use openinfer_kernels::ops::{
@@ -55,6 +55,13 @@ pub struct SampleScratch {
     top1_values: CudaSlice<half::bf16>,
     /// One token id per greedy row, in `row_indices` order.
     argmax_out: CudaSlice<i32>,
+    /// Pinned host landing buffer for `argmax_out`. A pageable readback here
+    /// has synchronous-copy semantics, so the step thread queues behind any
+    /// concurrent bulk copy traffic — a P/D KV-restore flood turned this
+    /// sub-ms call into a flat 23.6 ms and froze token delivery for every
+    /// active stream (#704). Pinned keeps the D2H async; the reader blocks
+    /// only on the copy's own event.
+    argmax_host: PinnedHostSlice<i32>,
     sampling: BatchSamplingScratch,
     /// Vocab width every buffer above was sized for; `select_batch` rejects a
     /// logits arena whose `hidden_dim` differs, since the sizes are baked in.
@@ -86,6 +93,12 @@ impl SampleScratch {
                 .alloc_zeros(max_rows)
                 .map_err(|e| anyhow!("SampleScratch alloc failed: {e}"))?,
             argmax_out: alloc_i32(max_rows)?,
+            // Read only after a D2H lands in it (write-combined pages start
+            // uninitialized). cudarc's alloc_pinned hardcodes write-combined
+            // memory, whose CPU reads are uncached — fine for max_rows i32s,
+            // but don't grow this buffer into anything read in a hot loop.
+            argmax_host: unsafe { ctx.ctx.alloc_pinned::<i32>(max_rows) }
+                .map_err(|e| anyhow!("SampleScratch pinned alloc failed: {e}"))?,
             sampling: BatchSamplingScratch::new(ctx, max_rows, vocab)?,
             vocab,
             max_rows,
@@ -179,11 +192,16 @@ pub fn select_batch(
             &mut scratch.top1_values,
             &mut scratch.argmax_out,
         )?;
-        let out = ctx
-            .stream
-            .clone_dtoh(&scratch.argmax_out)
+        ctx.stream
+            .memcpy_dtoh(&scratch.argmax_out, &mut scratch.argmax_host)
             .map_err(|e| anyhow!("select_batch D2H greedy tokens failed: {e}"))?;
-        ctx.sync()?;
+        // Blocks on this copy's own event — which transitively covers the
+        // argmax kernel queued before it on the same stream, so the wait is
+        // equivalent to the old full-stream sync for this path.
+        let out = scratch
+            .argmax_host
+            .as_slice()
+            .map_err(|e| anyhow!("select_batch greedy D2H sync failed: {e}"))?;
         for (k, &row) in greedy.iter().enumerate() {
             tokens[row as usize] = out[k] as u32;
         }

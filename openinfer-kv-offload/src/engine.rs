@@ -571,9 +571,11 @@ impl OffloadEngine {
             &reg.kv_stride_bytes,
             &reg.segments,
             Some(reg.block_stride_bytes.as_slice()),
-            // Direct (cuMemcpyAsync on the DMA engines) suits this path's few,
-            // large per-layer copies; the Kernel backend only wins for highly
-            // fragmented batches.
+            // Direct (cuMemcpyAsync on the DMA engines). The Kernel backend
+            // was A/B'd for the fragmented bulk-restore batches (#704) and
+            // measured WORSE for co-resident decode: its grid-strided copy
+            // kernels compete for SMs with decode kernels, stretching the
+            // stall (two ~110ms waves vs Direct's one).
             TransferMode::Direct,
             // Layer-first (false): one pegaflow layer per model layer, the
             // page-interleaved gap expressed via `block_stride_bytes` — the
