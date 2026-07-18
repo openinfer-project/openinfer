@@ -522,6 +522,7 @@ fn publish_load<E: ModelExecutor>(
         kv_total_blocks: kv_total,
         num_running_reqs,
         num_waiting_reqs,
+        spec_decode: executor.spec_decode_counters(),
     });
 }
 

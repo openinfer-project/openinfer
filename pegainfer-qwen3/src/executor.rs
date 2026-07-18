@@ -10,6 +10,7 @@ use anyhow::ensure;
 use crossbeam_channel as channel;
 use pegainfer_core::cuda_graph::CudaGraphDumpSummary;
 use pegainfer_core::engine::LoadLoraAdapterRequest;
+use pegainfer_core::engine::SpecDecodeCounters;
 use pegainfer_core::engine::TokenEvent;
 use pegainfer_core::engine::TokenLogprob;
 use pegainfer_core::engine::TokenSink;
@@ -864,6 +865,12 @@ pub(crate) trait ModelExecutor: Send {
         false
     }
 
+    /// Cumulative spec-decode acceptance counters, or `None` when no draft
+    /// model is loaded.
+    fn spec_decode_counters(&self) -> Option<SpecDecodeCounters> {
+        None
+    }
+
     /// Whether `request_id` has captured draft context and can be drafted.
     fn speculative_request_ready(&self, _request_id: RequestId) -> bool {
         false
@@ -1029,6 +1036,12 @@ pub struct Qwen3Executor {
     /// DFlash draft metadata; `Some` once a draft model is loaded into the
     /// primary lane. Speculative decoding is enabled iff this is set.
     speculative: Option<DFlashMeta>,
+    /// Cumulative acceptance counters for the DFlash path; `Some` exactly while
+    /// `speculative` is. Written in `execute_speculative_verify_impl`, read by
+    /// `publish_load`. Held on the executor rather than read back from the worker
+    /// lane, so the publish path never round-trips the worker. See
+    /// [`SpecDecodeCounters`] for why these are cumulative rather than per-step.
+    spec_decode_counters: Option<SpecDecodeCounters>,
     /// Requests whose DFlash context is captured and ready to draft. A request
     /// enters this set when its prompt finishes prefilling with captured target
     /// context, and leaves on retire or a plain (non-speculative) decode.
@@ -1252,6 +1265,7 @@ impl Qwen3Executor {
             overlap: None,
             async_prefill: None,
             speculative: None,
+            spec_decode_counters: None,
             dflash_ready_requests: HashSet::new(),
             kv_events,
             device_ordinal,
@@ -1576,6 +1590,7 @@ impl Qwen3Executor {
             overlap: None,
             async_prefill: None,
             speculative: None,
+            spec_decode_counters: None,
             dflash_ready_requests: HashSet::new(),
             // KV events are single-GPU only (asserted above); never wired here.
             kv_events: None,
@@ -1708,6 +1723,7 @@ impl Qwen3Executor {
             meta.block_size
         );
         self.set_prefix_cache_enabled(false);
+        self.spec_decode_counters = Some(SpecDecodeCounters::new(meta.num_spec_tokens));
         self.speculative = Some(meta);
         Ok(())
     }
@@ -2266,6 +2282,10 @@ impl ModelExecutor for Qwen3Executor {
 
     fn available_blocks(&self) -> usize {
         self.kv_mgr.pool().available_blocks()
+    }
+
+    fn spec_decode_counters(&self) -> Option<SpecDecodeCounters> {
+        self.spec_decode_counters
     }
 
     fn is_stop_token(&self, token_id: u32) -> bool {
@@ -3143,6 +3163,10 @@ impl Drop for Qwen3Executor {
 #[derive(Clone, Debug)]
 struct DFlashMeta {
     block_size: usize,
+    /// Max drafts proposed per verify step (`verify_span - 1`, the anchor
+    /// aside). This is the configured `K` the spec-decode metrics report as
+    /// `num_spec_tokens` and the length of their per-position acceptance vector.
+    num_spec_tokens: usize,
     /// Draft's max cacheable position; with the `block_size` in-fill headroom
     /// this caps the DFlash-effective context to `max_position_embeddings - block_size`.
     max_position_embeddings: usize,
@@ -3353,6 +3377,8 @@ impl LocalQwen3Lane {
         model.tune_gemm_algos(&self.model)?;
         let meta = DFlashMeta {
             block_size: model.block_size(),
+            // Anchor position aside, the verify span carries K proposed drafts.
+            num_spec_tokens: model.verify_span().saturating_sub(1),
             max_position_embeddings: model.max_position_embeddings(),
             target_layer_ids: model.target_layer_ids().to_vec(),
         };

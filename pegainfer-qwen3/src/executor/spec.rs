@@ -136,6 +136,20 @@ impl Qwen3Executor {
             self.save_sealed_blocks(req_result.request_id);
         }
 
+        // Fold this fully-committed step into the cumulative spec-decode
+        // counters the scheduler republishes for the frontend. Reached only
+        // after every request's KV is applied, so a rolled-back verify never
+        // inflates the totals. `span_len - 1` is the K drafts proposed (the
+        // span leads with the confirmed anchor token); `matched_draft_tokens`
+        // is how many the target accepted before its bonus token. The two
+        // slices are already id-aligned by the checks above.
+        if let Some(counters) = self.spec_decode_counters.as_mut() {
+            for (req, req_result) in plan.requests.iter().zip(&result.requests) {
+                let num_draft_tokens = req.as_slice().len().saturating_sub(1);
+                counters.observe_draft(num_draft_tokens, req_result.matched_draft_tokens);
+            }
+        }
+
         Ok(result)
     }
 

@@ -19,8 +19,10 @@ use pegainfer_engine::engine::EngineHandle;
 use pegainfer_engine::engine::FinishReason;
 use pegainfer_engine::engine::GenerateRequest;
 use pegainfer_engine::engine::LoadSnapshot;
+use pegainfer_engine::engine::MAX_SPEC_TOKENS;
 use pegainfer_engine::engine::RequestAbortReason;
 use pegainfer_engine::engine::RequestTag;
+use pegainfer_engine::engine::SpecDecodeCounters;
 use pegainfer_engine::engine::TokenEvent;
 use pegainfer_engine::engine::TokenSink;
 use pegainfer_engine::engine::TokenStreamReceiver;
@@ -46,6 +48,7 @@ use vllm_engine_core_client::protocol::request::EngineCoreRequest;
 use vllm_engine_core_client::protocol::request::EngineCoreRequestType;
 use vllm_engine_core_client::protocol::stats::PrefillStats;
 use vllm_engine_core_client::protocol::stats::SchedulerStats;
+use vllm_engine_core_client::protocol::stats::SpecDecodingStats;
 use vllm_engine_core_client::protocol::utility::UtilityCallId;
 use vllm_engine_core_client::protocol::utility::UtilityOutput;
 use vllm_engine_core_client::protocol::utility::UtilityResultEnvelope;
@@ -659,6 +662,34 @@ fn stop_sentinel_id(eos_token_id: Option<u32>, stop_token_ids: &[u32]) -> Option
     eos_token_id.or_else(|| stop_token_ids.first().copied())
 }
 
+/// Per-interval spec-decode delta from two cumulative snapshots, in the wire
+/// shape the frontend increments its `vllm:spec_decode_*_total` counters by (see
+/// [`SpecDecodeCounters`] for why the transport carries totals and the wire
+/// carries deltas).
+///
+/// `num_spec_tokens` is the drafter's `K`, not a counter, so it passes through
+/// undiffed; it also bounds the per-position slice, keeping the emitted vector —
+/// and therefore the frontend's `position` label set — stable across publishes.
+/// Saturating subtraction is defensive: the scheduler's totals only ever grow,
+/// so a non-monotone diff would be a bug, not an underflow to wrap.
+fn spec_decode_delta(last: &SpecDecodeCounters, cur: &SpecDecodeCounters) -> SpecDecodingStats {
+    let width = (cur.num_spec_tokens as usize).min(MAX_SPEC_TOKENS);
+    let num_accepted_tokens_per_pos = cur.num_accepted_tokens_per_pos[..width]
+        .iter()
+        .zip(&last.num_accepted_tokens_per_pos)
+        .map(|(cur_pos, last_pos)| cur_pos.saturating_sub(*last_pos))
+        .collect();
+    SpecDecodingStats {
+        num_spec_tokens: cur.num_spec_tokens,
+        num_drafts: cur.num_drafts.saturating_sub(last.num_drafts),
+        num_draft_tokens: cur.num_draft_tokens.saturating_sub(last.num_draft_tokens),
+        num_accepted_tokens: cur
+            .num_accepted_tokens
+            .saturating_sub(last.num_accepted_tokens),
+        num_accepted_tokens_per_pos,
+    }
+}
+
 /// Forward every scheduler load snapshot as a stats-only output batch; the
 /// frontend records it into the shared Prometheus registry. Sends the current
 /// snapshot up front so the gauges initialize before the first step, then one
@@ -671,8 +702,28 @@ async fn publish_scheduler_stats(
     output_tx: mpsc::UnboundedSender<EngineCoreOutputs>,
     shutdown: CancellationToken,
 ) -> Result<()> {
+    // Totals we last turned into a wire delta. Persists across the loop so no
+    // accepted token is dropped or double-counted when the watch coalesces
+    // several scheduler steps into one wake.
+    let mut last_spec = SpecDecodeCounters::default();
     loop {
         let snapshot = *load_rx.borrow_and_update();
+        let spec_decoding_stats = if let Some(cur) = &snapshot.spec_decode {
+            let delta = spec_decode_delta(&last_spec, cur);
+            last_spec = *cur;
+            // Attach only on intervals that actually drafted, matching vLLM's own
+            // scheduler (which leaves the field `None` on plain steps); an
+            // all-zero delta would spam NaN acceptance-rate logs. Dropping it
+            // loses nothing: every counter moves only inside `observe_draft`, so
+            // a zero `num_drafts` delta means nothing else moved either.
+            (delta.num_drafts > 0).then_some(delta)
+        } else {
+            // No drafter (or one that just went away): forget the totals so a
+            // drafter loaded later starts its diff from zero instead of being
+            // saturated away against a stale high-water mark.
+            last_spec = SpecDecodeCounters::default();
+            None
+        };
         let stats = SchedulerStats {
             num_running_reqs: snapshot.num_running_reqs,
             num_waiting_reqs: snapshot.num_waiting_reqs,
@@ -681,6 +732,7 @@ async fn publish_scheduler_stats(
             } else {
                 snapshot.kv_used_blocks as f64 / snapshot.kv_total_blocks as f64
             },
+            spec_decoding_stats,
             ..SchedulerStats::default()
         };
         let outputs = RequestBatchOutputs {
