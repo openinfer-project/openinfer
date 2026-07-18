@@ -10,8 +10,8 @@ mod traced;
 
 pub use attention::{
     paged_attention_batch_decode_hd256_into, paged_attention_batch_decode_into,
-    paged_attention_batch_decode_split_kv_into,
-    paged_attention_batch_decode_via_prefill_hd256_into, prefill_attention_paged_into,
+    paged_attention_batch_decode_split_kv_into, paged_attention_batch_prefill_hd256_into,
+    prefill_attention_paged_into,
 };
 pub use openinfer_kernels::ops::{
     GEMM_LT_MAX_N, LoraDecodeGroupedProjection, SUPPORTED_GQA_GROUP_SIZES,

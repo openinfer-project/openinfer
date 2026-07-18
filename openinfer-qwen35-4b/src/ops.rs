@@ -2,9 +2,10 @@
 
 pub(crate) use openinfer_core::ops::PrefillPagedPlan;
 pub(crate) use openinfer_core::ops::{
-    GEMM_LT_MAX_N, add_batch, add_batch_into, embedding_batch, extract_vec, gemm, gemm_into,
-    gemm_lt_tune, gemm_rows_into_checked, paged_attention_batch_decode_hd256_into,
-    paged_attention_batch_decode_via_prefill_hd256_into,
+    GEMM_LT_MAX_N, add_batch, add_batch_into, copy_hidden_token_range_into, embedding_batch,
+    extract_vec, extract_vec_into, gemm, gemm_into, gemm_into_checked, gemm_lt_tune,
+    gemm_rows_into_checked, paged_attention_batch_decode_hd256_into,
+    paged_attention_batch_decode_via_prefill_hd256_into, paged_attention_batch_prefill_hd256_into,
     qk_norm_partial_rope_batched_decode_hd256_into, rms_norm_gated_batch_into,
     silu_mul_fused_batch_into, write_vec_into,
 };

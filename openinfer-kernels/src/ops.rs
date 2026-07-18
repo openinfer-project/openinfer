@@ -19,10 +19,10 @@ mod sampling;
 pub use attention::{
     PrefillPagedPlan, SUPPORTED_GQA_GROUP_SIZES, dflash_qk_norm_rope_into, eagle3_rope_into,
     paged_attention_batch_decode_hd256_into, paged_attention_batch_decode_into,
-    paged_attention_batch_decode_split_kv_into,
-    paged_attention_batch_decode_via_prefill_hd256_into, prefill_attention_paged_into,
-    qk_norm_partial_rope_batched_decode_hd256_into, qk_norm_rope_batch_decode_into,
-    single_decode_nhd_into, single_prefill_nhd_causal_into, single_prefill_nhd_noncausal_into,
+    paged_attention_batch_decode_split_kv_into, paged_attention_batch_prefill_hd256_into,
+    prefill_attention_paged_into, qk_norm_partial_rope_batched_decode_hd256_into,
+    qk_norm_rope_batch_decode_into, single_decode_nhd_into, single_prefill_nhd_causal_into,
+    single_prefill_nhd_noncausal_into,
 };
 #[cfg(feature = "moe")]
 pub use deepep::{
@@ -59,7 +59,7 @@ pub use linear::{
     gemm_lt_pin_into_checked, gemm_lt_pin_tune, gemm_lt_pin_warmup, gemm_lt_tune, gemm_per_token,
     gemm_per_token_into_checked, gemm_rows_into, gemm_rows_into_checked, gemm_strided_batched_bf16,
     gemm_token_range_into_checked, gemv, linear, numeric_policy, per_token_served, pin_served,
-    reset_numeric_policy_counters, set_numeric_policy,
+    reset_numeric_policy_counters, set_numeric_policy, with_gemm_lt_disabled,
 };
 pub use lora::{
     LoraDecodeGroupedProjection, lora_decode_fused_delta_group3_into, lora_decode_fused_delta_into,
