@@ -1051,6 +1051,23 @@ def load_summary(path: Path) -> dict[str, Any]:
     return report
 
 
+def combined_contract_document(summary: dict[str, Any]) -> str:
+    contract = summary.get("contract") or {}
+    workload = summary.get("workload") or {}
+    comparable_contract = {
+        "contract": {
+            "name": contract.get("name"),
+            "description": contract.get("description"),
+            "required_trace_coverage_ratio": contract.get(
+                "required_trace_coverage_ratio"
+            ),
+            "claim_boundary": contract.get("claim_boundary"),
+        },
+        "workload": workload,
+    }
+    return json.dumps(comparable_contract, sort_keys=True, separators=(",", ":"))
+
+
 def build_combined_report(
     model: str, summaries: list[tuple[Path, dict[str, Any]]]
 ) -> dict[str, Any]:
@@ -1101,6 +1118,14 @@ def build_combined_report(
         and len(provenance_documents) == len(found)
         and bool(provenance_documents)
     )
+    contract_documents = [
+        combined_contract_document(summary) for _, summary in ordered
+    ]
+    contract_consistent = (
+        len(set(contract_documents)) == 1
+        and len(contract_documents) == len(found)
+        and bool(contract_documents)
+    )
     child_gates = {
         backend: (summary.get("soak_gate") or {}).get("passed") is True
         for backend, (_path, summary) in found.items()
@@ -1131,6 +1156,7 @@ def build_combined_report(
         and all(child_gates.values())
         and commit_consistent
         and provenance_consistent
+        and contract_consistent
         and runtime_boundaries_present
     )
     return {
@@ -1146,6 +1172,9 @@ def build_combined_report(
             "provenance": json.loads(provenance_documents[0])
             if provenance_consistent
             else None,
+            "contract": json.loads(contract_documents[0])
+            if contract_consistent
+            else None,
             "runtime_boundaries": runtime_boundaries,
         },
         "coverage_gate": {
@@ -1158,6 +1187,7 @@ def build_combined_report(
             "child_gates": child_gates,
             "commit_consistent": commit_consistent,
             "provenance_consistent": provenance_consistent,
+            "contract_consistent": contract_consistent,
             "runtime_boundaries_present": runtime_boundaries_present,
             "missing_runtime_boundaries": missing_runtime_boundaries,
         },

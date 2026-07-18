@@ -451,6 +451,20 @@ class BenchDsv2LiteHttpSoakTests(unittest.TestCase):
         self.assertFalse(report["coverage_gate"]["passed"])
         self.assertFalse(report["coverage_gate"]["provenance_consistent"])
 
+    def test_combined_report_rejects_workload_drift(self) -> None:
+        host = passing_summary()
+        nccl = passing_summary(backend="nccl", runtime="NCCL 2.26.2")
+        nccl = copy.deepcopy(nccl)
+        nccl["workload"]["duration_s"] = 120.0
+
+        report = bench_dsv2lite_http_soak.build_combined_report(
+            "DeepSeek-V2-Lite", [(Path("host.json"), host), (Path("nccl.json"), nccl)]
+        )
+
+        self.assertFalse(report["coverage_gate"]["passed"])
+        self.assertFalse(report["coverage_gate"]["contract_consistent"])
+        self.assertIsNone(report["metadata"]["contract"])
+
     def test_combined_report_rejects_missing_runtime_boundary(self) -> None:
         host = passing_summary()
         nccl = passing_summary(backend="nccl", runtime="NCCL 2.26.2")
