@@ -148,8 +148,8 @@ impl Eagle3DraftModel {
         })
     }
 
-    /// hidden state fuser for test
-    pub(crate) fn seed_hidden_from_context(
+    /// Fuse the draft's input hidden from target context features (test helper).
+    pub(crate) fn fuse_input_hidden_from_context(
         &self,
         ctx: &DeviceContext,
         context_features: &HiddenStates,
@@ -163,7 +163,7 @@ impl Eagle3DraftModel {
         );
         anyhow::ensure!(
             context_features.seq_len == 1,
-            "EAGLE-3 seed expects one position, got {}",
+            "EAGLE-3 input-hidden fuse expects one position, got {}",
             context_features.seq_len
         );
         self.ensure_scratch_geometry(scratch)?;
@@ -371,7 +371,7 @@ impl Eagle3DraftModel {
     ///
     /// NOTE: the returned `(logits, last_hidden)` is not consumed yet — the current
     /// callers only need the KV/boundary side effects. It is reserved for the
-    /// scheduler PR that drives prompt prefill (first-token logits / chain seed).
+    /// scheduler PR that drives prompt prefill (first-token logits / chain input hidden).
     pub(crate) fn prefill_batched(
         &self,
         target: &Qwen3Model,
@@ -422,7 +422,7 @@ impl Eagle3DraftModel {
         target.get_embeddings_batch_into(&token_ids_d, &mut embed)?;
 
         // 2. Residual stream = fc(per-position target features) — teacher forcing.
-        //    (draft_step gets this seeded in `scratch.hidden` instead.)
+        //    (draft_step gets this as the input hidden in `scratch.hidden` instead.)
         let mut residual = HiddenStates::zeros(ctx, hidden, num_tokens)?;
         ops::gemm_into(ctx, &self.fc, features, &mut residual);
 
@@ -576,7 +576,7 @@ impl Eagle3DraftModel {
         let mut logits = HiddenStates::zeros(ctx, self.config.draft_vocab_size, num_tokens)?;
         ops::gemm_into(ctx, &self.lm_head, &normed_final, &mut logits);
 
-        // 14. The last position's decoder output (post-mlp residual) seeds the chain.
+        // 14. The last position's decoder output (post-mlp residual) is the chain's input hidden.
         let mut last_hidden = HiddenStates::zeros(ctx, hidden, 1)?;
         ops::copy_hidden_token_range_into(ctx, &residual, num_tokens - 1, &mut last_hidden, 0, 1)?;
 
@@ -642,17 +642,16 @@ impl Eagle3DraftModel {
         Ok(())
     }
 
-    /// Autoregressive **chain** draft (v1, top-1): from the fused target boundary
+    /// Autoregressive **chain** draft (v1): from the fused target boundary  
     /// hidden (`fused_target_hidden` = `fc(last_aux_hidden_states)`) and the last
     /// committed token, draft `k` tokens one at a time — each `draft_step` produces
-    /// logits, greedy-argmax picks a draft id,
-    /// `d2t` maps it to the target vocab, and that token feeds the next step while
-    /// the residual stream carries forward. Returns the `k` drafted target-vocab
-    /// tokens (the tail of the verify span `[last_token, draft_1, …, draft_k]`).
+    /// logits, greedy-argmax picks a draft id, `d2t` maps it to the target vocab.
     ///
-    /// `start_position` must equal `state.cached_len` (drafting continues the KV).
-    /// v1 syncs logits to host per step for the argmax; device-side sampling (à la
-    /// DFlash `select_step_tokens`) is a perf follow-up, as is tree drafting.
+    /// The drafted token feeds the next step while the drafter's own hidden state
+    /// (the residual stream) is updated in place and carried into the next step.
+    ///
+    /// Next Step: v1 syncs logits to host per step for the argmax; device-side sampling (à la
+    /// DFlash `select_step_tokens`) is a perf follow-up.
     pub(crate) fn draft_chain(
         &self,
         target: &Qwen3Model,
@@ -669,7 +668,6 @@ impl Eagle3DraftModel {
                 && fused_target_hidden.seq_len == 1,
             "EAGLE-3 fused_target_hidden must be [hidden, 1]"
         );
-        // Fail before writing any speculative KV rather than mid-chain in `draft_step`.
         anyhow::ensure!(
             start_position + k <= state.max_cache_len,
             "EAGLE-3 draft chain [{}, {}) overflows cache {}",
@@ -679,7 +677,7 @@ impl Eagle3DraftModel {
         );
         let ctx = target.device_ctx();
 
-        // Seed the residual stream with the fused target boundary hidden.
+        // Initialize the residual stream with the fused target boundary hidden.
         ops::copy_hidden_token_range_into(ctx, fused_target_hidden, 0, &mut scratch.hidden, 0, 1)?;
 
         let mut span = Vec::with_capacity(k);
@@ -705,16 +703,14 @@ impl Eagle3DraftModel {
         Ok(span)
     }
 
-    /// One speculative draft round for a single request: fuse the boundary feature
-    /// (`fc(last_aux_hidden_states)`) into the chain seed, draft `k` tokens, then **rewind**
-    /// the draft KV to the round-start slot so the round is side-effect-free except
-    /// for the returned tokens.
+    /// One speculative draft round for a single request: Initialize the residual stream
+    /// with the fused target boundary hidden (`fc(last_aux_hidden_states)`), draft
+    /// `k` tokens via `draft_chain`, then rewind the draft KV to the round-start
+    /// slot so the round is side-effect-free except for the returned tokens.
     ///
-    /// The chain's KV writes (slots `[C, C+k)`) are speculative; `reseed_after_verify`
+    /// The chain's KV writes (slots `[C, C+k)`) are speculative; `rebuild_after_verify`
     /// rebuilds the accepted prefix teacher-forced from the verify's captured target
-    /// hidden, so we discard them here by resetting `cached_len` to `C` (the
-    /// boundary feature is kept for the re-seed's boundary column). Returns the `k`
-    /// drafted target-vocab tokens (the verify span's tail).
+    /// hidden, so we discard them here by resetting `cached_len` to `C`.
     pub(crate) fn chain_round(
         &self,
         target: &Qwen3Model,
@@ -724,9 +720,7 @@ impl Eagle3DraftModel {
         k: usize,
     ) -> Result<Vec<u32>> {
         let ctx = target.device_ctx();
-        // Chain seed = fc(boundary target feature). Scope the immutable borrow of
-        // `state.last_aux_hidden_states` so the `&mut state` for `draft_chain` is free after.
-        let mut seed = HiddenStates::zeros(ctx, self.config.hidden_size, 1)?;
+        let mut fused_target_hidden = HiddenStates::zeros(ctx, self.config.hidden_size, 1)?;
         {
             let feature = state
                 .last_aux_hidden_states
@@ -737,29 +731,26 @@ impl Eagle3DraftModel {
                 self.fc_input_dim(),
                 "last_aux_hidden_states must be [fc_input_dim, 1]"
             );
-            ops::gemm_into(ctx, &self.fc, feature, &mut seed);
+            ops::gemm_into(ctx, &self.fc, feature, &mut fused_target_hidden);
         }
         let start = state.cached_len;
-        let result = self.draft_chain(target, state, scratch, &seed, current_token, start, k);
-        // Discard the speculative chain KV; the re-seed rebuilds the accepted
+        let result = self.draft_chain(
+            target,
+            state,
+            scratch,
+            &fused_target_hidden,
+            current_token,
+            start,
+            k,
+        );
+        // Discard the speculative chain KV; `rebuild_after_verify` rebuilds the accepted
         // prefix teacher-forced. On a draft error the request is dropped.
         state.cached_len = start;
         result
     }
 
-    /// Re-seed the chain after a verify step, applying the EAGLE feature↔token
-    /// shift. Let `pos` be the position of `span_tokens[0]` (the round's current
-    /// token) and `n = matched_draft_tokens`; the round committed `t_{pos+1..pos+n}`
-    /// (matched drafts) plus the bonus `t_{pos+n+1}`.
-    ///
-    /// To predict `t_{pos+n+2}` next, the chain needs `(f_{pos+n}, e(t_{pos+n+1}))`.
-    /// So we (1) teacher-force the `n+1` shifted pairs `(f_{pos-1+i}, t_{pos+i})` for
-    /// `i = 0..n` — features `[boundary f_{pos-1} ‖ captured f_pos..f_{pos+n-1}]`,
-    /// tokens `span_tokens[0..n+1]` — into slots `[C, C+n+1)` (`C == cached_len`,
-    /// rewound by `chain_round`), rebuilding the committed prefix's draft KV; and
-    /// (2) set the new boundary feature to `f_{pos+n} = captured[:, n]`. The
-    /// boundary `f_{pos-1}` is the previous round's `last_aux_hidden_states` (kept pre-`fc`).
-    pub(crate) fn reseed_after_verify(
+    /// Rebuild the Draft state(KV Cache and Target boundary feature) after a verify step.
+    pub(crate) fn rebuild_after_verify(
         &self,
         target: &Qwen3Model,
         state: &mut Eagle3RequestState,
@@ -772,7 +763,7 @@ impl Eagle3DraftModel {
         let len = n + 1;
         anyhow::ensure!(
             len <= span_tokens.len(),
-            "EAGLE-3 re-seed needs {} span tokens, got {}",
+            "EAGLE-3 Draft State rebuild needs {} span tokens(1 bonus+k drafts), got {}",
             len,
             span_tokens.len()
         );
@@ -782,11 +773,11 @@ impl Eagle3DraftModel {
             captured.hidden_dim,
             self.fc_input_dim()
         );
-        // Need captured columns 0..n for the matched-feature pairs plus column n
-        // for the new boundary feature.
+        // Need captured columns [pos .. pos + n - 1] for the matched-feature pairs
+        // plus pos + n for KV Cache rebuild for the new boundary target feature.
         anyhow::ensure!(
             token_offset + n < captured.seq_len,
-            "EAGLE-3 re-seed slice [{}, {}] overflows {} captured rows",
+            "EAGLE-3 KV Cache rebuild slice [{}, {}] overflows {} captured rows",
             token_offset,
             token_offset + n,
             captured.seq_len
@@ -794,13 +785,13 @@ impl Eagle3DraftModel {
         let ctx = target.device_ctx();
         let dim = self.fc_input_dim();
 
-        // Shifted feature row: [boundary f_{pos-1} ‖ f_pos..f_{pos+n-1}] = n+1 cols.
+        // Shifted feature row: [boundary f_{pos-1} ‖ f_pos..f_{pos+n-1}] = n+1 cols
         let mut feat = HiddenStates::zeros(ctx, dim, len)?;
         {
             let boundary = state
                 .last_aux_hidden_states
                 .as_ref()
-                .context("EAGLE-3 re-seed has no boundary feature")?;
+                .context("EAGLE-3 rebuild has no boundary feature")?;
             debug_assert_eq!(
                 boundary.hidden_dim, dim,
                 "last_aux_hidden_states must be [fc_input_dim, 1]"
@@ -814,8 +805,7 @@ impl Eagle3DraftModel {
         let start_position = state.cached_len;
         self.prefill_batched(target, state, &feat, &span_tokens[..len], start_position)?;
 
-        // New boundary feature = f_{pos+n} (the target feature at the last committed
-        // position), kept pre-fc for the next round.
+        // New boundary feature = f_{pos+n} (the target feature at the last committed position.
         let mut new_boundary = HiddenStates::zeros(ctx, dim, 1)?;
         ops::copy_hidden_token_range_into(
             ctx,
