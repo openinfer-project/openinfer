@@ -44,6 +44,19 @@ pub struct GdrChunkwiseScratch35 {
 
     /// Per-chunk recurrent state snapshots, fp32: [num_chunks, num_value_heads, key_dim, value_dim]
     pub chunk_state: CudaSlice<f32>,
+
+    /// FlashInfer state workspace, fp32: [1, num_value_heads, value_dim, key_dim].
+    /// This is kept separate from the decode state because the two backends
+    /// intentionally use transposed matrix layouts.
+    #[cfg(feature = "flashinfer-gdn-prefill")]
+    pub flashinfer_state: CudaSlice<f32>,
+    /// FlashInfer varlen metadata: device-side [0, seq_len] int64.
+    #[cfg(feature = "flashinfer-gdn-prefill")]
+    pub flashinfer_cu_seqlens: CudaSlice<i64>,
+    /// FlashInfer TMA descriptor workspace. The launcher uses at most the
+    /// device SM count; 256 entries covers current Blackwell parts.
+    #[cfg(feature = "flashinfer-gdn-prefill")]
+    pub flashinfer_tensormaps: CudaSlice<u8>,
 }
 
 impl GdrChunkwiseScratch35 {
@@ -91,6 +104,22 @@ impl GdrChunkwiseScratch35 {
             .alloc_zeros(num_chunks * num_value_heads * value_dim * key_dim)
             .map_err(|e| anyhow::anyhow!("Alloc chunk_state failed: {}", e))?;
 
+        #[cfg(feature = "flashinfer-gdn-prefill")]
+        let flashinfer_state: CudaSlice<f32> = ctx
+            .stream
+            .alloc_zeros(num_value_heads * value_dim * key_dim)
+            .map_err(|e| anyhow::anyhow!("Alloc FlashInfer state failed: {}", e))?;
+        #[cfg(feature = "flashinfer-gdn-prefill")]
+        let flashinfer_cu_seqlens: CudaSlice<i64> = ctx
+            .stream
+            .alloc_zeros(2)
+            .map_err(|e| anyhow::anyhow!("Alloc FlashInfer cu_seqlens failed: {}", e))?;
+        #[cfg(feature = "flashinfer-gdn-prefill")]
+        let flashinfer_tensormaps: CudaSlice<u8> = ctx
+            .stream
+            .alloc_zeros(256 * 128)
+            .map_err(|e| anyhow::anyhow!("Alloc FlashInfer tensormaps failed: {}", e))?;
+
         Ok(Self {
             g_cumsum,
             beta,
@@ -103,6 +132,12 @@ impl GdrChunkwiseScratch35 {
             u: HiddenStates::zeros(ctx, vv_hidden_dim, seq_len)?,
             v_new: HiddenStates::zeros(ctx, vv_hidden_dim, seq_len)?,
             chunk_state,
+            #[cfg(feature = "flashinfer-gdn-prefill")]
+            flashinfer_state,
+            #[cfg(feature = "flashinfer-gdn-prefill")]
+            flashinfer_cu_seqlens,
+            #[cfg(feature = "flashinfer-gdn-prefill")]
+            flashinfer_tensormaps,
         })
     }
 
@@ -166,6 +201,14 @@ impl GdrChunkwiseScratch35 {
         let peak_layer = shared_layer + full_attn_temps.max(mlp_temps);
         let per_layer_bytes = peak_layer * 2; // bf16
 
-        gdr_bytes + per_layer_bytes
+        #[cfg(feature = "flashinfer-gdn-prefill")]
+        let flashinfer_bytes =
+            num_vh * val_dim * key_dim * std::mem::size_of::<f32>()
+                + 2 * std::mem::size_of::<i64>()
+                + 256 * 128;
+        #[cfg(not(feature = "flashinfer-gdn-prefill"))]
+        let flashinfer_bytes = 0;
+
+        gdr_bytes + flashinfer_bytes + per_layer_bytes
     }
 }

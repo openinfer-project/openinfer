@@ -2,6 +2,8 @@
 #![feature(generic_const_exprs)]
 
 pub mod ffi;
+#[cfg(feature = "flashinfer-gdn-prefill")]
+pub mod flashinfer_gdn;
 pub mod forward_pass;
 pub mod gpu_buffers;
 pub mod ops;

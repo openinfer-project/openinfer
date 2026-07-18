@@ -111,6 +111,39 @@ unsafe extern "C" {
         kernel_size: i32,
         stream: CUstream,
     );
+
+    /// Convert between OpenInfer's [H,K,V] state and FlashInfer's [H,V,K]
+    /// state. The operation is out-of-place and stream ordered.
+    #[cfg(feature = "qwen35-4b")]
+    pub fn gated_delta_rule_state_transpose_cuda(
+        src: *const f32,
+        dst: *mut f32,
+        num_heads: i32,
+        key_dim: i32,
+        value_dim: i32,
+        to_flashinfer: bool,
+        stream: CUstream,
+    ) -> CUresult;
+}
+
+// The CuTe AOT generator emits this symbol only when the opt-in build
+// produced an SM120 artifact. Keeping the declaration behind the generated
+// cfg lets normal CI and unsupported architectures retain the Triton path.
+#[cfg(flashinfer_gdn_aot)]
+unsafe extern "C" {
+    pub fn openinfer_qwen35_gdn_sm120_cuda(
+        q: *const Half,
+        k: *const Half,
+        v: *const Half,
+        output: *mut Half,
+        alpha: *const f32,
+        beta: *const f32,
+        state: *mut f32,
+        tensormaps: *mut u8,
+        cu_seqlens: *const i64,
+        seq_len: i32,
+        stream: CUstream,
+    ) -> CUresult;
 }
 
 // Chunk-wise GDR prefill kernels, Triton AOT-generated at build time. The

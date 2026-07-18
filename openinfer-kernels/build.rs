@@ -1392,7 +1392,88 @@ fn compile_triton_aot_kernels(cuda_include: &Path, out_dir: &Path, sm_targets: &
     println!("cargo:rerun-if-env-changed=OPENINFER_TRITON_PYTHON");
 }
 
+fn compile_flashinfer_gdn_aot(out_dir: &Path, sm_targets: &[String]) {
+    println!("cargo:rerun-if-env-changed=OPENINFER_FLASHINFER_GDN_AOT");
+    println!("cargo:rerun-if-env-changed=OPENINFER_FLASHINFER_PYTHON");
+
+    let requested = std::env::var_os("OPENINFER_FLASHINFER_GDN_AOT").is_some();
+    if !requested {
+        println!(
+            "cargo:warning=FlashInfer SM120 GDN AOT is available but disabled; set OPENINFER_FLASHINFER_GDN_AOT=1 to generate it"
+        );
+        return;
+    }
+    if !sm_targets.iter().any(|sm| sm == "120") {
+        println!(
+            "cargo:warning=FlashInfer SM120 GDN AOT requested without an sm_120 target; retaining Triton fallback"
+        );
+        return;
+    }
+
+    let root = crate_root();
+    let python = std::env::var_os("OPENINFER_FLASHINFER_PYTHON")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("python3"));
+    let generator = root.join("tools/flashinfer/gen_qwen35_gdn_aot.py");
+    let artifact_dir = out_dir.join("flashinfer_gdn_sm120");
+    let status = Command::new(&python)
+        .arg(&generator)
+        .arg("--output-dir")
+        .arg(&artifact_dir)
+        .current_dir(&root)
+        .status()
+        .unwrap_or_else(|err| {
+            panic!(
+                "failed to run FlashInfer GDN AOT generator {} with {}: {err}",
+                generator.display(),
+                python.display()
+            )
+        });
+    assert!(
+        status.success(),
+        "FlashInfer SM120 GDN AOT generation failed; install CUDA 13+ CuTe DSL build dependencies or unset OPENINFER_FLASHINFER_GDN_AOT"
+    );
+
+    let object = artifact_dir.join("openinfer_qwen35_gdn_sm120.o");
+    let wrapper = artifact_dir.join("openinfer_qwen35_gdn_sm120_wrapper.c");
+    assert!(object.is_file(), "missing generated CuTe object {}", object.display());
+    assert!(wrapper.is_file(), "missing generated C shim {}", wrapper.display());
+
+    let mut build = cc::Build::new();
+    build
+        .file(&wrapper)
+        .object(&object)
+        .include(&artifact_dir)
+        .flag_if_supported("-std=c11")
+        .warnings(false);
+    time_phase("cc flashinfer_gdn_sm120", || {
+        build.compile("flashinfer_gdn_sm120");
+    });
+
+    let runtime_libs = artifact_dir.join("runtime_libs.txt");
+    if let Ok(contents) = fs::read_to_string(&runtime_libs) {
+        for lib in contents.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            let path = Path::new(lib);
+            if let Some(parent) = path.parent() {
+                println!("cargo:rustc-link-search=native={}", parent.display());
+            }
+            if let Some(file_name) = path.file_name().and_then(|name| name.to_str()) {
+                let name = file_name
+                    .strip_prefix("lib")
+                    .unwrap_or(file_name)
+                    .split('.')
+                    .next()
+                    .unwrap_or(file_name);
+                println!("cargo:rustc-link-lib=dylib={name}");
+            }
+        }
+    }
+    println!("cargo:rustc-cfg=flashinfer_gdn_aot");
+    println!("cargo:rerun-if-changed={}", generator.display());
+}
+
 fn main() {
+    println!("cargo:rustc-check-cfg=cfg(flashinfer_gdn_aot)");
     ensure_git_submodules_initialized(&workspace_root());
 
     let toolkit = openinfer_build::CudaToolkit::discover();
@@ -1881,6 +1962,9 @@ fn main() {
         println!(
             "cargo:warning=Qwen3.5 Triton AOT kernels disabled; enable the openinfer-kernels `qwen35-4b` feature to build them (needs Python + Triton at build time)"
         );
+    }
+    if cfg!(feature = "flashinfer-gdn-prefill") {
+        compile_flashinfer_gdn_aot(&out_dir, &sm_targets);
     }
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());

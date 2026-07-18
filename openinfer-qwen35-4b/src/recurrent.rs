@@ -419,6 +419,90 @@ fn gated_delta_rule_prefill_chunk_o_stage_into(
     Ok(())
 }
 
+#[cfg(feature = "flashinfer-gdn-prefill")]
+#[allow(clippy::too_many_arguments)]
+fn gated_delta_rule_prefill_flashinfer_into(
+    ctx: &DeviceContext,
+    scratch: &mut GdrChunkwiseScratch35,
+    state: &mut CudaSlice<f32>,
+    output: &mut HiddenStates,
+    num_value_heads: usize,
+    key_dim: usize,
+    value_dim: usize,
+) -> Result<bool> {
+    // The first generated artifact is intentionally exact to Qwen3.5-4B's
+    // expanded post-prepare shape. Unsupported variants retain Triton.
+    if num_value_heads != 32 || key_dim != 128 || value_dim != 128 {
+        return Ok(false);
+    }
+
+    ctx.stream.memcpy_htod(
+        &[0_i64, scratch.q_expanded.seq_len as i64],
+        &mut scratch.flashinfer_cu_seqlens,
+    )?;
+
+    {
+        let (state_ptr, _state_guard) = state.device_ptr(&ctx.stream);
+        let (fi_state_ptr, _fi_state_guard) =
+            scratch.flashinfer_state.device_ptr_mut(&ctx.stream);
+        openinfer_kernels::flashinfer_gdn::transpose_state(
+            state_ptr as *const f32,
+            fi_state_ptr as *mut f32,
+            num_value_heads as i32,
+            key_dim as i32,
+            value_dim as i32,
+            true,
+            ctx.stream.cu_stream(),
+        )?;
+    }
+
+    let used = {
+        let (q_ptr, _q_guard) = scratch.q_expanded.data.device_ptr(&ctx.stream);
+        let (k_ptr, _k_guard) = scratch.k_expanded.data.device_ptr(&ctx.stream);
+        let (v_ptr, _v_guard) = scratch.v_raw.data.device_ptr(&ctx.stream);
+        let (o_ptr, _o_guard) = output.data.device_ptr_mut(&ctx.stream);
+        let (g_ptr, _g_guard) = scratch.g_cumsum.device_ptr(&ctx.stream);
+        let (beta_ptr, _beta_guard) = scratch.beta.device_ptr(&ctx.stream);
+        let (fi_state_ptr, _fi_state_guard) =
+            scratch.flashinfer_state.device_ptr_mut(&ctx.stream);
+        let (tensormaps_ptr, _tensormaps_guard) =
+            scratch.flashinfer_tensormaps.device_ptr_mut(&ctx.stream);
+        let (cu_ptr, _cu_guard) = scratch.flashinfer_cu_seqlens.device_ptr(&ctx.stream);
+
+        openinfer_kernels::flashinfer_gdn::launch_prefill(
+            q_ptr as *const ffi::Half,
+            k_ptr as *const ffi::Half,
+            v_ptr as *const ffi::Half,
+            o_ptr as *mut ffi::Half,
+            g_ptr as *const f32,
+            beta_ptr as *const f32,
+            fi_state_ptr as *mut f32,
+            tensormaps_ptr as *mut u8,
+            cu_ptr as *const i64,
+            scratch.q_expanded.seq_len as i32,
+            ctx.stream.cu_stream(),
+        )?
+    };
+    if !used {
+        return Ok(false);
+    }
+
+    {
+        let (fi_state_ptr, _fi_state_guard) = scratch.flashinfer_state.device_ptr(&ctx.stream);
+        let (state_ptr, _state_guard) = state.device_ptr_mut(&ctx.stream);
+        openinfer_kernels::flashinfer_gdn::transpose_state(
+            fi_state_ptr as *const f32,
+            state_ptr as *mut f32,
+            num_value_heads as i32,
+            key_dim as i32,
+            value_dim as i32,
+            false,
+            ctx.stream.cu_stream(),
+        )?;
+    }
+    Ok(true)
+}
+
 /// Chunk-wise GDR prefill operator contract for Qwen3.5.
 ///
 /// The chunk-wise path is an explicit multi-stage operator with pre-allocated
@@ -479,6 +563,20 @@ pub fn gated_delta_rule_prefill_chunkwise_into(
         num_value_heads,
     )
     .map_err(|e| anyhow::anyhow!("GDR prefill prepare failed: {e}"))?;
+
+    #[cfg(feature = "flashinfer-gdn-prefill")]
+    if gated_delta_rule_prefill_flashinfer_into(
+        ctx,
+        scratch,
+        state,
+        output,
+        num_value_heads,
+        key_dim,
+        val_dim,
+    )? {
+        return Ok(());
+    }
+
     gated_delta_rule_prefill_chunk_cumsum_inplace(
         ctx,
         &mut scratch.g_cumsum,
