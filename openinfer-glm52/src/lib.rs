@@ -1273,7 +1273,9 @@ fn connect_rank_hosts(
             .map(|&(host_index, first_rank, rank_count)| {
                 let host = &hosts[host_index];
                 scope.spawn(move || {
-                    Glm52RemoteNode::connect(&host.addr, model_path, moe_topo, first_rank, rank_count)
+                    Glm52RemoteNode::connect(
+                        &host.addr, model_path, moe_topo, first_rank, rank_count,
+                    )
                 })
             })
             .collect::<Vec<_>>();
