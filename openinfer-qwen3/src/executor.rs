@@ -959,6 +959,10 @@ pub struct Qwen3Executor {
     /// engine was built with events on — single-GPU, no LoRA). `None` on the
     /// plain path, where the whole feed costs nothing.
     kv_events: Option<ExecutorKvEvents>,
+    /// CUDA device ordinal this executor was built on. Used by
+    /// [`enable_decode_overlap`] to create overlap streams on the correct
+    /// device (the model, KV cache, and compute stream all live here).
+    device_ordinal: usize,
 }
 
 /// Executor-side state for the opt-in KV block-event feed.
@@ -1104,6 +1108,7 @@ impl Qwen3Executor {
             )?;
             (kv_mgr, None)
         };
+        let device_ordinal = model.device_ctx().device_ordinal;
         let metadata = Qwen3ExecutorMetadata {
             block_size: budget.block_size,
             stop_token_ids: model.config().stop_token_ids.clone(),
@@ -1186,6 +1191,7 @@ impl Qwen3Executor {
             speculative: None,
             dflash_ready_requests: HashSet::new(),
             kv_events,
+            device_ordinal,
         })
     }
 
@@ -1505,6 +1511,7 @@ impl Qwen3Executor {
             dflash_ready_requests: HashSet::new(),
             // KV events are single-GPU only (asserted above); never wired here.
             kv_events: None,
+            device_ordinal: device_ordinals[0],
         })
     }
 
@@ -1579,7 +1586,7 @@ impl Qwen3Executor {
             self.workers.is_empty() || matches!(overlap, crate::DecodeOverlap::Off),
             "decode-overlap is unsupported under tensor parallelism"
         );
-        let device_ordinal = 0; // single-GPU path
+        let device_ordinal = self.device_ordinal;
         self.overlap = crate::green_ctx::OverlapStreams::create(device_ordinal, overlap)?;
         Ok(())
     }
