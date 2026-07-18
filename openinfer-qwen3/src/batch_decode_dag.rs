@@ -178,13 +178,13 @@ impl<'a> BatchDecodeDag<'a> {
         q_norm: &DeviceVec,
         k_norm: &DeviceVec,
         positions: &CudaSlice<i32>,
-    ) {
+    ) -> Result<()> {
         #[cfg(feature = "kernel-call-trace")]
         Self::record(qk_norm_rope_batch_decode_call(
             label,
             q.hidden_dim,
             k.hidden_dim,
-            q.seq_len,
+            self.batch_size,
             self.model.cos_cache.len / self.model.config.head_dim,
             self.model.local_num_attention_heads(),
             self.model.local_num_key_value_heads(),
@@ -195,6 +195,8 @@ impl<'a> BatchDecodeDag<'a> {
             &self.model.ctx,
             q,
             k,
+            0,
+            self.batch_size,
             q_norm,
             k_norm,
             &self.model.cos_cache,
@@ -204,7 +206,7 @@ impl<'a> BatchDecodeDag<'a> {
             self.model.local_num_key_value_heads(),
             self.model.config.head_dim,
             self.model.config.rms_norm_eps,
-        );
+        )
     }
 
     pub(crate) fn paged_decode_attention(
@@ -265,6 +267,7 @@ impl<'a> BatchDecodeDag<'a> {
                     &bufs.q,
                     &bufs.k,
                     &bufs.v,
+                    0,
                     self.kv_buffer,
                     &self.layout.kernel_layout(),
                     layer_idx,

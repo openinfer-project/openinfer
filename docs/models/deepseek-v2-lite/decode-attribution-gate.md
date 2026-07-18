@@ -1,8 +1,8 @@
 # DeepSeek-V2-Lite EP2 Decode Attribution Gate
 
-> **TL;DR:** The attribution gate keeps DeepSeek-V2-Lite EP2 on a narrow, repeatable shape: `prompt="Hello"`, `output_len=16`, batch `1/4/8`, host-staged and NCCL backends. Issue #278 adds a fail-closed full decode graph probe for the NCCL batch-1 decode step: readiness is true only after capture, instantiate, replay, and token verification all pass.
+> **TL;DR:** This is a direct diagnostic benchmark for a narrow DeepSeek-V2-Lite EP2 shape: `prompt="Hello"`, `output_len=16`, batch `1/4/8`, host-staged and NCCL. Its timing and graph-readiness fields do not carry an HTTP serving SLO or production-readiness claim.
 
-Last touched: 2026-06
+Last touched: 2026-07
 
 ## Scope
 
@@ -100,6 +100,8 @@ Optional diagnostics:
 
 The top-level report includes:
 
+- `schema_version`, `kind`, model, backend, commit, and hardware/toolchain metadata;
+- `workload` and `metrics`: stable direct-diagnostic contract fields;
 - `accuracy`: generated tokens/text and exact hash status;
 - `timing`: CPU-side section timing for the fixed attribution path;
 - `gpu_timing` and `by_gpu_*`: selected CUDA event sections only;

@@ -15,36 +15,26 @@ use crate::dspark::{
 };
 
 use crate::model::{GLM52_MAX_BATCH_PER_RANK, Glm52RankModel, Glm52StepKv, Glm52StepShape};
-use crate::moe_ep4::{Glm52MoeEp4State, Glm52MoeEpState};
+use crate::moe_ep_wo::{Glm52MoeEpState, Glm52MoeEpWoState};
 use crate::moe_ep8::Glm52MoeEp8State;
 use crate::moe_tp::{
     Glm52MoeTpRank, Glm52MoeTpSliceBank, Glm52MoeTpState, Glm52TpExchange, load_tp_slice_layer,
 };
 use crate::weights::{
-    GLM52_EP_RANKS, Glm52RankGpuContext, Glm52RankGpuWeights, Glm52RankLoadBundle,
-    Glm52WeightManifest, load_rank_weights_to_gpu,
+    Glm52RankGpuContext, Glm52RankGpuWeights, Glm52RankLoadBundle, Glm52WeightManifest,
+    load_rank_weights_to_gpu,
 };
 
+/// Global rank + local CUDA device of one worker. Rank bounds are enforced
+/// where placements are built, against the launch topology's real width —
+/// there is no per-width invariant here.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Glm52RankPlacement {
     pub(crate) rank: usize,
     pub(crate) device_ordinal: usize,
 }
 
-impl Glm52RankPlacement {
-    pub(crate) fn new(rank: usize, device_ordinal: usize) -> Result<Self> {
-        ensure!(
-            rank < GLM52_EP_RANKS,
-            "GLM5.2 rank must be < {GLM52_EP_RANKS}, got {rank}"
-        );
-        Ok(Self {
-            rank,
-            device_ordinal,
-        })
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Glm52RankWeightLoadReport {
     pub(crate) rank: usize,
     pub(crate) loaded_tensor_count: usize,
@@ -59,7 +49,7 @@ pub(crate) struct Glm52RankWeightLoadReport {
 /// The coordinator's launch-ahead directives for one step — both are GLOBAL
 /// claims (a speculative replay is a full set of collectives, so ranks must
 /// act on them together or not at all).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Glm52StepFlags {
     /// This step IS the speculative replay every rank enqueued last step.
     pub(crate) consume: bool,
@@ -86,7 +76,7 @@ impl Glm52StepFlags {
 /// token lands at — a seeded request's philox seed mixes it, so its tokens
 /// replay independently of batch composition AND of how many rows rode each
 /// speculative round (spec and plain produce the same seeded stream).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Glm52RowSample {
     pub(crate) row: usize,
     pub(crate) params: openinfer_sample::SamplingParams,
@@ -165,6 +155,15 @@ enum Glm52RankCommand {
         proposals: Vec<(usize, u32, usize)>,
         resp: Sender<Result<Vec<[u32; GLM52_DSPARK_DRAFTS]>>>,
     },
+    /// Rank-local, vLLM-compat P/D only: deinterleave the RoPE dims of pages
+    /// just restored from a vLLM-written namespace (see
+    /// glm52_vllm_rope_fixup.cu). Sent after the pegaflow H2D completed and
+    /// before the pages become readable; command-queue FIFO plus same-stream
+    /// launch order the rewrite before any subsequent Step kernels.
+    VllmRopeFixup {
+        pages: Vec<i32>,
+        resp: Sender<Result<()>>,
+    },
     /// Rank-local inspection of an already pre-captured whole-step graph.
     /// This command stays on the worker so CUDA graph handles never cross the
     /// thread/context ownership boundary.
@@ -216,6 +215,20 @@ impl Glm52RankWorker {
             tx,
             handle: Some(handle),
         })
+    }
+
+    /// Deinterleave vLLM-restored RoPE dims at an idle step boundary.
+    pub(crate) fn vllm_rope_fixup(&self, pages: Vec<i32>) -> Result<()> {
+        let (resp_tx, resp_rx) = bounded(1);
+        self.tx
+            .send(Glm52RankCommand::VllmRopeFixup {
+                pages,
+                resp: resp_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("GLM5.2 rank worker channel closed"))?;
+        resp_rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("GLM5.2 rank worker dropped its fixup response"))?
     }
 
     pub(crate) fn load_weights_async(
@@ -377,6 +390,126 @@ impl Glm52RankWorker {
 impl Drop for Glm52RankWorker {
     fn drop(&mut self) {
         let _ = self.shutdown();
+    }
+}
+
+/// One rank executor as the engine sees it: an in-process worker thread or a
+/// rank-host-side worker behind the wire. Same typed surface either way (the
+/// remote twin mirrors [`Glm52RankWorker`] method-for-method), so the
+/// coordinator and the load/build/probe paths never branch on locality.
+pub(crate) enum Glm52Worker {
+    Local(Glm52RankWorker),
+    Remote(crate::remote::Glm52RemoteRankWorker),
+}
+
+impl Glm52Worker {
+    pub(crate) fn load_weights_async(
+        &self,
+        model_path: &Path,
+        moe_topo: crate::Glm52MoeTopo,
+    ) -> Result<Receiver<Result<Glm52RankWeightLoadReport>>> {
+        match self {
+            Self::Local(worker) => worker.load_weights_async(model_path, moe_topo),
+            Self::Remote(worker) => worker.load_weights_async(model_path, moe_topo),
+        }
+    }
+
+    pub(crate) fn build_model_async(
+        &self,
+        max_model_len: usize,
+        moe_topo: crate::Glm52MoeTopo,
+        dspark_enabled: bool,
+    ) -> Result<Receiver<Result<Vec<KvArena>>>> {
+        match self {
+            Self::Local(worker) => {
+                worker.build_model_async(max_model_len, moe_topo, dspark_enabled)
+            }
+            Self::Remote(worker) => {
+                worker.build_model_async(max_model_len, moe_topo, dspark_enabled)
+            }
+        }
+    }
+
+    pub(crate) fn setup_comm_async(
+        &self,
+        unique_id: [u8; 128],
+        moe_topo: crate::Glm52MoeTopo,
+        tp_exchange: Option<Arc<Glm52TpExchange>>,
+    ) -> Result<Receiver<Result<()>>> {
+        match self {
+            Self::Local(worker) => worker.setup_comm_async(unique_id, moe_topo, tp_exchange),
+            Self::Remote(worker) => {
+                ensure!(
+                    tp_exchange.is_none(),
+                    "GLM5.2 tensor-replicated topologies are single-node"
+                );
+                worker.setup_comm_async(unique_id, moe_topo)
+            }
+        }
+    }
+
+    pub(crate) fn step_async(
+        &self,
+        inputs: [(u32, usize); GLM52_MAX_BATCH_PER_RANK],
+        shape: Glm52StepShape,
+        kv: Glm52StepKv,
+        flags: Glm52StepFlags,
+        sampling: Vec<Glm52RowSample>,
+        seed: u64,
+    ) -> Result<Receiver<Result<[u32; GLM52_MAX_BATCH_PER_RANK]>>> {
+        match self {
+            Self::Local(worker) => worker.step_async(inputs, shape, kv, flags, sampling, seed),
+            Self::Remote(worker) => worker.step_async(inputs, shape, kv, flags, sampling, seed),
+        }
+    }
+
+    pub(crate) fn load_dspark_async(&self, path: &Path) -> Result<Receiver<Result<()>>> {
+        match self {
+            Self::Local(worker) => worker.load_dspark_async(path),
+            Self::Remote(worker) => worker.load_dspark_async(path),
+        }
+    }
+
+    pub(crate) fn free_vram_async(&self) -> Result<Receiver<Result<usize>>> {
+        match self {
+            Self::Local(worker) => worker.free_vram_async(),
+            Self::Remote(worker) => worker.free_vram_async(),
+        }
+    }
+
+    pub(crate) fn draft_async(
+        &self,
+        bucket: usize,
+        resets: Vec<usize>,
+        appends: Vec<(usize, usize)>,
+        proposals: Vec<(usize, u32, usize)>,
+    ) -> Result<Receiver<Result<Vec<[u32; GLM52_DSPARK_DRAFTS]>>>> {
+        match self {
+            Self::Local(worker) => worker.draft_async(bucket, resets, appends, proposals),
+            Self::Remote(worker) => worker.draft_async(bucket, resets, appends, proposals),
+        }
+    }
+
+    pub(crate) fn dump_decode_graph_async(
+        &self,
+        bucket: usize,
+        png_path: PathBuf,
+        title: String,
+    ) -> Result<Receiver<Result<CudaGraphDumpSummary>>> {
+        match self {
+            Self::Local(worker) => worker.dump_decode_graph_async(bucket, png_path, title),
+            Self::Remote(worker) => anyhow::bail!(
+                "GLM5.2 rank {} is remote; the decode-graph dump is a local dev tool",
+                worker.rank()
+            ),
+        }
+    }
+
+    pub(crate) fn request_shutdown(&self) -> Result<()> {
+        match self {
+            Self::Local(worker) => worker.request_shutdown(),
+            Self::Remote(worker) => worker.request_shutdown(),
+        }
     }
 }
 
@@ -633,27 +766,35 @@ impl Glm52RankThreadState {
         // rank's TP setup fails below.
         runtime.tp_exchange = tp_exchange.cloned();
         if moe_topo.uses_ep_expert_bundles() {
-            // Collective: every EP rank calls this concurrently. The
-            // topology selects both the shim instantiation and the
-            // routed-expert GEMM chain.
-            runtime.ep8 = Some(match moe_topo {
-                crate::Glm52MoeTopo::Ep8 => {
-                    Glm52MoeEpState::MaskedFp8(Box::new(Glm52MoeEp8State::new(
-                        &dev_ctx,
-                        unique_id,
-                        moe_topo.expected_ep_size(),
-                        self.placement.rank,
-                    )?))
-                }
-                crate::Glm52MoeTopo::Ep4 => {
-                    Glm52MoeEpState::WeightOnly(Box::new(Glm52MoeEp4State::new(
-                        &dev_ctx,
-                        unique_id,
-                        moe_topo.expected_ep_size(),
-                        self.placement.rank,
-                    )?))
-                }
-                other => anyhow::bail!("GLM5.2 {other:?} is not an expert-bundle topology"),
+            // Collective: every EP rank calls this concurrently. The topology
+            // selects the shim instantiation; the device generation selects
+            // the routed-expert GEMM chain (the DeepGEMM masked chain is
+            // sm_90a-only; everything else runs the weight-only mma chain).
+            let sm_major = dev_ctx.ctx.attribute(
+                cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+            )?;
+            let ranks = moe_topo.expected_ep_size();
+            let rank = self.placement.rank;
+            runtime.ep8 = Some(match (moe_topo, sm_major) {
+                (crate::Glm52MoeTopo::Ep8, 9) => Glm52MoeEpState::MaskedFp8(Box::new(
+                    Glm52MoeEp8State::new(&dev_ctx, unique_id, ranks, rank)?,
+                )),
+                (crate::Glm52MoeTopo::Ep8, _) => Glm52MoeEpState::WeightOnlyEp8(Box::new(
+                    Glm52MoeEpWoState::new(&dev_ctx, unique_id, ranks, rank)?,
+                )),
+                (crate::Glm52MoeTopo::Ep4, _) => Glm52MoeEpState::WeightOnlyEp4(Box::new(
+                    Glm52MoeEpWoState::new(&dev_ctx, unique_id, ranks, rank)?,
+                )),
+                (crate::Glm52MoeTopo::Ep16, _) => Glm52MoeEpState::WeightOnlyEp16(Box::new(
+                    Glm52MoeEpWoState::new(&dev_ctx, unique_id, ranks, rank)?,
+                )),
+                (crate::Glm52MoeTopo::Ep32, _) => Glm52MoeEpState::WeightOnlyEp32(Box::new(
+                    Glm52MoeEpWoState::new(&dev_ctx, unique_id, ranks, rank)?,
+                )),
+                (crate::Glm52MoeTopo::Ep64, _) => Glm52MoeEpState::WeightOnlyEp64(Box::new(
+                    Glm52MoeEpWoState::new(&dev_ctx, unique_id, ranks, rank)?,
+                )),
+                (other, _) => anyhow::bail!("GLM5.2 {other:?} is not an expert-bundle topology"),
             });
         }
         if let Some(exchange) = tp_exchange {
@@ -667,9 +808,7 @@ impl Glm52RankThreadState {
             let topology = match moe_topo {
                 crate::Glm52MoeTopo::Tp8 => openinfer_kernels::ops::Glm52TpTopology::Tp8,
                 crate::Glm52MoeTopo::Tp4 => openinfer_kernels::ops::Glm52TpTopology::Tp4,
-                crate::Glm52MoeTopo::Ep8 | crate::Glm52MoeTopo::Ep4 => {
-                    anyhow::bail!("GLM5.2 {moe_topo:?} setup received a TP exchange")
-                }
+                _ => anyhow::bail!("GLM5.2 {moe_topo:?} setup received a TP exchange"),
             };
             let state = Glm52MoeTpState::new(
                 &dev_ctx,
@@ -747,6 +886,15 @@ impl Glm52RankThreadState {
         )
     }
 
+    fn vllm_rope_fixup(&mut self, pages: &[i32]) -> Result<()> {
+        let dev_ctx = self.ctx.device_context()?;
+        let runtime = self
+            .runtime
+            .as_mut()
+            .context("GLM5.2 vLLM rope fixup before build_model")?;
+        runtime.model.vllm_rope_fixup(&dev_ctx, pages)
+    }
+
     fn dump_decode_graph(
         &self,
         bucket: usize,
@@ -798,6 +946,9 @@ fn rank_worker_loop(rx: &Receiver<Glm52RankCommand>, mut state: Glm52RankThreadS
             } => {
                 let _ = resp.send(state.step(&inputs, shape, &kv, flags, &sampling, seed));
             }
+            Glm52RankCommand::VllmRopeFixup { pages, resp } => {
+                let _ = resp.send(state.vllm_rope_fixup(&pages));
+            }
             Glm52RankCommand::DumpDecodeGraph {
                 bucket,
                 png_path,
@@ -824,6 +975,17 @@ fn rank_worker_loop(rx: &Receiver<Glm52RankCommand>, mut state: Glm52RankThreadS
             Glm52RankCommand::Shutdown => break,
         }
     }
+    // Worker exit is load-bearing for the fleet (a silently gone rank hangs
+    // every peer in the next collective) — always say why the loop ended.
+    log::info!(
+        "GLM5.2 rank {} worker loop exiting ({})",
+        state.placement.rank,
+        if rx.is_empty() {
+            "shutdown or channel closed"
+        } else {
+            "channel closed with queued commands"
+        }
+    );
     // TP8 LL buffers are peer-mapped on every device, and a speculative
     // launch-ahead replay can still be in flight when Shutdown lands (harvest
     // only blocks on the argmax D2H). Quiesce this rank, then rendezvous with

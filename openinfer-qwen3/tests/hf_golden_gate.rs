@@ -185,8 +185,10 @@ fn as_i32(st: &SafeTensors, name: &str) -> (Vec<i32>, Vec<usize>) {
     assert_eq!(t.dtype(), Dtype::I32, "{name} must be i32");
     let v = t
         .data()
-        .chunks_exact(4)
-        .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| i32::from_le_bytes(*b))
         .collect();
     (v, t.shape().to_vec())
 }
@@ -197,8 +199,10 @@ fn as_f32(st: &SafeTensors, name: &str) -> Vec<f32> {
         .unwrap_or_else(|e| panic!("golden missing {name}: {e}"));
     assert_eq!(t.dtype(), Dtype::F32, "{name} must be f32");
     t.data()
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
         .collect()
 }
 

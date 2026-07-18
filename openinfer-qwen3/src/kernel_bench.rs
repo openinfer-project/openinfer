@@ -1440,6 +1440,8 @@ impl DenseCase {
                     &self.ctx,
                     q,
                     k,
+                    0,
+                    q.seq_len,
                     q_norm,
                     k_norm,
                     cos_cache,
@@ -1449,7 +1451,7 @@ impl DenseCase {
                     NUM_KV_HEADS,
                     HEAD_DIM,
                     RMS_NORM_EPS,
-                );
+                )?;
                 Ok(())
             }
             DenseBuffers::SiluMul { gate, up, out } => {

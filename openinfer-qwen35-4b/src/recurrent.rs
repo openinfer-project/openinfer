@@ -1,10 +1,12 @@
 use anyhow::Result;
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 
+use crate::config::{GDN_AOT_KEY_HEAD_DIM, GDN_AOT_VALUE_HEAD_DIM, LINEAR_CONV_MAX_KERNEL_DIM};
 use crate::ffi;
 use crate::prefill_buffers::GdrChunkwiseScratch35;
 use openinfer_core::tensor::{DeviceContext, DeviceVec, HiddenStates};
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gated_delta_rule_decode_vec_into(
     ctx: &DeviceContext,
@@ -46,32 +48,89 @@ pub(crate) fn gated_delta_rule_decode_vec_into(
     }
 }
 
-pub(crate) fn conv1d_decode_into(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gated_delta_rule_decode_batch_into(
     ctx: &DeviceContext,
-    x: &DeviceVec,
+    qkv: &HiddenStates,
+    b_proj: &HiddenStates,
+    a_proj: &HiddenStates,
+    dt_bias: &DeviceVec,
+    a_log: &CudaSlice<f32>,
+    state_ptrs: &CudaSlice<u64>,
+    output: &mut HiddenStates,
+    batch_size: usize,
+    num_key_heads: usize,
+    num_value_heads: usize,
+    key_dim: usize,
+    val_dim: usize,
+) {
+    assert_eq!(qkv.seq_len, batch_size);
+    assert_eq!(b_proj.seq_len, batch_size);
+    assert_eq!(a_proj.seq_len, batch_size);
+    assert_eq!(output.seq_len, batch_size);
+    assert_eq!(b_proj.hidden_dim, num_value_heads);
+    assert_eq!(a_proj.hidden_dim, num_value_heads);
+    assert_eq!(output.hidden_dim, num_value_heads * val_dim);
+    assert_eq!(key_dim, GDN_AOT_KEY_HEAD_DIM);
+    assert_eq!(val_dim, GDN_AOT_VALUE_HEAD_DIM);
+    assert!(state_ptrs.len() >= batch_size);
+
+    let (qkv_ptr, _gq) = qkv.data.device_ptr(&ctx.stream);
+    let (b_ptr, _gb) = b_proj.data.device_ptr(&ctx.stream);
+    let (a_ptr, _ga) = a_proj.data.device_ptr(&ctx.stream);
+    let (dt_ptr, _gdt) = dt_bias.data.device_ptr(&ctx.stream);
+    let (alog_ptr, _gal) = a_log.device_ptr(&ctx.stream);
+    let (state_ptrs, _gsp) = state_ptrs.device_ptr(&ctx.stream);
+    let (o_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+
+    unsafe {
+        ffi::gated_delta_rule_decode_batch_cuda(
+            qkv_ptr as *const ffi::Half,
+            b_ptr as *const ffi::Half,
+            a_ptr as *const ffi::Half,
+            dt_ptr as *const ffi::Half,
+            alog_ptr as *const f32,
+            state_ptrs as *const u64,
+            o_ptr as *mut ffi::Half,
+            batch_size as i32,
+            num_key_heads as i32,
+            num_value_heads as i32,
+            key_dim as i32,
+            val_dim as i32,
+            ctx.stream.cu_stream(),
+        );
+    }
+}
+
+pub(crate) fn conv1d_decode_batch_into(
+    ctx: &DeviceContext,
+    x: &HiddenStates,
     conv_weight: &DeviceVec,
-    conv_state: &mut DeviceVec,
-    out: &mut DeviceVec,
+    conv_state_ptrs: &CudaSlice<u64>,
+    out: &mut HiddenStates,
     kernel_size: usize,
 ) {
-    let num_channels = x.len;
-    assert_eq!(out.len, num_channels);
+    let batch_size = x.seq_len;
+    let num_channels = x.hidden_dim;
+    assert_eq!(out.hidden_dim, num_channels);
+    assert_eq!(out.seq_len, batch_size);
     assert_eq!(conv_weight.len, num_channels * kernel_size);
-    assert_eq!(conv_state.len, num_channels * (kernel_size - 1));
+    assert!(kernel_size <= LINEAR_CONV_MAX_KERNEL_DIM);
+    assert!(conv_state_ptrs.len() >= batch_size);
 
     let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
     let (w_ptr, _gw) = conv_weight.data.device_ptr(&ctx.stream);
-    let (s_ptr, _gs) = conv_state.data.device_ptr_mut(&ctx.stream);
+    let (s_ptrs, _gs) = conv_state_ptrs.device_ptr(&ctx.stream);
     let (o_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
 
     unsafe {
-        ffi::conv1d_prefill_cuda(
+        ffi::conv1d_decode_batch_cuda(
             x_ptr as *const ffi::Half,
             w_ptr as *const ffi::Half,
-            s_ptr as *mut ffi::Half,
+            s_ptrs as *const u64,
             o_ptr as *mut ffi::Half,
             num_channels as i32,
-            1i32,
+            batch_size as i32,
             kernel_size as i32,
             ctx.stream.cu_stream(),
         );
@@ -418,13 +477,15 @@ pub fn gated_delta_rule_prefill_chunkwise_into(
         &mut scratch.beta,
         num_key_heads,
         num_value_heads,
-    )?;
+    )
+    .map_err(|e| anyhow::anyhow!("GDR prefill prepare failed: {e}"))?;
     gated_delta_rule_prefill_chunk_cumsum_inplace(
         ctx,
         &mut scratch.g_cumsum,
         qkv.seq_len,
         num_value_heads,
-    )?;
+    )
+    .map_err(|e| anyhow::anyhow!("GDR prefill cumsum failed: {e}"))?;
     gated_delta_rule_prefill_chunk_a_into(
         ctx,
         &scratch.k_expanded,
@@ -432,14 +493,16 @@ pub fn gated_delta_rule_prefill_chunkwise_into(
         &scratch.beta,
         &mut scratch.a_tril,
         num_value_heads,
-    )?;
+    )
+    .map_err(|e| anyhow::anyhow!("GDR prefill A stage failed: {e}"))?;
     gated_delta_rule_prefill_chunk_solve_into(
         ctx,
         &scratch.a_tril,
         &mut scratch.a_inv,
         qkv.seq_len,
         num_value_heads,
-    )?;
+    )
+    .map_err(|e| anyhow::anyhow!("GDR prefill solve failed: {e}"))?;
     gated_delta_rule_prefill_chunk_recompute_into(
         ctx,
         &scratch.k_expanded,
@@ -450,7 +513,8 @@ pub fn gated_delta_rule_prefill_chunkwise_into(
         &scratch.a_inv,
         &scratch.g_cumsum,
         num_value_heads,
-    )?;
+    )
+    .map_err(|e| anyhow::anyhow!("GDR prefill recompute failed: {e}"))?;
     gated_delta_rule_prefill_chunk_state_stage_into(
         ctx,
         &scratch.k_expanded,
@@ -461,7 +525,8 @@ pub fn gated_delta_rule_prefill_chunkwise_into(
         &mut scratch.chunk_state,
         &mut scratch.v_new,
         num_value_heads,
-    )?;
+    )
+    .map_err(|e| anyhow::anyhow!("GDR prefill state stage failed: {e}"))?;
     gated_delta_rule_prefill_chunk_o_stage_into(
         ctx,
         &scratch.q_expanded,
@@ -473,16 +538,18 @@ pub fn gated_delta_rule_prefill_chunkwise_into(
         num_value_heads,
         1.0 / (key_dim as f32).sqrt(),
     )
+    .map_err(|e| anyhow::anyhow!("GDR prefill output stage failed: {e}"))
 }
 
 #[cfg(test)]
 mod tests {
     use anyhow::Result;
+    use cudarc::driver::DevicePtrMut;
     use half::bf16;
 
     use super::{
-        conv1d_prefill_batch_into, gated_delta_rule_decode_vec_into,
-        gated_delta_rule_prefill_chunkwise_into,
+        conv1d_prefill_batch_into, gated_delta_rule_decode_batch_into,
+        gated_delta_rule_decode_vec_into, gated_delta_rule_prefill_chunkwise_into,
     };
     use crate::prefill_buffers::GdrChunkwiseScratch35;
     use openinfer_core::tensor::{DeviceContext, DeviceVec, HiddenStates};
@@ -625,6 +692,150 @@ mod tests {
 
         assert!(max_out_diff < 0.02, "output diff {max_out_diff}");
         assert!(max_state_diff < 0.02, "state diff {max_state_diff}");
+        Ok(())
+    }
+
+    #[test]
+    fn gdr_decode_batch_matches_single_slot_reference() -> Result<()> {
+        let ctx = DeviceContext::new()?;
+        let batch_size = 3usize;
+        let num_key_heads = 16usize;
+        let num_value_heads = 48usize;
+        let key_dim = 128usize;
+        let val_dim = 128usize;
+
+        let qkv_dim = 2 * num_key_heads * key_dim + num_value_heads * val_dim;
+        let out_dim = num_value_heads * val_dim;
+        let state_len = num_value_heads * key_dim * val_dim;
+
+        let qkv_host = bf16_vec(
+            &(0..batch_size * qkv_dim)
+                .map(|i| ((i % 89) as f32 - 44.0) * 0.0078125)
+                .collect::<Vec<_>>(),
+        );
+        let b_host = bf16_vec(
+            &(0..batch_size * num_value_heads)
+                .map(|i| ((i % 11) as f32 - 5.0) * 0.03125)
+                .collect::<Vec<_>>(),
+        );
+        let a_host = bf16_vec(
+            &(0..batch_size * num_value_heads)
+                .map(|i| ((i % 13) as f32 - 6.0) * 0.03125)
+                .collect::<Vec<_>>(),
+        );
+        let dt_host = bf16_vec(
+            &(0..num_value_heads)
+                .map(|i| ((i % 7) as f32 - 3.0) * 0.0625)
+                .collect::<Vec<_>>(),
+        );
+        let alog_host: Vec<f32> = (0..num_value_heads)
+            .map(|i| ((i % 5) as f32 - 2.0) * 0.125)
+            .collect();
+
+        let qkv_batch = HiddenStates {
+            data: ctx.stream.clone_htod(&qkv_host)?,
+            hidden_dim: qkv_dim,
+            seq_len: batch_size,
+        };
+        let b_batch = HiddenStates {
+            data: ctx.stream.clone_htod(&b_host)?,
+            hidden_dim: num_value_heads,
+            seq_len: batch_size,
+        };
+        let a_batch = HiddenStates {
+            data: ctx.stream.clone_htod(&a_host)?,
+            hidden_dim: num_value_heads,
+            seq_len: batch_size,
+        };
+        let dt_bias = DeviceVec::from_host(&ctx, &dt_host)?;
+        let a_log = ctx.stream.clone_htod(&alog_host)?;
+
+        let mut batch_states: Vec<cudarc::driver::CudaSlice<f32>> = (0..batch_size)
+            .map(|_| ctx.stream.alloc_zeros(state_len))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut state_ptrs = Vec::with_capacity(batch_size);
+        for state in &mut batch_states {
+            let (ptr, _guard) = state.device_ptr_mut(&ctx.stream);
+            state_ptrs.push(ptr as u64);
+        }
+        let state_ptrs_d = ctx.stream.clone_htod(&state_ptrs)?;
+
+        let mut out_batch = HiddenStates::zeros(&ctx, out_dim, batch_size)?;
+        gated_delta_rule_decode_batch_into(
+            &ctx,
+            &qkv_batch,
+            &b_batch,
+            &a_batch,
+            &dt_bias,
+            &a_log,
+            &state_ptrs_d,
+            &mut out_batch,
+            batch_size,
+            num_key_heads,
+            num_value_heads,
+            key_dim,
+            val_dim,
+        );
+
+        let mut out_ref_rows: Vec<f32> = Vec::with_capacity(batch_size * out_dim);
+        let mut ref_states = Vec::with_capacity(batch_size);
+        for row in 0..batch_size {
+            let qkv_row =
+                DeviceVec::from_host(&ctx, &qkv_host[row * qkv_dim..(row + 1) * qkv_dim])?;
+            let b_row = DeviceVec::from_host(
+                &ctx,
+                &b_host[row * num_value_heads..(row + 1) * num_value_heads],
+            )?;
+            let a_row = DeviceVec::from_host(
+                &ctx,
+                &a_host[row * num_value_heads..(row + 1) * num_value_heads],
+            )?;
+            let mut state_ref: cudarc::driver::CudaSlice<f32> =
+                ctx.stream.alloc_zeros(state_len)?;
+            let mut out_row = DeviceVec::zeros(&ctx, out_dim)?;
+            gated_delta_rule_decode_vec_into(
+                &ctx,
+                &qkv_row,
+                &b_row,
+                &a_row,
+                &dt_bias,
+                &a_log,
+                &mut state_ref,
+                &mut out_row,
+                num_key_heads,
+                num_value_heads,
+                key_dim,
+                val_dim,
+            );
+            out_ref_rows.extend_from_slice(&out_row.to_host(&ctx)?);
+            ref_states.push(state_ref);
+        }
+
+        let out_batch_host = ctx.stream.clone_dtoh(&out_batch.data)?;
+        ctx.sync()?;
+        let out_batch_host: Vec<f32> = out_batch_host.iter().map(|x| x.to_f32()).collect();
+        let max_out_diff = out_batch_host
+            .iter()
+            .zip(out_ref_rows.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+
+        let mut max_state_diff = 0.0_f32;
+        for (batch_state, ref_state) in batch_states.iter().zip(ref_states.iter()) {
+            let batch_state_host = ctx.stream.clone_dtoh(batch_state)?;
+            let ref_state_host = ctx.stream.clone_dtoh(ref_state)?;
+            ctx.sync()?;
+            max_state_diff = max_state_diff.max(
+                batch_state_host
+                    .iter()
+                    .zip(ref_state_host.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0_f32, f32::max),
+            );
+        }
+
+        assert!(max_out_diff < 0.05, "output diff {max_out_diff}");
+        assert!(max_state_diff < 0.05, "state diff {max_state_diff}");
         Ok(())
     }
 

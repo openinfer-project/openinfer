@@ -1,5 +1,7 @@
-//! Device gate for the GLM5.2 EP4 weight-only routed-expert chain
-//! (tiles metadata + masked grouped bf16×fp8 mma GEMM + weighted SiLU).
+//! Device gate for the GLM5.2 weight-only routed-expert chain
+//! (tiles metadata + masked grouped bf16×fp8 mma GEMM + weighted SiLU),
+//! at the boundary shim shapes: EP4 (64 local experts × 32 global tokens),
+//! EP8 (32 × 64), and EP64 (4 × 512, the local-experts < topk extreme).
 //!
 //! Single GPU, no DeepEP: a synthetic psum_expert drives the tile kernel and
 //! a randomized aligned receive layout drives the GEMM/SiLU, checked against
@@ -16,12 +18,7 @@ use openinfer_kernels::ops::{
 };
 use openinfer_kernels::tensor::DeviceContext;
 
-const GROUPS: usize = 64;
 const ALIGN: usize = 64;
-/// Per-expert real row counts for the synthetic step (everything else 0).
-/// 1-row, full-tile, two-tile, and tail-expert cases.
-const COUNTS: [(usize, usize); 6] = [(0, 1), (2, 8), (3, 9), (5, 3), (31, 5), (63, 2)];
-const GLOBAL_TOKENS: usize = 32;
 const TOPK: usize = 8;
 
 /// e4m3 byte -> f32 (matches `__nv_fp8_e4m3` semantics; NaN encodings are
@@ -65,16 +62,16 @@ struct Layout {
     tiles: Vec<(usize, usize, usize)>, // (row base, expert, rows)
 }
 
-fn build_layout() -> Layout {
-    let mut counts = vec![0usize; GROUPS];
-    for &(e, c) in &COUNTS {
+fn build_layout(groups: usize, expert_counts: &[(usize, usize)]) -> Layout {
+    let mut counts = vec![0usize; groups];
+    for &(e, c) in expert_counts {
         counts[e] = c;
     }
-    let mut starts = vec![0usize; GROUPS];
-    let mut psum = vec![0i32; GROUPS];
+    let mut starts = vec![0usize; groups];
+    let mut psum = vec![0i32; groups];
     let mut cursor = 0usize;
     let mut tiles = Vec::new();
-    for e in 0..GROUPS {
+    for e in 0..groups {
         let start = if e == 0 {
             0
         } else {
@@ -100,14 +97,39 @@ fn build_layout() -> Layout {
     }
 }
 
+/// Per-expert real row counts for the synthetic step (everything else 0):
+/// 1-row, full-tile, two-tile, mid, and tail-expert cases at each shape.
 #[test]
-fn glm52_moe_ep_wo_chain_matches_host_reference() {
+fn glm52_moe_ep_wo_chain_matches_host_reference_ep4_shape() {
+    run_chain_case(64, 32, &[(0, 1), (2, 8), (3, 9), (5, 3), (31, 5), (63, 2)]);
+}
+
+/// The EP8 shim shape (32 local experts, 8 ranks x 8 slots global) — the
+/// GB300 EP8 configuration's chain runs exactly this geometry.
+#[test]
+fn glm52_moe_ep_wo_chain_matches_host_reference_ep8_shape() {
+    run_chain_case(
+        32,
+        64,
+        &[(0, 2), (1, 8), (4, 17), (13, 1), (22, 9), (31, 6)],
+    );
+}
+
+/// The EP64 shim shape (4 local experts, 64 ranks x 8 slots global): the
+/// few-experts/deep-rows extreme where local experts (4) < topk (8) — the
+/// EP16/EP32 geometries interpolate between this and the EP8 case.
+#[test]
+fn glm52_moe_ep_wo_chain_matches_host_reference_ep64_shape() {
+    run_chain_case(4, 512, &[(0, 1), (1, 9), (2, 64), (3, 3)]);
+}
+
+fn run_chain_case(groups: usize, global_tokens: usize, expert_counts: &[(usize, usize)]) {
     let Ok(ctx) = DeviceContext::new() else {
         eprintln!("skip: no CUDA device");
         return;
     };
-    let layout = build_layout();
-    let max_tiles = glm52_moe_ep_wo_max_tiles(GROUPS, GLOBAL_TOKENS, TOPK);
+    let layout = build_layout(groups, expert_counts);
+    let max_tiles = glm52_moe_ep_wo_max_tiles(groups, global_tokens, TOPK);
     assert!(layout.tiles.len() <= max_tiles);
     let expanded = layout.aligned_end;
     // m_capacity mirrors the production bound-rows math loosely; anything
@@ -123,9 +145,9 @@ fn glm52_moe_ep_wo_chain_matches_host_reference() {
     let mut count_dev = ctx.stream.alloc_zeros::<i32>(1).expect("count alloc");
     glm52_moe_ep_wo_tiles_launch(
         &ctx,
-        GROUPS,
+        groups,
         m_capacity,
-        GLOBAL_TOKENS,
+        global_tokens,
         max_tiles,
         &psum_dev,
         &mut tiles_dev,
@@ -158,12 +180,12 @@ fn glm52_moe_ep_wo_chain_matches_host_reference() {
     ] {
         let (n, k) = kind.shape();
         let weighted = kind == Glm52DeepGemmGroupedFp8Kind::W2;
-        let active: Vec<usize> = COUNTS.iter().map(|&(e, _)| e).collect();
+        let active: Vec<usize> = expert_counts.iter().map(|&(e, _)| e).collect();
         // Weight bank: random e4m3 for active experts, zeros elsewhere (the
         // kernel must only touch listed experts, and zero banks keep host
         // generation cheap).
-        let mut weight = vec![0u8; GROUPS * n * k];
-        let mut weight_scale = vec![0f32; GROUPS * (n / 128) * (k / 128)];
+        let mut weight = vec![0u8; groups * n * k];
+        let mut weight_scale = vec![0f32; groups * (n / 128) * (k / 128)];
         for &e in &active {
             let w = &mut weight[e * n * k..(e + 1) * n * k];
             for b in w.iter_mut() {
@@ -189,7 +211,7 @@ fn glm52_moe_ep_wo_chain_matches_host_reference() {
         glm52_moe_ep_wo_masked_mma_launch(
             &ctx,
             kind,
-            GROUPS,
+            groups,
             max_tiles,
             &act_dev,
             &weight_dev,
@@ -206,7 +228,7 @@ fn glm52_moe_ep_wo_chain_matches_host_reference() {
         // the kernel's scale association; the mma slot order inside a block
         // differs, so compare at bf16-rounding tolerance).
         let mut max_rel = 0f32;
-        for e in 0..GROUPS {
+        for e in 0..groups {
             for r in 0..layout.counts[e] {
                 let row = layout.starts[e] + r;
                 // Sample output columns rather than the full n for speed.
@@ -239,7 +261,7 @@ fn glm52_moe_ep_wo_chain_matches_host_reference() {
             }
             // Alignment-gap rows keep the sentinel.
             let real_end = layout.starts[e] + layout.counts[e];
-            let gap_end = if e + 1 < GROUPS {
+            let gap_end = if e + 1 < groups {
                 layout.starts[e + 1]
             } else {
                 expanded
@@ -278,7 +300,7 @@ fn glm52_moe_ep_wo_chain_matches_host_reference() {
     )
     .expect("silu launch");
     let silu_host = ctx.stream.clone_dtoh(&silu_dev).expect("silu D2H");
-    for e in 0..GROUPS {
+    for e in 0..groups {
         for r in 0..layout.counts[e] {
             let row = layout.starts[e] + r;
             for col in (0..inter).step_by(97) {
@@ -293,7 +315,7 @@ fn glm52_moe_ep_wo_chain_matches_host_reference() {
             }
         }
         let real_end = layout.starts[e] + layout.counts[e];
-        let gap_end = if e + 1 < GROUPS {
+        let gap_end = if e + 1 < groups {
             layout.starts[e + 1]
         } else {
             expanded

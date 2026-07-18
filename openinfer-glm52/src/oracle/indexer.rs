@@ -138,8 +138,10 @@ fn indexer_oracle_gate() -> Result<()> {
     // safetensors data() is a byte view into the mmap with no alignment
     // guarantee — decode per element instead of casting the pointer.
     let bf16_vec = |data: &[u8]| -> Vec<bf16> {
-        data.chunks_exact(2)
-            .map(|b| bf16::from_le_bytes([b[0], b[1]]))
+        data.as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| bf16::from_le_bytes(*b))
             .collect()
     };
 
@@ -178,8 +180,10 @@ fn indexer_oracle_gate() -> Result<()> {
         "topk size mismatch"
     );
     let topk_all: Vec<i32> = topk_data
-        .chunks_exact(4)
-        .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| i32::from_le_bytes(*b))
         .collect();
     let oracle_topk: &[i32] =
         &topk_all[position * GLM52_INDEXER_TOPK..(position + 1) * GLM52_INDEXER_TOPK];

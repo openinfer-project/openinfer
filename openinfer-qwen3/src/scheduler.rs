@@ -28,6 +28,7 @@ use openinfer_core::engine::{
     TokenEvent, TokenSink,
 };
 use openinfer_core::sampler::SamplingParams;
+use openinfer_kernels::ops::{NumericPolicy, numeric_policy};
 
 use self::effects::apply_effects;
 use self::kv_events::KvEventProducer;
@@ -107,10 +108,14 @@ impl PendingRequest {
 /// step's total forwarded tokens at `max_prefill_tokens`. Each taken request
 /// gets its per-step chunk recorded in `step_chunk`. Echo requests need
 /// logits for every prompt position in one forward, so they only run when
-/// their whole remainder fits the profiled prefill bound.
+/// their whole remainder fits the profiled prefill bound. Under request-local
+/// chunking, a request takes `min(remaining, max_prefill_tokens)` whole or skips
+/// the step, so its chunk boundaries depend only on its own length and are
+/// batch-invariant.
 fn take_prefill_chunks(
     prefilling: &mut Vec<PendingRequest>,
     max_prefill_tokens: usize,
+    request_local: bool,
 ) -> Vec<PendingRequest> {
     let mut budget = max_prefill_tokens;
     let mut taken: Vec<PendingRequest> = Vec::new();
@@ -123,6 +128,13 @@ fn take_prefill_chunks(
                 continue;
             }
             remaining
+        } else if request_local {
+            let desired = remaining.min(max_prefill_tokens);
+            if desired > budget {
+                i += 1;
+                continue;
+            }
+            desired
         } else {
             remaining.min(budget)
         };
@@ -131,8 +143,7 @@ fn take_prefill_chunks(
         budget = budget.saturating_sub(chunk);
         taken.push(req);
     }
-    // Echo skips can take items out of arrival order; results come back
-    // sorted by request id, so the step set must be too.
+    // Whole-or-skip may select later requests; sort to match request-id-ordered results.
     taken.sort_by_key(|req| req.request_id);
     taken
 }
@@ -622,7 +633,14 @@ fn scheduler_loop<E>(
         let pending = if inflight_prefill_pending.is_some() {
             Vec::new()
         } else {
-            take_prefill_chunks(&mut prefilling, max_prefill_tokens)
+            take_prefill_chunks(
+                &mut prefilling,
+                max_prefill_tokens,
+                matches!(
+                    numeric_policy(),
+                    NumericPolicy::Pin | NumericPolicy::PerToken
+                ),
+            )
         };
 
         let Some(plan) = runtime_plan(&executor, &active, pending) else {
@@ -804,7 +822,8 @@ fn scheduler_loop_with_lora_control<E>(
         }
         prefilling.extend(admission.pending);
         deferred = admission.deferred;
-        let pending = take_prefill_chunks(&mut prefilling, max_prefill_tokens);
+        // LoRA rejects --batch-invariant upstream, so Pin never runs on this path.
+        let pending = take_prefill_chunks(&mut prefilling, max_prefill_tokens, false);
 
         if active.is_empty() && pending.is_empty() {
             // A parked load must still be polled to completion before we block.

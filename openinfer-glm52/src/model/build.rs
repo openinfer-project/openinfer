@@ -13,7 +13,7 @@ use crate::dense::Glm52DenseMlpWeights;
 use crate::fp8::ProjWeight;
 use crate::indexer::Glm52IndexerLayerWeights;
 use crate::layer::{Glm52DecoderLayerWeights, Glm52LayerIndexer, Glm52LayerMlp};
-use crate::mla_decode::Glm52MlaLayerWeights;
+use crate::mla_front::Glm52MlaLayerWeights;
 use crate::moe_decode::{Glm52MoeExpertBank, Glm52MoeRouterWeights, Glm52MoeSharedExpert};
 use crate::moe_ep8::Glm52MoeEp8LayerWeights;
 use crate::weights::{Glm52RankGpuWeights, retype_owned};

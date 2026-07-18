@@ -12,7 +12,7 @@ use openinfer_core::kv_pool::KvState;
 use openinfer_core::sampler::SamplingParams;
 use openinfer_core::tensor::HiddenStates;
 
-use crate::batch_decode_graph::{BatchDecodeGraphState, MAX_BATCH};
+use crate::batch_decode_graph::BatchDecodeGraphState;
 use crate::decode_buffers::BatchDecodeBuffers35;
 use crate::logprobs::snapshot_requested_logprobs;
 use crate::recurrent_state::RecurrentState;
@@ -33,9 +33,9 @@ impl RequestId {
 
 #[derive(Clone)]
 pub struct PrefillStepItem {
-    request_id: RequestId,
-    prompt_tokens: Vec<u32>,
-    logprobs: usize,
+    pub(crate) request_id: RequestId,
+    pub(crate) prompt_tokens: Vec<u32>,
+    pub(crate) logprobs: usize,
 }
 
 impl PrefillStepItem {
@@ -50,9 +50,9 @@ impl PrefillStepItem {
 
 #[derive(Clone)]
 pub struct DecodeStepItem {
-    request_id: RequestId,
-    token_id: u32,
-    logprobs: usize,
+    pub(crate) request_id: RequestId,
+    pub(crate) token_id: u32,
+    pub(crate) logprobs: usize,
 }
 
 impl DecodeStepItem {
@@ -89,10 +89,12 @@ pub struct DecodeRequestResult {
     pub logprob: Option<TokenLogprob>,
 }
 
+#[derive(Debug)]
 pub struct PrefillResult {
     pub requests: Vec<PrefillRequestResult>,
 }
 
+#[derive(Debug)]
 pub struct DecodeResult {
     pub requests: Vec<DecodeRequestResult>,
 }
@@ -110,31 +112,10 @@ pub struct Qwen35Executor {
 }
 
 impl Qwen35Executor {
-    pub fn from_runtime(
-        model_path: &str,
-        enable_cuda_graph: bool,
-        device_ordinals: &[usize],
-    ) -> Result<Self> {
-        Self::from_runtime_with_capacity(model_path, enable_cuda_graph, device_ordinals, MAX_BATCH)
-    }
-
-    pub fn from_runtime_with_capacity(
-        model_path: &str,
-        enable_cuda_graph: bool,
-        device_ordinals: &[usize],
-        max_batch: usize,
-    ) -> Result<Self> {
-        anyhow::ensure!(
-            device_ordinals.len() == 1,
-            "Qwen3.5 logits executor supports exactly one CUDA device"
-        );
-        let model = Qwen35Model::from_safetensors_with_device_options(
-            model_path,
-            enable_cuda_graph,
-            device_ordinals[0],
-        )?;
+    pub fn from_runtime(model_path: &str, device_ordinal: usize, max_batch: usize) -> Result<Self> {
+        let model = Qwen35Model::from_safetensors(model_path, device_ordinal, max_batch)?;
         model.tune_decode_gemm_algos()?;
-        let graph_state = model.create_batch_decode_graph_state_with_capacity(max_batch)?;
+        let graph_state = model.create_batch_decode_graph_state()?;
         Ok(Self {
             model,
             graph_state,

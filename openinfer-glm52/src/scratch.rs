@@ -36,7 +36,8 @@ use crate::dspark::GLM52_DSPARK_CONTEXT_DIM;
 use crate::fp8::Glm52MlpScratch;
 use crate::indexer::Glm52IndexerScratch;
 use crate::layer::Glm52LayerScratch;
-use crate::mla_decode::{Glm52MlaAttendScratch, Glm52MlaBackend, Glm52MlaFront};
+use crate::mla_decode::{Glm52MlaAttendScratch, Glm52MlaBackend};
+use crate::mla_front::Glm52MlaFront;
 use crate::moe_decode::{GLM52_SHARED_EXPERT_INTERMEDIATE, Glm52RouterScratch};
 use crate::rows::Rows;
 

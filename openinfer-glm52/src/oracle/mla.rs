@@ -38,7 +38,8 @@ use openinfer_kernels::tensor::DeviceContext;
 
 use crate::config::{GLM52_ROPE_HALF, GLM52_SM_SCALE};
 use crate::fp8::Glm52ProjBytes;
-use crate::mla_decode::{Glm52MlaLayerWeights, Glm52MlaSchedMetadata, glm52_mla_decode_forward};
+use crate::mla_decode::{Glm52MlaSchedMetadata, glm52_mla_decode_forward};
+use crate::mla_front::Glm52MlaLayerWeights;
 use crate::model::rope_tables;
 
 // ---- BEGIN GENERATED: glm52_oracle probes ----
@@ -325,8 +326,10 @@ fn diff_against_dump(outputs: &[f32], dump: &Path) -> Result<()> {
     let oracle: Vec<f32> = st
         .tensor("o")?
         .data()
-        .chunks_exact(2)
-        .map(|c| bf16::from_le_bytes([c[0], c[1]]).to_f32())
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| bf16::from_le_bytes(*c).to_f32())
         .collect();
     ensure!(
         oracle.len() == outputs.len(),

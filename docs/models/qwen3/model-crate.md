@@ -8,6 +8,8 @@
 
 `--batch-invariant` is scoped to one process, one toolchain, and one GPU. The cuBLASLt algo is re-tuned on every boot and cached per executor thread (`thread_local`), so it does not promise stability across cuBLAS or driver versions; startup logging records the pinned `splitk` and `reduction_scheme` per `(M,K)`. The builder rejects decode-overlap, DFlash speculative decoding, LoRA, and tensor parallelism.
 
+It also **requires `--no-prefix-cache` and rejects `--kv-offload`**. A prefix hit advances a prompt's `chunk_start` off the request-local chunk grid, re-cutting its prefill chunks according to prior traffic. `--no-prefix-cache` closes that — except under offload, where it only disables HBM retention and deliberately leaves prefix *matching* on (host-tier reuse is the point of that mode), so that pair is rejected outright.
+
 ## Preparation
 
 - **Read**:

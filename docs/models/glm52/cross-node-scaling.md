@@ -1,28 +1,29 @@
 # GLM5.2 cross-node scaling: DP16 design, and the road to DP32/64
 
-> **TL;DR:** Design doc, no code — DP16 (2×8 H200) is not on the roadmap; this records the
-> full cross-node design so the discussion isn't lost. Three orthogonal planes, each with its
-> own answer: **data plane** = DeepEP v2 GIN scale-out (we already vendor the v2 elastic
-> kernels on the NCCL device API; cross-node is *unbaking* four single-node specializations in
-> the shim, not porting to NVSHMEM) — a two-node dispatch/combine microbench is the go/no-go
-> gate for everything else. **Control plane** = framed-TCP hub-and-spoke: the coordinator stays
-> the one global scheduler, remote ranks sit behind a dumb `rank-host` process, one connection
-> per node, two frame kinds (FIFO-matched `Response` + push `Event`), fail-stop, no framework.
-> **Facts plane** = node-local async facts (offload saves, P/D KV transfers) push as `Event`
-> frames the moment the owning node observes them; the coordinator keeps a ≤1-step-stale
-> mirror, which under lock-step is exactly as fresh as a local poll. DP32/64 changes no code
-> shape: the data plane re-derives per-scale constants, EPLB becomes load-bearing, blast
-> radius grows linearly, and past ~4 nodes (or single-digit-ms steps) the control plane
-> upgrades from hub-and-spoke to the replicated deterministic coordinator (SMR) design
-> preserved at the end of this doc. Supersedes `dp16-smr-coordinator.md`.
+> **TL;DR:** The control plane is SHIPPED and the NVL72 variant of the data plane is proven:
+> `feat/glm52-rank-host` implements the framed-TCP hub-and-spoke below verbatim
+> (`--rank-hosts host:port=N` on the coordinator, `--glm52-rank-host addr` for the dumb
+> rank-host), and on GB300 NVL72 the whole rack is ONE NVLink/IMEX domain, so the existing
+> single-LSA DeepEP shim works cross-tray with **no GIN un-baking at all** — live-verified
+> up to **EP32 across 8 trays**: bucket-1 solo p50 is flat at ~23.3-23.6 ms from EP4 loopback
+> through EP32 (intra-rack width tax ≈ nil), bucket-8 EP32 c256 9072 tok/s, greedy text
+> coherent through the serving path (EP8). EP widths
+> {4,8,16,32,64} each get a constexpr shim instantiation + `Glm52MoeTopo` variant; the
+> weight-only expert chain is ABI-generic so a new width is a config header, not new code.
+> The GIN scale-out sections below remain the design for IB/RoCE clusters beyond one rack.
+> Pitfalls that cost real time: the IMEX channel device must be passed into containers
+> (`--device /dev/nvidia-caps-imex-channels/channel0` — `--gpus` alone silently breaks
+> cross-tray LSA), and a remote-node teardown must `shutdown()` the socket, not just drop
+> the writer (a reader clone keeps the fd alive → no FIN → both sides hang).
 >
 > **Last touched:** 2026-07
 
 ## Scope and status
 
-- **Status: design only.** No cross-node work is scheduled. The gate that starts it is
-  hardware (two GIN-capable IB/RoCE-connected 8×H200 nodes) plus the data-plane microbench
-  below coming back with an acceptable number.
+- **Status: control plane + NVL72 data plane shipped** (`feat/glm52-rank-host`); the IB/RoCE
+  GIN data plane below stays design-only. Its gate is hardware (two GIN-capable
+  IB/RoCE-connected 8×H200 nodes) plus the data-plane microbench below coming back with an
+  acceptable number.
 - **What scales: the EP path.** Cross-node DP-N means attention stays data-parallel per rank
   and MoE goes EP-N. The TP8 topology (`--moe-topo tp8`, the solo-latency winner) is pinned to
   one NVLink/LSA domain by construction and does not cross nodes; a cross-node deployment is
@@ -33,6 +34,56 @@
   (see `moe-gemm` history); (b) halving per-GPU expert residency frees HBM for KV → bigger
   admissible batches per rank. Both wins grow with scale; both are throughput plays. Solo
   latency *loses* cross-node (added a2a hops), full stop.
+
+## Shipped: rank-host on GB300 NVL72 (2026-07-12)
+
+One NVL72 tray = 4 GPUs; the rack is a single NVLink/IMEX domain, so DeepEP's single-LSA
+assert holds across trays and the shim needs nothing new. Verified 2-tray EP8 recipe
+(all inside the `susun-dev` container, binaries + weights on the shared `/work` mount):
+
+```bash
+# remote tray: dumb rank-host, hosts ranks by the coordinator's instruction
+CUDA_VISIBLE_DEVICES=0,1,2,3 EP_DISABLE_GIN=1 \
+  openinfer --glm52-rank-host 0.0.0.0:19000
+
+# coordinator tray: 4 local ranks + 4 remote
+glm52_step_bench --model-path <GLM-5.2-FP8> --moe-topo ep8 \
+  --rank-hosts <tray04-ip>:19000=4 --buckets 1,8 --steps 96 --warmup-steps 24
+```
+
+Measured (GB300, weight-only chain, whole-step graphs), same command with only
+`--moe-topo`/`--rank-hosts` widened; EP16 = 4 trays, EP32 = 8 trays:
+
+| Topo | trays | bucket-1 p50/p99 ms | bucket-8 p50/p99 ms | bucket-8 tok/s |
+|------|-------|--------------------|---------------------|----------------|
+| EP4 (loopback) | 1 | 23.45 / – | – | – |
+| EP8 | 2 | 23.58 / 23.68 | 34.85 / 71.03 | 1837 (c64) |
+| EP16 | 4 | 23.29 / 23.91 | 28.90 / 57.83 | 4430 (c128) |
+| EP32 | 8 | 23.31 / 24.29 | 28.22 / 55.46 | 9072 (c256) |
+
+Bucket-1 p50 is flat across widths — intra-rack width tax ≈ nil (per-rank expert bytes
+shrink with width and cancel the wider a2a). 32-rank DeepEP contexts come up in ~7 s.
+Two open items: bucket-8 p99 has a reproducible ~2× bimodal tail at every width ≥ EP8,
+unexplained; and the context-cap ledger doesn't count width-scaled DeepEP buffers
+(`kNumRanks × kDecodeMaxTokens`), so wide-EP runs need an explicit `--max-model-len`
+until the ledger learns about comm buffers.
+`openinfer --rank-hosts ...` serves the same topology over HTTP (greedy prose + code checked).
+
+Operational contract:
+
+- Weights load per CONNECTION (~30 s warm page cache, ~95 s cold): the rank-host derives its
+  own load bundles from the wire hello; nothing model-specific is configured on it.
+- Teardown: coordinator drop `shutdown()`s the socket → rank-host sees EOF → fail-stop
+  worker teardown bounded by a 60 s watchdog (`exit(2)` if the collective destroy lacks
+  peers). The rank-host serves ONE connection and exits: worker drop does not return all
+  hosted GPU state (281 GiB/GPU stayed resident after a clean close), so process exit is
+  the release mechanism — wrap in a restart loop for a persistent node.
+- Container must receive the IMEX channel device (`dev-container.sh` does this): without
+  `/dev/nvidia-caps-imex-channels/channel0`, NCCL init succeeds but DeepEP `ctx_create`
+  fails cross-tray — some ranks error, others block in bootstrap.
+- After any tray-side `git pull`, verify `git rev-parse HEAD`: the egress proxy can flake
+  mid-pull and leave a stale checkout that builds fine (a chain-selection bug hid there for
+  one full bench cycle).
 
 ## Topology
 

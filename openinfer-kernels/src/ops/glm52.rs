@@ -14,6 +14,7 @@ mod router;
 mod sparse_mla;
 mod topk;
 mod tp_ar;
+mod vllm_fixup;
 
 pub use decode_feed::*;
 pub use deepgemm_grouped::*;
@@ -31,3 +32,4 @@ pub use router::*;
 pub use sparse_mla::*;
 pub use topk::*;
 pub use tp_ar::*;
+pub use vllm_fixup::*;

@@ -217,13 +217,6 @@ impl LocalQwen3Lane {
             !requests.is_empty(),
             "DFlash draft requested without active requests"
         );
-        for req in requests {
-            anyhow::ensure!(
-                req.params.is_greedy(),
-                "DFlash draft currently supports greedy sampling only"
-            );
-        }
-
         // Take the lane out of `self` so the draft forward (which borrows
         // `dflash.model`/`dflash.scratch`) and the argmax (which borrows
         // `self.sample_scratch`) don't collide on a `self` borrow.

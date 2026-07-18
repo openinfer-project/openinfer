@@ -32,13 +32,13 @@ pub use openinfer_kernels::ops::{
 #[cfg(not(feature = "kernel-call-trace"))]
 pub use openinfer_kernels::ops::{
     embedding_batch, fused_add_rms_norm_batch_into, gemm_into, gemm_rows_into,
-    gemm_token_range_into_checked, qk_norm_rope_batch_decode_into, rms_norm_batch_into,
-    silu_mul_fused_batch_into,
+    gemm_rows_into_checked, gemm_token_range_into_checked, qk_norm_rope_batch_decode_into,
+    rms_norm_batch_into, silu_mul_fused_batch_into,
 };
 pub use paged_plan::PrefillPagedPlan;
 #[cfg(feature = "kernel-call-trace")]
 pub use traced::{
     embedding_batch, fused_add_rms_norm_batch_into, gemm_into, gemm_rows_into,
-    gemm_token_range_into_checked, qk_norm_rope_batch_decode_into, rms_norm_batch_into,
-    silu_mul_fused_batch_into,
+    gemm_rows_into_checked, gemm_token_range_into_checked, qk_norm_rope_batch_decode_into,
+    rms_norm_batch_into, silu_mul_fused_batch_into,
 };

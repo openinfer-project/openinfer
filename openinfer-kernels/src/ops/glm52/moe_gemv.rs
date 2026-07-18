@@ -48,7 +48,112 @@ pub fn glm52_silu_and_mul_bf16_launch(
 /// size their buffer as `rows * GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW` — one
 /// constant instead of mirroring the CUDA-side per-shape config table; the
 /// launcher still guards the exact requirement and rejects a short buffer.
+/// (The Blackwell table's larger splits only apply to small n — 48 × 2048
+/// stays well inside this budget; the CUDA-side guard is the invariant.)
 pub const GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW: usize = 16 * 24576;
+
+/// Fused fixed-order k-slice reduce + `SiLU(gate) * up`: consumes the f32
+/// partials a [`glm52_fp8_weight_only_gemv_partials_launch`] left in scratch
+/// for a packed gate|up projection. Bit-identical to the standalone
+/// reduce -> silu pair (both sums round to bf16 before the SiLU math).
+pub fn glm52_gemv_reduce_silu_mul_launch(
+    ctx: &DeviceContext,
+    rows: usize,
+    inter: usize,
+    ksplit: usize,
+    partial: &CudaSlice<f32>,
+    output: &mut CudaSlice<bf16>,
+) -> Result<()> {
+    ensure!(
+        rows > 0 && inter > 0 && ksplit >= 1,
+        "GLM5.2 reduce-SiLU needs positive rows/inter/ksplit, got {rows}/{inter}/{ksplit}"
+    );
+    ensure!(
+        partial.len() >= ksplit * rows * 2 * inter && output.len() >= rows * inter,
+        "GLM5.2 reduce-SiLU buffers too small: partial {} (need {}), out {} (need {})",
+        partial.len(),
+        ksplit * rows * 2 * inter,
+        output.len(),
+        rows * inter
+    );
+    let (p_ptr, _p) = partial.device_ptr(&ctx.stream);
+    let (out_ptr, _o) = output.device_ptr_mut(&ctx.stream);
+    unsafe {
+        ffi::glm52_gemv_reduce_silu_mul_cuda(
+            p_ptr as *const f32,
+            out_ptr as *mut ffi::Half,
+            rows as i32,
+            inter as i32,
+            ksplit as i32,
+            ctx.stream.cu_stream(),
+        )
+    }
+    .result()
+    .map_err(|err| anyhow!("GLM5.2 reduce-SiLU launch failed: {err}"))
+}
+
+/// Fixed-order k-slice reduce for a horizontally packed projection pair:
+/// de-interleaves the packed `[ksplit, rows, n_a + n_b]` partials into the two
+/// compact per-projection bf16 outputs. Same summation order and rounding as
+/// the plain reduce.
+#[allow(clippy::too_many_arguments)]
+pub fn glm52_gemv_split_reduce_launch(
+    ctx: &DeviceContext,
+    rows: usize,
+    n_a: usize,
+    n_b: usize,
+    ksplit: usize,
+    partial: &CudaSlice<f32>,
+    out_a: &mut CudaSlice<bf16>,
+    out_b: &mut CudaSlice<bf16>,
+) -> Result<()> {
+    ensure!(
+        rows > 0 && n_a > 0 && n_b > 0 && ksplit >= 1,
+        "GLM5.2 split-reduce needs positive rows/n_a/n_b/ksplit, got {rows}/{n_a}/{n_b}/{ksplit}"
+    );
+    ensure!(
+        partial.len() >= ksplit * rows * (n_a + n_b)
+            && out_a.len() >= rows * n_a
+            && out_b.len() >= rows * n_b,
+        "GLM5.2 split-reduce buffers too small: partial {} (need {}), out_a {} (need {}), out_b {} (need {})",
+        partial.len(),
+        ksplit * rows * (n_a + n_b),
+        out_a.len(),
+        rows * n_a,
+        out_b.len(),
+        rows * n_b
+    );
+    let (p_ptr, _p) = partial.device_ptr(&ctx.stream);
+    let (a_ptr, _a) = out_a.device_ptr_mut(&ctx.stream);
+    let (b_ptr, _b) = out_b.device_ptr_mut(&ctx.stream);
+    unsafe {
+        ffi::glm52_gemv_split_reduce_cuda(
+            p_ptr as *const f32,
+            a_ptr as *mut ffi::Half,
+            b_ptr as *mut ffi::Half,
+            rows as i32,
+            n_a as i32,
+            n_b as i32,
+            ksplit as i32,
+            ctx.stream.cu_stream(),
+        )
+    }
+    .result()
+    .map_err(|err| anyhow!("GLM5.2 split-reduce launch failed: {err}"))
+}
+
+/// Whether the batched GEMV mma table has an entry for (batch, n, k) — the
+/// gate for routing a horizontally packed projection through one batched
+/// launch. Without an entry the packed launch would take the register tile
+/// and write an interleaved layout no consumer understands, so callers fall
+/// back to separate per-projection launches.
+pub fn glm52_gemv_mma_routes(batch: usize, n: usize, k: usize) -> Result<bool> {
+    let mut ksplit: i32 = 0;
+    unsafe { ffi::glm52_gemv_mma_ksplit_cuda(batch as i32, n as i32, k as i32, &raw mut ksplit) }
+        .result()
+        .map_err(|err| anyhow!("GLM5.2 mma ksplit query failed: {err}"))?;
+    Ok(ksplit > 0)
+}
 
 /// Plain weight-only fp8 GEMV (bs=1): `out[n] = deq(weight[n,k]) @ activation[k]`
 /// with the bf16 activation read directly (no activation quant, no scale
@@ -72,6 +177,69 @@ pub fn glm52_fp8_weight_only_gemv_launch(
     scale_bytes: &CudaSlice<u8>,
     scratch: Option<&mut CudaSlice<f32>>,
     out: &mut CudaSlice<bf16>,
+) -> Result<()> {
+    gemv_batched_launch(
+        ctx,
+        rows,
+        n,
+        k,
+        activation,
+        weight,
+        scale_bytes,
+        scratch,
+        out,
+        None,
+    )
+    .map(|_| ())
+}
+
+/// Partials-producing twin of [`glm52_fp8_weight_only_gemv_launch`]: when the
+/// (batch, shape) routes to the tensor-core mma path, the launch stops at the
+/// f32 k-slice partials in `scratch` and returns the split factor (`out` is
+/// untouched); otherwise it behaves exactly like the plain launch and returns
+/// 0. Callers pair a non-zero return with a fused reduce consumer.
+#[allow(clippy::too_many_arguments)]
+pub fn glm52_fp8_weight_only_gemv_partials_launch(
+    ctx: &DeviceContext,
+    rows: usize,
+    n: usize,
+    k: usize,
+    activation: &CudaSlice<bf16>,
+    weight: &CudaSlice<u8>,
+    scale_bytes: &CudaSlice<u8>,
+    scratch: &mut CudaSlice<f32>,
+    out: &mut CudaSlice<bf16>,
+) -> Result<usize> {
+    let mut ksplit: i32 = 0;
+    gemv_batched_launch(
+        ctx,
+        rows,
+        n,
+        k,
+        activation,
+        weight,
+        scale_bytes,
+        Some(scratch),
+        out,
+        Some(&mut ksplit),
+    )?;
+    Ok(ksplit as usize)
+}
+
+/// Shared body of the two entry points above: validation, pointer extraction,
+/// and the FFI call (plain when `ksplit_out` is `None`, partials otherwise).
+#[allow(clippy::too_many_arguments)]
+fn gemv_batched_launch(
+    ctx: &DeviceContext,
+    rows: usize,
+    n: usize,
+    k: usize,
+    activation: &CudaSlice<bf16>,
+    weight: &CudaSlice<u8>,
+    scale_bytes: &CudaSlice<u8>,
+    scratch: Option<&mut CudaSlice<f32>>,
+    out: &mut CudaSlice<bf16>,
+    ksplit_out: Option<&mut i32>,
 ) -> Result<()> {
     ensure!(
         rows > 0 && n > 0 && k > 0,
@@ -108,19 +276,36 @@ pub fn glm52_fp8_weight_only_gemv_launch(
     // rows 4/8 the tensor-core mma path on winning shapes (deterministic per
     // bucket, not bit-identical to m=1). The CUDA side whitelists the
     // supported batches — a drifted GLM52_DECODE_BUCKETS crashes here.
-    unsafe {
-        ffi::glm52_fp8_weight_only_gemv_batched_cuda(
-            act_ptr as *const ffi::Half,
-            w_ptr as *const u8,
-            s_ptr as *const f32,
-            out_ptr as *mut ffi::Half,
-            scr_ptr,
-            scr_floats,
-            rows as i32,
-            n as i32,
-            k as i32,
-            ctx.stream.cu_stream(),
-        )
+    match ksplit_out {
+        None => unsafe {
+            ffi::glm52_fp8_weight_only_gemv_batched_cuda(
+                act_ptr as *const ffi::Half,
+                w_ptr as *const u8,
+                s_ptr as *const f32,
+                out_ptr as *mut ffi::Half,
+                scr_ptr,
+                scr_floats,
+                rows as i32,
+                n as i32,
+                k as i32,
+                ctx.stream.cu_stream(),
+            )
+        },
+        Some(ksplit) => unsafe {
+            ffi::glm52_fp8_weight_only_gemv_partials_cuda(
+                act_ptr as *const ffi::Half,
+                w_ptr as *const u8,
+                s_ptr as *const f32,
+                out_ptr as *mut ffi::Half,
+                scr_ptr,
+                scr_floats,
+                rows as i32,
+                n as i32,
+                k as i32,
+                ctx.stream.cu_stream(),
+                ksplit,
+            )
+        },
     }
     .result()
     .map_err(|err| anyhow!("GLM5.2 linear GEMV launch failed for rows={rows}, n={n}, k={k}: {err}"))

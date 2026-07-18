@@ -498,6 +498,7 @@ impl OffloadEngine {
             &config.namespace,
             config.device_id,
             reg,
+            false,
         )
     }
 
@@ -516,18 +517,25 @@ impl OffloadEngine {
             &config.namespace,
             config.device_id,
             Registration::from_arenas(arenas),
+            false,
         )
     }
 
     /// [`Self::with_arenas`] onto an existing shared host: this rank becomes
     /// one more pegaflow instance over the host's single pool. Ranks that
     /// should see each other's blocks pass the same `namespace`.
+    /// `page_first` must match how the namespace's writer stores blocks: the
+    /// vLLM connector stores MLA-model blocks page-first (all layers of a
+    /// block concatenated into one host page, offsets by lexicographic layer
+    /// name), so joining a vLLM MLA namespace requires `true` — with layer
+    /// names and per-layer block bytes identical to the writer's.
     pub fn with_arenas_on(
         host: Arc<OffloadHost>,
         instance_id: impl Into<String>,
         namespace: &str,
         device_id: i32,
         arenas: &[KvArena],
+        page_first: bool,
     ) -> Result<Self, EngineError> {
         Self::register(
             host,
@@ -535,6 +543,7 @@ impl OffloadEngine {
             namespace,
             device_id,
             Registration::from_arenas(arenas),
+            page_first,
         )
     }
 
@@ -544,6 +553,7 @@ impl OffloadEngine {
         namespace: &str,
         device_id: i32,
         reg: Registration,
+        page_first: bool,
     ) -> Result<Self, EngineError> {
         host.engine.register_context_layer_batch_strided(
             &instance_id,
@@ -565,13 +575,13 @@ impl OffloadEngine {
             // large per-layer copies; the Kernel backend only wins for highly
             // fragmented batches.
             TransferMode::Direct,
-            // page_first = false: openinfer registers one pegaflow layer per
-            // model layer (see `Registration::from_buffer`) and expresses the
-            // page-interleaved gap via `block_stride_bytes` — the layer-first
-            // model. The page-first path instead collapses all layers into a
-            // single page slot per block, which this per-layer registration is
-            // not laid out for.
-            false,
+            // Layer-first (false): one pegaflow layer per model layer, the
+            // page-interleaved gap expressed via `block_stride_bytes` — the
+            // native openinfer layout. Page-first (true) instead stores each
+            // block as one host page holding every layer at its
+            // name-sorted offset; used only to join a namespace whose writer
+            // (the vLLM connector on MLA models) stores blocks that way.
+            page_first,
         )?;
 
         Ok(Self {

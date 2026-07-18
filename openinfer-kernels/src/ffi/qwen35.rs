@@ -73,6 +73,22 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    pub fn gated_delta_rule_decode_batch_cuda(
+        qkv_batch: *const Half,
+        b_proj_batch: *const Half,
+        a_proj_batch: *const Half,
+        dt_bias: *const Half,
+        A_log: *const f32,
+        state_ptrs: *const u64,
+        output_batch: *mut Half,
+        batch_size: i32,
+        num_key_heads: i32,
+        num_value_heads: i32,
+        key_dim: i32,
+        val_dim: i32,
+        stream: CUstream,
+    );
+
     // Causal depthwise conv1d prefill (parallel over sequence)
     pub fn conv1d_prefill_cuda(
         x_seq: *const Half,
@@ -81,6 +97,17 @@ unsafe extern "C" {
         out_seq: *mut Half,
         num_channels: i32,
         seq_len: i32,
+        kernel_size: i32,
+        stream: CUstream,
+    );
+
+    pub fn conv1d_decode_batch_cuda(
+        x_batch: *const Half,
+        conv_weight: *const Half,
+        conv_state_ptrs: *const u64,
+        out_batch: *mut Half,
+        num_channels: i32,
+        batch_size: i32,
         kernel_size: i32,
         stream: CUstream,
     );

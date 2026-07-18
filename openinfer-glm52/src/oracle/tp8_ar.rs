@@ -203,7 +203,7 @@ fn tp8_ar_brick_gate() -> Result<()> {
     }
 
     let timings: Vec<f64> = all.iter().map(|(_, us)| *us).collect();
-    let worst = timings.iter().cloned().fold(0.0f64, f64::max);
+    let worst = timings.iter().copied().fold(0.0f64, f64::max);
     println!("tp8_ar standalone: per-rank us/layer = {timings:.3?}, worst {worst:.2}");
     ensure!(
         worst <= 10.0,

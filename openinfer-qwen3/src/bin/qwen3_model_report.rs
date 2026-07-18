@@ -602,6 +602,8 @@ fn measure_qk_norm_rope(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
             &ctx,
             &mut q,
             &mut k,
+            0,
+            batch,
             &q_norm,
             &k_norm,
             &cos_cache,
@@ -611,7 +613,7 @@ fn measure_qk_norm_rope(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
             NUM_KV_HEADS,
             HEAD_DIM_VALUE,
             RMS_NORM_EPS,
-        );
+        )?;
         Ok(())
     })
 }
@@ -671,6 +673,7 @@ fn measure_paged_decode_attention(call: &KernelCall, iters: u64) -> Result<Laten
                 &q,
                 &k,
                 &v,
+                0,
                 &kv_buffer,
                 &layout,
                 0,

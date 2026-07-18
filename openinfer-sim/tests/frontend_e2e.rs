@@ -506,6 +506,220 @@ async fn streaming_completion_emits_terminal_done() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chat_completions_returns_correct_format() -> Result<()> {
+    let server = SimServer::spawn().await?;
+    let client = test_client()?;
+
+    let response: Value = client
+        .post(format!("{}/v1/chat/completions", server.base_url))
+        .json(&json!({
+            "model": MODEL_NAME,
+            "messages": [{"role": "user", "content": "alpha beta"}],
+            "max_tokens": 4,
+            "temperature": 0.0
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+
+    assert_eq!(
+        response["object"].as_str(),
+        Some("chat.completion"),
+        "object field must be chat.completion: {response}"
+    );
+
+    let choice = &response["choices"][0];
+    assert_eq!(
+        choice["message"]["role"].as_str(),
+        Some("assistant"),
+        "message role must be assistant: {response}"
+    );
+    assert!(
+        choice["message"]["content"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()),
+        "message content must be a non-empty string: {response}"
+    );
+    assert_eq!(
+        choice["finish_reason"].as_str(),
+        Some("length"),
+        "finish_reason must be length when max_tokens is exhausted: {response}"
+    );
+
+    let usage = &response["usage"];
+    let prompt_tokens = usage["prompt_tokens"]
+        .as_u64()
+        .ok_or_else(|| anyhow!("usage.prompt_tokens missing: {response}"))?;
+    let completion_tokens = usage["completion_tokens"]
+        .as_u64()
+        .ok_or_else(|| anyhow!("usage.completion_tokens missing: {response}"))?;
+    let total_tokens = usage["total_tokens"]
+        .as_u64()
+        .ok_or_else(|| anyhow!("usage.total_tokens missing: {response}"))?;
+    assert!(
+        prompt_tokens > 0,
+        "prompt_tokens must be positive: {response}"
+    );
+    assert_eq!(
+        completion_tokens, 4,
+        "completion_tokens must equal max_tokens: {response}"
+    );
+    assert_eq!(
+        total_tokens,
+        prompt_tokens + completion_tokens,
+        "total_tokens must equal prompt + completion: {response}"
+    );
+
+    server.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chat_completions_streaming_emits_role_content_and_done() -> Result<()> {
+    let server = SimServer::spawn().await?;
+    let client = test_client()?;
+
+    let response = client
+        .post(format!("{}/v1/chat/completions", server.base_url))
+        .json(&json!({
+            "model": MODEL_NAME,
+            "messages": [{"role": "user", "content": "alpha"}],
+            "max_tokens": 2,
+            "temperature": 0.0,
+            "stream": true
+        }))
+        .send()
+        .await?
+        .error_for_status()?;
+    assert_event_stream_content_type(&response)?;
+    let stream_text = response.text().await?;
+
+    let chunks = parse_terminal_sse_chunks(&stream_text)?;
+
+    assert!(
+        !chunks.is_empty(),
+        "streaming response must contain at least one chunk"
+    );
+
+    for chunk in &chunks {
+        assert_eq!(
+            chunk["object"].as_str(),
+            Some("chat.completion.chunk"),
+            "chunk object must be chat.completion.chunk: {chunk}"
+        );
+    }
+
+    assert_eq!(
+        chunks[0]["choices"][0]["delta"]["role"].as_str(),
+        Some("assistant"),
+        "first chunk must declare assistant role: {}",
+        chunks[0]
+    );
+
+    let content: String = chunks
+        .iter()
+        .filter_map(|chunk| chunk["choices"][0]["delta"]["content"].as_str())
+        .collect();
+    assert_eq!(
+        content, " alpha alpha",
+        "streaming response must emit the simulated content: {stream_text}"
+    );
+
+    let last_chunk = chunks.last().expect("at least one chunk");
+    assert_eq!(
+        last_chunk["choices"][0]["finish_reason"].as_str(),
+        Some("length"),
+        "last chunk must carry finish_reason: {last_chunk}"
+    );
+
+    server.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chat_completions_usage_with_stream_options() -> Result<()> {
+    let server = SimServer::spawn().await?;
+    let client = test_client()?;
+
+    let response = client
+        .post(format!("{}/v1/chat/completions", server.base_url))
+        .json(&json!({
+            "model": MODEL_NAME,
+            "messages": [{"role": "user", "content": "alpha"}],
+            "max_tokens": 3,
+            "temperature": 0.0,
+            "stream": true,
+            "stream_options": {"include_usage": true}
+        }))
+        .send()
+        .await?
+        .error_for_status()?;
+    assert_event_stream_content_type(&response)?;
+    let stream_text = response.text().await?;
+
+    let chunks = parse_terminal_sse_chunks(&stream_text)?;
+    let usage_indices: Vec<usize> = chunks
+        .iter()
+        .enumerate()
+        .filter_map(|(index, chunk)| (!chunk["usage"].is_null()).then_some(index))
+        .collect();
+    assert_eq!(
+        usage_indices.len(),
+        1,
+        "stream_options.include_usage must emit exactly one usage chunk: {stream_text}"
+    );
+
+    let usage_index = usage_indices[0];
+    let usage_chunk = &chunks[usage_index];
+    assert_eq!(
+        usage_chunk["choices"].as_array().map(Vec::len),
+        Some(0),
+        "usage chunk must not contain choices: {usage_chunk}"
+    );
+
+    let finish_index = chunks
+        .iter()
+        .position(|chunk| chunk["choices"][0]["finish_reason"] == "length")
+        .ok_or_else(|| anyhow!("streaming response has no length finish chunk: {stream_text}"))?;
+    assert_eq!(
+        usage_index,
+        finish_index + 1,
+        "usage chunk must immediately follow the finish chunk: {stream_text}"
+    );
+    assert_eq!(
+        usage_index,
+        chunks.len() - 1,
+        "usage chunk must be the final JSON chunk before [DONE]: {stream_text}"
+    );
+
+    let usage = &usage_chunk["usage"];
+    let prompt_tokens = usage["prompt_tokens"]
+        .as_u64()
+        .ok_or_else(|| anyhow!("usage.prompt_tokens missing: {usage_chunk}"))?;
+    let completion_tokens = usage["completion_tokens"]
+        .as_u64()
+        .ok_or_else(|| anyhow!("usage.completion_tokens missing: {usage_chunk}"))?;
+    let total_tokens = usage["total_tokens"]
+        .as_u64()
+        .ok_or_else(|| anyhow!("usage.total_tokens missing: {usage_chunk}"))?;
+    assert!(
+        prompt_tokens > 0,
+        "usage.prompt_tokens must be positive: {usage_chunk}"
+    );
+    assert_eq!(
+        completion_tokens, 3,
+        "usage.completion_tokens must equal max_tokens: {usage_chunk}"
+    );
+    assert_eq!(
+        total_tokens,
+        prompt_tokens + completion_tokens,
+        "usage.total_tokens must equal prompt + completion: {usage_chunk}"
+    );
+
+    server.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn simulated_frontend_metadata_contract_is_executable() -> Result<()> {
     let model_dir = model_dir_with_minimal_metadata()?;
     for file in ["tokenizer.json", "tokenizer_config.json", "config.json"] {
@@ -633,6 +847,84 @@ fn completion_body(model_name: &str, stream: bool) -> Value {
     })
 }
 
+fn assert_event_stream_content_type(response: &reqwest::Response) -> Result<()> {
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .ok_or_else(|| anyhow!("streaming response is missing Content-Type"))?
+        .to_str()
+        .context("streaming response has an invalid Content-Type")?;
+    let media_type = content_type.split(';').next().unwrap_or_default().trim();
+    if media_type != "text/event-stream" {
+        bail!("streaming response must use text/event-stream, got {content_type}");
+    }
+    Ok(())
+}
+
+fn parse_terminal_sse_chunks(stream: &str) -> Result<Vec<Value>> {
+    let normalized = stream.replace("\r\n", "\n").replace('\r', "\n");
+    let mut payloads = Vec::new();
+    let mut data_lines = Vec::new();
+
+    for line in normalized.split_terminator('\n') {
+        if line.is_empty() {
+            if !data_lines.is_empty() {
+                payloads.push(data_lines.join("\n"));
+                data_lines.clear();
+            }
+            continue;
+        }
+        if line.starts_with(':') {
+            continue;
+        }
+
+        let (field, value) = line.split_once(':').unwrap_or((line, ""));
+        if field == "data" {
+            data_lines.push(value.strip_prefix(' ').unwrap_or(value));
+        }
+    }
+    if !data_lines.is_empty() {
+        bail!("streaming response ended before its final SSE event was dispatched: {stream}");
+    }
+
+    let done_count = payloads
+        .iter()
+        .filter(|payload| payload.as_str() == "[DONE]")
+        .count();
+    if done_count != 1 {
+        bail!("streaming response must contain exactly one data: [DONE]: {stream}");
+    }
+    if payloads.last().map(String::as_str) != Some("[DONE]") {
+        bail!("streaming response must end with data: [DONE]: {stream}");
+    }
+
+    payloads[..payloads.len() - 1]
+        .iter()
+        .map(|payload| serde_json::from_str(payload))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to parse streaming chunks")
+}
+
+#[test]
+fn sse_parser_requires_dispatched_events_and_unique_terminal_done() -> Result<()> {
+    let valid = "data: {\"object\":\"chat.completion.chunk\"}\n\ndata:[DONE]\n\n";
+    assert_eq!(parse_terminal_sse_chunks(valid)?.len(), 1);
+
+    let missing_separator = "data: {\"object\":\"chat.completion.chunk\"}\ndata:[DONE]\n\n";
+    assert!(parse_terminal_sse_chunks(missing_separator).is_err());
+
+    let duplicate_done = "data: {}\n\ndata:[DONE]\n\ndata: [DONE]\n\n";
+    assert!(parse_terminal_sse_chunks(duplicate_done).is_err());
+
+    let undispatched_done = "data: {}\n\ndata:[DONE]";
+    assert!(parse_terminal_sse_chunks(undispatched_done).is_err());
+
+    let line_terminated_but_undispatched_done = "data: {}\n\ndata:[DONE]\n";
+    assert!(parse_terminal_sse_chunks(line_terminated_but_undispatched_done).is_err());
+
+    Ok(())
+}
+
 async fn wait_for_health(client: &Client, base_url: &str) -> Result<()> {
     let health_url = format!("{base_url}/health");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
@@ -693,7 +985,8 @@ const TINY_TOKENIZER_JSON: &str = r#"{
 
 const TINY_TOKENIZER_CONFIG_JSON: &str = r#"{
   "unk_token": "<unk>",
-  "tokenizer_class": "PreTrainedTokenizerFast"
+  "tokenizer_class": "PreTrainedTokenizerFast",
+  "chat_template": "{% for message in messages %}{{ message.content }}{% endfor %}"
 }"#;
 
 const TINY_CONFIG_JSON: &str = r#"{

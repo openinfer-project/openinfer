@@ -1,13 +1,16 @@
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
+use cudarc::nccl::safe::{Comm, ReduceOp};
 use log::{debug, info};
+use safetensors::SafeTensors;
+use std::collections::HashMap;
 use std::time::Instant;
 
-use super::config::{Config35, LayerType};
-use openinfer_core::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
+use super::config::{Config35, LayerType, TensorParallelConfig};
+use openinfer_core::tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
 use openinfer_core::weight_loader::{
     deserialize_shards, load_shard_info_fixed, load_tensor_1d, load_tensor_1d_f32, load_tensor_2d,
-    mmap_shards, precompute_rope,
+    load_tensor_2d_col_shard, load_tensor_2d_row_shard, mmap_shards, precompute_rope,
 };
 
 /// Full attention layer weights (8 layers in Qwen3.5-4B).
@@ -68,10 +71,28 @@ pub(super) struct TransformerBlock35 {
     pub(super) mlp: MLP35,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ModelRuntimeConfig {
+    pub(crate) enable_cuda_graph: bool,
+    pub(crate) tensor_parallel: Option<TensorParallelConfig>,
+    pub(crate) device_ordinal: usize,
+}
+
+impl Default for ModelRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            enable_cuda_graph: true,
+            tensor_parallel: None,
+            device_ordinal: 0,
+        }
+    }
+}
+
 /// Qwen3.5 model (text-only).
 pub struct Qwen35Model {
     pub(super) ctx: DeviceContext,
     pub(super) config: Config35,
+    pub(super) tensor_parallel: TensorParallelConfig,
     pub(super) embed_tokens: DeviceMatrix,
     pub(super) lm_head: Option<DeviceMatrix>,
     pub(super) layers: Vec<TransformerBlock35>,
@@ -81,14 +102,35 @@ pub struct Qwen35Model {
     pub(super) sin_cache: DeviceVec,
     /// Shared paged KV pool for full-attention layers.
     pub(super) kv_pool: openinfer_core::kv_pool::KvPool,
+    /// Decode-slot count the recurrent-state reserve was sized for.
+    pub(super) reserved_decode_slots: usize,
+    pub(super) tp_comm: Option<Comm>,
 }
+
+// SAFETY: A Qwen3.5 model instance is bound to one CUDA device and driven from
+// one owning scheduler/worker thread at a time. TP constructs one independent
+// rank-local model per worker; the model is moved between threads only during
+// startup, never shared for concurrent mutation.
+unsafe impl Send for Qwen35Model {}
+unsafe impl Sync for Qwen35Model {}
+
+/// Graph slot state + one in-flight prefill transient per decode slot.
+const STATES_PER_DECODE_SLOT: usize = 2;
+/// KV-pool floor, also the low-memory fail-fast threshold.
+const MIN_KV_PAGES: usize = 64;
 
 impl Qwen35Model {
     pub fn from_safetensors_with_options(
         model_path: &str,
         enable_cuda_graph: bool,
     ) -> Result<Self> {
-        Self::from_safetensors_with_device_options(model_path, enable_cuda_graph, 0)
+        Self::from_safetensors_with_runtime(
+            model_path,
+            ModelRuntimeConfig {
+                enable_cuda_graph,
+                ..Default::default()
+            },
+        )
     }
 
     pub fn from_safetensors_with_device_options(
@@ -96,19 +138,86 @@ impl Qwen35Model {
         enable_cuda_graph: bool,
         device_ordinal: usize,
     ) -> Result<Self> {
-        info!("Loading Qwen3.5 model from: {}", model_path);
-        debug!("Initializing GPU");
-        let ctx = DeviceContext::new_with_device(device_ordinal)?;
+        Self::from_safetensors_with_runtime(
+            model_path,
+            ModelRuntimeConfig {
+                enable_cuda_graph,
+                device_ordinal,
+                ..Default::default()
+            },
+        )
+    }
+}
 
-        let config = Config35::from_file(model_path)?;
+impl Qwen35Model {
+    /// `max_batch` must be a decode bucket ({1,2,4,8,16,32,64}).
+    pub fn from_safetensors(
+        model_path: &str,
+        device_ordinal: usize,
+        max_batch: usize,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            super::batch_decode_graph::BATCH_BUCKETS.contains(&max_batch),
+            "decode batch capacity must be one of {:?}, got {max_batch}",
+            super::batch_decode_graph::BATCH_BUCKETS,
+        );
+        Self::from_safetensors_with_runtime_and_capacity(
+            model_path,
+            ModelRuntimeConfig {
+                device_ordinal,
+                ..Default::default()
+            },
+            max_batch,
+        )
+    }
+
+    pub(crate) fn from_safetensors_with_runtime(
+        model_path: &str,
+        runtime: ModelRuntimeConfig,
+    ) -> Result<Self> {
+        Self::from_safetensors_with_runtime_and_capacity(
+            model_path,
+            runtime,
+            super::batch_decode_graph::MAX_BATCH,
+        )
+    }
+
+    fn from_safetensors_with_runtime_and_capacity(
+        model_path: &str,
+        runtime: ModelRuntimeConfig,
+        max_batch: usize,
+    ) -> Result<Self> {
+        info!("Loading Qwen3.5 model from: {}", model_path);
+        debug!("Initializing GPU device {}", runtime.device_ordinal);
+        let ctx = DeviceContext::new_with_device(runtime.device_ordinal)?;
+
+        let mut config = Config35::from_file(model_path)?;
+        let tensor_parallel = runtime.tensor_parallel.unwrap_or_default();
+        tensor_parallel.validate_for(&config, runtime.enable_cuda_graph)?;
         debug!(
-            "Config: hidden_size={}, num_layers={}, full_attn={}, linear_attn={}, max_position_embeddings={}",
+            "Config: hidden_size={}, num_layers={}, full_attn={}, linear_attn={}, max_position_embeddings={}, tp_rank={}, tp_world_size={}",
             config.hidden_size,
             config.num_hidden_layers,
             config.num_full_attention_layers(),
             config.num_hidden_layers - config.num_full_attention_layers(),
-            config.max_position_embeddings
+            config.max_position_embeddings,
+            tensor_parallel.rank,
+            tensor_parallel.world_size,
         );
+        let effective_vocab = super::config::tokenizer_effective_vocab(model_path)?;
+        anyhow::ensure!(
+            effective_vocab <= config.vocab_size,
+            "tokenizer defines ids up to {} but checkpoint vocab_size is {}",
+            effective_vocab - 1,
+            config.vocab_size,
+        );
+        if effective_vocab < config.vocab_size {
+            config.selection_vocab = effective_vocab;
+            info!(
+                "output projection: selection bounded to decodable vocab {} (checkpoint pads to {})",
+                effective_vocab, config.vocab_size
+            );
+        }
 
         let (shard_paths, weight_map) = load_shard_info_fixed(model_path)?;
         debug!("Loading {} safetensor shard(s)", shard_paths.len());
@@ -153,6 +262,9 @@ impl Qwen35Model {
             config.num_hidden_layers
         );
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        let (_, q_rows) = tensor_parallel.shard_range(config.full_attn_q_dim());
+        let (kv_row_offset, kv_rows) = tensor_parallel.shard_range(config.full_attn_kv_dim());
+        let (inter_row_offset, inter_rows) = tensor_parallel.shard_range(config.intermediate_size);
         for i in 0..config.num_hidden_layers {
             let prefix = format!("{}.layers.{}", wp, i);
             let layer_type = config.layer_types[i];
@@ -161,29 +273,40 @@ impl Qwen35Model {
                 LayerType::FullAttention => {
                     let attn_prefix = format!("{}.self_attn", prefix);
                     LayerKind::FullAttention(FullAttentionLayer {
-                        q_proj: load_tensor_2d(
+                        q_proj: load_full_attention_gated_q_proj(
                             &ctx,
                             &shards,
                             &weight_map,
                             &format!("{}.q_proj.weight", attn_prefix),
+                            &config,
+                            tensor_parallel,
                         )?,
-                        k_proj: load_tensor_2d(
+                        k_proj: load_tensor_2d_row_shard_if_needed(
                             &ctx,
                             &shards,
                             &weight_map,
                             &format!("{}.k_proj.weight", attn_prefix),
+                            tensor_parallel,
+                            kv_row_offset,
+                            kv_rows,
                         )?,
-                        v_proj: load_tensor_2d(
+                        v_proj: load_tensor_2d_row_shard_if_needed(
                             &ctx,
                             &shards,
                             &weight_map,
                             &format!("{}.v_proj.weight", attn_prefix),
+                            tensor_parallel,
+                            kv_row_offset,
+                            kv_rows,
                         )?,
-                        o_proj: load_tensor_2d(
+                        o_proj: load_tensor_2d_col_shard_if_needed(
                             &ctx,
                             &shards,
                             &weight_map,
                             &format!("{}.o_proj.weight", attn_prefix),
+                            tensor_parallel,
+                            tensor_parallel.shard_range(config.full_attn_q_dim()).0,
+                            q_rows,
                         )?,
                         q_norm: load_tensor_1d(
                             &ctx,
@@ -260,17 +383,23 @@ impl Qwen35Model {
                 }
             };
 
-            let gate_proj = load_tensor_2d(
+            let gate_proj = load_tensor_2d_row_shard_if_needed(
                 &ctx,
                 &shards,
                 &weight_map,
                 &format!("{}.mlp.gate_proj.weight", prefix),
+                tensor_parallel,
+                inter_row_offset,
+                inter_rows,
             )?;
-            let up_proj = load_tensor_2d(
+            let up_proj = load_tensor_2d_row_shard_if_needed(
                 &ctx,
                 &shards,
                 &weight_map,
                 &format!("{}.mlp.up_proj.weight", prefix),
+                tensor_parallel,
+                inter_row_offset,
+                inter_rows,
             )?;
             let gate_up_proj = DeviceMatrix::vstack(&ctx, &[&gate_proj, &up_proj])?;
             drop(gate_proj);
@@ -292,11 +421,14 @@ impl Qwen35Model {
                 )?,
                 mlp: MLP35 {
                     gate_up_proj,
-                    down_proj: load_tensor_2d(
+                    down_proj: load_tensor_2d_col_shard_if_needed(
                         &ctx,
                         &shards,
                         &weight_map,
                         &format!("{}.mlp.down_proj.weight", prefix),
+                        tensor_parallel,
+                        inter_row_offset,
+                        inter_rows,
                     )?,
                 },
             };
@@ -328,18 +460,17 @@ impl Qwen35Model {
             "GPU model loaded in {:.0}ms",
             t_gpu.elapsed().as_secs_f64() * 1e3
         );
-        if enable_cuda_graph {
+        if runtime.enable_cuda_graph {
             debug!("Decode path CUDA Graph is enabled");
         } else {
             debug!("Decode path CUDA Graph is disabled");
         }
-
         // Paged KV pool for the 8 full-attention layers.
         let page_size = 16usize;
         let num_full_layers = config.num_full_attention_layers();
         let layout = openinfer_core::kv_pool::KvLayout::new(
             num_full_layers,
-            config.num_key_value_heads,
+            config.local_num_key_value_heads(tensor_parallel),
             config.head_dim,
             page_size,
         );
@@ -351,20 +482,35 @@ impl Qwen35Model {
         let max_prefill_len = super::prefill::SCRATCH_ESTIMATE_SEQ;
         let scratch_reserve =
             super::prefill_buffers::GdrChunkwiseScratch35::estimate_bytes(&config, max_prefill_len);
-        let available = free_bytes.saturating_sub(scratch_reserve);
+        let recurrent_reserve =
+            STATES_PER_DECODE_SLOT * max_batch * super::recurrent_state::bytes_per_request(&config);
+        let min_kv_bytes = MIN_KV_PAGES * bytes_per_page;
+        anyhow::ensure!(
+            free_bytes >= scratch_reserve + recurrent_reserve + min_kv_bytes,
+            "insufficient device memory for Qwen3.5: {} MB free, but prefill scratch needs {} MB, \
+             recurrent state needs {} MB ({STATES_PER_DECODE_SLOT} x {max_batch} decode slots), \
+             and the minimal KV pool needs {} MB; lower the decode batch capacity (--max-batch) \
+             or use a smaller model",
+            free_bytes / (1024 * 1024),
+            scratch_reserve / (1024 * 1024),
+            recurrent_reserve / (1024 * 1024),
+            min_kv_bytes / (1024 * 1024),
+        );
+        let available = free_bytes - scratch_reserve - recurrent_reserve;
         let kv_budget = (available as f64 * 0.85) as usize;
-        let num_pages = (kv_budget / bytes_per_page).max(64);
+        let num_pages = (kv_budget / bytes_per_page).max(MIN_KV_PAGES);
         let kv_mb = num_pages * bytes_per_page / (1024 * 1024);
         let scratch_mb = scratch_reserve / (1024 * 1024);
+        let recurrent_mb = recurrent_reserve / (1024 * 1024);
         info!(
-            "Qwen3.5 KV cache: {num_pages} pages ({kv_mb} MB), prefill scratch reserve: {scratch_mb} MB, {:.0}% of {:.0} MB free",
+            "Qwen3.5 KV cache: {num_pages} pages ({kv_mb} MB), prefill scratch reserve: {scratch_mb} MB, recurrent-state reserve: {recurrent_mb} MB ({STATES_PER_DECODE_SLOT} x {max_batch} slots), {:.0}% of {:.0} MB free",
             kv_budget as f64 / free_bytes as f64 * 100.0,
             free_bytes as f64 / 1024.0 / 1024.0
         );
         let kv_pool = openinfer_core::kv_pool::KvPool::new(
             &ctx,
             num_full_layers,
-            config.num_key_value_heads,
+            config.local_num_key_value_heads(tensor_parallel),
             config.head_dim,
             page_size,
             num_pages,
@@ -373,6 +519,7 @@ impl Qwen35Model {
         Ok(Self {
             ctx,
             config,
+            tensor_parallel,
             embed_tokens,
             lm_head,
             layers,
@@ -380,6 +527,8 @@ impl Qwen35Model {
             cos_cache,
             sin_cache,
             kv_pool,
+            reserved_decode_slots: max_batch,
+            tp_comm: None,
         })
     }
 
@@ -413,6 +562,22 @@ impl Qwen35Model {
         &self.kv_pool
     }
 
+    pub(crate) fn attach_tp_comm(&mut self, comm: Comm) {
+        self.tp_comm = Some(comm);
+    }
+
+    pub(crate) fn all_reduce_hidden(&self, hidden: &mut HiddenStates) -> Result<()> {
+        self.all_reduce_hidden_untraced(hidden)
+    }
+
+    pub(crate) fn all_reduce_hidden_untraced(&self, hidden: &mut HiddenStates) -> Result<()> {
+        if let Some(comm) = &self.tp_comm {
+            comm.all_reduce_in_place(&mut hidden.data, &ReduceOp::Sum)
+                .map_err(|e| anyhow::anyhow!("Qwen3.5 NCCL all-reduce failed: {e:?}"))?;
+        }
+        Ok(())
+    }
+
     /// Tune small-batch decode GEMM algorithms on the thread that will capture
     /// or replay the CUDA Graph. cuBLASLt plans are thread-local, so scheduler
     /// workers and model-local executors must call this after binding CUDA.
@@ -421,13 +586,14 @@ impl Qwen35Model {
     pub(crate) fn tune_decode_gemm_algos(&self) -> Result<()> {
         let ctx = &self.ctx;
         let hidden = self.config.hidden_size;
-        let vocab = self.config.vocab_size;
-        let full_q = self.config.full_attn_q_proj_dim();
-        let full_kv = self.config.full_attn_kv_dim();
+        let vocab = self.config.selection_vocab;
+        let tp = self.tensor_parallel;
+        let full_q = self.config.local_full_attn_gated_q_dim(tp);
+        let full_kv = self.config.local_full_attn_kv_dim(tp);
         let linear_qkv = self.config.linear_attn_qkv_dim();
         let linear_z = self.config.linear_attn_z_dim();
         let linear_ba = self.config.linear_num_value_heads;
-        let intermediate = self.config.intermediate_size;
+        let intermediate = self.config.local_intermediate_size(tp);
 
         let full_q_samples: Vec<_> = self
             .layers
@@ -503,7 +669,9 @@ impl Qwen35Model {
 
         for &n in super::batch_decode_graph::BATCH_BUCKETS
             .iter()
-            .filter(|&&bucket| bucket <= crate::ops::GEMM_LT_MAX_N)
+            .filter(|&&bucket| {
+                bucket <= crate::ops::GEMM_LT_MAX_N && bucket <= self.reserved_decode_slots
+            })
         {
             tune_if_nonempty(ctx, &full_q_samples, full_q, n)?;
             tune_if_nonempty(ctx, &full_kv_samples, full_kv, n)?;
@@ -519,16 +687,42 @@ impl Qwen35Model {
         Ok(())
     }
 
-    /// Create a CUDA Graph batch decode state with a custom slot capacity.
+    /// Create the CUDA Graph batch decode state at the loaded capacity.
+    pub(crate) fn create_batch_decode_graph_state(
+        &self,
+    ) -> anyhow::Result<super::batch_decode_graph::BatchDecodeGraphState> {
+        self.create_batch_decode_graph_state_with_capacity(self.reserved_decode_slots)
+    }
+
     pub(crate) fn create_batch_decode_graph_state_with_capacity(
         &self,
         max_batch: usize,
     ) -> anyhow::Result<super::batch_decode_graph::BatchDecodeGraphState> {
+        anyhow::ensure!(
+            max_batch <= self.reserved_decode_slots,
+            "requested graph capacity {max_batch} exceeds loaded capacity {}",
+            self.reserved_decode_slots
+        );
         super::batch_decode_graph::BatchDecodeGraphState::with_capacity(
             &self.ctx,
             &self.config,
+            self.tensor_parallel,
             &self.kv_pool,
             max_batch,
+        )
+    }
+
+    pub(crate) fn create_batch_decode_buffers_with_capacity(
+        &self,
+        max_batch: usize,
+    ) -> anyhow::Result<super::decode_buffers::BatchDecodeBuffers35> {
+        super::decode_buffers::BatchDecodeBuffers35::new(
+            &self.ctx,
+            &self.config,
+            self.tensor_parallel,
+            max_batch,
+            self.kv_pool.capacity_pages(),
+            self.kv_pool.padding_page_id(),
         )
     }
 
@@ -547,4 +741,155 @@ fn tune_if_nonempty(
         return Ok(());
     }
     crate::ops::gemm_lt_tune(ctx, samples, rows, n)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GatedQShardRange {
+    row_offset: usize,
+    rows: usize,
+}
+
+fn full_attention_gated_q_shard_range(
+    config: &Config35,
+    tensor_parallel: TensorParallelConfig,
+) -> GatedQShardRange {
+    // HF/OpenInfer kernels interpret q_proj rows as per-head [q, gate] chunks.
+    // Keep each local head's q rows adjacent to its gate rows.
+    let local_heads = config.local_num_attention_heads(tensor_parallel);
+    let head_start = tensor_parallel.rank * local_heads;
+    GatedQShardRange {
+        row_offset: head_start * config.head_dim * 2,
+        rows: local_heads * config.head_dim * 2,
+    }
+}
+
+fn load_full_attention_gated_q_proj(
+    ctx: &DeviceContext,
+    shards: &[SafeTensors],
+    weight_map: &HashMap<String, usize>,
+    name: &str,
+    config: &Config35,
+    tensor_parallel: TensorParallelConfig,
+) -> Result<DeviceMatrix> {
+    if !tensor_parallel.is_sharded() {
+        return load_tensor_2d(ctx, shards, weight_map, name);
+    }
+
+    let range = full_attention_gated_q_shard_range(config, tensor_parallel);
+    load_tensor_2d_row_shard(ctx, shards, weight_map, name, range.row_offset, range.rows)
+}
+
+fn load_tensor_2d_row_shard_if_needed(
+    ctx: &DeviceContext,
+    shards: &[SafeTensors],
+    weight_map: &HashMap<String, usize>,
+    name: &str,
+    tensor_parallel: TensorParallelConfig,
+    row_offset: usize,
+    rows: usize,
+) -> Result<DeviceMatrix> {
+    if tensor_parallel.is_sharded() {
+        load_tensor_2d_row_shard(ctx, shards, weight_map, name, row_offset, rows)
+    } else {
+        load_tensor_2d(ctx, shards, weight_map, name)
+    }
+}
+
+fn load_tensor_2d_col_shard_if_needed(
+    ctx: &DeviceContext,
+    shards: &[SafeTensors],
+    weight_map: &HashMap<String, usize>,
+    name: &str,
+    tensor_parallel: TensorParallelConfig,
+    col_offset: usize,
+    cols: usize,
+) -> Result<DeviceMatrix> {
+    if tensor_parallel.is_sharded() {
+        load_tensor_2d_col_shard(ctx, shards, weight_map, name, col_offset, cols)
+    } else {
+        load_tensor_2d(ctx, shards, weight_map, name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config() -> Config35 {
+        Config35 {
+            hidden_size: 2560,
+            intermediate_size: 9216,
+            num_hidden_layers: 32,
+            vocab_size: 248320,
+            selection_vocab: 248320,
+            rms_norm_eps: 1e-6,
+            eos_token_id: 151645,
+            num_attention_heads: 16,
+            num_key_value_heads: 4,
+            head_dim: 256,
+            linear_num_key_heads: 16,
+            linear_key_head_dim: 128,
+            linear_num_value_heads: 32,
+            linear_value_head_dim: 128,
+            linear_conv_kernel_dim: 4,
+            rope_theta: 10_000.0,
+            rotary_dim: 64,
+            max_position_embeddings: 262_144,
+            tie_word_embeddings: true,
+            layer_types: vec![LayerType::LinearAttention; 32],
+        }
+    }
+
+    #[test]
+    fn gated_q_shard_range_keeps_matching_q_and_gate_rows() {
+        let config = test_config();
+
+        let rank0 = full_attention_gated_q_shard_range(
+            &config,
+            TensorParallelConfig {
+                rank: 0,
+                world_size: 2,
+            },
+        );
+        assert_eq!(
+            rank0,
+            GatedQShardRange {
+                row_offset: 0,
+                rows: 4096,
+            }
+        );
+
+        let rank1 = full_attention_gated_q_shard_range(
+            &config,
+            TensorParallelConfig {
+                rank: 1,
+                world_size: 2,
+            },
+        );
+        assert_eq!(
+            rank1,
+            GatedQShardRange {
+                row_offset: 4096,
+                rows: 4096,
+            }
+        );
+    }
+
+    #[test]
+    fn mlp_tp2_uses_matching_gate_up_rows_and_down_cols() {
+        let config = test_config();
+        let tp = TensorParallelConfig {
+            rank: 1,
+            world_size: 2,
+        };
+
+        let (inter_offset, inter_rows) = tp.shard_range(config.intermediate_size);
+        assert_eq!((inter_offset, inter_rows), (4608, 4608));
+        assert_eq!(config.local_intermediate_size(tp), inter_rows);
+
+        let local_gate_up_rows = 2 * inter_rows;
+        let local_down_cols = inter_rows;
+        assert_eq!(local_gate_up_rows, 9216);
+        assert_eq!(local_down_cols, 4608);
+    }
 }

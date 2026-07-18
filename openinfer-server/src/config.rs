@@ -29,7 +29,8 @@ pub(crate) struct Args {
     pub port: u16,
 
     /// Enable CUDA Graph capture/replay on decode path (`--cuda-graph=false` to
-    /// disable). Rejected for GLM5.2; forced off in Qwen3 LoRA mode.
+    /// disable). Rejected for GLM5.2; forced off in Qwen3 LoRA mode; Qwen3.5
+    /// always captures and rejects `false`.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub cuda_graph: bool,
 
@@ -125,6 +126,41 @@ pub(crate) struct Args {
     #[arg(long, default_value_t = false, requires = "kv_p2p_metaserver_addr")]
     pub kv_p2p_flush_on_finish: bool,
 
+    /// P/D decode role with a vLLM prefill peer: the shared PYTHONHASHSEED
+    /// value set on every vLLM prefill process. Switches offload query keys to
+    /// vLLM's prefix-cache hash scheme (requires the P side to run
+    /// --prefix-caching-hash-algo xxhash_cbor) and makes a cold request wait
+    /// out the producer's registration tail instead of prefilling locally.
+    /// Requires --kv-pd-vllm-namespace and the P2P mesh flags.
+    #[arg(long, value_parser = parse_pythonhashseed, requires_all = ["kv_p2p_metaserver_addr", "kv_pd_vllm_namespace"])]
+    pub kv_pd_vllm_seed: Option<String>,
+
+    /// The vLLM prefill peer's pegaflow-connector namespace (an 8-hex digest
+    /// the connector logs at startup as `namespace=...`). Both sides must
+    /// address the same content domain. The digest carries no model identity:
+    /// pointing a decode node at a different model's namespace (same
+    /// tokenizer, same geometry class) silently cross-loads foreign KV.
+    #[arg(long, value_parser = parse_pegaflow_namespace, requires = "kv_pd_vllm_seed")]
+    pub kv_pd_vllm_namespace: Option<String>,
+
+    /// Zero-hit wait window for --kv-pd-vllm-seed mode, in milliseconds: how
+    /// long a cold request keeps re-querying before giving up on the expected
+    /// remote KV. On give-up, Qwen3 prefills locally; GLM5.2 rejects for the
+    /// router to retry (see --kv-pd-allow-local-prefill). Must stay below the
+    /// executor's 15s remote-fetch deadline (both engines enforce this at
+    /// startup).
+    #[arg(long, default_value_t = 5000, requires = "kv_pd_vllm_seed")]
+    pub kv_pd_miss_wait_ms: u64,
+
+    /// Debug escape hatch for --kv-pd-vllm-seed mode on models whose decode
+    /// node has no prefill path (GLM5.2): admit with local prompt compute
+    /// when the remote KV never materializes, instead of rejecting for the
+    /// router to retry. Local prompt compute rides the decode kernels
+    /// token-by-token — leave off in production. Qwen3 ignores this flag
+    /// (its miss path always falls back to a real local prefill).
+    #[arg(long, default_value_t = false, requires = "kv_pd_vllm_seed")]
+    pub kv_pd_allow_local_prefill: bool,
+
     /// vLLM-style no-prefix-cache. Without --kv-offload it disables prefix
     /// matching outright (every prefill recomputes the full prompt). With
     /// --kv-offload it is the pure-L2 mode: no cross-request HBM reuse, so every
@@ -146,6 +182,11 @@ pub(crate) struct Args {
     #[arg(long)]
     pub max_prefill_tokens: Option<usize>,
 
+    /// Decode-batch capacity, one of 1/2/4/8/16/32/64; lower it to fit
+    /// reduced-memory GPUs. Qwen3.5 only; defaults to 64.
+    #[arg(long)]
+    pub max_batch: Option<usize>,
+
     /// Per-request context cap: prompt + max_tokens - 1 must fit. GLM5.2 only;
     /// when omitted, GLM5.2 sizes it from post-weight-load free VRAM.
     #[arg(long)]
@@ -161,6 +202,21 @@ pub(crate) struct Args {
     /// `tp4` is the GB300 four-GPU low-latency topology.
     #[arg(long, default_value = "ep8")]
     pub moe_topo: String,
+
+    /// GLM5.2 remote rank-host nodes for cross-node EP, comma-separated
+    /// `host:port=ranks` (e.g. `10.13.84.7:19000=4`). Each node contributes
+    /// its ranks AFTER this process's local ranks, in list order; the total
+    /// must equal the topology's rank count. Start the remote side with
+    /// `--glm52-rank-host`.
+    #[arg(long, value_delimiter = ',')]
+    pub rank_hosts: Vec<String>,
+
+    /// Serve as a GLM5.2 rank-host on this listen address (e.g.
+    /// `0.0.0.0:19000`) instead of running an engine: a coordinator started
+    /// with `--rank-hosts` connects and drives this node's GPUs. No HTTP
+    /// frontend, no scheduler — a dumb worker shell.
+    #[arg(long)]
+    pub glm52_rank_host: Option<String>,
 
     /// Fraction of total GPU memory the Qwen3 instance may use. The KV cache is
     /// sized from this budget after startup profiling accounts for weights,
@@ -193,8 +249,9 @@ pub(crate) struct Args {
     #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..=99))]
     pub decode_sm_pct: u32,
 
-    /// Enable Qwen3 projection-GEMM and split-KV chunk-count batch-invariant
-    /// pinning. Off by default; does not cover path-selection residuals. Qwen3-only.
+    /// Enable single-GPU Qwen3 batch-invariant serving by pinning the numeric paths and cutting
+    /// each prompt's prefill chunks on its own grid. Off by default. Requires `--no-prefix-cache`;
+    /// incompatible with `--kv-offload`, which keeps prefix matching on regardless.
     #[arg(long, default_value_t = false)]
     pub batch_invariant: bool,
 }
@@ -261,8 +318,16 @@ fn consumed_args(model_type: ModelType) -> &'static [&'static str] {
             "kv_offload",
             "kv_offload_host_gib",
             "kv_offload_hugepages",
+            "kv_p2p_metaserver_addr",
+            "kv_p2p_advertise_addr",
+            "kv_p2p_nics",
+            "kv_pd_vllm_seed",
+            "kv_pd_vllm_namespace",
+            "kv_pd_miss_wait_ms",
+            "kv_pd_allow_local_prefill",
             "moe_topo",
             "dump_graph_png",
+            "rank_hosts",
         ],
         #[cfg(feature = "kimi-k2")]
         ModelType::KimiK2 => &["tp_size", "dp_size", "ep_backend", "cuda_graph"],
@@ -283,6 +348,9 @@ fn consumed_args(model_type: ModelType) -> &'static [&'static str] {
             "kv_p2p_advertise_addr",
             "kv_p2p_nics",
             "kv_p2p_flush_on_finish",
+            "kv_pd_vllm_seed",
+            "kv_pd_vllm_namespace",
+            "kv_pd_miss_wait_ms",
             "no_prefix_cache",
             "max_prefill_tokens",
             "gpu_memory_utilization",
@@ -294,7 +362,13 @@ fn consumed_args(model_type: ModelType) -> &'static [&'static str] {
             "dflash_draft_model_path",
         ],
         #[cfg(feature = "qwen35-4b")]
-        ModelType::Qwen35 => &["device_ordinal", "cuda_graph", "max_prefill_tokens"],
+        ModelType::Qwen35 => &[
+            "device_ordinal",
+            "tp_size",
+            "cuda_graph",
+            "max_prefill_tokens",
+            "max_batch",
+        ],
     }
 }
 
@@ -367,6 +441,13 @@ impl Args {
                 "--batch-invariant is not compatible with --decode-overlap; the stream override would force the pinned GEMM to bail at runtime"
             );
         }
+        if self.batch_invariant && self.kv_offload {
+            bail!(
+                "--batch-invariant is not supported with --kv-offload: offload keeps prefix matching \
+                 on (--no-prefix-cache only disables HBM retention there), and a host-tier prefix hit \
+                 shifts a prompt's chunk boundaries off the request-local grid"
+            );
+        }
         if self.batch_invariant && self.dflash_draft_model_path.is_some() {
             bail!(
                 "--batch-invariant is not supported with DFlash speculative decoding; enable one at a time"
@@ -374,6 +455,12 @@ impl Args {
         }
         if self.batch_invariant && self.tp_size > 1 {
             bail!("--batch-invariant is not supported with --tp-size > 1; enable one at a time");
+        }
+        if self.batch_invariant && !self.no_prefix_cache {
+            bail!(
+                "--batch-invariant requires --no-prefix-cache; prefix-cache hits move a prompt's chunk \
+                 boundaries off the request-local grid, so batch-invariant prefill cannot be provided"
+            );
         }
         if provided.contains("decode_sm_pct")
             && !matches!(self.decode_overlap, CliDecodeOverlap::GreenCtx)
@@ -500,6 +587,32 @@ pub(crate) fn parse_max_lora_rank_arg(value: &str) -> Result<usize, String> {
     }
 }
 
+/// PYTHONHASHSEED as vLLM accepts it: a decimal integer in [0, 4294967295].
+/// An empty or malformed seed would derive a well-formed key space that can
+/// never match the peer — a config error must fail here, not as slow requests.
+fn parse_pythonhashseed(s: &str) -> Result<String, String> {
+    if s.parse::<u32>().is_err() || s.starts_with('+') {
+        return Err(format!(
+            "PYTHONHASHSEED must be a decimal integer in [0, 4294967295], got {s:?}"
+        ));
+    }
+    Ok(s.to_string())
+}
+
+/// A pegaflow namespace digest: exactly 8 lowercase hex chars.
+fn parse_pegaflow_namespace(s: &str) -> Result<String, String> {
+    if s.len() != 8
+        || !s
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return Err(format!(
+            "namespace must be an 8-char lowercase hex digest, got {s:?}"
+        ));
+    }
+    Ok(s.to_string())
+}
+
 fn parse_lora_module_fields(name: &str, path: &str) -> Result<LoraModule, String> {
     if name.is_empty() {
         return Err("--lora-modules name must not be empty".to_string());
@@ -517,7 +630,7 @@ fn parse_lora_module_fields(name: &str, path: &str) -> Result<LoraModule, String
 mod tests {
     use super::*;
 
-    #[cfg(any(feature = "glm52", feature = "qwen3"))]
+    #[cfg(any(feature = "glm52", feature = "qwen3", feature = "qwen35-4b"))]
     fn parse_with_provided(argv: &[&str]) -> (Args, BTreeSet<String>) {
         use clap::FromArgMatches;
         let matches = Args::command()
@@ -560,6 +673,15 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[cfg(feature = "qwen35-4b")]
+    #[test]
+    fn qwen35_accepts_tp_size() {
+        let (args, provided) =
+            parse_with_provided(&["openinfer", "--tp-size", "2", "--cuda-graph=false"]);
+        args.validate(ModelType::Qwen35, &provided)
+            .expect("Qwen3.5 should accept --tp-size for eager TP startup");
     }
 
     #[test]

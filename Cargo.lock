@@ -3179,6 +3179,7 @@ name = "openinfer-engine"
 version = "0.1.0"
 dependencies = [
  "log",
+ "serde",
  "tokio",
 ]
 
@@ -3187,6 +3188,7 @@ name = "openinfer-glm52"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bincode",
  "bytesize",
  "crossbeam-channel",
  "cudarc",
@@ -3200,6 +3202,7 @@ dependencies = [
  "openinfer-kv-offload",
  "openinfer-sample",
  "safetensors",
+ "serde",
  "serde_json",
  "sha2 0.11.0",
  "tokio",
@@ -3266,6 +3269,7 @@ dependencies = [
  "pegaflow-core",
  "tokio",
  "tokio-stream",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -3313,14 +3317,17 @@ dependencies = [
  "openinfer-core",
  "openinfer-kernels",
  "openinfer-sample",
+ "openinfer-vllm-frontend",
  "openinfer-vllm-support",
  "rand 0.10.1",
+ "reqwest",
  "safetensors",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "tempfile",
  "tokio",
+ "tokio-util",
  "vllm-text",
 ]
 
@@ -3585,8 +3592,8 @@ checksum = "19b17cddbe7ec3f8bc800887bab5e717348c95ea2ca0b1bf0837fb964dc67099"
 
 [[package]]
 name = "pegaflow-common"
-version = "0.23.2"
-source = "git+https://github.com/novitalabs/pegaflow.git?rev=d46fd1653154f3f895ff23e995b6efbf4e3e1e9a#d46fd1653154f3f895ff23e995b6efbf4e3e1e9a"
+version = "0.23.3"
+source = "git+https://github.com/novitalabs/pegaflow.git?rev=1473c5355d879b4fea23101760cb2a0074642ada#1473c5355d879b4fea23101760cb2a0074642ada"
 dependencies = [
  "colored",
  "libc",
@@ -3596,8 +3603,8 @@ dependencies = [
 
 [[package]]
 name = "pegaflow-core"
-version = "0.23.2"
-source = "git+https://github.com/novitalabs/pegaflow.git?rev=d46fd1653154f3f895ff23e995b6efbf4e3e1e9a#d46fd1653154f3f895ff23e995b6efbf4e3e1e9a"
+version = "0.23.3"
+source = "git+https://github.com/novitalabs/pegaflow.git?rev=1473c5355d879b4fea23101760cb2a0074642ada#1473c5355d879b4fea23101760cb2a0074642ada"
 dependencies = [
  "ahash",
  "bytesize",
@@ -3626,8 +3633,8 @@ dependencies = [
 
 [[package]]
 name = "pegaflow-proto"
-version = "0.23.2"
-source = "git+https://github.com/novitalabs/pegaflow.git?rev=d46fd1653154f3f895ff23e995b6efbf4e3e1e9a#d46fd1653154f3f895ff23e995b6efbf4e3e1e9a"
+version = "0.23.3"
+source = "git+https://github.com/novitalabs/pegaflow.git?rev=1473c5355d879b4fea23101760cb2a0074642ada#1473c5355d879b4fea23101760cb2a0074642ada"
 dependencies = [
  "prost",
  "tonic",
@@ -3637,8 +3644,8 @@ dependencies = [
 
 [[package]]
 name = "pegaflow-transfer"
-version = "0.23.2"
-source = "git+https://github.com/novitalabs/pegaflow.git?rev=d46fd1653154f3f895ff23e995b6efbf4e3e1e9a#d46fd1653154f3f895ff23e995b6efbf4e3e1e9a"
+version = "0.23.3"
+source = "git+https://github.com/novitalabs/pegaflow.git?rev=1473c5355d879b4fea23101760cb2a0074642ada#1473c5355d879b4fea23101760cb2a0074642ada"
 dependencies = [
  "anyhow",
  "bincode",

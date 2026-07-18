@@ -8,6 +8,8 @@ use log::info;
 use openinfer::logging;
 use openinfer::server_engine::{ModelType, detect_model_type};
 use openinfer_core::engine::EngineHandle;
+#[cfg(feature = "qwen35-4b")]
+use openinfer_core::engine::EngineLoadOptions;
 #[cfg(feature = "qwen3")]
 use openinfer_qwen3::{Qwen3LaunchOptions, Qwen3LoraOptions, Qwen3OffloadOptions};
 
@@ -25,6 +27,22 @@ async fn main() -> anyhow::Result<()> {
     let args =
         Args::from_arg_matches(&matches).map_err(|e| anyhow::anyhow!("invalid CLI args: {e}"))?;
     let provided = config::provided_args(&matches);
+
+    // rank-host mode: a dumb worker shell for a remote GLM5.2 coordinator —
+    // no engine, no HTTP. Serves connections until killed.
+    if let Some(listen) = &args.glm52_rank_host {
+        #[cfg(feature = "glm52")]
+        {
+            return tokio::task::spawn_blocking({
+                let listen = listen.clone();
+                move || openinfer_glm52::serve_rank_host(&listen)
+            })
+            .await
+            .context("rank-host thread panicked")?;
+        }
+        #[cfg(not(feature = "glm52"))]
+        anyhow::bail!("--glm52-rank-host requires the glm52 feature (got {listen})");
+    }
 
     let model_type = detect_model_type(&args.model_path).with_context(|| {
         format!(
@@ -143,9 +161,41 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
                             pinned_pool_bytes: (args.kv_offload_host_gib * f64::from(1u32 << 30))
                                 as usize,
                             use_hugepages: args.kv_offload_hugepages,
+                            p2p: match (
+                                args.kv_p2p_metaserver_addr.clone(),
+                                args.kv_p2p_advertise_addr.clone(),
+                            ) {
+                                (Some(metaserver_addr), Some(advertise_addr)) => {
+                                    Some(openinfer_glm52::Glm52P2pOptions {
+                                        metaserver_addr,
+                                        advertise_addr,
+                                        rdma_nics: args.kv_p2p_nics.clone(),
+                                    })
+                                }
+                                _ => None,
+                            },
+                            vllm_compat: args.kv_pd_vllm_seed.clone().map(|seed| {
+                                openinfer_glm52::Glm52VllmCompatOptions {
+                                    python_hash_seed: seed,
+                                    namespace: args
+                                        .kv_pd_vllm_namespace
+                                        .clone()
+                                        .expect("clap requires kv_pd_vllm_namespace"),
+                                    miss_wait: std::time::Duration::from_millis(
+                                        args.kv_pd_miss_wait_ms,
+                                    ),
+                                    allow_local_prefill: args.kv_pd_allow_local_prefill,
+                                }
+                            }),
                         }),
                     moe_topo,
                     dump_graph_png: args.dump_graph_png.clone(),
+                    rank_hosts: args
+                        .rank_hosts
+                        .iter()
+                        .map(|spec| spec.parse())
+                        .collect::<anyhow::Result<Vec<_>>>()
+                        .context("--rank-hosts")?,
                 },
             )
             .context("failed to start GLM5.2 engine")?
@@ -176,6 +226,16 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
                         advertise_addr,
                         rdma_nics: args.kv_p2p_nics.clone(),
                         flush_on_finish: args.kv_p2p_flush_on_finish,
+                    });
+                }
+                if let Some(seed) = args.kv_pd_vllm_seed.clone() {
+                    offload = offload.with_vllm_compat(openinfer_qwen3::Qwen3VllmCompatOptions {
+                        python_hash_seed: seed,
+                        namespace: args
+                            .kv_pd_vllm_namespace
+                            .clone()
+                            .expect("clap requires kv_pd_vllm_namespace"),
+                        miss_wait: std::time::Duration::from_millis(args.kv_pd_miss_wait_ms),
                     });
                 }
                 offload
@@ -243,12 +303,19 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
             .context("failed to start Qwen3 engine")?
         }
         #[cfg(feature = "qwen35-4b")]
-        ModelType::Qwen35 => openinfer_qwen35_4b::launch(
+        ModelType::Qwen35 => openinfer_qwen35_4b::launch_with_options(
             &args.model_path,
-            args.device_ordinal,
-            args.cuda_graph,
-            args.max_prefill_tokens
-                .unwrap_or(openinfer_qwen35_4b::DEFAULT_MAX_PREFILL_TOKENS),
+            openinfer_qwen35_4b::Qwen35LaunchOptions {
+                device_ordinal: args.device_ordinal,
+                tp_size: args.tp_size,
+                cuda_graph: args.cuda_graph,
+                max_batch: args
+                    .max_batch
+                    .unwrap_or(openinfer_qwen35_4b::runtime::MAX_BATCH),
+                max_prefill_tokens: args
+                    .max_prefill_tokens
+                    .unwrap_or(openinfer_qwen35_4b::DEFAULT_MAX_PREFILL_TOKENS),
+            },
         )
         .context("failed to start Qwen3.5 engine")?,
     };

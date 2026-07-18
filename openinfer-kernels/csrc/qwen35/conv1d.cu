@@ -1,4 +1,5 @@
 #include "common.cuh"
+#include <stdint.h>
 
 // ============================================================================
 // Causal Depthwise Conv1d for Gated Delta Net linear attention
@@ -78,6 +79,54 @@ __global__ void conv1d_prefill_kernel(
     }
 }
 
+__global__ void conv1d_decode_batch_kernel(
+    const __nv_bfloat16* __restrict__ x_batch,
+    const __nv_bfloat16* __restrict__ conv_weight,
+    const uint64_t* __restrict__ conv_state_ptrs,
+    __nv_bfloat16* __restrict__ out_batch,
+    int num_channels,
+    int batch_size,
+    int kernel_size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = num_channels * batch_size;
+    if (idx >= total) return;
+
+    int c = idx % num_channels;
+    int slot = idx / num_channels;
+    int state_width = kernel_size - 1;
+    const __nv_bfloat16* x = x_batch + (size_t)slot * num_channels;
+    __nv_bfloat16* conv_state =
+        reinterpret_cast<__nv_bfloat16*>(static_cast<uintptr_t>(conv_state_ptrs[slot]));
+
+    float old_state[4];
+    #pragma unroll
+    for (int i = 0; i < state_width; i++) {
+        old_state[i] = __bfloat162float(conv_state[c * state_width + i]);
+    }
+
+    float sum = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < 4; k++) {
+        if (k >= kernel_size) break;
+        float val = (k == kernel_size - 1)
+            ? __bfloat162float(x[c])
+            : old_state[k];
+        sum += val * __bfloat162float(conv_weight[c * kernel_size + k]);
+    }
+
+    float sum_bf16 = __bfloat162float(__float2bfloat16(sum));
+    float silu_out = sum_bf16 / (1.0f + expf(-sum_bf16));
+    out_batch[(size_t)slot * num_channels + c] = __float2bfloat16(silu_out);
+
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        if (i >= state_width) break;
+        conv_state[c * state_width + i] =
+            (i + 1 < state_width) ? __float2bfloat16(old_state[i + 1]) : x[c];
+    }
+}
+
 extern "C" {
 
 void conv1d_prefill_cuda(
@@ -94,6 +143,24 @@ void conv1d_prefill_cuda(
     int blocks = (total + CONV1D_BLOCK - 1) / CONV1D_BLOCK;
     conv1d_prefill_kernel<<<blocks, CONV1D_BLOCK, 0, stream>>>(
         x_seq, conv_weight, conv_state, out_seq, num_channels, seq_len, kernel_size
+    );
+}
+
+void conv1d_decode_batch_cuda(
+    const __nv_bfloat16* x_batch,
+    const __nv_bfloat16* conv_weight,
+    const uint64_t* conv_state_ptrs,
+    __nv_bfloat16* out_batch,
+    int num_channels,
+    int batch_size,
+    int kernel_size,
+    cudaStream_t stream
+) {
+    int total = num_channels * batch_size;
+    int blocks = (total + CONV1D_BLOCK - 1) / CONV1D_BLOCK;
+    conv1d_decode_batch_kernel<<<blocks, CONV1D_BLOCK, 0, stream>>>(
+        x_batch, conv_weight, conv_state_ptrs, out_batch,
+        num_channels, batch_size, kernel_size
     );
 }
 

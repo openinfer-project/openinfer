@@ -1,5 +1,5 @@
-//! `--batch-invariant` is rejected at the Qwen3 builder boundary for unsupported combos:
-//! stream overlap, the DFlash drafter, and LoRA each run GEMMs the base-projection pin does not cover; the builder rejects all three.
+//! Builder-boundary tests for unsupported `--batch-invariant` combinations. They call the public
+//! `start_engine_*` entry points, so they also cover guard wiring.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -22,7 +22,7 @@ fn batch_invariant_rejects_decode_overlap() {
         Path::new("/nonexistent-model"),
         EngineLoadOptions::default(),
         Qwen3OffloadOptions::disabled(),
-        false,
+        true,
         DEFAULT_MAX_PREFILL_TOKENS,
         Qwen3MemoryOptions::default(),
         DecodeOverlap::SharedSm,
@@ -51,7 +51,7 @@ fn batch_invariant_rejects_dflash() {
         Path::new("/nonexistent-model"),
         EngineLoadOptions::default(),
         Qwen3OffloadOptions::disabled(),
-        false,
+        true,
         DEFAULT_MAX_PREFILL_TOKENS,
         Qwen3MemoryOptions::default(),
         DecodeOverlap::Off,
@@ -73,6 +73,64 @@ fn batch_invariant_rejects_dflash() {
 }
 
 #[test]
+fn batch_invariant_rejects_prefix_cache() {
+    let _g = POLICY_LOCK.lock().unwrap();
+    set_numeric_policy(NumericPolicy::Tuned);
+    let err = start_engine_with_offload(
+        Path::new("/nonexistent-model"),
+        EngineLoadOptions::default(),
+        Qwen3OffloadOptions::disabled(),
+        false,
+        DEFAULT_MAX_PREFILL_TOKENS,
+        Qwen3MemoryOptions::default(),
+        DecodeOverlap::Off,
+        true,
+        None,
+        false,
+    )
+    .err()
+    .expect("--batch-invariant with the prefix cache on must be rejected");
+    assert!(
+        format!("{err}").contains("--no-prefix-cache"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(
+        numeric_policy(),
+        NumericPolicy::Tuned,
+        "guard must reject before apply_batch_invariant_policy — global policy was polluted to Pin"
+    );
+}
+
+#[test]
+fn batch_invariant_rejects_kv_offload() {
+    let _g = POLICY_LOCK.lock().unwrap();
+    set_numeric_policy(NumericPolicy::Tuned);
+    let err = start_engine_with_offload(
+        Path::new("/nonexistent-model"),
+        EngineLoadOptions::default(),
+        Qwen3OffloadOptions::enabled(1 << 30),
+        true,
+        DEFAULT_MAX_PREFILL_TOKENS,
+        Qwen3MemoryOptions::default(),
+        DecodeOverlap::Off,
+        true,
+        None,
+        false,
+    )
+    .err()
+    .expect("--batch-invariant + KV offload must be rejected");
+    assert!(
+        format!("{err}").contains("KV offload"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(
+        numeric_policy(),
+        NumericPolicy::Tuned,
+        "guard must reject before apply_batch_invariant_policy — global policy was polluted to Pin"
+    );
+}
+
+#[test]
 fn batch_invariant_rejects_lora() {
     let _g = POLICY_LOCK.lock().unwrap();
     set_numeric_policy(NumericPolicy::Tuned);
@@ -81,7 +139,7 @@ fn batch_invariant_rejects_lora() {
         EngineLoadOptions::default(),
         Qwen3LoraOptions::default(),
         Qwen3OffloadOptions::disabled(),
-        false,
+        true,
         DEFAULT_MAX_PREFILL_TOKENS,
         Qwen3MemoryOptions::default(),
         DecodeOverlap::Off,

@@ -1,59 +1,161 @@
 # Qwen3.5-4B Roadmap
 
-> **TL;DR:** Qwen3.5-4B is decode-correct and still improving: the decode-tuning refresh improves direct TPOT by `2.1-3.2%`, while vLLM still leads 1024/256 HTTP decode and high-concurrency throughput. Long-prompt HF logits and GSM8K gates cover the old 4096-position RoPE boundary. Remaining structural items are HND prefill staging, prefix-cache design, and the serving-level concurrency gap.
+> **TL;DR:** Qwen3.5-4B has the main correctness, admission, chunked-prefill,
+> sampling, and step-tail gates needed for the dense single-GPU roadmap. The
+> retained RTX 5090 #469 serving sweep is now the current HTTP performance
+> boundary: zero failed benchmark requests, but vLLM is faster across the
+> retained envelope. Next work should attribute the HTTP/frontend/scheduler gap
+> before changing kernels, then keep mixed-load and HTTP lifecycle evidence
+> separate.
 >
-> **Last touched:** 2026-06
+> **Last touched:** 2026-07
 
-Tracking issue: see the `[Model] Qwen3.5-4B roadmap` GitHub issue. Sibling doc: `docs/models/qwen3/roadmap.md` — batched sampling is shared and #284 now routes Qwen3.5 decode through the same compact batched sampler; Qwen3.5 now has its own model-level non-greedy behavior gate, while qwen3 keeps the sibling gate on its side.
+Tracking issue: `[Model] Qwen3.5 dense roadmap v2: Stable single-GPU serving`
+(#654). It supersedes #249. Sibling maturity bar:
+`docs/models/qwen3/roadmap.md` and `docs/models/qwen3/serving-perf-5090.md`.
 
-## Where the line stands
+## Maturity Target
+
+The product boundary here is dense BF16 Qwen3.5 4B/9B/27B on one GPU. 4B is
+the serving-performance anchor. Larger sizes inherit correctness gates, not 4B
+performance or production-readiness claims.
+
+Qwen3.5 needs a Qwen3-like serving story with hybrid-state constraints called
+out:
+
+| Dimension | Target | Qwen3.5-specific constraint |
+| --- | --- | --- |
+| Correctness | Short and long HF logits gates stay green for enabled paths | State is full-attention KV plus recurrent f32 plus conv bf16 |
+| Serving stability | Requests are served, deferred, rejected, or recovered explicitly | Batch-level errors must not poison unrelated rows |
+| Performance | Same-host HTTP comparison names GPU, versions, workload, concurrency/QPS, and output sanity | Historical single-concurrency parity is not the current claim |
+| Mixed load | Long prefill overlap with active decode is measured, including saturated/failure cells | Chunking bounds stalls but does not reduce total prefill work |
+| Prefix reuse | One valid boundary restores KV, recurrent, and conv state together | KV-only prefix cache is incorrect |
+| Parallelism | TP starts from a design and correctness gate | Recurrent/conv state sharding is part of the design |
+
+## Current State
 
 | Area | State | Evidence |
 | --- | --- | --- |
-| Decode perf | Partial: the decode-tuning refresh improves direct OpenInfer TPOT, but vLLM 0.23.0 still leads 1024/256 HTTP decode and high-concurrency throughput. Nsight points the next gap search at serving/scheduler/event sync. | `docs/models/qwen35/optimization.md`, `docs/benchmarks/qwen35-4b-serving-vllm-rtx5090.md` |
-| Bench snapshots | ✓ current (unlike qwen3's) | `bench_snapshots/` |
-| **Long-prompt accuracy** | Recovered for the measured path: the 4097/8192-token HF logits replay passes after the RoPE cache fix; full GSM8K 8-shot at `batch_size=1` recovers to `strict-match` 79.38% / `flexible-extract` 79.30% vs HF 79.45% | `tests/hf_golden_gate.rs`, `test_data/qwen35-4b-hf-long-golden.safetensors`, `docs/benchmarks/accuracy-eval-results.md`, issue #250 |
-| Accuracy gate | ✓ small and long HF bf16 logits gates for pinned Qwen3.5-4B; exact-text e2e/regen retired; broader rand/hash corpus deferred until cross-arch policy exists | `tests/hf_golden_gate.rs`, `test_data/qwen35-4b-hf-golden.safetensors`, `test_data/qwen35-4b-hf-long-golden.safetensors`, `docs/models/qwen35/accuracy.md` |
-| Teacher forcing | ✓ model-local test executor can force fixed token IDs through prefill + graph decode; serving scheduler still free-runs user requests | `src/executor.rs`, `tests/hf_golden_gate.rs` |
-| Prefill memory | Partial: prefill is chunked at `PREFILL_CHUNK_LEN = 20000`, but each chunk still carries the large HND staging footprint | `prefill.rs` |
-| Long context | Partial: #250/#253 size the RoPE cache from `max_position_embeddings`; prefill/decode check cache coverage before use; scheduler admission rejects `prompt + max_tokens` past the position window and exposes the servable cap to the frontend; the scheduler e2e now covers the over-window rejection path | `config.rs`, `weights.rs`, `prefill.rs`, `batch_decode.rs`, `scheduler.rs`, `tests/e2e_scheduler.rs`, `src/scheduler/plan.rs` |
-| Admission | ✓ existing full-lifetime KV admission and explicit `Rejected` events cover impossible KV requests; #253 adds the context-window rejection reason before prefill/decode | `scheduler.rs`, `src/scheduler/plan.rs`, `docs/models/qwen35/kv-admission.md` |
-| Scheduler tests | Partial: current plan selection, full-lifetime admission, context-window rejection, slot assignment, and slot-compaction decisions are CPU-tested; GPU execution remains coupled to the production scheduler | `src/scheduler/plan.rs` |
-| Step tail | Local branch verified: #353 batches the prefill final norm/lm_head tail, samples decode/unified rows from batched logits, and keeps host full-vocab copies only for requested logprobs; HF/e2e gates pass, short-output serving A/B shows TTFT benefit, long-decode TPOT remains a no-claim diagnostic | `docs/models/qwen35/batched-step-tail.md` |
-| TP | ✗ absent (single GPU only) | — |
-| Prefix cache | ✗ absent; recurrent GDR state (~48MB per boundary snapshot) makes "prefix hit" itself a design question | — |
+| Accuracy | Done: 4B/9B/27B short and long HF bf16 logits gates | `docs/models/qwen35/accuracy.md`, #186, #250, #654 |
+| Admission / long context | Done: full-lifetime KV accounting and explicit context/KV rejection | `docs/models/qwen35/kv-admission.md`, #254, #290, #654 |
+| Prefill | Done: direct paged writes, bounded scheduler chunking, and resumed `base_pos > 0` coverage | #252, #305, #313, #314, #333, #375, #654 |
+| Sampling / step tail | Done: mixed batched sampling and batched final norm/lm_head/token selection | #284, #353, #654 |
+| Serving-vs-vLLM evidence | Retained #469 RTX 5090 sweep exists. OpenInfer completed every cell with zero failures, but vLLM 0.25.1 is faster across the retained HTTP envelope. | `docs/benchmarks/qwen35-4b-serving-vllm-rtx5090-2026-07.md`, #469 |
+| Serving overhead | Open: direct c16 TPOT is close to vLLM HTTP c16, while OpenInfer HTTP c16 is slower. Start with HTTP/frontend/scheduler/event attribution. | #469, #654 |
+| Mixed-load evidence | Open: prove injected prefill overlaps active decode and keep starvation setups as negative controls | #470 |
+| HTTP lifecycle | Open: retain cancel, disconnect, overload, rejection, recovery, health, and memory-return evidence | #471 |
+| Fault isolation | Open risk: batch-level execution errors can still fail multiple active requests | #654 |
+| Prefix reuse | Open: bounded joint KV/recurrent/conv snapshot design and implementation | #257 |
+| DFlash | In flight and opt-in: correctness-first work must stay default-off until gates pass | #434, PR #626, #654 |
+| Tensor parallel | Phase 1 complete: eager dense TP2 worker/scheduler execution; Phase 2 still needs mixed-step execution and sharded linear-attention/GDR state. | `docs/models/qwen35/tp-implementation.md`, #446 |
 
-## Roadmap
+## Active Contract
+
+Correctness:
+
+- HF logits gates are the primary oracle.
+- Exact text output is not a portable correctness gate.
+- Qwen3.5 state moves, caches, rolls back, or transfers as one transaction:
+  paged full-attention KV, recurrent f32 state, conv bf16 state, and logical
+  position.
+- Any chunking, sampling, prefix, speculative, or TP change must preserve the
+  short and long gates.
+
+Serving:
+
+- Direct diagnostics, profiler attribution, HTTP pressure, and serving claims
+  stay labeled separately.
+- One request's KV, prefill, context, sampling, or execution failure must not
+  silently lose or wedge unrelated requests.
+- Lifecycle evidence needs cancel, disconnect, overload, rejection, follow-up
+  completion, health, and memory-return checks.
+- A performance win does not establish production readiness.
+
+Performance:
+
+- The retained #469 sweep is the current HTTP boundary for 4B on 1x RTX 5090:
+  OpenInfer passed the matrix with zero failures, but did not match vLLM.
+- New claims must include GPU, driver, CUDA/toolchain, OpenInfer commit, vLLM
+  version, model revision, serve flags, bench flags, workload, concurrency/QPS,
+  completed/failed counts, average output tokens, and output sanity/hash.
+- The 1024/256 c16 direct diagnostic is attribution evidence only. It suggests
+  looking at HTTP/frontend/scheduler/event overhead before a kernel-first
+  rewrite.
+- Product-mode prefix cache results are not part of the #469 main comparison.
+
+## Roadmap V2
 
 ### Now
 
-1. **Keep #250's score evidence attached to the PR.** The current #250 slice proves a concrete long-prompt logits gate at 4097/8192 tokens, fixes the RoPE cache boundary, and passes full GSM8K 8-shot against `/v1/completions`: `strict-match` 79.38%, `flexible-extract` 79.30%, compared with the HF reference 79.45%.
-2. **HF gate widening after the long-prompt root cause.** #186 provides the teacher-forced HF logits gate and qwen35 replay surfaces: sequential graph decode, bucket-straddling graph decode, and slot-compaction replay. #250 adds the first long-prompt case. Future widening should add recurrent-state handoff coverage once prefix work creates that surface.
-3. **RoPE cache sibling follow-through.** Qwen3.5 now follows the qwen3 #220 shape for the unscaled checkpoint: cache length comes from config, runtime checks fail closed before prefill/decode uses a missing position, and admission rejects requests that would run past the position window. Keep the YaRN #8 caveat for scaled checkpoints when porting or comparing model families.
-4. **Step-tail batching (#353).** The local branch removes the request-by-request final tail from Qwen3.5 prefill, executor decode, and scheduler unified/decode paths. HF logits + scheduler e2e pass; same-host `bench_serving request` supports a first-token/short-output TTFT claim only. Keep long-decode TPOT as a no-claim diagnostic until a stronger contract says otherwise.
+1. **Finish #469 as a retained benchmark record.**
+   - Keep the #469 doc as a benchmark snapshot, not a parity claim.
+   - Preserve failed, timeout, unsupported, OOM, and overload cells if any appear
+     in follow-up runs.
+   - Use the retained sweep to update README wording only with the full setup
+     and non-parity boundary attached.
+
+2. **Make #470 a valid mixed-load ITL gate.**
+   - Prove injected prefill overlaps active decode.
+   - Keep starvation or capped-concurrency setups as negative controls.
+   - Record saturated, rejected, failed, timeout, or OOM cells instead of
+     dropping them.
+
+3. **Add #471 as the HTTP lifecycle gate.**
+   - Retain cancel, disconnect during prefill/decode, explicit rejection,
+     admissible overload, post-pressure completion, health, and GPU memory
+     return.
+   - Keep the recovery request and output hash in the artifact.
+
+4. **Finish DFlash correctness without changing default serving claims.**
+   - Accept-all, accepted-prefix, reject-first, fallback, long-context, memory
+     reservation, and joint KV/recurrent/conv restore all need real GPU gates.
+   - DFlash remains opt-in and default-off until correctness and tail behavior
+     are retained.
 
 ### Next
 
-5. **Prefill full-paged migration.** Replace the HND staging copy with direct paged writes: removes the ~640MB transient and the extra D2D pass. Chain dependency: paged-direct prefill → per-token position plumbing → RoPE/context-window invariants → opens the door to prefix-cache design.
-6. **Serving-level concurrency profiling.** Add a measured-only server-side range, then split the 1024/256 concurrency-16 gap across scheduler wait, event sync, request dispatch, and model execution. Also teach the Qwen3.5 direct decode bench to prove cached-token exclusion before it reports pure decode TPOT.
-7. **Scheduler logic seam follow-through.** The current admission/slot/compaction decisions have a CPU-tested seam. Keep future admission and rejection changes in that seam instead of re-embedding them in GPU execution.
-8. **Prefix-cache design note.** Linear-attention layers carry recurrent state, not KV blocks — a "prefix hit" must restore both the full-attention KV *and* a recurrent-state snapshot at a block boundary (~48MB per boundary at bf16). Whether to snapshot per block, per N blocks, or only at request end is an open trade; write the design note before any code. Depends on 5.
+1. **Attribute the #469 HTTP gap.**
+   - Start with 1024/256 c1/c16 and QPS 8/12/16.
+   - Trace queue wait, scheduler planning, scheduled-to-first-token,
+     prefill/decode step time, decode batch size, send/event overhead, terminal
+     latency, and idle gaps.
+   - Move to kernel profiling only if GPU step time explains the serving gap.
+
+2. **Close only measured 4B serving gaps.**
+   - Promote changes from repeated same-host HTTP A/B runs.
+   - Do not trade away correctness gates, lifecycle recovery, or mixed-load ITL.
+
+3. **Implement prefix reuse after #257 settles the boundary.**
+   - Snapshot format, eviction/salt semantics, hit observability, and warm-TTFT
+     benchmark are separate acceptance surfaces.
+   - If the joint-state snapshot is unbounded or too expensive, record the
+     no-go condition.
 
 ### Later
 
-- **TP** — no sharding design exists for the hybrid stack (GDR state sharding is the open question). Design-first, no driver today.
-- **CUDA-graph prefill** — prefill is eager and serial; revisit after 6 changes the memory layout.
+- TP for a concrete 9B or 27B TP=2 target, then 4B TP only if same-host TP=1 vs
+  TP=2 shows value.
+- LoRA with real-adapter logprob parity.
+- Exporter-specific FP8/NVFP4/MXFP4 loading and accuracy lanes.
+- MTP/DSpark under a separate speculative path.
+- Hybrid-state offload and P/D under a separate transfer/restore contract.
+- MoE and VLM under separate model roadmaps.
 
-## Cleanup ledger
+## Done Criteria
 
-- **Dead code:** ✓ qwen35 `probe_model()`+`ModelInfo` and the `start_with_model` entry point removed (#258); the same dead pair still exists in qwen3 (owned there).
-- **Docs:** ✓ qwen35 docs cleaned (#258): `Status:` enum headers dropped, obsolete `crates/` paths corrected to top-level, parity numbers reconciled to one ledger (234ms/11.77ms), and the e2e-gibberish story lifted to `docs/lessons/exact-match-gate-thread-cublas.md`. #186 then added the HF logits gate and retired the exact-text baseline.
-- **Shared with qwen3 (owned there):** batched decode sampling is implemented for greedy and non-greedy rows (#307/#284); Qwen3.5 now also has a model-level non-greedy sampling behavior gate; remaining shared items are frontend usage accounting (#78).
+Qwen3.5 reaches the dense single-GPU stable bar when:
 
-## Done criteria
-
-- GSM8K 8-shot within a few points of the HF reference, and a logits-level gate that would have caught the divergence.
-- The exact-text e2e baseline-regeneration ritual is retired (#186 gate work).
-- A 30k-token prompt is either served or rejected at admission — never a crash, never a silent cap.
-- One request's KV exhaustion never kills its batch-mates.
-- Scheduler admission logic runs under `cargo test` without a GPU.
+- Cancel, disconnect, overload, rejection, and a clean follow-up request stay
+  green without wedges, silent loss, or leaked request state.
+- Mixed-load cells prove the intended prefill/decode overlap and retain failure
+  accounting.
+- 4B c1/c4/c8/c16 and QPS throughput/TPOT match or beat the pinned vLLM
+  baseline inside the documented RTX 5090 envelope.
+- Short and long HF gates remain green for 4B/9B/27B across every enabled mode.
+- Prefix reuse restores one valid joint KV/recurrent/conv boundary, survives
+  eviction and memory pressure, and preserves cold-serving behavior when the
+  snapshot pool cannot insert.
+- DFlash, when enabled, passes real GPU correctness and same-commit A/B gates.
+- Unsupported size, context, sampling, topology, cache, and speculative
+  combinations fail explicitly.
+- No open blocker remains for the documented single-GPU dense stable claim.

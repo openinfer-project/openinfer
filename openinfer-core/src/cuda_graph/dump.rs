@@ -468,6 +468,8 @@ fn dot_escape(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
+
     use super::{
         GraphDescription, GraphEdge, GraphNode, GraphNodeKind, communicate, demangle, dot_escape,
         format_driver_api_version,
@@ -516,9 +518,10 @@ mod tests {
             .stderr(std::process::Stdio::piped())
             .spawn()
             .expect("spawn pipe stress child");
-        let input = (0..2_048)
-            .map(|index| format!("line_{index:04}_{}\n", "x".repeat(96)))
-            .collect::<String>();
+        let mut input = String::new();
+        for index in 0..2_048 {
+            let _ = writeln!(input, "line_{index:04}_{}", "x".repeat(96));
+        }
 
         let output = communicate(child, input.clone(), "pipe stress child")
             .expect("communicate with pipe stress child");

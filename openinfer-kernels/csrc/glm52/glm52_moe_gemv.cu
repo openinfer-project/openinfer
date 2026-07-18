@@ -424,12 +424,44 @@ __global__ void glm52_gemv_batched_mma_reduce_kernel(
   out[i] = __float2bfloat16(v);
 }
 
-// (ksplit, ntiles) per (batch, whitelisted shape); ksplit == 0 keeps the
-// register tile. Measured winners ONLY, jz-38 H200 2026-07-05 (see block
-// comment) — an explicit per-shape table so a future whitelist addition lands
-// on the register tile until someone measures it into here.
+// (ksplit, ntiles) per (arch, batch, whitelisted shape); ksplit == 0 keeps the
+// register tile. Measured winners ONLY — Hopper table from an 8xH200
+// locked-clock sweep 2026-07-05, Blackwell batch-8 table from a GB300 sm_103
+// locked-clock sweep 2026-07-13 (full KSPLIT x NTILES grid per shape; method
+// in docs/models/glm52/). Batch-4 has not been re-swept on Blackwell and
+// keeps the Hopper picks.
 struct MmaConfig { int ksplit; int ntiles; };
+
+bool arch_is_blackwell() {
+  // Config selection only — on a failed attribute query fall back to the
+  // Hopper table (still correct everywhere) instead of failing the launch.
+  static const bool blackwell = [] {
+    int device = 0;
+    int major = 0;
+    if (cudaGetDevice(&device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor,
+                               device) != cudaSuccess) {
+      return false;
+    }
+    return major >= 10;
+  }();
+  return blackwell;
+}
+
 MmaConfig mma_config(int batch, int n, int k) {
+  if (batch == 8 && arch_is_blackwell()) {
+    if (n == 2048  && k == 6144)  return {48, 2};  // q_a / shared gate,up
+    if (n == 2624  && k == 6144)  return {16, 1};  // q_a|kv_a pack (7.3us vs 12.6 separate)
+    if (n == 16384 && k == 2048)  return {4, 1};   // q_b
+    if (n == 576   && k == 6144)  return {16, 1};  // kv_a
+    if (n == 6144  && k == 16384) return {16, 2};  // o_proj
+    if (n == 24576 && k == 6144)  return {8, 2};   // dense gate|up
+    if (n == 6144  && k == 12288) return {16, 2};  // dense down
+    if (n == 4096  && k == 6144)  return {16, 2};  // shared gate|up
+    if (n == 6144  && k == 2048)  return {16, 2};  // shared down
+    if (n == 4096  && k == 2048)  return {16, 1};  // indexer wq_b
+    if (n == 128   && k == 6144)  return {48, 1};  // indexer wk
+  }
   if (batch == 8) {
     if (n == 2048  && k == 6144)  return {16, 2};  // q_a / shared gate,up
     if (n == 16384 && k == 2048)  return {8, 4};   // q_b
@@ -458,7 +490,8 @@ CUresult launch_gemv_batched_mma(const __nv_bfloat16* activation,
                                  const unsigned char* weight,
                                  const float* weight_scale, __nv_bfloat16* out,
                                  float* scratch, size_t scratch_floats, int n,
-                                 int k, cudaStream_t stream) {
+                                 int k, cudaStream_t stream,
+                                 bool skip_reduce = false) {
   if (n % 16 != 0 || k % (128 * KSPLIT) != 0 || (n / 16) % NTILES != 0 ||
       scratch == nullptr || (size_t)KSPLIT * BATCH * n > scratch_floats) {
     return CUDA_ERROR_INVALID_VALUE;
@@ -468,10 +501,12 @@ CUresult launch_gemv_batched_mma(const __nv_bfloat16* activation,
   glm52_gemv_batched_mma_kernel<BATCH, KSPLIT, NTILES>
       <<<grid, kMmaWarps * kWarpSize, 0, stream>>>(activation, weight,
                                                    weight_scale, scratch, n, k);
-  const int rthreads = 256;
-  glm52_gemv_batched_mma_reduce_kernel<BATCH, KSPLIT>
-      <<<(BATCH * n + rthreads - 1) / rthreads, rthreads, 0, stream>>>(scratch,
-                                                                       out, n);
+  if (!skip_reduce) {
+    const int rthreads = 256;
+    glm52_gemv_batched_mma_reduce_kernel<BATCH, KSPLIT>
+        <<<(BATCH * n + rthreads - 1) / rthreads, rthreads, 0, stream>>>(
+            scratch, out, n);
+  }
   return consume_last_cuda_error();
 }
 
@@ -489,6 +524,58 @@ __global__ void glm52_silu_and_mul_bf16_kernel(
   const float u = __bfloat162float(up[col]);
   const float sg = 1.0f / (1.0f + expf(-g));
   output[(size_t)row * inter + col] = __float2bfloat16(g * sg * u);
+}
+
+// Fixed-order k-slice reduce fused with the SwiGLU: `partial` is the packed
+// gate|up mma scratch ([ksplit, rows, 2*inter] f32). Each of the two sums is
+// rounded to bf16 before the SiLU math — bit-identical to the standalone
+// reduce -> silu pair this replaces, one launch instead of two. ksplit is a
+// runtime loop bound: the kernel is bandwidth-trivial and shared across every
+// per-shape split factor.
+__global__ void glm52_gemv_reduce_silu_mul_kernel(
+    const float* __restrict__ partial,       // [ksplit, rows, 2*inter]
+    __nv_bfloat16* __restrict__ output,      // [rows, inter]
+    int rows, int inter, int ksplit) {
+  const int row = blockIdx.x;
+  const int col = blockIdx.y * blockDim.x + threadIdx.x;
+  if (row >= rows || col >= inter) return;
+  const size_t slice = (size_t)rows * 2 * inter;
+  const size_t base = (size_t)row * (2 * inter);
+  float g = partial[base + col];
+  float u = partial[base + inter + col];
+  for (int s = 1; s < ksplit; ++s) {
+    g += partial[(size_t)s * slice + base + col];
+    u += partial[(size_t)s * slice + base + inter + col];
+  }
+  g = __bfloat162float(__float2bfloat16(g));
+  u = __bfloat162float(__float2bfloat16(u));
+  const float sg = 1.0f / (1.0f + expf(-g));
+  output[(size_t)row * inter + col] = __float2bfloat16(g * sg * u);
+}
+
+// Fixed-order k-slice reduce for a horizontally packed projection pair:
+// partials are [ksplit, rows, n_a + n_b] (one mma launch over the packed
+// weight); the reduce de-interleaves into the two compact per-projection
+// outputs so every downstream consumer keeps its contiguous [rows, n] layout.
+// Same summation order and rounding as the plain reduce kernel.
+__global__ void glm52_gemv_split_reduce_kernel(
+    const float* __restrict__ partial,   // [ksplit, rows, n_a + n_b]
+    __nv_bfloat16* __restrict__ out_a,   // [rows, n_a]
+    __nv_bfloat16* __restrict__ out_b,   // [rows, n_b]
+    int rows, int n_a, int n_b, int ksplit) {
+  const int n = n_a + n_b;
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= rows * n) return;
+  const int row = i / n;
+  const int col = i % n;
+  float v = partial[i];
+  for (int s = 1; s < ksplit; ++s) v += partial[(size_t)s * rows * n + i];
+  const __nv_bfloat16 h = __float2bfloat16(v);
+  if (col < n_a) {
+    out_a[(size_t)row * n_a + col] = h;
+  } else {
+    out_b[(size_t)row * n_b + (col - n_a)] = h;
+  }
 }
 
 // Kernel-coverage + scale-index invariants. k%128 keeps the scale column stride
@@ -535,6 +622,7 @@ constexpr int kBatchedWarps = 4;
 // or 16 (batch 4/8) for batched — so it is applied by each launcher, not here).
 bool whitelisted_linear_shape(int n, int k) {
   if (n == 2048  && k == 6144)  return true;  // q_a / shared gate,up
+  if (n == 2624  && k == 6144)  return true;  // q_a|kv_a horizontal pack
   if (n == 16384 && k == 2048)  return true;  // q_b
   if (n == 4096  && k == 2048)  return true;  // q_b attention-TP 16-head shard
   if (n == 2048  && k == 2048)  return true;  // q_b attention-TP 8-head shard
@@ -614,18 +702,32 @@ CUresult glm52_fp8_weight_only_gemv_pair_cuda(
 // one buffer per stream, never shared across the ctx/aux overlap). Batches
 // that stay on the register tile ignore it; an mma-routed launch with a
 // null/short buffer fails INVALID_VALUE instead of racing.
-CUresult glm52_fp8_weight_only_gemv_batched_cuda(
+//
+// `partials_only`: an mma-routed launch stops after the mma kernel, leaves the
+// f32 k-slice partials in `scratch`, and reports the ksplit via `ksplit_out`
+// so a fused consumer (reduce+SwiGLU below) can take over the fixed-order
+// reduction. Non-mma paths write bf16 `out` as usual and report ksplit 0.
+static CUresult gemv_batched_dispatch(
     const __nv_bfloat16* activation, const unsigned char* weight,
     const float* weight_scale, __nv_bfloat16* out, float* scratch,
-    size_t scratch_floats, int batch, int n, int k, cudaStream_t stream) {
+    size_t scratch_floats, int batch, int n, int k, cudaStream_t stream,
+    bool partials_only, int* ksplit_out) {
   if (activation == nullptr || weight == nullptr || weight_scale == nullptr ||
       out == nullptr || !aligned16(activation) ||
       !whitelisted_linear_shape(n, k)) {
     return CUDA_ERROR_INVALID_VALUE;
   }
+  if (ksplit_out != nullptr) *ksplit_out = 0;
   if (batch == 1) {
     return fp8_weight_only_gemv(activation, weight, weight_scale, out, n, k,
                                 stream);
+  }
+#define GLM52_MMA_CASE(BATCH_, KS_, NT_)                                     \
+  if (cfg.ksplit == (KS_) && cfg.ntiles == (NT_)) {                         \
+    if (partials_only && ksplit_out != nullptr) *ksplit_out = (KS_);        \
+    return launch_gemv_batched_mma<BATCH_, KS_, NT_>(                       \
+        activation, weight, weight_scale, out, scratch, scratch_floats, n,  \
+        k, stream, partials_only);                                          \
   }
   switch (batch) {
     case kBatchedGemvBatch2: {
@@ -639,11 +741,11 @@ CUresult glm52_fp8_weight_only_gemv_batched_cuda(
     }
     case kBatchedGemvBatch4: {
       const MmaConfig cfg = mma_config(batch, n, k);
-      if (cfg.ksplit == 16 && cfg.ntiles == 2) {
-        return launch_gemv_batched_mma<kBatchedGemvBatch4, 16, 2>(
-            activation, weight, weight_scale, out, scratch, scratch_floats, n,
-            k, stream);
-      }
+      GLM52_MMA_CASE(kBatchedGemvBatch4, 16, 2)
+      // A table entry whose (ksplit, ntiles) has no case above is a config/
+      // dispatch drift — crash at capture, never silently take the register
+      // tile (the sweep winner would quietly not run).
+      if (cfg.ksplit != 0) return CUDA_ERROR_INVALID_VALUE;
       if (!valid_tiling(n, k, kBatchedWarps * kBatchedRows))
         return CUDA_ERROR_INVALID_VALUE;
       const dim3 grid(1, n / (kBatchedWarps * kBatchedRows), 1);
@@ -654,23 +756,19 @@ CUresult glm52_fp8_weight_only_gemv_batched_cuda(
       break;
     }
     case kBatchedGemvBatchFull: {
-      // Every whitelisted shape runs the tensor-core path at batch 8.
+      // Table shapes route to the tensor-core path; anything off-table (e.g.
+      // the attention-TP shard shapes) keeps the register tile below.
       const MmaConfig cfg = mma_config(batch, n, k);
-      if (cfg.ksplit == 16 && cfg.ntiles == 2) {
-        return launch_gemv_batched_mma<kBatchedGemvBatchFull, 16, 2>(
-            activation, weight, weight_scale, out, scratch, scratch_floats, n,
-            k, stream);
-      }
-      if (cfg.ksplit == 8 && cfg.ntiles == 4) {
-        return launch_gemv_batched_mma<kBatchedGemvBatchFull, 8, 4>(
-            activation, weight, weight_scale, out, scratch, scratch_floats, n,
-            k, stream);
-      }
-      if (cfg.ksplit == 8 && cfg.ntiles == 1) {
-        return launch_gemv_batched_mma<kBatchedGemvBatchFull, 8, 1>(
-            activation, weight, weight_scale, out, scratch, scratch_floats, n,
-            k, stream);
-      }
+      GLM52_MMA_CASE(kBatchedGemvBatchFull, 16, 2)
+      GLM52_MMA_CASE(kBatchedGemvBatchFull, 8, 4)
+      GLM52_MMA_CASE(kBatchedGemvBatchFull, 8, 1)
+      GLM52_MMA_CASE(kBatchedGemvBatchFull, 48, 2)
+      GLM52_MMA_CASE(kBatchedGemvBatchFull, 48, 1)
+      GLM52_MMA_CASE(kBatchedGemvBatchFull, 16, 1)
+      GLM52_MMA_CASE(kBatchedGemvBatchFull, 8, 2)
+      GLM52_MMA_CASE(kBatchedGemvBatchFull, 4, 1)
+      // See the batch-4 arm: an uninstantiated table entry must crash here.
+      if (cfg.ksplit != 0) return CUDA_ERROR_INVALID_VALUE;
       if (!valid_tiling(n, k, kBatchedWarps * kBatchedRows))
         return CUDA_ERROR_INVALID_VALUE;
       const dim3 grid(1, n / (kBatchedWarps * kBatchedRows), 1);
@@ -684,6 +782,30 @@ CUresult glm52_fp8_weight_only_gemv_batched_cuda(
       return CUDA_ERROR_INVALID_VALUE;
   }
   return consume_last_cuda_error();
+#undef GLM52_MMA_CASE
+}
+
+CUresult glm52_fp8_weight_only_gemv_batched_cuda(
+    const __nv_bfloat16* activation, const unsigned char* weight,
+    const float* weight_scale, __nv_bfloat16* out, float* scratch,
+    size_t scratch_floats, int batch, int n, int k, cudaStream_t stream) {
+  return gemv_batched_dispatch(activation, weight, weight_scale, out, scratch,
+                               scratch_floats, batch, n, k, stream,
+                               /*partials_only=*/false, nullptr);
+}
+
+// Partials-producing twin of the batched GEMV: mma-routed shapes stop at the
+// f32 k-slice partials (`*ksplit_out` > 0, bf16 `out` untouched); everything
+// else behaves exactly like the plain entry and reports `*ksplit_out` == 0.
+CUresult glm52_fp8_weight_only_gemv_partials_cuda(
+    const __nv_bfloat16* activation, const unsigned char* weight,
+    const float* weight_scale, __nv_bfloat16* out, float* scratch,
+    size_t scratch_floats, int batch, int n, int k, cudaStream_t stream,
+    int* ksplit_out) {
+  if (ksplit_out == nullptr) return CUDA_ERROR_INVALID_VALUE;
+  return gemv_batched_dispatch(activation, weight, weight_scale, out, scratch,
+                               scratch_floats, batch, n, k, stream,
+                               /*partials_only=*/true, ksplit_out);
 }
 
 CUresult glm52_silu_and_mul_bf16_cuda(
@@ -697,6 +819,49 @@ CUresult glm52_silu_and_mul_bf16_cuda(
   glm52_silu_and_mul_bf16_kernel<<<grid, threads, 0, stream>>>(input, output, rows,
                                                                inter);
   return consume_last_cuda_error();
+}
+
+CUresult glm52_gemv_reduce_silu_mul_cuda(
+    const float* partial, __nv_bfloat16* output, int rows, int inter,
+    int ksplit, cudaStream_t stream) {
+  if (partial == nullptr || output == nullptr || rows <= 0 || inter <= 0 ||
+      ksplit < 1) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  const int threads = 256;
+  const dim3 grid(rows, (inter + threads - 1) / threads, 1);
+  glm52_gemv_reduce_silu_mul_kernel<<<grid, threads, 0, stream>>>(
+      partial, output, rows, inter, ksplit);
+  return consume_last_cuda_error();
+}
+
+CUresult glm52_gemv_split_reduce_cuda(
+    const float* partial, __nv_bfloat16* out_a, __nv_bfloat16* out_b, int rows,
+    int n_a, int n_b, int ksplit, cudaStream_t stream) {
+  if (partial == nullptr || out_a == nullptr || out_b == nullptr || rows <= 0 ||
+      n_a <= 0 || n_b <= 0 || ksplit < 1) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  const int threads = 256;
+  const int total = rows * (n_a + n_b);
+  glm52_gemv_split_reduce_kernel<<<(total + threads - 1) / threads, threads, 0,
+                                   stream>>>(partial, out_a, out_b, rows, n_a,
+                                             n_b, ksplit);
+  return consume_last_cuda_error();
+}
+
+// Capability query for the horizontal-pack route: reports the ksplit the mma
+// table would pick for (batch, n, k), 0 when the shape would take the
+// register tile. The rust side must NOT run a packed batched launch without a
+// table entry — the register tile would write the packed interleaved layout
+// no consumer understands.
+CUresult glm52_gemv_mma_ksplit_cuda(int batch, int n, int k, int* ksplit_out) {
+  if (ksplit_out == nullptr) return CUDA_ERROR_INVALID_VALUE;
+  *ksplit_out =
+      (batch == kBatchedGemvBatch4 || batch == kBatchedGemvBatchFull)
+          ? mma_config(batch, n, k).ksplit
+          : 0;
+  return CUDA_SUCCESS;
 }
 
 }  // extern "C"

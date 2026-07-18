@@ -77,7 +77,7 @@ fn sampling_params_steer_the_qwen35_sampler() {
         return;
     };
 
-    let handle = openinfer_qwen35_4b::start_engine_with_capacity(
+    let handle = openinfer_qwen35_4b::start_engine(
         Path::new(&model_path),
         EngineLoadOptions {
             enable_cuda_graph: true,

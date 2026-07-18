@@ -20,7 +20,7 @@
 //!   |
 //! hidden[6144]
 //!   +-- wk (fp8 linear) -> k_raw[128]
-//!   +-- weights_proj (bf16 GEMM) -> weights[32]
+//!   +-- weights_proj (bf16 min-latency GEMV) -> weights[32]
 //!   +-- k quant + cache write (glm52_indexer_k_quant_and_cache)
 //!   |
 //!   +-- DeepGEMM paged MQA logits (fuses per-head ReLU + weighting)
@@ -37,11 +37,11 @@ use openinfer_kernels::ops::{
     GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW, GLM52_INDEXER_HEAD_DIM, GLM52_INDEXER_TOPK,
     Glm52DeepGemmMqaLogitsShape, Glm52IndexerCacheInsert, Glm52IndexerCacheLayout,
     Glm52IndexerLocalTopKToSlots, Glm52IndexerTopK, Glm52MoeQuantShape, bf16_bytes_to_f32_into,
-    gemm_strided_batched_bf16, glm52_deepgemm_paged_mqa_logits_launch,
-    glm52_deepgemm_paged_mqa_metadata_launch, glm52_flashinfer_topk_2048_launch,
-    glm52_fp8_per_token_group_quant_bf16_launch, glm52_indexer_k_quant_and_cache_launch,
-    glm52_indexer_local_topk_to_slots_launch, glm52_indexer_rope_launch,
-    glm52_indexer_weights_fold_launch, layer_norm_into,
+    glm52_deepgemm_paged_mqa_logits_launch, glm52_deepgemm_paged_mqa_metadata_launch,
+    glm52_flashinfer_topk_2048_launch, glm52_fp8_per_token_group_quant_bf16_launch,
+    glm52_indexer_k_quant_and_cache_launch, glm52_indexer_local_topk_to_slots_launch,
+    glm52_indexer_rope_launch, glm52_indexer_weights_fold_launch,
+    glm52_indexer_weights_proj_launch, layer_norm_into,
 };
 use openinfer_kernels::tensor::DeviceContext;
 
@@ -65,7 +65,7 @@ const K_NORM_EPS: f32 = 1.0e-6;
 pub(crate) struct Glm52IndexerLayerWeights {
     wq_b: ProjWeight,              // [32*128, 2048]
     wk: ProjWeight,                // [128, 6144]
-    weights_proj: CudaSlice<bf16>, // [32, 6144] — bf16 GEMM (transformers _keep_in_fp32_modules)
+    weights_proj: CudaSlice<bf16>, // [32, 6144] — bf16 GEMV (transformers _keep_in_fp32_modules)
     k_norm_w: CudaSlice<f32>,      // [128] — LayerNorm gamma (f32 for FlashInfer)
     k_norm_b: CudaSlice<f32>,      // [128] — LayerNorm beta  (f32 for FlashInfer)
 }
@@ -398,30 +398,17 @@ pub(crate) fn glm52_indexer_forward_into(
         Some(&mut s.gemv_partial),
         &mut s.k_raw,
     )?; // [T, 128]
-    // weights_proj: bf16 GEMM (transformers keeps weights_proj in fp32 via
-    // _keep_in_fp32_modules; checkpoint stores bf16, so bf16 GEMM is the
-    // closest match without a dedicated f32 GEMM path).
-    // cuBLAS column-major: weights [32, 6144] row-major = [6144, 32]^T,
-    // hidden [T, 6144] row-major = [6144, T] col-major. So m=32, n=T, k=6144,
-    // op_a=T, op_b=N; the col-major [32, T] output IS the row-major [T, 32]
-    // layout the fold consumes.
-    gemm_strided_batched_bf16(
+    // weights_proj: bf16 in/out (transformers keeps it fp32 via
+    // _keep_in_fp32_modules; the checkpoint stores bf16). Min-latency GEMV,
+    // [T, 32] row-major out — the layout the fold consumes.
+    glm52_indexer_weights_proj_launch(
         ctx,
-        true,        // transpose_a: weights [32, 6144] row-major → col-major
-        false,       // transpose_b: hidden [6144, T] col-major
-        INDEX_HEADS, // m = 32
-        t,           // n = batch rows
-        HIDDEN,      // k = 6144
-        &w.weights_proj,
-        HIDDEN, // lda = k (row stride of transposed weights)
-        0,      // stride_a (batch=1, unused)
         hidden.data(),
-        HIDDEN, // ldb = k
-        0,      // stride_b
+        &w.weights_proj,
+        t,
+        INDEX_HEADS,
+        HIDDEN,
         &mut s.weights_bf16,
-        INDEX_HEADS, // ldc = m
-        0,           // stride_c
-        1,           // batch
     )?;
     // ---- k LayerNorm (eps=1e-6, with bias), one CTA per row ----
     layer_norm_into(

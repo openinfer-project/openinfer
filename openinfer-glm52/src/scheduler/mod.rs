@@ -45,7 +45,7 @@ mod testkit;
 
 use std::collections::VecDeque;
 
-use openinfer_core::engine::{GenerateRequest, LoadSnapshot, TokenEvent, unix_now_s};
+use openinfer_core::engine::{GenerateRequest, LoadSnapshot, TokenEvent};
 use openinfer_kv_cache::{BlockPool, RequestKv};
 use openinfer_kv_offload::OffloadEngine;
 use openinfer_sample::mix_seed;
@@ -55,11 +55,13 @@ use crate::model::{
     GLM52_MAX_BATCH_PER_RANK, GLM52_MODEL_LEN_ALIGN, Glm52StepKv, Glm52StepShape,
     glm52_pool_blocks, glm52_table_width,
 };
-use crate::runner::{Glm52RankWorker, Glm52StepFlags};
+use crate::runner::{Glm52StepFlags, Glm52Worker};
 
-use admission::{intake, lifetime_blocks};
+use admission::{admit_from_queue, intake};
 use graph::{GraphDumpRequest, dump_rank0_decode_graph, precapture_step_graphs};
 use load::{pending_is_empty, publish_load, running_counts};
+pub(crate) use offload::REMOTE_FETCH_DEADLINE;
+use offload::VllmPdState;
 use plan::{collect_sampling_rows, feed_wants, launch_ahead_flags, plan_step_shapes};
 use slot::{GLM52_PADDING_STEP, Glm52SlotState, Glm52StepOutcome};
 
@@ -107,14 +109,16 @@ enum SpanKind {
 /// fails (the EP8 collective group cannot recover from a failed step — see
 /// the teardown comment below).
 #[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_dp8_coordinator(
     mut submit_rx: mpsc::UnboundedReceiver<GenerateRequest>,
-    workers: Vec<Glm52RankWorker>,
+    workers: Vec<Glm52Worker>,
     eos_token_ids: &[u32],
     dspark_enabled: bool,
     max_model_len: usize,
     no_prefix_cache: bool,
     offload: Option<Vec<OffloadEngine>>,
+    vllm_compat: Option<crate::Glm52VllmCompatOptions>,
     moe_topo: crate::Glm52MoeTopo,
     load_txs: Vec<watch::Sender<LoadSnapshot>>,
     graph_dump_request: Option<GraphDumpRequest>,
@@ -144,8 +148,17 @@ pub(crate) fn run_dp8_coordinator(
     } else {
         slot::GLM52_DSPARK_EP8_SPAN_DRAFTS
     };
-    let offload: Option<Vec<offload::RankOffload>> =
-        offload.map(|engines| engines.into_iter().map(offload::RankOffload::new).collect());
+    // vLLM-compat P/D disables self-saves: the content domain carries the
+    // peer's key scheme, and the peer re-registers the full history each turn.
+    let save_enabled = vllm_compat.is_none();
+    let offload: Option<Vec<offload::RankOffload>> = offload.map(|engines| {
+        engines
+            .into_iter()
+            .map(|engine| offload::RankOffload::new(engine, save_enabled))
+            .collect()
+    });
+    let mut vllm_pd =
+        vllm_compat.map(|opts| VllmPdState::new(&opts, moe_topo.logical_rank_count()));
     // One KV page pool per LOGICAL rank: pool block ids index the rank's
     // per-layer MLA and index-K arenas directly (the arenas were built for
     // `glm52_pool_blocks` blocks). Block 0-equivalent is the reserved
@@ -264,6 +277,9 @@ pub(crate) fn run_dp8_coordinator(
             &pools,
             &usable_blocks,
             offload.as_deref(),
+            &mut vllm_pd,
+            &workers,
+            mirrored,
             prefix_cache_enabled,
             dspark_enabled,
             &mut pending_resets,
@@ -274,6 +290,12 @@ pub(crate) fn run_dp8_coordinator(
         }
         publish_load(&load_txs, &pools, &slots, &pending);
         if all_idle(&slots) {
+            // A parked P/D front re-queries at admission; with no running
+            // slots there is no step cadence to pace the retries — throttle
+            // instead of spinning on the MetaServer.
+            if vllm_pd.as_ref().is_some_and(VllmPdState::any_parked) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
             continue;
         }
 
@@ -401,120 +423,6 @@ pub(crate) fn run_dp8_coordinator(
     drop(workers);
 }
 
-/// Admission: fill each rank's free slots from its own FIFO queue while its
-/// full-lifetime KV budget permits. The frontend already selected the rank;
-/// admission must never move the request or its metrics/KV ownership diverge.
-/// New requests join the lock-step at the next step boundary. An `Err` is a
-/// kvbm invariant break — the caller fails the step (the affected request was
-/// already answered here).
-#[allow(clippy::too_many_arguments)]
-fn admit_from_queue(
-    pending: &mut [VecDeque<GenerateRequest>],
-    slots: &mut [RankSlots],
-    pools: &[BlockPool],
-    usable_blocks: &[usize],
-    offload: Option<&[offload::RankOffload]>,
-    prefix_cache_enabled: bool,
-    dspark_enabled: bool,
-    pending_resets: &mut [Vec<usize>],
-    slots_changed: &mut bool,
-) -> anyhow::Result<()> {
-    assert_eq!(pending.len(), slots.len());
-    let mut committed: Vec<usize> = slots
-        .iter()
-        .map(|rank_slots| {
-            rank_slots
-                .iter()
-                .flatten()
-                .map(|active| {
-                    lifetime_blocks(active.req.prompt_tokens.len(), active.req.max_tokens)
-                })
-                .sum()
-        })
-        .collect();
-    // Pages pinned by in-flight release saves are physically unallocatable
-    // until their D2H lands. Hide them from each rank's full-lifetime budget
-    // so admission defers instead of promising pages a later schedule cannot
-    // get (which would fail the whole engine).
-    let usable: Vec<usize> = match offload {
-        Some(offload) => usable_blocks
-            .iter()
-            .zip(offload)
-            .map(|(&usable, rank)| usable.saturating_sub(rank.pinned_blocks()))
-            .collect(),
-        None => usable_blocks.to_vec(),
-    };
-
-    for rank in 0..slots.len() {
-        while let Some(slot) = slots[rank].iter().position(Option::is_none) {
-            let Some(front) = pending[rank].front() else {
-                break;
-            };
-            let need_blocks = lifetime_blocks(front.prompt_tokens.len(), front.max_tokens);
-            if committed[rank] + need_blocks > usable[rank] {
-                break;
-            }
-
-            let req = pending[rank].pop_front().expect("checked non-empty");
-            // The client left while the request sat in the queue — admitting
-            // it would burn a slot (and whole global steps) on a dead sink.
-            if req.token_tx.is_closed() {
-                continue;
-            }
-            let mut kv = pools[rank].new_request(req.prompt_tokens.clone(), req.max_tokens, None);
-            // Host-tier restore first, so the GPU prefix match sees the union
-            // of HBM-resident and freshly-restored blocks. The probe stays
-            // alive across the match to close the eviction window.
-            let _restored_hold = offload.filter(|_| prefix_cache_enabled).map(|offload| {
-                offload::restore_host_prefix(
-                    &offload[rank].engine,
-                    &pools[rank],
-                    &req.prompt_tokens,
-                )
-            });
-            let cached_tokens = if prefix_cache_enabled {
-                match kv.match_and_add_prefix(&pools[rank]) {
-                    Ok(cached) => cached,
-                    Err(err) => {
-                        // The request is already out of `pending` and never
-                        // reaches a slot, so fail it explicitly before the
-                        // engine-fatal invariant error propagates.
-                        let err = err.context("GLM5.2 prefix match at admission");
-                        let _ = req.token_tx.send(TokenEvent::Error {
-                            message: format!("{err:#}"),
-                            prompt_tokens: req.prompt_tokens.len(),
-                            completion_tokens: 0,
-                        });
-                        return Err(err);
-                    }
-                }
-            } else {
-                0
-            };
-            let queued_at_unix_s = req.queued_at_unix_s.unwrap_or_else(unix_now_s);
-            let _ = req.token_tx.send(TokenEvent::Scheduled {
-                queued_at_unix_s,
-                scheduled_at_unix_s: unix_now_s(),
-                prompt_tokens: req.prompt_tokens.len(),
-                cached_tokens,
-            });
-            let state = Glm52SlotState::new(
-                req.prompt_tokens.clone(),
-                req.max_tokens,
-                req.params.ignore_eos,
-                cached_tokens,
-            );
-            if dspark_enabled {
-                pending_resets[rank].push(slot);
-            }
-            slots[rank][slot] = Some(ActiveRequest { req, state, kv });
-            committed[rank] += need_blocks;
-            *slots_changed = true;
-        }
-    }
-    Ok(())
-}
-
 /// One lock-step step: per-rank submit — schedule each active span's KV
 /// (full-lifetime reservation makes every schedule succeed; a failure is an
 /// accounting bug and fails the step), build the row inputs, page rows and
@@ -525,7 +433,7 @@ fn admit_from_queue(
 /// slot (`span_kinds[rank][slot]`), which the output walk pairs exactly.
 #[allow(clippy::type_complexity)]
 fn submit_and_join_step(
-    workers: &[Glm52RankWorker],
+    workers: &[Glm52Worker],
     pools: &[BlockPool],
     slots: &mut [RankSlots],
     shapes: &[Glm52StepShape],
@@ -636,7 +544,7 @@ fn submit_and_join_step(
             pages: pages.into_boxed_slice(),
             slot_mapping,
         };
-        let executors: &[Glm52RankWorker] = if mirrored {
+        let executors: &[Glm52Worker] = if mirrored {
             workers
         } else {
             std::slice::from_ref(&workers[rank])
@@ -851,7 +759,7 @@ fn apply_step_outputs(
 /// keeps the round cadence (draft sits between verify steps, ~2 ms against a
 /// 22-46 ms step).
 fn run_draft_round(
-    workers: &[Glm52RankWorker],
+    workers: &[Glm52Worker],
     slots: &mut [RankSlots],
     shapes: &[Glm52StepShape],
     pending_resets: &mut [Vec<usize>],
@@ -870,7 +778,7 @@ fn run_draft_round(
             continue;
         }
         let proposal_slots: Vec<usize> = proposals.iter().map(|&(slot, _, _)| slot).collect();
-        let executors: &[Glm52RankWorker] = if mirrored {
+        let executors: &[Glm52Worker] = if mirrored {
             workers
         } else {
             std::slice::from_ref(&workers[rank])

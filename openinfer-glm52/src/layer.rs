@@ -35,10 +35,8 @@ use crate::dense::Glm52DenseMlpWeights;
 #[cfg(test)]
 use crate::dense::glm52_dense_mlp_forward_into;
 use crate::indexer::{Glm52IndexerLayerWeights, glm52_indexer_forward_into};
-use crate::mla_decode::{
-    Glm52MlaLayerWeights, Glm52MlaSchedMetadata, glm52_mla_attend_into, glm52_mla_front_q_into,
-    glm52_mla_front_rest_into,
-};
+use crate::mla_decode::{Glm52MlaSchedMetadata, glm52_mla_attend_into};
+use crate::mla_front::{Glm52MlaLayerWeights, glm52_mla_front_q_into, glm52_mla_front_rest_into};
 use crate::moe_ep8::Glm52MoeEp8LayerWeights;
 use crate::rows::Rows;
 use crate::scratch::Glm52DecodeScratch;

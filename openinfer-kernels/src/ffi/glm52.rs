@@ -145,6 +145,15 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn glm52_vllm_rope_fixup_cuda(
+        arena_base: *mut u8,
+        block_stride_bytes: i64,
+        kind: i32,
+        pages: *const i32,
+        num_pages: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn glm52_mla_front_pack_fp8_cuda(
         ql_nope: *const Half,
         q_pe_base: *const Half,
@@ -281,6 +290,43 @@ unsafe extern "C" {
         inter: i32,
         stream: CUstream,
     ) -> CUresult;
+
+    pub fn glm52_fp8_weight_only_gemv_partials_cuda(
+        activation: *const Half,
+        weight: *const u8,
+        weight_scale: *const f32,
+        out: *mut Half,
+        scratch: *mut f32,
+        scratch_floats: usize,
+        batch: i32,
+        n: i32,
+        k: i32,
+        stream: CUstream,
+        ksplit_out: *mut i32,
+    ) -> CUresult;
+
+    pub fn glm52_gemv_reduce_silu_mul_cuda(
+        partial: *const f32,
+        output: *mut Half,
+        rows: i32,
+        inter: i32,
+        ksplit: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn glm52_gemv_split_reduce_cuda(
+        partial: *const f32,
+        out_a: *mut Half,
+        out_b: *mut Half,
+        rows: i32,
+        n_a: i32,
+        n_b: i32,
+        ksplit: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn glm52_gemv_mma_ksplit_cuda(batch: i32, n: i32, k: i32, ksplit_out: *mut i32)
+    -> CUresult;
 }
 
 macro_rules! declare_tp_ffi {

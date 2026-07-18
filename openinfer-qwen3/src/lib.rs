@@ -100,6 +100,10 @@ pub struct Qwen3OffloadOptions {
     /// MetaServer, peers pull missing prefixes over RDMA, and this engine
     /// serves theirs. The P/D disaggregation data plane.
     pub p2p: Option<Qwen3P2pOptions>,
+    /// `Some` when the P/D prefill peer is vLLM (pegaflow connector): offload
+    /// query keys switch from kvbm lineage hashes to vLLM's prefix-cache hash
+    /// scheme so this decode node can find the blocks vLLM registered.
+    pub vllm_compat: Option<Qwen3VllmCompatOptions>,
 }
 
 /// Cross-instance P2P KV sharing (see `openinfer_kv_offload::P2pConfig`).
@@ -121,6 +125,31 @@ pub struct Qwen3P2pOptions {
     pub flush_on_finish: bool,
 }
 
+/// Decode-node settings for a P/D deployment whose prefill node is vLLM with
+/// the pegaflow connector. vLLM registers KV under its own prefix-cache block
+/// hashes (`xxh3_128` over canonical-CBOR chained tuples — see
+/// `openinfer_kv_offload::VllmBlockHasher`); with this set, cold-request
+/// offload queries derive those keys instead of kvbm lineage hashes, and a
+/// zero hit waits out the producer's save/registration tail instead of
+/// immediately prefilling from scratch.
+///
+/// Requires on every vLLM prefill process: `--prefix-caching-hash-algo
+/// xxhash_cbor` and `PYTHONHASHSEED` set to `python_hash_seed` (unset, vLLM's
+/// chain root is `os.urandom` — unreproducible across processes).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Qwen3VllmCompatOptions {
+    /// The `PYTHONHASHSEED` value shared with every vLLM prefill process.
+    pub python_hash_seed: String,
+    /// The P side's pegaflow-connector namespace: an 8-hex digest the
+    /// connector derives from vLLM config and logs at startup
+    /// (`namespace=...`). Both sides must address the same content domain.
+    pub namespace: String,
+    /// How long a cold request keeps re-querying a zero hit before giving up
+    /// on the expected remote KV and prefilling locally. Covers the P side's
+    /// post-response save + MetaServer-registration tail (tens of ms).
+    pub miss_wait: std::time::Duration,
+}
+
 impl Qwen3OffloadOptions {
     /// 8 GiB host tier — a few thousand dense Qwen3-4B blocks.
     pub const DEFAULT_PINNED_POOL_BYTES: usize = 8 << 30;
@@ -131,6 +160,7 @@ impl Qwen3OffloadOptions {
             pinned_pool_bytes: 0,
             use_hugepages: false,
             p2p: None,
+            vllm_compat: None,
         }
     }
 
@@ -140,12 +170,19 @@ impl Qwen3OffloadOptions {
             pinned_pool_bytes,
             use_hugepages: false,
             p2p: None,
+            vllm_compat: None,
         }
     }
 
     #[must_use]
     pub fn with_p2p(mut self, p2p: Qwen3P2pOptions) -> Self {
         self.p2p = Some(p2p);
+        self
+    }
+
+    #[must_use]
+    pub fn with_vllm_compat(mut self, compat: Qwen3VllmCompatOptions) -> Self {
+        self.vllm_compat = Some(compat);
         self
     }
 }
@@ -410,12 +447,15 @@ fn start_engine_with_offload_inner(
     let model_path = model_path
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("model path must be valid UTF-8"))?;
-    ensure_batch_invariant_supported(
-        decode_overlap,
-        batch_invariant,
-        dflash_draft_model_path.is_some(),
-        device_ordinals.len(),
-    )?;
+    if batch_invariant {
+        ensure_batch_invariant_supported(
+            decode_overlap,
+            no_prefix_cache,
+            offload_options.enabled,
+            dflash_draft_model_path.is_some(),
+            device_ordinals.len(),
+        )?;
+    }
     apply_batch_invariant_policy(batch_invariant);
     let dflash_draft_model_path = dflash_draft_model_path
         .map(|path| {
@@ -459,12 +499,6 @@ pub fn start_engine_with_lora_control(
     let model_path = model_path
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("model path must be valid UTF-8"))?;
-    ensure_batch_invariant_supported(
-        decode_overlap,
-        batch_invariant,
-        false,
-        device_ordinals.len(),
-    )?;
     if batch_invariant {
         anyhow::bail!(
             "--batch-invariant is not supported with LoRA: the decode-GEMM pin warms and self-checks \
@@ -500,25 +534,39 @@ fn apply_batch_invariant_policy(batch_invariant: bool) {
 
 fn ensure_batch_invariant_supported(
     decode_overlap: DecodeOverlap,
-    batch_invariant: bool,
+    no_prefix_cache: bool,
+    offload: bool,
     dflash: bool,
     world_size: usize,
 ) -> Result<()> {
-    if batch_invariant && !matches!(decode_overlap, DecodeOverlap::Off) {
+    if !matches!(decode_overlap, DecodeOverlap::Off) {
         anyhow::bail!(
             "--batch-invariant is not compatible with --decode-overlap; the stream override would force the pinned GEMM to bail at runtime"
         );
     }
-    if batch_invariant && world_size > 1 {
+    if offload {
+        anyhow::bail!(
+            "--batch-invariant is not supported with KV offload: offload keeps prefix matching on \
+             (--no-prefix-cache only disables HBM retention there), and a host-tier prefix hit \
+             shifts a prompt's chunk boundaries off the request-local grid"
+        );
+    }
+    if world_size > 1 {
         anyhow::bail!(
             "--batch-invariant is not supported with tensor parallelism: world_size={world_size} has unverified cross-rank reduction order"
         );
     }
-    if batch_invariant && dflash {
+    if dflash {
         anyhow::bail!(
             "--batch-invariant is not supported with DFlash speculative decoding: the decode-GEMM \
              pin warms and self-checks only the base projections, so the drafter's fc/MLP GEMMs \
              are not pinned and would bail at the GEMM boundary under Pin"
+        );
+    }
+    if !no_prefix_cache {
+        anyhow::bail!(
+            "--batch-invariant requires --no-prefix-cache; prefix-cache hits move a prompt's chunk \
+             boundaries off the request-local grid, so batch-invariant prefill cannot be provided"
         );
     }
     Ok(())

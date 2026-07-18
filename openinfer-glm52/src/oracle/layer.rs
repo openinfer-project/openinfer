@@ -43,7 +43,8 @@ use crate::layer::{
     Glm52DecodeStep, Glm52DecoderLayerWeights, Glm52LayerCaches, Glm52LayerIndexer, Glm52LayerMlp,
     glm52_decoder_layer_forward,
 };
-use crate::mla_decode::{Glm52MlaLayerWeights, Glm52MlaSchedMetadata};
+use crate::mla_decode::Glm52MlaSchedMetadata;
+use crate::mla_front::Glm52MlaLayerWeights;
 use crate::model::{INDEX_CACHE_BLOCK, NUM_SMS, rope_tables};
 use crate::moe_decode::Glm52MoeRoutedExpertBytes;
 use crate::scratch::Glm52DecodeScratch;

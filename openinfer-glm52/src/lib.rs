@@ -19,13 +19,15 @@ mod indexer;
 mod indexer_smoke;
 mod layer;
 mod mla_decode;
+mod mla_front;
 mod model;
 mod moe_decode;
-mod moe_ep4;
 mod moe_ep8;
+mod moe_ep_wo;
 mod moe_tp;
 #[cfg(test)]
 mod oracle;
+mod remote;
 mod rows;
 mod runner;
 mod scheduler;
@@ -38,11 +40,14 @@ use std::{
     time::Instant,
 };
 
-use anyhow::{Context as _, Result, ensure};
+use anyhow::{Context as _, Result, bail, ensure};
 use bytesize::ByteSize;
 use openinfer_core::engine::{EngineHandle, KvCapacity, LoadSnapshot};
 use openinfer_kv_offload::{HostConfig, KvArena, OffloadEngine, OffloadHost};
-use runner::{Glm52RankPlacement, Glm52RankWorker};
+use remote::Glm52RemoteNode;
+use runner::{Glm52RankPlacement, Glm52RankWorker, Glm52Worker};
+
+pub use remote::serve_rank_host;
 use tokio::sync::{mpsc, watch};
 use weights::{GLM52_EP_RANKS, Glm52RankLoadBundle, Glm52WeightManifest};
 
@@ -98,11 +103,44 @@ pub struct Glm52LaunchOptions {
     /// The requested PNG gets a complete sibling `.dot` for machine
     /// inspection.
     pub dump_graph_png: Option<PathBuf>,
+    /// Remote rank-host nodes (cross-node EP): each entry contributes its
+    /// `ranks` workers AFTER the local ranks, in list order. The local
+    /// process keeps ranks `0..device_count - Σ remote` on its own GPUs.
+    /// Empty (the default) is the single-node engine, byte-for-byte.
+    pub rank_hosts: Vec<Glm52RankHostSpec>,
+}
+
+/// One `--rank-hosts` entry: `host:port=ranks` (e.g. `10.13.84.7:19000=4`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Glm52RankHostSpec {
+    pub addr: String,
+    pub ranks: usize,
+}
+
+impl std::str::FromStr for Glm52RankHostSpec {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        let (addr, ranks) = s
+            .rsplit_once('=')
+            .with_context(|| format!("rank-host spec `{s}` must be host:port=ranks"))?;
+        let ranks: usize = ranks
+            .parse()
+            .with_context(|| format!("rank-host spec `{s}` has a non-numeric rank count"))?;
+        ensure!(
+            !addr.is_empty() && ranks > 0,
+            "rank-host spec `{s}` must be host:port=ranks with ranks > 0"
+        );
+        Ok(Self {
+            addr: addr.to_string(),
+            ranks,
+        })
+    }
 }
 
 /// Launch-time MoE sharding topology (the expert slab is repacked during
 /// H2D load, so this is a boot choice — the two layouts never co-reside).
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Glm52MoeTopo {
     #[default]
     Ep8,
@@ -112,6 +150,12 @@ pub enum Glm52MoeTopo {
     /// arch-portable weight-only mma chain instead of the sm_90a DeepGEMM
     /// masked chain.
     Ep4,
+    /// Cross-tray expert-parallel widths on GB300 NVL72 (4 GPUs per tray,
+    /// remote ranks behind `--rank-hosts`). Same DeepEP protocol with one
+    /// shim instantiation per width; all run the weight-only chain.
+    Ep16,
+    Ep32,
+    Ep64,
     Tp8,
     Tp4,
 }
@@ -120,9 +164,8 @@ impl Glm52MoeTopo {
     #[must_use]
     pub fn default_dp_size(self) -> usize {
         match self {
-            Self::Ep8 | Self::Tp8 => GLM52_EP_RANKS,
-            Self::Ep4 => 4,
             Self::Tp4 => 1,
+            _ => self.device_count(),
         }
     }
 
@@ -131,6 +174,9 @@ impl Glm52MoeTopo {
         match self {
             Self::Ep8 | Self::Tp8 => GLM52_EP_RANKS,
             Self::Ep4 | Self::Tp4 => 4,
+            Self::Ep16 => 16,
+            Self::Ep32 => 32,
+            Self::Ep64 => 64,
         }
     }
 
@@ -150,23 +196,23 @@ impl Glm52MoeTopo {
     #[must_use]
     pub fn expected_tp_size(self) -> usize {
         match self {
-            Self::Ep8 | Self::Ep4 | Self::Tp8 => 1,
             Self::Tp4 => 4,
+            _ => 1,
         }
     }
 
     #[must_use]
     pub(crate) fn expected_ep_size(self) -> usize {
         match self {
-            Self::Ep8 | Self::Tp8 => GLM52_EP_RANKS,
-            Self::Ep4 => 4,
+            Self::Tp8 => GLM52_EP_RANKS,
             Self::Tp4 => 1,
+            _ => self.device_count(),
         }
     }
 
     #[must_use]
     pub(crate) fn uses_ep_expert_bundles(self) -> bool {
-        matches!(self, Self::Ep8 | Self::Ep4)
+        !self.uses_tensor_replicated_moe()
     }
 
     /// Whole routed experts per rank of an expert-bundle topology (EP8 → 32,
@@ -188,12 +234,18 @@ impl std::str::FromStr for Glm52MoeTopo {
 
     fn from_str(s: &str) -> Result<Self> {
         match s {
-            "ep8" => Ok(Self::Ep8),
             "ep4" => Ok(Self::Ep4),
+            "ep8" => Ok(Self::Ep8),
+            "ep16" => Ok(Self::Ep16),
+            "ep32" => Ok(Self::Ep32),
+            "ep64" => Ok(Self::Ep64),
             "tp8" => Ok(Self::Tp8),
             "tp4" => Ok(Self::Tp4),
             other => {
-                anyhow::bail!("GLM5.2 MoE topology must be ep8, ep4, tp8, or tp4, got {other}")
+                anyhow::bail!(
+                    "GLM5.2 MoE topology must be ep4, ep8, ep16, ep32, ep64, tp8, or tp4, \
+                     got {other}"
+                )
             }
         }
     }
@@ -243,6 +295,25 @@ mod topology_tests {
         assert_eq!(Glm52MoeTopo::Ep4.ep_local_experts(), 64);
         assert_eq!("ep4".parse::<Glm52MoeTopo>().unwrap(), Glm52MoeTopo::Ep4);
     }
+
+    #[test]
+    fn cross_tray_ep_widths_shard_all_routed_experts() {
+        for (topo, ranks, local) in [
+            (Glm52MoeTopo::Ep16, 16, 16),
+            (Glm52MoeTopo::Ep32, 32, 8),
+            (Glm52MoeTopo::Ep64, 64, 4),
+        ] {
+            assert_eq!(topo.default_dp_size(), ranks);
+            assert_eq!(topo.device_count(), ranks);
+            assert_eq!(topo.logical_rank_count(), ranks);
+            assert_eq!(topo.expected_tp_size(), 1);
+            assert_eq!(topo.expected_ep_size(), ranks);
+            assert!(topo.uses_ep_expert_bundles());
+            assert!(!topo.uses_tensor_replicated_moe());
+            assert_eq!(topo.ep_local_experts(), local);
+            assert_eq!(format!("ep{ranks}").parse::<Glm52MoeTopo>().unwrap(), topo);
+        }
+    }
 }
 
 /// Host-tier KV offload knobs. One `PegaEngine` (one pinned pool) backs all
@@ -259,6 +330,56 @@ pub struct Glm52KvOffloadOptions {
     /// Back the pool with hugepages (the box must hold a reservation —
     /// check `HugePages_Total`).
     pub use_hugepages: bool,
+    /// `Some` joins the cross-instance P2P mesh: saved block hashes register
+    /// with the MetaServer and missing prefixes are pulled from peer
+    /// instances over RDMA — the P/D disaggregation data plane.
+    pub p2p: Option<Glm52P2pOptions>,
+    /// `Some` when the P/D prefill peer is vLLM (pegaflow connector): offload
+    /// query keys switch from kvbm lineage hashes to vLLM's prefix-cache hash
+    /// scheme so this decode node can find the blocks vLLM registered.
+    /// Requires `p2p` (the peer's KV lives in its pegaflow-server's pool,
+    /// even on the same host).
+    pub vllm_compat: Option<Glm52VllmCompatOptions>,
+}
+
+/// Cross-instance P2P KV sharing (see `openinfer_kv_offload::P2pConfig`).
+#[derive(Clone, Debug)]
+pub struct Glm52P2pOptions {
+    /// MetaServer gRPC address, e.g. `http://10.0.0.100:50056`.
+    pub metaserver_addr: String,
+    /// This engine's routable `IP:port` (doubles as the embedded transfer
+    /// service's bind address). Must be reachable by every peer.
+    pub advertise_addr: String,
+    /// RDMA NIC device names to register the pinned pool on.
+    pub rdma_nics: Vec<String>,
+}
+
+/// Decode-node settings for a P/D deployment whose prefill node is vLLM with
+/// the pegaflow connector (see `openinfer_kv_offload::VllmBlockHasher` and
+/// `docs/models/glm52/pd-vllm-prefill.md`).
+///
+/// GLM5.2's decode node has no prefill path — prompt positions ride the
+/// decode kernels token-by-token (~worst case seconds per request) — so the
+/// contract here is stricter than qwen3's: the router appends the prefill
+/// peer's first generated token to the prompt, the full original prompt's KV
+/// (all full pages plus the partial tail page) must arrive from the peer, and
+/// a request whose remote KV never materializes is REJECTED for the router to
+/// retry, never silently prefilled locally.
+#[derive(Clone, Debug)]
+pub struct Glm52VllmCompatOptions {
+    /// The `PYTHONHASHSEED` value shared with every vLLM prefill process.
+    pub python_hash_seed: String,
+    /// The P side's pegaflow-connector namespace (8-hex digest logged by the
+    /// connector at startup as `namespace=...`).
+    pub namespace: String,
+    /// How long a cold request keeps re-querying a zero/partial hit before
+    /// giving up on the expected remote KV. Covers the P side's post-response
+    /// save + MetaServer-registration tail (tens of ms).
+    pub miss_wait: std::time::Duration,
+    /// Debug escape hatch: admit with local prompt compute when remote KV
+    /// never materializes, instead of rejecting. Leave OFF in production —
+    /// on GLM5.2 the fallback rides decode kernels token-by-token.
+    pub allow_local_prefill: bool,
 }
 
 pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHandle> {
@@ -271,22 +392,12 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
         kv_offload,
         moe_topo,
         dump_graph_png,
+        rank_hosts,
     } = options;
     if let Some(path) = &dump_graph_png {
         openinfer_core::cuda_graph::validate_graph_dump_request(path)?;
     }
     match moe_topo {
-        Glm52MoeTopo::Ep8 | Glm52MoeTopo::Ep4 | Glm52MoeTopo::Tp8 => {
-            ensure!(
-                tp_size == 1,
-                "GLM5.2 {moe_topo:?} requires --tp-size=1, got {tp_size}"
-            );
-            let expected_dp = moe_topo.default_dp_size();
-            ensure!(
-                dp_size == expected_dp,
-                "GLM5.2 {moe_topo:?} requires --dp-size={expected_dp} (or omitted), got {dp_size}"
-            );
-        }
         Glm52MoeTopo::Tp4 => {
             ensure!(
                 tp_size == 4,
@@ -295,6 +406,17 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
             ensure!(
                 dp_size == 1,
                 "GLM5.2 TP4 requires --dp-size=1 (or omitted), got {dp_size}"
+            );
+        }
+        _ => {
+            ensure!(
+                tp_size == 1,
+                "GLM5.2 {moe_topo:?} requires --tp-size=1, got {tp_size}"
+            );
+            let expected_dp = moe_topo.default_dp_size();
+            ensure!(
+                dp_size == expected_dp,
+                "GLM5.2 {moe_topo:?} requires --dp-size={expected_dp} (or omitted), got {dp_size}"
             );
         }
     }
@@ -314,13 +436,56 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
         "GLM5.2 --kv-offload requires the EP8 topology (tp8 replicates KV on all ranks; \
          a host-tier restore would land on one)"
     );
+    // The vLLM prefill peer's KV lives in its pegaflow-server's pool (a
+    // separate process even on the same host); without the P2P mesh the
+    // compat keys would query an empty local tier and every request would
+    // wait out the full miss window.
+    ensure!(
+        kv_offload
+            .as_ref()
+            .is_none_or(|kv| kv.vllm_compat.is_none() || kv.p2p.is_some()),
+        "GLM5.2 --kv-pd-vllm-seed requires the KV P2P mesh (--kv-p2p-metaserver-addr, \
+         --kv-p2p-advertise-addr, --kv-p2p-nics)"
+    );
+    // The miss window must sit inside the in-flight-fetch ceiling, or the
+    // registration phase could never hand over to the fetch phase.
+    ensure!(
+        kv_offload
+            .as_ref()
+            .and_then(|kv| kv.vllm_compat.as_ref())
+            .is_none_or(|c| c.miss_wait < scheduler::REMOTE_FETCH_DEADLINE),
+        "GLM5.2 --kv-pd-miss-wait-ms must stay below the {}s remote-fetch deadline",
+        scheduler::REMOTE_FETCH_DEADLINE.as_secs(),
+    );
+    let remote_ranks: usize = rank_hosts.iter().map(|host| host.ranks).sum();
+    if remote_ranks > 0 {
+        ensure!(
+            moe_topo.uses_ep_expert_bundles(),
+            "GLM5.2 --rank-hosts requires an EP topology (tensor-replicated MoE \
+             rendezvouses device pointers in-process)"
+        );
+        ensure!(
+            remote_ranks < moe_topo.device_count(),
+            "GLM5.2 --rank-hosts claims {remote_ranks} ranks but {moe_topo:?} has only {} \
+             (the coordinator keeps at least rank 0 local)",
+            moe_topo.device_count()
+        );
+        // Remote arenas hold device pointers that cannot cross the wire; the
+        // host tier would need a per-node offload host + the Event facts
+        // plane (cross-node-scaling.md) — not built yet.
+        ensure!(
+            kv_offload.is_none(),
+            "GLM5.2 --kv-offload is not supported with --rank-hosts yet"
+        );
+    }
     start_engine(
         model_path,
         &Glm52LoadOptions {
-            device_ordinals: (0..moe_topo.device_count()).collect(),
+            device_ordinals: (0..moe_topo.device_count() - remote_ranks).collect(),
             tp_size,
             dp_size,
             ep_size: moe_topo.expected_ep_size(),
+            rank_hosts,
         },
         dspark_draft_model_path.as_deref(),
         max_model_len,
@@ -462,15 +627,19 @@ fn derive_max_model_len(
 
 #[derive(Clone, Debug)]
 struct Glm52LoadOptions {
+    /// Ordinals for the LOCAL ranks (`0..local_count`); remote ranks live on
+    /// their rank-hosts' own devices.
     device_ordinals: Vec<usize>,
     tp_size: usize,
     dp_size: usize,
     ep_size: usize,
+    rank_hosts: Vec<Glm52RankHostSpec>,
 }
 
 #[derive(Debug)]
 struct StartupValidation {
     device_ordinals: Vec<usize>,
+    rank_hosts: Vec<Glm52RankHostSpec>,
     rank_bundles: Vec<Glm52RankLoadBundle>,
     rank_tensor_counts: Vec<usize>,
     rank_expert_ranges: Vec<std::ops::Range<usize>>,
@@ -485,7 +654,7 @@ struct GpuWeightLoadReport {
 }
 
 struct LoadedGlm52Runtime {
-    workers: Vec<Glm52RankWorker>,
+    workers: Vec<Glm52Worker>,
     report: GpuWeightLoadReport,
 }
 
@@ -517,18 +686,27 @@ fn start_engine(
         .copied()
         .min()
         .expect("at least one rank loaded");
-    let budget =
-        derive_max_model_len(requested_max_model_len, min_free_vram_bytes, dspark_enabled)?;
+    // The q_a|kv_a packed twins allocate during rank-model build, after this
+    // probe — charge them to the budget here so the derived cap still leaves
+    // the post-build headroom floor.
+    let qa_kva_twin_bytes = mla_front::glm52_qa_kva_twin_bytes()?;
+    let budget = derive_max_model_len(
+        requested_max_model_len,
+        min_free_vram_bytes.saturating_sub(qa_kva_twin_bytes),
+        dspark_enabled,
+    )?;
     let max_model_len = budget.max_model_len;
     log::info!(
-        "GLM5.2 max_model_len={max_model_len} ({}): min rank free VRAM {} after weights, \
-         cap-scaled arenas {} across {} slots{}, reserve {}, budget {}",
+        "GLM5.2 max_model_len={max_model_len} ({}): min rank free VRAM {} after weights \
+         (qa|kv_a twins {} charged), cap-scaled arenas {} across {} slots{}, reserve {}, \
+         budget {}",
         if requested_max_model_len.is_some() {
             "--max-model-len"
         } else {
             "VRAM-derived"
         },
         ByteSize(min_free_vram_bytes as u64),
+        ByteSize(qa_kva_twin_bytes as u64),
         ByteSize(budget.arena_bytes as u64),
         model::GLM52_MAX_BATCH_PER_RANK,
         if dspark_enabled {
@@ -560,6 +738,9 @@ fn start_engine(
                 return Err(err);
             }
         };
+    let vllm_compat = kv_offload
+        .as_ref()
+        .and_then(|opts| opts.vllm_compat.clone());
     let post_comm_startup = || -> Result<Option<Vec<OffloadEngine>>> {
         if let Some(dspark_path) = dspark_path {
             load_dspark_drafters(&loaded.workers, dspark_path)?;
@@ -608,6 +789,7 @@ fn start_engine(
                 max_model_len,
                 no_prefix_cache,
                 offload,
+                vllm_compat,
                 moe_topo,
                 load_txs,
                 graph_dump_request,
@@ -659,7 +841,7 @@ fn start_engine(
 
 /// Load the DSpark drafter on every rank (rank-local, ~3.8 GB bf16 each —
 /// the draft's embed/lm_head reuse the target's, so they are never loaded).
-fn load_dspark_drafters(workers: &[Glm52RankWorker], dspark_path: &Path) -> Result<()> {
+fn load_dspark_drafters(workers: &[Glm52Worker], dspark_path: &Path) -> Result<()> {
     let started = Instant::now();
     let responses = workers
         .iter()
@@ -684,10 +866,10 @@ fn load_dspark_drafters(workers: &[Glm52RankWorker], dspark_path: &Path) -> Resu
 /// graph instantiations and allocator slack need, fail the launch with the
 /// numbers — a reserve/ledger drift must crash here, not as a mid-serving
 /// OOM that tears the collective group down.
-fn ensure_post_build_headroom(workers: &[Glm52RankWorker]) -> Result<()> {
+fn ensure_post_build_headroom(workers: &[Glm52Worker]) -> Result<()> {
     let responses = workers
         .iter()
-        .map(Glm52RankWorker::free_vram_async)
+        .map(Glm52Worker::free_vram_async)
         .collect::<Result<Vec<_>>>()?;
     let mut per_rank = Vec::with_capacity(responses.len());
     for (rank, response) in responses.into_iter().enumerate() {
@@ -717,7 +899,7 @@ fn ensure_post_build_headroom(workers: &[Glm52RankWorker]) -> Result<()> {
 /// no useful error. TP4 currently stops after the per-rank build, before
 /// entering any EP8/TP8 collective setup.
 fn build_rank_models(
-    workers: &[Glm52RankWorker],
+    workers: &[Glm52Worker],
     max_model_len: usize,
     moe_topo: Glm52MoeTopo,
     dspark_enabled: bool,
@@ -735,9 +917,12 @@ fn build_rank_models(
                 .map_err(|_| anyhow::anyhow!("GLM5.2 rank {rank} dropped its build response"))??,
         );
     }
-    let unique_id = match moe_topo {
-        Glm52MoeTopo::Ep4 => openinfer_kernels::ops::glm52_ep4_deepep_unique_id()?,
-        _ => openinfer_kernels::ops::glm52_deepep_unique_id()?,
+    let unique_id = if moe_topo.uses_ep_expert_bundles() {
+        openinfer_kernels::ops::glm52_ep_deepep_unique_id(moe_topo.expected_ep_size())?
+    } else {
+        // TP allreduce bootstrap just needs one NCCL unique id; ride the EP8
+        // shim's generator.
+        openinfer_kernels::ops::glm52_ep_deepep_unique_id(8)?
     };
     let tp_exchange = moe_topo
         .uses_tensor_replicated_moe()
@@ -789,26 +974,52 @@ fn build_offload_engines(
         pinned_pool_bytes: opts.pinned_pool_bytes,
         use_hugepages: opts.use_hugepages,
         runtime_threads: 2,
-        p2p: None,
+        p2p: opts
+            .p2p
+            .as_ref()
+            .map(|p2p| openinfer_kv_offload::P2pConfig {
+                metaserver_addr: p2p.metaserver_addr.clone(),
+                advertise_addr: p2p.advertise_addr.clone(),
+                rdma_nics: p2p.rdma_nics.clone(),
+            }),
     })
     .map_err(|err| anyhow::anyhow!("GLM5.2 KV offload host: {err}"))?;
-    let namespace = format!(
-        "openinfer-glm52-l{GLM52_LAYERS}-p{}-mla{}-idxk{}",
-        mla_page_size,
-        mla_bytes_per_token,
-        config::GLM52_INDEX_HEAD_DIM + 4,
-    );
+    // vLLM-compat mode joins the *P side's* content domain: the pegaflow
+    // connector derives an 8-hex namespace from vLLM config (and logs it at
+    // startup); reproducing that derivation would mean chasing Python repr
+    // of vLLM internals, so the operator passes it through explicitly.
+    let namespace = match &opts.vllm_compat {
+        Some(compat) => compat.namespace.clone(),
+        None => format!(
+            "openinfer-glm52-l{GLM52_LAYERS}-p{}-mla{}-idxk{}",
+            mla_page_size,
+            mla_bytes_per_token,
+            config::GLM52_INDEX_HEAD_DIM + 4,
+        ),
+    };
+    // vLLM-compat: the P side's connector stores MLA-model blocks page-first —
+    // one host page per block, layers at offsets ordered by lexicographic
+    // layer name. Byte-identical interop therefore requires registering under
+    // vLLM's own layer names (same sort order ⇒ same page offsets; the
+    // per-layer byte widths already match by construction) and page-first.
+    let vllm_compat_active = opts.vllm_compat.is_some();
     let engines = rank_arenas
         .into_iter()
         .zip(device_ordinals)
         .enumerate()
-        .map(|(rank, (arenas, &device_ordinal))| {
+        .map(|(rank, (mut arenas, &device_ordinal))| {
+            if vllm_compat_active {
+                for arena in &mut arenas {
+                    arena.name = vllm_arena_name(&arena.name)?;
+                }
+            }
             OffloadEngine::with_arenas_on(
                 std::sync::Arc::clone(&host),
                 format!("glm52-rank{rank}"),
                 &namespace,
                 device_ordinal as i32,
                 &arenas,
+                vllm_compat_active,
             )
             .map_err(|err| anyhow::anyhow!("GLM5.2 KV offload rank {rank} registration: {err}"))
         })
@@ -830,6 +1041,22 @@ fn build_offload_engines(
 fn is_mla_arena_name(name: &str) -> bool {
     name.rsplit_once('.')
         .is_some_and(|(_, arena_kind)| arena_kind == "mla")
+}
+
+/// Map a native arena name (`glm52.L{n}.mla` / `glm52.L{n}.idxk`) to the name
+/// vLLM registers the same cache under (`GlmMoeDsaForCausalLM`, vLLM ≥ 0.24:
+/// MLA latent on every layer, indexer K only on full-indexer layers).
+fn vllm_arena_name(name: &str) -> Result<String> {
+    let parse = || -> Option<(usize, &str)> {
+        let rest = name.strip_prefix("glm52.L")?;
+        let (layer, kind) = rest.split_once('.')?;
+        Some((layer.parse().ok()?, kind))
+    };
+    match parse() {
+        Some((layer, "mla")) => Ok(format!("model.layers.{layer}.self_attn.attn")),
+        Some((layer, "idxk")) => Ok(format!("model.layers.{layer}.self_attn.indexer.k_cache")),
+        _ => bail!("GLM5.2 arena {name} has no vLLM-compat mapping"),
+    }
 }
 
 /// EOS ids from the checkpoint's generation_config.json (`eos_token_id` is a
@@ -872,9 +1099,12 @@ fn validate_startup(
     probe_config_json(&json)?;
 
     let expected_devices = moe_topo.device_count();
+    let remote_ranks: usize = options.rank_hosts.iter().map(|host| host.ranks).sum();
     ensure!(
-        options.device_ordinals.len() == expected_devices,
-        "GLM5.2 {moe_topo:?} load requires {expected_devices} devices, got {:?}",
+        options.device_ordinals.len() + remote_ranks == expected_devices,
+        "GLM5.2 {moe_topo:?} load requires {expected_devices} ranks, got {} local ({:?}) + \
+         {remote_ranks} remote",
+        options.device_ordinals.len(),
         options.device_ordinals
     );
     ensure!(
@@ -923,6 +1153,7 @@ fn validate_startup(
 
     Ok(StartupValidation {
         device_ordinals: options.device_ordinals.clone(),
+        rank_hosts: options.rank_hosts.clone(),
         rank_bundles,
         rank_tensor_counts,
         rank_expert_ranges,
@@ -936,13 +1167,28 @@ fn load_rank_weights_to_gpu(
 ) -> Result<LoadedGlm52Runtime> {
     let spawn_started = Instant::now();
     log::info!(
-        "start spawn GLM5.2 rank workers: ranks={}",
-        startup.rank_bundles.len()
+        "start spawn GLM5.2 rank workers: ranks={} ({} local + {} remote nodes)",
+        startup.rank_bundles.len(),
+        startup.device_ordinals.len(),
+        startup.rank_hosts.len(),
     );
     let mut workers = Vec::with_capacity(startup.rank_bundles.len());
-    for (rank, bundle) in startup.rank_bundles.iter().enumerate() {
-        let placement = Glm52RankPlacement::new(rank, startup.device_ordinals[rank])?;
-        workers.push(Glm52RankWorker::spawn(placement, bundle.clone())?);
+    for (rank, &device_ordinal) in startup.device_ordinals.iter().enumerate() {
+        let placement = Glm52RankPlacement {
+            rank,
+            device_ordinal,
+        };
+        workers.push(Glm52Worker::Local(Glm52RankWorker::spawn(
+            placement,
+            startup.rank_bundles[rank].clone(),
+        )?));
+    }
+    let mut next_rank = startup.device_ordinals.len();
+    for host in &startup.rank_hosts {
+        let remote =
+            Glm52RemoteNode::connect(&host.addr, model_path, moe_topo, next_rank, host.ranks)?;
+        next_rank += host.ranks;
+        workers.extend(remote.into_iter().map(Glm52Worker::Remote));
     }
     log::info!(
         "spawn GLM5.2 rank workers cost {:.2}s: ranks={}",

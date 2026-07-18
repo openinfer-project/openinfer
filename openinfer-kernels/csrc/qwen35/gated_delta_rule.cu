@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include <cmath>
+#include <stdint.h>
 
 // ============================================================================
 // Gated Delta Rule — Recurrent decode step for linear attention
@@ -170,6 +171,135 @@ __global__ void gated_delta_rule_decode_kernel(
     }
 }
 
+__global__ void gated_delta_rule_decode_batch_kernel(
+    const __nv_bfloat16* __restrict__ qkv_batch,   // [batch, qkv_dim]
+    const __nv_bfloat16* __restrict__ b_proj_batch, // [batch, num_value_heads]
+    const __nv_bfloat16* __restrict__ a_proj_batch, // [batch, num_value_heads]
+    const __nv_bfloat16* __restrict__ dt_bias,      // [num_value_heads]
+    const float* __restrict__ A_log,                // [num_value_heads]
+    const uint64_t* __restrict__ state_ptrs,        // [batch] device pointers
+    __nv_bfloat16* __restrict__ output_batch,       // [batch, num_value_heads * val_dim]
+    int num_key_heads,
+    int num_value_heads,
+    int key_dim,
+    int val_dim
+) {
+    int slot = blockIdx.y;
+    int v_head = blockIdx.x;
+    int val_idx = threadIdx.x & 0x7F;
+    int j_slice = threadIdx.x >> 7;
+    int warp_id = threadIdx.x >> 5;
+    int lane_id = threadIdx.x & 0x1F;
+
+    int k_head = v_head * num_key_heads / num_value_heads;
+    int q_dim_total = key_dim * num_key_heads;
+    int k_dim_total = q_dim_total;
+    int qkv_dim = q_dim_total + k_dim_total + num_value_heads * val_dim;
+
+    const __nv_bfloat16* qkv = qkv_batch + (size_t)slot * qkv_dim;
+    const __nv_bfloat16* b_proj = b_proj_batch + (size_t)slot * num_value_heads;
+    const __nv_bfloat16* a_proj = a_proj_batch + (size_t)slot * num_value_heads;
+
+    __shared__ float smem_q[GDR_KEY_DIM];
+    __shared__ float smem_k[GDR_KEY_DIM];
+    __shared__ float smem_norm[2];
+    __shared__ float warp_norms[GDR_BLOCK_DIM / WARP_SIZE];
+    __shared__ float s_exp_g;
+    __shared__ float s_beta;
+    __shared__ float smem_kv_partial[GDR_J_SLICES][GDR_VAL_DIM];
+    __shared__ float smem_out_partial[GDR_J_SLICES][GDR_VAL_DIM];
+
+    float q_val = __bfloat162float(qkv[k_head * key_dim + val_idx]);
+    float k_val = __bfloat162float(qkv[q_dim_total + k_head * key_dim + val_idx]);
+    float v_val = __bfloat162float(qkv[q_dim_total + k_dim_total + v_head * val_dim + val_idx]);
+
+    float q_sq = (j_slice == 0) ? q_val * q_val : 0.0f;
+    q_sq = warp_reduce_sum(q_sq);
+    if (lane_id == 0) warp_norms[warp_id] = q_sq;
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        float total = warp_norms[0] + warp_norms[1] + warp_norms[2] + warp_norms[3];
+        smem_norm[0] = rsqrtf(total + 1e-12f);
+    }
+    __syncthreads();
+
+    float k_sq = (j_slice == 0) ? k_val * k_val : 0.0f;
+    k_sq = warp_reduce_sum(k_sq);
+    if (lane_id == 0) warp_norms[warp_id] = k_sq;
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        float total = warp_norms[0] + warp_norms[1] + warp_norms[2] + warp_norms[3];
+        smem_norm[1] = rsqrtf(total + 1e-12f);
+    }
+    __syncthreads();
+
+    q_val *= smem_norm[0];
+    k_val *= smem_norm[1];
+    q_val *= rsqrtf((float)key_dim);
+
+    if (j_slice == 0) {
+        smem_q[val_idx] = q_val;
+        smem_k[val_idx] = k_val;
+    }
+
+    if (threadIdx.x == 0) {
+        float a_val = __bfloat162float(a_proj[v_head]);
+        float b_val = __bfloat162float(b_proj[v_head]);
+        float bias = __bfloat162float(dt_bias[v_head]);
+        float a_log = A_log[v_head];
+
+        float x = a_val + bias;
+        float softplus_x = (x > 20.0f) ? x : logf(1.0f + expf(x));
+        float g = -expf(a_log) * softplus_x;
+        s_exp_g = expf(g);
+        s_beta = 1.0f / (1.0f + expf(-b_val));
+    }
+    __syncthreads();
+
+    float exp_g = s_exp_g;
+    float beta = s_beta;
+    float* state = reinterpret_cast<float*>(static_cast<uintptr_t>(state_ptrs[slot]));
+    float* my_state = state + v_head * key_dim * val_dim;
+
+    int j_start = j_slice * GDR_J_PER_SLICE;
+    int j_end = j_start + GDR_J_PER_SLICE;
+
+    float partial_kv = 0.0f;
+    for (int j = j_start; j < j_end; j++) {
+        float s = my_state[j * val_dim + val_idx];
+        s *= exp_g;
+        my_state[j * val_dim + val_idx] = s;
+        partial_kv += s * smem_k[j];
+    }
+
+    smem_kv_partial[j_slice][val_idx] = partial_kv;
+    __syncthreads();
+
+    float kv_mem = smem_kv_partial[0][val_idx] + smem_kv_partial[1][val_idx]
+                 + smem_kv_partial[2][val_idx] + smem_kv_partial[3][val_idx];
+    float my_delta = (v_val - kv_mem) * beta;
+
+    float partial_out = 0.0f;
+    for (int j = j_start; j < j_end; j++) {
+        float s = my_state[j * val_dim + val_idx];
+        s += my_delta * smem_k[j];
+        my_state[j * val_dim + val_idx] = s;
+        partial_out += s * smem_q[j];
+    }
+
+    smem_out_partial[j_slice][val_idx] = partial_out;
+    __syncthreads();
+
+    if (j_slice == 0) {
+        float out = smem_out_partial[0][val_idx] + smem_out_partial[1][val_idx]
+                   + smem_out_partial[2][val_idx] + smem_out_partial[3][val_idx];
+        output_batch[(size_t)slot * num_value_heads * val_dim + v_head * val_dim + val_idx] =
+            __float2bfloat16(out);
+    }
+}
+
 extern "C" {
 
 void gated_delta_rule_decode_cuda(
@@ -191,6 +321,28 @@ void gated_delta_rule_decode_cuda(
         qkv, b_proj, a_proj, dt_bias, A_log,
         state, output,
         num_key_heads, num_value_heads, key_dim, val_dim
+    );
+}
+
+void gated_delta_rule_decode_batch_cuda(
+    const __nv_bfloat16* qkv_batch,
+    const __nv_bfloat16* b_proj_batch,
+    const __nv_bfloat16* a_proj_batch,
+    const __nv_bfloat16* dt_bias,
+    const float* A_log,
+    const uint64_t* state_ptrs,
+    __nv_bfloat16* output_batch,
+    int batch_size,
+    int num_key_heads,
+    int num_value_heads,
+    int key_dim,
+    int val_dim,
+    cudaStream_t stream
+) {
+    dim3 grid(num_value_heads, batch_size);
+    gated_delta_rule_decode_batch_kernel<<<grid, GDR_BLOCK_DIM, 0, stream>>>(
+        qkv_batch, b_proj_batch, a_proj_batch, dt_bias, A_log, state_ptrs,
+        output_batch, num_key_heads, num_value_heads, key_dim, val_dim
     );
 }
 

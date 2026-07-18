@@ -311,7 +311,7 @@ fn check_lossless(
         eprintln!("  [diag] prompt {i} matched={matched}");
         eprintln!(
             "  [diag] context+gen base ids {:?} = {:?}",
-            &base_ids,
+            base_ids,
             tokenizer.decode(&base_ids, false).unwrap_or_default()
         );
         eprintln!(
@@ -400,7 +400,9 @@ fn dflash_speculative_greedy_matches_plain_greedy() {
     let (Some(model_path), Some(draft_path)) = (target_path_or_skip(), draft_path_or_skip()) else {
         return;
     };
-    let _gpu = GPU.lock().unwrap_or_else(|p| p.into_inner());
+    let _gpu = GPU
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let prompts = [
         "The capital of France is",
@@ -493,16 +495,19 @@ fn dflash_speculative_greedy_matches_plain_greedy() {
 /// is only ever captured/replayed at the maximal shape) it stays lossless.
 #[test]
 fn dflash_short_then_long_verify_capture_is_lossless() {
-    let (Some(model_path), Some(draft_path)) = (target_path_or_skip(), draft_path_or_skip()) else {
-        return;
-    };
-    let _gpu = GPU.lock().unwrap_or_else(|p| p.into_inner());
-
     // << block_size (16): the poison request's only verify step is a short
     // truncated span, capturing the bucket-bs=1 graph at total_tokens far below
     // the full span. The fewer valid rows, the sooner a full-span replay hits the
     // stale tail — so the victim diverges early, well clear of its token budget.
     const POISON_MAX_TOKENS: usize = 4;
+
+    let (Some(model_path), Some(draft_path)) = (target_path_or_skip(), draft_path_or_skip()) else {
+        return;
+    };
+    let _gpu = GPU
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
     let poison_prompt = "Hello, world! Tell me a story.";
     let victim_prompt = "Q: What is 17 multiplied by 23? A: Let's think step by step.";
 
@@ -578,7 +583,9 @@ fn dflash_concurrent_heterogeneous_is_lossless() {
     let (Some(model_path), Some(draft_path)) = (target_path_or_skip(), draft_path_or_skip()) else {
         return;
     };
-    let _gpu = GPU.lock().unwrap_or_else(|p| p.into_inner());
+    let _gpu = GPU
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     // Distinct prompts with staggered budgets: at any tick the in-flight batch
     // mixes full and near-budget (truncated) verify spans.
@@ -658,10 +665,14 @@ fn dflash_concurrent_heterogeneous_is_lossless() {
 /// panicked mid-prefill when the draft allocated KV past its own max positions.
 #[test]
 fn dflash_request_in_draft_headroom_is_rejected_not_panicked() {
+    const BLOCK_SIZE: usize = 16; // DFlash drafter block size.
+
     let (Some(model_path), Some(draft_path)) = (target_path_or_skip(), draft_path_or_skip()) else {
         return;
     };
-    let _gpu = GPU.lock().unwrap_or_else(|p| p.into_inner());
+    let _gpu = GPU
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     // Read the real context window so the boundary is exact regardless of the
     // checkpoint, then size the request to sit inside the draft's final in-fill
@@ -673,7 +684,6 @@ fn dflash_request_in_draft_headroom_is_rejected_not_panicked() {
     let max_pos = config["max_position_embeddings"]
         .as_u64()
         .expect("max_position_embeddings") as usize;
-    const BLOCK_SIZE: usize = 16; // DFlash drafter block size.
     let prompt_len = 16usize;
     // total in (max_pos - BLOCK_SIZE, max_pos]: clears the target check, trips
     // the DFlash admission cap (max_pos - BLOCK_SIZE).

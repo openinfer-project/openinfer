@@ -1,15 +1,15 @@
 #include "../common.cuh"
+#include "glm52_min_gemv.cuh"
 
-#include <cublas_v2.h>
 #include <cuda.h>
+#include <cuda_runtime.h>
 #include <math_constants.h>
-
-extern thread_local cublasHandle_t g_cublas_handle;
 
 namespace {
 
-constexpr int kRouterSelectThreads = 512;
 constexpr int kGlm52Experts = 256;
+// One thread per expert; threads past n_experts only idled (512 was inherited).
+constexpr int kRouterSelectThreads = kGlm52Experts;
 constexpr int kGlm52Topk = 8;
 
 __device__ __forceinline__ bool better_router_choice(float value, int expert,
@@ -98,21 +98,11 @@ CUresult glm52_router_logits_gemm(const __nv_bfloat16* hidden,
                                   float* logits, int padded_tokens,
                                   int hidden_dim, int n_experts,
                                   cudaStream_t stream) {
-  if (g_cublas_handle == nullptr) return CUDA_ERROR_NOT_INITIALIZED;
-  const float alpha = 1.0f;
-  const float beta = 0.0f;
-  cublasStatus_t status = cublasSetStream(g_cublas_handle, stream);
-  if (status != CUBLAS_STATUS_SUCCESS) return CUDA_ERROR_INVALID_HANDLE;
-  // CUBLAS_COMPUTE_32F (NOT _PEDANTIC): the kimi router shipped PEDANTIC and
-  // measured 60x off roofline (kimi_router.cu:139 post-mortem). Tensor-op f32
-  // accumulation is the intended mode; bf16 inputs already bound the precision.
-  status = cublasGemmEx(
-      g_cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, n_experts, padded_tokens,
-      hidden_dim, &alpha, gate_weight, CUDA_R_16BF, hidden_dim, hidden,
-      CUDA_R_16BF, hidden_dim, &beta, logits, CUDA_R_32F, n_experts,
-      CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-  return status == CUBLAS_STATUS_SUCCESS ? CUDA_SUCCESS
-                                         : CUDA_ERROR_LAUNCH_FAILED;
+  if (hidden_dim != glm52_min_gemv::kHidden || n_experts != kGlm52Experts) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  return map_cuda_error(glm52_min_gemv::launch_tokens<kGlm52Experts, float>(
+      logits, hidden, gate_weight, padded_tokens, stream));
 }
 
 }  // namespace

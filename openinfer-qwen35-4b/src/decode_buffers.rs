@@ -4,9 +4,9 @@ use anyhow::Result;
 
 use cudarc::driver::CudaSlice;
 
-use super::config::Config35;
+use super::config::{Config35, TensorParallelConfig};
 use openinfer_core::kv_pool::KvState;
-use openinfer_core::tensor::{DeviceContext, DeviceVec, HiddenStates};
+use openinfer_core::tensor::{DeviceContext, HiddenStates};
 
 /// Pre-allocated GPU buffers for Qwen3.5 batch decode (N requests, 1 token each).
 pub(crate) struct BatchDecodeBuffers35 {
@@ -34,15 +34,9 @@ pub(crate) struct BatchDecodeBuffers35 {
     pub(crate) z: HiddenStates,
     pub(crate) b_proj: HiddenStates,
     pub(crate) a_proj: HiddenStates,
+    pub(crate) qkv_conv: HiddenStates,
     pub(crate) gdr_out: HiddenStates,
     pub(crate) normed_gated: HiddenStates,
-
-    // Per-request reusable scratch for linear-attention serial decode
-    pub(crate) qkv_tmp: DeviceVec,
-    pub(crate) qkv_conv_tmp: DeviceVec,
-    pub(crate) b_tmp: DeviceVec,
-    pub(crate) a_tmp: DeviceVec,
-    pub(crate) gdr_tmp: DeviceVec,
 
     // Metadata
     pub(crate) token_ids_d: CudaSlice<u32>,
@@ -70,19 +64,21 @@ impl BatchDecodeBuffers35 {
     pub(crate) fn new(
         ctx: &DeviceContext,
         config: &Config35,
+        tensor_parallel: TensorParallelConfig,
         max_batch_size: usize,
         max_total_pages: usize,
         padding_page_id: i32,
     ) -> Result<Self> {
         let h = config.hidden_size;
         let bs = max_batch_size;
-        let q_proj_dim = config.full_attn_q_proj_dim();
-        let q_dim = config.full_attn_q_dim();
-        let kv_dim = config.full_attn_kv_dim();
+        let q_proj_dim = config.local_full_attn_gated_q_dim(tensor_parallel);
+        let q_dim = config.local_full_attn_q_dim(tensor_parallel);
+        let kv_dim = config.local_full_attn_kv_dim(tensor_parallel);
         let qkv_dim = config.linear_attn_qkv_dim();
         let z_dim = config.linear_attn_z_dim();
         let b_dim = config.linear_num_value_heads;
         let a_dim = b_dim;
+        let intermediate = config.local_intermediate_size(tensor_parallel);
 
         Ok(Self {
             max_batch_size: bs,
@@ -90,10 +86,10 @@ impl BatchDecodeBuffers35 {
             normed: HiddenStates::zeros(ctx, h, bs)?,
             attn_results: HiddenStates::zeros(ctx, h, bs)?,
             hidden_mid: HiddenStates::zeros(ctx, h, bs)?,
-            gate_up_out: HiddenStates::zeros(ctx, 2 * config.intermediate_size, bs)?,
-            act_out: HiddenStates::zeros(ctx, config.intermediate_size, bs)?,
+            gate_up_out: HiddenStates::zeros(ctx, 2 * intermediate, bs)?,
+            act_out: HiddenStates::zeros(ctx, intermediate, bs)?,
             mlp_out: HiddenStates::zeros(ctx, h, bs)?,
-            logits: HiddenStates::zeros(ctx, config.vocab_size, bs)?,
+            logits: HiddenStates::zeros(ctx, config.selection_vocab, bs)?,
 
             q_full: HiddenStates::zeros(ctx, q_proj_dim, bs)?,
             q_attn: HiddenStates::zeros(ctx, q_dim, bs)?,
@@ -105,14 +101,9 @@ impl BatchDecodeBuffers35 {
             z: HiddenStates::zeros(ctx, z_dim, bs)?,
             b_proj: HiddenStates::zeros(ctx, b_dim, bs)?,
             a_proj: HiddenStates::zeros(ctx, a_dim, bs)?,
+            qkv_conv: HiddenStates::zeros(ctx, qkv_dim, bs)?,
             gdr_out: HiddenStates::zeros(ctx, z_dim, bs)?,
             normed_gated: HiddenStates::zeros(ctx, z_dim, bs)?,
-
-            qkv_tmp: DeviceVec::zeros(ctx, qkv_dim)?,
-            qkv_conv_tmp: DeviceVec::zeros(ctx, qkv_dim)?,
-            b_tmp: DeviceVec::zeros(ctx, b_dim)?,
-            a_tmp: DeviceVec::zeros(ctx, a_dim)?,
-            gdr_tmp: DeviceVec::zeros(ctx, z_dim)?,
 
             token_ids_d: ctx.stream.alloc_zeros(bs)?,
             positions_d: ctx.stream.alloc_zeros(bs)?,
@@ -124,7 +115,7 @@ impl BatchDecodeBuffers35 {
             kv_tile_indices_d: ctx.stream.alloc_zeros(bs)?,
             kv_chunk_size_d: ctx.stream.alloc_zeros(bs)?,
 
-            sample: openinfer_sample::SampleScratch::new(ctx, config.vocab_size, bs)?,
+            sample: openinfer_sample::SampleScratch::new(ctx, config.selection_vocab, bs)?,
             steps: Vec::new(),
 
             padding_page_id,
@@ -152,6 +143,7 @@ impl BatchDecodeBuffers35 {
         self.z.seq_len = bs;
         self.b_proj.seq_len = bs;
         self.a_proj.seq_len = bs;
+        self.qkv_conv.seq_len = bs;
         self.gdr_out.seq_len = bs;
         self.normed_gated.seq_len = bs;
     }

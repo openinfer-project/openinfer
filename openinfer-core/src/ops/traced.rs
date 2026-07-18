@@ -54,6 +54,18 @@ pub fn gemm_rows_into(
     x: &HiddenStates,
     out: &mut HiddenStates,
 ) {
+    gemm_rows_into_checked(ctx, weight, row_offset, num_rows, x, out)
+        .expect("GEMM row-range launch failed");
+}
+
+pub fn gemm_rows_into_checked(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    row_offset: usize,
+    num_rows: usize,
+    x: &HiddenStates,
+    out: &mut HiddenStates,
+) -> Result<()> {
     if call_trace::is_enabled() {
         let label = call_trace::current_label("gemm_rows");
         call_trace::record_call(gemm_rows_call::<OutDim>(
@@ -65,7 +77,7 @@ pub fn gemm_rows_into(
             x.seq_len,
         ));
     }
-    openinfer_kernels::ops::gemm_rows_into(ctx, weight, row_offset, num_rows, x, out);
+    openinfer_kernels::ops::gemm_rows_into_checked(ctx, weight, row_offset, num_rows, x, out)
 }
 
 pub fn gemm_into(
@@ -109,6 +121,8 @@ pub fn qk_norm_rope_batch_decode_into(
     ctx: &DeviceContext,
     q: &mut HiddenStates,
     k: &mut HiddenStates,
+    row_offset: usize,
+    num_rows: usize,
     q_norm_weight: &DeviceVec,
     k_norm_weight: &DeviceVec,
     cos_cache: &DeviceVec,
@@ -118,7 +132,7 @@ pub fn qk_norm_rope_batch_decode_into(
     num_kv_heads: usize,
     head_dim: usize,
     rms_eps: f32,
-) {
+) -> Result<()> {
     if call_trace::is_enabled() {
         let label = call_trace::current_label("qk_norm_rope_batch_decode");
         let rope_seq = cos_cache.len / head_dim;
@@ -126,7 +140,7 @@ pub fn qk_norm_rope_batch_decode_into(
             label,
             q.hidden_dim,
             k.hidden_dim,
-            q.seq_len,
+            num_rows,
             rope_seq,
             num_q_heads,
             num_kv_heads,
@@ -138,6 +152,8 @@ pub fn qk_norm_rope_batch_decode_into(
         ctx,
         q,
         k,
+        row_offset,
+        num_rows,
         q_norm_weight,
         k_norm_weight,
         cos_cache,
@@ -147,7 +163,7 @@ pub fn qk_norm_rope_batch_decode_into(
         num_kv_heads,
         head_dim,
         rms_eps,
-    );
+    )
 }
 
 pub fn fused_add_rms_norm_batch_into(

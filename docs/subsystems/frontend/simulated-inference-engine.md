@@ -43,6 +43,12 @@ test fixture must provide at least a tokenizer source such as `tokenizer.json`.
 `tokenizer_config.json` and `config.json` are useful for EOS and context-window
 metadata, but no weight files are required.
 
+Chat-completions tests also need a `chat_template` in
+`tokenizer_config.json`. Keep the minimal template deterministic and ensure it
+renders at least one token that the simulated engine can stream as observable
+content; otherwise response-shape tests can pass without exercising
+`delta.content`.
+
 ## Implementation Details
 
 - `openinfer-engine` owns the shared engine contract, while `openinfer-core` only re-exports it for existing model crates.

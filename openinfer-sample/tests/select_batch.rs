@@ -325,3 +325,61 @@ fn seeded_rows_replay_independent_of_batch_position() {
     assert_ne!(a[2], c[0], "step must advance the seeded stream");
     assert_ne!(a[2], d[0], "seed must select a distinct stream");
 }
+
+/// Latency micro-benchmark for the verify-round sampler cost (#512): span-17
+/// rows at Qwen3 vocab, greedy argmax vs sampled paths. Not a correctness
+/// gate — prints per-call microseconds; run with --nocapture.
+#[test]
+#[ignore = "GPU latency probe — run manually with --nocapture"]
+fn select_batch_span17_latency_probe() {
+    let ctx = DeviceContext::new().unwrap();
+    let vocab = 151_936;
+    let rows = 17;
+    let logits: Vec<Vec<f32>> = (0..rows)
+        .map(|r| {
+            (0..vocab)
+                .map(|v| (((v * 2_654_435_761 + r * 97) % 1000) as f32) / 50.0)
+                .collect()
+        })
+        .collect();
+    let arena = make_arena(&ctx, &logits);
+    let mut scratch = SampleScratch::new(&ctx, vocab, rows).unwrap();
+
+    let cases: Vec<(&str, SamplingParams)> = vec![
+        ("greedy", SamplingParams::default()),
+        (
+            "t0.8_topp0.95",
+            SamplingParams {
+                temperature: 0.8,
+                top_p: 0.95,
+                ..SamplingParams::default()
+            },
+        ),
+        (
+            "t0.7_topk20_topp0.9",
+            SamplingParams {
+                temperature: 0.7,
+                top_k: 20,
+                top_p: 0.9,
+                ..SamplingParams::default()
+            },
+        ),
+    ];
+    for (name, p) in cases {
+        let params = vec![p; rows];
+        let param_refs = refs(&params);
+        let steps = vec![0u64; rows];
+        for _ in 0..20 {
+            select_batch(&ctx, &arena, &param_refs, &steps, 7, &mut scratch).unwrap();
+        }
+        ctx.sync().unwrap();
+        let start = std::time::Instant::now();
+        let iters = 200;
+        for i in 0..iters {
+            select_batch(&ctx, &arena, &param_refs, &steps, i as u64, &mut scratch).unwrap();
+        }
+        ctx.sync().unwrap();
+        let us = start.elapsed().as_micros() as f64 / iters as f64;
+        eprintln!("select_batch span17 {name}: {us:.1} us/call");
+    }
+}

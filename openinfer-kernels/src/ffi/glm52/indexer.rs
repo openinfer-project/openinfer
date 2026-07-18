@@ -14,6 +14,16 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn glm52_indexer_weights_proj_cuda(
+        hidden: *const Half,
+        weights_proj: *const Half,
+        out: *mut Half,
+        tokens: i32,
+        heads: i32,
+        hidden_dim: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn glm52_indexer_local_topk_to_slots_cuda(
         global_slots: *mut i32,
         topk_lens: *mut i32,

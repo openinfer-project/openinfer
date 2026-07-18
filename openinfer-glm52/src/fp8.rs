@@ -15,7 +15,8 @@ use half::bf16;
 
 use openinfer_kernels::ops::{
     GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW, glm52_fp8_weight_only_gemv_launch,
-    glm52_fp8_weight_only_gemv_pair_launch, glm52_silu_and_mul_bf16_launch,
+    glm52_fp8_weight_only_gemv_pair_launch, glm52_fp8_weight_only_gemv_partials_launch,
+    glm52_gemv_reduce_silu_mul_launch, glm52_silu_and_mul_bf16_launch,
 };
 use openinfer_kernels::tensor::DeviceContext;
 
@@ -36,8 +37,10 @@ pub(crate) fn e4m3_to_f32(b: u8) -> f32 {
 }
 
 pub(crate) fn bytes_to_f32(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+    b.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect()
 }
 
@@ -206,8 +209,9 @@ impl ProjWeight {
 /// Pack two fp8 projections that share the same input into one `[a.n + b.n, k]`
 /// projection (weight bytes and per-128-block scale rows concatenated along n).
 /// Requires `a.n` to be a multiple of 128 so `b`'s scale rows stay aligned to
-/// the packed row/128 grid. Used to fuse gate|up into a single GEMV whose
-/// output is exactly the `[gate | up]` layout the SwiGLU consumes.
+/// the packed row/128 grid. Clients: gate|up (a single GEMV writes the
+/// `[gate | up]` layout the SwiGLU consumes) and the MLA q_a|kv_a horizontal
+/// pack (`mla_front::pack_qa_kva`).
 pub(crate) fn pack_proj_pair(
     ctx: &DeviceContext,
     a: &ProjWeight,
@@ -265,6 +269,29 @@ pub(crate) fn fp8_linear_into(
         w.k
     );
     glm52_fp8_weight_only_gemv_launch(
+        ctx, rows, w.n, w.k, input, &w.weight, &w.scale, scratch, out,
+    )
+}
+
+/// [`fp8_linear_into`] that stops at the f32 k-slice partials when the (rows,
+/// shape) routes to the mma path, so a fused epilogue can absorb the
+/// fixed-order reduce. Returns the ksplit the partials were written with;
+/// 0 means the register-tile path already wrote bf16 into `out`.
+pub(crate) fn fp8_linear_partials_into(
+    ctx: &DeviceContext,
+    w: &ProjWeight,
+    rows: usize,
+    input: &CudaSlice<bf16>,
+    scratch: &mut CudaSlice<f32>,
+    out: &mut CudaSlice<bf16>,
+) -> Result<usize> {
+    ensure!(
+        input.len() >= rows * w.k,
+        "GLM5.2 fp8_linear input {} < rows {rows} * k {}",
+        input.len(),
+        w.k
+    );
+    glm52_fp8_weight_only_gemv_partials_launch(
         ctx, rows, w.n, w.k, input, &w.weight, &w.scale, scratch, out,
     )
 }
@@ -354,16 +381,34 @@ pub(crate) fn fp8_mlp_into(
         "GLM5.2 fp8_mlp scratch sized for intermediate {} but weights have {intermediate}",
         s.intermediate
     );
-    fp8_linear_into(
+    // The gate|up projection stops at its f32 k-slice partials when the
+    // (rows, shape) routes to the mma path, and the SwiGLU absorbs the
+    // fixed-order reduce (one launch instead of two, bit-identical); the
+    // register-tile rows keep the bf16 GEMV -> standalone SwiGLU pair.
+    let ksplit = glm52_fp8_weight_only_gemv_partials_launch(
         ctx,
-        gate_up,
         s.rows,
+        gate_up.n,
+        gate_up.k,
         input,
-        Some(&mut s.gemv_partial),
+        &gate_up.weight,
+        &gate_up.scale,
+        &mut s.gemv_partial,
         &mut s.gate_up,
     )?;
-    // bf16 SwiGLU (no route weight, no activation quant) -> bf16 down input.
-    glm52_silu_and_mul_bf16_launch(ctx, s.rows, intermediate, &s.gate_up, &mut s.silu_out)?;
+    if ksplit == 0 {
+        // bf16 SwiGLU (no route weight, no activation quant) -> bf16 down input.
+        glm52_silu_and_mul_bf16_launch(ctx, s.rows, intermediate, &s.gate_up, &mut s.silu_out)?;
+    } else {
+        glm52_gemv_reduce_silu_mul_launch(
+            ctx,
+            s.rows,
+            intermediate,
+            ksplit,
+            &s.gemv_partial,
+            &mut s.silu_out,
+        )?;
+    }
     fp8_linear_into(
         ctx,
         down,
@@ -377,6 +422,115 @@ pub(crate) fn fp8_mlp_into(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openinfer_kernels::ops::{glm52_gemv_mma_routes, glm52_gemv_split_reduce_launch};
+
+    /// e4m3fn bytes avoiding the NaN encodings (0x7F / 0xFF).
+    fn synth_fp8(len: usize, salt: usize) -> Vec<u8> {
+        (0..len)
+            .map(|i| {
+                let b = ((i * 31 + salt * 17) % 256) as u8;
+                if b & 0x7F == 0x7F { b & 0x7E } else { b }
+            })
+            .collect()
+    }
+
+    fn synth_scale(rows: usize, cols: usize, salt: usize) -> Vec<u8> {
+        (0..rows * cols)
+            .flat_map(|i| (0.001f32 + 0.0005 * ((i + salt) % 7) as f32).to_le_bytes())
+            .collect()
+    }
+
+    /// Batch-8 parity of the horizontal q_a|kv_a pack against the separate
+    /// launches at the production shapes. kv_a must be BIT-exact (the packed
+    /// {16,1} config k-slices its rows exactly like the separate launch);
+    /// q_a's split factor changes (48 -> 16 slices), so it gets a tolerance.
+    /// Skips (trivially green) where the mma table has no packed route.
+    #[test]
+    #[ignore = "requires a GPU"]
+    fn qa_kva_pack_batch8_parity() -> Result<()> {
+        let ctx = DeviceContext::new_with_device(0)?;
+        let (n_qa, n_kva, k, t) = (2048usize, 576usize, 6144usize, 8usize);
+        if !glm52_gemv_mma_routes(t, n_qa + n_kva, k)? {
+            eprintln!("no packed mma route on this arch; parity is vacuous");
+            return Ok(());
+        }
+        let q_a = ProjWeight::upload(
+            &ctx,
+            &Glm52ProjBytes {
+                weight: &synth_fp8(n_qa * k, 1),
+                scale: &synth_scale(n_qa / FP8_BLOCK, k / FP8_BLOCK, 1),
+                n: n_qa,
+                k,
+            },
+        )?;
+        let kv_a = ProjWeight::upload(
+            &ctx,
+            &Glm52ProjBytes {
+                weight: &synth_fp8(n_kva * k, 2),
+                scale: &synth_scale(n_kva.div_ceil(FP8_BLOCK), k / FP8_BLOCK, 2),
+                n: n_kva,
+                k,
+            },
+        )?;
+        let act_host: Vec<bf16> = (0..t * k)
+            .map(|i| bf16::from_f32(((i % 61) as f32 - 30.0) * 0.03))
+            .collect();
+        let activation = ctx.stream.clone_htod(&act_host)?;
+        let mut scratch = ctx
+            .stream
+            .alloc_zeros::<f32>(t * GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW)?;
+
+        let mut qa_sep = ctx.stream.alloc_zeros::<bf16>(t * n_qa)?;
+        let mut kva_sep = ctx.stream.alloc_zeros::<bf16>(t * n_kva)?;
+        fp8_linear_into(&ctx, &q_a, t, &activation, Some(&mut scratch), &mut qa_sep)?;
+        fp8_linear_into(
+            &ctx,
+            &kv_a,
+            t,
+            &activation,
+            Some(&mut scratch),
+            &mut kva_sep,
+        )?;
+
+        let packed = pack_proj_pair(&ctx, &q_a, &kv_a)?;
+        let mut packed_sink = ctx.stream.alloc_zeros::<bf16>(t * packed.n)?;
+        let ksplit = fp8_linear_partials_into(
+            &ctx,
+            &packed,
+            t,
+            &activation,
+            &mut scratch,
+            &mut packed_sink,
+        )?;
+        assert!(ksplit > 0, "packed launch took the register tile");
+        let mut qa_fused = ctx.stream.alloc_zeros::<bf16>(t * n_qa)?;
+        let mut kva_fused = ctx.stream.alloc_zeros::<bf16>(t * n_kva)?;
+        glm52_gemv_split_reduce_launch(
+            &ctx,
+            t,
+            n_qa,
+            n_kva,
+            ksplit,
+            &scratch,
+            &mut qa_fused,
+            &mut kva_fused,
+        )?;
+
+        let kva_sep_h = ctx.stream.clone_dtoh(&kva_sep)?;
+        let kva_fused_h = ctx.stream.clone_dtoh(&kva_fused)?;
+        assert_eq!(kva_sep_h, kva_fused_h, "kv_a must be bit-exact");
+
+        let qa_sep_h = ctx.stream.clone_dtoh(&qa_sep)?;
+        let qa_fused_h = ctx.stream.clone_dtoh(&qa_fused)?;
+        let mut worst = 0f32;
+        for (a, b) in qa_sep_h.iter().zip(&qa_fused_h) {
+            let (a, b) = (a.to_f32(), b.to_f32());
+            let rel = (a - b).abs() / a.abs().max(1e-3);
+            worst = worst.max(rel);
+        }
+        assert!(worst < 1e-2, "q_a fused/separate rel diff {worst}");
+        Ok(())
+    }
 
     /// Byte-level geometry check for the attention-TP shard helpers: build a
     /// projection whose every weight/scale byte encodes its own (row, col)
