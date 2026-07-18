@@ -70,11 +70,11 @@ The current-source #466 aggregate is retained under `artifacts/bench/dsv2-lite/<
 
 ### Issue #465 Retained HTTP Soak Report
 
-The retained soak layer uses model-owned `scripts/bench_dsv2lite_http_soak.py` over the generic `bench_http_serving.py` leaf runner. The retained 2026-07-18 run used commit `2b33b02ede965beeae1eb717b801378cc31f2c93`, model revision `604d5664dddd88a0433dbae533b7fe9472482de0`, 2x RTX 5090, `prompt_words=64`, `max_tokens=64`, greedy sampling, ignore-EOS, concurrency `4,8`, 120-second duration, and 60-second buckets. Both backends passed `soak_gate.passed=true`; command details and artifact hashes live in `benchmarking.md`.
+The retained soak layer uses model-owned `scripts/bench_dsv2lite_http_soak.py` over the generic `bench_http_serving.py` leaf runner. The retained 2026-07-18 latest-HEAD rerun used commit `a5703d0424d917ce99b4bd8691b0b86eecde966f`, model revision `604d5664dddd88a0433dbae533b7fe9472482de0`, 2x RTX 5090, `prompt_words=64`, `max_tokens=64`, greedy sampling, ignore-EOS, concurrency `4,8`, 120-second duration, and 60-second buckets. Both backends passed `soak_gate.passed=true`; command details and artifact hashes live in `benchmarking.md`.
 
 | Backend | Runtime boundary | Completed | Failed/timeouts | Buckets / leafs | Combined output hash | Boundary |
 | --- | --- | ---: | ---: | ---: | --- | --- |
-| host-staged | `host-staged` | 104 | 0 / 0 | 4 / 13 | `0b465ee14dbf4ab6` | Sustained HTTP soak evidence for the host-staged oracle path |
+| host-staged | `host-staged` | 112 | 0 / 0 | 4 / 14 | `6912777bed672f57` | Sustained HTTP soak evidence for the host-staged oracle path |
 | NCCL | NCCL `2.26.2`, `NCCL_IB_DISABLE=1`, `NCCL_P2P_DISABLE=1` | 128 | 0 / 0 | 4 / 16 | `24f2db9fc47acc10` | Sustained HTTP soak evidence for this conservative single-node NCCL runtime |
 
 The combined retained report passed child gates for both backends, commit consistency, model provenance consistency, and runtime-boundary retention. The soak JSON records first/last-quartile tail, throughput, RSS, and device-memory drift, but numeric drift is still reported evidence rather than a production budget. Treat long-duration and long/mixed-prompt soaks as follow-up contracts, not implied coverage from this short-shape baseline.
