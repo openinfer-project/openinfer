@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import copy
 import sys
 import tempfile
 import unittest
@@ -150,6 +151,58 @@ def leaf_report(
     }
 
 
+def bucket_record(
+    *,
+    concurrency: int = 4,
+    completed: int = 8,
+    failed: int = 0,
+    timeouts: int = 0,
+    returncode: int = 0,
+) -> dict[str, object]:
+    return bench_dsv2lite_http_soak.bucket_record(
+        bucket_index=0,
+        concurrency=concurrency,
+        report_path=Path(f"bucket-c{concurrency}.json"),
+        report=leaf_report(completed=completed, failed=failed, timeouts=timeouts),
+        returncode=returncode,
+        resource_before=resource(0.0, 100, [1000, 1000]),
+        resource_after=resource(10.0, 110, [1100, 1100]),
+    )
+
+
+def clean_followup_record(
+    *, completed: int = 1, failed: int = 0, timeouts: int = 0, returncode: int = 0
+) -> dict[str, object]:
+    return bench_dsv2lite_http_soak.bucket_record(
+        bucket_index=-1,
+        concurrency=1,
+        report_path=Path("clean_followup.json"),
+        report=leaf_report(completed=completed, failed=failed, timeouts=timeouts),
+        returncode=returncode,
+        resource_before=resource(10.0, 110, [1100, 1100]),
+        resource_after=resource(11.0, 111, [1101, 1101]),
+    )
+
+
+def passing_summary(
+    *, backend: str = "host-staged", runtime: str = "host-staged"
+) -> dict[str, object]:
+    return bench_dsv2lite_http_soak.build_summary(
+        args(
+            backend=backend,
+            backend_runtime_version=runtime,
+            concurrency=[4],
+            required_trace_coverage=1.0,
+        ),
+        buckets=[bucket_record(concurrency=4)],
+        resources=[resource(0.0, 100, [1000, 1000])],
+        clean_followup=clean_followup_record(),
+        run_errors=[],
+        started_wall_s=0.0,
+        ended_wall_s=11.0,
+    )
+
+
 class BenchDsv2LiteHttpSoakTests(unittest.TestCase):
     def test_leaf_command_locks_soak_workload_and_provenance(self) -> None:
         command = bench_dsv2lite_http_soak.build_leaf_command(
@@ -284,6 +337,8 @@ class BenchDsv2LiteHttpSoakTests(unittest.TestCase):
         )
 
         self.assertTrue(summary["soak_gate"]["passed"])
+        self.assertTrue(summary["soak_gate"]["bucket_coverage_passed"])
+        self.assertTrue(summary["soak_gate"]["leaf_commands_passed"])
         self.assertEqual(summary["summary"]["completed"], 16)
         self.assertEqual(summary["summary"]["terminal_reasons"], {"completed_length": 16})
         self.assertEqual(
@@ -293,32 +348,68 @@ class BenchDsv2LiteHttpSoakTests(unittest.TestCase):
         self.assertTrue(summary["clean_followup"]["passed"])
         self.assertIn("not direct decode attribution", summary["claim_boundary"])
 
+    def test_backend_summary_fails_missing_trace_coverage(self) -> None:
+        bucket = bucket_record()
+        bucket["trace_coverage"]["token_timing_coverage_ratio"] = 0.5
+
+        summary = bench_dsv2lite_http_soak.build_summary(
+            args(concurrency=[4], required_trace_coverage=1.0),
+            buckets=[bucket],
+            resources=[],
+            clean_followup=clean_followup_record(),
+            run_errors=[],
+            started_wall_s=0.0,
+            ended_wall_s=11.0,
+        )
+
+        self.assertFalse(summary["soak_gate"]["passed"])
+        self.assertFalse(summary["soak_gate"]["trace_coverage_passed"])
+
+    def test_backend_summary_fails_leaf_command_error(self) -> None:
+        summary = bench_dsv2lite_http_soak.build_summary(
+            args(concurrency=[4], required_trace_coverage=1.0),
+            buckets=[bucket_record(returncode=1)],
+            resources=[],
+            clean_followup=clean_followup_record(),
+            run_errors=[],
+            started_wall_s=0.0,
+            ended_wall_s=11.0,
+        )
+
+        self.assertFalse(summary["soak_gate"]["passed"])
+        self.assertFalse(summary["soak_gate"]["leaf_commands_passed"])
+
+    def test_backend_summary_fails_empty_or_missing_bucket(self) -> None:
+        summary = bench_dsv2lite_http_soak.build_summary(
+            args(concurrency=[4, 8], required_trace_coverage=None),
+            buckets=[bucket_record(concurrency=4)],
+            resources=[],
+            clean_followup=None,
+            run_errors=[],
+            started_wall_s=0.0,
+            ended_wall_s=1.0,
+        )
+
+        self.assertFalse(summary["soak_gate"]["passed"])
+        self.assertFalse(summary["soak_gate"]["bucket_coverage_passed"])
+
+    def test_backend_summary_fails_clean_followup_error(self) -> None:
+        summary = bench_dsv2lite_http_soak.build_summary(
+            args(concurrency=[4], required_trace_coverage=1.0),
+            buckets=[bucket_record(concurrency=4)],
+            resources=[],
+            clean_followup=clean_followup_record(completed=0, failed=1, returncode=1),
+            run_errors=[],
+            started_wall_s=0.0,
+            ended_wall_s=11.0,
+        )
+
+        self.assertFalse(summary["soak_gate"]["passed"])
+        self.assertFalse(summary["soak_gate"]["clean_followup_passed"])
+
     def test_combined_report_requires_host_and_nccl(self) -> None:
-        host = bench_dsv2lite_http_soak.build_summary(
-            args(backend="host-staged", concurrency=[4], required_trace_coverage=None),
-            buckets=[],
-            resources=[],
-            clean_followup=None,
-            run_errors=[],
-            started_wall_s=0.0,
-            ended_wall_s=1.0,
-        )
-        nccl = bench_dsv2lite_http_soak.build_summary(
-            args(
-                backend="nccl",
-                backend_runtime_version="2.26.2",
-                concurrency=[4],
-                required_trace_coverage=None,
-            ),
-            buckets=[],
-            resources=[],
-            clean_followup=None,
-            run_errors=[],
-            started_wall_s=0.0,
-            ended_wall_s=1.0,
-        )
-        host["soak_gate"]["passed"] = True
-        nccl["soak_gate"]["passed"] = True
+        host = passing_summary()
+        nccl = passing_summary(backend="nccl", runtime="NCCL 2.26.2")
 
         missing = bench_dsv2lite_http_soak.build_combined_report(
             "DeepSeek-V2-Lite", [(Path("host.json"), host)]
@@ -331,6 +422,48 @@ class BenchDsv2LiteHttpSoakTests(unittest.TestCase):
         self.assertEqual(missing["coverage_gate"]["missing"], ["nccl"])
         self.assertTrue(full["coverage_gate"]["passed"])
         self.assertEqual(full["coverage_gate"]["required_backends"], 2)
+        self.assertEqual(
+            full["metadata"]["runtime_boundaries"]["nccl"],
+            "NCCL 2.26.2",
+        )
+
+    def test_combined_report_rejects_failed_child_gate(self) -> None:
+        host = passing_summary()
+        nccl = passing_summary(backend="nccl", runtime="NCCL 2.26.2")
+        nccl["soak_gate"]["passed"] = False
+
+        report = bench_dsv2lite_http_soak.build_combined_report(
+            "DeepSeek-V2-Lite", [(Path("host.json"), host), (Path("nccl.json"), nccl)]
+        )
+
+        self.assertFalse(report["coverage_gate"]["passed"])
+        self.assertFalse(report["coverage_gate"]["child_gates"]["nccl"])
+
+    def test_combined_report_rejects_provenance_drift(self) -> None:
+        host = passing_summary()
+        nccl = passing_summary(backend="nccl", runtime="NCCL 2.26.2")
+        nccl["metadata"]["model_revision"] = "different-model-rev"
+
+        report = bench_dsv2lite_http_soak.build_combined_report(
+            "DeepSeek-V2-Lite", [(Path("host.json"), host), (Path("nccl.json"), nccl)]
+        )
+
+        self.assertFalse(report["coverage_gate"]["passed"])
+        self.assertFalse(report["coverage_gate"]["provenance_consistent"])
+
+    def test_combined_report_rejects_missing_runtime_boundary(self) -> None:
+        host = passing_summary()
+        nccl = passing_summary(backend="nccl", runtime="NCCL 2.26.2")
+        nccl = copy.deepcopy(nccl)
+        nccl["metadata"]["backend_runtime_version"] = "nccl"
+
+        report = bench_dsv2lite_http_soak.build_combined_report(
+            "DeepSeek-V2-Lite", [(Path("host.json"), host), (Path("nccl.json"), nccl)]
+        )
+
+        self.assertFalse(report["coverage_gate"]["passed"])
+        self.assertFalse(report["coverage_gate"]["runtime_boundaries_present"])
+        self.assertEqual(report["coverage_gate"]["missing_runtime_boundaries"], ["nccl"])
 
 
 if __name__ == "__main__":

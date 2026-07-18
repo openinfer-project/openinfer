@@ -40,6 +40,7 @@ DEFAULT_CLAIM_BOUNDARY = (
     "recovery, or production-readiness evidence by itself."
 )
 RESOURCE_SAMPLE_VERSION = 1
+GENERIC_RUNTIME_BOUNDARIES = {"", "unknown", "n/a", "na", "none"}
 
 
 @dataclass(frozen=True)
@@ -58,6 +59,14 @@ def parse_int_list(value: str) -> list[int]:
     if any(item <= 0 for item in parsed):
         raise argparse.ArgumentTypeError("all values must be positive")
     return parsed
+
+
+def normalized_runtime_boundary(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def runtime_boundary_is_present(value: Any) -> bool:
+    return normalized_runtime_boundary(value).lower() not in GENERIC_RUNTIME_BOUNDARIES
 
 
 def run_text(command: list[str]) -> str | None:
@@ -155,6 +164,15 @@ def validate_run_args(args: argparse.Namespace) -> None:
         raise SystemExit("--required-trace-coverage must be in (0, 1]")
     if args.max_buckets is not None and args.max_buckets <= 0:
         raise SystemExit("--max-buckets must be positive")
+    runtime_boundary = normalized_runtime_boundary(args.backend_runtime_version)
+    if not runtime_boundary:
+        raise SystemExit("--backend-runtime-version must describe the runtime boundary")
+    if args.backend == "nccl" and runtime_boundary.lower() == "nccl":
+        raise SystemExit(
+            "--backend-runtime-version for NCCL must include the NCCL version "
+            "or selector boundary"
+        )
+    args.backend_runtime_version = runtime_boundary
     missing = [str(path) for path in required_files(args) if not path.is_file()]
     if missing:
         raise SystemExit(f"required soak-run files are missing: {', '.join(missing)}")
@@ -799,8 +817,17 @@ def build_summary(
                 )
             )
 
+    bucket_coverage_passed = bool(buckets) and all(
+        by_concurrency[str(concurrency)] for concurrency in args.concurrency
+    )
+    leaf_commands_passed = bucket_coverage_passed and all(
+        bucket.get("benchmark_returncode") == 0
+        and bucket.get("report_loaded") is True
+        for bucket in buckets
+    )
     passed = (
         not run_errors
+        and leaf_commands_passed
         and total_counts["failed"] == 0
         and total_counts["timeouts"] == 0
         and trace_passed
@@ -865,6 +892,8 @@ def build_summary(
         },
         "soak_gate": {
             "passed": passed,
+            "bucket_coverage_passed": bucket_coverage_passed,
+            "leaf_commands_passed": leaf_commands_passed,
             "zero_failures": total_counts["failed"] == 0,
             "zero_timeouts": total_counts["timeouts"] == 0,
             "trace_coverage_passed": trace_passed,
@@ -1076,6 +1105,25 @@ def build_combined_report(
         backend: (summary.get("soak_gate") or {}).get("passed") is True
         for backend, (_path, summary) in found.items()
     }
+    runtime_boundaries = {}
+    missing_runtime_boundaries = []
+    for backend, (_path, summary) in found.items():
+        metadata = summary.get("metadata") or {}
+        runtime_boundary = normalized_runtime_boundary(
+            metadata.get("backend_runtime_version")
+        )
+        if runtime_boundary_is_present(runtime_boundary) and not (
+            backend == "nccl" and runtime_boundary.lower() == "nccl"
+        ):
+            runtime_boundaries[backend] = runtime_boundary
+        else:
+            missing_runtime_boundaries.append(backend)
+    missing_runtime_boundaries = sorted(missing_runtime_boundaries)
+    runtime_boundaries_present = (
+        len(runtime_boundaries) == len(found)
+        and not missing_runtime_boundaries
+        and bool(runtime_boundaries)
+    )
     passed = (
         not missing
         and not invalid
@@ -1083,6 +1131,7 @@ def build_combined_report(
         and all(child_gates.values())
         and commit_consistent
         and provenance_consistent
+        and runtime_boundaries_present
     )
     return {
         "schema_version": 1,
@@ -1097,6 +1146,7 @@ def build_combined_report(
             "provenance": json.loads(provenance_documents[0])
             if provenance_consistent
             else None,
+            "runtime_boundaries": runtime_boundaries,
         },
         "coverage_gate": {
             "passed": passed,
@@ -1108,6 +1158,8 @@ def build_combined_report(
             "child_gates": child_gates,
             "commit_consistent": commit_consistent,
             "provenance_consistent": provenance_consistent,
+            "runtime_boundaries_present": runtime_boundaries_present,
+            "missing_runtime_boundaries": missing_runtime_boundaries,
         },
         "reports": [
             {

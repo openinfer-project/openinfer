@@ -25,7 +25,7 @@ The first three can be green while the fourth is only a retained baseline. A pas
 | Direct decode attribution | Retained | `decode-attribution-gate.md` | Direct diagnostic only |
 | HTTP lifecycle reliability | Retained | `status.md`, issue #453 | Failure isolation and recovery scenarios, no long-duration claim |
 | HTTP SLO report | Retained for #466 | `benchmarking.md`, `bench_dsv2lite_http_slo.py` | Fixed host-staged/NCCL HTTP contracts retained; no soak or production claim |
-| Sustained soak | Retained baseline for #465 | `benchmarking.md`, `bench_dsv2lite_http_soak.py` | Fixed short-shape host-staged/NCCL soak retained; drift is reported, not a ratified production budget |
+| Sustained soak | Retained baseline for #465 | `benchmarking.md`, `bench_dsv2lite_http_soak.py` | Fixed short-shape host-staged/NCCL soak retained; runtime/provenance gates are hard, drift is reported, not a ratified production budget |
 | Long-prefill scheduling | Open | issue #452 | Current long smoke records the boundary; it does not close latency work |
 | Device attention and KV | Open | issue #635 | Required for bounded device lifetime and stronger scaling |
 
@@ -40,6 +40,8 @@ This closes the missing report layer. It does not optimize latency or throughput
 Issue #465 is the sustained evidence milestone. The retained 2026-07-18 run covered host-staged and NCCL under the fixed short-shape HTTP soak contract with zero failures/timeouts, full required trace coverage, clean follow-up recovery, output hashes, resource samples, and first/last-quartile drift fields. The NCCL row used NCCL `2.26.2` with `NCCL_IB_DISABLE=1` and `NCCL_P2P_DISABLE=1`; keep that runtime boundary attached to the evidence.
 
 This closes the first retained soak baseline. It does not set hard latency or drift budgets, does not cover long-prefill scheduling, and does not claim production readiness.
+
+The tooling now guards the evidence boundary directly: backend summaries fail on missing bucket coverage, leaf command errors, missing trace coverage, or failed clean follow-up, and the combined report fails on missing host-staged/NCCL children, failed child gates, provenance drift, commit drift, or missing/generic runtime boundaries. Long-duration and long/mixed-prompt soaks still need separate versioned contracts before Stable promotion.
 
 ## Sequence
 
@@ -57,6 +59,7 @@ Primary issue: #465.
 - Keep the retained host-staged/NCCL short-shape soak reproducible after scheduler, frontend, trace, or backend changes.
 - Extend from the short-shape baseline into ratified long-duration and long/mixed-prompt soaks only when those contracts have explicit support limits.
 - Calibrate latency, throughput, RSS, and VRAM budgets from repeated retained variance before promoting numeric thresholds to hard gates.
+- Keep conservative NCCL runtime selectors in the retained evidence until default-runtime startup is separately proven on the supported hardware matrix.
 
 ### 3. Move Decode State To The Device
 
@@ -83,6 +86,7 @@ Promotion requires all of the following:
 - request and KV capacity are bounded and observable;
 - lifecycle and soak gates recover cleanly with no unexplained drift;
 - short, mixed, and long retained SLO reports pass on the supported hardware/runtime matrix;
+- long-duration and long/mixed-prompt soak profiles have ratified duration, shape, and drift budgets;
 - backend startup failures give actionable version or configuration errors;
 - API, topology, context, sampling, and recovery limits are documented;
 - performance claims use matched repeated HTTP contracts, while direct and profiler data remain diagnostic.
