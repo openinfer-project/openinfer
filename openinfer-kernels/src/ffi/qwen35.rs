@@ -124,6 +124,13 @@ unsafe extern "C" {
         to_flashinfer: bool,
         stream: CUstream,
     ) -> CUresult;
+
+    pub fn gated_delta_rule_prefill_gate_exp_cuda(
+        input: *const f32,
+        output: *mut f32,
+        length: i32,
+        stream: CUstream,
+    ) -> CUresult;
 }
 
 // The CuTe AOT generator emits this symbol only when the opt-in build
@@ -139,6 +146,7 @@ unsafe extern "C" {
         alpha: *const f32,
         beta: *const f32,
         state: *mut f32,
+        init_state: *const f32,
         tensormaps: *mut u8,
         cu_seqlens: *const i64,
         seq_len: i32,

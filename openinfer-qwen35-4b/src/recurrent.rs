@@ -242,6 +242,28 @@ fn gated_delta_rule_prefill_chunk_cumsum_inplace(
     Ok(())
 }
 
+fn gated_delta_rule_prefill_chunk_cumsum_into(
+    ctx: &DeviceContext,
+    g_in: &CudaSlice<f32>,
+    g_out: &mut CudaSlice<f32>,
+    seq_len: usize,
+    num_value_heads: usize,
+) -> Result<()> {
+    let (g_in_ptr, _g_in_guard) = g_in.device_ptr(&ctx.stream);
+    let (g_out_ptr, _g_out_guard) = g_out.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::gated_delta_rule_prefill_chunk_cumsum_cuda(
+            g_in_ptr as *const f32,
+            g_out_ptr as *mut f32,
+            seq_len as i32,
+            num_value_heads as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result.result()?;
+    Ok(())
+}
+
 fn gated_delta_rule_prefill_chunk_a_into(
     ctx: &DeviceContext,
     k: &HiddenStates,
@@ -435,6 +457,30 @@ fn gated_delta_rule_prefill_flashinfer_into(
     if num_value_heads != 32 || key_dim != 128 || value_dim != 128 {
         return Ok(false);
     }
+    if !openinfer_kernels::flashinfer_gdn::aot_available() {
+        return Ok(false);
+    }
+
+    // FlashInfer receives positive cumulative decay factors, while the
+    // fallback pipeline keeps cumulative log-gates for its exp-difference
+    // formulas. Build the former in a separate buffer so fallback semantics
+    // remain unchanged when the optional artifact is unavailable.
+    gated_delta_rule_prefill_chunk_cumsum_into(
+        ctx,
+        &scratch.g_cumsum,
+        &mut scratch.flashinfer_alpha,
+        scratch.q_expanded.seq_len,
+        num_value_heads,
+    )?;
+    {
+        let (alpha_ptr, _alpha_guard) = scratch.flashinfer_alpha.device_ptr_mut(&ctx.stream);
+        openinfer_kernels::flashinfer_gdn::exp_gate(
+            alpha_ptr as *const f32,
+            alpha_ptr as *mut f32,
+            (scratch.q_expanded.seq_len * num_value_heads) as i32,
+            ctx.stream.cu_stream(),
+        )?;
+    }
 
     ctx.stream.memcpy_htod(
         &[0_i64, scratch.q_expanded.seq_len as i64],
@@ -443,11 +489,11 @@ fn gated_delta_rule_prefill_flashinfer_into(
 
     {
         let (state_ptr, _state_guard) = state.device_ptr(&ctx.stream);
-        let (fi_state_ptr, _fi_state_guard) =
-            scratch.flashinfer_state.device_ptr_mut(&ctx.stream);
+        let (fi_init_state_ptr, _fi_init_state_guard) =
+            scratch.flashinfer_init_state.device_ptr_mut(&ctx.stream);
         openinfer_kernels::flashinfer_gdn::transpose_state(
             state_ptr as *const f32,
-            fi_state_ptr as *mut f32,
+            fi_init_state_ptr as *mut f32,
             num_value_heads as i32,
             key_dim as i32,
             value_dim as i32,
@@ -461,10 +507,11 @@ fn gated_delta_rule_prefill_flashinfer_into(
         let (k_ptr, _k_guard) = scratch.k_expanded.data.device_ptr(&ctx.stream);
         let (v_ptr, _v_guard) = scratch.v_raw.data.device_ptr(&ctx.stream);
         let (o_ptr, _o_guard) = output.data.device_ptr_mut(&ctx.stream);
-        let (g_ptr, _g_guard) = scratch.g_cumsum.device_ptr(&ctx.stream);
+        let (alpha_ptr, _alpha_guard) = scratch.flashinfer_alpha.device_ptr(&ctx.stream);
         let (beta_ptr, _beta_guard) = scratch.beta.device_ptr(&ctx.stream);
-        let (fi_state_ptr, _fi_state_guard) =
-            scratch.flashinfer_state.device_ptr_mut(&ctx.stream);
+        let (fi_state_ptr, _fi_state_guard) = scratch.flashinfer_state.device_ptr_mut(&ctx.stream);
+        let (fi_init_state_ptr, _fi_init_state_guard) =
+            scratch.flashinfer_init_state.device_ptr(&ctx.stream);
         let (tensormaps_ptr, _tensormaps_guard) =
             scratch.flashinfer_tensormaps.device_ptr_mut(&ctx.stream);
         let (cu_ptr, _cu_guard) = scratch.flashinfer_cu_seqlens.device_ptr(&ctx.stream);
@@ -474,9 +521,10 @@ fn gated_delta_rule_prefill_flashinfer_into(
             k_ptr as *const ffi::Half,
             v_ptr as *const ffi::Half,
             o_ptr as *mut ffi::Half,
-            g_ptr as *const f32,
+            alpha_ptr as *const f32,
             beta_ptr as *const f32,
             fi_state_ptr as *mut f32,
+            fi_init_state_ptr as *const f32,
             tensormaps_ptr as *mut u8,
             cu_ptr as *const i64,
             scratch.q_expanded.seq_len as i32,

@@ -9,6 +9,11 @@ use cudarc::driver::sys::{CUresult, CUstream};
 
 use crate::ffi;
 
+/// Returns whether build.rs emitted the optional SM120 CuTe artifact.
+pub const fn aot_available() -> bool {
+    cfg!(flashinfer_gdn_aot)
+}
+
 fn check_cuda(result: CUresult, operation: &str) -> Result<()> {
     if result as u32 == 0 {
         Ok(())
@@ -31,6 +36,7 @@ pub fn launch_prefill(
     alpha: *const f32,
     beta: *const f32,
     state: *mut f32,
+    init_state: *const f32,
     tensormaps: *mut u8,
     cu_seqlens: *const i64,
     seq_len: i32,
@@ -43,16 +49,7 @@ pub fn launch_prefill(
         // stream-ordered launch completes.
         let result = unsafe {
             ffi::openinfer_qwen35_gdn_sm120_cuda(
-                q,
-                k,
-                v,
-                output,
-                alpha,
-                beta,
-                state,
-                tensormaps,
-                cu_seqlens,
-                seq_len,
+                q, k, v, output, alpha, beta, state, init_state, tensormaps, cu_seqlens, seq_len,
                 stream,
             )
         };
@@ -62,7 +59,10 @@ pub fn launch_prefill(
 
     #[cfg(not(flashinfer_gdn_aot))]
     {
-        let _ = (q, k, v, output, alpha, beta, state, tensormaps, cu_seqlens, seq_len, stream);
+        let _ = (
+            q, k, v, output, alpha, beta, state, init_state, tensormaps, cu_seqlens, seq_len,
+            stream,
+        );
         Ok(false)
     }
 }
@@ -96,3 +96,9 @@ pub fn transpose_state(
     check_cuda(result, "GDN state transpose")
 }
 
+/// Convert cumulative log-gates to FlashInfer's positive alpha factors.
+pub fn exp_gate(input: *const f32, output: *mut f32, length: i32, stream: CUstream) -> Result<()> {
+    let result =
+        unsafe { ffi::gated_delta_rule_prefill_gate_exp_cuda(input, output, length, stream) };
+    check_cuda(result, "GDN gate exponentiation")
+}

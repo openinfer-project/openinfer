@@ -1,6 +1,34 @@
 #include "common.cuh"
 
+#include <cuda.h>
 #include <stdint.h>
+
+__global__ void gated_delta_rule_gate_exp_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int32_t length) {
+  const int32_t index = static_cast<int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (index < length) {
+    output[index] = expf(input[index]);
+  }
+}
+
+extern "C" CUresult gated_delta_rule_prefill_gate_exp_cuda(
+    const float* input,
+    float* output,
+    int32_t length,
+    CUstream stream) {
+  if (input == nullptr || output == nullptr || length < 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  if (length == 0) {
+    return CUDA_SUCCESS;
+  }
+  constexpr int threads = 256;
+  const int blocks = (length + threads - 1) / threads;
+  gated_delta_rule_gate_exp_kernel<<<blocks, threads, 0, stream>>>(input, output, length);
+  return static_cast<CUresult>(cudaGetLastError());
+}
 
 // FlashInfer stores recurrent state as [H, V, K], while OpenInfer's decode
 // kernels use [H, K, V] with V contiguous.  Keep the conversion explicit at

@@ -50,6 +50,14 @@ pub struct GdrChunkwiseScratch35 {
     /// intentionally use transposed matrix layouts.
     #[cfg(feature = "flashinfer-gdn-prefill")]
     pub flashinfer_state: CudaSlice<f32>,
+    /// FlashInfer initial-state input, fp32: [1, num_value_heads, value_dim, key_dim].
+    /// Kept separate from `flashinfer_state` because the generated kernel reads
+    /// the initial state while writing the final state.
+    #[cfg(feature = "flashinfer-gdn-prefill")]
+    pub flashinfer_init_state: CudaSlice<f32>,
+    /// FlashInfer alpha input, fp32: exp(prefix-summed gate), [seq_len, num_value_heads].
+    #[cfg(feature = "flashinfer-gdn-prefill")]
+    pub flashinfer_alpha: CudaSlice<f32>,
     /// FlashInfer varlen metadata: device-side [0, seq_len] int64.
     #[cfg(feature = "flashinfer-gdn-prefill")]
     pub flashinfer_cu_seqlens: CudaSlice<i64>,
@@ -110,6 +118,16 @@ impl GdrChunkwiseScratch35 {
             .alloc_zeros(num_value_heads * value_dim * key_dim)
             .map_err(|e| anyhow::anyhow!("Alloc FlashInfer state failed: {}", e))?;
         #[cfg(feature = "flashinfer-gdn-prefill")]
+        let flashinfer_init_state: CudaSlice<f32> = ctx
+            .stream
+            .alloc_zeros(num_value_heads * value_dim * key_dim)
+            .map_err(|e| anyhow::anyhow!("Alloc FlashInfer init state failed: {}", e))?;
+        #[cfg(feature = "flashinfer-gdn-prefill")]
+        let flashinfer_alpha: CudaSlice<f32> = ctx
+            .stream
+            .alloc_zeros(seq_len * num_value_heads)
+            .map_err(|e| anyhow::anyhow!("Alloc FlashInfer alpha failed: {}", e))?;
+        #[cfg(feature = "flashinfer-gdn-prefill")]
         let flashinfer_cu_seqlens: CudaSlice<i64> = ctx
             .stream
             .alloc_zeros(2)
@@ -134,6 +152,10 @@ impl GdrChunkwiseScratch35 {
             chunk_state,
             #[cfg(feature = "flashinfer-gdn-prefill")]
             flashinfer_state,
+            #[cfg(feature = "flashinfer-gdn-prefill")]
+            flashinfer_init_state,
+            #[cfg(feature = "flashinfer-gdn-prefill")]
+            flashinfer_alpha,
             #[cfg(feature = "flashinfer-gdn-prefill")]
             flashinfer_cu_seqlens,
             #[cfg(feature = "flashinfer-gdn-prefill")]
@@ -202,10 +224,10 @@ impl GdrChunkwiseScratch35 {
         let per_layer_bytes = peak_layer * 2; // bf16
 
         #[cfg(feature = "flashinfer-gdn-prefill")]
-        let flashinfer_bytes =
-            num_vh * val_dim * key_dim * std::mem::size_of::<f32>()
-                + 2 * std::mem::size_of::<i64>()
-                + 256 * 128;
+        let flashinfer_bytes = seq * num_vh * std::mem::size_of::<f32>()
+            + 2 * num_vh * val_dim * key_dim * std::mem::size_of::<f32>()
+            + 2 * std::mem::size_of::<i64>()
+            + 256 * 128;
         #[cfg(not(feature = "flashinfer-gdn-prefill"))]
         let flashinfer_bytes = 0;
 

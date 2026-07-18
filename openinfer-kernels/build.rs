@@ -1392,7 +1392,13 @@ fn compile_triton_aot_kernels(cuda_include: &Path, out_dir: &Path, sm_targets: &
     println!("cargo:rerun-if-env-changed=OPENINFER_TRITON_PYTHON");
 }
 
-fn compile_flashinfer_gdn_aot(out_dir: &Path, sm_targets: &[String]) {
+fn compile_flashinfer_gdn_aot(
+    cuda_include: &Path,
+    extra_cuda_includes: &[PathBuf],
+    flashinfer: &FlashInferIncludes,
+    out_dir: &Path,
+    sm_targets: &[String],
+) {
     println!("cargo:rerun-if-env-changed=OPENINFER_FLASHINFER_GDN_AOT");
     println!("cargo:rerun-if-env-changed=OPENINFER_FLASHINFER_PYTHON");
 
@@ -1416,19 +1422,30 @@ fn compile_flashinfer_gdn_aot(out_dir: &Path, sm_targets: &[String]) {
         .unwrap_or_else(|| PathBuf::from("python3"));
     let generator = root.join("tools/flashinfer/gen_qwen35_gdn_aot.py");
     let artifact_dir = out_dir.join("flashinfer_gdn_sm120");
-    let status = Command::new(&python)
+    // The FlashInfer Python sources are vendored as a submodule.  Keep the
+    // AOT build reproducible without requiring an editable pip install of the
+    // whole package; the CuTe/CUDA dependencies still come from the selected
+    // build Python environment.
+    let mut python_path = vec![root.join("third_party/flashinfer")];
+    if let Some(existing) = std::env::var_os("PYTHONPATH") {
+        python_path.extend(std::env::split_paths(&existing));
+    }
+    let mut command = Command::new(&python);
+    command
         .arg(&generator)
         .arg("--output-dir")
         .arg(&artifact_dir)
-        .current_dir(&root)
-        .status()
-        .unwrap_or_else(|err| {
-            panic!(
-                "failed to run FlashInfer GDN AOT generator {} with {}: {err}",
-                generator.display(),
-                python.display()
-            )
-        });
+        .current_dir(&root);
+    if let Ok(joined) = std::env::join_paths(python_path) {
+        command.env("PYTHONPATH", joined);
+    }
+    let status = command.status().unwrap_or_else(|err| {
+        panic!(
+            "failed to run FlashInfer GDN AOT generator {} with {}: {err}",
+            generator.display(),
+            python.display()
+        )
+    });
     assert!(
         status.success(),
         "FlashInfer SM120 GDN AOT generation failed; install CUDA 13+ CuTe DSL build dependencies or unset OPENINFER_FLASHINFER_GDN_AOT"
@@ -1436,23 +1453,42 @@ fn compile_flashinfer_gdn_aot(out_dir: &Path, sm_targets: &[String]) {
 
     let object = artifact_dir.join("openinfer_qwen35_gdn_sm120.o");
     let wrapper = artifact_dir.join("openinfer_qwen35_gdn_sm120_wrapper.c");
-    assert!(object.is_file(), "missing generated CuTe object {}", object.display());
-    assert!(wrapper.is_file(), "missing generated C shim {}", wrapper.display());
+    assert!(
+        object.is_file(),
+        "missing generated CuTe object {}",
+        object.display()
+    );
+    assert!(
+        wrapper.is_file(),
+        "missing generated C shim {}",
+        wrapper.display()
+    );
 
     let mut build = cc::Build::new();
     build
         .file(&wrapper)
         .object(&object)
         .include(&artifact_dir)
+        .include(cuda_include)
         .flag_if_supported("-std=c11")
         .warnings(false);
+    for include in extra_cuda_includes {
+        build.include(include);
+    }
+    for include in &flashinfer.cccl {
+        build.include(include);
+    }
     time_phase("cc flashinfer_gdn_sm120", || {
         build.compile("flashinfer_gdn_sm120");
     });
 
     let runtime_libs = artifact_dir.join("runtime_libs.txt");
     if let Ok(contents) = fs::read_to_string(&runtime_libs) {
-        for lib in contents.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        for lib in contents
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+        {
             let path = Path::new(lib);
             if let Some(parent) = path.parent() {
                 println!("cargo:rustc-link-search=native={}", parent.display());
@@ -1469,6 +1505,9 @@ fn compile_flashinfer_gdn_aot(out_dir: &Path, sm_targets: &[String]) {
         }
     }
     println!("cargo:rustc-cfg=flashinfer_gdn_aot");
+    if !cfg!(target_os = "windows") {
+        println!("cargo:rustc-link-lib=pthread");
+    }
     println!("cargo:rerun-if-changed={}", generator.display());
 }
 
@@ -1481,6 +1520,17 @@ fn main() {
     let cuda_include = toolkit
         .header_dir("cuda.h")
         .unwrap_or_else(|| toolkit.root.join("include"));
+    // NVIDIA's pip CUDA packages split cuBLAS headers out of the nvcc
+    // package. Add sibling math-library include roots when using that layout.
+    let mut extra_cuda_includes = Vec::new();
+    if let Some(nvidia_root) = toolkit.root.parent() {
+        for (package, header) in [("cublas", "cublas_v2.h"), ("curand", "curand.h")] {
+            let include = nvidia_root.join(package).join("include");
+            if include.join(header).is_file() {
+                extra_cuda_includes.push(include);
+            }
+        }
+    }
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let sm_targets = detect_sm_targets();
     let nvcc_sm_targets = normalize_nvcc_sms(&sm_targets, &nvcc);
@@ -1609,6 +1659,9 @@ fn main() {
             "-I".to_string(),
             csrc_dir.to_string_lossy().to_string(),
         ];
+        for include in &extra_cuda_includes {
+            nvcc_args.extend(["-I".to_string(), include.to_string_lossy().to_string()]);
+        }
         if stem == "glm52_flashmla_sparse" {
             nvcc_args.extend(glm52_flashmla_sparse_arch_args(&nvcc_sm_targets, &nvcc));
         } else if stem == "glm52_deepgemm_mqa" {
@@ -1638,6 +1691,13 @@ fn main() {
         }
         nvcc_args.extend(["--compiler-options".to_string(), "-fPIC".to_string()]);
 
+        // CUDA 13's cuda_fp16.h includes libcudacxx's nv/target even for
+        // translation units that do not otherwise include FlashInfer. Keep
+        // the vendored CCCL ahead of the toolkit headers for every TU.
+        for dir in &flashinfer.cccl {
+            nvcc_args.extend(["-I".to_string(), dir.to_string_lossy().to_string()]);
+        }
+
         // Files that include FlashInfer headers (C++17, header-only)
         if stem == "paged_attention"
             || stem == "flashinfer_norm"
@@ -1645,9 +1705,6 @@ fn main() {
             || stem == "flashinfer_top1"
             || stem == "glm52_topk"
         {
-            for dir in &flashinfer.cccl {
-                nvcc_args.extend(["-I".to_string(), dir.to_string_lossy().to_string()]);
-            }
             nvcc_args.extend([
                 "--std=c++17".to_string(),
                 "-I".to_string(),
@@ -1964,7 +2021,13 @@ fn main() {
         );
     }
     if cfg!(feature = "flashinfer-gdn-prefill") {
-        compile_flashinfer_gdn_aot(&out_dir, &sm_targets);
+        compile_flashinfer_gdn_aot(
+            &cuda_include,
+            &extra_cuda_includes,
+            &flashinfer,
+            &out_dir,
+            &sm_targets,
+        );
     }
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());

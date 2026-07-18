@@ -26,13 +26,14 @@ TENSOR_MAP_BYTES = 256 * 128
 PREFIX = "openinfer_qwen35_gdn_sm120"
 
 
-def _patch_grid_argument_annotation(kernel_cls, cutlass) -> None:
-    """Make the upstream ``grid_x`` launch scalar exportable.
+def _patch_export_annotations(kernel_cls, cutlass, cuda_driver) -> None:
+    """Make upstream launch-only arguments exportable.
 
     FlashInfer v0.6.14 annotates ``grid_x`` as a Python ``int``.  CuTe's C
     header exporter only accepts DSL numeric types, even though the value is a
-    runtime launch scalar.  Treating it as Int32 preserves the ABI and lets
-    the generated wrapper vary the grid for future batched callers.
+    runtime launch scalar.  It also leaves ``stream`` unannotated, while the
+    exporter requires the CUDA binding type.  These annotations preserve the
+    runtime ABI without changing the vendored FlashInfer source.
     """
 
     call = kernel_cls.__call__
@@ -43,6 +44,7 @@ def _patch_grid_argument_annotation(kernel_cls, cutlass) -> None:
     if annotations is None:
         raise RuntimeError("cannot find CuTe GDN kernel annotations")
     annotations["grid_x"] = cutlass.Int32
+    annotations["stream"] = cuda_driver.CUstream
 
 
 def _fake_tensor(cute, cutlass, dtype, shape, stride):
@@ -65,6 +67,7 @@ def _write_c_shim(output_dir: Path, header_name: str) -> None:
     header_prefix = PREFIX
     wrapper_name = f"cute_dsl_{PREFIX}_wrapper"
     text = f'''#include "{header_name}"
+#include <cuda.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
 #include <pthread.h>
@@ -78,7 +81,7 @@ static void load_{header_prefix}(void) {{
 
 // q/k/v/o are token-major [T, H, D] buffers.  CuTe consumes the equivalent
 // TMA views [T, D, H] with the static strides below.  alpha/beta are [T, H].
-// state is [1, H, V, K], matching FlashInfer's final-state contract.
+// state and init_state are [1, H, V, K], matching FlashInfer's state contract.
 CUresult {header_prefix}_cuda(
     const uint16_t* q,
     const uint16_t* k,
@@ -87,6 +90,7 @@ CUresult {header_prefix}_cuda(
     const float* alpha,
     const float* beta,
     float* state,
+    const float* init_state,
     uint8_t* tensormaps,
     const int64_t* cu_seqlens,
     int32_t seq_len,
@@ -101,10 +105,11 @@ CUresult {header_prefix}_cuda(
     {header_prefix}_Tensor_g_alpha_t alpha_desc = {{(void*)alpha, {{seq_len}}}};
     {header_prefix}_Tensor_g_beta_t beta_desc = {{(void*)beta, {{seq_len}}}};
     {header_prefix}_Tensor_g_state_t state_desc = {{(void*)state}};
+    {header_prefix}_Tensor_g_init_state_t init_state_desc = {{(void*)init_state}};
     {header_prefix}_Tensor_g_tensormaps_t tensormaps_desc = {{(void*)tensormaps}};
     {header_prefix}_Tensor_cu_seqlens_t cu_desc = {{(void*)cu_seqlens}};
 
-    {wrapper_name}(
+    int32_t launch_status = {wrapper_name}(
         &g_module,
         &q_desc,
         &k_desc,
@@ -113,6 +118,7 @@ CUresult {header_prefix}_cuda(
         &alpha_desc,
         &beta_desc,
         &state_desc,
+        &init_state_desc,
         &tensormaps_desc,
         &cu_desc,
         1.0f / 11.313708498984761f,
@@ -125,7 +131,8 @@ CUresult {header_prefix}_cuda(
         0,
         {HEADS},
         stream);
-    return (CUresult)cudaGetLastError();
+    if (launch_status != 0) return CUDA_ERROR_LAUNCH_FAILED;
+    return cudaGetLastError() == cudaSuccess ? CUDA_SUCCESS : CUDA_ERROR_LAUNCH_FAILED;
 }}
 '''
     (output_dir / f"{PREFIX}_wrapper.c").write_text(text, encoding="utf-8")
@@ -149,7 +156,7 @@ def generate(output_dir: Path) -> None:
     )
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    _patch_grid_argument_annotation(_FullyFusedDeltaRuleSm120, cutlass)
+    _patch_export_annotations(_FullyFusedDeltaRuleSm120, cutlass, cuda_driver)
 
     token_count = cute.sym_int32(divisibility=64, symbol="total_tokens")
     q_stride = (HEADS * HEAD_DIM, 1, HEAD_DIM)
@@ -167,6 +174,9 @@ def generate(output_dir: Path) -> None:
     state = _fake_tensor(
         cute, cutlass, cutlass.Float32, (1, HEADS, HEAD_DIM, HEAD_DIM), state_stride
     )
+    init_state = _fake_tensor(
+        cute, cutlass, cutlass.Float32, (1, HEADS, HEAD_DIM, HEAD_DIM), state_stride
+    )
     tensormaps = _fake_tensor(
         cute, cutlass, cutlass.Uint8, (TENSOR_MAP_BYTES,), (1,)
     )
@@ -176,7 +186,7 @@ def generate(output_dir: Path) -> None:
     kernel = _FullyFusedDeltaRuleSm120(
         needs_alpha=True,
         needs_beta=True,
-        needs_init_state=False,
+        needs_init_state=True,
         needs_checkpointing=False,
         dtype=cutlass.BFloat16,
     )
@@ -188,7 +198,7 @@ def generate(output_dir: Path) -> None:
         alpha,
         beta,
         state,
-        None,
+        init_state,
         None,
         None,
         tensormaps,
@@ -205,7 +215,7 @@ def generate(output_dir: Path) -> None:
         stream,
     )
 
-    options = (cutlass.GPUArch("sm_120a"),)
+    options = (cute.GPUArch("sm_120a"),)
     compiled = cute.compile[options](kernel, *args)
     compiled.export_to_c(str(output_dir), PREFIX, function_prefix=PREFIX)
     _write_c_shim(output_dir, f"{PREFIX}.h")
