@@ -1418,8 +1418,7 @@ fn compile_flashinfer_gdn_aot(
 
     let root = crate_root();
     let python = std::env::var_os("OPENINFER_FLASHINFER_PYTHON")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("python3"));
+        .map_or_else(|| PathBuf::from("python3"), PathBuf::from);
     let generator = root.join("tools/flashinfer/gen_qwen35_gdn_aot.py");
     let artifact_dir = out_dir.join("flashinfer_gdn_sm120");
     // The FlashInfer Python sources are vendored as a submodule.  Keep the

@@ -125,6 +125,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    #[cfg(feature = "qwen35-4b")]
     pub fn gated_delta_rule_prefill_gate_exp_cuda(
         input: *const f32,
         output: *mut f32,
