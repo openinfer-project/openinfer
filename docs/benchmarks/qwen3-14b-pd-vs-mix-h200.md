@@ -91,7 +91,7 @@ pegaflow-router 原生支持 `--prefill/--decode` 各传多个端点（round-rob
 1. **主因**：`commit_loaded_blocks` 在 scheduler 线程上逐块注册 restore 的块，~70µs/块（registry radix 插入 + event hook + 频率统计 + store 锁）。1000+ 块的大 restore = ~70ms 内所有流的 token 交付冻结。
 2. **次因**：greedy token 回读用 pageable D2H（同步拷贝语义），被并发大批量拷贝排队，从亚毫秒平顶到 23.6ms/步。
 
-修复（#705）：注册改为 `Committing` 阶段每 tick 64 块分期支付（仅在有活跃 decode 行时限速，纯 prefill tick 一次付清）+ token 回读 pinned 化。探测中 >40ms 的 ITL 尖峰从每次 restore 必现降到 **0**；restore 密集的 warm 复跑吞吐 +22%（298 vs 244 tok/s）。试过并被数据否决的方案：off-thread 注册线程（store 锁与 scheduler 争抢，更差）、Kernel 拷贝后端（copy kernel 抢 SM，两波 ~110ms 停顿）。
+修复（#705）：注册改为 `Committing` 阶段每 tick 64 块分期支付（仅在有活跃 decode 行时限速，纯 prefill tick 一次付清）+ token 回读 pinned 化。追根（[#708](https://github.com/openinfer-project/openinfer/pull/708)）：70µs/块中真实注册只有 ~0.8µs,其余是 `PositionalRadixTree` 内层 DashMap 的按需分配——分片数随核数缩放（192 核 = 1024 分片/新 position）而并发度毫无用处（外层 entry 写锁已独占）;内层改平 HashMap 后 1024 块 commit 36.4ms → 1.67ms（22×）。分块 pacing 保留为任意大 restore 的每 tick 有界不变量。探测中 >40ms 的 ITL 尖峰从每次 restore 必现降到 **0**；restore 密集的 warm 复跑吞吐 +22%（298 vs 244 tok/s）。试过并被数据否决的方案：off-thread 注册线程（store 锁与 scheduler 争抢，更差）、Kernel 拷贝后端（copy kernel 抢 SM，两波 ~110ms 停顿）。
 
 ## 5. 正确性与故障门（14B 复验）
 
