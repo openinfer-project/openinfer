@@ -21,7 +21,7 @@
 #   CONCURRENCY_LIST space-separated concurrency values for spec sweep [default: "1 4 8"]
 #   INPUT_LEN        input length [default: 1024]
 #   OUTPUT_LEN       output length [default: 128]
-#   SEED             random seed [default: 42]
+#   SEED             base random seed; each point derives its own from SEED + axis/value [default: 42]
 #   SECONDS_PER_RUN  seconds per QPS run [default: 60]
 #   BENCH            path to vllm-bench binary [default: vllm-bench on PATH]
 #   VLLM             path to vllm binary for ENGINE=vllm [default: vllm on PATH]
@@ -61,6 +61,21 @@ SKIP_BUILD=${SKIP_BUILD:-0}
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 MODEL_LABEL=$(basename "$MODEL")
+
+# A shared seed replays the same prompts at every point — warm for a
+# prefix-cache-on server. Deriving from axis+value (not draw order) keeps a
+# point's prompt stream stable no matter which sweeps are enabled.
+USED_SEEDS=" "
+point_seed() { # $1 axis  $2 value
+  POINT_SEED=$(( SEED + $(printf '%s' "$1=$2" | cksum | cut -d' ' -f1) % 100000 ))
+  case "$USED_SEEDS" in *" $POINT_SEED "*)
+    echo "FATAL: seed $POINT_SEED for $1=$2 already used this run (duplicate point or hash collision); points would share a prompt stream" >&2
+    exit 1;;
+  esac
+  USED_SEEDS="$USED_SEEDS$POINT_SEED "
+}
+# Summarize only this run's files; RESULT_DIR may hold stale JSONs.
+RESULT_FILES=()
 
 mkdir -p "$RESULT_DIR"
 
@@ -155,19 +170,21 @@ if [[ -n "${QPS_LIST// /}" ]]; then
   fi
   for QPS in $QPS_LIST; do
     NUM_PROMPTS=$(python3 -c "print(int($QPS * $SECONDS_PER_RUN))")
-    echo "--- $LABEL $MODEL_LABEL qps=$QPS num_prompts=$NUM_PROMPTS dataset=$DATASET ---"
+    point_seed qps "$QPS"
+    echo "--- $LABEL $MODEL_LABEL qps=$QPS num_prompts=$NUM_PROMPTS dataset=$DATASET seed=$POINT_SEED ---"
     "$BENCH" \
       --backend openai --model "$MODEL" --port "$PORT" \
       --base-url "http://localhost:$PORT" \
       "${DATASET_ARGS[@]}" \
       --num-prompts "$NUM_PROMPTS" \
       --request-rate "$QPS" \
-      --seed "$SEED" \
+      --seed "$POINT_SEED" \
       --ignore-eos --temperature 0 \
       --tokenizer "$MODEL" \
       --percentile-metrics ttft,tpot,itl,e2el \
       --save-result --result-dir "$RESULT_DIR" \
-      --result-filename "${LABEL}-${MODEL_LABEL}-${DATASET}-qps${QPS}-seed${SEED}.json"
+      --result-filename "${LABEL}-${MODEL_LABEL}-${DATASET}-qps${QPS}-seed${POINT_SEED}.json"
+    RESULT_FILES+=("$RESULT_DIR/${LABEL}-${MODEL_LABEL}-${DATASET}-qps${QPS}-seed${POINT_SEED}.json")
   done
 else
   echo "=== QPS sweep skipped (QPS_LIST is empty) ==="
@@ -182,25 +199,27 @@ if [[ "${ENGINE}" == "openinfer" && -n "${CONCURRENCY_LIST// /}" ]]; then
   fi
   for C in $CONCURRENCY_LIST; do
     NUM_PROMPTS=$(python3 -c "print(int($C * $SECONDS_PER_RUN))")
-    echo "--- $LABEL $MODEL_LABEL c=$C num_prompts=$NUM_PROMPTS dataset=$DATASET ---"
+    point_seed c "$C"
+    echo "--- $LABEL $MODEL_LABEL c=$C num_prompts=$NUM_PROMPTS dataset=$DATASET seed=$POINT_SEED ---"
     "$BENCH" \
       --backend openai --model "$MODEL" --port "$PORT" \
       --base-url "http://localhost:$PORT" \
       "${DATASET_ARGS[@]}" \
       --num-prompts "$NUM_PROMPTS" \
       --max-concurrency "$C" \
-      --seed "$SEED" \
+      --seed "$POINT_SEED" \
       --ignore-eos --temperature 0 \
       --tokenizer "$MODEL" \
       --percentile-metrics ttft,tpot,itl,e2el \
       --save-result --result-dir "$RESULT_DIR" \
-      --result-filename "${LABEL}-${MODEL_LABEL}-${DATASET}-c${C}-seed${SEED}.json"
+      --result-filename "${LABEL}-${MODEL_LABEL}-${DATASET}-c${C}-seed${POINT_SEED}.json"
+    RESULT_FILES+=("$RESULT_DIR/${LABEL}-${MODEL_LABEL}-${DATASET}-c${C}-seed${POINT_SEED}.json")
   done
 fi
 
 # ---- summary ---------------------------------------------------------------
 echo ""
 echo "=== results summary ==="
-"$SCRIPT_DIR/summarize_qps_sweep.py" "$RESULT_DIR"/${LABEL}-${MODEL_LABEL}-*.json
+"$SCRIPT_DIR/summarize_qps_sweep.py" "${RESULT_FILES[@]}"
 echo ""
 echo "results saved to $RESULT_DIR"
