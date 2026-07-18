@@ -48,7 +48,7 @@ pegaflow #381 已合入 master（squash 为 `d46fd16`，含 router `max_completi
 - P 侧冷 prompt 多付一轮 RemoteFetch 往返（本地全 miss 先 `Loading` 再空手 prefill）——设计使然。
 - 单机验证 ≠ 跨机：跨机需确认 dma-buf/GID/路由；目标集群 GPU↔NIC 同构（8×400G 1:1 PIX）预期直接成立。
 - 多 P 多 D 纯 router 事务（内容寻址保证任意 D 发现任意 P 的 KV）——**14B 战役已实测 2P+2D**：任意 D↔任意 P 拉取成立，甚至 P 会从 D 拉前缀（mesh 全向）；但 router round-robin 会打碎前缀局部性，重负载 ITL p99 从 23→85ms，**必须配前缀亲和选路**（pegaflow #405，P+D 都要亲和）。
-- bulk restore 的块注册是 O(blocks) 的 CPU 簿记（~70µs/块,其中 ~97% 是 PRT 内层分片表按核数分配,[#708](https://github.com/openinfer-project/openinfer/pull/708) 修掉后 ~1.6µs/块），在 scheduler 线程上一次付清会冻结全部流的 token 交付 ~70ms（openinfer [#704](https://github.com/openinfer-project/openinfer/issues/704)，[#705](https://github.com/openinfer-project/openinfer/pull/705) 改为每 tick 64 块分期 + pinned token 回读修复）。诊断教训：GPU 占空比正常但 token 停 = 查 scheduler 线程,别猜带宽。
+- bulk restore 的块注册曾在 scheduler 线程冻结全部流 ~70ms（openinfer [#704](https://github.com/openinfer-project/openinfer/issues/704)）：~97% 成本是 registry PRT 内层分片表按核数分配（192 核 = 1024 分片/新 position）,[#705](https://github.com/openinfer-project/openinfer/pull/705) 内层改平 HashMap（~1.6µs/块,1000 块 inline ~2ms）+ pinned token 回读修复,无需分期机制。诊断教训：GPU 占空比正常但 token 停 = 查 scheduler 线程,别猜带宽;第三方并发容器的 or_default 可能藏着随核数缩放的分配。
 - 字节一致门有边界：P/D 的 restore+suffix-prefill 与本地整段 prefill 的 chunk 边界不同,Tuned 策略下近平局 token 可合法翻转（非缺陷,单机 prefix-cache 命中同理;详见 14B 战役文档 §5）。传输无损由大传输档 + logits golden gate 保证。
 - host 池大小是 decode 纯净性的一部分：池装不下工作集时 P 侧 evict → D 查询 miss → D 本地 prefill 兜底污染 decode（14B 重负载实测 ITL p99 23.6→84.6ms）。大池用 `--kv-offload-hugepages`（2MiB hugepages，200GiB NUMA 感知池 ~5s/池分配）。
 - prefill-only 请求模式（省掉 max_tokens=1 的一步 decode）：`PendingEffect::EmitAndFinish` 缝上加,未做。
