@@ -43,18 +43,44 @@ pub(crate) struct LinearStatePointerTables {
 
 /// Per-layer element counts shared by allocation and reservation:
 /// (linear layers, f32 state elements, bf16 conv elements).
-fn per_layer_dims(config: &Config35) -> (usize, usize, usize) {
-    let num_linear_layers = config.num_hidden_layers - config.num_full_attention_layers();
-    let state_size =
-        config.linear_num_value_heads * config.linear_key_head_dim * config.linear_value_head_dim;
-    let conv_state_size = config.linear_attn_qkv_dim() * (config.linear_conv_kernel_dim - 1);
-    (num_linear_layers, state_size, conv_state_size)
+fn per_layer_dims(config: &Config35) -> Result<(usize, usize, usize)> {
+    let num_linear_layers = config
+        .num_hidden_layers
+        .checked_sub(config.num_full_attention_layers())
+        .ok_or_else(|| {
+            anyhow::anyhow!("Qwen3.5 full-attention layer count exceeds total layers")
+        })?;
+    let state_size = config
+        .linear_num_value_heads
+        .checked_mul(config.linear_key_head_dim)
+        .and_then(|size| size.checked_mul(config.linear_value_head_dim))
+        .ok_or_else(|| anyhow::anyhow!("Qwen3.5 recurrent state dimensions overflow usize"))?;
+    let linear_q = config
+        .linear_num_key_heads
+        .checked_mul(config.linear_key_head_dim)
+        .ok_or_else(|| anyhow::anyhow!("Qwen3.5 linear Q dimension overflows usize"))?;
+    let linear_v = config
+        .linear_num_value_heads
+        .checked_mul(config.linear_value_head_dim)
+        .ok_or_else(|| anyhow::anyhow!("Qwen3.5 linear V dimension overflows usize"))?;
+    let linear_qkv = linear_q
+        .checked_mul(2)
+        .and_then(|qk| qk.checked_add(linear_v))
+        .ok_or_else(|| anyhow::anyhow!("Qwen3.5 linear QKV dimension overflows usize"))?;
+    let conv_tail = config
+        .linear_conv_kernel_dim
+        .checked_sub(1)
+        .ok_or_else(|| anyhow::anyhow!("Qwen3.5 linear conv kernel must be positive"))?;
+    let conv_state_size = linear_qkv
+        .checked_mul(conv_tail)
+        .ok_or_else(|| anyhow::anyhow!("Qwen3.5 conv state dimensions overflow usize"))?;
+    Ok((num_linear_layers, state_size, conv_state_size))
 }
 
 impl RecurrentState {
     /// Allocate zeroed recurrent state for all linear attention layers.
     pub(crate) fn new(ctx: &DeviceContext, config: &Config35) -> Result<Self> {
-        let (num_linear_layers, state_size, conv_state_size) = per_layer_dims(config);
+        let (num_linear_layers, state_size, conv_state_size) = per_layer_dims(config)?;
 
         let mut layers = Vec::with_capacity(num_linear_layers);
         for _ in 0..num_linear_layers {
@@ -145,15 +171,24 @@ impl LinearStatePointerTables {
 }
 
 /// Device bytes of one request's recurrent state.
-pub(crate) fn bytes_per_request(config: &Config35) -> usize {
-    let (num_linear_layers, state_size, conv_state_size) = per_layer_dims(config);
+pub(crate) fn bytes_per_request(config: &Config35) -> Result<usize> {
+    let (num_linear_layers, state_size, conv_state_size) = per_layer_dims(config)?;
+    let state_bytes = state_size
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| anyhow::anyhow!("Qwen3.5 recurrent state bytes overflow usize"))?;
+    let conv_bytes = conv_state_size
+        .checked_mul(std::mem::size_of::<half::bf16>())
+        .ok_or_else(|| anyhow::anyhow!("Qwen3.5 conv state bytes overflow usize"))?;
+    let per_layer_bytes = state_bytes
+        .checked_add(conv_bytes)
+        .ok_or_else(|| anyhow::anyhow!("Qwen3.5 per-layer recurrent bytes overflow usize"))?;
     num_linear_layers
-        * (state_size * std::mem::size_of::<f32>()
-            + conv_state_size * std::mem::size_of::<half::bf16>())
+        .checked_mul(per_layer_bytes)
+        .ok_or_else(|| anyhow::anyhow!("Qwen3.5 per-request recurrent bytes overflow usize"))
 }
 
 impl RecurrentState {
-    pub(crate) fn allocation_bytes(config: &Config35) -> usize {
+    pub(crate) fn allocation_bytes(config: &Config35) -> Result<usize> {
         bytes_per_request(config)
     }
 }

@@ -429,6 +429,38 @@ impl Qwen35Model {
             start_positions.push(pos);
         }
 
+        let page_indices: Vec<Vec<i32>> =
+            kv_states.iter().map(|kv| kv.page_indices_i32()).collect();
+        let last_page_lens: Vec<usize> = kv_states.iter().map(|kv| kv.last_page_len()).collect();
+        let seq_lens = vec![1usize; bs];
+
+        let plan = graph_state
+            .uncompiled_prefill_plan
+            .as_mut()
+            .ok_or_else(|| {
+                anyhow::anyhow!("uncompiled GQA decode requires a preallocated PrefillPagedPlan")
+            })?;
+        plan.update_batch_with_cta_tile_q(
+            &self.ctx,
+            &page_indices,
+            &last_page_lens,
+            &start_positions,
+            &seq_lens,
+            self.config.num_attention_heads,
+            self.config.num_key_value_heads,
+            self.config.head_dim,
+            0,
+        )
+        .with_context(|| {
+            format!(
+                "hybrid decode update PrefillPagedPlan bs={bs}, pages={}, heads={}/{}, head_dim={}",
+                page_indices.iter().map(Vec::len).sum::<usize>(),
+                self.config.num_attention_heads,
+                self.config.num_key_value_heads,
+                self.config.head_dim
+            )
+        })?;
+
         let bufs = &mut graph_state.buffers;
         bufs.set_batch_size(bs);
         self.ctx
@@ -450,32 +482,6 @@ impl Qwen35Model {
                 )
             })?;
 
-        let page_indices: Vec<Vec<i32>> =
-            kv_states.iter().map(|kv| kv.page_indices_i32()).collect();
-        let last_page_lens: Vec<usize> = kv_states.iter().map(|kv| kv.last_page_len()).collect();
-        let seq_lens = vec![1usize; bs];
-        // cta_tile_q 0 = the kernel's own FA2 derivation; the hd256 FFI takes no override.
-        let plan = ops::PrefillPagedPlan::from_raw_batch_with_cta_tile_q(
-            &self.ctx,
-            &page_indices,
-            &last_page_lens,
-            &start_positions,
-            &seq_lens,
-            self.config.num_attention_heads,
-            self.config.num_key_value_heads,
-            self.config.head_dim,
-            0,
-        )
-        .with_context(|| {
-            format!(
-                "hybrid decode build PrefillPagedPlan bs={bs}, pages={}, heads={}/{}, head_dim={}",
-                page_indices.iter().map(Vec::len).sum::<usize>(),
-                self.config.num_attention_heads,
-                self.config.num_key_value_heads,
-                self.config.head_dim
-            )
-        })?;
-
         let kv_buffer = kv_states[0].buffer();
         let layout = *kv_states[0].layout();
         anyhow::ensure!(
@@ -490,7 +496,7 @@ impl Qwen35Model {
         self.batch_decode_batched_hybrid_kernels(
             kv_buffer,
             &layout,
-            &plan,
+            plan,
             bs,
             &graph_state.linear_pointer_tables.state_ptrs,
             &graph_state.linear_pointer_tables.conv_state_ptrs,

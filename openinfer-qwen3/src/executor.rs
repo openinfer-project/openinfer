@@ -1250,6 +1250,7 @@ impl Qwen3Executor {
                     total_blocks,
                     padding_block_id,
                     max_prefill_tokens,
+                    budget.uncompiled_prefill_plan_capacity,
                 )?,
             )?,
             workers: Vec::new(),
@@ -1482,6 +1483,7 @@ impl Qwen3Executor {
                 total_blocks,
                 padding_block_id,
                 max_prefill_tokens,
+                budget.uncompiled_prefill_plan_capacity,
             )?,
         )?;
 
@@ -1496,6 +1498,7 @@ impl Qwen3Executor {
                     total_blocks,
                     padding_block_id,
                     max_prefill_tokens,
+                    budget.uncompiled_prefill_plan_capacity,
                 )?;
                 RankWorker::spawn(index + 1, lane)
             })
@@ -3137,6 +3140,9 @@ struct LocalQwen3Lane {
     padding_block_id: i32,
     /// Set by the sweep's `Finalize`; arms the TP replay fail-loud in serving.
     precapture_complete: bool,
+    /// Reusable metadata for the uncompiled-GQA unified decode fallback.
+    /// `None` for models with a compiled decode-attention kernel.
+    uncompiled_prefill_plan: Option<ops::PrefillPagedPlan>,
 }
 
 /// Stored state for an async prefill that was launched but not yet synced.
@@ -3160,6 +3166,7 @@ impl LocalQwen3Lane {
         total_blocks: usize,
         padding_block_id: i32,
         max_prefill_tokens: usize,
+        uncompiled_prefill_plan_capacity: Option<ops::PrefillPagedPlanCapacity>,
     ) -> Result<Self> {
         let buf_layout = kv_buffer.layout();
         let layout = KvLayout::new(
@@ -3187,6 +3194,27 @@ impl LocalQwen3Lane {
             model.config().vocab_size,
             max_bucket,
         )?;
+        anyhow::ensure!(
+            uncompiled_prefill_plan_capacity.is_some() != model.config().decode_group_is_compiled(),
+            "Qwen3 reusable-plan capacity does not match decode route"
+        );
+        let uncompiled_prefill_plan = if let Some(capacity) = uncompiled_prefill_plan_capacity {
+            let bytes = capacity.preallocated_bytes()?;
+            log::info!(
+                "Qwen3 uncompiled-GQA PrefillPagedPlan: tokens={}, page_indices={}, batch={}, tiles={}, footprint={} bytes",
+                capacity.max_total_tokens(),
+                capacity.max_page_indices(),
+                capacity.max_batch(),
+                capacity.max_tiles(),
+                bytes,
+            );
+            Some(ops::PrefillPagedPlan::new_preallocated_for_capacity(
+                model.device_ctx(),
+                capacity,
+            )?)
+        } else {
+            None
+        };
         Ok(Self {
             model,
             kv_buffer,
@@ -3201,6 +3229,7 @@ impl LocalQwen3Lane {
             total_blocks,
             padding_block_id,
             precapture_complete: false,
+            uncompiled_prefill_plan,
         })
     }
 
@@ -3504,6 +3533,7 @@ impl LocalQwen3Lane {
             &mut self.bufs,
             self.kv_buffer.buffer(),
             &self.layout,
+            self.uncompiled_prefill_plan.as_mut(),
         )
     }
 

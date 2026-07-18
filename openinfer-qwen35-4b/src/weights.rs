@@ -7,6 +7,7 @@ use cudarc::nccl::safe::Comm;
 use cudarc::nccl::safe::ReduceOp;
 use log::debug;
 use log::info;
+use openinfer_core::ops::PrefillPagedPlanCapacity;
 use openinfer_core::tensor::DeviceContext;
 use openinfer_core::tensor::DeviceMatrix;
 use openinfer_core::tensor::DeviceVec;
@@ -124,6 +125,8 @@ pub struct Qwen35Model {
     /// sit below `reserved_decode_slots` when the request is not a bucket
     /// (e.g. `--max-batch 5` allocates bucket 8 but admits at most 5). See #470.
     pub(super) decode_admission_batch: usize,
+    /// Capacity charged at startup and later consumed by the graph state.
+    uncompiled_prefill_plan_capacity: Option<PrefillPagedPlanCapacity>,
     tp_comm: Option<Comm>,
 }
 
@@ -207,6 +210,11 @@ impl Qwen35Model {
 
         let mut config = Config35::from_file(model_path)?;
         let tensor_parallel = runtime.tensor_parallel.unwrap_or_default();
+        // TP currently uses the eager decode kernel path, which does not own a
+        // hybrid PrefillPagedPlan. Only the single-GPU graph owner needs the
+        // persistent uncompiled-GQA metadata reservation.
+        let needs_uncompiled_prefill_plan =
+            tensor_parallel.world_size == 1 && !config.decode_group_is_compiled();
         tensor_parallel.validate_for(&config, runtime.enable_cuda_graph)?;
         debug!(
             "Config: hidden_size={}, num_layers={}, full_attn={}, linear_attn={}, max_position_embeddings={}, tp_rank={}, tp_world_size={}",
@@ -491,36 +499,71 @@ impl Qwen35Model {
             config.head_dim,
             page_size,
         );
-        let bytes_per_page = layout.page_stride * std::mem::size_of::<half::bf16>();
+        let bytes_per_page = layout
+            .page_stride
+            .checked_mul(std::mem::size_of::<half::bf16>())
+            .ok_or_else(|| anyhow::anyhow!("Qwen3.5 KV page bytes overflow usize"))?;
         let (free_bytes, _total_bytes) = cudarc::driver::result::mem_get_info()
             .map_err(|e| anyhow::anyhow!("cuMemGetInfo failed: {e}"))?;
         // Reserve space for prefill scratch (GDR chunkwise + per-layer transients)
         // before allocating KV pool, so prefill doesn't OOM.
         let max_prefill_len = super::prefill::SCRATCH_ESTIMATE_SEQ;
-        let scratch_reserve =
-            super::prefill_buffers::GdrChunkwiseScratch35::estimate_bytes(&config, max_prefill_len);
-        let recurrent_reserve =
-            STATES_PER_DECODE_SLOT * max_batch * super::recurrent_state::bytes_per_request(&config);
-        let min_kv_bytes = MIN_KV_PAGES * bytes_per_page;
+        let scratch_reserve = super::prefill_buffers::GdrChunkwiseScratch35::estimate_bytes(
+            &config,
+            max_prefill_len,
+        )?;
+        let recurrent_bytes_per_request = super::recurrent_state::bytes_per_request(&config)?;
+        let recurrent_reserve = STATES_PER_DECODE_SLOT
+            .checked_mul(max_batch)
+            .and_then(|slots| slots.checked_mul(recurrent_bytes_per_request))
+            .ok_or_else(|| anyhow::anyhow!("Qwen3.5 recurrent reserve overflows usize"))?;
+        let min_kv_bytes = MIN_KV_PAGES
+            .checked_mul(bytes_per_page)
+            .ok_or_else(|| anyhow::anyhow!("Qwen3.5 minimum KV reserve overflows usize"))?;
+        let uncompiled_prefill_plan_capacity = if needs_uncompiled_prefill_plan {
+            let group_size = config.num_attention_heads / config.num_key_value_heads;
+            Some(PrefillPagedPlanCapacity::for_context(
+                max_batch,
+                max_batch,
+                config.max_position_embeddings,
+                page_size,
+                group_size,
+            )?)
+        } else {
+            None
+        };
+        let prefill_plan_reserve = uncompiled_prefill_plan_capacity
+            .map(PrefillPagedPlanCapacity::preallocated_bytes)
+            .transpose()?
+            .unwrap_or(0);
+        let base_reserve = scratch_reserve
+            .checked_add(recurrent_reserve)
+            .ok_or_else(|| anyhow::anyhow!("Qwen3.5 scratch/recurrent reserves overflow usize"))?;
+        let startup_reserve = base_reserve
+            .checked_add(prefill_plan_reserve)
+            .ok_or_else(|| anyhow::anyhow!("Qwen3.5 startup reserves overflow usize"))?;
+        let required_bytes = startup_reserve
+            .checked_add(min_kv_bytes)
+            .ok_or_else(|| anyhow::anyhow!("Qwen3.5 total memory requirement overflows usize"))?;
         anyhow::ensure!(
-            free_bytes >= scratch_reserve + recurrent_reserve + min_kv_bytes,
-            "insufficient device memory for Qwen3.5: {} MB free, but prefill scratch needs {} MB, \
-             recurrent state needs {} MB ({STATES_PER_DECODE_SLOT} x {max_batch} decode slots), \
-             and the minimal KV pool needs {} MB; lower the decode batch capacity (--max-batch) \
-             or use a smaller model",
+            free_bytes >= required_bytes,
+            "insufficient device memory for Qwen3.5: free={} MB, scratch/recurrent={} MB, persistent plan={} MB, minimum KV={} MB; lower --max-batch or use a smaller model",
             free_bytes / (1024 * 1024),
-            scratch_reserve / (1024 * 1024),
-            recurrent_reserve / (1024 * 1024),
+            base_reserve / (1024 * 1024),
+            prefill_plan_reserve / (1024 * 1024),
             min_kv_bytes / (1024 * 1024),
         );
-        let available = free_bytes - scratch_reserve - recurrent_reserve;
+        let available = free_bytes
+            .checked_sub(startup_reserve)
+            .ok_or_else(|| anyhow::anyhow!("Qwen3.5 startup reserves exceed free device memory"))?;
         let kv_budget = (available as f64 * 0.85) as usize;
         let num_pages = (kv_budget / bytes_per_page).max(MIN_KV_PAGES);
         let kv_mb = num_pages * bytes_per_page / (1024 * 1024);
         let scratch_mb = scratch_reserve / (1024 * 1024);
         let recurrent_mb = recurrent_reserve / (1024 * 1024);
         info!(
-            "Qwen3.5 KV cache: {num_pages} pages ({kv_mb} MB), prefill scratch reserve: {scratch_mb} MB, recurrent-state reserve: {recurrent_mb} MB ({STATES_PER_DECODE_SLOT} x {max_batch} slots), {:.0}% of {:.0} MB free",
+            "Qwen3.5 KV cache: {num_pages} pages ({kv_mb} MB), prefill scratch reserve: {scratch_mb} MB, recurrent-state reserve: {recurrent_mb} MB ({STATES_PER_DECODE_SLOT} x {max_batch} slots), persistent plan reserve: {} MB, {:.0}% of {:.0} MB free",
+            prefill_plan_reserve / (1024 * 1024),
             kv_budget as f64 / free_bytes as f64 * 100.0,
             free_bytes as f64 / 1024.0 / 1024.0
         );
@@ -546,6 +589,7 @@ impl Qwen35Model {
             kv_pool,
             reserved_decode_slots: max_batch,
             decode_admission_batch,
+            uncompiled_prefill_plan_capacity,
             tp_comm: None,
         })
     }
@@ -727,6 +771,7 @@ impl Qwen35Model {
             self.tensor_parallel,
             &self.kv_pool,
             max_batch,
+            self.uncompiled_prefill_plan_capacity,
         )
     }
 

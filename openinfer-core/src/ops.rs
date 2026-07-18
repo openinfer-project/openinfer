@@ -81,6 +81,7 @@ pub use openinfer_kernels::ops::single_prefill_nhd_causal_into;
 pub use openinfer_kernels::ops::single_prefill_nhd_noncausal_into;
 pub use openinfer_kernels::ops::write_vec_into;
 pub use paged_plan::PrefillPagedPlan;
+pub use paged_plan::PrefillPagedPlanCapacity;
 #[cfg(feature = "kernel-call-trace")]
 pub use traced::embedding_batch;
 #[cfg(feature = "kernel-call-trace")]
