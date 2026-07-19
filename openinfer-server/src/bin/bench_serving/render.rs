@@ -472,6 +472,15 @@ pub(crate) fn render_mixed_text(report: &MixedLoadReport) -> String {
         key_cell("warmup / seed"),
         value_cell(format!("{} / {}", cfg.warmup, cfg.seed)),
     ]);
+    meta.add_row(vec![
+        key_cell("max_batch / max_prefill_tokens"),
+        value_cell(format!(
+            "{} / {}",
+            cfg.max_batch,
+            cfg.max_prefill_tokens
+                .map_or_else(|| "default".to_string(), |v| v.to_string())
+        )),
+    ]);
     push_table(&mut out, &meta);
     out.push('\n');
 

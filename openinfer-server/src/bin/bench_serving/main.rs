@@ -202,7 +202,15 @@ fn main() -> Result<()> {
         #[cfg(feature = "qwen35-4b")]
         ModelType::Qwen35 => {
             // Chunked-prefill budget from --max-prefill-tokens (mirrors the Qwen3
-            // path); omit for the model default.
+            // path); omit for the model default. Concurrent capacity from
+            // --max-batch (was hardcoded to 4; see issue #470).
+            anyhow::ensure!(cli.max_batch > 0, "--max-batch must be > 0");
+            anyhow::ensure!(
+                cli.max_batch <= openinfer_qwen35_4b::runtime::MAX_BATCH,
+                "--max-batch {} exceeds Qwen3.5 MAX_BATCH ({})",
+                cli.max_batch,
+                openinfer_qwen35_4b::runtime::MAX_BATCH
+            );
             let max_prefill_tokens = cli
                 .max_prefill_tokens
                 .filter(|&v| v > 0)
@@ -216,7 +224,7 @@ fn main() -> Result<()> {
                     ep_backend: EpBackend::Nccl,
                     seed: command_seed(&cli),
                 },
-                4,
+                cli.max_batch,
                 max_prefill_tokens,
             )?;
             finish(handle, cli.cuda_graph)

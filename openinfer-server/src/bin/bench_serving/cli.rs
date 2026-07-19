@@ -154,6 +154,14 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub(crate) max_prefill_tokens: Option<usize>,
 
+    /// Scheduler concurrent-request capacity (Qwen3.5). Default 4 matches the
+    /// historical bench hardcode. For `mixed`, set this above `--bg-concurrency`
+    /// so the injector can claim a slot while background decode streams are live
+    /// (e.g. `--max-batch 5 --bg-concurrency 4`). `max_batch == bg_concurrency`
+    /// is a valid starvation / negative-control cell.
+    #[arg(long, default_value_t = 4)]
+    pub(crate) max_batch: usize,
+
     #[command(subcommand)]
     pub(crate) command: Command,
 }

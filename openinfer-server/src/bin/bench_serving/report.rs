@@ -254,6 +254,15 @@ pub(crate) struct MixedLoadConfig {
     pub(crate) inj_warm_frac: f64,
     pub(crate) warmup: usize,
     pub(crate) seed: u64,
+    /// Scheduler concurrent-request cap (`--max-batch`) the engine was built
+    /// with. Core to reproducing the #470 matrix (e.g. 5 leaves one free slot
+    /// for the injector above `bg_concurrency=4`). `0` in pre-#470 snapshots.
+    #[serde(default)]
+    pub(crate) max_batch: usize,
+    /// Per-step chunked-prefill token budget (`--max-prefill-tokens`). `None`
+    /// means the model default (chunking on); a huge value means chunking off.
+    #[serde(default)]
+    pub(crate) max_prefill_tokens: Option<usize>,
 }
 
 /// Inter-token-latency of the background decode streams

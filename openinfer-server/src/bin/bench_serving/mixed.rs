@@ -314,6 +314,29 @@ pub(crate) fn run_mixed_load(
 
     let mut warnings = Vec::new();
 
+    // Slot starvation: long-lived bg streams hold every scheduler slot when
+    // bg_concurrency >= max_batch, so the injector cannot admit until a bg
+    // stream dies. That poisons mixed-load ITL (issue #470). Warn loudly but
+    // do not fail — `max_batch == bg_concurrency` is an intentional
+    // starvation / negative-control cell.
+    //
+    // Only Qwen3.5 wires `--max-batch` into its scheduler admission cap; the
+    // other model lines ignore it and keep their own capacity, so comparing
+    // `bg_concurrency` against `cli.max_batch` for them would be a false alarm.
+    // `ModelType::Qwen35` only exists under the feature, so gate the whole check.
+    #[cfg(feature = "qwen35-4b")]
+    if matches!(model_type, ModelType::Qwen35) && args.bg_concurrency >= cli.max_batch {
+        let msg = format!(
+            "slot starvation: --bg-concurrency ({}) >= --max-batch ({}), \
+             injector has no free slot while all background streams are live; \
+             treat as invalid / negative-control unless intentional \
+             (prefer --max-batch > --bg-concurrency, e.g. 5 > 4)",
+            args.bg_concurrency, cli.max_batch
+        );
+        log::warn!("{msg}");
+        warnings.push(msg);
+    }
+
     info!(
         "mixed-load warmup: {} round(s) at bg_concurrency={}",
         args.run.warmup, args.bg_concurrency
@@ -429,6 +452,8 @@ pub(crate) fn run_mixed_load(
             inj_warm_frac: args.inj_warm_frac,
             warmup: args.run.warmup,
             seed: args.run.seed,
+            max_batch: cli.max_batch,
+            max_prefill_tokens: cli.max_prefill_tokens,
         },
         baseline_itl,
         mixed_itl,

@@ -6,8 +6,10 @@
 
 mod plan;
 
+use std::sync::OnceLock;
 use std::sync::mpsc as std_mpsc;
 use std::thread;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use log::{debug, info, warn};
@@ -83,6 +85,26 @@ enum PrefillBackendState {
 }
 
 pub const DEFAULT_MAX_PREFILL_TOKENS: usize = 1024;
+
+/// Env-gated per-step ITL diagnostics (issue #470). When `OPENINFER_ITL_DEBUG`
+/// is set, the scheduler emits one `ITL_STEP` line per executed step, tagging
+/// the plan kind, the *actual* prefill-chunk token count run this step, the
+/// number of active decode rows frozen behind it, and the CPU wall-time the
+/// step took. This lets the mixed-load bench attribute a background decode
+/// stall to the specific steps that truly ran a prefill chunk, instead of the
+/// coarse `[submit, last-token]` injection window that spans every step of a
+/// long chunked prefill. Off by default: no cost on the normal bench path.
+fn itl_debug_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("OPENINFER_ITL_DEBUG").is_some())
+}
+
+/// Monotonic microseconds since the first ITL step, so `ITL_STEP` timestamps
+/// are correlatable within one process run (paired with wall-clock epoch us).
+fn itl_debug_mono_us() -> u128 {
+    static ORIGIN: OnceLock<Instant> = OnceLock::new();
+    ORIGIN.get_or_init(Instant::now).elapsed().as_micros()
+}
 
 // ── Entry point ─────────────────────────────────────────────────────────
 
@@ -227,7 +249,12 @@ impl SingleGpuBackend {
     }
 
     fn max_batch(&self) -> usize {
-        self.graph_state.slot_states.len()
+        // #470: admit the requested `--max-batch`, which may sit below the loaded
+        // graph bucket (e.g. 5 on bucket 8); never exceed the physical slots.
+        self.model
+            .decode_admission_batch
+            .min(self.graph_state.slot_states.len())
+            .max(1)
     }
 
     fn page_size(&self) -> usize {
@@ -859,12 +886,25 @@ fn scheduler_loop(
         // 5. Take this step's budgeted prefill chunk off the front of the queue,
         //    then dispatch by plan.
         let scheduled = take_prefill_chunks(&mut prefilling, prefill_budget);
+        // ITL diagnostics (#470): capture the *actual* prefill-chunk token count
+        // and the frozen decode width for this step before the plan consumes the
+        // scheduled set. Off unless OPENINFER_ITL_DEBUG is set.
+        let itl_debug = itl_debug_enabled();
+        let itl_prefill_tokens: usize = scheduled.iter().map(|p| p.step_chunk).sum();
+        let itl_prefill_reqs = scheduled.len();
+        let itl_decode_n = active.len();
         let plan = if backend.is_tp() {
             build_eager_only_plan(!active.is_empty(), scheduled)
         } else {
             plan::build_next_plan(!active.is_empty(), scheduled)
         };
         if let Some(plan) = plan {
+            let itl_plan_kind = match &plan {
+                ExecutionPlan::Unified { .. } => "unified",
+                ExecutionPlan::Prefill { .. } => "prefill",
+                ExecutionPlan::Decode => "decode",
+            };
+            let itl_step_start = itl_debug.then(Instant::now);
             match plan {
                 ExecutionPlan::Unified { pending } => unified_step_sched(
                     &mut backend,
@@ -883,6 +923,28 @@ fn scheduler_loop(
                 ExecutionPlan::Decode => {
                     decode_step(&mut backend, &mut active, &mut rng);
                 }
+            }
+            if let Some(step_start) = itl_step_start {
+                // A `unified`/`prefill` step with prefill_tok>0 is the only kind
+                // that freezes active decodes behind real prefill work; a
+                // `decode` step (prefill_tok=0) is a genuine steady gap. dur_us
+                // is the CPU wall-time of the step, i.e. the per-step stall the
+                // active decodes actually eat this tick.
+                let dur_us = step_start.elapsed().as_micros();
+                let epoch_us = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_micros())
+                    .unwrap_or(0);
+                info!(
+                    "ITL_STEP mono_us={} epoch_us={} plan={} prefill_tok={} prefill_reqs={} decode_n={} dur_us={}",
+                    itl_debug_mono_us(),
+                    epoch_us,
+                    itl_plan_kind,
+                    itl_prefill_tokens,
+                    itl_prefill_reqs,
+                    itl_decode_n,
+                    dur_us
+                );
             }
         }
     }
