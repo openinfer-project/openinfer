@@ -115,6 +115,7 @@ enum WireRequest {
         max_model_len: usize,
         moe_topo: Glm52MoeTopo,
         dspark_enabled: bool,
+        exportable_kv: bool,
     },
     SetupComm {
         unique_id: Vec<u8>,
@@ -459,6 +460,7 @@ impl Glm52RemoteRankWorker {
         max_model_len: usize,
         moe_topo: Glm52MoeTopo,
         dspark_enabled: bool,
+        exportable_kv: bool,
     ) -> Result<Receiver<Result<Vec<KvArena>>>> {
         let (tx, rx) = bounded(1);
         self.node.shared.submit(
@@ -467,6 +469,7 @@ impl Glm52RemoteRankWorker {
                 max_model_len,
                 moe_topo,
                 dspark_enabled,
+                exportable_kv,
             },
             PendingResp::BuildModel(tx),
         )?;
@@ -809,10 +812,12 @@ fn host_demux_loop(
                 max_model_len,
                 moe_topo,
                 dspark_enabled,
+                exportable_kv,
             } => HostPending::BuildModel(worker.build_model_async(
                 max_model_len,
                 moe_topo,
                 dspark_enabled,
+                exportable_kv,
             )?),
             WireRequest::SetupComm {
                 unique_id,

@@ -1,8 +1,8 @@
 # pegaflow KV 卸载接入 Spec
 
-> **TL;DR**: 把 `pegaflow-core` 当**进程内 Rust 库**做 KV 卸载的物理后端（HBM→DRAM/SSD/RDMA），补上 kvbm 留着没写的卸载层。connector 大脑（决定 load/save 哪些 block）用 kvbm logical/physical 分层思想自建，pegaflow 退为语义无关的 raw block transfer 后端。**路线已调整为 Qwen3-4B full-attn 首发**（原计划 Kimi 首发）：page-first 单 buffer 经 pegaflow `block_stride_bytes`（PR #331）适配。**端到端已在真实 GPU 上跑通并验证**：async SAVE + async LOAD 接进 `Qwen3Executor` + scheduler，`tests/kv_offload_cpu_hit.rs` 覆盖纯 CPU-hit 与 GPU+CPU 组合 hit，恢复后 logits 与冷算一致；连接层 `OffloadEngine` + `tests/cpu_roundtrip.rs` 字节级一致。默认关（builder flag opt-in）；**server CLI 已接**（#316：`--kv-offload` / `--kv-offload-host-gib` / `--no-prefix-cache`，plain 与 `--enable-lora` 两条启动路径都透传）。纯-L2 基准实测 Qwen3-4B mean TTFT 195→40ms（−79%，evict-before-probe → `gpu_hit=0`，全前缀从 host tier 恢复）。**Qwen3.5 linear/SSM state 明确排除**；**DeepSeek sparse 暂缓**。
+> **TL;DR**: 本文保留最初把 `pegaflow-core` 嵌入 OpenInfer 的设计与 Qwen3 验证记录；当前实现已改为 external-only：OpenInfer 通过 `--kv-offload-server` 注册 CUDA IPC allocation 并调用 save/query/load/flush RPC，DRAM/hugepage/SSD/RDMA 全归 PegaFlow server。当前边界和跨进程验证见 [external-pegaflow-server.md](external-pegaflow-server.md)。
 >
-> Last touched: 2026-06
+> Last touched: 2026-07
 
 ## 0. 实现状态（2026-06）
 

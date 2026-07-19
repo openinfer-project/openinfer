@@ -38,6 +38,26 @@ impl KvCacheManager {
         Ok(Self { pool, buffer })
     }
 
+    pub fn new_exportable(
+        stream: &Arc<CudaStream>,
+        num_layers: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        block_size: usize,
+        num_blocks: usize,
+    ) -> anyhow::Result<Self> {
+        let buffer = KvBuffer::new_exportable(
+            stream,
+            num_layers,
+            num_kv_heads,
+            head_dim,
+            block_size,
+            num_blocks,
+        )?;
+        let pool = BlockPool::new(block_size, num_blocks)?;
+        Ok(Self { pool, buffer })
+    }
+
     /// Like [`new`](Self::new) but the pool emits KV block events; returns the
     /// receiver to drain. See [`BlockPool::with_events`].
     pub fn new_with_events(

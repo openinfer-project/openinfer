@@ -155,25 +155,10 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
                     dspark_draft_model_path: args.dflash_draft_model_path.clone(),
                     max_model_len: args.max_model_len,
                     no_prefix_cache: args.no_prefix_cache,
-                    kv_offload: args
-                        .kv_offload
-                        .then(|| openinfer_glm52::Glm52KvOffloadOptions {
-                            pinned_pool_bytes: (args.kv_offload_host_gib * f64::from(1u32 << 30))
-                                as usize,
-                            use_hugepages: args.kv_offload_hugepages,
-                            p2p: match (
-                                args.kv_p2p_metaserver_addr.clone(),
-                                args.kv_p2p_advertise_addr.clone(),
-                            ) {
-                                (Some(metaserver_addr), Some(advertise_addr)) => {
-                                    Some(openinfer_glm52::Glm52P2pOptions {
-                                        metaserver_addr,
-                                        advertise_addr,
-                                        rdma_nics: args.kv_p2p_nics.clone(),
-                                    })
-                                }
-                                _ => None,
-                            },
+                    kv_offload: args.kv_offload_server.clone().map(|server_addr| {
+                        openinfer_glm52::Glm52KvOffloadOptions {
+                            server_addr,
+                            namespace: args.kv_offload_namespace.clone(),
                             vllm_compat: args.kv_pd_vllm_seed.clone().map(|seed| {
                                 openinfer_glm52::Glm52VllmCompatOptions {
                                     python_hash_seed: seed,
@@ -187,7 +172,8 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
                                     allow_local_prefill: args.kv_pd_allow_local_prefill,
                                 }
                             }),
-                        }),
+                        }
+                    }),
                     moe_topo,
                     dump_graph_png: args.dump_graph_png.clone(),
                     rank_hosts: args
@@ -213,20 +199,11 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
         .context("failed to start Kimi-K2.6 text engine")?,
         #[cfg(feature = "qwen3")]
         ModelType::Qwen3 => {
-            let offload = if args.kv_offload {
-                let bytes = (args.kv_offload_host_gib * f64::from(1u32 << 30)) as usize;
-                let mut offload = Qwen3OffloadOptions::enabled(bytes);
-                offload.use_hugepages = args.kv_offload_hugepages;
-                if let (Some(metaserver_addr), Some(advertise_addr)) = (
-                    args.kv_p2p_metaserver_addr.clone(),
-                    args.kv_p2p_advertise_addr.clone(),
-                ) {
-                    offload = offload.with_p2p(openinfer_qwen3::Qwen3P2pOptions {
-                        metaserver_addr,
-                        advertise_addr,
-                        rdma_nics: args.kv_p2p_nics.clone(),
-                        flush_on_finish: args.kv_p2p_flush_on_finish,
-                    });
+            let offload = if let Some(server_addr) = &args.kv_offload_server {
+                let mut offload = Qwen3OffloadOptions::external(server_addr)
+                    .with_flush_on_finish(args.kv_offload_flush_on_finish);
+                if let Some(namespace) = args.kv_offload_namespace.clone() {
+                    offload = offload.with_namespace(namespace);
                 }
                 if let Some(seed) = args.kv_pd_vllm_seed.clone() {
                     offload = offload.with_vllm_compat(openinfer_qwen3::Qwen3VllmCompatOptions {
@@ -262,8 +239,8 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
                         "--dflash-draft-model-path is not supported with --enable-lora"
                     );
                     anyhow::ensure!(
-                        !args.kv_offload,
-                        "--dflash-draft-model-path is not supported with --kv-offload"
+                        args.kv_offload_server.is_none(),
+                        "--dflash-draft-model-path is not supported with --kv-offload-server"
                     );
                     anyhow::ensure!(
                         args.tp_size == 1,

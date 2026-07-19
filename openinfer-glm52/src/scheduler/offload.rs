@@ -325,7 +325,7 @@ pub(super) fn admit_vllm_pd(
                     // feeding the breaker forever.
                     state.consecutive_miss_windows = 0;
                     if let Some(reservation) = pool.reserve_loaded_blocks(hit.num_blocks) {
-                        match offload.engine.load(lease, reservation.page_ids()) {
+                        match offload.engine.load(&lease, reservation.page_ids()) {
                             Ok(handle) => {
                                 // After the H2D lands, rewrite the pages'
                                 // RoPE dims from the peer's interleaved
@@ -414,7 +414,7 @@ pub(super) fn admit_vllm_pd(
                             // so tail_len tokens open exactly one fresh page).
                             let pages = kv.step_page_indices(tail_len);
                             let tail_page = *pages.last().expect("tail step has a page");
-                            match offload.engine.load(lease, vec![tail_page]) {
+                            match offload.engine.load(&lease, vec![tail_page]) {
                                 Ok(handle) => {
                                     let landed = handle
                                         .wait()
@@ -578,7 +578,7 @@ pub(super) fn restore_host_prefix(
     };
     let page_ids = reservation.page_ids();
     let restored = reservation.len();
-    match engine.load(lease, page_ids) {
+    match engine.load(&lease, page_ids) {
         Ok(handle) => match handle.wait() {
             Ok(()) => {
                 pool.commit_loaded_blocks(&mut probe, reservation);

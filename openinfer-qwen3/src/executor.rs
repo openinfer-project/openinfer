@@ -935,7 +935,7 @@ pub struct Qwen3Executor {
     l1_retention_disabled: bool,
     /// P/D prefill role: withhold each step's `Finished` events until offload
     /// saves + MetaServer registrations are peer-visible, so the HTTP response
-    /// doubles as the KV-ready signal (see `Qwen3P2pOptions::flush_on_finish`).
+    /// doubles as the KV-ready signal.
     flush_offload_on_finish: bool,
     /// P/D decode role with a vLLM prefill peer: offload query keys derive
     /// with vLLM's hash scheme, a zero hit waits out the producer's
@@ -1094,7 +1094,12 @@ impl Qwen3Executor {
                 }),
             )
         } else {
-            let kv_mgr = KvCacheManager::new(
+            let allocate = if offload_opts.is_enabled() {
+                KvCacheManager::new_exportable
+            } else {
+                KvCacheManager::new
+            };
+            let kv_mgr = allocate(
                 &model.device_ctx().stream,
                 budget.num_layers,
                 budget.num_kv_heads,
@@ -1112,7 +1117,7 @@ impl Qwen3Executor {
         let kv_buffer = kv_mgr.buffer().clone();
         // Build the offload engine while the model's stream is still in hand
         // (it moves into the RankWorker below). Registers the fused KV buffer.
-        let offload = build_offload(offload_opts, &kv_mgr, model.config(), model.device_ctx())?;
+        let offload = build_offload(offload_opts, &kv_mgr, model.device_ctx())?;
         let total_blocks = kv_mgr.pool().total_blocks();
         let padding_block_id = kv_mgr.pool().padding_block_id();
         let vllm_compat = match offload_opts.vllm_compat.as_ref() {
@@ -1176,10 +1181,7 @@ impl Qwen3Executor {
             l1_retention_disabled: false,
             // Derived here, not via a post-construction setter, so every
             // launch path (plain and LoRA alike) honors the P/D contract.
-            flush_offload_on_finish: offload_opts
-                .p2p
-                .as_ref()
-                .is_some_and(|p2p| p2p.flush_on_finish),
+            flush_offload_on_finish: offload_opts.flush_on_finish,
             vllm_compat,
             overlap: None,
             async_prefill: None,
@@ -1229,7 +1231,7 @@ impl Qwen3Executor {
             "Qwen3 executor requires at least one device"
         );
         anyhow::ensure!(
-            !offload_options.enabled || device_ordinals.len() == 1,
+            !offload_options.is_enabled() || device_ordinals.len() == 1,
             "KV offload is only supported on the single-GPU path (tensor parallel \
              shards KV per rank); got {} devices",
             device_ordinals.len()
@@ -1247,7 +1249,7 @@ impl Qwen3Executor {
         // hash, which the cursor + lineage→seq map do not model — so the two are
         // mutually exclusive by construction rather than silently mis-announced.
         anyhow::ensure!(
-            !enable_kv_events || !offload_options.enabled,
+            !enable_kv_events || !offload_options.is_enabled(),
             "KV block events and KV offload are mutually exclusive (the event cursor \
              assumes GPU-resident block reuse)"
         );
@@ -1986,7 +1988,7 @@ impl Qwen3Executor {
             return Err(());
         };
         let page_ids = reservation.page_ids();
-        match offload.load(lease, page_ids) {
+        match offload.load(&lease, page_ids) {
             Ok(handle) => {
                 self.prefetch.insert(
                     id,
@@ -2082,21 +2084,17 @@ fn profile_kv_budget_on_worker(
 fn build_offload(
     opts: &Qwen3OffloadOptions,
     kv_mgr: &KvCacheManager,
-    config: &Config,
     ctx: &DeviceContext,
 ) -> Result<Option<OffloadEngine>> {
-    if !opts.enabled {
+    let Some(server_addr) = &opts.server_addr else {
         return Ok(None);
-    }
+    };
     let device_id = ctx.device_ordinal as i32;
     let layout = kv_mgr.buffer().layout();
     // Content-addressing domain: two engines may cross-hit only when the same
-    // token prefix produces interchangeable KV bytes. That needs the *model*
-    // to match, not just the KV geometry — Qwen3-4B and 8B share
-    // layers/heads/head_dim and a tokenizer, so geometry alone would let a
-    // mixed mesh silently feed one model the other's KV. hidden_size +
-    // intermediate_size + vocab_size discriminate the model line's sizes;
-    // the layout fields pin the block geometry the transfer relies on.
+    // token prefix produces interchangeable KV bytes. The deployment identity
+    // distinguishes checkpoints with identical shapes; layout facts prevent a
+    // reused identity from crossing incompatible cache geometry.
     // vLLM-compat mode joins the *P side's* content domain instead: the
     // pegaflow connector derives an 8-hex namespace from vLLM config (and logs
     // it at startup); reproducing that derivation would mean chasing Python
@@ -2104,37 +2102,21 @@ fn build_offload(
     let namespace = match &opts.vllm_compat {
         Some(compat) => compat.namespace.clone(),
         None => format!(
-            "openinfer-qwen3-hs{}-is{}-v{}-l{}h{}d{}p{}",
-            config.hidden_size,
-            config.intermediate_size,
-            config.vocab_size,
+            "openinfer-qwen3-{}-l{}h{}d{}p{}",
+            opts.namespace
+                .as_deref()
+                .context("Qwen3 native KV offload requires a checkpoint namespace")?,
             layout.num_layers,
             layout.num_kv_heads,
             layout.head_dim,
             layout.page_size
         ),
     };
-    let mut config = OffloadConfig::new(
-        format!("qwen3-dev{device_id}"),
-        device_id,
-        opts.pinned_pool_bytes,
-    )
-    .with_namespace(namespace);
-    config.use_hugepages = opts.use_hugepages;
-    if let Some(p2p) = &opts.p2p {
-        config = config.with_p2p(openinfer_kv_offload::P2pConfig {
-            metaserver_addr: p2p.metaserver_addr.clone(),
-            advertise_addr: p2p.advertise_addr.clone(),
-            rdma_nics: p2p.rdma_nics.clone(),
-        });
-    }
-    let engine = OffloadEngine::new(config, kv_mgr.buffer(), &ctx.stream)
+    let config = OffloadConfig::new(format!("qwen3-dev{device_id}"), device_id, server_addr)
+        .with_namespace(namespace);
+    let engine = OffloadEngine::new(&config, kv_mgr.buffer(), &ctx.stream)
         .map_err(|e| anyhow::anyhow!("KV offload engine init failed: {e}"))?;
-    log::info!(
-        "KV offload enabled on device {device_id} ({} MiB host tier, p2p={})",
-        opts.pinned_pool_bytes >> 20,
-        opts.p2p.is_some(),
-    );
+    log::info!("KV offload enabled on device {device_id}: server={server_addr}");
     Ok(Some(engine))
 }
 
@@ -3012,6 +2994,9 @@ mod tests {
 
 impl Drop for Qwen3Executor {
     fn drop(&mut self) {
+        if let Some(mut offload) = self.offload.take() {
+            offload.shutdown();
+        }
         self.primary.shutdown();
         for worker in &mut self.workers {
             worker.shutdown();

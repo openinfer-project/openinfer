@@ -79,60 +79,34 @@ pub(crate) struct Args {
     #[arg(long, default_value = "deepep")]
     pub ep_backend: CliEpBackend,
 
-    /// Enable pegaflow KV offload (host-tier "L2" cache): single-GPU Qwen3,
-    /// or GLM5.2 DP8 (one pool shared by all 8 ranks under one namespace).
-    /// Sealed KV blocks are saved to host pinned memory and restored into
-    /// HBM before prefill when a prompt's prefix has fallen out of the GPU
-    /// cache. GLM5.2 requires the prefix cache: incompatible with
-    /// --no-prefix-cache and the DSpark drafter.
-    #[arg(long, default_value_t = false)]
-    pub kv_offload: bool,
+    /// Connect to an external PegaFlow gRPC server and enable KV offload. The
+    /// server owns host memory, hugepages, SSD, RDMA, and peer discovery.
+    #[arg(long)]
+    pub kv_offload_server: Option<String>,
 
-    /// Host pinned-memory pool size for the KV offload tier, in GiB. pegaflow
-    /// allocates the whole pool up front, so RSS reflects this at startup.
-    #[arg(long, default_value_t = 8.0, value_parser = parse_offload_gib, requires = "kv_offload")]
-    pub kv_offload_host_gib: f64,
+    /// Stable checkpoint/deployment identity for native OpenInfer KV sharing.
+    /// Every compatible producer and consumer must use the same value.
+    #[arg(
+        long,
+        requires = "kv_offload_server",
+        conflicts_with = "kv_pd_vllm_seed"
+    )]
+    pub kv_offload_namespace: Option<String>,
 
-    /// Back the KV offload pool with 2 MiB hugepages. The box must hold a
-    /// reservation covering the pool (`HugePages_Total` in /proc/meminfo;
-    /// `echo N > /proc/sys/vm/nr_hugepages` as root) — allocation fails at
-    /// startup otherwise.
-    #[arg(long, default_value_t = false, requires = "kv_offload")]
-    pub kv_offload_hugepages: bool,
-
-    /// Join the cross-instance KV P2P mesh: pegaflow MetaServer gRPC address
-    /// (e.g. `http://127.0.0.1:50056`). Saved block hashes register there and
-    /// missing prefixes are pulled from peer instances over RDMA — the P/D
-    /// disaggregation data plane. Requires --kv-offload, --kv-p2p-advertise-addr
-    /// and --kv-p2p-nics.
-    #[arg(long, requires_all = ["kv_offload", "kv_p2p_advertise_addr", "kv_p2p_nics"])]
-    pub kv_p2p_metaserver_addr: Option<String>,
-
-    /// This instance's routable IP:port for KV P2P — a literal socket address
-    /// (it is also the embedded transfer-service bind address, so hostnames
-    /// are rejected at startup). Peers dial it for RDMA handshakes and block
-    /// queries. Must be reachable by every peer; not 0.0.0.0.
-    #[arg(long, requires = "kv_p2p_metaserver_addr")]
-    pub kv_p2p_advertise_addr: Option<String>,
-
-    /// RDMA NIC device names for KV P2P (e.g. `mlx5_0`), comma-separated.
-    #[arg(long, value_delimiter = ',', requires = "kv_p2p_metaserver_addr")]
-    pub kv_p2p_nics: Vec<String>,
-
-    /// P/D prefill role: barrier each request's KV saves (host tier +
-    /// MetaServer registration) before its final token event, so this
+    /// P/D prefill role: barrier each request's KV saves before its final
+    /// token event, so this
     /// instance's HTTP response doubles as the KV-ready signal a router can
     /// act on. Leave off on decode instances.
-    #[arg(long, default_value_t = false, requires = "kv_p2p_metaserver_addr")]
-    pub kv_p2p_flush_on_finish: bool,
+    #[arg(long, default_value_t = false, requires = "kv_offload_server")]
+    pub kv_offload_flush_on_finish: bool,
 
     /// P/D decode role with a vLLM prefill peer: the shared PYTHONHASHSEED
     /// value set on every vLLM prefill process. Switches offload query keys to
     /// vLLM's prefix-cache hash scheme (requires the P side to run
     /// --prefix-caching-hash-algo xxhash_cbor) and makes a cold request wait
     /// out the producer's registration tail instead of prefilling locally.
-    /// Requires --kv-pd-vllm-namespace and the P2P mesh flags.
-    #[arg(long, value_parser = parse_pythonhashseed, requires_all = ["kv_p2p_metaserver_addr", "kv_pd_vllm_namespace"])]
+    /// Requires --kv-offload-server and --kv-pd-vllm-namespace.
+    #[arg(long, value_parser = parse_pythonhashseed, requires_all = ["kv_offload_server", "kv_pd_vllm_namespace"])]
     pub kv_pd_vllm_seed: Option<String>,
 
     /// The vLLM prefill peer's pegaflow-connector namespace (an 8-hex digest
@@ -161,9 +135,9 @@ pub(crate) struct Args {
     #[arg(long, default_value_t = false, requires = "kv_pd_vllm_seed")]
     pub kv_pd_allow_local_prefill: bool,
 
-    /// vLLM-style no-prefix-cache. Without --kv-offload it disables prefix
+    /// vLLM-style no-prefix-cache. Without --kv-offload-server it disables prefix
     /// matching outright (every prefill recomputes the full prompt). With
-    /// --kv-offload it is the pure-L2 mode: no cross-request HBM reuse, so every
+    /// --kv-offload-server it is the pure-L2 mode: no cross-request HBM reuse, so every
     /// prefix is restored from the host tier — for measuring the L2 TTFT win.
     #[arg(long, default_value_t = false)]
     pub no_prefix_cache: bool,
@@ -171,7 +145,7 @@ pub(crate) struct Args {
     /// Speculative drafter model path: Qwen3 DFlash/DSpark decoding, or the
     /// GLM5.2 DSpark drafter (greedy AND sampled requests speculate;
     /// per-request accept stats logged). For Qwen3: single-GPU greedy only;
-    /// incompatible with --enable-lora and --kv-offload, and forces the
+    /// incompatible with --enable-lora and --kv-offload-server, and forces the
     /// prefix cache off (it needs clean target hidden states).
     #[arg(long = "dflash-draft-model-path")]
     pub dflash_draft_model_path: Option<PathBuf>,
@@ -251,7 +225,7 @@ pub(crate) struct Args {
 
     /// Enable single-GPU Qwen3 batch-invariant serving by pinning the numeric paths and cutting
     /// each prompt's prefill chunks on its own grid. Off by default. Requires `--no-prefix-cache`;
-    /// incompatible with `--kv-offload`, which keeps prefix matching on regardless.
+    /// incompatible with `--kv-offload-server`, which keeps prefix matching on regardless.
     #[arg(long, default_value_t = false)]
     pub batch_invariant: bool,
 }
@@ -315,12 +289,8 @@ fn consumed_args(model_type: ModelType) -> &'static [&'static str] {
             "dflash_draft_model_path",
             "max_model_len",
             "no_prefix_cache",
-            "kv_offload",
-            "kv_offload_host_gib",
-            "kv_offload_hugepages",
-            "kv_p2p_metaserver_addr",
-            "kv_p2p_advertise_addr",
-            "kv_p2p_nics",
+            "kv_offload_server",
+            "kv_offload_namespace",
             "kv_pd_vllm_seed",
             "kv_pd_vllm_namespace",
             "kv_pd_miss_wait_ms",
@@ -341,13 +311,9 @@ fn consumed_args(model_type: ModelType) -> &'static [&'static str] {
             "max_lora_rank",
             "device_ordinal",
             "tp_size",
-            "kv_offload",
-            "kv_offload_host_gib",
-            "kv_offload_hugepages",
-            "kv_p2p_metaserver_addr",
-            "kv_p2p_advertise_addr",
-            "kv_p2p_nics",
-            "kv_p2p_flush_on_finish",
+            "kv_offload_server",
+            "kv_offload_namespace",
+            "kv_offload_flush_on_finish",
             "kv_pd_vllm_seed",
             "kv_pd_vllm_namespace",
             "kv_pd_miss_wait_ms",
@@ -441,11 +407,22 @@ impl Args {
                 "--batch-invariant is not compatible with --decode-overlap; the stream override would force the pinned GEMM to bail at runtime"
             );
         }
-        if self.batch_invariant && self.kv_offload {
+        if self.batch_invariant && self.kv_offload_server.is_some() {
             bail!(
-                "--batch-invariant is not supported with --kv-offload: offload keeps prefix matching \
+                "--batch-invariant is not supported with --kv-offload-server: offload keeps prefix matching \
                  on (--no-prefix-cache only disables HBM retention there), and a host-tier prefix hit \
                  shifts a prompt's chunk boundaries off the request-local grid"
+            );
+        }
+        if self.kv_offload_server.is_some()
+            && self.kv_pd_vllm_seed.is_none()
+            && self
+                .kv_offload_namespace
+                .as_deref()
+                .is_none_or(str::is_empty)
+        {
+            bail!(
+                "--kv-offload-namespace is required with --kv-offload-server unless vLLM compatibility supplies --kv-pd-vllm-namespace"
             );
         }
         if self.batch_invariant && self.dflash_draft_model_path.is_some() {
@@ -561,17 +538,6 @@ pub(crate) fn parse_lora_modules_arg(value: &str) -> Result<LoraModule, String> 
     }
 }
 
-fn parse_offload_gib(value: &str) -> Result<f64, String> {
-    let gib = value
-        .parse::<f64>()
-        .map_err(|error| format!("invalid --kv-offload-host-gib: {error}"))?;
-    if gib.is_finite() && gib > 0.0 {
-        Ok(gib)
-    } else {
-        Err("--kv-offload-host-gib must be a positive, finite number of GiB".to_owned())
-    }
-}
-
 #[cfg(feature = "qwen3")]
 pub(crate) fn parse_max_lora_rank_arg(value: &str) -> Result<usize, String> {
     let rank = value
@@ -673,6 +639,40 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[cfg(feature = "qwen3")]
+    #[test]
+    fn qwen3_parses_external_kv_offload_endpoint() {
+        let (args, provided) = parse_with_provided(&[
+            "openinfer",
+            "--kv-offload-server",
+            "http://127.0.0.1:50055",
+            "--kv-offload-namespace",
+            "qwen3-checkpoint-v1",
+        ]);
+        assert_eq!(
+            args.kv_offload_server.as_deref(),
+            Some("http://127.0.0.1:50055")
+        );
+        assert_eq!(
+            args.kv_offload_namespace.as_deref(),
+            Some("qwen3-checkpoint-v1")
+        );
+        args.validate(ModelType::Qwen3, &provided)
+            .expect("Qwen3 should accept an external PegaFlow endpoint");
+    }
+
+    #[cfg(feature = "qwen3")]
+    #[test]
+    fn qwen3_native_kv_offload_requires_checkpoint_namespace() {
+        let (args, provided) =
+            parse_with_provided(&["openinfer", "--kv-offload-server", "http://127.0.0.1:50055"]);
+        let error = args
+            .validate(ModelType::Qwen3, &provided)
+            .expect_err("native KV sharing without checkpoint identity must be rejected")
+            .to_string();
+        assert!(error.contains("--kv-offload-namespace"));
     }
 
     #[cfg(feature = "qwen35-4b")]

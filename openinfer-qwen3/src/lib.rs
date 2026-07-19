@@ -82,7 +82,7 @@ impl Default for Qwen3LoraOptions {
 /// stream plumbing in [`green_ctx`].
 pub use green_ctx::DecodeOverlap;
 
-/// KV-offload (pegaflow) opt-in for the single-GPU Qwen3 path.
+/// External PegaFlow KV-offload opt-in for the single-GPU Qwen3 path.
 ///
 /// Disabled by default — the existing GPU-only prefix cache is unchanged.
 /// When enabled, the executor saves sealed KV blocks to pegaflow's host tier
@@ -91,38 +91,19 @@ pub use green_ctx::DecodeOverlap;
 /// single-GPU topology is supported (tensor parallel shards KV per rank).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Qwen3OffloadOptions {
-    pub enabled: bool,
-    /// Host pinned-memory pool size (the CPU KV-tier capacity), in bytes.
-    pub pinned_pool_bytes: usize,
-    /// Back the pool with 2 MiB hugepages (the box must hold a reservation).
-    pub use_hugepages: bool,
-    /// `Some` joins the cross-instance P2P mesh: block hashes register with a
-    /// MetaServer, peers pull missing prefixes over RDMA, and this engine
-    /// serves theirs. The P/D disaggregation data plane.
-    pub p2p: Option<Qwen3P2pOptions>,
+    /// Out-of-process PegaFlow gRPC endpoint. `None` disables offload.
+    pub server_addr: Option<String>,
+    /// Stable deployment/checkpoint identity shared by compatible native
+    /// producers and consumers. Required unless vLLM compatibility supplies
+    /// the connector namespace.
+    pub namespace: Option<String>,
+    /// Barrier saves before emitting `Finished`. Prefill deployments use this
+    /// to make the HTTP response a KV-ready signal.
+    pub flush_on_finish: bool,
     /// `Some` when the P/D prefill peer is vLLM (pegaflow connector): offload
     /// query keys switch from kvbm lineage hashes to vLLM's prefix-cache hash
     /// scheme so this decode node can find the blocks vLLM registered.
     pub vllm_compat: Option<Qwen3VllmCompatOptions>,
-}
-
-/// Cross-instance P2P KV sharing (see `openinfer_kv_offload::P2pConfig`).
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Qwen3P2pOptions {
-    /// MetaServer gRPC address, e.g. `http://127.0.0.1:50056`.
-    pub metaserver_addr: String,
-    /// This engine's routable `IP:port` (literal socket address; also the
-    /// P2P gRPC listen address, so hostnames are rejected at startup). Peers
-    /// dial it for RDMA handshakes and block queries.
-    pub advertise_addr: String,
-    /// RDMA NIC device names (e.g. `mlx5_0`).
-    pub rdma_nics: Vec<String>,
-    /// Barrier a request's KV saves (host tier + MetaServer registration)
-    /// before its `Finished` event is emitted. The prefill role in a P/D
-    /// deployment turns this on so its HTTP response *is* the KV-ready signal;
-    /// costs one write-pipeline + registration drain per finishing step, so
-    /// leave it off on decode/serving instances.
-    pub flush_on_finish: bool,
 }
 
 /// Decode-node settings for a P/D deployment whose prefill node is vLLM with
@@ -151,33 +132,38 @@ pub struct Qwen3VllmCompatOptions {
 }
 
 impl Qwen3OffloadOptions {
-    /// 8 GiB host tier — a few thousand dense Qwen3-4B blocks.
-    pub const DEFAULT_PINNED_POOL_BYTES: usize = 8 << 30;
-
     pub fn disabled() -> Self {
         Self {
-            enabled: false,
-            pinned_pool_bytes: 0,
-            use_hugepages: false,
-            p2p: None,
+            server_addr: None,
+            namespace: None,
+            flush_on_finish: false,
             vllm_compat: None,
         }
     }
 
-    pub fn enabled(pinned_pool_bytes: usize) -> Self {
+    pub fn external(server_addr: impl Into<String>) -> Self {
         Self {
-            enabled: true,
-            pinned_pool_bytes,
-            use_hugepages: false,
-            p2p: None,
+            server_addr: Some(server_addr.into()),
+            namespace: None,
+            flush_on_finish: false,
             vllm_compat: None,
         }
     }
 
     #[must_use]
-    pub fn with_p2p(mut self, p2p: Qwen3P2pOptions) -> Self {
-        self.p2p = Some(p2p);
+    pub fn with_flush_on_finish(mut self, flush_on_finish: bool) -> Self {
+        self.flush_on_finish = flush_on_finish;
         self
+    }
+
+    #[must_use]
+    pub fn with_namespace(mut self, namespace: impl Into<String>) -> Self {
+        self.namespace = Some(namespace.into());
+        self
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.server_addr.is_some()
     }
 
     #[must_use]
@@ -308,10 +294,10 @@ pub fn launch(model_path: &Path, options: Qwen3LaunchOptions) -> Result<EngineHa
         ep_backend: EpBackend::Nccl,
         seed: 42,
     };
-    if options.offload.enabled {
+    if options.offload.is_enabled() {
         info!(
-            "Qwen3 KV offload enabled: host tier {:.1} GiB, no_prefix_cache={}",
-            options.offload.pinned_pool_bytes as f64 / f64::from(1u32 << 30),
+            "Qwen3 KV offload enabled: server={}, no_prefix_cache={}",
+            options.offload.server_addr.as_deref().expect("enabled"),
             options.no_prefix_cache
         );
     }
@@ -451,7 +437,7 @@ fn start_engine_with_offload_inner(
         ensure_batch_invariant_supported(
             decode_overlap,
             no_prefix_cache,
-            offload_options.enabled,
+            offload_options.is_enabled(),
             dflash_draft_model_path.is_some(),
             device_ordinals.len(),
         )?;

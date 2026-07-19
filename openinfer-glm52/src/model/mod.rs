@@ -21,6 +21,7 @@ use cudarc::driver::{CudaSlice, CudaStream, DevicePtr as _, PinnedHostSlice};
 use half::bf16;
 use openinfer_core::cuda_graph::CudaGraphDumpSummary;
 use openinfer_core::cuda_graph::CudaGraphState;
+use openinfer_kernels::exportable::alloc_ipc_zeros;
 use openinfer_kernels::ops::{
     GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN, GLM52_FLASHMLA_SPARSE_PAGE_SIZE,
     GLM52_FLASHMLA_SPARSE_TOPK, GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW, GLM52_MLA_CACHE_BYTES,
@@ -477,6 +478,7 @@ impl Glm52RankModel {
         moe_topo: crate::Glm52MoeTopo,
         attn_shard: Option<usize>,
         dspark_enabled: bool,
+        exportable_kv: bool,
     ) -> Result<Self> {
         ensure!(
             moe_topo.uses_tensor_replicated_moe() == attn_shard.is_some(),
@@ -523,17 +525,25 @@ impl Glm52RankModel {
                 build::build_decoder_layer(ctx, w, layer, moe_topo, attn_shard)
                     .with_context(|| format!("build GLM5.2 decoder layer {layer}"))?,
             );
+            let mla_len =
+                contract.num_blocks * GLM52_FLASHMLA_SPARSE_PAGE_SIZE * mla_cache_bytes_per_token;
+            let mla_cache = if exportable_kv {
+                alloc_ipc_zeros::<u8>(&ctx.stream, mla_len)
+            } else {
+                ctx.stream.alloc_zeros::<u8>(mla_len)
+            }?;
             caches.push(Glm52LayerCaches {
-                mla_cache: ctx.stream.alloc_zeros::<u8>(
-                    contract.num_blocks
-                        * GLM52_FLASHMLA_SPARSE_PAGE_SIZE
-                        * mla_cache_bytes_per_token,
-                )?,
+                mla_cache,
                 index_k_cache: glm52_layer_has_full_indexer(layer)
                     .then(|| {
-                        ctx.stream
-                            .alloc_zeros::<u8>(index_cache_layout.min_cache_bytes()?)
-                            .map_err(anyhow::Error::from)
+                        let len = index_cache_layout.min_cache_bytes()?;
+                        if exportable_kv {
+                            alloc_ipc_zeros::<u8>(&ctx.stream, len).map_err(anyhow::Error::from)
+                        } else {
+                            ctx.stream
+                                .alloc_zeros::<u8>(len)
+                                .map_err(anyhow::Error::from)
+                        }
                     })
                     .transpose()?,
             });
