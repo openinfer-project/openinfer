@@ -15,8 +15,8 @@ use crate::lora::{
 use half::bf16;
 use openinfer_core::tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
 use openinfer_core::weight_loader::{
-    deserialize_shards, load_shard_info, load_tensor_1d, load_tensor_2d, load_tensor_2d_col_shard,
-    load_tensor_2d_row_shard, mmap_shards, precompute_rope,
+    WeightPrefetch, deserialize_shards, load_shard_info, load_tensor_1d, load_tensor_2d,
+    load_tensor_2d_col_shard, load_tensor_2d_row_shard, mmap_shards, precompute_rope,
 };
 use openinfer_kv_cache::KvBuffer;
 
@@ -383,6 +383,8 @@ impl Qwen3Model {
 
         let (shard_paths, weight_map) = load_shard_info(model_path)?;
         debug!("Loading {} safetensor shard(s)", shard_paths.len());
+        let prefetch =
+            (tensor_parallel.world_size == 1).then(|| WeightPrefetch::spawn(&shard_paths));
         let mmaps = mmap_shards(&shard_paths)?;
         let shards = deserialize_shards(&mmaps)?;
 
@@ -593,6 +595,7 @@ impl Qwen3Model {
         )?;
 
         ctx.sync()?;
+        drop(prefetch);
         info!(
             "GPU model loaded in {:.0}ms",
             t_gpu.elapsed().as_secs_f64() * 1e3

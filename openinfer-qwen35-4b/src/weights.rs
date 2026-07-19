@@ -9,8 +9,9 @@ use std::time::Instant;
 use super::config::{Config35, LayerType, TensorParallelConfig};
 use openinfer_core::tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
 use openinfer_core::weight_loader::{
-    deserialize_shards, load_shard_info_fixed, load_tensor_1d, load_tensor_1d_f32, load_tensor_2d,
-    load_tensor_2d_col_shard, load_tensor_2d_row_shard, mmap_shards, precompute_rope,
+    WeightPrefetch, deserialize_shards, load_shard_info_fixed, load_tensor_1d, load_tensor_1d_f32,
+    load_tensor_2d, load_tensor_2d_col_shard, load_tensor_2d_row_shard, mmap_shards,
+    precompute_rope,
 };
 
 /// Full attention layer weights (8 layers in Qwen3.5-4B).
@@ -221,6 +222,8 @@ impl Qwen35Model {
 
         let (shard_paths, weight_map) = load_shard_info_fixed(model_path)?;
         debug!("Loading {} safetensor shard(s)", shard_paths.len());
+        let prefetch =
+            (tensor_parallel.world_size == 1).then(|| WeightPrefetch::spawn(&shard_paths));
         let mmaps = mmap_shards(&shard_paths)?;
         let shards = deserialize_shards(&mmaps)?;
 
@@ -456,6 +459,7 @@ impl Qwen35Model {
         )?;
 
         ctx.sync()?;
+        drop(prefetch);
         info!(
             "GPU model loaded in {:.0}ms",
             t_gpu.elapsed().as_secs_f64() * 1e3

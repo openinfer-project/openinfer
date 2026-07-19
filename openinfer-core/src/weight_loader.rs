@@ -3,11 +3,14 @@
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
 use half::bf16;
-use log::info;
+use log::{info, warn};
 use memmap2::Mmap;
 use safetensors::{Dtype, SafeTensors};
 use std::collections::HashMap;
 use std::fs;
+use std::os::unix::fs::FileExt;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
 
@@ -44,6 +47,154 @@ pub fn load_shard_info(model_path: &str) -> Result<(Vec<String>, HashMap<String,
     }
 
     Ok((shard_files, weight_map))
+}
+
+/// Advisory parallel page-cache prefetch for a single-rank whole-model load;
+/// the loader never depends on it. Dropping cancels and joins the workers, and
+/// failures are aggregated into one warning with the first cause retained.
+pub struct WeightPrefetch {
+    cancel: Arc<AtomicBool>,
+    stats: Arc<PrefetchStats>,
+    unreadable_shards: usize,
+    spawn_failures: usize,
+    workers: Vec<std::thread::JoinHandle<()>>,
+}
+
+#[derive(Default)]
+struct PrefetchStats {
+    read_errors: AtomicUsize,
+    first_error: Mutex<Option<String>>,
+}
+
+impl PrefetchStats {
+    fn record_first_error(&self, message: impl FnOnce() -> String) {
+        let mut slot = match self.first_error.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if slot.is_none() {
+            *slot = Some(message());
+        }
+    }
+}
+
+impl WeightPrefetch {
+    pub fn spawn(shard_paths: &[String]) -> Self {
+        const CHUNK: u64 = 16 << 20;
+        const THREADS: usize = 8;
+
+        let stats = Arc::new(PrefetchStats::default());
+        let mut files: Vec<(Arc<fs::File>, u64, String)> = Vec::new();
+        let mut chunks: Vec<(usize, u64)> = Vec::new();
+        let mut unreadable_shards = 0usize;
+        for path in shard_paths {
+            let meta = fs::File::open(path).and_then(|file| {
+                let len = file.metadata()?.len();
+                Ok((file, len))
+            });
+            match meta {
+                Ok((file, len)) => {
+                    let idx = files.len();
+                    files.push((Arc::new(file), len, path.clone()));
+                    chunks.extend((0..len).step_by(CHUNK as usize).map(|off| (idx, off)));
+                }
+                Err(err) => {
+                    unreadable_shards += 1;
+                    stats.record_first_error(|| format!("{path}: {err}"));
+                }
+            }
+        }
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut workers = Vec::new();
+        let mut spawn_failures = 0usize;
+        let threads = THREADS.min(chunks.len());
+        if !chunks.is_empty() {
+            let total_bytes: u64 = files.iter().map(|(_, len, _)| len).sum();
+            let num_files = files.len();
+            let files = Arc::new(files);
+            let chunks = Arc::new(chunks);
+            let next = Arc::new(AtomicUsize::new(0));
+            for _ in 0..threads {
+                let worker = {
+                    let (files, chunks, next) = (files.clone(), chunks.clone(), next.clone());
+                    let (cancel, stats) = (cancel.clone(), stats.clone());
+                    std::thread::Builder::new()
+                        .name("weight-prefetch".into())
+                        .spawn(move || {
+                            let mut buf = vec![0u8; CHUNK as usize];
+                            while !cancel.load(Ordering::Relaxed) {
+                                let i = next.fetch_add(1, Ordering::Relaxed);
+                                let Some(&(file_idx, off)) = chunks.get(i) else {
+                                    break;
+                                };
+                                let (file, len, path) = &files[file_idx];
+                                let want = CHUNK.min(len - off) as usize;
+                                if let Err(err) = file.read_exact_at(&mut buf[..want], off) {
+                                    stats.read_errors.fetch_add(1, Ordering::Relaxed);
+                                    stats.record_first_error(|| format!("{path}@{off}: {err}"));
+                                }
+                            }
+                        })
+                };
+                match worker {
+                    Ok(handle) => workers.push(handle),
+                    Err(err) => {
+                        spawn_failures += 1;
+                        stats.record_first_error(|| format!("worker spawn: {err}"));
+                    }
+                }
+            }
+            if !workers.is_empty() {
+                info!(
+                    "Prefetching {num_files} weight shard(s) ({:.1} GB) on {} threads",
+                    total_bytes as f64 / 1e9,
+                    workers.len()
+                );
+            }
+        }
+        Self {
+            cancel,
+            stats,
+            unreadable_shards,
+            spawn_failures,
+            workers,
+        }
+    }
+}
+
+impl Drop for WeightPrefetch {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        let mut panicked = 0usize;
+        for worker in self.workers.drain(..) {
+            if let Err(payload) = worker.join() {
+                panicked += 1;
+                let message = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "non-string panic payload".to_string());
+                self.stats
+                    .record_first_error(|| format!("worker panic: {message}"));
+            }
+        }
+        let read_errors = self.stats.read_errors.load(Ordering::Relaxed);
+        if self.unreadable_shards + self.spawn_failures + read_errors + panicked > 0 {
+            let first = match self.stats.first_error.lock() {
+                Ok(guard) => guard.clone(),
+                Err(poisoned) => poisoned.into_inner().clone(),
+            };
+            warn!(
+                "weight prefetch incomplete: {} unreadable shard(s), {} worker spawn failure(s), {} chunk read error(s), {} panic(s); first error: {}",
+                self.unreadable_shards,
+                self.spawn_failures,
+                read_errors,
+                panicked,
+                first.as_deref().unwrap_or("unknown")
+            );
+        }
+    }
 }
 
 /// Memory-map shard files and return the mmaps.
