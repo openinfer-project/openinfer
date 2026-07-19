@@ -35,7 +35,8 @@ fn commit_extends_partial_gpu_hit() {
 
     // Seed the GPU cache with the first 3 blocks via a real request.
     let mut seed = pool.new_request(prompt[..3 * BLOCK_SIZE].to_vec(), 1, None);
-    seed.schedule_prefill(3 * BLOCK_SIZE, &pool).expect("seed schedule");
+    seed.schedule_prefill(3 * BLOCK_SIZE, &pool)
+        .expect("seed schedule");
     seed.apply_prefill(1, &pool).expect("seed apply");
     seed.release().expect("seed release");
 
