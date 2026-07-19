@@ -4,9 +4,9 @@
 >
 > **Last touched:** 2026-07
 
-## Corrections to `dp1-ep8-decode-plan.md`'s PR3 section
+## Corrections carried into the current layer implementation
 
-This doc supersedes the plan doc's PR3 section (same pattern as `indexer-forward.md` superseding PR2).
+The original bring-up plan described this layer only as a milestone. The corrections below are the retained implementation contract.
 
 1. **"Full EP1 decode forward with e2e bs=1 generation gate" is impossible.** Routed-expert weights total ~700 GiB fp8 (measured rank slabs: rank0 105.1 GiB + 7×85.5 GiB). One GPU cannot hold the model. PR3 is brick-level: single-decoder-layer oracle gates (a MoE layer's 256 experts ≈ 9.4 GiB — fits fine). The first e2e generation gate lands in PR4, the first point where the full model is resident across 8 ranks and all-to-all exists.
 2. **Cross-layer top-k sharing was missing from the plan.** GLM5.2 config: `index_topk_freq=4`, `index_skip_topk_offset=3` (`config.rs:36-39` validates both). Per transformers' derivation, layer *i* is `full` iff `max(i-2, 0) % 4 == 0` → **21 of 78 layers run the indexer** ({0,1,2} ∪ {6,10,…,74}); the other 57 are `shared` and reuse the previous full layer's `topk_indices` verbatim (they have **no indexer weights** — the manifest's conditional indexer push in `weights.rs:218-227` matches). Reuse across layers is sound because `topk_indices` are global KV slots and all layers share one block table / slot mapping. The layer composition must thread `prev_topk` through the loop; this is also a large decode win (indexer runs 21×, not 78×).
@@ -141,8 +141,7 @@ Gate env: jz38 H200 + `/data/models/GLM-5.2-FP8`, same build env as `oracle-harn
 
 ## Read
 
-- `docs/models/glm52/dp1-ep8-decode-plan.md` — the 5-PR roadmap (PR3 section superseded by this doc).
-- `docs/models/glm52/mla-decode-brick.md`, `indexer-forward.md`, `oracle-harness.md` — the merged bricks + gate pattern.
+- `docs/models/glm52/indexer-forward.md`, `oracle-harness.md` — the retained indexer design and gate pattern.
 - `vllm/vllm/model_executor/models/deepseek_v2.py:216-407,1154-1325` — MLP/MoE/decoder layer (authoritative model graph).
 - `vllm/vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py:80-161` — routing math.
 - `vllm/vllm/model_executor/layers/fused_moe/prepare_finalize/deepep_v2.py` — the graph-first DeepEP v2 decode contract (what PR4 must preserve; `do_cpu_sync=False`, device-side counts, pow2 token cap).

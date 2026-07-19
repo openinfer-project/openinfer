@@ -4,9 +4,9 @@
 >
 > **Last touched:** 2026-07
 
-## Why this doc replaces the PR2 section of `dp1-ep8-decode-plan.md`
+## Why this correction still matters
 
-The plan doc's PR2 data-flow diagram omits three steps that vllm's `DeepseekV32Indexer.forward` performs: **k_norm is a LayerNorm (not RMSNorm) with bias**, **per-head `weights_proj` + head-weighted score reduction** (fused inside DeepGEMM's `fp8_paged_mqa_logits`), and **ReLU** (also fused inside DeepGEMM). The plan also listed Hadamard; vllm's DSv32 path does NOT apply Hadamard (only TokenSpeed does). Aligning to vllm — which already landed the `weights` parameter in our DeepGEMM wrapper (#489) — means Hadamard is dropped for now. This doc is the corrected scope.
+The original bring-up data-flow omitted three steps that vLLM's `DeepseekV32Indexer.forward` performs: **k_norm is a LayerNorm (not RMSNorm) with bias**, **per-head `weights_proj` + head-weighted score reduction** (fused inside DeepGEMM's `fp8_paged_mqa_logits`), and **ReLU** (also fused inside DeepGEMM). It also listed Hadamard; vLLM's DSv32 path does NOT apply Hadamard (only TokenSpeed does). Aligning to vLLM — which already landed the `weights` parameter in our DeepGEMM wrapper (#489) — means Hadamard is dropped for now. This doc is the corrected contract.
 
 ## vllm cross-reference (the alignment target)
 
@@ -156,8 +156,6 @@ OPENINFER_TEST_MODEL_PATH=/data/models/GLM-5.2-FP8 \
 
 ## Read
 
-- `docs/models/glm52/dp1-ep8-decode-plan.md` — the 5-PR roadmap (PR2 section is superseded by this doc).
-- `docs/models/glm52/dsa-indexer.md` — PR2 kernel ops dev doc (the 6 ops already landed).
 - `docs/models/glm52/oracle-harness.md` — harness design, verification, pitfalls.
 - `openinfer-glm52/src/mla_decode.rs` — PR1 forward pattern to mirror.
 - `vllm/vllm/models/deepseek_v32/nvidia/attention.py:39-157` — `DeepseekV32Indexer` (alignment target).
@@ -167,7 +165,7 @@ OPENINFER_TEST_MODEL_PATH=/data/models/GLM-5.2-FP8 \
 
 ## Relevant history
 
-- PR2 kernel ops (#489) landed all 6 ops + smoke tests on H200. The model-crate forward wiring was explicitly deferred ("the remaining piece" — `dsa-indexer.md` debrief).
+- PR2 kernel ops (#489) landed all 6 ops and smoke tests on H200 before the model-crate forward was wired in #521.
 - Oracle harness (#499) landed the self-contained probe pipeline; MLA gate is green. Indexer gate was noted as the next extension.
 - transformers 5.12.1 had a RoPE contradiction (config says `indexer_rope_interleave=true` but modeling used non-interleave). Fixed in 5.13.0.dev0 PR #46842 (`8698b5a525`). The harness must bump its pin.
 - vllm's `DeepseekV32Indexer` is the production reference for GLM5.2 DSA. It does NOT apply Hadamard (unlike TokenSpeed). The `glm52_indexer_hadamard_bf16` kernel landed in #489 stays as dead code.

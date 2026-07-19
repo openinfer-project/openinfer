@@ -1,243 +1,167 @@
-# GLM5.2 P/D 分离 M2：vLLM-TP8 prefill + openinfer-EP8 decode 执行记录
+# GLM5.2 P/D disaggregation
 
-> **TL;DR:** GLM P/D 里程碑 2 **全 gate 完成（2026-07-12）**：P = vLLM TP8（8×H200 节点 A），D = openinfer EP8（8×H200 节点 B），跨节点 pegaflow P2P，无 MTP/DSpark。跨引擎链路逐 token 一致、D 全程零 prefill（admit 即 suffix=1）；gsm8k 同分、NIAH 36/36 打平；故障注入干净失败 + 自愈；等卡数验收压测（16 vs 16，8k+2k×5 轮）：P/D 赢 TPOT p99（26-38 ms ≈ median vs mixed turn1 67-89 ms）与 turn3+ TTFT（0.6-1.1 s vs ~1.7 s），mixed 赢原始吞吐（340 vs 271 tok/s）与 turn1 TTFT。#657 已同步当前 `main` 并修复本地 CI，`pegaflow-core` 已推进到合入 #395 的 v0.23.3 rev `1473c53`；支持面只覆盖已实测的 normal 配置（Qwen3 P = vLLM 0.23.0 默认 NHD，GLM P = vLLM 0.24.0），两者都不依赖 #382，剩余落地约束只有先合其下层 #540。GLM 硬依赖：vLLM 0.24.0 + `--kv-cache-dtype fp8_ds_mla`；D 端 compat 注册用 vLLM 层名 + page-first；restore 后 RoPE deinterleave fixup。残余风险：indexer rope 约定分歧（NIAH 已过，未完全关闭）；follow-up：pegaflow metaserver 重启后 re-publish catalog。
+> **TL;DR:** GLM5.2 target-only P/D is merged in OpenInfer #657: vLLM 0.24.0 TP8 performs prefill, OpenInfer EP8 performs decode, and PegaFlow transfers the 99 target-cache arenas per rank. The measured path preserves token output, admits every request at `suffix == 1`, matches vLLM on GSM8K and NIAH, and trades first-turn TTFT/raw throughput for stable TPOT tails and better later-turn TTFT. DSpark state is not transferred and remains incompatible with this path.
 >
 > **Last touched:** 2026-07
 
-## Preparation (2026-07-13 upstream integration)
+## Supported contract
 
-- **Read**:
-  - `docs/index.md` — routed this work to the existing GLM5.2 P/D execution record.
-  - `docs/models/glm52/pd-vllm-prefill.md` — established that strict zero-prefill depends on the Pegaflow tail-save and first-token router contract.
-  - `docs/models/glm52/pegaflow-offload-pd.md` — recorded the old `pegaflow-core` revision and the 99-arena target-KV boundary.
-  - `docs/subsystems/runtime/pegaflow-offload-integration.md` — required an upstream-merged revision pin rather than a development branch or path dependency.
-- **Relevant history**:
-  - This document records the measured cross-engine correctness, failure-injection, and equal-card performance gates; dependency maintenance must preserve those claims rather than reinterpret them.
-  - Pegaflow PR #395 merged to `master` as `1473c5355d879b4fea23101760cb2a0074642ada`; OpenInfer PR #657 still pins the earlier #381 revision.
-- **Plan**:
-  1. Merge current `origin/main` into `feat/glm52-pd` and resolve conflicts without dropping either the P/D path or newer GLM5.2 mainline changes.
-  2. Audit the vLLM layout boundary and Pegaflow connector inference, then advance the pin to the merged #395 revision if the supported versions are already single-segment.
-  3. Apply rustfmt and the four evidence-backed Clippy fixes, then run formatting, locked metadata, focused unit tests, and the Qwen3 CUDA Clippy lane locally.
-  4. Record exact results here, commit with a Commitizen message, push the PR branch, and re-check PR mergeability and CI state.
-- **Risks / open questions**:
-  - Reading an old vLLM KV shape as the current contract would create a false dependency; the version boundary and connector branch must both be checked from source.
-  - `main` changed GLM5.2 scheduler/model code after the P/D branch split, so conflict resolution needs control-flow inspection rather than mechanical side selection.
-  - Full two-node 8×H200 P/D replay is not available on this workstation; this maintenance pass can preserve the previously measured A/B evidence but cannot replace it.
+This is the one supported GLM5.2 P/D configuration:
 
-## Execution Log (2026-07-13)
-
-### Step 1: synchronize the PR with `main`
-
-- Fetched `origin/main` and `origin/feat/glm52-pd`, then merged the current `origin/main` into the PR branch.
-- Resolved two semantic conflicts:
-  - `openinfer-glm52/src/lib.rs` now retains both the P/D P2P/deadline invariants and the newer remote rank-host invariants; remote rank-host launch remains incompatible with KV offload.
-  - `openinfer-qwen3/src/executor/remote_fetch.rs` retains the P/D miss-breaker controls on top of `main`'s fallible query contract.
-- Result: conflict markers are gone and `git diff --check` passes. The newer `Glm52Worker::{Local, Remote}` scheduler shape required one additional semantic repair: P/D admission now accepts the worker enum, while RoPE fixup fails early for remote rank-host workers because launch validation forbids that topology with KV offload.
-
-### Correction: #382 is not a supported-stack dependency
-
-- The initial audit incorrectly treated the pre-v0.23 FlashAttention shape as the configuration used by Qwen3 M1. vLLM PR #42095 (`7e33081c`) changed the v0.23.0 default NHD layout from `(2, blocks, ...)` to `(blocks, 2, ...)`.
-- Under the supported Qwen3 configuration (vLLM 0.23.0, default NHD), Pegaflow sets `bytes_per_block` from the block stride and registers `segments=1`; the host copy unit is block-local `[K|V]`, matching OpenInfer's contiguous device page.
-- GLM uses the separately gated vLLM 0.24.0 page-first single-segment MLA/indexer payload. Pegaflow #382 only serves a split-segment producer, which neither supported normal configuration uses.
-- Decision: advance `pegaflow-core` to merged #395 rev `1473c5355d879b4fea23101760cb2a0074642ada`; #657 remains stacked on #540 but is no longer blocked by #382.
-
-### Step 2: repair observed CI failures
-
-- Retrieved the failed GitHub Actions job logs directly. Rust formatting had drifted across the P/D files; Qwen3 CUDA Clippy reported four `decimal_bitwise_operands` errors in the canonical-CBOR head encoder.
-- Ran `cargo fmt --all` and changed CBOR additional-information operands `24..27` to their protocol-shaped hexadecimal forms `0x18..0x1b`.
-- Repaired the merged Qwen3 test closures for `main`'s fallible query contract, removed format-collection lint debt in the CBOR test helper, and boxed the large GLM admission payload.
-- Local verification:
-  - `cargo fmt --all -- --check`: pass.
-  - `cargo metadata --locked --no-deps --format-version 1`: pass.
-  - Qwen3 CUDA CI Clippy lane with `-D warnings`: pass.
-  - `cargo test --release --locked -p openinfer-kv-offload -p openinfer-qwen3 --lib`: pass (8 + 72 tests).
-  - GLM server feature compile: pass.
-  - `cargo test --release --locked -p openinfer-glm52 --lib`: pass (70 passed, 15 ignored).
-- Post-push GitHub Actions for dependency commit `992a533e`: pass (12/12 checks, including sm_80 Qwen3 compile/Clippy and simulated frontend E2E).
-  - GLM Clippy reaches only six warnings inherited unchanged from current `main`; branch-specific warnings in admission/offload are cleared.
-
-### Step 3: advance the merged Pegaflow dependency
-
-- Updated `pegaflow-core` from the #381 revision (`d46fd16`, v0.23.2) to the #395 merge revision (`1473c53`, v0.23.3), which retains #381 and adds P-side partial-tail save plus first-token router forwarding.
-- Refreshed `Cargo.lock` and re-ran the locked local verification after the dependency move:
-  - `cargo fmt --all -- --check`, `git diff --check`, and locked metadata: pass.
-  - Qwen3 CUDA CI Clippy lane with `-D warnings`: pass.
-  - `cargo test --release --locked -p openinfer-kv-offload -p openinfer-qwen3 --lib`: pass (8 + 72 tests).
-  - GLM server feature compile: pass.
-  - `cargo test --release --locked -p openinfer-glm52 --lib`: pass (70 passed, 15 ignored).
-
-## Debrief (2026-07-13)
-
-- **Outcome:** #657 is reconciled with current `main`; its merge conflicts, formatting failure, Qwen3 Clippy failure, and GLM worker-shape integration error are repaired locally.
-- **Dependency decision:** pin `pegaflow-core` to merged #395 rev `1473c53`. The supported normal configurations are Qwen3 vLLM 0.23.0 default NHD and GLM vLLM 0.24.0; both use the gated single-segment block geometry, so #382 is neither required nor awaited.
-- **Landing order:** land #540, then remove its stacked commits from #657 and land #657. Pegaflow #395 is already merged and pinned.
-- **Remaining validation:** this maintenance pass does not replace the already recorded two-node performance/correctness gates. The pin advances to the merged revision containing the previously gated tail-save/router behavior; local locked compile/tests and the 12-check GitHub Actions run on `992a533e` pass.
-
-## 与 qwen3 里程碑 1 的差异（GLM 专属工作项)
-
-qwen3 的 vLLM-P + openinfer-D（PR #540，未合）已验证 hash 复刻 + 兼容等式 + RemoteFetch 等待分支。GLM 新增：
-
-1. **双 cache 家族**：78 层 MLA（656 B/token）+ 21 层 index-K（132 B/token）都要 hash 命中 + 字节比对。布局已做过源码级核对（vs vLLM `cdab28319`，见 `pegaflow-offload-pd.md` M2 节），gate 防的是静默漂移。
-2. **页大小天然对齐**：GLM 两边都是 page 64（qwen3 要 P 迁就 `--block-size 16`）。vLLM P 直接 `--block-size 64`。
-3. **零 prefill 是硬约束**（qwen3 上 D 兜底算 ≤16 token 尾巴可接受，GLM 上尾巴 = token-by-token 骑 decode 内核，最坏 ~3s）：
-   - P 端 connector 加法式尾块扩展：`xxh3_128(cbor((last_full_hash, tail_token_ids, None)))` 派生尾块 key，partial page 一并入库；
-   - D 端 partial-block restore（kvbm 目前拒收未 seal 块，需要 `(hash, valid_len)` 级契约）+ 从 decode 路径继续填充该页；
-   - 路由变体 A：P 的 t1 直接回客户端并追加进转发 D 的上下文，D 首步 = 对 t1 的真 decode（1 token，零 prompt 位置）；
-   - D 严格模式：miss/超时 → 429/500（router 重试重走 P），禁止 scratch 兜底；executor 加不变量——P/D 模式下 admitted 请求未算 prompt token > 1 即报错。
-4. **跨节点**：M2 qwen3 是单机双卡；本次 P/D 各占一台整机，dma-buf/GID/路由首次实测（两边同构 8×400G IB 1:1 PIX，预期直接成立）。
-5. **等待谓词**：D 必须等完整前缀命中才放行（partial-hit 在 GLM 不可接受），复用 #540 的 miss 窗口重查询 + 熔断，但退化路径改为 fail。
-
-## 环境
-
-- 节点 A（P）与节点 B（D）：各 8×H200 + 8×400G IB。B = openinfer GLM 全套 gate 环境（NCCL 2.30.7、DeepGEMM、oracle）；A 新配 vLLM。
-- **权重必须同源**：两台机器上原有的两份 GLM-5.2 checkpoint 数值不同（`embed_tokens` md5 不一致，config 只差 `transformers_version`），已统一为同一份 GLM-5.2-FP8 checkpoint；内部挂载路径不写入本文。错误的 provider checkpoint 已删除。**教训：P/D 两侧权重不同源时 hash 照样命中（key 只看 token），是静默正确性洞——环境搭建时先 spot-hash 权重。**
-- P 侧栈模板：里程碑 1 的 `stack.sh`（vLLM `PegaKVConnector` + `--prefix-caching-hash-algo xxhash_cbor` + `PYTHONHASHSEED=0` + pegaflow-server per node + pegaflow-router）。
-- 依赖状态：Pegaflow #395 已合并并 pin 到 rev `1473c53`；GLM 分支仍叠在未合的 OpenInfer #540 上。支持面固定为 Qwen3 vLLM 0.23.0 默认 NHD 与 GLM vLLM 0.24.0，两者都不等待 Pegaflow #382。
-
-## 实现落点（2026-07-12）
-
-- **openinfer `feat/glm52-pd`**（基于 main + merge #540）：
-  - `Glm52KvOffloadOptions` 增 `p2p`（pegaflow mesh）与 `vllm_compat`；host 加入 P2P mesh 并使用 peer namespace；
-  - `scheduler/offload.rs::admit_vllm_pd`：整前缀 restore（vLLM 键）→ 尾块经派生 key 载入**请求私有页**（`schedule_prefill(tail_len)` → pegaflow `load` 整页 H2D → `apply_prefill_chunk`，不进 radix）→ suffix==1 才放行；zero/partial-hit park 在队首按 step 边界重试（全空闲时 5ms 节流）；窗口耗尽 **Reject**（router 重试），3 连窗 miss 开 breaker；`--kv-pd-allow-local-prefill` 为调试逃生门；compat 模式禁自存；
-  - 关键洞察：+1 token（变体 A 追加 t1）使 kvbm probe 的 cacheable 窗口恰好覆盖 P 侧全部满页——对齐 prompt 无需特判。部分页的"无效尾行"由后续 decode 自然覆盖，kvbm 零改动。
-- **pegaflow `feat/glm52-pd`**：
-  - connector `pegaflow.pd_tail_save`：调度完最后一段 prompt 的那一步（KV 已写完、无需等 finish，规避空闲引擎不再 step 的死角）用 **vLLM 自己的 hash 函数**派生尾块 key 并入库；racing 的 t1 行无害（key 只覆盖 prompt 位置）；
-  - router `--pd-first-token`（变体 A）：P 带 `return_token_ids` + `min_tokens=1`；t1 拼进客户端响应并追加进发给 D 的 **token-id prompt**（chat 模板只在 P 生效，D 恒走 `/v1/completions`）；D 的 SSE 转换回客户端 API；D 失败整流程重试（`--pd-flow-retries`）。
-- vLLM 0.23.0 API 已在 P 机 venv 实证：`return_token_ids`（chat 的 `prompt_token_ids` 在响应**顶层**）、`hash_block_tokens/NONE_HASH`、需补装 `xxhash`+`cbor2`。
-- **GLM P 固定 vLLM 0.24.0**：0.23 给全部 78 层都建 Indexer cache（`_skip_topk` 只是运行时开关）→ 注册 156 层；0.24.0（#45895）只在 full-indexer 层建 → 78 MLA + 21 idxk = 99，与 openinfer arena 集一致。首跑 smoke 报 `stored block has 1 slots but instance expects 99` 的另一半原因：pegaflow connector 对 MLA 模型自动 **page-first**（整块所有层拼一页、单 slot，页内偏移按**层名字典序**）。D 端修法：compat 模式下 arena 用 vLLM 层名（`model.layers.N.self_attn.attn` / `...indexer.k_cache`）+ `page_first=true` 注册——同名 ⇒ 同序 ⇒ 同偏移，字节宽度本就同源（fp8_ds_mla 656 B/token、idxk 132 B/token）。
-
-## 里程碑与 gate
-
-| # | Gate | 状态 |
-| --- | --- | --- |
-| 0 | 权重同源（spot-hash 对齐）+ A 机 vLLM TP8 起服 | ✅（错误的 0614-Provider 已删；vLLM **0.24.0** + `--kv-cache-dtype fp8_ds_mla` 起服） |
-| 1 | 跨节点 pegaflow P2P RDMA READ 实证 | ✅（D 侧 RDMA fetch 实测：3 块 9.9 MiB ≈3.3 MiB/块 = 78×41984+21×8448 精确吻合） |
-| 2 | hash + namespace + 双 cache 字节比对（对齐 / 非对齐 prompt 各一档） | ✅（e2e 逐 token 一致：250-token 尾块档与 256-token 对齐档均与 vLLM 基线逐 token 相同，重复请求确定性） |
-| 3 | 尾块 + 变体 A + 严格模式：D 零 prefill invariant 全绿 | ✅（admit 全部 `suffix=1`，`allow_local_prefill=false`；窗口耗尽→500→router 重试链路实测） |
-| 4 | E2E：router P/D vs baseline 逐 token 一致 ×3 档 prompt；多轮 delta 只拉增量；杀 P/杀 metaserver 干净失败 | ✅（逐 token 一致 ×2 档；radix 复用 `gpu_hit=3 pulled=0`；多轮 delta 只拉增量；故障注入见下节——顺带抓出并修复 miss-breaker 死锁） |
-| 5 | 验收压测：多轮长输入（首轮 ~8k、每轮 +2k），P/D vs 2× vLLM mixed（会话亲和），吞吐/TTFT/TPOT 分轮报告 + D 零 prefill 证据（严格模式下 admit 即 suffix=1，无 allow_local_prefill） | ✅（16 卡 vs 16 卡，160/160 双侧零失败，admit 全 suffix=1；分轮数据与诚实结论见下节） |
-
-### Bring-up 期间抓出的三个正确性 bug（均已修）
-
-1. **层数 156 vs 99**：vLLM 0.23 给全部 78 层建 Indexer cache；0.24.0（#45895）只建 21 个 full-indexer 层。**GLM P 侧固定 vLLM 0.24.0**。
-2. **RoPE 存储排列**：vLLM（`is_neox_style=False`）旋转后 pair 保持 interleaved `(2i,2i+1)`；openinfer 内核是 interleave-in/block-out `[i, i+32]`——同值不同排列。D 端 restore 后对每个新拉取页做一次 deinterleave（MLA 行 528..656 的 64×bf16 + index-K 行前 64×fp8；rank worker 命令，同 stream 先于后续 step）。未修时症状：t1 正确、后续输出全是 prompt 词汇的乱序拼贴（KV 结构性错位），或直接 DeepEP dispatch 断言崩（bf16 布局时代）。
-3. **P 侧尾块保存在前缀命中下不触发**：`scheduled >= prompt_len` 没算上本地 prefix-cache 命中的位置——**多轮 turn≥2 必踩**（P 必然命中上轮前缀）。初版修法（connector 自记账本）经 review 再修：改用 vLLM scheduler 每步给的权威 `num_computed_tokens + num_scheduled_tokens`（connector 侧累加器在 preempt/resume 下会撒谎，可能把未写完的 tail 页以合法 key 存进按内容寻址、拒收后到重复的 tier——静默精度损坏）。lora/cache_salt/多模态请求拒绝 tail save（tail key 不含 extra_keys，会跨租户碰撞）。
-
-### Bring-up 快压：TTFT 增量与 TPOT 稳定性 A/B（2026-07-12，非验收数据）
-
-`vllm bench serve`（random 4096 in / 128 out / temp 0 / ignore-eos，每档独立 seed 防 prefix-cache 污染）。A = vLLM 单机直连（mixed，prefill+decode 同实例），B = router 全 P/D 链路。P = vLLM TP8（8×H200），D = openinfer EP8（8×H200）。
-
-**并发 1（隔离纯交接开销，无排队）：**
-
-| | vLLM 直连 | P/D | 增量 |
-| --- | --- | --- | --- |
-| TTFT median | 496 ms | 541 ms | **+45 ms（+9%）** |
-| TPOT median | 11.9 ms | 19.5 ms | +7.7 ms |
-
-- **P/D 交接的 TTFT 代价 = ~45 ms**，构成与 D admit 日志吻合：park 等待 ~46 ms（P 侧 save 注册可见性，占大头，可优化）+ RDMA fetch ~5 ms（64 块 ~13 MB）+ router 串行往返。相对 4k prefill（~500 ms）是 +9%；prompt 越长占比越小。
-- batch=1 的 TPOT 差（19.5 vs 11.9）是 openinfer EP8 lock-step 单请求 decode 的 MoE 固定开销，与 P/D 传输无关（负载下消失，见下）。
-
-**并发 8 × 32 请求（负载下）：**
-
-| | vLLM 直连（mixed） | P/D | Δ |
-| --- | --- | --- | --- |
-| TTFT median | 1913 ms | 1005 ms | **-47%** |
-| TTFT p99 | 6472 ms | 3544 ms | -45% |
-| TPOT median | 31.9 ms | 25.0 ms | -22% |
-| TPOT p99 | **60.8 ms** | **25.5 ms** | **-58%** |
-| 输出吞吐 | 154 tok/s | 215 tok/s | +39% |
-
-- **TPOT 稳定性是核心证据**：mixed 的 p99/median = 1.9（prefill chunk 抢占 decode），P/D 的 p99≈median（25.5/25.0 = 1.02）——decode 完全无抢占。
-- 负载下 P/D 的 TTFT 反而更低：P 专注 prefill，无 decode batch 占坑。
-- **公平性注意**：本对比 P/D 用 16 卡 vs mixed 8 卡，吞吐/TTFT 优势含卡数加成，不可直接引用；等卡数结论以验收压测（P/D vs 2× mixed 会话亲和）为准。与卡数无关的两个结论：交接开销 ~45 ms、P/D 侧 TPOT p99≈median。
-- 零 prefill 全程成立：压测窗口 D 的 admit 全部 `suffix=1`，零拒绝零失败。
-- 局限：单轮、恒定长度、无会话复用——**不可引用为验收结论**。
-
-### 多轮 A/B（vllm-bench openai-chat，16 会话 × 5 轮，首轮 8192 +2048/轮，输出 128/轮，并发 8，temp 0 + ignore-eos）
-
-| 轮次 | P/D TTFT med (ms) | 直连 TTFT med (ms) | P/D TPOT med/p99 | 直连 TPOT med/p99 |
-| --- | --- | --- | --- | --- |
-| 1 (8k) | 4382 | 4611 | 23.8 / 27.3 | 41.8 / **66.6** |
-| 2 | **653** | 858 | 26.5 / 27.0 | 27.3 / 31.5 |
-| 3 | **521** | 992 | 26.9 / 27.6 | 26.4 / 31.4 |
-| 4 | **385** | 999 | 25.4 / 25.5 | 26.4 / 31.5 |
-| 5 | **390** | 1380 | 25.4 / 25.7 | 21.8 / 31.3 |
-
-- 160/160 请求零失败（多轮 = P 侧必然前缀命中 = 尾块保存修复的主战场）。
-- **turn2+ TTFT：P/D 稳定 ~390-650 ms 且逐轮下降；直连 858→1380 ms 逐轮恶化**（增量 prefill 与在场 decode batch 抢卡）。turn5 差 3.5×。
-- TPOT p99：P/D 全程 25-27 ms（≈median）；直连全程 ~31 ms、首轮 66 ms。
-- 同样注意 16 卡 vs 8 卡的公平性 caveat；等卡数对比以验收压测为准。turn>2048 上下文的 indexer 风险（见下节）在此工况（峰值 ~17k）未见输出退化迹象（gsm8k 上下文 <2048，不覆盖该风险；多轮 bench 是 random token 无法直接测质量）。
-
-### 故障注入（gate 4 收尾，2026-07-12）
-
-**杀 P（vLLM `kill -9`）**：router 5 ms 内干净 502（`prefill request: error sending request`），无 hang、无 D 侧兜底，D 进程与日志无恙。恢复 = 单独重启 vLLM（~4 min 权重装载），无需动其它组件——namespace 由 seed 确定性派生，P 重启不换名。恢复后链路直接可用（实测 200）。
-
-**杀 metaserver（`kill -9` + 重启）**：故障期间请求 30 s 干净 502（= 2 × 15 s in-flight-fetch 窗口 × router 双尝试），D 把 metaserver 连接拒绝当 miss 持续轮询、严格拒绝，进程无恙。**恢复语义分三层**：
-
-1. **节点会话自愈**：pegaserver 与 D 的 metaserver_client 心跳自动重注册（重启后 ~10 s 内），新保存的块注册/发现全部正常。
-2. **存量块元数据丢失（设计事实）**：metaserver 元数据是内存态，重启即清零；pegaserver **不会**重新发布已持有块的目录。叠加 P 侧 connector 对前缀命中的请求只重存尾块、不重存满页——**故障前的老前缀成为黑洞**（数据在 pegaflow 里、注册永久缺失），命中老前缀的请求持续干净 502，直到 P 重启（vLLM prefix cache 清零 → 全量重算重存）或自然逐出。运维口径：metaserver 重启后，若要立即恢复存量会话，连带重启 vLLM。pegaflow 侧正确修法（follow-up）：metaserver_client 重连成功后全量重发布本地块目录（DB 视角 = replica 在 registry failover 后 re-publish catalog）。
-3. **miss breaker 死锁（已修，injection 战果）**：修复前 3 连 miss 窗口开断路器后新请求"首查即拒"（µs 级）。而 pegaflow `query()` 是异步模型——首查只**发起**后台 metaserver 解析 + fetch 并立即报 miss/Loading，意味着断路器一旦打开，任何远端块都不可能完成 restore，唯一复位条件（完整 restore 落地）永远无法达成 → metaserver 瞬时抖动即可让 D 进入**永久全量拒绝**（实测：metaserver 早已恢复、query 返回 prefix=8/8，D 仍 µs 级拒绝一切）。修复：breaker open 改为短探针窗口 park（500 ms，同时替换 miss 与 in-flight 两个 deadline，覆盖 ~46 ms save 可见性 + 异步 fetch），完整 restore 照旧复位——P 真挂时 router 仍按探针节奏快速 failover，P 恢复后首个新请求自动闭合断路器。**修复后实测**：故障期失败节奏 30 s → 15.5 s（第 3 次 miss 开断路器）→ 1.07 s/请求（2×500 ms 探针 × router 双尝试）；metaserver 重启 15 s 后首个新请求即 200/0.18 s（park 7 ms），断路器自动闭合，零人工干预。
-
-### lm-eval 精度 gate（gsm8k 5-shot，limit 200，greedy，经由各 endpoint）
-
-| Endpoint | exact_match (strict) |
+| Component | Contract |
 | --- | --- |
-| P/D router 第 1 轮 | 0.960 ± 0.014 |
-| P/D router 第 2 轮 | 0.970 ± 0.012 |
-| vLLM 直连 | 0.955 ± 0.015 |
+| Prefill worker | vLLM 0.24.0, TP8, GLM-5.2-FP8 |
+| Decode worker | OpenInfer EP8 |
+| Data plane | PegaFlow P2P, `pegaflow-core` v0.23.3 rev `1473c53` |
+| vLLM cache | `fp8_ds_mla`, page size 64, page-first registration |
+| Hashing | vLLM canonical-CBOR block hash with an identical fixed `PYTHONHASHSEED` on P and D |
+| Handoff | P forwards its first token; D restores the complete prompt and admits only at `suffix == 1` |
+| Speculation | Target cache only; no MTP or DSpark state transfer |
 
-- P/D 与 vLLM 直连**同分（噪声内）**——跨引擎 restore 路径无精度损失。
-- 两轮 P/D 差 2 个样本：D 的 EP8 批式 decode 非 batch-invariant（batch 组成影响数值），greedy 下仍可能因并发组 batch 不同而在近平局 token 上分叉，属预期。
+The normal Qwen3 vLLM 0.23.0 NHD layout and the GLM5.2 vLLM 0.24.0 layout are both single-segment block payloads. PegaFlow #382 is therefore not a dependency for either supported configuration.
 
-### 验收压测：P/D vs 2× vLLM mixed，等卡数 16 vs 16（gate 5，2026-07-12）
+P and D must use the same checkpoint revision. Cache keys identify token history and layout, not model weights; mismatched weights can still produce a cache hit and silently invalidate the result. Deployment validation must compare representative weight digests before serving traffic.
 
-工况：多轮长输入（首轮 8192、每轮 +2048、输出 128/轮、5 轮、temp 0 + ignore-eos），两个并行 vllm-bench 客户端（openai-chat，各 16 会话、并发 8，seed 1/2 → **两侧 token 流逐字节相同**）。P/D 侧两个客户端都打 router（P = vLLM TP8 节点 A，D = openinfer EP8 节点 B）；mixed 侧各打一个**干净 vLLM TP8**（无 connector，节点 A/B 各一，构造性会话亲和）。两侧均 160/160 零失败；P/D 窗口内 admit 全部 `suffix=1`、零拒绝（零 prefill 证据）。
+## Why prefill stays in vLLM
 
-**TTFT 中位（两 seed 客户端，ms）：**
+OpenInfer's GLM5.2 engine is intentionally decode-oriented:
 
-| 轮次 | P/D s1 | P/D s2 | mixed s1 | mixed s2 |
-| --- | --- | --- | --- | --- |
-| 1 (8k) | 11621 | 11647 | **4130** | **4233** |
-| 2 | 1524 | 1403 | **1272** | 3020 |
-| 3 | **1057** | **1103** | 1668 | 1841 |
-| 4 | **564** | **974** | 1664 | 1686 |
-| 5 | **1030** | **679** | 1683 | 1706 |
+- sparse MLA is instantiated for decode rows;
+- the indexer uses paged MQA logits;
+- the DeepEP shim is the latency-oriented decode protocol;
+- the scheduler can ingest a prompt through decode steps, but that is not an efficient production prefill path.
 
-**TPOT med/p99（ms）：**
+Building native prefill would require a new attention-parallel path, sparse-prefill kernels, normal-mode MoE communication, and chunked-prefill scheduling. The current product path delegates that work to vLLM and treats OpenInfer as the decode worker.
 
-| 轮次 | P/D s1 | P/D s2 | mixed s1 | mixed s2 |
-| --- | --- | --- | --- | --- |
-| 1 | 23.3/26.4 | 23.7/33.6 | 42.8/**67.3** | 53.4/**88.9** |
-| 2 | 34.1/35.0 | 33.9/36.2 | 23.0/31.6 | 25.4/**45.6** |
-| 3 | 35.2/36.6 | 34.7/35.6 | 21.0/31.4 | 22.3/**65.3** |
-| 4 | 35.2/36.7 | 35.6/36.6 | 21.1/31.5 | 21.1/31.6 |
-| 5 | 35.4/38.1 | 34.6/38.0 | 21.0/31.5 | 21.0/31.7 |
+## State and ownership
 
-总吞吐：mixed 340 tok/s（54/68 s 跑完）vs P/D 271 tok/s（76 s）。
+Each OpenInfer rank registers 99 target arenas under one PegaFlow instance:
 
-**等卡数结论（诚实口径）：**
+- 78 MLA arenas at 656 bytes per token;
+- 21 index-K arenas at 132 bytes per token for full-indexer layers.
 
-1. **P/D 赢在尾延迟与 turn2+ 交互性**：P/D 的 TPOT p99≈median 全程成立（26-38 ms，decode 永不被 prefill 抢占）；mixed 的 p99 在 turn1 冲到 67-89 ms、且随负载波动（45-65 ms 尾巴散布到 turn2/3）。turn3+ TTFT 中位 P/D 0.6-1.1 s vs mixed ~1.7 s（增量 prefill 与 decode 解耦）。**若 SLO 是"TPOT p99 ≤ 40 ms"，P/D goodput = 100%，mixed 在 turn1（以及 seed2 的 turn2/3）成批违约。**
-2. **mixed 赢在原始吞吐与 turn1 TTFT**：本合成工况输入:输出 ≈ 50:1（ignore-eos + 128 输出），prefill 算力主导——P/D 把全部 32×8k 首轮 prefill 压到单节点 P 上排队（TTFT 11.6 s vs 4.1 s），D 大量空转；mixed 两台都出 prefill 算力。**这是 P:D=1:1 配比对 prefill-heavy 工况的错配，不是架构差**：P/D 的正确用法是按工况调 P:D 配比（本工况应 2P:1D 甚至更高），而 mixed 无该自由度。
-3. **openinfer EP8 decode 引擎差距（与 P/D 架构无关）**：batch16 lock-step decode ~35 ms/token vs vLLM batch8 的 ~21 ms——中位 TPOT 差主要是引擎实现差距 + 单 D 承担全部 32 路 decode（mixed 每实例只有 ~8 路）。
-4. 复现注意：mixed 基线 vLLM 版本必须与 P 相同（0.24.0）且**同参**（fp8_ds_mla / block 64 / gpu-util 0.85），全新 venv 首启会做 ~40 min 的冷 JIT（DeepGEMM/inductor）+ CUDA graph 捕获。
+The combined target state is 53,940 bytes per token per rank. One pool block identifies the matching pages across both cache families, so a restore is atomic at the request-prefix boundary.
 
-### 长上下文质量探针：NIAH passkey 检索（已跑，风险降级）
+There are two uses of the same mechanism:
 
-自建 needle-in-a-haystack（passkey 6 位数字，4k/8k/16k × 深度 10%/50%/90% × 4 样本，greedy）——这是对 indexer 风险最尖锐的探针：>2048 时 DSA top-k=2048 真正做选择（16k 时只选 12.5% 的 token），indexer 打分错位会直接漏掉 needle。
+1. **Host-tier offload:** OpenInfer saves sealed target blocks on release and restores them before local prefix matching. A measured 1,466-token warm restore reduced TTFT from 5,371 ms to 157.6 ms while preserving bytes.
+2. **Cross-engine P/D:** vLLM writes target pages under vLLM-compatible hashes and names; OpenInfer derives the same keys, restores the pages, applies the layout fixup, and begins decode.
 
-| Endpoint | 4k | 8k | 16k | 合计 |
-| --- | --- | --- | --- | --- |
-| P/D router | 12/12 | 12/12 | 12/12 | **36/36** |
-| vLLM 直连 | 12/12 | 12/12 | 12/12 | **36/36** |
+The cross-engine boundary has four invariants:
 
-- P/D 在 16k（256 块 ≈ 845 MB/请求的跨节点传输）下检索全对，与直连打平。
-- 顺带验证了大上下文传输路径（单请求 256 块 RDMA + host 池占用）无异常。
+1. namespace, hash seed, page size, and layer names match;
+2. page-first arena order and per-token byte layouts match;
+3. the partial prompt tail is saved under its derived tail key and restored into the request's private page;
+4. D never computes a prompt position locally in strict mode.
 
-### 残余风险：indexer RoPE 约定分歧（已降级，未完全关闭）
+The router returns P's first generated token to the client and appends that token to D's token-id prompt. This makes D's first forward a real decode step over the forwarded token. A miss or incomplete restore is rejected instead of silently falling back to local prefill.
 
-openinfer 的 indexer rope 按**旧版 transformers**（半劈 rotate_half）对齐；新版 transformers 与 vLLM 均为 interleave。上述 NIAH 36/36 说明该分歧在 16k 检索工况下无可见影响（可能 openinfer 权重装载时已做等价变换，或 needle 分数余量足够大）；但 NIAH 是粗探针——若未来长上下文 QA 类任务（longbench 风格）上 P/D 相对直连出现系统性劣化，第一嫌疑仍是这里，修法是把 openinfer indexer rope 切到 interleave 约定（连带 oracle 基线更新）。
+## Layout compatibility
 
-## 复跑
+The compatible target payload was checked at both source and byte level:
 
-复跑脚本保存在两台 8×H200 节点的内部工作目录中（P 侧：metaserver/pegaserver/vLLM/router；D 侧：OpenInfer + smoke，namespace 从 P 侧 vLLM 日志读取），私有路径不写入本文。D 严格模式下**禁止**直接绕过 router 发请求（键链按"最后一个 token 是 P 生成的"派生，直连请求必然 miss → 全量拒绝）。
+- MLA page rows contain 512 FP8 NoPE bytes, four FP32 scales, and 64 BF16 RoPE values per token;
+- index-K pages use the DeepGEMM block-split FP8-plus-scale layout;
+- both engines use 64-token pages;
+- OpenInfer registers the vLLM layer names and page-first order in compatibility mode.
+
+One required conversion remains at the boundary: vLLM stores the rotated MLA and indexer dimensions in interleaved order, while OpenInfer's decode kernels consume the block order used by its native cache. D deinterleaves newly restored pages on the rank stream before replay.
+
+The original vLLM 0.23.0 GLM path allocated indexer state for all 78 layers and produced 156 cache regions. vLLM 0.24.0 allocates index-K state only for the 21 full-indexer layers, matching OpenInfer's 99-arena contract. This is why the supported producer version is fixed rather than expressed as `>= 0.24.0`.
+
+## Readiness and failure semantics
+
+P's HTTP response can arrive before its asynchronous save is visible through the metaserver. D therefore performs bounded, throttled queries for the complete prefix. Partial hits remain parked; strict-mode timeout rejects the request and lets the router retry the complete P/D flow.
+
+Failure injection established these behaviors:
+
+- killing P produces a prompt upstream failure without D-side fallback or engine damage;
+- metaserver loss produces bounded request failure rather than a hang;
+- the miss breaker uses a short probe window while open, allowing a recovered async fetch to complete and close the breaker;
+- PegaFlow clients reconnect after a metaserver restart and new saves become discoverable.
+
+The unresolved recovery gap is catalog reconstruction. The metaserver keeps its directory in memory, and a restarted metaserver does not learn about blocks that data nodes already hold. Existing sessions therefore remain unavailable until P recomputes and republishes them, or until PegaFlow implements catalog re-publication after reconnect.
+
+## Correctness gates
+
+The merged path passed:
+
+- aligned and unaligned prompt transfer with token-for-token equality against the vLLM producer;
+- strict zero-prefill checks: every D admission had `suffix == 1`;
+- repeated and multi-turn requests using content-addressed delta reuse;
+- GSM8K 5-shot, 200-example comparison;
+- NIAH at 4k, 8k, and 16k contexts;
+- failure and recovery injection.
+
+### GSM8K
+
+| Endpoint | Strict exact match |
+| --- | ---: |
+| P/D router, run 1 | 0.960 ± 0.014 |
+| P/D router, run 2 | 0.970 ± 0.012 |
+| vLLM direct | 0.955 ± 0.015 |
+
+The two P/D runs differ on two examples because EP8 bucket composition is not batch-invariant at near-tied logits. Both remain within the measured baseline noise.
+
+### Long-context retrieval
+
+| Endpoint | 4k | 8k | 16k | Total |
+| --- | ---: | ---: | ---: | ---: |
+| P/D router | 12/12 | 12/12 | 12/12 | 36/36 |
+| vLLM direct | 12/12 | 12/12 | 12/12 | 36/36 |
+
+This exercises real sparse top-k selection above 2,048 tokens and large remote restores. It reduces, but does not close, the indexer-reference risk tracked by #541.
+
+## Equal-card serving A/B
+
+The acceptance workload used 16 GPUs on each side:
+
+- P/D: one 8-GPU vLLM TP8 prefill worker plus one 8-GPU OpenInfer EP8 decode worker;
+- mixed baseline: two independent 8-GPU vLLM TP8 workers with session affinity;
+- 32 chat sessions, five turns, first input 8,192 tokens, then +2,048 tokens per turn, 128 output tokens, greedy, concurrent clients split across two seeds.
+
+Both sides completed 160/160 requests. Every P/D admission remained at `suffix == 1`.
+
+### TTFT median, milliseconds
+
+| Turn | P/D, two clients | Mixed, two clients |
+| --- | ---: | ---: |
+| 1 | 11,621 / 11,647 | 4,130 / 4,233 |
+| 2 | 1,524 / 1,403 | 1,272 / 3,020 |
+| 3 | 1,057 / 1,103 | 1,668 / 1,841 |
+| 4 | 564 / 974 | 1,664 / 1,686 |
+| 5 | 1,030 / 679 | 1,683 / 1,706 |
+
+### TPOT median / p99, milliseconds
+
+| Turn | P/D, two clients | Mixed, two clients |
+| --- | ---: | ---: |
+| 1 | 23.3/26.4 · 23.7/33.6 | 42.8/67.3 · 53.4/88.9 |
+| 2 | 34.1/35.0 · 33.9/36.2 | 23.0/31.6 · 25.4/45.6 |
+| 3 | 35.2/36.6 · 34.7/35.6 | 21.0/31.4 · 22.3/65.3 |
+| 4 | 35.2/36.7 · 35.6/36.6 | 21.1/31.5 · 21.1/31.6 |
+| 5 | 35.4/38.1 · 34.6/38.0 | 21.0/31.5 · 21.0/31.7 |
+
+Mixed finished at 340 output tokens/s; P/D finished at 271 output tokens/s.
+
+The evidence supports a trade-off, not a universal win:
+
+- P/D isolates decode from prefill, keeping TPOT p99 close to its median and improving turn 3+ TTFT in this workload;
+- the 1P:1D split under-provisions prefill for the input-heavy first turn, so mixed wins first-turn TTFT and total throughput;
+- later-turn TPOT median remains lower on mixed, while its tail is more variable;
+- a deployment must choose the P:D ratio from its input/output mix and SLO rather than copying 1:1.
+
+## DSpark boundary
+
+OpenInfer #657 transfers only target MLA and index-K state. DSpark additionally owns five layers of BF16 draft K/V and consumes target auxiliary hidden states while constructing its context.
+
+vLLM's model-based P/D path runs the same cache-owning speculator on P and D and transfers the draft K/V pages with the target cache. For GLM5.2 that draft state is about 80 KiB/token, making target plus draft transfer about 2.52× the target-only payload. vLLM has generic EAGLE3/MTP acceptance gates, but no GLM5.2 DSpark P/D result.
+
+OpenInfer therefore keeps DSpark mutually exclusive with prefix caching, offload, and P/D. Issue #590 owns the first experiment: cold-start the drafter at the restored boundary, preserve absolute positions, and measure first-round and steady-state acceptance. Draft pages must never be fabricated or marked valid merely because target verification can reject bad proposals.
+
+## Remaining risks
+
+- **Indexer reference:** #541 must establish a reproducible long-context indexer oracle. NIAH is an end-to-end probe, not a replacement for that gate.
+- **Catalog recovery:** PegaFlow data nodes need to republish their existing block directory after metaserver restart.
+- **Version drift:** any vLLM cache-layout or hashing change requires rerunning the byte-layout and aligned/unaligned prompt gates before expanding the supported version range.
+- **Speculative state:** DSpark remains outside the P/D contract until #590 produces measured acceptance evidence or a draft-KV transfer protocol is gated.

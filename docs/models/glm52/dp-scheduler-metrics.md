@@ -20,7 +20,7 @@ The representation must match the real scheduling topology. EP8/DP8 must expose 
 
 - `docs/index.md`
 - `docs/subsystems/frontend/prometheus-metrics.md`
-- `docs/models/glm52/dp8-scheduler.md`
+- `docs/models/glm52/continuous-batching.md`
 - `docs/models/glm52/serving-status.md`
 - `docs/conventions/bench-regression.md`
 - `openinfer-engine/src/engine.rs`
