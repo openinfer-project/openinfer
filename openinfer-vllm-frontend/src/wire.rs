@@ -25,10 +25,11 @@ pub(crate) fn to_wire_position_logprobs(
         logprob: lp.logprob,
         rank: 1,
     });
+    // The msgpack ndarray is rectangular (vLLM's LogprobsTensors is
+    // [positions, max_num_logprobs + 1]), so every position must carry the
+    // full top-k even when the sampled token already appears in it — the
+    // duplicate collapses back out when clients build per-position dicts.
     for (index, (alt_id, alt_logprob)) in lp.top_logprobs.into_iter().enumerate() {
-        if alt_id == token_id {
-            continue;
-        }
         entries.push(WireTokenLogprob {
             token_id: alt_id,
             logprob: alt_logprob,
@@ -329,14 +330,47 @@ mod tests {
             MaybeWireLogprobs::Wire(_) => panic!("expected Direct logprobs"),
         };
         assert_eq!(direct.positions.len(), 1);
+        // Rectangular wire shape: the sampled token keeps its top-k slot too,
+        // so every position stays max_num_logprobs + 1 wide.
         let entries = &direct.positions[0].entries;
-        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].token_id, 7);
         assert_logprob_eq(entries[0].logprob, -0.5);
         assert_eq!(entries[0].rank, 1);
-        assert_eq!(entries[1].token_id, 42);
-        assert_logprob_eq(entries[1].logprob, -1.5);
-        assert_eq!(entries[1].rank, 2);
+        assert_eq!(entries[1].token_id, 7);
+        assert_logprob_eq(entries[1].logprob, -0.5);
+        assert_eq!(entries[1].rank, 1);
+        assert_eq!(entries[2].token_id, 42);
+        assert_logprob_eq(entries[2].logprob, -1.5);
+        assert_eq!(entries[2].rank, 2);
+    }
+
+    #[test]
+    fn to_wire_logprobs_positions_have_uniform_width() {
+        // Regression test for the engine-core msgpack encode crash: a prompt
+        // logprobs batch whose sampled tokens fall inside the top-k for some
+        // positions and outside it for others must stay rectangular.
+        let sampled_in_topk = to_wire_position_logprobs(
+            7,
+            Some(TokenLogprob {
+                logprob: -0.5,
+                top_logprobs: vec![(7, -0.5), (42, -1.5)],
+            }),
+        )
+        .expect("position");
+        let sampled_outside_topk = to_wire_position_logprobs(
+            1,
+            Some(TokenLogprob {
+                logprob: -14.0,
+                top_logprobs: vec![(7, -0.5), (42, -1.5)],
+            }),
+        )
+        .expect("position");
+        assert_eq!(
+            sampled_in_topk.entries.len(),
+            sampled_outside_topk.entries.len()
+        );
+        assert_eq!(sampled_in_topk.entries.len(), 3);
     }
 
     #[test]

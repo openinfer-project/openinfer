@@ -505,7 +505,11 @@ fn prompt_tokens_become_prompt_logprobs_payload() {
         first[0].token_id, 8,
         "scored prompt token leads its position"
     );
-    assert_eq!(first.len(), 2, "chosen + one top alternative");
+    assert_eq!(
+        first.len(),
+        3,
+        "chosen + full top-k (rectangular wire width, sampled token keeps its slot)"
+    );
     let second = &direct.positions[1].entries;
     assert_eq!(second[0].token_id, 7);
     assert!(d.next_output().is_none());

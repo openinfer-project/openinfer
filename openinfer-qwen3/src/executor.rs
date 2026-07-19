@@ -4,6 +4,8 @@ use std::thread;
 
 use anyhow::{Context, Result, ensure};
 use crossbeam_channel as channel;
+use cudarc::driver::CudaSlice;
+use half::bf16;
 
 use crate::batch_decode::DecodeGraphUse;
 use crate::batch_decode_buffers::{BATCH_BUCKETS, BatchDecodeBuffers};
@@ -18,7 +20,7 @@ use openinfer_core::engine::{
 use openinfer_core::kv_pool::KvLayout;
 use openinfer_core::ops;
 use openinfer_core::sampler::SamplingParams;
-use openinfer_core::tensor::{DeviceContext, DeviceVec, HiddenStates};
+use openinfer_core::tensor::{DeviceContext, HiddenStates};
 use openinfer_kv_cache::{
     KvBlockGuard, KvBuffer, KvCacheEvent, KvCacheManager, KvView, LoadReservation, PrefixProbe,
     RegisteredBlock,
@@ -165,6 +167,260 @@ impl DecodeStepItem {
     }
 }
 
+/// Largest top-k the device logprobs path serves; FlashInfer FilteredTopK
+/// caps at 2048 (shared-memory index buffer). Larger requests take the host
+/// path per row.
+const LOGPROBS_DEVICE_TOPK_MAX: usize = 2048;
+
+/// One scored row of a batched logprobs call: logits arena row, the picked
+/// token, and the per-row top-k budget.
+struct LogprobsJob {
+    row: u32,
+    picked: u32,
+    top_k: usize,
+}
+
+/// Device buffers for the batched logprobs reduction (#719), grown on demand
+/// and reused across steps so the decode hot path stays allocation-free.
+struct LogprobsScratch {
+    row_indices: CudaSlice<u32>,
+    picked: CudaSlice<u32>,
+    lse: CudaSlice<f32>,
+    picked_lp: CudaSlice<f32>,
+    /// [max_rows x vocab] gathered block feeding FilteredTopK (k > 0 only).
+    gathered: CudaSlice<bf16>,
+    topk_values: CudaSlice<bf16>,
+    topk_indices: CudaSlice<i32>,
+    max_rows: usize,
+    max_k: usize,
+}
+
+impl LogprobsScratch {
+    fn new(ctx: &DeviceContext) -> Result<Self> {
+        Ok(Self {
+            row_indices: ctx
+                .stream
+                .alloc_zeros(1)
+                .map_err(|e| anyhow::anyhow!("LogprobsScratch alloc failed: {e}"))?,
+            picked: ctx
+                .stream
+                .alloc_zeros(1)
+                .map_err(|e| anyhow::anyhow!("LogprobsScratch alloc failed: {e}"))?,
+            lse: ctx
+                .stream
+                .alloc_zeros(1)
+                .map_err(|e| anyhow::anyhow!("LogprobsScratch alloc failed: {e}"))?,
+            picked_lp: ctx
+                .stream
+                .alloc_zeros(1)
+                .map_err(|e| anyhow::anyhow!("LogprobsScratch alloc failed: {e}"))?,
+            gathered: ctx
+                .stream
+                .alloc_zeros(1)
+                .map_err(|e| anyhow::anyhow!("LogprobsScratch alloc failed: {e}"))?,
+            topk_values: ctx
+                .stream
+                .alloc_zeros(1)
+                .map_err(|e| anyhow::anyhow!("LogprobsScratch alloc failed: {e}"))?,
+            topk_indices: ctx
+                .stream
+                .alloc_zeros(1)
+                .map_err(|e| anyhow::anyhow!("LogprobsScratch alloc failed: {e}"))?,
+            max_rows: 0,
+            max_k: 0,
+        })
+    }
+
+    fn ensure_capacity(
+        &mut self,
+        ctx: &DeviceContext,
+        vocab: usize,
+        rows: usize,
+        k: usize,
+    ) -> Result<()> {
+        let rows = rows.max(1);
+        let grew_rows = rows > self.max_rows;
+        if grew_rows {
+            self.row_indices = ctx
+                .stream
+                .alloc_zeros(rows)
+                .map_err(|e| anyhow::anyhow!("LogprobsScratch grow failed: {e}"))?;
+            self.picked = ctx
+                .stream
+                .alloc_zeros(rows)
+                .map_err(|e| anyhow::anyhow!("LogprobsScratch grow failed: {e}"))?;
+            self.lse = ctx
+                .stream
+                .alloc_zeros(rows)
+                .map_err(|e| anyhow::anyhow!("LogprobsScratch grow failed: {e}"))?;
+            self.picked_lp = ctx
+                .stream
+                .alloc_zeros(rows)
+                .map_err(|e| anyhow::anyhow!("LogprobsScratch grow failed: {e}"))?;
+            self.gathered = ctx
+                .stream
+                .alloc_zeros(rows * vocab)
+                .map_err(|e| anyhow::anyhow!("LogprobsScratch grow failed: {e}"))?;
+            self.max_rows = rows;
+        }
+        let k = k.max(1);
+        if grew_rows || k > self.max_k {
+            self.max_k = self.max_k.max(k);
+            self.topk_values = ctx
+                .stream
+                .alloc_zeros(self.max_rows * self.max_k)
+                .map_err(|e| anyhow::anyhow!("LogprobsScratch grow failed: {e}"))?;
+            self.topk_indices = ctx
+                .stream
+                .alloc_zeros(self.max_rows * self.max_k)
+                .map_err(|e| anyhow::anyhow!("LogprobsScratch grow failed: {e}"))?;
+        }
+        Ok(())
+    }
+}
+
+/// Per-row host logprobs (full-vocab D2H + CPU passes) — the pre-#719 path,
+/// kept as the fallback for device-unsupported cases and as the golden
+/// reference in tests.
+fn logprobs_host_row(
+    ctx: &DeviceContext,
+    logits: &HiddenStates,
+    job: &LogprobsJob,
+) -> Result<Option<TokenLogprob>> {
+    let row = ops::extract_vec(ctx, logits, job.row as usize)?;
+    let row_f32 = row.to_host(ctx)?;
+    Ok(openinfer_sample::token_logprob_from_row(
+        &row_f32, job.picked, job.top_k,
+    ))
+}
+
+/// Batched device-side logprobs over `logits` rows (#719): one LSE pass for
+/// every job, one FilteredTopK over the gathered rows when any job wants
+/// alternatives, then a single D2H of O(rows * (k + 1)) and one stream sync —
+/// replacing the per-row full-vocab D2H + host passes. Per-row fallbacks to
+/// the host path cover top_k above the device cap and GPUs without the
+/// FilteredTopK shared-memory budget.
+fn extract_logprobs_batch(
+    ctx: &DeviceContext,
+    scratch: &mut LogprobsScratch,
+    logits: &HiddenStates,
+    jobs: &[LogprobsJob],
+) -> Result<Vec<Option<TokenLogprob>>> {
+    let n = jobs.len();
+    let mut results: Vec<Option<TokenLogprob>> = (0..n).map(|_| None).collect();
+    if n == 0 {
+        return Ok(results);
+    }
+    let vocab = logits.hidden_dim;
+
+    // Host path for jobs beyond the device top-k cap.
+    let mut device_jobs: Vec<usize> = Vec::with_capacity(n);
+    for (i, job) in jobs.iter().enumerate() {
+        if job.top_k > LOGPROBS_DEVICE_TOPK_MAX {
+            results[i] = logprobs_host_row(ctx, logits, job)?;
+        } else {
+            device_jobs.push(i);
+        }
+    }
+    if device_jobs.is_empty() {
+        return Ok(results);
+    }
+
+    let m = device_jobs.len();
+    let k_dev = device_jobs
+        .iter()
+        .map(|&i| jobs[i].top_k)
+        .max()
+        .unwrap_or(0)
+        .min(vocab);
+    scratch.ensure_capacity(ctx, vocab, m, k_dev)?;
+
+    let rows: Vec<u32> = device_jobs.iter().map(|&i| jobs[i].row).collect();
+    let picked: Vec<u32> = device_jobs.iter().map(|&i| jobs[i].picked).collect();
+    ctx.stream
+        .memcpy_htod(&rows, &mut scratch.row_indices)
+        .map_err(|e| anyhow::anyhow!("logprobs row indices H2D failed: {e}"))?;
+    ctx.stream
+        .memcpy_htod(&picked, &mut scratch.picked)
+        .map_err(|e| anyhow::anyhow!("logprobs picked H2D failed: {e}"))?;
+
+    openinfer_kernels::ops::logprobs_lse_bf16_into(
+        ctx,
+        logits,
+        Some(&scratch.row_indices),
+        &scratch.picked,
+        m,
+        &mut scratch.lse,
+        &mut scratch.picked_lp,
+    )?;
+
+    let mut topk_ok = false;
+    if k_dev > 0 {
+        openinfer_kernels::ops::logprobs_gather_rows_bf16_into(
+            ctx,
+            logits,
+            &scratch.row_indices,
+            m,
+            &mut scratch.gathered,
+        )?;
+        topk_ok = openinfer_kernels::ops::logprobs_topk_bf16_into(
+            ctx,
+            &scratch.gathered,
+            m,
+            vocab,
+            k_dev,
+            &mut scratch.topk_values,
+            &mut scratch.topk_indices,
+        )?;
+    }
+
+    let lse_host = ctx
+        .stream
+        .clone_dtoh(&scratch.lse)
+        .map_err(|e| anyhow::anyhow!("logprobs lse D2H failed: {e}"))?;
+    let picked_lp_host = ctx
+        .stream
+        .clone_dtoh(&scratch.picked_lp)
+        .map_err(|e| anyhow::anyhow!("logprobs picked D2H failed: {e}"))?;
+    let topk_host = if topk_ok {
+        Some((
+            ctx.stream
+                .clone_dtoh(&scratch.topk_values)
+                .map_err(|e| anyhow::anyhow!("logprobs top-k values D2H failed: {e}"))?,
+            ctx.stream
+                .clone_dtoh(&scratch.topk_indices)
+                .map_err(|e| anyhow::anyhow!("logprobs top-k indices D2H failed: {e}"))?,
+        ))
+    } else {
+        None
+    };
+    ctx.sync()?;
+
+    for (out_idx, &job_idx) in device_jobs.iter().enumerate() {
+        let job = &jobs[job_idx];
+        if job.top_k > 0 && !topk_ok {
+            // GPU cannot run FilteredTopK; keep this row on the host path.
+            results[job_idx] = logprobs_host_row(ctx, logits, job)?;
+            continue;
+        }
+        let lse = lse_host[out_idx];
+        let top_logprobs = match &topk_host {
+            Some((values, indices)) if job.top_k > 0 => {
+                let base = out_idx * k_dev;
+                (0..job.top_k.min(vocab))
+                    .map(|t| (indices[base + t] as u32, values[base + t].to_f32() - lse))
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+        results[job_idx] = Some(TokenLogprob {
+            logprob: picked_lp_host[out_idx],
+            top_logprobs,
+        });
+    }
+    Ok(results)
+}
+
 fn build_prefill_request_results(
     lane: &mut LocalQwen3Lane,
     requests: &[PrefillStepItem],
@@ -173,31 +429,67 @@ fn build_prefill_request_results(
     all_position_logits: Option<&HiddenStates>,
     compute_prompt_logprobs: bool,
 ) -> Result<Vec<PrefillRequestResult>> {
+    // Pass 1: collect device-batchable logprobs jobs (#719) — first-token
+    // rows from `logits`, prompt positions from `all_position_logits`.
+    let mut first_jobs = Vec::new();
+    let mut prompt_jobs = Vec::new();
     let mut token_offset = 0usize;
+    for (i, req) in requests.iter().enumerate() {
+        if req.is_final_chunk() && req.logprobs.is_some() {
+            first_jobs.push(LogprobsJob {
+                row: i as u32,
+                picked: tokens[i],
+                top_k: req.logprobs.unwrap_or(0),
+            });
+        }
+        if compute_prompt_logprobs && all_position_logits.is_some() {
+            if let Some(prompt_top_k) = req.prompt_logprobs {
+                for j in 1..req.prompt_tokens.len() {
+                    prompt_jobs.push(LogprobsJob {
+                        row: (token_offset + j - 1) as u32,
+                        picked: req.prompt_tokens[j],
+                        top_k: prompt_top_k,
+                    });
+                }
+            }
+        }
+        token_offset += req.chunk_tokens;
+    }
+    let mut first_lp = extract_logprobs_batch(
+        lane.model.device_ctx(),
+        &mut lane.logprobs_scratch,
+        logits,
+        &first_jobs,
+    )?
+    .into_iter();
+    let mut prompt_lp = match all_position_logits {
+        Some(all_logits) if !prompt_jobs.is_empty() => extract_logprobs_batch(
+            lane.model.device_ctx(),
+            &mut lane.logprobs_scratch,
+            all_logits,
+            &prompt_jobs,
+        )?
+        .into_iter(),
+        _ => Vec::new().into_iter(),
+    };
+
+    // Pass 2: assemble per-request outputs in the original wire shape.
     let mut outputs = Vec::with_capacity(requests.len());
     for (i, req) in requests.iter().enumerate() {
         let completed = req.is_final_chunk();
         let first_token = tokens[i];
         let first_token_logprob = if completed && req.logprobs.is_some() {
-            let logits_i = ops::extract_vec(lane.model.device_ctx(), logits, i)?;
-            Some(lane.extract_logprobs(&logits_i, first_token, req.logprobs.unwrap_or(0))?)
+            first_lp.next().flatten()
         } else {
             None
         };
-        let prompt_logprobs = if let Some(prompt_top_k) = req.prompt_logprobs {
+        let prompt_logprobs = if req.prompt_logprobs.is_some() {
             if compute_prompt_logprobs {
                 let mut echo_logprobs = Vec::with_capacity(req.prompt_tokens.len());
                 echo_logprobs.push(None);
-                if let Some(all_logits) = all_position_logits {
-                    for j in 1..req.prompt_tokens.len() {
-                        let prev_pos = token_offset + j - 1;
-                        let target_token = req.prompt_tokens[j];
-                        echo_logprobs.push(lane.extract_prompt_logprobs(
-                            all_logits,
-                            prev_pos,
-                            target_token,
-                            prompt_top_k,
-                        ));
+                if all_position_logits.is_some() {
+                    for _ in 1..req.prompt_tokens.len() {
+                        echo_logprobs.push(prompt_lp.next().flatten());
                     }
                 } else {
                     for _ in 1..req.prompt_tokens.len() {
@@ -211,7 +503,6 @@ fn build_prefill_request_results(
         } else {
             None
         };
-        token_offset += req.chunk_tokens;
         outputs.push(PrefillRequestResult {
             request_id: req.request_id,
             first_token,
@@ -232,12 +523,28 @@ fn build_decode_request_results(
     row_offset: usize,
     tokens: &[u32],
 ) -> Result<Vec<DecodeRequestResult>> {
+    let jobs: Vec<LogprobsJob> = requests
+        .iter()
+        .enumerate()
+        .filter(|(_, req)| req.logprobs.is_some())
+        .map(|(i, req)| LogprobsJob {
+            row: (row_offset + i) as u32,
+            picked: tokens[row_offset + i],
+            top_k: req.logprobs.unwrap_or(0),
+        })
+        .collect();
+    let mut lp = extract_logprobs_batch(
+        lane.model.device_ctx(),
+        &mut lane.logprobs_scratch,
+        logits,
+        &jobs,
+    )?
+    .into_iter();
     let mut outputs = Vec::with_capacity(requests.len());
     for (i, req) in requests.iter().enumerate() {
         let token = tokens[row_offset + i];
         let logprob = if req.logprobs.is_some() {
-            let logits_i = ops::extract_vec(lane.model.device_ctx(), logits, row_offset + i)?;
-            Some(lane.extract_logprobs(&logits_i, token, req.logprobs.unwrap_or(0))?)
+            lp.next().flatten()
         } else {
             None
         };
@@ -267,12 +574,28 @@ fn build_batch_decode_request_results(
         &mut lane.sample_scratch,
     )?;
 
+    let jobs: Vec<LogprobsJob> = requests
+        .iter()
+        .enumerate()
+        .filter(|(_, req)| req.logprobs.is_some())
+        .map(|(i, req)| LogprobsJob {
+            row: i as u32,
+            picked: tokens[i],
+            top_k: req.logprobs.unwrap_or(0),
+        })
+        .collect();
+    let mut lp = extract_logprobs_batch(
+        lane.model.device_ctx(),
+        &mut lane.logprobs_scratch,
+        &lane.bufs.logits,
+        &jobs,
+    )?
+    .into_iter();
     let mut outputs = Vec::with_capacity(requests.len());
     for (i, req) in requests.iter().enumerate() {
         let token = tokens[i];
         let logprob = if req.logprobs.is_some() {
-            let logits_i = ops::extract_vec(lane.model.device_ctx(), &lane.bufs.logits, i)?;
-            Some(lane.extract_logprobs(&logits_i, token, req.logprobs.unwrap_or(0))?)
+            lp.next().flatten()
         } else {
             None
         };
@@ -3046,6 +3369,9 @@ struct LocalQwen3Lane {
     kv_buffer: KvBuffer,
     layout: KvLayout,
     sample_scratch: openinfer_sample::SampleScratch,
+    /// Batched logprobs scratch (#719), grown on demand; keeps the decode
+    /// hot path allocation-free after the first logprobs step.
+    logprobs_scratch: LogprobsScratch,
     /// Request-local decode steps handed to `select_batch`, reused across
     /// steps to keep the sampling hot path allocation-free. All zeros until
     /// the scheduler wires generated counts through (sampling-parity 1b).
@@ -3119,12 +3445,14 @@ impl LocalQwen3Lane {
             model.config().vocab_size,
             max_bucket,
         )?;
+        let logprobs_scratch = LogprobsScratch::new(model.device_ctx())?;
         Ok(Self {
             model,
             kv_buffer,
             layout,
             bufs,
             sample_scratch,
+            logprobs_scratch,
             steps_buf: Vec::new(),
             max_prefill_tokens,
             inflight_prefill: None,
@@ -3305,32 +3633,6 @@ impl LocalQwen3Lane {
             sample_seed,
             &mut self.sample_scratch,
         )
-    }
-
-    fn extract_logprobs(
-        &self,
-        logits: &DeviceVec,
-        sampled_token: u32,
-        top_k: usize,
-    ) -> Result<TokenLogprob> {
-        let logits_f32 = logits.to_host(self.model.device_ctx())?;
-        openinfer_sample::token_logprob_from_row(&logits_f32, sampled_token, top_k)
-            .ok_or_else(|| anyhow::anyhow!("logprobs computation failed"))
-    }
-
-    fn extract_prompt_logprobs(
-        &self,
-        all_logits: &HiddenStates,
-        prev_pos: usize,
-        target_token: u32,
-        top_k: usize,
-    ) -> Option<TokenLogprob> {
-        openinfer_core::ops::extract_vec(self.model.device_ctx(), all_logits, prev_pos)
-            .ok()
-            .and_then(|logits_vec| {
-                let logits_f32 = logits_vec.to_host(self.model.device_ctx()).ok()?;
-                openinfer_sample::token_logprob_from_row(&logits_f32, target_token, top_k)
-            })
     }
 
     fn execute_prefill(
