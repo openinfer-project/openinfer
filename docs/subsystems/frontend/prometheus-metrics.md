@@ -24,6 +24,8 @@ Measured cost is noise in both covered configurations:
 - Spec-decode counters, per-GPU FLOPs/bytes estimates, KV-block residency histograms, cudagraph stats — the bridge sends `SchedulerStats::default()` for these fields.
 - Every model crate whose scheduler doesn't publish a `LoadSnapshot` watch (currently deepseek and kimi) gets path 1 only; its engine gauges are absent, not lying-zero — the bridge skips the stats task for that partition when no watch exists.
 
-## Next step
+## Validated coverage and next step
 
-Validate Qwen3.5 running, waiting, KV usage, and idle-zero behavior on a live GPU endpoint. If real pressure never retains Qwen3.5 requests in `deferred`, track any scheduler-policy change separately instead of changing the metrics integration. Then wire the remaining model schedulers using the same recipe, and report real prefix-cache query/hit counters instead of zeros. A future partitioned model must expose its logical scheduler partitions instead of averaging them behind engine 0.
+Qwen3.5 single-GPU live RTX 5090 validation confirmed that running and KV gauges rise during generation, waiting rises under batch-slot pressure, and all three return to zero after drain and recovery. The commands and metric samples are recorded in [Qwen3.5 Scheduler LoadSnapshot](../../models/qwen35/load-snapshot.md#validation-boundary). TP uses the same scheduler publication path but was not part of that live run.
+
+Next, wire the DeepSeek-V2-Lite and Kimi-K2 schedulers using the same recipe, and report real prefix-cache query/hit counters instead of zeros. A future partitioned model must expose its logical scheduler partitions instead of averaging them behind engine 0.

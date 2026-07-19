@@ -1,6 +1,6 @@
 # Qwen3.5 Scheduler LoadSnapshot
 
-> **TL;DR:** Issue #605 now keeps every Rust change in `openinfer-qwen35-4b/src/scheduler.rs`, reuses the existing HTTP benchmark for RTX 5090 proof, and carries no Qwen3.5-specific runner or test files.
+> **TL;DR:** Qwen3.5 publishes one logical `LoadSnapshot` stream from its shared single-GPU/TP scheduler: running counts active and prefilling requests, waiting counts deferred requests, and KV usage is request-page capacity minus available pages.
 >
 > **Last touched:** 2026-07
 
@@ -11,15 +11,14 @@
   - `docs/models/qwen35/model-crate.md` — confirmed that the model crate owns the scheduler and exposes it through the generic `EngineHandle`.
   - `docs/models/qwen35/roadmap.md` — confirmed the serving and lifecycle observability context.
   - `docs/subsystems/frontend/prometheus-metrics.md` — confirmed the existing `LoadSnapshot` bridge contract.
-  - `docs/conventions/coding-style.md` — confirmed that existing E2E coverage should be preferred over adding ceremonial tests.
-  - `openinfer-qwen35-4b/src/scheduler.rs` on this branch and `origin/main` — compared the metrics wiring with the shared single-GPU/TP scheduler flow.
+  - `openinfer-qwen35-4b/src/scheduler.rs` before and after the metrics change — compared the wiring with the shared single-GPU/TP scheduler flow.
 - **Relevant history**:
-  - Qwen3 already publishes `LoadSnapshot`, but its deferred-plus-continue idle transition predates metrics and is model scheduler behavior, not part of the shared observability recipe.
+  - Qwen3 established the `LoadSnapshot` watch path consumed by the frontend bridge.
   - Qwen3.5 shares one scheduler loop between single-GPU and TP backends, so KV accounting must come from `SchedulerBackend`, not directly from `Qwen35Model`.
 - **Plan**:
   1. Publish backend-neutral snapshots from existing Qwen3.5 scheduler boundaries.
-  2. Attach one load watch to the single-GPU and TP engine handles without adding scheduler transitions or iterations.
-  3. Use the existing Qwen3.5 scheduler E2E, generic HTTP benchmark, and raw `/metrics` sampling for validation; retain commands and results in this document and the PR body.
+  2. Attach one load watch to the single-GPU and TP engine handles.
+  3. Validate field accounting and idle reset with the existing scheduler E2E, HTTP benchmark, and raw `/metrics` sampling.
 
 ## Design
 
@@ -47,22 +46,21 @@ Snapshot accounting is:
 | `kv_used_blocks` | request KV capacity minus currently available request pages |
 | `kv_total_blocks` | backend request KV capacity, excluding the CUDA Graph padding page |
 
-Instrumentation only reads these states. It does not move newly received requests into `deferred`, force a request to appear as waiting, or alter admission, prefill, decode, and idle wake-up control flow.
+Publication reads the scheduler's existing queues and KV allocator at the settled boundary.
 
-The live gate uses the repository's existing `scripts/bench_http_serving.py` to create real overlapping HTTP traffic and a 100 ms `curl /metrics` sampler to retain the three labeled gauges. A Qwen3.5-specific runner is not required.
+The live gate uses `scripts/bench_http_serving.py` to create overlapping HTTP traffic and a 100 ms `curl /metrics` sampler to retain the three labeled gauges.
 
 ## Execution Log
 
 - Added load watches to `start_with_capacity` and `start_tp_with_capacity` and attached each receiver to its engine handle.
 - Added direct, backend-neutral `LoadSnapshot` publication at the top of the shared scheduler loop, following Qwen3's instrumentation shape.
-- Kept the original Qwen3.5 idle receive and same-iteration admission flow; removed the draft-only `deferred = pending; continue;` transition after maintainer review.
 - Derived KV capacity and availability through `SchedulerBackend`, so the same publication logic serves single-GPU and TP.
-- Used the existing scheduler E2E and generic HTTP benchmark for validation; no model-specific runner or new test file is part of the change.
+- Validated the single-GPU path with the existing scheduler E2E and live HTTP pressure: running and KV usage rose during generation, waiting reached three at `--max-batch 1`, and every gauge returned to zero after drain and recovery.
 - Updated the shared Prometheus documentation for Qwen3.5's one-logical-engine contract.
 
 ## Validation Boundary
 
-The NVIDIA evidence validates the current scheduler implementation at `6c9b7d2b8464a846414605fdbde9020887f18ee7`. It was captured on an RTX 5090 with driver `580.105.08`, CUDA toolkit `12.8.93`, Rust nightly `1.99.0`, Triton `3.6.0`, and model revision `851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a`. The raw artifacts record source revision `a033258c1de1944469d6c6335d4a36d4a80192cf`; between that revision and `6c9b7d2`, the scheduler change only inlined the same snapshot expression, leaving its publication point, state inputs, and control flow unchanged.
+The single-GPU NVIDIA run was captured at `a033258c1de1944469d6c6335d4a36d4a80192cf` on an RTX 5090 with driver `580.105.08`, CUDA toolkit `12.8.93`, Rust nightly `1.99.0`, Triton `3.6.0`, and model revision `851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a`. Commit `6c9b7d2b8464a846414605fdbde9020887f18ee7` was not rerun; its scheduler diff only inlines the snapshot construction and preserves its fields and publication point.
 
 Build and existing scheduler E2E:
 
@@ -153,20 +151,14 @@ vllm:num_requests_waiting{model_name="qwen35-metrics",engine="0"} 0
 vllm:kv_cache_usage_perc{model_name="qwen35-metrics",engine="0"} 0.0
 ```
 
-The server exited cleanly and the metric sampler reported no errors. Raw logs, benchmark JSON, hashes, and metric samples remain in the gitignored `docs/private/qwen35-load-metrics-evidence/` directory.
-
-If real pressure never retains requests in `deferred`, investigate the actual parked state and track any scheduler-policy change in a separate issue. Do not add a scheduler transition as a metrics workaround.
+The server exited cleanly and the metric sampler reported no errors.
 
 ## Debrief
 
-- **Outcome**: The metrics-only implementation exposes Qwen3.5 scheduler gauges for single-GPU and TP without changing scheduler behavior; the PR surface is reduced to one Rust implementation file plus documentation.
+- **Outcome**: Qwen3.5 now feeds one logical `LoadSnapshot` stream to the frontend for both single-GPU and TP. Single-GPU live validation confirms running, waiting, KV usage, idle reset, and recovery; TP uses the same scheduler path but was not part of this live run.
 - **Pitfalls encountered**:
   - The TP scheduler rebase required KV accounting through `SchedulerBackend`; retaining model-specific `model.kv_pool()` access would not compile against the shared loop.
-  - Copying Qwen3's deferred-plus-continue transition would mix scheduler policy into an observability PR.
 - **Lessons learned**:
-  - Reuse Qwen3's watch contract, not model-specific control flow.
-  - Observability should consume the scheduler backend contract when one loop serves multiple execution topologies.
-  - Existing repository E2E and HTTP tooling is sufficient for one-off GPU evidence; a model-specific runner would add more maintenance cost than coverage.
-- **Follow-ups**:
-  - Keep PR #692 focused on metrics and retain the NVIDIA commands and output in its description.
-  - Track any future Qwen3.5 scheduler-policy alignment separately from issue #605.
+  - A shared scheduler loop should expose observability through `SchedulerBackend` so one implementation covers both execution topologies.
+  - Top-of-loop publication captures settled state, including the idle zero after KV pages return.
+  - The existing HTTP benchmark plus raw metric sampling covers the live gauge contract.
