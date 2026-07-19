@@ -10,6 +10,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+dashmap = { workspace = true }
 dynamo-tokens = { workspace = true }
 
 anyhow = { workspace = true }

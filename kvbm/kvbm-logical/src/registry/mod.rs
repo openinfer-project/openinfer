@@ -5,7 +5,8 @@
 //!
 //! The [`BlockRegistry`] is the central coordination point for block deduplication in the
 //! KVBM system. It maps sequence hashes to registration handles using a
-//! [`dynamo_tokens::PositionalRadixTree`], enabling efficient prefix-based lookups.
+//! position-keyed two-level map ([`prt::PositionalRadixTree`]), enabling
+//! efficient prefix-based lookups.
 //!
 //! # Architecture
 //!
@@ -30,6 +31,7 @@
 
 mod attachments;
 mod handle;
+mod prt;
 mod registration;
 
 #[cfg(test)]
@@ -47,7 +49,7 @@ use std::sync::{Arc, Weak};
 
 use handle::BlockRegistrationHandleInner;
 
-pub(crate) type PositionalRadixTree<V> = dynamo_tokens::PositionalRadixTree<V, SequenceHash>;
+pub(crate) type PositionalRadixTree<V> = prt::PositionalRadixTree<V, SequenceHash>;
 
 /// Builder for [`BlockRegistry`].
 ///
@@ -229,8 +231,8 @@ impl BlockRegistry {
     // pattern should replace the direct EventsManager call here.
     #[inline]
     pub fn register_sequence_hash(&self, seq_hash: SequenceHash) -> BlockRegistrationHandle {
-        let map = self.prt.prefix(&seq_hash);
-        let mut weak = map.entry(seq_hash).or_default();
+        let mut map = self.prt.prefix(&seq_hash);
+        let weak = map.entry(seq_hash).or_default();
 
         if let Some(inner) = weak.upgrade() {
             return BlockRegistrationHandle::from_inner(inner);
@@ -254,8 +256,8 @@ impl BlockRegistry {
     /// Used when copying blocks between pools where we don't want to count the transfer as a new access.
     #[allow(dead_code)]
     pub(crate) fn transfer_registration(&self, seq_hash: SequenceHash) -> BlockRegistrationHandle {
-        let map = self.prt.prefix(&seq_hash);
-        let mut weak = map.entry(seq_hash).or_default();
+        let mut map = self.prt.prefix(&seq_hash);
+        let weak = map.entry(seq_hash).or_default();
 
         match weak.upgrade() {
             Some(inner) => BlockRegistrationHandle::from_inner(inner),
