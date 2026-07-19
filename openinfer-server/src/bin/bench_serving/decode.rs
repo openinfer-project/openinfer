@@ -286,8 +286,8 @@ fn measure_decode_stream(
             max_tokens,
             lora_adapter: None,
             token_tx,
-            logprobs: 0,
-            echo: false,
+            logprobs: None,
+            prompt_logprobs: None,
         })
         .map_err(|e| anyhow!("scheduler submit failed: {e}"))?;
 

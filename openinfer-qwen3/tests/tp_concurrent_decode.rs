@@ -126,8 +126,8 @@ fn tp2_graph_dump_when_available_and_concurrent_decode_complete() {
                     max_tokens: 24 + (i % 4) * 24,
                     lora_adapter: None,
                     token_tx,
-                    logprobs: 0,
-                    echo: false,
+                    logprobs: None,
+                    prompt_logprobs: None,
                 })
                 .expect("submit failed");
             rx

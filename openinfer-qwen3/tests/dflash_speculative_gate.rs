@@ -150,8 +150,8 @@ fn generate(
             max_tokens,
             lora_adapter: None,
             token_tx,
-            logprobs,
-            echo: false,
+            logprobs: (logprobs > 0).then_some(logprobs),
+            prompt_logprobs: None,
         })
         .expect("submit failed");
 
@@ -193,8 +193,8 @@ fn generate_concurrent(handle: &EngineHandle, requests: Vec<(Vec<u32>, usize)>) 
                     max_tokens,
                     lora_adapter: None,
                     token_tx,
-                    logprobs: 0,
-                    echo: false,
+                    logprobs: None,
+                    prompt_logprobs: None,
                 })
                 .expect("submit failed");
             rx
@@ -246,8 +246,8 @@ fn prefill_next(handle: &EngineHandle, context: Vec<u32>, logprobs: usize) -> St
             max_tokens: 1,
             lora_adapter: None,
             token_tx,
-            logprobs,
-            echo: true,
+            logprobs: Some(logprobs),
+            prompt_logprobs: Some(logprobs),
         })
         .expect("submit failed");
 
@@ -706,8 +706,8 @@ fn dflash_request_in_draft_headroom_is_rejected_not_panicked() {
             max_tokens,
             lora_adapter: None,
             token_tx,
-            logprobs: 0,
-            echo: false,
+            logprobs: None,
+            prompt_logprobs: None,
         })
         .expect("submit failed");
 

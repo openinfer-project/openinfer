@@ -49,8 +49,8 @@ fn pitem(id: RequestId, prompt: Vec<u32>) -> PrefillStepItem {
         prompt,
         MAX_OUTPUT_TOKENS,
         SamplingParams::default(),
-        LOGPROBS,
-        false,
+        Some(LOGPROBS),
+        None,
     )
 }
 
@@ -79,7 +79,12 @@ fn a_first_and_decode(ex: &mut Qwen3Executor, n_requests: usize) -> (u32, Vec<(u
         .iter()
         .zip(&pr.requests)
         .map(|((id, _), req)| {
-            DecodeStepItem::new(*id, req.first_token, SamplingParams::default(), LOGPROBS)
+            DecodeStepItem::new(
+                *id,
+                req.first_token,
+                SamplingParams::default(),
+                Some(LOGPROBS),
+            )
         })
         .collect();
     let dr = ex

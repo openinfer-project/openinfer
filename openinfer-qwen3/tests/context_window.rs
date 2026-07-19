@@ -61,8 +61,8 @@ fn generate_text(
             max_tokens,
             lora_adapter: None,
             token_tx,
-            logprobs: 0,
-            echo: false,
+            logprobs: None,
+            prompt_logprobs: None,
         })
         .expect("submit failed");
 
@@ -111,8 +111,8 @@ fn oversized_prompt_is_rejected_with_context_length_error() {
             max_tokens: 8,
             lora_adapter: None,
             token_tx,
-            logprobs: 0,
-            echo: false,
+            logprobs: None,
+            prompt_logprobs: None,
         })
         .expect("submit failed");
 

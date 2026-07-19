@@ -102,16 +102,32 @@ async fn run_simulated_request(req: GenerateRequest, config: SimulatedEngineConf
         return;
     }
 
-    if req.echo
-        && req
+    if let Some(top_k) = req.prompt_logprobs {
+        let logprobs = req
+            .prompt_tokens
+            .iter()
+            .enumerate()
+            .map(|(index, &id)| {
+                // The leading prompt token has no predecessor logits.
+                if index == 0 {
+                    return None;
+                }
+                Some(TokenLogprob {
+                    logprob: -0.5,
+                    top_logprobs: dummy_top_logprobs(id, top_k),
+                })
+            })
+            .collect();
+        if req
             .token_tx
             .send(TokenEvent::PromptTokens {
                 ids: req.prompt_tokens.clone(),
-                logprobs: vec![None; req.prompt_tokens.len()],
+                logprobs,
             })
             .is_err()
-    {
-        return;
+        {
+            return;
+        }
     }
 
     let script = &config.scripted_completion;
@@ -130,15 +146,15 @@ async fn run_simulated_request(req: GenerateRequest, config: SimulatedEngineConf
             tokio::time::sleep(config.tpot()).await;
         }
 
-        let logprob = (req.logprobs > 0).then_some(TokenLogprob {
-            logprob: 0.0,
-            top_logprobs: Vec::new(),
-        });
         let id = if script.is_empty() {
             fake_token_id(&req.prompt_tokens, index, config.fallback_token_id)
         } else {
             script[index]
         };
+        let logprob = req.logprobs.map(|top_k| TokenLogprob {
+            logprob: -0.25,
+            top_logprobs: dummy_top_logprobs(id, top_k),
+        });
         if req
             .token_tx
             .send(TokenEvent::Token { id, logprob })
@@ -166,6 +182,13 @@ fn fake_token_id(prompt_tokens: &[u32], index: usize, fallback_token_id: u32) ->
         return fallback_token_id;
     }
     prompt_tokens[index % prompt_tokens.len()]
+}
+
+/// `top_k` fabricated alternatives that never collide with the scored token.
+fn dummy_top_logprobs(scored_id: u32, top_k: usize) -> Vec<(u32, f32)> {
+    (0..top_k)
+        .map(|j| (scored_id.wrapping_add(j as u32 + 1), -1.0 - j as f32))
+        .collect()
 }
 
 fn duration_from_ms(ms: f64) -> Duration {
@@ -212,8 +235,8 @@ mod tests {
                 max_tokens: 8,
                 lora_adapter: None,
                 token_tx,
-                logprobs: 0,
-                echo: false,
+                logprobs: None,
+                prompt_logprobs: None,
             },
             config,
         )
@@ -257,8 +280,8 @@ mod tests {
                 max_tokens: 2,
                 lora_adapter: None,
                 token_tx,
-                logprobs: 0,
-                echo: false,
+                logprobs: None,
+                prompt_logprobs: None,
             },
             config,
         )
@@ -309,8 +332,8 @@ mod tests {
                 max_tokens: 3,
                 lora_adapter: None,
                 token_tx,
-                logprobs: 1,
-                echo: false,
+                logprobs: Some(1),
+                prompt_logprobs: None,
             },
             config,
         )

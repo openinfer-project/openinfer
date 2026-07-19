@@ -110,7 +110,7 @@ pub struct Qwen35TpExecutor {
 pub struct TpPrefillChunkItem {
     request_id: RequestId,
     prompt_tokens: Vec<u32>,
-    logprobs: usize,
+    logprobs: Option<usize>,
     sampling_params: SamplingParams,
     finish_prefill: bool,
 }
@@ -119,7 +119,7 @@ impl TpPrefillChunkItem {
     pub fn new(
         request_id: RequestId,
         prompt_tokens: Vec<u32>,
-        logprobs: usize,
+        logprobs: Option<usize>,
         finish_prefill: bool,
     ) -> Self {
         Self {
@@ -134,7 +134,7 @@ impl TpPrefillChunkItem {
     pub fn new_with_sampling(
         request_id: RequestId,
         prompt_tokens: Vec<u32>,
-        logprobs: usize,
+        logprobs: Option<usize>,
         sampling_params: SamplingParams,
         finish_prefill: bool,
     ) -> Self {
@@ -152,7 +152,7 @@ impl TpPrefillChunkItem {
 pub struct TpDecodeStepItem {
     request_id: RequestId,
     token_id: u32,
-    logprobs: usize,
+    logprobs: Option<usize>,
     sampling_params: SamplingParams,
 }
 
@@ -160,7 +160,7 @@ impl TpDecodeStepItem {
     pub fn new(
         request_id: RequestId,
         token_id: u32,
-        logprobs: usize,
+        logprobs: Option<usize>,
         sampling_params: SamplingParams,
     ) -> Self {
         Self {
@@ -1042,7 +1042,7 @@ impl TpWorkerState {
         )?;
         let first_token = tokens[0];
         let first_token_logprob = cpu_logits[0].as_ref().and_then(|row| {
-            openinfer_sample::token_logprob_from_row(row, first_token, chunk.logprobs)
+            openinfer_sample::token_logprob_from_row(row, first_token, chunk.logprobs.unwrap_or(0))
         });
         Ok(PrefillRequestResult {
             request_id: chunk.request_id,
@@ -1113,7 +1113,11 @@ impl TpWorkerState {
                 )?;
                 let token = tokens[0];
                 let logprob = cpu_logits[0].as_ref().and_then(|row| {
-                    openinfer_sample::token_logprob_from_row(row, token, request.logprobs)
+                    openinfer_sample::token_logprob_from_row(
+                        row,
+                        token,
+                        request.logprobs.unwrap_or(0),
+                    )
                 });
                 primary_results.push(DecodeRequestResult {
                     request_id: request.request_id,

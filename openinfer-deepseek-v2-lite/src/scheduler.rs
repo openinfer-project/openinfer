@@ -529,8 +529,8 @@ impl From<GenerateRequest> for PendingRequest {
             max_tokens: req.max_tokens,
             lora_adapter: req.lora_adapter,
             token_tx: req.token_tx,
-            logprobs: req.logprobs,
-            echo: req.echo,
+            logprobs: req.logprobs.unwrap_or(0),
+            echo: req.prompt_logprobs.is_some(),
         }
     }
 }
@@ -837,6 +837,14 @@ fn admission_decision(req: &PendingRequest, supported_context: usize) -> Admissi
     if req.logprobs > 0 {
         return AdmissionDecision::Reject(
             "DeepSeek-V2-Lite EP=2 mixed serving gate does not return logprobs yet".to_string(),
+        );
+    }
+    // Honor-or-reject: the echo stub would emit all-None prompt logprobs,
+    // which silently strips the requested data (#720).
+    if req.echo {
+        return AdmissionDecision::Reject(
+            "DeepSeek-V2-Lite EP=2 mixed serving gate does not return prompt logprobs yet"
+                .to_string(),
         );
     }
     if req.lora_adapter.is_some() {

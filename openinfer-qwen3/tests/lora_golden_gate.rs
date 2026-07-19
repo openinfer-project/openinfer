@@ -313,14 +313,14 @@ fn prefill_item(id: RequestId, prompt: Vec<u32>, lora: bool) -> PrefillStepItem 
         prompt,
         MAX_OUTPUT_TOKENS,
         SamplingParams::default(),
-        LOGPROBS,
-        false,
+        Some(LOGPROBS),
+        None,
     )
     .with_lora_adapter(lora.then(|| ADAPTER_NAME.to_string()))
 }
 
 fn decode_item(id: RequestId, fed: u32, lora: bool) -> DecodeStepItem {
-    DecodeStepItem::new(id, fed, SamplingParams::default(), LOGPROBS)
+    DecodeStepItem::new(id, fed, SamplingParams::default(), Some(LOGPROBS))
         .with_lora_adapter(lora.then(|| ADAPTER_NAME.to_string()))
 }
 

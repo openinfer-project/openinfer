@@ -452,6 +452,120 @@ fn rejected_request_is_reported_as_error() {
     );
 }
 
+/// `PromptTokens` becomes the prompt-logprobs wire payload: one position per
+/// *scored* prompt token (the leading prompt token is excluded — the frontend
+/// prepends its `None` itself), each position led by the actual prompt token
+/// at that offset. The payload rides the same coalesced output as the burst's
+/// tokens and lands exactly once.
+#[test]
+fn prompt_tokens_become_prompt_logprobs_payload() {
+    let mut d = Demux::new();
+    d.add("req-prompt");
+    d.emit(
+        "req-prompt",
+        TokenEvent::PromptTokens {
+            ids: vec![9, 8, 7],
+            logprobs: vec![
+                None,
+                Some(TokenLogprob {
+                    logprob: -0.3,
+                    top_logprobs: vec![(8, -0.3), (1, -2.0)],
+                }),
+                Some(TokenLogprob {
+                    logprob: -1.1,
+                    top_logprobs: vec![(7, -1.1), (2, -1.4)],
+                }),
+            ],
+        },
+    );
+    d.emit(
+        "req-prompt",
+        TokenEvent::Token {
+            id: 42,
+            logprob: None,
+        },
+    );
+    assert!(d.drain());
+
+    let batch = d.next_output().expect("coalesced output");
+    assert_eq!(batch.outputs.len(), 1);
+    let output = &batch.outputs[0];
+    assert_eq!(output.new_token_ids, vec![42]);
+    let direct = match output
+        .new_prompt_logprobs_tensors
+        .as_ref()
+        .expect("prompt logprobs payload")
+    {
+        MaybeWireLogprobs::Direct(direct) => direct,
+        MaybeWireLogprobs::Wire(_) => panic!("expected direct prompt logprobs"),
+    };
+    assert_eq!(direct.positions.len(), 2, "leading prompt token excluded");
+    let first = &direct.positions[0].entries;
+    assert_eq!(
+        first[0].token_id, 8,
+        "scored prompt token leads its position"
+    );
+    assert_eq!(first.len(), 2, "chosen + one top alternative");
+    let second = &direct.positions[1].entries;
+    assert_eq!(second[0].token_id, 7);
+    assert!(d.next_output().is_none());
+}
+
+/// A lone `PromptTokens` burst (no sampled token yet) still flushes the
+/// payload immediately instead of parking it — the frontend reads prompt
+/// logprobs off the request's first output.
+#[test]
+fn lone_prompt_tokens_flush_their_payload() {
+    let mut d = Demux::new();
+    d.add("req-lone");
+    d.emit(
+        "req-lone",
+        TokenEvent::PromptTokens {
+            ids: vec![5, 6],
+            logprobs: vec![
+                None,
+                Some(TokenLogprob {
+                    logprob: -0.7,
+                    top_logprobs: Vec::new(),
+                }),
+            ],
+        },
+    );
+    assert!(d.drain());
+
+    let batch = d.next_output().expect("payload-only output");
+    let output = &batch.outputs[0];
+    assert!(output.new_token_ids.is_empty());
+    assert!(output.new_prompt_logprobs_tensors.is_some());
+    assert!(output.finish_reason.is_none());
+}
+
+/// A single-token prompt scores no position: no payload is published (the
+/// frontend answers the one-token case from the request itself).
+#[test]
+fn single_token_prompt_publishes_no_payload() {
+    let mut d = Demux::new();
+    d.add("req-single");
+    d.emit(
+        "req-single",
+        TokenEvent::PromptTokens {
+            ids: vec![9],
+            logprobs: vec![None],
+        },
+    );
+    d.emit(
+        "req-single",
+        TokenEvent::Token {
+            id: 3,
+            logprob: None,
+        },
+    );
+    assert!(d.drain());
+
+    let batch = d.next_output().expect("token output");
+    assert!(batch.outputs[0].new_prompt_logprobs_tensors.is_none());
+}
+
 /// The scheduler-stats task turns each load-watch snapshot into a stats-only
 /// batch (no request outputs, no finished set) with the queue gauges and the
 /// fractional KV usage the frontend records into Prometheus, sends the current

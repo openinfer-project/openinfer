@@ -101,8 +101,8 @@ fn generate_tokens(
             max_tokens,
             lora_adapter,
             token_tx,
-            logprobs: 0,
-            echo: false,
+            logprobs: None,
+            prompt_logprobs: None,
         })
         .expect("submit failed");
 
