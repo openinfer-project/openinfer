@@ -23,6 +23,15 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  dco:
+    if: github.event_name == 'pull_request'
+    name: DCO sign-off
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check commit sign-offs
+        uses: KineticCafe/actions-dco@v3.1.0
+
   rust-format:
     name: Rust formatting
     runs-on: ubuntu-latest
