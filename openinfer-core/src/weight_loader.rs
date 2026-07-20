@@ -49,7 +49,7 @@ pub fn load_shard_info(model_path: &str) -> Result<(Vec<String>, HashMap<String,
     Ok((shard_files, weight_map))
 }
 
-/// Advisory parallel page-cache prefetch for a single-rank whole-model load;
+/// Advisory parallel page-cache prefetch for a whole-checkpoint load;
 /// the loader never depends on it. Dropping cancels and joins the workers, and
 /// failures are aggregated into one warning with the first cause retained.
 pub struct WeightPrefetch {

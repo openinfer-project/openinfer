@@ -19,6 +19,7 @@ use openinfer_core::kv_pool::KvLayout;
 use openinfer_core::ops;
 use openinfer_core::sampler::SamplingParams;
 use openinfer_core::tensor::{DeviceContext, HiddenStates};
+use openinfer_core::weight_loader::{WeightPrefetch, load_shard_info};
 use openinfer_kv_cache::{
     KvBlockGuard, KvBuffer, KvCacheEvent, KvCacheManager, KvView, LoadReservation, PrefixProbe,
     RegisteredBlock,
@@ -1355,6 +1356,10 @@ impl Qwen3Executor {
 
         let world_size = device_ordinals.len();
         let mut models = Vec::with_capacity(world_size);
+        // TP ranks load sequentially and suppress per-rank prefetch, so keep one
+        // whole-checkpoint prefetch alive across the loop.
+        let (shard_paths, _) = load_shard_info(model_path)?;
+        let prefetch = WeightPrefetch::spawn(&shard_paths);
         for (rank, &device_ordinal) in device_ordinals.iter().enumerate() {
             models.push(Qwen3Model::from_safetensors_with_runtime(
                 model_path,
@@ -1367,6 +1372,7 @@ impl Qwen3Executor {
                 },
             )?);
         }
+        drop(prefetch);
         // Profile each rank independently and use the minimum shared block
         // count. The logical scheduler uses one block budget for all ranks, but
         // free memory and worker-thread runtime allocations are per device.
