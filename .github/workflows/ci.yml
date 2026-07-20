@@ -32,6 +32,22 @@ jobs:
       - name: Check commit sign-offs
         uses: KineticCafe/actions-dco@v3.1.0
 
+  attribution-script:
+    name: Attribution script checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Lint attribution scripts
+        run: shellcheck .github/scripts/attribution-notice.sh .github/scripts/attribution-notice-test.sh
+
+      - name: Run attribution behavior tests
+        run: bash .github/scripts/attribution-notice-test.sh
+
   rust-format:
     name: Rust formatting
     runs-on: ubuntu-latest

@@ -1,0 +1,39 @@
+# SECURITY: pull_request_target grants a write-capable token on fork PRs.
+# The checkout below must never take a ref override — it stays on the
+# trusted base commit, and nothing here may execute PR code.
+
+name: Commit attribution
+
+on:
+  pull_request_target:
+    types:
+      - opened
+      - synchronize
+      - reopened
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  attribution-notice:
+    name: Commit attribution notice
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout base branch
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Scan commits and maintain the notice comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: bash .github/scripts/attribution-notice.sh
