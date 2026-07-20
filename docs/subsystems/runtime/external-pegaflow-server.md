@@ -1,6 +1,6 @@
 # External PegaFlow server for KV offload
 
-> **TL;DR:** KV offload now has one ownership boundary: OpenInfer is a CUDA-IPC/RPC client selected by `--kv-offload-server`, while the external PegaFlow server owns storage and acknowledges transfer/drain barriers before exported GPU memory can be reused. The rewritten PRs pass local compile/test gates; the recorded Qwen3 and GLM5.2 cross-process results predate the final scope and must be replayed on the final heads.
+> **TL;DR:** KV offload now has one ownership boundary: OpenInfer is a CUDA-IPC/RPC client selected by `--kv-offload-server`, while the external PegaFlow server owns storage. The minimal protocol/server PR passes local compile/test gates; the recorded Qwen3 and GLM5.2 cross-process results predate the final scope and must be replayed on the final heads.
 >
 > **Last touched:** 2026-07
 
@@ -63,21 +63,17 @@
 
 ### Step 4: failure and multi-tenant review
 
-- Scoped PegaFlow's asynchronous deeper-tier prefetch state by `(instance_id, req_id)`. A regression test keeps two equal request IDs in separate active entries and proves that polling one instance cannot consume the other's result.
 - Replaced process-ID instance suffixes with UUIDv4 and made native content namespaces explicit. Native Qwen3 and GLM5.2 launches now require `--kv-offload-namespace`, a stable checkpoint/deployment identity; vLLM compatibility continues to use the connector namespace.
 - Deadlines remain on health, query, release, and flush. Ownership RPCs do not carry a cancelable gRPC deadline because an accepted CUDA DMA cannot be canceled with its handler; a 30-second local watchdog or an indeterminate transport failure is fail-stop. Native load completion is returned by the Load RPC instead of a shared-memory poll.
-- Added an owned session guard and explicit client shutdown. Shutdown waits for accepted saves, sends `UnregisterContext`, and releases the session only after the server acknowledges both GPU queue drain and CUDA mapping close. Failure to obtain that ownership acknowledgement is fail-stop.
-- PegaFlow unregister keeps a closing instance addressable to concurrent cleanup calls, rejects new transfers, places barriers behind every accepted load/save on every registered device, and removes the instance only after the shared drain completes. The worker threads retain join handles for deterministic teardown.
-- Registration and cleanup are serialized per instance and by session generation. A canceled registry reply rolls back a newly published CUDA mapping; session cleanup still closes registry state when engine registration never completed.
+- Added an owned session guard and explicit client shutdown. Shutdown flushes accepted saves before `UnregisterContext`; native Load returns terminal completion, so callers retain responsibility for completing load handles before engine teardown.
 - Kept legacy-exportable allocation behind the offload option so an offload-disabled launch uses the original allocator.
-- Failure-path local gates pass: PegaFlow server 28/28, PegaFlow core 126/126 with one GPU-only test ignored, and OpenInfer KV-offload 9/9.
-- Re-ran the cross-process gates after the lifecycle fixes. The raw Qwen round trip remained byte-exact at 0.43 s versus 0.44 s before the fixes. The hot Qwen3 executor gate took 3.32 s; CPU-only and combined GPU/CPU restores kept mean head-logprob deltas at 0.0105 and 0.0272 nat.
-- Re-ran GLM5.2 with a 520-block rank-local HBM pool. After rank-pinned displacement, the original 66-token request restored one host block, returned `cached_tokens=64`, reproduced the same first two tokens, and completed in 0.0438 s versus 0.257 s cold. A graceful stop drained all eight rank instances, closed 99 CUDA mappings per rank, emptied the server instance list, and returned all eight GPUs to zero allocated memory after the PegaFlow process exited.
+- Final-scope local gates pass: PegaFlow server 23/23, PegaFlow core 124/124 with one GPU-only test ignored, and OpenInfer KV-offload 9/9.
+- A discarded lifecycle prototype also passed the raw Qwen, Qwen3 executor, and GLM5.2 cross-process gates. Those results are historical only; the final minimal heads still require replay.
 
 ### Step 5: upstream PR scope
 
 - Review found that the PegaFlow PR combined three concerns: native CUDA IPC registration, drain-before-unmap ownership, and an unrelated prefetch-key isolation fix.
-- The rewritten PegaFlow PR keeps native registration, synchronous native load and flush, and the required GPU-worker drain/unregister ordering together; the unrelated prefetch-key change is removed.
+- The rewritten PegaFlow PR contains only native registration plus synchronous native load and flush. GPU-worker lifecycle and the unrelated prefetch-key change are outside this PR.
 - Native registration carries `block_stride_bytes` inside each CUDA IPC view instead of adding a second positionally coupled request array. The existing Python-wrapper request shape remains unchanged.
 - The registration handshake has a distinct native-CUDA-IPC wire capability, so mixed old/new clients and servers fail before importing a CUDA mapping instead of silently falling back to a dense layout.
 
@@ -87,4 +83,4 @@ The embedded and external modes represented two owners for the same host-tier st
 
 The runtime gates caught environment assumptions that are worth keeping outside the product interface: a server build needs a full protobuf toolchain, GLM5.2 code generation needs the validated TileLang version, and a NIC-less EP8 development node must disable DeepEP GIN. None of these became OpenInfer offload flags.
 
-Independent failure-path review is READY. Merge the combined PegaFlow protocol/lifecycle PR before the dependent OpenInfer client PR. Replay the Qwen3 and GLM5.2 cross-process gates on those final heads before deployment.
+Independent failure-path review is READY. Merge the PegaFlow protocol/server PR before the dependent OpenInfer client PR. Replay the Qwen3 and GLM5.2 cross-process gates on those final heads before deployment.

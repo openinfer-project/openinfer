@@ -525,8 +525,8 @@ impl OffloadEngine {
         });
     }
 
-    /// Stop this client instance and wait for the server to drain its GPU
-    /// queues and close every imported CUDA mapping.
+    /// Flush submitted saves, then ask the server to close this instance's
+    /// imported CUDA mappings.
     pub fn shutdown(&mut self) {
         if self.session.is_none() {
             return;
@@ -545,9 +545,8 @@ impl OffloadEngine {
             );
             std::process::abort();
         }
-        // The explicit unregister owns cleanup. Once its response arrives the
-        // server has drained workers and closed the imported mappings; aborting
-        // the liveness stream only removes its now-empty session entry.
+        // The explicit unregister owns mapping cleanup. Aborting the liveness
+        // stream afterwards only removes its now-empty session entry.
         self.session.take();
     }
 }
