@@ -104,7 +104,13 @@ pub struct Qwen35Model {
     /// Shared paged KV pool for full-attention layers.
     pub(super) kv_pool: openinfer_core::kv_pool::KvPool,
     /// Decode-slot count the recurrent-state reserve was sized for.
+    /// Physical decode capacity actually allocated (recurrent-state slots,
+    /// decode buffers, CUDA-graph slots). Always a `BATCH_BUCKETS` value.
     pub(super) reserved_decode_slots: usize,
+    /// Scheduler concurrent-request cap requested at load (`--max-batch`). May
+    /// sit below `reserved_decode_slots` when the request is not a bucket
+    /// (e.g. `--max-batch 5` allocates bucket 8 but admits at most 5). See #470.
+    pub(super) decode_admission_batch: usize,
     pub(super) tp_comm: Option<Comm>,
 }
 
@@ -151,17 +157,15 @@ impl Qwen35Model {
 }
 
 impl Qwen35Model {
-    /// `max_batch` must be a decode bucket ({1,2,4,8,16,32,64}).
+    /// `max_batch` is the requested concurrent-request cap in `1..=MAX_BATCH`.
+    /// It need not be a decode bucket: the physical decode capacity is rounded
+    /// up to the next `BATCH_BUCKETS` value while the scheduler still admits at
+    /// most `max_batch` (see #470 and `decode_admission_batch`).
     pub fn from_safetensors(
         model_path: &str,
         device_ordinal: usize,
         max_batch: usize,
     ) -> Result<Self> {
-        anyhow::ensure!(
-            super::batch_decode_graph::BATCH_BUCKETS.contains(&max_batch),
-            "decode batch capacity must be one of {:?}, got {max_batch}",
-            super::batch_decode_graph::BATCH_BUCKETS,
-        );
         Self::from_safetensors_with_runtime_and_capacity(
             model_path,
             ModelRuntimeConfig {
@@ -188,6 +192,17 @@ impl Qwen35Model {
         runtime: ModelRuntimeConfig,
         max_batch: usize,
     ) -> Result<Self> {
+        anyhow::ensure!(
+            (1..=super::batch_decode_graph::MAX_BATCH).contains(&max_batch),
+            "decode batch capacity must be in 1..={}, got {max_batch}",
+            super::batch_decode_graph::MAX_BATCH,
+        );
+        // Requested scheduler admission cap; physical decode capacity is the
+        // next CUDA-graph bucket >= this (e.g. `--max-batch 5` allocates bucket
+        // 8 but admits at most 5, see #470). Everything below sizes to the
+        // physical bucket; only `decode_admission_batch` keeps the request.
+        let decode_admission_batch = max_batch;
+        let max_batch = super::batch_decode_graph::bucket_for(max_batch);
         info!("Loading Qwen3.5 model from: {}", model_path);
         debug!("Initializing GPU device {}", runtime.device_ordinal);
         let ctx = DeviceContext::new_with_device(runtime.device_ordinal)?;
@@ -532,6 +547,7 @@ impl Qwen35Model {
             sin_cache,
             kv_pool,
             reserved_decode_slots: max_batch,
+            decode_admission_batch,
             tp_comm: None,
         })
     }

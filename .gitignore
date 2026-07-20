@@ -1,6 +1,7 @@
 /target
 /traces
 /models
+/datasets/
 /.venv/
 __pycache__/
 *.py[cod]
