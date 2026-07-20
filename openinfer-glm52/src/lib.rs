@@ -1265,7 +1265,7 @@ fn connect_rank_hosts(
     model_path: &Path,
     moe_topo: Glm52MoeTopo,
     first_remote_rank: usize,
-) -> Result<Vec<Glm52RemoteRankWorker>> {
+) -> Result<Vec<remote::Glm52RemoteRankWorker>> {
     let spans = rank_host_spans(first_remote_rank, hosts);
     let results = std::thread::scope(|scope| {
         let handles = spans
