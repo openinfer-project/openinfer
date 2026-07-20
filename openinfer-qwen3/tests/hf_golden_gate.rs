@@ -371,13 +371,13 @@ fn prefill_item(id: RequestId, prompt: Vec<u32>) -> PrefillStepItem {
         prompt,
         MAX_OUTPUT_TOKENS,
         SamplingParams::default(),
-        LOGPROBS,
-        false,
+        Some(LOGPROBS),
+        None,
     )
 }
 
 fn decode_item(id: RequestId, fed: u32) -> DecodeStepItem {
-    DecodeStepItem::new(id, fed, SamplingParams::default(), LOGPROBS)
+    DecodeStepItem::new(id, fed, SamplingParams::default(), Some(LOGPROBS))
 }
 
 /// Teacher-force the golden sequences `seqs` through `ex` and fold every

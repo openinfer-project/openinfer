@@ -12,6 +12,7 @@ mod glm52;
 #[cfg(feature = "kimi-k2")]
 mod kimi_k2;
 mod linear;
+mod logprobs;
 mod lora;
 mod norm;
 mod sampling;
@@ -60,6 +61,9 @@ pub use linear::{
     gemm_per_token_into_checked, gemm_rows_into, gemm_rows_into_checked, gemm_strided_batched_bf16,
     gemm_token_range_into_checked, gemv, linear, numeric_policy, per_token_served, pin_served,
     reset_numeric_policy_counters, set_numeric_policy,
+};
+pub use logprobs::{
+    logprobs_gather_rows_bf16_into, logprobs_lse_bf16_into, logprobs_topk_bf16_into,
 };
 pub use lora::{
     LoraDecodeGroupedProjection, lora_decode_fused_delta_group3_into, lora_decode_fused_delta_into,

@@ -95,8 +95,8 @@ impl Harness {
                 max_tokens: output.0,
                 lora_adapter: None,
                 token_tx,
-                logprobs: output.1,
-                echo: false,
+                logprobs: (output.1 > 0).then_some(output.1),
+                prompt_logprobs: None,
             })
             .expect("submit failed");
         (tag, cutoff)

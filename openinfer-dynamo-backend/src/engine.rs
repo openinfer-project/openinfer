@@ -291,10 +291,11 @@ impl LLMEngine for OpeninferBackend {
             lora_adapter: None,
             token_tx: sink,
             // M1 does not surface per-token logprobs (the Dynamo `log_probs`
-            // slot stays None), so pin 0 rather than make openinfer pay the
-            // full-vocab O(V) logprob pass for a value we would then drop.
-            logprobs: 0,
-            echo: false,
+            // slot stays None), so leave logprobs disabled rather than make
+            // openinfer pay the full-vocab O(V) logprob pass for a value we
+            // would then drop.
+            logprobs: None,
+            prompt_logprobs: None,
         };
 
         if handle.submit(req).is_err() {

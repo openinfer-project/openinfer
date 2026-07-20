@@ -77,13 +77,18 @@ fn prefill_item(id: u64, prompt: &[u32]) -> PrefillStepItem {
         prompt.to_vec(),
         MAX_OUTPUT,
         SamplingParams::default(),
-        LOGPROBS,
-        false,
+        Some(LOGPROBS),
+        None,
     )
 }
 
 fn decode_item(id: u64, fed: u32) -> DecodeStepItem {
-    DecodeStepItem::new(RequestId::new(id), fed, SamplingParams::default(), LOGPROBS)
+    DecodeStepItem::new(
+        RequestId::new(id),
+        fed,
+        SamplingParams::default(),
+        Some(LOGPROBS),
+    )
 }
 
 fn top_logprobs(lp: Option<&TokenLogprob>) -> Vec<(u32, f32)> {

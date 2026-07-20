@@ -50,23 +50,24 @@ pub(super) fn build_next_plan(
     pending: Vec<PendingRequest>,
     speculative: bool,
 ) -> Option<ExecutionPlan> {
-    // echo+logprobs requests need all-position logits, which the unified forward
-    // does not compute (it passes all_position_logits=None). And under DFlash
-    // speculation, an eligible request must capture its target hidden context
-    // during prefill — the unified forward skips that capture, so a request
-    // prefilled via Unified would never become draft-ready and DFlash would
-    // silently no-op for it forever. Either way, route pending through a
+    // Prompt-logprobs requests need all-position logits, which the unified
+    // forward does not compute (it passes all_position_logits=None). And under
+    // DFlash speculation, an eligible request must capture its target hidden
+    // context during prefill — the unified forward skips that capture, so a
+    // request prefilled via Unified would never become draft-ready and DFlash
+    // would silently no-op for it forever. Either way, route pending through a
     // dedicated prefill step instead of degrading silently.
-    let needs_prompt_logprobs = pending.iter().any(|r| r.echo && r.logprobs > 0);
+    let needs_prompt_logprobs = pending.iter().any(PendingRequest::wants_prompt_logprobs);
     // Deliberately a loose superset of the real capture eligibility
-    // (`dflash_prefill_supported`, which also needs `cached_tokens == 0 && !echo`):
-    // over-routing an ineligible request to a dedicated prefill only costs one
-    // fusion, but under-routing a capture-eligible one into Unified would silently
-    // break its readiness. Never tighten this into the dangerous direction.
+    // (`dflash_prefill_supported`, which also needs `cached_tokens == 0 && no
+    // prompt logprobs`): over-routing an ineligible request to a dedicated
+    // prefill only costs one fusion, but under-routing a capture-eligible one
+    // into Unified would silently break its readiness. Never tighten this into
+    // the dangerous direction.
     let needs_dflash_capture = speculative
         && pending
             .iter()
-            .any(|r| r.lora_adapter.is_none() && r.logprobs == 0);
+            .any(|r| r.lora_adapter.is_none() && r.logprobs.is_none());
     if !pending.is_empty() && have_active && !needs_prompt_logprobs && !needs_dflash_capture {
         Some(ExecutionPlan::Unified { pending })
     } else if !pending.is_empty() {
@@ -89,7 +90,7 @@ pub(super) fn execute_plan(
             let scheduled_at_unix_s = openinfer_core::engine::unix_now_s();
             let indices: Vec<usize> = (0..pending.len()).collect();
             let requests = build_prefill_items(&pending, &indices);
-            let any_echo = pending.iter().any(|req| req.echo);
+            let any_echo = pending.iter().any(PendingRequest::wants_prompt_logprobs);
             let mut result = executor.execute_prefill(PrefillPlan {
                 requests: &requests,
                 echo: any_echo,
@@ -166,7 +167,7 @@ pub(super) fn should_speculative_decode(
         && active.iter().all(|req| {
             executor.speculative_request_ready(req.request_id)
                 && req.lora_adapter.is_none()
-                && req.logprobs == 0
+                && req.logprobs.is_none()
         })
 }
 
@@ -214,7 +215,7 @@ fn build_prefill_items(pending: &[PendingRequest], indices: &[usize]) -> Vec<Pre
                 max_output_tokens: r.max_tokens,
                 params: r.params,
                 logprobs: r.logprobs,
-                echo: r.echo,
+                prompt_logprobs: r.prompt_logprobs,
                 lora_adapter: r.lora_adapter.clone(),
                 cached_tokens: r.cached_tokens,
                 chunk_budget: r.step_chunk,
@@ -264,8 +265,8 @@ mod tests {
             params: SamplingParams::default(),
             max_tokens: 8,
             token_tx,
-            logprobs: 0,
-            echo: false,
+            logprobs: None,
+            prompt_logprobs: None,
             queued_at_unix_s: None,
             prefetch_offered: false,
             prefill_pos: 0,
@@ -285,7 +286,7 @@ mod tests {
             max_tokens,
             prompt_len: 10,
             params: SamplingParams::default(),
-            logprobs: 0,
+            logprobs: None,
         }
     }
 
@@ -335,27 +336,36 @@ mod tests {
             ),
             "active + pending fuses prefill and decode into one unified step"
         );
-        // echo+logprobs requests need all-position logits; route to Prefill
+        // Prompt-logprobs requests need all-position logits; route to Prefill
         // even when decodes are active so prompt logprobs are not silently lost.
         let mut echo_req = pending();
-        echo_req.echo = true;
-        echo_req.logprobs = 5;
+        echo_req.prompt_logprobs = Some(5);
         assert!(
             matches!(
                 build_next_plan(true, vec![echo_req], false),
                 Some(ExecutionPlan::Prefill { pending }) if pending.len() == 1
             ),
-            "active + pending echo+logprobs request routes to prefill not unified"
+            "active + pending prompt_logprobs request routes to prefill not unified"
         );
-        // echo without logprobs (no prompt logprobs needed) can still use unified.
-        let mut echo_no_lp = pending();
-        echo_no_lp.echo = true;
+        // prompt_logprobs=0 still needs every position's logits (the scored
+        // token's logprob is a full-row reduction), so it routes to Prefill too.
+        let mut echo_zero = pending();
+        echo_zero.prompt_logprobs = Some(0);
         assert!(
             matches!(
-                build_next_plan(true, vec![echo_no_lp], false),
+                build_next_plan(true, vec![echo_zero], false),
+                Some(ExecutionPlan::Prefill { pending }) if pending.len() == 1
+            ),
+            "active + pending prompt_logprobs=0 request routes to prefill not unified"
+        );
+        // No prompt logprobs requested → the unified fusion is fine.
+        let plain = pending();
+        assert!(
+            matches!(
+                build_next_plan(true, vec![plain], false),
                 Some(ExecutionPlan::Unified { pending }) if pending.len() == 1
             ),
-            "active + pending echo-only request (no logprobs) can use unified"
+            "active + pending plain request (no prompt logprobs) can use unified"
         );
         // Under DFlash speculation, an eligible pending must capture its
         // target context during prefill — the unified forward skips that capture,

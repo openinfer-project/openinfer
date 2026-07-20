@@ -25,10 +25,11 @@ pub(crate) fn to_wire_position_logprobs(
         logprob: lp.logprob,
         rank: 1,
     });
+    // The msgpack ndarray is rectangular (vLLM's LogprobsTensors is
+    // [positions, max_num_logprobs + 1]), so every position must carry the
+    // full top-k even when the sampled token already appears in it — the
+    // duplicate collapses back out when clients build per-position dicts.
     for (index, (alt_id, alt_logprob)) in lp.top_logprobs.into_iter().enumerate() {
-        if alt_id == token_id {
-            continue;
-        }
         entries.push(WireTokenLogprob {
             token_id: alt_id,
             logprob: alt_logprob,
@@ -107,14 +108,42 @@ pub(crate) fn unsupported_sampling(params: &EngineCoreSamplingParams) -> Option<
             params.repetition_penalty
         ));
     }
+    for (field, value) in [
+        ("logprobs", params.logprobs),
+        ("prompt_logprobs", params.prompt_logprobs),
+    ] {
+        match value {
+            // `-1` means the full vocabulary in the vLLM contract; fail loud
+            // instead of silently degrading it to "disabled".
+            Some(-1) => {
+                return Some(format!(
+                    "{field}=-1 (full-vocabulary logprobs) is not supported yet; \
+                     request a finite top-k count instead"
+                ));
+            }
+            Some(value) if value < -1 => {
+                return Some(format!("{field}={value} is invalid (must be >= -1)"));
+            }
+            _ => {}
+        }
+    }
     None
 }
 
-pub(crate) fn requested_logprobs(params: &EngineCoreSamplingParams) -> usize {
-    params
-        .logprobs
-        .and_then(|value| usize::try_from(value).ok())
-        .unwrap_or(0)
+/// Map the pinned contract's `Option<i32>` logprob counts onto the engine's
+/// `Option<usize>`: `None` stays disabled, `Some(0)` stays "scored token
+/// only", and `Some(k)` stays top-`k`. Negative values are rejected upstream
+/// by [`unsupported_sampling`], so they are unreachable here.
+fn logprob_count(value: Option<i32>) -> Option<usize> {
+    value.map(|value| usize::try_from(value).expect("negative logprobs rejected upstream"))
+}
+
+pub(crate) fn requested_logprobs(params: &EngineCoreSamplingParams) -> Option<usize> {
+    logprob_count(params.logprobs)
+}
+
+pub(crate) fn requested_prompt_logprobs(params: &EngineCoreSamplingParams) -> Option<usize> {
+    logprob_count(params.prompt_logprobs)
 }
 
 pub(crate) fn lora_adapter_from_sampling_params(
@@ -221,6 +250,49 @@ mod tests {
         params.presence_penalty = 0.0;
         params.repetition_penalty = 1.2;
         assert!(unsupported_sampling(&params).is_some());
+        params.repetition_penalty = 1.0;
+    }
+
+    #[test]
+    fn unsupported_sampling_rejects_full_vocabulary_and_invalid_logprobs() {
+        let mut params = EngineCoreSamplingParams::for_test();
+        assert_eq!(unsupported_sampling(&params), None);
+
+        params.logprobs = Some(-1);
+        let message = unsupported_sampling(&params).expect("-1 must be rejected");
+        assert!(message.contains("full-vocabulary"), "{message}");
+
+        params.logprobs = Some(-2);
+        let message = unsupported_sampling(&params).expect("<-1 must be rejected");
+        assert!(message.contains("invalid"), "{message}");
+
+        params.logprobs = Some(0);
+        assert_eq!(unsupported_sampling(&params), None);
+
+        params.prompt_logprobs = Some(-1);
+        let message = unsupported_sampling(&params).expect("prompt -1 must be rejected");
+        assert!(message.contains("prompt_logprobs"), "{message}");
+        params.prompt_logprobs = Some(3);
+        assert_eq!(unsupported_sampling(&params), None);
+    }
+
+    #[test]
+    fn requested_logprobs_preserves_the_option_contract() {
+        let mut params = EngineCoreSamplingParams::for_test();
+        assert_eq!(requested_logprobs(&params), None);
+        assert_eq!(requested_prompt_logprobs(&params), None);
+
+        // Some(0) requests the scored token's logprob with no top entries —
+        // distinct from the disabled value, not an alias for it.
+        params.logprobs = Some(0);
+        params.prompt_logprobs = Some(0);
+        assert_eq!(requested_logprobs(&params), Some(0));
+        assert_eq!(requested_prompt_logprobs(&params), Some(0));
+
+        params.logprobs = Some(5);
+        params.prompt_logprobs = Some(2);
+        assert_eq!(requested_logprobs(&params), Some(5));
+        assert_eq!(requested_prompt_logprobs(&params), Some(2));
     }
 
     #[test]
@@ -258,14 +330,47 @@ mod tests {
             MaybeWireLogprobs::Wire(_) => panic!("expected Direct logprobs"),
         };
         assert_eq!(direct.positions.len(), 1);
+        // Rectangular wire shape: the sampled token keeps its top-k slot too,
+        // so every position stays max_num_logprobs + 1 wide.
         let entries = &direct.positions[0].entries;
-        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].token_id, 7);
         assert_logprob_eq(entries[0].logprob, -0.5);
         assert_eq!(entries[0].rank, 1);
-        assert_eq!(entries[1].token_id, 42);
-        assert_logprob_eq(entries[1].logprob, -1.5);
-        assert_eq!(entries[1].rank, 2);
+        assert_eq!(entries[1].token_id, 7);
+        assert_logprob_eq(entries[1].logprob, -0.5);
+        assert_eq!(entries[1].rank, 1);
+        assert_eq!(entries[2].token_id, 42);
+        assert_logprob_eq(entries[2].logprob, -1.5);
+        assert_eq!(entries[2].rank, 2);
+    }
+
+    #[test]
+    fn to_wire_logprobs_positions_have_uniform_width() {
+        // Regression test for the engine-core msgpack encode crash: a prompt
+        // logprobs batch whose sampled tokens fall inside the top-k for some
+        // positions and outside it for others must stay rectangular.
+        let sampled_in_topk = to_wire_position_logprobs(
+            7,
+            Some(TokenLogprob {
+                logprob: -0.5,
+                top_logprobs: vec![(7, -0.5), (42, -1.5)],
+            }),
+        )
+        .expect("position");
+        let sampled_outside_topk = to_wire_position_logprobs(
+            1,
+            Some(TokenLogprob {
+                logprob: -14.0,
+                top_logprobs: vec![(7, -0.5), (42, -1.5)],
+            }),
+        )
+        .expect("position");
+        assert_eq!(
+            sampled_in_topk.entries.len(),
+            sampled_outside_topk.entries.len()
+        );
+        assert_eq!(sampled_in_topk.entries.len(), 3);
     }
 
     #[test]

@@ -743,3 +743,47 @@ unsafe extern "C" {
 unsafe extern "C" {
     pub fn openinfer_kernels_last_error() -> *const std::os::raw::c_char;
 }
+
+// #719: batched device-side logprobs reduction over bf16 logits rows.
+// Replaces per-row full-vocab D2H + host O(V) passes with O(rows * (k + 1))
+// D2H. Semantics match `openinfer_sample::token_logprob_from_row`:
+// fp32 log-sum-exp, top-k ordered (value desc, index asc) with
+// smallest-index tie-break selection.
+unsafe extern "C" {
+    /// Per-row log-sum-exp + picked-token logprob. `row_indices == nullptr`
+    /// scores rows `0..num_rows` contiguously.
+    pub fn logprobs_lse_bf16_cuda(
+        logits: *const Half,
+        row_indices: *const u32,
+        picked: *const u32,
+        num_rows: i32,
+        vocab_size: i32,
+        out_lse: *mut f32,
+        out_picked_lp: *mut f32,
+        stream: CUstream,
+    ) -> i32;
+
+    /// Gather `num_rows` logits rows by index into a contiguous
+    /// [num_rows, vocab_size] block for the FilteredTopK layout.
+    pub fn logprobs_gather_rows_bf16_cuda(
+        logits: *const Half,
+        row_indices: *const u32,
+        out: *mut Half,
+        num_rows: i32,
+        vocab_size: i32,
+        stream: CUstream,
+    ) -> i32;
+
+    /// Deterministic top-k over a contiguous [num_rows, vocab_size] bf16
+    /// block, output ordered (value desc, index asc). Returns
+    /// CUDA_ERROR_NOT_SUPPORTED when the GPU cannot run FilteredTopK.
+    pub fn logprobs_topk_bf16_cuda(
+        logits: *const Half,
+        num_rows: i32,
+        vocab_size: i32,
+        top_k: i32,
+        out_values: *mut Half,
+        out_indices: *mut i32,
+        stream: CUstream,
+    ) -> i32;
+}

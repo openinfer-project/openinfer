@@ -64,8 +64,8 @@ fn generate_text(
             max_tokens,
             lora_adapter: None,
             token_tx,
-            logprobs: 0,
-            echo: false,
+            logprobs: None,
+            prompt_logprobs: None,
         })
         .expect("submit failed");
 
@@ -132,8 +132,8 @@ fn scheduler_survives_consumer_drop() {
             max_tokens: 10,
             lora_adapter: None,
             token_tx,
-            logprobs: 0,
-            echo: false,
+            logprobs: None,
+            prompt_logprobs: None,
         })
         .expect("submit failed");
     std::thread::sleep(Duration::from_millis(500));

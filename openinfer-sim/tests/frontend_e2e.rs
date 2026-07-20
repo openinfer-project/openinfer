@@ -746,6 +746,227 @@ async fn simulated_frontend_metadata_contract_is_executable() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn echo_with_logprobs_returns_prompt_and_completion_logprobs() -> Result<()> {
+    let server = SimServer::spawn().await?;
+    let client = test_client()?;
+    // Non-streaming echo=true + logprobs asks the engine for prompt logprobs
+    // via the vLLM lowering (prompt_logprobs := logprobs). Previously the
+    // bridge dropped the request field and response assembly 500'd.
+    let mut body = completion_body(&server.model_name, false);
+    body["echo"] = json!(true);
+    body["logprobs"] = json!(2);
+    body["return_tokens_as_token_ids"] = json!(true);
+
+    let completion = post_completion_body(&client, &server.base_url, &body).await?;
+    let choice = &completion["choices"][0];
+    let logprobs = &choice["logprobs"];
+    let tokens = logprobs["tokens"]
+        .as_array()
+        .ok_or_else(|| anyhow!("echo logprobs missing tokens: {completion}"))?;
+    // 2 prompt tokens + 3 completion tokens in one concatenated payload.
+    assert_eq!(
+        tokens.len(),
+        5,
+        "prompt + completion positions: {completion}"
+    );
+    assert!(
+        logprobs["token_logprobs"][0].is_null(),
+        "leading prompt position has no predecessor logprob: {completion}"
+    );
+    assert!(logprobs["top_logprobs"][0].is_null());
+    for index in 1..5 {
+        assert!(
+            logprobs["token_logprobs"][index].is_number(),
+            "position {index} must carry the scored token's logprob: {completion}"
+        );
+        assert_eq!(
+            logprobs["top_logprobs"][index]
+                .as_object()
+                .map(serde_json::Map::len),
+            Some(3),
+            "position {index} must carry scored + top-2 entries: {completion}"
+        );
+    }
+    // echo lowers to prompt_logprobs, so the choice-level field is set too.
+    let prompt_logprobs = choice["prompt_logprobs"]
+        .as_array()
+        .ok_or_else(|| anyhow!("echo response missing prompt_logprobs: {completion}"))?;
+    assert_eq!(prompt_logprobs.len(), 2);
+    assert!(prompt_logprobs[0].is_null());
+    assert!(prompt_logprobs[1].is_object());
+
+    server.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_prompt_logprobs_returns_scored_prompt_positions() -> Result<()> {
+    let server = SimServer::spawn().await?;
+    let client = test_client()?;
+    // The previously-500 case: an explicit multi-token prompt_logprobs request
+    // must come back with one map per prompt position instead of an error.
+    let mut body = completion_body(&server.model_name, false);
+    body["prompt"] = json!([1, 2, 1]);
+    body["prompt_logprobs"] = json!(2);
+    body["return_tokens_as_token_ids"] = json!(true);
+
+    let completion = post_completion_body(&client, &server.base_url, &body).await?;
+    let choice = &completion["choices"][0];
+    let prompt_logprobs = choice["prompt_logprobs"]
+        .as_array()
+        .ok_or_else(|| anyhow!("missing prompt_logprobs: {completion}"))?;
+    assert_eq!(
+        prompt_logprobs.len(),
+        3,
+        "one entry per prompt token: {completion}"
+    );
+    assert!(
+        prompt_logprobs[0].is_null(),
+        "leading position: {completion}"
+    );
+    for (index, position) in prompt_logprobs.iter().enumerate().skip(1) {
+        let map = position
+            .as_object()
+            .ok_or_else(|| anyhow!("position {index} must be a map: {completion}"))?;
+        assert_eq!(
+            map.len(),
+            3,
+            "scored + top-2 at position {index}: {completion}"
+        );
+        let scored = format!("token_id:{}", [1, 2, 1][index]);
+        assert!(
+            map.contains_key(&scored),
+            "position {index} must contain its scored token {scored}: {completion}"
+        );
+    }
+    // Completion logprobs were not requested.
+    assert!(
+        choice.get("logprobs").is_none_or(Value::is_null),
+        "no completion logprobs without a logprobs request: {completion}"
+    );
+
+    server.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_zero_logprobs_returns_scored_token_only() -> Result<()> {
+    let server = SimServer::spawn().await?;
+    let client = test_client()?;
+    // logprobs=0 is a real request (scored token, no alternatives) — not the
+    // disabled value. Response assembly used to expect a logprob the engine
+    // never emitted.
+    let mut body = completion_body(&server.model_name, false);
+    body["logprobs"] = json!(0);
+    body["return_tokens_as_token_ids"] = json!(true);
+
+    let completion = post_completion_body(&client, &server.base_url, &body).await?;
+    let logprobs = &completion["choices"][0]["logprobs"];
+    let token_logprobs = logprobs["token_logprobs"]
+        .as_array()
+        .ok_or_else(|| anyhow!("logprobs=0 missing token_logprobs: {completion}"))?;
+    assert_eq!(
+        token_logprobs.len(),
+        3,
+        "one per completion token: {completion}"
+    );
+    let top_logprobs = logprobs["top_logprobs"].as_array().unwrap();
+    for (index, position) in top_logprobs.iter().enumerate() {
+        assert!(
+            token_logprobs[index].is_number(),
+            "position {index}: {completion}"
+        );
+        assert_eq!(
+            position.as_object().map(serde_json::Map::len),
+            Some(1),
+            "logprobs=0 yields exactly the scored entry at position {index}: {completion}"
+        );
+    }
+
+    server.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_zero_prompt_logprobs_returns_scored_token_only() -> Result<()> {
+    let server = SimServer::spawn().await?;
+    let client = test_client()?;
+    let mut body = completion_body(&server.model_name, false);
+    body["prompt_logprobs"] = json!(0);
+    body["return_tokens_as_token_ids"] = json!(true);
+
+    let completion = post_completion_body(&client, &server.base_url, &body).await?;
+    let prompt_logprobs = completion["choices"][0]["prompt_logprobs"]
+        .as_array()
+        .ok_or_else(|| anyhow!("prompt_logprobs=0 missing payload: {completion}"))?;
+    assert_eq!(prompt_logprobs.len(), 2);
+    assert!(prompt_logprobs[0].is_null());
+    assert_eq!(
+        prompt_logprobs[1].as_object().map(serde_json::Map::len),
+        Some(1),
+        "prompt_logprobs=0 yields exactly the scored entry: {completion}"
+    );
+
+    server.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn single_token_prompt_logprobs_answers_from_the_request() -> Result<()> {
+    let server = SimServer::spawn().await?;
+    let client = test_client()?;
+    let mut body = completion_body(&server.model_name, false);
+    body["prompt"] = json!([1]);
+    body["prompt_logprobs"] = json!(1);
+    body["return_tokens_as_token_ids"] = json!(true);
+
+    let completion = post_completion_body(&client, &server.base_url, &body).await?;
+    let prompt_logprobs = completion["choices"][0]["prompt_logprobs"]
+        .as_array()
+        .ok_or_else(|| anyhow!("single-token prompt_logprobs missing: {completion}"))?;
+    assert_eq!(prompt_logprobs.len(), 1);
+    assert!(prompt_logprobs[0].is_null());
+
+    server.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn full_vocabulary_logprobs_fails_before_gpu_work() -> Result<()> {
+    let server = SimServer::spawn().await?;
+    let client = test_client()?;
+    // The -1 full-vocabulary sentinel used to be silently degraded to
+    // "disabled"; now the bridge rejects the request at admission instead.
+    let mut body = completion_body(&server.model_name, false);
+    body["prompt_logprobs"] = json!(-1);
+
+    let response = client
+        .post(format!("{}/v1/completions", server.base_url))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body.to_string())
+        .send()
+        .await?;
+    let status = response.status();
+    let response_body = response.text().await?;
+    if status.is_success() {
+        bail!("prompt_logprobs=-1 unexpectedly succeeded: {response_body}");
+    }
+
+    // The endpoint stays healthy for well-formed requests afterwards.
+    assert_non_streaming_completion_has_output(&client, &server.base_url, &server.model_name)
+        .await?;
+    server.shutdown().await
+}
+
+async fn post_completion_body(client: &Client, base_url: &str, body: &Value) -> Result<Value> {
+    client
+        .post(format!("{base_url}/v1/completions"))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body.to_string())
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await
+        .context("failed to parse completion response")
+}
+
 async fn assert_models_endpoint(client: &Client, base_url: &str, model_name: &str) -> Result<()> {
     let models: Value = client
         .get(format!("{base_url}/v1/models"))
@@ -992,5 +1213,5 @@ const TINY_TOKENIZER_CONFIG_JSON: &str = r#"{
 const TINY_CONFIG_JSON: &str = r#"{
   "model_type": "openinfer_sim",
   "max_position_embeddings": 128,
-  "vocab_size": 3
+  "vocab_size": 16
 }"#;
