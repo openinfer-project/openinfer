@@ -78,8 +78,17 @@ pub struct GenerateRequest {
     /// one engine share a single tagged output channel behind this sink (see
     /// [`TokenSink`]); the frontend demuxes by tag.
     pub token_tx: TokenSink,
-    pub logprobs: usize,
-    pub echo: bool,
+    /// Completion logprobs, mirroring the pinned vLLM contract: `None`
+    /// disables them, `Some(0)` requests the sampled token's logprob with no
+    /// additional top entries, and `Some(k)` adds the top-`k` alternatives.
+    /// (`-1` full-vocabulary requests are rejected by the frontend before a
+    /// request ever reaches the engine.)
+    pub logprobs: Option<usize>,
+    /// Prompt logprobs, same `None`/`Some(0)`/`Some(k)` semantics as
+    /// `logprobs` but independent of it. `Some(_)` makes the scheduler emit
+    /// [`TokenEvent::PromptTokens`] with one entry per prompt position; the
+    /// leading position carries `None` because it has no predecessor logits.
+    pub prompt_logprobs: Option<usize>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

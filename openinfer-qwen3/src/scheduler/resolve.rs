@@ -128,7 +128,7 @@ fn resolve_prefill_outputs(
             continue;
         }
 
-        if req.echo {
+        if req.prompt_logprobs.is_some() {
             effects.prompt_echoes.push(PromptEchoEffect {
                 token_tx: req.token_tx.clone(),
                 ids: req.prompt_tokens.clone(),

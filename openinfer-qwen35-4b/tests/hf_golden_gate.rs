@@ -425,11 +425,11 @@ fn report_fixture_shape(golden: &Golden) {
 }
 
 fn prefill_item(id: RequestId, prompt: Vec<u32>) -> PrefillStepItem {
-    PrefillStepItem::new(id, prompt, LOGPROBS)
+    PrefillStepItem::new(id, prompt, Some(LOGPROBS))
 }
 
 fn decode_item(id: RequestId, fed: u32) -> DecodeStepItem {
-    DecodeStepItem::new(id, fed, LOGPROBS)
+    DecodeStepItem::new(id, fed, Some(LOGPROBS))
 }
 
 fn run(g: &Golden, ex: &mut Qwen35Executor, seqs: &[usize], batched: bool) -> (Stats, Vec<f32>) {

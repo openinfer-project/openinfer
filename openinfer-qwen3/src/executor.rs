@@ -61,8 +61,11 @@ pub struct PrefillStepItem {
     pub(crate) prompt_tokens: Vec<u32>,
     pub(crate) max_output_tokens: usize,
     pub(crate) params: SamplingParams,
-    pub(crate) logprobs: usize,
-    pub(crate) echo: bool,
+    /// Completion logprob top-k count (`None` = disabled, `Some(0)` = scored
+    /// token only).
+    pub(crate) logprobs: Option<usize>,
+    /// Prompt logprob top-k count; `Some(_)` needs all-position logits.
+    pub(crate) prompt_logprobs: Option<usize>,
     pub(crate) lora_adapter: Option<String>,
     /// Leading prompt tokens whose KV came from the prefix cache.
     /// Set by the executor after matching; the forward pass only computes
@@ -85,8 +88,8 @@ impl PrefillStepItem {
         prompt_tokens: Vec<u32>,
         max_output_tokens: usize,
         params: SamplingParams,
-        logprobs: usize,
-        echo: bool,
+        logprobs: Option<usize>,
+        prompt_logprobs: Option<usize>,
     ) -> Self {
         let chunk_tokens = prompt_tokens.len();
         Self {
@@ -95,7 +98,7 @@ impl PrefillStepItem {
             max_output_tokens,
             params,
             logprobs,
-            echo,
+            prompt_logprobs,
             lora_adapter: None,
             cached_tokens: 0,
             chunk_budget: usize::MAX,
@@ -135,7 +138,7 @@ pub struct DecodeStepItem {
     pub(crate) request_id: RequestId,
     pub(crate) token_id: u32,
     pub(crate) params: SamplingParams,
-    pub(crate) logprobs: usize,
+    pub(crate) logprobs: Option<usize>,
     pub(crate) lora_adapter: Option<String>,
 }
 
@@ -144,7 +147,7 @@ impl DecodeStepItem {
         request_id: RequestId,
         token_id: u32,
         params: SamplingParams,
-        logprobs: usize,
+        logprobs: Option<usize>,
     ) -> Self {
         Self {
             request_id,
@@ -175,13 +178,13 @@ fn build_prefill_request_results(
     for (i, req) in requests.iter().enumerate() {
         let completed = req.is_final_chunk();
         let first_token = tokens[i];
-        let first_token_logprob = if completed && req.logprobs > 0 {
+        let first_token_logprob = if completed && req.logprobs.is_some() {
             let logits_i = ops::extract_vec(lane.model.device_ctx(), logits, i)?;
-            Some(lane.extract_logprobs(&logits_i, first_token, req.logprobs)?)
+            Some(lane.extract_logprobs(&logits_i, first_token, req.logprobs.unwrap_or(0))?)
         } else {
             None
         };
-        let prompt_logprobs = if req.echo {
+        let prompt_logprobs = if let Some(prompt_top_k) = req.prompt_logprobs {
             if compute_prompt_logprobs {
                 let mut echo_logprobs = Vec::with_capacity(req.prompt_tokens.len());
                 echo_logprobs.push(None);
@@ -193,7 +196,7 @@ fn build_prefill_request_results(
                             all_logits,
                             prev_pos,
                             target_token,
-                            req.logprobs,
+                            prompt_top_k,
                         ));
                     }
                 } else {
@@ -232,9 +235,9 @@ fn build_decode_request_results(
     let mut outputs = Vec::with_capacity(requests.len());
     for (i, req) in requests.iter().enumerate() {
         let token = tokens[row_offset + i];
-        let logprob = if req.logprobs > 0 {
+        let logprob = if req.logprobs.is_some() {
             let logits_i = ops::extract_vec(lane.model.device_ctx(), logits, row_offset + i)?;
-            Some(lane.extract_logprobs(&logits_i, token, req.logprobs)?)
+            Some(lane.extract_logprobs(&logits_i, token, req.logprobs.unwrap_or(0))?)
         } else {
             None
         };
@@ -267,9 +270,9 @@ fn build_batch_decode_request_results(
     let mut outputs = Vec::with_capacity(requests.len());
     for (i, req) in requests.iter().enumerate() {
         let token = tokens[i];
-        let logprob = if req.logprobs > 0 {
+        let logprob = if req.logprobs.is_some() {
             let logits_i = ops::extract_vec(lane.model.device_ctx(), &lane.bufs.logits, i)?;
-            Some(lane.extract_logprobs(&logits_i, token, req.logprobs)?)
+            Some(lane.extract_logprobs(&logits_i, token, req.logprobs.unwrap_or(0))?)
         } else {
             None
         };
@@ -1752,9 +1755,10 @@ impl Qwen3Executor {
                 req.max_output_tokens,
                 req.lora_adapter.as_deref(),
             );
-            // Echo needs logits for every prompt position; cached positions
-            // are never forwarded, so echo requests prefill from scratch.
-            if self.prefix_cache_enabled && !req.echo {
+            // Prompt-logprobs requests need logits for every prompt position;
+            // cached positions are never forwarded, so they prefill from
+            // scratch.
+            if self.prefix_cache_enabled && req.prompt_logprobs.is_none() {
                 req.cached_tokens = rkv.match_and_add_prefix(self.kv_mgr.pool())?;
             }
             self.request_kvs.insert(req.request_id, rkv);
@@ -1769,9 +1773,10 @@ impl Qwen3Executor {
             .expect("inserted above");
         req.chunk_start = rkv.kv_position();
         let remaining = req.prompt_tokens.len() - req.chunk_start;
-        // Echo must produce all-position logits in a single forward, so it is
-        // exempt from chunking (the scheduler never splits echo requests).
-        req.chunk_tokens = if req.echo {
+        // Prompt-logprobs requests must produce all-position logits in a
+        // single forward, so they are exempt from chunking (the scheduler
+        // never splits them).
+        req.chunk_tokens = if req.prompt_logprobs.is_some() {
             remaining
         } else {
             remaining.min(req.chunk_budget)

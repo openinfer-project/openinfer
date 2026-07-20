@@ -15,8 +15,8 @@ fn send_rejection_reports_kv_lifetime_request_tokens() {
         max_tokens: 65,
         lora_adapter: None,
         token_tx,
-        logprobs: 0,
-        echo: false,
+        logprobs: None,
+        prompt_logprobs: None,
     };
 
     send_rejection(&req, RejectReason::KvBudget);
@@ -99,8 +99,8 @@ fn tp2_scheduler_chunked_prefill_then_decode_smoke() {
             max_tokens: 3,
             lora_adapter: None,
             token_tx,
-            logprobs: 1,
-            echo: false,
+            logprobs: Some(1),
+            prompt_logprobs: None,
         })
         .expect("submit TP scheduler request");
 
@@ -148,8 +148,8 @@ fn send_rejection_reports_context_window_limit() {
         max_tokens: 17,
         lora_adapter: None,
         token_tx,
-        logprobs: 0,
-        echo: false,
+        logprobs: None,
+        prompt_logprobs: None,
     };
 
     send_rejection(&req, RejectReason::ContextLength { limit: 32 });

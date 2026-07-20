@@ -59,8 +59,8 @@ fn validate_request(req: &GenerateRequest, max_model_len: usize) -> Result<(), S
             ));
         }
     }
-    if req.logprobs > 0 || req.echo {
-        return Err("GLM5.2 bring-up does not support logprobs/echo".to_owned());
+    if req.logprobs.is_some() || req.prompt_logprobs.is_some() {
+        return Err("GLM5.2 bring-up does not support completion/prompt logprobs".to_owned());
     }
     if req.lora_adapter.is_some() {
         return Err("GLM5.2 does not support LoRA adapters".to_owned());

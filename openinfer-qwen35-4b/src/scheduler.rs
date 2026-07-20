@@ -50,8 +50,9 @@ struct ActiveRequest35 {
     max_tokens: usize,
     prompt_len: usize,
     params: SamplingParams,
-    /// Number of top logprobs to return (0 = disabled).
-    logprobs: usize,
+    /// Completion logprob top-k count (`None` = disabled, `Some(0)` = scored
+    /// token only).
+    logprobs: Option<usize>,
 }
 
 /// A request whose prompt is being prefilled across multiple scheduler steps.
@@ -333,7 +334,7 @@ impl SingleGpuBackend {
             pending.len(),
             "Qwen3.5 prefill logits rows must preserve pending request order"
         );
-        let requested_logprobs: Vec<usize> = pending.iter().map(|r| r.logprobs).collect();
+        let requested_logprobs: Vec<Option<usize>> = pending.iter().map(|r| r.logprobs).collect();
         let cpu_logits =
             snapshot_requested_logprobs(self.model.device_ctx(), logits, &requested_logprobs)?;
         let params_refs: Vec<&SamplingParams> = pending.iter().map(|r| &r.params).collect();
@@ -353,7 +354,7 @@ impl SingleGpuBackend {
                     openinfer_sample::token_logprob_from_row(
                         &logits_f32,
                         tokens[i],
-                        pending[i].logprobs,
+                        pending[i].logprobs.unwrap_or(0),
                     )
                 })
             })
@@ -366,7 +367,7 @@ impl SingleGpuBackend {
         active: &[ActiveRequest35],
         rng: &mut StdRng,
     ) -> Result<(Vec<u32>, Vec<Option<TokenLogprob>>)> {
-        let requested_logprobs: Vec<usize> = active.iter().map(|r| r.logprobs).collect();
+        let requested_logprobs: Vec<Option<usize>> = active.iter().map(|r| r.logprobs).collect();
         let cpu_logits = snapshot_requested_logprobs(
             self.model.device_ctx(),
             &self.graph_state.buffers.logits,
@@ -388,7 +389,7 @@ impl SingleGpuBackend {
                     openinfer_sample::token_logprob_from_row(
                         &logits_f32,
                         tokens[i],
-                        active[i].logprobs,
+                        active[i].logprobs.unwrap_or(0),
                     )
                 })
             })
@@ -826,6 +827,23 @@ fn scheduler_loop(
 
         // 3. Admit new prompts. In-flight prefills reserve their promotion slot
         //    and future KV growth, so shrink the slot/page budgets accordingly
+        //
+        // Honor-or-reject: prompt logprobs need all-position logits, which the
+        // Qwen3.5 prefill path does not produce yet. Reject loudly at intake
+        // rather than returning empty prompt logprobs (same policy as Kimi-K2,
+        // #236).
+        pending.retain(|req| {
+            if req.prompt_logprobs.is_none() {
+                return true;
+            }
+            let _ = req.token_tx.send(TokenEvent::Rejected {
+                message: "prompt logprobs are not supported on the Qwen3.5 serving path yet"
+                    .to_string(),
+                prompt_tokens: req.prompt_tokens.len(),
+                completion_tokens: 0,
+            });
+            false
+        });
         let active_budget: Vec<ActiveKvBudget> = active
             .iter()
             .map(|req| ActiveKvBudget {
@@ -1426,14 +1444,6 @@ fn promote_or_requeue(
         let prompt_len = req.prompt_tokens.len();
         let first_token = tokens[i];
         let logprob = logprobs[i].clone();
-
-        if req.echo {
-            let echo_logprobs = vec![None; req.prompt_tokens.len()];
-            let _ = req.token_tx.send(TokenEvent::PromptTokens {
-                ids: req.prompt_tokens.clone(),
-                logprobs: echo_logprobs,
-            });
-        }
 
         if !req.params.ignore_eos && backend.is_stop_token(first_token) {
             debug!(

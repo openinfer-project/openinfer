@@ -131,8 +131,8 @@ pub(crate) fn run_scheduler_stream(
             max_tokens,
             lora_adapter: None,
             token_tx,
-            logprobs: 0,
-            echo: false,
+            logprobs: None,
+            prompt_logprobs: None,
         })
         .map_err(|e| anyhow::anyhow!("scheduler submit failed: {e}"))?;
 

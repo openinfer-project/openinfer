@@ -272,7 +272,7 @@ fn kv_budget_distinguishes_written_tokens_from_lifetime_blocks() {
         max_tokens: 17,
         prompt_len: 16,
         params: SamplingParams::default(),
-        logprobs: 0,
+        logprobs: None,
     };
     assert_eq!(current_active_tokens(&after_prefill), 16);
     assert_eq!(max_active_tokens(&after_prefill), 32);
@@ -288,7 +288,7 @@ fn kv_budget_distinguishes_written_tokens_from_lifetime_blocks() {
         max_tokens: 17,
         prompt_len: 16,
         params: SamplingParams::default(),
-        logprobs: 0,
+        logprobs: None,
     };
     assert_eq!(current_active_tokens(&after_one_decode), 17);
     assert_eq!(max_active_tokens(&after_one_decode), 32);
@@ -310,7 +310,7 @@ fn admission_splits_deferred_into_pending_deferred_and_rejected() {
         max_tokens: 18,     // lifetime tokens = 16 + 18 = 34 -> 3 blocks; future growth = 2
         prompt_len: 16,
         params: SamplingParams::default(),
-        logprobs: 0,
+        logprobs: None,
     }];
 
     let mk = |id: u64, prompt_len, max_tokens| {
@@ -405,7 +405,7 @@ fn admission_respects_decode_batch_capacity() {
             max_tokens: 2,
             prompt_len: 16,
             params: SamplingParams::default(),
-            logprobs: 0,
+            logprobs: None,
         });
     }
     let pending = PendingRequest::from_scheduler_request(RequestId(64), request(16, 1).0);
@@ -523,7 +523,7 @@ fn echo_requests_run_only_when_their_prompt_fits_the_prefill_bound() {
     let mk_echo = |id: u64, prompt_len| {
         let (req, _rx) = request(prompt_len, 1);
         let mut pending = PendingRequest::from_scheduler_request(RequestId(id), req);
-        pending.echo = true;
+        pending.prompt_logprobs = Some(2);
         pending
     };
     let mk = |id: u64, prompt_len| {
@@ -565,7 +565,7 @@ fn oversized_echo_request_is_rejected_at_admission() {
     let active: [ActiveRequestState; 0] = [];
     let mk_echo = |id: u64, prompt_len| {
         let (mut req, _rx) = request(prompt_len, 1);
-        req.echo = true;
+        req.prompt_logprobs = Some(2);
         PendingRequest::from_scheduler_request(RequestId(id), req)
     };
     let mk = |id: u64, prompt_len| {
@@ -757,8 +757,8 @@ fn pending(request_id: u64, echo: bool) -> PendingRequest {
         params: SamplingParams::default(),
         max_tokens: 1,
         token_tx,
-        logprobs: 0,
-        echo,
+        logprobs: None,
+        prompt_logprobs: echo.then_some(2),
         queued_at_unix_s: None,
         prefetch_offered: false,
         prefill_pos: 0,
@@ -804,8 +804,8 @@ fn request(
             max_tokens,
             lora_adapter: None,
             token_tx,
-            logprobs: 0,
-            echo: false,
+            logprobs: None,
+            prompt_logprobs: None,
         },
         token_rx,
     )
@@ -945,7 +945,7 @@ fn retiring_multiple_active_requests_tolerates_unsorted_indices() {
             max_tokens: 2,
             prompt_len: 16,
             params: SamplingParams::default(),
-            logprobs: 0,
+            logprobs: None,
         });
         executor
             .ensure_request_tokens(request_id, 16)
@@ -1097,7 +1097,7 @@ fn spec_active(
             ignore_eos,
             ..SamplingParams::default()
         },
-        logprobs: 0,
+        logprobs: None,
     }
 }
 

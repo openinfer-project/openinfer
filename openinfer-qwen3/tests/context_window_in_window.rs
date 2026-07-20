@@ -75,8 +75,8 @@ fn in_window_prompt_past_old_rope_table_is_served() {
             max_tokens: 1,
             lora_adapter: None,
             token_tx,
-            logprobs: 0,
-            echo: false,
+            logprobs: None,
+            prompt_logprobs: None,
         })
         .expect("submit failed");
 

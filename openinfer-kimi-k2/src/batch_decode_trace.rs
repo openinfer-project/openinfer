@@ -133,8 +133,8 @@ pub fn trace_runtime_decode_kernel_calls(
                 max_tokens: 2,
                 lora_adapter: None,
                 token_tx,
-                logprobs: 0,
-                echo: false,
+                logprobs: None,
+                prompt_logprobs: None,
             })?;
             receivers.push(std::thread::spawn(move || -> Result<()> {
                 while let Some((_, event)) = token_rx.blocking_recv() {

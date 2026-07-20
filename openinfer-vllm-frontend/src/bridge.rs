@@ -32,7 +32,7 @@ use openinfer_engine::engine::{
 
 use crate::wire::{
     convert_finish_reason, convert_sampling, lora_adapter_from_sampling_params, requested_logprobs,
-    to_wire_position_logprobs,
+    requested_prompt_logprobs, to_wire_position_logprobs,
 };
 
 pub(crate) struct LocalEngineBridge {
@@ -319,7 +319,7 @@ impl LocalEngineBridge {
                 output_tx,
                 request_id,
                 EngineCoreFinishReason::Error,
-                None,
+                Some(StopReason::Text(unsupported)),
                 None,
                 None,
             )?;
@@ -357,7 +357,7 @@ impl LocalEngineBridge {
                 lora_adapter,
                 token_tx,
                 logprobs: requested_logprobs(&sampling_params),
-                echo: false,
+                prompt_logprobs: requested_prompt_logprobs(&sampling_params),
             })
             .context("failed to submit request to scheduler")?;
 
@@ -474,6 +474,7 @@ fn reduce_request(
     let mut token_ids: Vec<u32> = Vec::new();
     let mut positions: Vec<PositionLogprobs> = Vec::new();
     let mut has_logprobs = false;
+    let mut prompt_logprobs: Option<Logprobs> = None;
     let mut finish_reason: Option<EngineCoreFinishReason> = None;
     let mut stop_reason: Option<StopReason> = None;
     let mut terminated = false;
@@ -518,8 +519,31 @@ fn reduce_request(
                     });
                 }
             }
-            TokenEvent::PromptTokens { .. } => {
-                // Prompt logprobs are intentionally deferred for this bridge.
+            TokenEvent::PromptTokens { ids, logprobs } => {
+                // The wire payload carries one position per *scored* prompt
+                // token (every prompt token except the leading one, which has
+                // no predecessor logits); the frontend prepends the leading
+                // `None` itself. A single-token prompt scores nothing, so we
+                // publish no payload and let the frontend's one-token branch
+                // answer instead.
+                if ids.len() > 1 {
+                    let positions: Vec<PositionLogprobs> = ids
+                        .iter()
+                        .zip(logprobs.iter())
+                        .skip(1)
+                        .filter_map(|(&id, logprob)| {
+                            let position = to_wire_position_logprobs(id, logprob.clone());
+                            if position.is_none() {
+                                warn!(
+                                    "request {request_id}: missing prompt logprob for a \
+                                     scored position; dropping it"
+                                );
+                            }
+                            position
+                        })
+                        .collect();
+                    prompt_logprobs = Some(Logprobs { positions });
+                }
             }
             TokenEvent::Finished {
                 finish_reason: fr, ..
@@ -544,7 +568,7 @@ fn reduce_request(
         }
     }
 
-    if token_ids.is_empty() && !terminated {
+    if token_ids.is_empty() && prompt_logprobs.is_none() && !terminated {
         return (None, false);
     }
 
@@ -553,6 +577,7 @@ fn reduce_request(
         request_id.to_string(),
         token_ids,
         logprobs,
+        prompt_logprobs.map(MaybeWireLogprobs::Direct),
         finish_reason,
         stop_reason,
         state.first_token_events.take(),
@@ -633,6 +658,7 @@ fn send_terminal_output(
                 request_id.clone(),
                 Vec::new(),
                 None,
+                None,
                 Some(finish_reason),
                 stop_reason,
                 events,
@@ -688,6 +714,7 @@ fn engine_output(
     request_id: String,
     new_token_ids: Vec<u32>,
     new_logprobs: Option<MaybeWireLogprobs>,
+    new_prompt_logprobs_tensors: Option<MaybeWireLogprobs>,
     finish_reason: Option<EngineCoreFinishReason>,
     stop_reason: Option<StopReason>,
     events: Option<Vec<EngineCoreEvent>>,
@@ -697,7 +724,7 @@ fn engine_output(
         request_id,
         new_token_ids,
         new_logprobs,
-        new_prompt_logprobs_tensors: None,
+        new_prompt_logprobs_tensors,
         pooling_output: None,
         finish_reason,
         stop_reason,

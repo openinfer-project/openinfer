@@ -190,8 +190,8 @@ fn sample_wave(
                     max_tokens: POSITIONS,
                     lora_adapter: None,
                     token_tx,
-                    logprobs: 0,
-                    echo: false,
+                    logprobs: None,
+                    prompt_logprobs: None,
                 })
                 .expect("submit failed");
             rx

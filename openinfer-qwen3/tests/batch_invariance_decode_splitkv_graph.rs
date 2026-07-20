@@ -37,8 +37,8 @@ fn pitem(id: RequestId, prompt: Vec<u32>) -> PrefillStepItem {
         prompt,
         MAX_OUTPUT_TOKENS,
         SamplingParams::default(),
-        LOGPROBS,
-        false,
+        Some(LOGPROBS),
+        None,
     )
 }
 
@@ -77,8 +77,8 @@ fn a_decode_cobatched_with(
     let b_first = prefill_chunked(ex, id_b, b_prompt);
     // Decode A+B together (batch 2, A row 0); B's KV length sets the batch max_seq_len.
     let ditems = vec![
-        DecodeStepItem::new(id_a, a_first, SamplingParams::default(), LOGPROBS),
-        DecodeStepItem::new(id_b, b_first, SamplingParams::default(), LOGPROBS),
+        DecodeStepItem::new(id_a, a_first, SamplingParams::default(), Some(LOGPROBS)),
+        DecodeStepItem::new(id_b, b_first, SamplingParams::default(), Some(LOGPROBS)),
     ];
     let dr = ex
         .execute_decode(DecodePlan {
