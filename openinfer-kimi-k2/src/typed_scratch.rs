@@ -1,7 +1,7 @@
 //! Typed Kimi decode scratch buffers.
 
 use anyhow::{Result, ensure};
-use cudarc::driver::CudaSlice;
+use cudarc::driver::{CudaSlice, PinnedHostSlice};
 use openinfer_kernels::gpu_buffers;
 use openinfer_kernels::tensor::{DeviceContext, GpuTensor, HiddenStates};
 
@@ -146,6 +146,9 @@ pub(crate) struct SamplingScratch {
     pub(crate) top1_out: CudaSlice<i32>,
     pub(crate) top1_partial_values: CudaSlice<f32>,
     pub(crate) top1_partial_indices: CudaSlice<i32>,
+    /// Compact top-1 readback packets: 8 bytes/row {i32 id, bf16 value} (#716).
+    pub(crate) top1_packets: CudaSlice<u8>,
+    pub(crate) top1_packets_host: PinnedHostSlice<u8>,
     /// Buffers for non-greedy rows (f32 probs are batch x vocab, ~42 MB at
     /// batch 64) — allocated on the first sampling request so greedy-only
     /// serving pays nothing.
@@ -156,11 +159,14 @@ pub(crate) struct SamplingScratch {
 impl SamplingScratch {
     pub(crate) fn new(ctx: &DeviceContext, batch_size: usize) -> Result<Self> {
         let partials = argmax_batch_bf16_split_partials_len(batch_size, KIMI_K2_VOCAB);
+        let packet_bytes = batch_size * 8; // sizeof {i32 id, bf16 value} per row
         Ok(Self {
             top1_value_scratch: ctx.stream.alloc_zeros(batch_size)?,
             top1_out: ctx.stream.alloc_zeros(batch_size)?,
             top1_partial_values: ctx.stream.alloc_zeros(partials)?,
             top1_partial_indices: ctx.stream.alloc_zeros(partials)?,
+            top1_packets: ctx.stream.alloc_zeros(packet_bytes)?,
+            top1_packets_host: unsafe { ctx.ctx.alloc_pinned(packet_bytes)? },
             batch_sampling: None,
             batch_size,
         })
