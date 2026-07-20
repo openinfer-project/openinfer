@@ -91,6 +91,7 @@ impl ExternalClient {
             registration.device_id,
             registration.data_ptrs,
             registration.size_bytes,
+            registration.block_stride_bytes,
         )?;
         let tp_rank = as_u32(registration.tp_rank, "tp_rank")?;
         let pp_rank = as_u32(registration.pp_rank, "pp_rank")?;
@@ -148,11 +149,6 @@ impl ExternalClient {
             transfer_mode: TransferMode::Direct as i32,
             page_first: registration.page_first,
             cuda_ipc_tensors,
-            block_stride_bytes: registration
-                .block_stride_bytes
-                .iter()
-                .map(|&value| as_u64(value, "block_stride_bytes"))
-                .collect::<Result<_, _>>()?,
         };
         let mut client = self.client.clone();
         let response = match tokio::time::timeout(
@@ -394,12 +390,14 @@ fn export_cuda_ipc_tensors(
     device_id: i32,
     data_ptrs: &[u64],
     size_bytes: &[usize],
+    block_stride_bytes: &[usize],
 ) -> Result<Vec<CudaIpcTensor>, EngineError> {
-    if data_ptrs.len() != size_bytes.len() {
+    if data_ptrs.len() != size_bytes.len() || data_ptrs.len() != block_stride_bytes.len() {
         return Err(EngineError::InvalidArgument(format!(
-            "CUDA IPC export metadata length mismatch: pointers={}, sizes={}",
+            "CUDA IPC export metadata length mismatch: pointers={}, sizes={}, block strides={}",
             data_ptrs.len(),
-            size_bytes.len()
+            size_bytes.len(),
+            block_stride_bytes.len()
         )));
     }
     let device = usize::try_from(device_id).map_err(|_| {
@@ -416,7 +414,8 @@ fn export_cuda_ipc_tensors(
         .iter()
         .copied()
         .zip(size_bytes.iter().copied())
-        .map(|(data_ptr, view_size)| {
+        .zip(block_stride_bytes.iter().copied())
+        .map(|((data_ptr, view_size), block_stride)| {
             let mut allocation_base = 0;
             let mut allocation_size = 0;
             // SAFETY: every pointer comes from a live registered KV arena in
@@ -474,6 +473,7 @@ fn export_cuda_ipc_tensors(
                 handle,
                 offset_bytes: offset,
                 size_bytes: as_u64(view_size, "size_bytes")?,
+                block_stride_bytes: as_u64(block_stride, "block_stride_bytes")?,
             })
         })
         .collect()

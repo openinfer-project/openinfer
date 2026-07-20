@@ -1,6 +1,6 @@
 # External PegaFlow server for KV offload
 
-> **TL;DR:** KV offload now has one ownership boundary: OpenInfer is a CUDA-IPC/RPC client selected by `--kv-offload-server`, while the external PegaFlow server owns storage and acknowledges transfer/drain barriers before exported GPU memory can be reused; Qwen3 and GLM5.2 cross-process restore gates pass on 8×H200.
+> **TL;DR:** KV offload now has one ownership boundary: OpenInfer is a CUDA-IPC/RPC client selected by `--kv-offload-server`, while the external PegaFlow server owns storage and acknowledges transfer/drain barriers before exported GPU memory can be reused. The rewritten PR stack passes local compile/test gates; its recorded Qwen3 and GLM5.2 cross-process results predate the split and must be replayed on the final heads.
 >
 > **Last touched:** 2026-07
 
@@ -74,10 +74,17 @@
 - Re-ran the cross-process gates after the lifecycle fixes. The raw Qwen round trip remained byte-exact at 0.43 s versus 0.44 s before the fixes. The hot Qwen3 executor gate took 3.32 s; CPU-only and combined GPU/CPU restores kept mean head-logprob deltas at 0.0105 and 0.0272 nat.
 - Re-ran GLM5.2 with a 520-block rank-local HBM pool. After rank-pinned displacement, the original 66-token request restored one host block, returned `cached_tokens=64`, reproduced the same first two tokens, and completed in 0.0438 s versus 0.257 s cold. A graceful stop drained all eight rank instances, closed 99 CUDA mappings per rank, emptied the server instance list, and returned all eight GPUs to zero allocated memory after the PegaFlow process exited.
 
+### Step 5: upstream PR scope reduction
+
+- Review found that the PegaFlow PR combined three concerns: native CUDA IPC registration, drain-before-unmap ownership, and an unrelated prefetch-key isolation fix.
+- The rewritten feature PR keeps native registration plus synchronous native load and flush, depends on a separate GPU-worker drain and unregister-ordering PR, and removes the prefetch-key change from this delivery chain.
+- Native registration carries `block_stride_bytes` inside each CUDA IPC view instead of adding a second positionally coupled request array. The existing Python-wrapper request shape remains unchanged.
+- The registration handshake has a distinct native-CUDA-IPC wire capability, so mixed old/new clients and servers fail before importing a CUDA mapping instead of silently falling back to a dense layout.
+
 ## Debrief
 
 The embedded and external modes represented two owners for the same host-tier state and doubled every lifecycle decision. Removing the embedded mode left a stable boundary: model crates describe GPU arenas, the client exports allocation-relative CUDA IPC views and preserves lease semantics, and PegaFlow owns storage resources and process-level cleanup.
 
 The runtime gates caught environment assumptions that are worth keeping outside the product interface: a server build needs a full protobuf toolchain, GLM5.2 code generation needs the validated TileLang version, and a NIC-less EP8 development node must disable DeepEP GIN. None of these became OpenInfer offload flags.
 
-Independent failure-path review is READY. Merge the PegaFlow protocol/server PR before the dependent OpenInfer client PR, then deploy matching revisions together.
+Independent failure-path review is READY. Merge the PegaFlow drain PR, then the protocol/server PR, then the dependent OpenInfer client PR. Replay the Qwen3 and GLM5.2 cross-process gates on those final heads before deployment.
