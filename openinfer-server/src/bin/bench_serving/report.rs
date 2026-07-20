@@ -286,6 +286,8 @@ pub(crate) struct InjectionRecord {
     pub(crate) warm: bool,
     pub(crate) prefill_ms: f64,
     pub(crate) arrival_offset_ms: f64,
+    pub(crate) generated_tokens: usize,
+    pub(crate) generated_token_trace: GeneratedTokenTrace,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -305,6 +307,8 @@ pub(crate) struct MixedLoadReport {
     pub(crate) gpu: String,
     pub(crate) run: RunInfo,
     pub(crate) config: MixedLoadConfig,
+    pub(crate) background_generated_tokens: CountStats,
+    pub(crate) background_generated_token_traces: Vec<GeneratedTokenTrace>,
     pub(crate) baseline_itl: Option<DurationStats>,
     pub(crate) mixed_itl: MixedLoadItl,
     pub(crate) injections: Vec<InjectionRecord>,

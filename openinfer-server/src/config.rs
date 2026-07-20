@@ -185,10 +185,16 @@ pub(crate) struct Args {
     #[arg(long)]
     pub max_prefill_tokens: Option<usize>,
 
-    /// Decode-batch capacity, one of 1/2/4/8/16/32/64; lower it to fit
-    /// reduced-memory GPUs. Qwen3.5 only; defaults to 64.
+    /// Decode-batch capacity, 1..=64. Qwen3.5 internally rounds allocation to
+    /// the next graph bucket but admits only this many scheduler slots; defaults
+    /// to 64.
     #[arg(long)]
     pub max_batch: Option<usize>,
+
+    /// Qwen3.5 prefill/decode scheduler policy. Defaults to `off`; `auto` is
+    /// opt-in and currently single-GPU only.
+    #[arg(long, value_enum, default_value_t = CliQwen35SchedulerPolicy::Off)]
+    pub qwen35_scheduler_policy: CliQwen35SchedulerPolicy,
 
     /// Per-request context cap: prompt + max_tokens - 1 must fit. GLM5.2 only;
     /// when omitted, GLM5.2 sizes it from post-weight-load free VRAM.
@@ -302,6 +308,26 @@ impl CliDecodeOverlap {
     }
 }
 
+/// CLI selector for the Qwen3.5 adaptive scheduler policy.
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+pub(crate) enum CliQwen35SchedulerPolicy {
+    /// Fixed chunked-prefill behavior.
+    #[default]
+    Off,
+    /// Runtime-state adaptive policy.
+    Auto,
+}
+
+impl CliQwen35SchedulerPolicy {
+    #[cfg(feature = "qwen35-4b")]
+    pub(crate) fn resolve(self) -> openinfer_qwen35_4b::Qwen35SchedulerPolicy {
+        match self {
+            Self::Off => openinfer_qwen35_4b::Qwen35SchedulerPolicy::Off,
+            Self::Auto => openinfer_qwen35_4b::Qwen35SchedulerPolicy::Auto,
+        }
+    }
+}
+
 /// Flags accepted for every model line regardless of detected type.
 const CORE_ARGS: &[&str] = &["model_path", "served_model_name", "port"];
 
@@ -371,6 +397,7 @@ fn consumed_args(model_type: ModelType) -> &'static [&'static str] {
             "cuda_graph",
             "max_prefill_tokens",
             "max_batch",
+            "qwen35_scheduler_policy",
         ],
     }
 }
@@ -477,6 +504,24 @@ impl Args {
         }
         if !matches!(self.decode_overlap, CliDecodeOverlap::Off) && self.tp_size > 1 {
             bail!("--decode-overlap is single-GPU only; tp_size>1 has no prefill/decode overlap");
+        }
+        #[cfg(feature = "qwen35-4b")]
+        if matches!(model_type, ModelType::Qwen35) {
+            if let Some(max_batch) = self.max_batch {
+                if !(1..=openinfer_qwen35_4b::MAX_DECODE_BATCH).contains(&max_batch) {
+                    bail!(
+                        "--max-batch must be in 1..={} for Qwen3.5, got {max_batch}",
+                        openinfer_qwen35_4b::MAX_DECODE_BATCH
+                    );
+                }
+            }
+            if self.tp_size > 1
+                && matches!(self.qwen35_scheduler_policy, CliQwen35SchedulerPolicy::Auto)
+            {
+                bail!(
+                    "--qwen35-scheduler-policy=auto is single-GPU only; Qwen3.5 TP uses the fixed off policy"
+                );
+            }
         }
         #[cfg(feature = "glm52")]
         if matches!(model_type, ModelType::Glm52) {
@@ -685,6 +730,72 @@ mod tests {
             parse_with_provided(&["openinfer", "--tp-size", "2", "--cuda-graph=false"]);
         args.validate(ModelType::Qwen35, &provided)
             .expect("Qwen3.5 should accept --tp-size for eager TP startup");
+    }
+
+    #[cfg(feature = "qwen35-4b")]
+    #[test]
+    fn qwen35_defaults_scheduler_policy_off() {
+        let (args, provided) = parse_with_provided(&["openinfer"]);
+        args.validate(ModelType::Qwen35, &provided)
+            .expect("Qwen3.5 should accept default scheduler-policy off");
+        assert!(matches!(
+            args.qwen35_scheduler_policy,
+            CliQwen35SchedulerPolicy::Off
+        ));
+    }
+
+    #[cfg(feature = "qwen35-4b")]
+    #[test]
+    fn qwen35_accepts_scheduler_policy_off() {
+        let (args, provided) =
+            parse_with_provided(&["openinfer", "--qwen35-scheduler-policy", "off"]);
+        args.validate(ModelType::Qwen35, &provided)
+            .expect("Qwen3.5 should accept explicit scheduler-policy off");
+        assert!(matches!(
+            args.qwen35_scheduler_policy,
+            CliQwen35SchedulerPolicy::Off
+        ));
+    }
+
+    #[cfg(feature = "qwen35-4b")]
+    #[test]
+    fn qwen35_rejects_tp_auto_scheduler_policy() {
+        let (args, provided) = parse_with_provided(&[
+            "openinfer",
+            "--tp-size",
+            "2",
+            "--cuda-graph=false",
+            "--qwen35-scheduler-policy",
+            "auto",
+        ]);
+        let err = args
+            .validate(ModelType::Qwen35, &provided)
+            .expect_err("Qwen3.5 TP should reject auto scheduler-policy")
+            .to_string();
+        assert!(err.contains("single-GPU only"));
+    }
+
+    #[cfg(feature = "qwen35-4b")]
+    #[test]
+    fn qwen35_accepts_non_bucket_scheduler_max_batch() {
+        let (args, provided) = parse_with_provided(&["openinfer", "--max-batch", "5"]);
+        args.validate(ModelType::Qwen35, &provided)
+            .expect("Qwen3.5 should accept scheduler max_batch between decode buckets");
+        assert_eq!(args.max_batch, Some(5));
+    }
+
+    #[cfg(feature = "qwen35-4b")]
+    #[test]
+    fn qwen35_rejects_zero_scheduler_max_batch() {
+        let (args, provided) = parse_with_provided(&["openinfer", "--max-batch", "0"]);
+        let err = args
+            .validate(ModelType::Qwen35, &provided)
+            .expect_err("Qwen3.5 should reject zero scheduler max_batch")
+            .to_string();
+        assert!(
+            err.contains("--max-batch must be in 1..="),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

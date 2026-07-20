@@ -514,6 +514,17 @@ pub(crate) fn render_mixed_text(report: &MixedLoadReport) -> String {
         0.0
     };
     let _ = writeln!(out, "stall gaps: {stalled}/{total} ({stall_pct:.1}%)");
+    let _ = writeln!(
+        out,
+        "background generated tokens: min={} max={} avg={:.2} runs={}",
+        report.background_generated_tokens.min,
+        report.background_generated_tokens.max,
+        report.background_generated_tokens.avg,
+        report.background_generated_tokens.samples
+    );
+    if let Some(trace) = report.background_generated_token_traces.first() {
+        let _ = writeln!(out, "background hash0: {} len={}", trace.hash, trace.len);
+    }
 
     let dur = |ms: f64| Duration::from_secs_f64(ms / 1000.0);
     let prefill_line = |label: &str, ms: &[Duration]| {
@@ -544,6 +555,25 @@ pub(crate) fn render_mixed_text(report: &MixedLoadReport) -> String {
             .collect();
         out.push_str(&prefill_line("injected prefill (cold)", &cold));
         out.push_str(&prefill_line("injected prefill (warm)", &warm));
+        if let Some(first) = report.injections.first() {
+            let min_generated = report
+                .injections
+                .iter()
+                .map(|r| r.generated_tokens)
+                .min()
+                .unwrap_or(0);
+            let max_generated = report
+                .injections
+                .iter()
+                .map(|r| r.generated_tokens)
+                .max()
+                .unwrap_or(0);
+            let _ = writeln!(
+                out,
+                "injection generated tokens: min={min_generated} max={max_generated} hash0={} len={}",
+                first.generated_token_trace.hash, first.generated_token_trace.len
+            );
+        }
     }
 
     let d = &report.decision_inputs;

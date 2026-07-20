@@ -11,8 +11,6 @@ use openinfer::logging;
 use openinfer::server_engine::ModelType;
 use openinfer::server_engine::detect_model_type;
 use openinfer_core::engine::EngineHandle;
-#[cfg(feature = "qwen35-4b")]
-use openinfer_core::engine::EngineLoadOptions;
 #[cfg(feature = "qwen3")]
 use openinfer_qwen3::Qwen3LaunchOptions;
 #[cfg(feature = "qwen3")]
@@ -308,7 +306,7 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
             .context("failed to start Qwen3 engine")?
         }
         #[cfg(feature = "qwen35-4b")]
-        ModelType::Qwen35 => openinfer_qwen35_4b::launch_with_options(
+        ModelType::Qwen35 => openinfer_qwen35_4b::launch_with_options_and_policy(
             &args.model_path,
             openinfer_qwen35_4b::Qwen35LaunchOptions {
                 device_ordinal: args.device_ordinal,
@@ -316,11 +314,12 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
                 cuda_graph: args.cuda_graph,
                 max_batch: args
                     .max_batch
-                    .unwrap_or(openinfer_qwen35_4b::runtime::MAX_BATCH),
+                    .unwrap_or(openinfer_qwen35_4b::MAX_DECODE_BATCH),
                 max_prefill_tokens: args
                     .max_prefill_tokens
                     .unwrap_or(openinfer_qwen35_4b::DEFAULT_MAX_PREFILL_TOKENS),
             },
+            args.qwen35_scheduler_policy.resolve(),
         )
         .context("failed to start Qwen3.5 engine")?,
     };

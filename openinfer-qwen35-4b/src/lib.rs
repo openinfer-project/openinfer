@@ -33,6 +33,9 @@ use openinfer_core::engine::EngineLoadOptions;
 use openinfer_core::engine::EpBackend;
 pub use scheduler::DEFAULT_MAX_PREFILL_TOKENS;
 
+/// Maximum supported Qwen3.5 decode scheduler slots.
+pub const MAX_DECODE_BATCH: usize = batch_decode_graph::MAX_BATCH;
+
 /// Low-level Qwen3.5 execution interface.
 ///
 /// This is for model-local tests, debugging, and benchmarks. The root server
@@ -61,13 +64,29 @@ pub mod runtime_ops {
     pub use crate::ops::rms_norm_offset_into;
 }
 
+/// Scheduler policy for balancing Qwen3.5 prefill work against active decode.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Qwen35SchedulerPolicy {
+    /// Preserve the fixed chunked-prefill behavior.
+    #[default]
+    Off,
+    /// Adapt per scheduler tick based on active decode and prefill pressure.
+    Auto,
+}
+
 pub fn start_engine(
     model_path: &Path,
     options: EngineLoadOptions,
     max_batch: usize,
     max_prefill_tokens: usize,
 ) -> Result<EngineHandle> {
-    start_engine_with_capacity(model_path, options, max_batch, max_prefill_tokens)
+    start_engine_with_capacity_and_policy(
+        model_path,
+        options,
+        max_batch,
+        max_prefill_tokens,
+        Qwen35SchedulerPolicy::Off,
+    )
 }
 
 #[derive(Clone, Debug)]
@@ -117,8 +136,16 @@ pub fn launch_with_options(
     model_path: &Path,
     options: Qwen35LaunchOptions,
 ) -> Result<EngineHandle> {
+    launch_with_options_and_policy(model_path, options, Qwen35SchedulerPolicy::Off)
+}
+
+pub fn launch_with_options_and_policy(
+    model_path: &Path,
+    options: Qwen35LaunchOptions,
+    scheduler_policy: Qwen35SchedulerPolicy,
+) -> Result<EngineHandle> {
     let device_ordinals = options.device_ordinals()?;
-    start_engine_with_capacity(
+    start_engine_with_capacity_and_policy(
         model_path,
         EngineLoadOptions {
             enable_cuda_graph: options.cuda_graph,
@@ -129,6 +156,7 @@ pub fn launch_with_options(
         },
         options.max_batch,
         options.max_prefill_tokens,
+        scheduler_policy,
     )
 }
 
@@ -138,6 +166,26 @@ pub fn start_engine_with_capacity(
     max_batch: usize,
     max_prefill_tokens: usize,
 ) -> Result<EngineHandle> {
+    start_engine_with_capacity_and_policy(
+        model_path,
+        options,
+        max_batch,
+        max_prefill_tokens,
+        Qwen35SchedulerPolicy::Off,
+    )
+}
+
+pub fn start_engine_with_capacity_and_policy(
+    model_path: &Path,
+    options: EngineLoadOptions,
+    max_batch: usize,
+    max_prefill_tokens: usize,
+    scheduler_policy: Qwen35SchedulerPolicy,
+) -> Result<EngineHandle> {
+    anyhow::ensure!(
+        (1..=MAX_DECODE_BATCH).contains(&max_batch),
+        "Qwen3.5 max_batch must be in 1..={MAX_DECODE_BATCH}, got {max_batch}"
+    );
     let EngineLoadOptions {
         enable_cuda_graph,
         device_ordinals,
@@ -145,6 +193,11 @@ pub fn start_engine_with_capacity(
         ..
     } = options;
     if device_ordinals.len() > 1 {
+        if scheduler_policy == Qwen35SchedulerPolicy::Auto {
+            return Err(anyhow!(
+                "Qwen3.5 TP uses the fixed off scheduler policy; --qwen35-scheduler-policy=auto is single-GPU only"
+            ));
+        }
         if enable_cuda_graph {
             return Err(anyhow!(
                 "Qwen3.5 TP Phase 1 supports eager execution only; disable CUDA Graph"
@@ -180,12 +233,25 @@ pub fn start_engine_with_capacity(
         .to_str()
         .ok_or_else(|| anyhow!("model path must be valid UTF-8"))?;
     let model = weights::Qwen35Model::from_safetensors(model_path, device_ordinal, max_batch)?;
-    scheduler::start(model, seed, max_prefill_tokens)
+    scheduler::start_with_capacity_and_policy(
+        model,
+        seed,
+        max_batch,
+        max_prefill_tokens,
+        scheduler_policy,
+    )
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
+    use openinfer_core::engine::EngineLoadOptions;
+    use openinfer_core::engine::EpBackend;
+
     use super::Qwen35LaunchOptions;
+    use super::Qwen35SchedulerPolicy;
+    use super::start_engine_with_capacity_and_policy;
 
     #[test]
     fn launch_options_reject_zero_tp_size() {
@@ -199,5 +265,32 @@ mod tests {
 
         let err = options.device_ordinals().unwrap_err().to_string();
         assert!(err.contains("tp_size must be >= 1"));
+    }
+
+    #[test]
+    fn scheduler_policy_defaults_to_off() {
+        assert_eq!(Qwen35SchedulerPolicy::default(), Qwen35SchedulerPolicy::Off);
+    }
+
+    #[test]
+    fn tp_rejects_auto_scheduler_policy_before_loading_model() {
+        let err = start_engine_with_capacity_and_policy(
+            Path::new("unused-model-path"),
+            EngineLoadOptions {
+                enable_cuda_graph: false,
+                device_ordinals: vec![0, 1],
+                parallel_config: None,
+                ep_backend: EpBackend::Nccl,
+                seed: 42,
+            },
+            1,
+            1,
+            Qwen35SchedulerPolicy::Auto,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("scheduler policy"));
+        assert!(err.contains("single-GPU only"));
     }
 }

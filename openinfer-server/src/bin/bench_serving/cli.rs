@@ -82,6 +82,23 @@ impl From<CliEpBackend> for EpBackend {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, ValueEnum, PartialEq, Eq)]
+pub(crate) enum CliQwen35SchedulerPolicy {
+    #[default]
+    Off,
+    Auto,
+}
+
+impl CliQwen35SchedulerPolicy {
+    #[cfg(feature = "qwen35-4b")]
+    pub(crate) fn resolve(self) -> openinfer_qwen35_4b::Qwen35SchedulerPolicy {
+        match self {
+            Self::Off => openinfer_qwen35_4b::Qwen35SchedulerPolicy::Off,
+            Self::Auto => openinfer_qwen35_4b::Qwen35SchedulerPolicy::Auto,
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
     /// Measure one request shape end-to-end.
@@ -164,6 +181,10 @@ pub(crate) struct Cli {
     /// is a valid starvation / negative-control cell.
     #[arg(long, default_value_t = 4)]
     pub(crate) max_batch: usize,
+
+    /// Qwen3.5 scheduler policy for prefill/decode balancing.
+    #[arg(long, value_enum, default_value_t = CliQwen35SchedulerPolicy::Off)]
+    pub(crate) qwen35_scheduler_policy: CliQwen35SchedulerPolicy,
 
     #[command(subcommand)]
     pub(crate) command: Command,

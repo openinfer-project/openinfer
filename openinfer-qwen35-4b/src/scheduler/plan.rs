@@ -1,3 +1,5 @@
+use crate::Qwen35SchedulerPolicy;
+
 pub(super) enum ExecutionPlan<T> {
     Prefill { pending: Vec<T> },
     Decode,
@@ -16,6 +18,25 @@ pub(super) struct ActiveKvBudget {
     pub(super) generated_count: usize,
     pub(super) max_tokens: usize,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ActiveDecodeState {
+    pub(super) generated_count: usize,
+    pub(super) max_tokens: usize,
+}
+
+impl ActiveDecodeState {
+    fn remaining_tokens(self) -> usize {
+        self.max_tokens.saturating_sub(self.generated_count)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct PrefillQueueState {
+    pub(super) remaining_tokens: usize,
+}
+
+const DECODE_FINISH_WINDOW_TOKENS: usize = 4;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SlotCompaction {
@@ -39,6 +60,30 @@ pub(super) fn build_next_plan<T>(have_active: bool, pending: Vec<T>) -> Option<E
     } else {
         None
     }
+}
+
+pub(super) fn choose_prefill_budget(
+    policy: Qwen35SchedulerPolicy,
+    base_budget: usize,
+    active: &[ActiveDecodeState],
+    prefilling: &[PrefillQueueState],
+) -> usize {
+    assert!(
+        base_budget > 0,
+        "Qwen3.5 adaptive scheduler requires a positive base prefill budget"
+    );
+    if policy == Qwen35SchedulerPolicy::Off || active.is_empty() || prefilling.is_empty() {
+        return base_budget;
+    }
+
+    if active
+        .iter()
+        .any(|req| req.remaining_tokens() <= DECODE_FINISH_WINDOW_TOKENS)
+    {
+        return 0;
+    }
+
+    prefilling[0].remaining_tokens.min(base_budget)
 }
 
 pub(super) fn admit_pending_requests<T>(
@@ -253,6 +298,121 @@ mod tests {
                 Some(ExecutionPlan::Unified { pending }) if ids(&pending) == vec![1]
             ),
             "active + pending scheduler tick runs the unified path"
+        );
+    }
+
+    #[test]
+    fn adaptive_prefill_budget_preserves_off_policy() {
+        let active = [ActiveDecodeState {
+            generated_count: 16,
+            max_tokens: 256,
+        }];
+        let prefilling = [PrefillQueueState {
+            remaining_tokens: 4096,
+        }];
+
+        assert_eq!(
+            choose_prefill_budget(Qwen35SchedulerPolicy::Off, 1024, &active, &prefilling),
+            1024,
+            "off keeps the fixed chunk budget"
+        );
+    }
+
+    #[test]
+    fn adaptive_prefill_budget_never_exceeds_configured_cap() {
+        let active = [ActiveDecodeState {
+            generated_count: 16,
+            max_tokens: 4096,
+        }];
+        let prefilling = [PrefillQueueState {
+            remaining_tokens: 4096,
+        }];
+
+        assert_eq!(
+            choose_prefill_budget(Qwen35SchedulerPolicy::Auto, 1024, &active, &prefilling),
+            1024,
+            "auto preserves --max-prefill-tokens as a hard per-step cap"
+        );
+    }
+
+    #[test]
+    fn adaptive_prefill_budget_keeps_standard_long_output_cells_chunked() {
+        let active = [ActiveDecodeState {
+            generated_count: 16,
+            max_tokens: 256,
+        }];
+        let prefilling = [PrefillQueueState {
+            remaining_tokens: 4096,
+        }];
+
+        assert_eq!(
+            choose_prefill_budget(Qwen35SchedulerPolicy::Auto, 1024, &active, &prefilling),
+            1024,
+            "standard serving cells with long outputs keep the fixed chunk path"
+        );
+    }
+
+    #[test]
+    fn adaptive_prefill_budget_trims_final_chunk_to_remaining_tokens() {
+        let active = [ActiveDecodeState {
+            generated_count: 16,
+            max_tokens: 4096,
+        }];
+        let prefilling = [PrefillQueueState {
+            remaining_tokens: 512,
+        }];
+
+        assert_eq!(
+            choose_prefill_budget(Qwen35SchedulerPolicy::Auto, 1024, &active, &prefilling),
+            512,
+            "auto may shrink the final chunk but never expands beyond the configured cap"
+        );
+    }
+
+    #[test]
+    fn adaptive_prefill_budget_prioritizes_decode_when_active_request_is_finishing() {
+        let active = [
+            ActiveDecodeState {
+                generated_count: 252,
+                max_tokens: 256,
+            },
+            ActiveDecodeState {
+                generated_count: 16,
+                max_tokens: 4096,
+            },
+        ];
+        let prefilling = [PrefillQueueState {
+            remaining_tokens: 4096,
+        }];
+
+        assert_eq!(
+            choose_prefill_budget(Qwen35SchedulerPolicy::Auto, 1024, &active, &prefilling),
+            0,
+            "a near-finished active request gets a decode-priority tick before a long prefill"
+        );
+        assert!(
+            matches!(
+                build_next_plan::<Pending>(true, vec![]),
+                Some(ExecutionPlan::Decode)
+            ),
+            "zero prefill budget turns the scheduler tick into decode-only work"
+        );
+    }
+
+    #[test]
+    fn adaptive_prefill_budget_prioritizes_decode_before_final_prefill_chunk() {
+        let active = [ActiveDecodeState {
+            generated_count: 253,
+            max_tokens: 256,
+        }];
+        let prefilling = [PrefillQueueState {
+            remaining_tokens: 512,
+        }];
+
+        assert_eq!(
+            choose_prefill_budget(Qwen35SchedulerPolicy::Auto, 1024, &active, &prefilling),
+            0,
+            "decode-priority applies before even a final prefill chunk when an active request is finishing"
         );
     }
 

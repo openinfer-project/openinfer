@@ -34,11 +34,14 @@ use rand::rngs::StdRng;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
 
+use self::plan::ActiveDecodeState;
 use self::plan::ActiveKvBudget;
 use self::plan::ExecutionPlan;
 use self::plan::PrefillKvBudget;
+use self::plan::PrefillQueueState;
 use self::plan::RejectReason;
 use self::plan::admit_pending_requests;
+use self::plan::choose_prefill_budget;
 use self::plan::compaction_after_retire;
 use self::plan::max_kv_tokens;
 use self::plan::plan_prefill_chunks;
@@ -126,20 +129,27 @@ fn itl_debug_mono_us() -> u128 {
 
 // ── Entry point ─────────────────────────────────────────────────────────
 
-pub(crate) fn start(
-    model: Qwen35Model,
-    seed: u64,
-    max_prefill_tokens: usize,
-) -> Result<SchedulerHandle> {
-    let max_batch = model.reserved_decode_slots;
-    start_with_capacity(model, seed, max_batch, max_prefill_tokens)
-}
-
 pub fn start_with_capacity(
     model: Qwen35Model,
     seed: u64,
     max_batch: usize,
     max_prefill_tokens: usize,
+) -> Result<SchedulerHandle> {
+    start_with_capacity_and_policy(
+        model,
+        seed,
+        max_batch,
+        max_prefill_tokens,
+        Qwen35SchedulerPolicy::Off,
+    )
+}
+
+pub(crate) fn start_with_capacity_and_policy(
+    model: Qwen35Model,
+    seed: u64,
+    max_batch: usize,
+    max_prefill_tokens: usize,
+    scheduler_policy: Qwen35SchedulerPolicy,
 ) -> Result<SchedulerHandle> {
     assert!(
         max_prefill_tokens > 0,
@@ -174,6 +184,7 @@ pub fn start_with_capacity(
                     submit_rx,
                     seed,
                     max_prefill_tokens,
+                    scheduler_policy,
                     load_tx,
                 );
             }
@@ -241,6 +252,7 @@ pub(crate) fn start_tp_with_capacity(
                 submit_rx,
                 seed,
                 max_prefill_tokens,
+                Qwen35SchedulerPolicy::Off,
                 load_tx,
             );
         })
@@ -271,7 +283,9 @@ struct TpSchedulerBackend {
 
 impl SingleGpuBackend {
     fn new(model: Qwen35Model, max_batch: usize) -> Result<Self> {
-        let graph_state = model.create_batch_decode_graph_state_with_capacity(max_batch)?;
+        anyhow::ensure!(max_batch > 0, "Qwen3.5 max_batch must be > 0");
+        let graph_capacity = crate::batch_decode_graph::bucket_for(max_batch);
+        let graph_state = model.create_batch_decode_graph_state_with_capacity(graph_capacity)?;
         Ok(Self { model, graph_state })
     }
 
@@ -833,6 +847,7 @@ fn scheduler_loop(
     mut submit_rx: mpsc::UnboundedReceiver<SchedulerRequest>,
     seed: u64,
     prefill_budget: usize,
+    scheduler_policy: Qwen35SchedulerPolicy,
     load_tx: watch::Sender<LoadSnapshot>,
 ) {
     let mut rng = StdRng::seed_from_u64(seed);
@@ -937,9 +952,30 @@ fn scheduler_loop(
 
         deferred = admission.deferred;
 
-        // 5. Take this step's budgeted prefill chunk off the front of the queue,
-        //    then dispatch by plan.
-        let scheduled = take_prefill_chunks(&mut prefilling, prefill_budget);
+        // 5. Choose this tick's prefill budget, take that chunk off the front of
+        //    the queue, then dispatch by plan. Auto can return 0 for a short
+        //    decode-priority tick; the next iteration reconsiders the same FIFO
+        //    prefill without reordering it.
+        let active_decode: Vec<ActiveDecodeState> = active
+            .iter()
+            .map(|req| ActiveDecodeState {
+                generated_count: req.generated_count,
+                max_tokens: req.max_tokens,
+            })
+            .collect();
+        let prefill_queue: Vec<PrefillQueueState> = prefilling
+            .iter()
+            .map(|req| PrefillQueueState {
+                remaining_tokens: req.req.prompt_tokens.len().saturating_sub(req.cursor),
+            })
+            .collect();
+        let step_prefill_budget = choose_prefill_budget(
+            scheduler_policy,
+            prefill_budget,
+            &active_decode,
+            &prefill_queue,
+        );
+        let scheduled = take_prefill_chunks(&mut prefilling, step_prefill_budget);
         // ITL diagnostics (#470): capture the *actual* prefill-chunk token count
         // and the frozen decode width for this step before the plan consumes the
         // scheduled set. Off unless OPENINFER_ITL_DEBUG is set.

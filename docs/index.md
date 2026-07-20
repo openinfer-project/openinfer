@@ -57,6 +57,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | `models/qwen35/tp-design.md` | Qwen3.5 TP design: Phase 1 is eager dense TP on Qwen3's controller/worker runtime; validate TP2 first, fail closed for indivisible degrees and TP+CUDA Graph, shard dense full-attention/MLP, and leave sharded linear/GDR state to follow-up. |
 | `models/qwen35/tp-implementation.md` | Qwen3.5 TP Phase 1 implementation record: eager dense TP2 worker/scheduler path, short/long HF logits gates, scheduler e2e, and real OpenAI-compatible HTTP smoke pass; remaining TP work is kept as follow-up, not a Phase 1 claim. |
 | `models/qwen35/mixed-load-itl-470.md` | Issue #470: full cold `--max-batch 8/bg=4` matrix on RTX 4090 (24/24 valid) + starvation negative control. Qwen3.5 is not immune; chunking bounds max/per-step stall but raises p99 at low QPS (~14→~80–92ms) and pulls p99/max back from the prefill wall to the chunk wall at high load; `qps·prefill_s≳1` is a throughput wall (chunking can't fix it, and ON's +15% TTFT can trip it earlier). The old "p99 immunity" was a slot-starvation artifact. |
+| `models/qwen35/adaptive-scheduler-policy.md` | Issue #727 adaptive scheduler policy record: default `off`, opt-in `auto`, hard `--max-prefill-tokens` cap, TP `auto` rejection, and pre-review whole-prefill benchmark tradeoff retained as non-default evidence. |
 
 ## models / glm52
 
