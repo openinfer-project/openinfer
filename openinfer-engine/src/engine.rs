@@ -44,14 +44,6 @@ pub enum EpBackend {
     DeepEp,
 }
 
-#[derive(Clone, Debug)]
-pub struct ModelInfo {
-    pub id: &'static str,
-    pub display_name: String,
-    pub model_path: PathBuf,
-    pub max_model_len: Option<u32>,
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct TokenLogprob {
     pub logprob: f32,

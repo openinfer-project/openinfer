@@ -9,7 +9,7 @@
 
 - **Read**:
   - `docs/index.md` - routed the task to Qwen3.5 roadmap, Qwen3 KV pressure history, and scheduler docs.
-  - `docs/models/qwen3/kv-pressure-hang.md` - records the #85 fix shape: full-lifetime KV admission, waiting-queue deferral, impossible-request rejection, error semantics, and real HTTP pressure validation.
+  - `docs/lessons/kv-full-lifetime-admission.md` - records the reusable #85 fix shape: full-lifetime KV admission, waiting-queue deferral, impossible-request rejection, error semantics, and real HTTP pressure validation.
   - `docs/models/qwen35/roadmap.md` - lists admission overhaul as the next Qwen3.5 structural item and calls out prompt-only sizing plus missing rejected path.
   - `docs/subsystems/scheduler/scheduler.md` - explains paged KV, scheduler ownership, and why pressure evidence needs a real serving run plus post-pressure completion.
   - `docs/models/qwen35/model-crate.md` - confirms Qwen3.5 scheduler/runtime ownership and test paths.
@@ -19,7 +19,7 @@
   - `openinfer-qwen3/src/scheduler.rs` - reference implementation for `prompt_len + max_tokens - 1` KV accounting and impossible-request rejection.
   - `openinfer-core/src/kv_pool.rs` - confirms `KvState::ensure_capacity` grows physical pages lazily and pool capacity includes the reserved padding page.
 - **Relevant history**:
-  - `docs/models/qwen3/kv-pressure-hang.md` - the original failure mode kept the server alive while completions hung, so validation must include both pressure result and a post-pressure completion.
+  - `docs/lessons/kv-full-lifetime-admission.md` - the original failure mode kept the server alive while completions hung, so validation must include both pressure result and a post-pressure completion.
   - `docs/models/qwen35/roadmap.md` - the current #255 scheduler seam should host policy changes so they remain CPU-testable.
 - **Plan**:
   1. Update `scheduler/plan.rs` admission to use full-lifetime KV pages: `prompt_len + max_tokens - 1` for pending requests and remaining future pages for active requests.

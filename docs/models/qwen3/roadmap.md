@@ -1,8 +1,8 @@
 # Qwen3-4B Roadmap
 
-> **TL;DR:** Qwen3-4B is the maturity bar of the project — continuous batching, TP=2, default-on prefix cache (#216), and the HF logits golden gate are all live — so its roadmap is sharpening, not bring-up. The #220 RoPE OOB bug is fixed (cos/sin cache sized from `max_position_embeddings`, admission rejects past the window, kernel traps an out-of-range position; gated by both an oversized-reject and an in-window >4096 IT). Since the 2026-06-04 open-set review, batched greedy sampling (#307), mixed greedy/non-greedy batched sampling (#284), and in-process pegaflow KV offload / L2 host tier (#316, pure-L2 TTFT 195→40ms) have landed in the table below. Remaining open set: zero TP correctness coverage, LoRA gated only by a zero-adapter smoke, prefix-cache observability dropped at the scheduler boundary, stale docs, and the YaRN #8 follow-up for rope-scaled checkpoints.
+> **TL;DR:** Qwen3-4B is the project's maturity bar: continuous batching, TP=2, default-on prefix cache (#216), the HF logits golden gate, batched sampling (#307/#284), and in-process KV offload (#316) are live. TP now has a two-GPU concurrent-completion/deadlock test, but no TP=1 versus TP=2 logits parity gate. The main open set is TP numerical qualification, a real-adapter LoRA accuracy gate, prefix-cache observability, and YaRN #8 for rope-scaled checkpoints.
 >
-> **Last touched:** 2026-06
+> **Last touched:** 2026-07
 
 Tracking issue: see the `[Model] Qwen3-4B roadmap` GitHub issue. Cross-model items stay in `docs/roadmap/execution.md`; this doc owns the qwen3 line.
 
@@ -16,7 +16,7 @@ Tracking issue: see the `[Model] Qwen3-4B roadmap` GitHub issue. Cross-model ite
 | Long context | ✓ fixed: RoPE cache sized from `max_position_embeddings`, admission rejects past the window, kernel traps OOB; gated by reject + in-window >4096 ITs. YaRN #8 still open for scaled checkpoints | `weights.rs:310-318`, `tests/context_window.rs`, `tests/context_window_in_window.rs` |
 | Batch sampling | ✓ #307/#284: greedy rows use indexed batched argmax; non-greedy rows compact into one FlashInfer batched sampling call per step; top1 scratch sizing now comes from the kernel | `openinfer-core/src/ops/sampling.rs`, `openinfer-kernels/csrc/shared/flashinfer_sampling.cu` |
 | KV offload (L2) | ✓ in-process pegaflow host-tier save/restore (#316); CLI `--kv-offload`/`--no-prefix-cache`, plain + LoRA; pure-L2 TTFT 195→40ms | `subsystems/runtime/pegaflow-offload-integration.md` |
-| TP correctness | ✗ zero automated coverage — every test runs `device_ordinals: vec![0]` | grep `tests/` |
+| TP correctness | ⚠ TP=2 graph startup/concurrent completion/deadlock coverage exists; TP-vs-TP=1 logits parity is still ungated | `tests/tp_concurrent_decode.rs`, `tp-design.md` |
 | LoRA | ⚠ load/unload/TP/request-level all built; only test uses a **zero adapter** | `lora.rs`, `tests/lora_smoke.rs:91-130` |
 | Non-greedy sampling | ⚠ qwen3/qwen35 model behavior gates now cover `temperature` / `top_k` / `top_p`; penalties/min_p are still absent from `SamplingParams` | `tests/sampling_behavior.rs`, `openinfer-kernels/src/ops/sampling.rs` |
 | Bench snapshots | ⚠ exist but ~187 commits stale; not refreshed by #216; no mixed-load ITL profile | `bench_snapshots/` |
@@ -34,7 +34,7 @@ Tracking issue: see the `[Model] Qwen3-4B roadmap` GitHub issue. Cross-model ite
 ### Next
 
 5. **Mixed-load ITL profile, then the chunked-prefill decision.** A long prompt admitted mid-decode runs as one unbounded prefill in the unified step (no per-step token budget exists) — the documented +38% ITL p99 tail vs vLLM. Maintainer stance on chunked prefill is *conditional* (`scheduler.md`: varied-length workloads break waves naturally); so the gate is a tracked mixed-load benchmark profile first, implementation only if the tail matters for a real workload. Refresh the stale bench snapshots in the same pass.
-6. **TP correctness pass.** Run the golden gate over `device_ordinals [0,1]` (skip when <2 GPUs) so the tolerances also guard sharding + all-reduce; TP=8 systematic pass after. A reduction-order or shard-offset bug is currently invisible to every gate.
+6. **TP correctness pass.** Extend the golden gate to TP=2 (skip when fewer than two GPUs) so its tolerances guard sharding and all-reduce, then qualify TP=8 systematically. `tp_concurrent_decode` now protects graph startup and concurrent progress, but a reduction-order or shard-offset bug remains invisible to numerical gates.
 7. **LoRA real-adapter accuracy gate.** The last open #173 acceptance criterion: teacher-force one real PEFT adapter against an HF reference with the golden-gate tolerances. Today base==(base+zero·LoRA) is all that's proven. The salt-isolation of the prefix cache also deserves a pinning test (adapter A's blocks must not hit for adapter B).
 8. **Eviction behavioral test.** Evict-then-remiss is never exercised: register a prefix, release it, pressure the pool until eviction, assert truncated/zero match + correct recompute. kvbm-logical layer needs no GPU.
 9. **Disconnect block-pinning.** After #216, a disconnected request pins its cache blocks (strong Arcs) until the next failed send — #215 is now also a KV-budget problem. Scheduler half: proactive `token_tx.is_closed()` sweep per step; folds into the server-wide #215.
@@ -42,14 +42,13 @@ Tracking issue: see the `[Model] Qwen3-4B roadmap` GitHub issue. Cross-model ite
 ### Later
 
 - **Pipeline parallelism** — greenfield, no code; revisit when a multi-node driver appears.
-- **Vocab-parallel embedding/lm_head + TP CUDA-graph** — the real open remainder of `tp-design.md`.
+- **Vocab-parallel embedding/lm_head** — revisit after TP numerical qualification; TP decode CUDA Graph pre-capture is already implemented.
 
 ## Cleanup ledger
 
 - **Issue hygiene:** #188 references a test target deleted in #194 — close as superseded by the golden gate. #203 §1 still claims qwen3 has no prefix reuse — stale since #216.
-- **Dead code:** ~~`batch_decode_trace.rs` `HIDDEN_SIZE`/`INTERMEDIATE_SIZE` consts; qwen3 `probe_model()`+`ModelInfo`~~ — removed in the hawk dead-public sweep (#743).
 - **File size:** `executor.rs` (1435), `scheduler.rs` (1420, ~826 of them inline tests), `kernel_bench.rs` (1112) breach the 1k-line redline.
-- **Docs:** `model-crate.md` TL;DR advertises a deleted `qwen3_kernel_snapshot` bench and, with `kernels-crate.md`, uses the obsolete `crates/` layout in every command — collapse both into one slim layout doc. `tp-design.md` describes the implemented controller/worker runtime as future direction — rewrite to past tense, promote the 3 real open items. `kv-pressure-hang.md` — lift the KV-lifetime-reservation lessons to `docs/lessons/`, then delete. `execution.md` Done list predates #216.
+- **Docs/dead code:** ✓ #248 refreshed the crate/TP docs, moved the full-lifetime KV admission lesson to `docs/lessons/`, and removed the verified-unused Qwen3 constants and model-probe API. `execution.md` Done list still predates #216.
 
 ## Done criteria
 

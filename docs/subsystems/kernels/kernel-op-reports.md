@@ -9,13 +9,12 @@
 
 - **Read**:
   - `docs/index.md` - located the active benchmarking, CUPTI, kernel-boundary, and Qwen3 model-crate docs.
-  - `docs/models/qwen3/model-crate.md` - confirmed `qwen3_kernel_snapshot` was the current Qwen3 kernel snapshot runner and already captured warm/cold-L2 latency plus default CUPTI counters.
+  - `docs/models/qwen3/model-crate.md` - confirms the current boundary: reusable kernel source/build ownership lives in `openinfer-kernels`, while model execution and DAG metadata belong in the Qwen3 crate.
   - `docs/conventions/bench-regression.md` - clarified that the existing serving benchmark remains the model-level regression artifact; this task should not mix per-op reports with E2E snapshots.
   - `docs/subsystems/kernels/openinfer-kernels-boundary.md` - confirmed kernels should become first-class measurable assets and model DAG manifests should live with model crates.
-  - `docs/models/qwen3/kernels-crate.md` - confirmed kernel source/build ownership now lives in `openinfer-kernels`, while model-owned DAG metadata belongs in the Qwen3 crate.
   - `docs/playbooks/profiling-guide.md` - confirmed the diagnostic split between kernel composition/proportions and benchmark-grade latency.
 - **Relevant history**:
-  - `docs/models/qwen3/model-crate.md` showed the current single-op snapshot already found the low-batch long-context decode-attention bottleneck.
+  - `docs/models/qwen3/decode-attention.md` records the low-batch long-context decode-attention bottleneck and its current runtime policy.
 - **Plan**:
   1. Add direct Qwen3 crate dev-dependencies for generic infrastructure (`clap` derive for CLI and `toml` for manifest parsing) instead of extending the hand-written parser.
   2. Add a model-local TOML manifest for Qwen3-4B kernel reports, initially covering only op names, phases, shape sweeps, and variants.
