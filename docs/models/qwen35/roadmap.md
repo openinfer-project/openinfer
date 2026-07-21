@@ -47,7 +47,7 @@ out:
 | Fault isolation | Open risk: batch-level execution errors can still fail multiple active requests | #654 |
 | Prefix reuse | Open: bounded joint KV/recurrent/conv snapshot design and implementation | #257 |
 | DFlash | In flight and opt-in: correctness-first work must stay default-off until gates pass | #434, PR #626, #654 |
-| Tensor parallel | Phase 1 complete: eager dense TP2 worker/scheduler execution; Phase 2 still needs mixed-step execution and sharded linear-attention/GDR state. | `docs/models/qwen35/tp-implementation.md`, #446 |
+| Tensor parallel | Phase 1 complete: eager dense TP2 worker/scheduler execution. P2a adds eager `RequestId`-keyed unified execution with replicated GDR; P2b adds local-head linear-attention/GDR sharding. | `docs/models/qwen35/tp-implementation.md`, `docs/models/qwen35/tp-design.md`, #446 |
 
 ## Active Contract
 
@@ -132,6 +132,8 @@ Performance:
      no-go condition.
 
 ### Later
+
+- **TP Phase 2** — land P2a and P2b as separate implementation series; report a matched Phase 1 TP2 versus P2b TP2 A/B before making any performance claim.
 
 - TP for a concrete 9B or 27B TP=2 target, then 4B TP only if same-host TP=1 vs
   TP=2 shows value.
