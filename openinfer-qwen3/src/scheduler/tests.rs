@@ -1,14 +1,18 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::atomic::AtomicU8;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::Result;
 use openinfer_core::engine::EngineControlError;
 use openinfer_core::engine::LoadLoraAdapterRequest;
+use openinfer_core::engine::RequestAbortReason;
+use openinfer_core::engine::TokenStreamReceiver;
 use openinfer_core::engine::UnloadLoraAdapterRequest;
 use openinfer_kv_cache::BlockPool;
+use parking_lot::Mutex;
 
 use super::*;
 use crate::executor::DecodePlan;
@@ -147,7 +151,7 @@ impl ModelExecutor for FakeExecutor {
             self.available_blocks += blocks_needed(tokens, self.block_size);
         }
         self.prefill_positions.remove(&request_id);
-        self.dropped.lock().unwrap().push(request_id.get());
+        self.dropped.lock().push(request_id.get());
         Ok(())
     }
 
@@ -158,7 +162,7 @@ impl ModelExecutor for FakeExecutor {
         _lora_adapter: Option<&str>,
         _reserve_floor: usize,
     ) -> bool {
-        self.prefetch_offers.lock().unwrap().push(request_id.get());
+        self.prefetch_offers.lock().push(request_id.get());
         false
     }
 
@@ -780,12 +784,12 @@ fn echo_requests_are_never_offered_to_prefetch() {
     let offers = Arc::clone(&executor.prefetch_offers);
 
     let mut deferred = vec![pending(1, true), pending(2, false)];
-    let mut loading = Vec::new();
+    let mut loading: Vec<PendingRequest> = Vec::new();
     offer_prefetch(&mut executor, &mut deferred, &mut loading, 0);
 
     // The plain request is probed; the echo request is skipped entirely, so
     // its prefill forwards the whole prompt without parking unspendable KV.
-    assert_eq!(*offers.lock().unwrap(), vec![2]);
+    assert_eq!(*offers.lock(), vec![2]);
     let echo = deferred.iter().find(|r| r.request_id.get() == 1).unwrap();
     assert!(!echo.prefetch_offered, "echo request must stay un-probed");
     let plain = deferred.iter().find(|r| r.request_id.get() == 2).unwrap();
@@ -909,10 +913,7 @@ fn decode_error_drops_request_state_and_scheduler_recovers() {
         _ => panic!("decode failure should surface as TokenEvent::Error"),
     }
     assert!(
-        wait_until(Duration::from_secs(1), || dropped
-            .lock()
-            .unwrap()
-            .contains(&0)),
+        wait_until(Duration::from_secs(1), || dropped.lock().contains(&0)),
         "failed request state should be dropped"
     );
 
@@ -996,7 +997,7 @@ fn retiring_multiple_active_requests_tolerates_unsorted_indices() {
         active.is_empty(),
         "all finished requests should retire without index drift"
     );
-    let mut dropped = dropped.lock().unwrap().clone();
+    let mut dropped = dropped.lock().clone();
     dropped.sort_unstable();
     assert_eq!(dropped, vec![1, 7, 10]);
 }
@@ -1266,4 +1267,186 @@ fn speculative_resolves_each_request_independently() {
         effects::DecodeEffect::EmitManyAndFinish { request_id, finish_reason: FinishReason::Stop, .. }
             if *request_id == RequestId(2)
     ));
+}
+
+// ── Proactive cancellation sweep (#642) ───────────────────────────────────
+//
+// `TokenSink::standalone()` pins `abort_reason` to `None` forever, so it
+// can't model a frontend-driven cancel. These helpers build a sink backed by
+// a real shared `Arc<AtomicU8>` the test trips to an abort reason, then drive
+// `sweep_cancelled_requests` directly with the FakeExecutor (CPU-only).
+
+fn cancellable_sink() -> (TokenSink, Arc<AtomicU8>, TokenStreamReceiver) {
+    let abort_reason = Arc::new(AtomicU8::new(RequestAbortReason::None as u8));
+    let (tx, rx) = mpsc::unbounded_channel();
+    let sink = TokenSink::new(Arc::from("test"), tx, Arc::clone(&abort_reason));
+    (sink, abort_reason, rx)
+}
+
+fn cancellable_pending(request_id: u64) -> (PendingRequest, Arc<AtomicU8>, TokenStreamReceiver) {
+    let (token_tx, abort_reason, rx) = cancellable_sink();
+    (
+        PendingRequest {
+            request_id: RequestId::new(request_id),
+            lora_adapter: None,
+            prompt_tokens: vec![1; 32],
+            params: SamplingParams::default(),
+            max_tokens: 1,
+            token_tx,
+            logprobs: 0,
+            echo: false,
+            queued_at_unix_s: None,
+            prefetch_offered: false,
+            prefill_pos: 0,
+            step_chunk: 0,
+            cached_tokens: 0,
+        },
+        abort_reason,
+        rx,
+    )
+}
+
+fn cancellable_active(request_id: u64) -> (ActiveRequestState, Arc<AtomicU8>, TokenStreamReceiver) {
+    let (token_tx, abort_reason, rx) = cancellable_sink();
+    (
+        ActiveRequestState {
+            request_id: RequestId::new(request_id),
+            lora_adapter: None,
+            token_tx,
+            last_token: 100,
+            generated_count: 1,
+            max_tokens: 4,
+            prompt_len: 32,
+            params: SamplingParams::default(),
+            logprobs: 0,
+        },
+        abort_reason,
+        rx,
+    )
+}
+
+/// A cancelled deferred request is dropped before it ever reaches prefill,
+/// and the LoRA-control-only `post_control_deferred` queue (loop2 path) is
+/// swept too. Live siblings are left untouched.
+#[test]
+fn sweep_drops_cancelled_deferred_request_before_prefill() {
+    let dropped = Arc::new(Mutex::new(Vec::new()));
+    let mut executor = FakeExecutor::new(64, Arc::clone(&dropped));
+    let mut active = Vec::new();
+    let mut deferred = Vec::new();
+    let _loading: Vec<PendingRequest> = Vec::new();
+    let mut prefilling = Vec::new();
+    let mut post_control_deferred = Vec::new();
+
+    let (cancelled, abort, _cancelled_rx) = cancellable_pending(1);
+    let (live, _live_abort, _live_rx) = cancellable_pending(2);
+    // Park a cancelled request in the LoRA-control-only queue as well, to
+    // cover the loop2 sweep path (the `Some(&mut ..)` branch).
+    let (post_cancelled, post_abort, _post_rx) = cancellable_pending(3);
+    deferred.push(cancelled);
+    deferred.push(live);
+    post_control_deferred.push(post_cancelled);
+
+    abort.store(RequestAbortReason::Cancelled as u8, Ordering::Release);
+    post_abort.store(RequestAbortReason::Disconnected as u8, Ordering::Release);
+
+    let n = sweep_cancelled_requests(
+        &mut executor,
+        &mut active,
+        &mut deferred,
+        &mut prefilling,
+        Some(&mut post_control_deferred),
+    );
+
+    assert_eq!(
+        n, 2,
+        "both cancelled requests (deferred + post-control) drop"
+    );
+    let mut got = dropped.lock().clone();
+    got.sort_unstable();
+    assert_eq!(got, vec![1, 3]);
+    assert_eq!(deferred.len(), 1);
+    assert_eq!(deferred[0].request_id.get(), 2, "live request survives");
+    assert!(post_control_deferred.is_empty());
+    assert!(
+        prefilling.is_empty(),
+        "cancelled request must never reach prefilling"
+    );
+}
+
+/// A cancelled request mid-chunked-prefill is retired and its executor-side
+/// progress state released; a live sibling keeps its place and its state.
+#[test]
+fn sweep_drops_cancelled_prefilling_request_and_releases_state() {
+    let dropped = Arc::new(Mutex::new(Vec::new()));
+    let mut executor = FakeExecutor::new(64, Arc::clone(&dropped));
+    let mut active = Vec::new();
+    let mut deferred = Vec::new();
+    let _loading: Vec<PendingRequest> = Vec::new();
+    let mut prefilling = Vec::new();
+
+    let (cancelled, abort, _cancelled_rx) = cancellable_pending(1);
+    let (live, _live_abort, _live_rx) = cancellable_pending(2);
+    // Both already admitted into prefilling, holding prompt-progress state.
+    executor.prefill_positions.insert(RequestId::new(1), 16);
+    executor.prefill_positions.insert(RequestId::new(2), 16);
+    prefilling.push(cancelled);
+    prefilling.push(live);
+
+    abort.store(RequestAbortReason::Cancelled as u8, Ordering::Release);
+
+    let n = sweep_cancelled_requests(
+        &mut executor,
+        &mut active,
+        &mut deferred,
+        &mut prefilling,
+        None,
+    );
+
+    assert_eq!(n, 1);
+    assert_eq!(*dropped.lock(), vec![1]);
+    assert_eq!(prefilling.len(), 1);
+    assert_eq!(prefilling[0].request_id.get(), 2);
+    assert!(!executor.prefill_positions.contains_key(&RequestId::new(1)));
+    assert!(executor.prefill_positions.contains_key(&RequestId::new(2)));
+}
+
+/// A cancelled active (decoding) request leaves the running set and its KV
+/// reservation is returned; a live sibling keeps decoding.
+#[test]
+fn sweep_drops_cancelled_active_request_from_running_set() {
+    let dropped = Arc::new(Mutex::new(Vec::new()));
+    let mut executor = FakeExecutor::new(64, Arc::clone(&dropped));
+    let mut active = Vec::new();
+    let mut deferred = Vec::new();
+    let _loading: Vec<PendingRequest> = Vec::new();
+    let mut prefilling = Vec::new();
+
+    let (cancelled, abort, _cancelled_rx) = cancellable_active(1);
+    let (live, _live_abort, _live_rx) = cancellable_active(2);
+    executor
+        .ensure_request_tokens(RequestId::new(1), 32)
+        .unwrap();
+    executor
+        .ensure_request_tokens(RequestId::new(2), 32)
+        .unwrap();
+    active.push(cancelled);
+    active.push(live);
+
+    abort.store(RequestAbortReason::Cancelled as u8, Ordering::Release);
+
+    let n = sweep_cancelled_requests(
+        &mut executor,
+        &mut active,
+        &mut deferred,
+        &mut prefilling,
+        None,
+    );
+
+    assert_eq!(n, 1);
+    assert_eq!(*dropped.lock(), vec![1]);
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].request_id.get(), 2);
+    assert!(!executor.held_tokens.contains_key(&RequestId::new(1)));
+    assert!(executor.held_tokens.contains_key(&RequestId::new(2)));
 }

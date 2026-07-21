@@ -477,15 +477,18 @@ fn release_rejected<E: ModelExecutor>(executor: &mut E, req: &PendingRequest) {
 
 // ── Main loop ───────────────────────────────────────────────────────────
 
-/// Republish live KV occupancy to the load-watch feed. Called once at the top of
-/// every loop iteration (before this step admits/allocates), so it reports the
-/// resident occupancy *between* steps — the steady-state load a router wants,
-/// not a transient in-step peak. Top-of-loop placement guarantees exactly one
-/// publish per iteration regardless of which `continue` the step takes, and the
-/// post-completion free shows up at the next iteration's top before the loop
-/// parks idle. `watch` coalesces (a consumer wakes at most once per step and
-/// reads the latest); `send_replace` ignores a dropped receiver, so the
-/// scheduler runs whether or not anyone is watching.
+/// Republish live KV occupancy to the load-watch feed. Called once per loop
+/// iteration, right after the proactive cancellation sweep and before this step
+/// admits/allocates, so it reports post-sweep occupancy *between* steps — the
+/// steady-state load a router wants, not a transient in-step peak. Placing it
+/// after the sweep (not at the very top) guarantees exactly one publish per
+/// iteration regardless of which `continue` the step takes, AND that a
+/// just-disconnected request batch reads 0/0 before the loop parks idle on the
+/// next `blocking_recv` — otherwise the watch would freeze on the stale
+/// pre-sweep counts until a fresh request woke the scheduler. `watch` coalesces
+/// (a consumer wakes at most once per step and reads the latest); `send_replace`
+/// ignores a dropped receiver, so the scheduler runs whether or not anyone is
+/// watching.
 /// `num_waiting_reqs` folds every not-yet-running queue (KV-deferred,
 /// prefetch-loading, post-control) into one number; the vLLM frontend exports
 /// it as `num_requests_waiting` and attributes all of it to
@@ -505,6 +508,96 @@ fn publish_load<E: ModelExecutor>(
         num_running_reqs,
         num_waiting_reqs,
     });
+}
+
+// ── Proactive cancellation sweep ─────────────────────────────────────────
+
+/// Remove every request whose [`TokenSink`] reports closed — the frontend
+/// cancelled it, the client disconnected, or the whole engine demux is gone
+/// — from the per-iteration scheduler queues, releasing its executor-side
+/// state (KV blocks, parked prefetch DMA, saved cursor) via
+/// [`ModelExecutor::drop_request`].
+///
+/// Called once at the top of each scheduler iteration, after new submissions
+/// are drained and before admission, so a cancelled request never burns a
+/// prefill (or decode) step. Between iterations no request's KV is being
+/// written, so dropping lands at a safe boundary — the same one the reactive
+/// retirement paths (`token_tx.send()` failure, the `ContinuePrefill` check)
+/// already use, just reached one step earlier.
+///
+/// Returns the number of requests dropped (useful for diagnostics).
+///
+/// # What is *not* swept
+///
+/// `loading` (requests waiting for async KV prefetch) is excluded because
+/// `drop_request` blocks on `handle.wait()` until an in-flight H2D/RDMA/SSD
+/// prefetch DMA completes, which would stall the scheduler thread and delay
+/// unrelated decode steps. A cancelled request in `loading` settles naturally
+/// via `reclaim_ready_prefetch`, enters `deferred`, and is swept on the next
+/// iteration — no blocking, one-step delay at most.
+///
+/// `inflight_prefill_pending` (decode-overlap mode) is deliberately
+/// excluded. While a prefill runs on the overlap stream its KV is mid-write
+/// and its queue entry is positionally zipped with the in-flight result, so
+/// freeing it mid-compute would both corrupt KV and misalign the
+/// request↔result pairing. Those requests live at most one step and are
+/// retired reactively by the existing checks once the in-flight prefill
+/// lands, so omitting them costs at most one extra step.
+fn sweep_cancelled_requests<E: ModelExecutor>(
+    executor: &mut E,
+    active: &mut Vec<ActiveRequestState>,
+    deferred: &mut Vec<PendingRequest>,
+    prefilling: &mut Vec<PendingRequest>,
+    post_control_deferred: Option<&mut Vec<PendingRequest>>,
+) -> usize {
+    let mut dropped = 0;
+    dropped += sweep_pending(&mut *executor, prefilling);
+    dropped += sweep_pending(&mut *executor, deferred);
+    if let Some(post_control) = post_control_deferred {
+        dropped += sweep_pending(&mut *executor, post_control);
+    }
+    dropped += sweep_active(&mut *executor, active);
+    if dropped > 0 {
+        debug!("sweep_cancelled_requests: retired {dropped} cancelled request(s)");
+    }
+    dropped
+}
+
+/// Drop closed requests from a pending queue, releasing their state. Order-
+/// preserving (`deferred`/`prefilling` are FIFO; a `swap_remove` sweep would
+/// break that invariant). The ids are collected up front so the mutable
+/// executor borrow needed for `drop_request` never overlaps the queue borrow.
+///
+/// Retain is driven by the collected IDs, NOT by re-checking `is_closed()`.
+/// A request can become closed between the two checks (frontend aborts it
+/// concurrently); re-checking would remove it from the queue without calling
+/// `drop_request`, leaking KV blocks and parked prefetch state.
+fn sweep_pending<E: ModelExecutor>(executor: &mut E, queue: &mut Vec<PendingRequest>) -> usize {
+    let dropped: Vec<RequestId> = queue
+        .iter()
+        .filter(|req| req.token_tx.is_closed())
+        .map(|req| req.request_id)
+        .collect();
+    for id in &dropped {
+        let _ = executor.drop_request(*id);
+    }
+    queue.retain(|req| !dropped.contains(&req.request_id));
+    dropped.len()
+}
+
+/// Drop closed requests from the active (decoding) set, releasing state.
+/// See [`sweep_pending`] for the borrow/ordering/TOCTOU rationale.
+fn sweep_active<E: ModelExecutor>(executor: &mut E, queue: &mut Vec<ActiveRequestState>) -> usize {
+    let dropped: Vec<RequestId> = queue
+        .iter()
+        .filter(|req| req.token_tx.is_closed())
+        .map(|req| req.request_id)
+        .collect();
+    for id in &dropped {
+        let _ = executor.drop_request(*id);
+    }
+    queue.retain(|req| !dropped.contains(&req.request_id));
+    dropped.len()
 }
 
 fn scheduler_loop<E>(
@@ -536,20 +629,11 @@ fn scheduler_loop<E>(
     info!("Scheduler ready");
 
     loop {
-        publish_load(
-            load_tx,
-            kv_total,
-            &executor,
-            (active.len()
-                + prefilling.len()
-                + inflight_prefill_pending.as_ref().map_or(0, Vec::len)) as u64,
-            (deferred.len() + loading.len()) as u64,
-        );
         // Flush the prior step's cache changes to a router (no-op unless the
-        // event feed is on). Top-of-loop, like `publish_load`: one pass per
-        // iteration regardless of which branch the step takes, at the cost of a
-        // one-iteration announcement lag the router tolerates. Stores first so a
-        // block evicted the same step it registered is announced before removed.
+        // event feed is on). One pass per iteration regardless of which branch
+        // the step takes, at the cost of a one-iteration announcement lag the
+        // router tolerates. Stores first so a block evicted the same step it
+        // registered is announced before removed.
         if let Some(producer) = kv_producer.as_mut() {
             producer.emit_stores(executor.take_kv_store_events());
             producer.drain_removes();
@@ -582,6 +666,37 @@ fn scheduler_loop<E>(
             ));
             next_request_id += 1;
         }
+        // Proactive cancellation sweep: retire requests whose consumer is
+        // already gone (frontend cancel/disconnect) before they burn a
+        // prefill step. `inflight_prefill_pending` is excluded — see
+        // `sweep_cancelled_requests`.
+        let cancelled = sweep_cancelled_requests(
+            &mut executor,
+            &mut active,
+            &mut deferred,
+            &mut prefilling,
+            None,
+        );
+        // The top-of-loop `drain_removes()` ran before the sweep, so block
+        // evictions from just-dropped requests are unpublished. Flush them
+        // now so a KV-aware router sees freed blocks before the next step.
+        if cancelled > 0 {
+            if let Some(producer) = kv_producer.as_mut() {
+                producer.drain_removes();
+            }
+        }
+        // Publish live load AFTER the cancellation sweep so the metrics reflect
+        // post-sweep reality (a just-disconnected burst reads 0/0, not the stale
+        // pre-sweep counts) before the loop parks idle on the next `blocking_recv`.
+        publish_load(
+            load_tx,
+            kv_total,
+            &executor,
+            (active.len()
+                + prefilling.len()
+                + inflight_prefill_pending.as_ref().map_or(0, Vec::len)) as u64,
+            (deferred.len() + loading.len()) as u64,
+        );
 
         // 2. Reclaim settled prefetches, then offer fresh requests to prefetch.
         let reserve_floor = admitted_future_blocks(&executor, &active, &prefilling);
@@ -747,14 +862,6 @@ fn scheduler_loop_with_lora_control<E>(
     info!("Scheduler ready with LoRA control");
 
     loop {
-        publish_load(
-            load_tx,
-            kv_total,
-            &executor,
-            (active.len() + prefilling.len()) as u64,
-            (deferred.len() + loading.len() + post_control_deferred.len()) as u64,
-        );
-
         // 1. Drain incoming commands. Generation submitted after a pending
         // control command waits until that control command is handled at idle.
         while let Ok(command) = command_rx.try_recv() {
@@ -766,6 +873,24 @@ fn scheduler_loop_with_lora_control<E>(
                 &mut next_request_id,
             );
         }
+        // Proactive cancellation sweep: retire cancelled requests before
+        // admission so they never reach prefill. See `sweep_cancelled_requests`.
+        sweep_cancelled_requests(
+            &mut executor,
+            &mut active,
+            &mut deferred,
+            &mut prefilling,
+            Some(&mut post_control_deferred),
+        );
+        // Publish live load AFTER the cancellation sweep so the metrics reflect
+        // post-sweep reality before the loop parks idle on the next `blocking_recv`.
+        publish_load(
+            load_tx,
+            kv_total,
+            &executor,
+            (active.len() + prefilling.len()) as u64,
+            (deferred.len() + loading.len() + post_control_deferred.len()) as u64,
+        );
 
         // 1b. Reclaim settled prefetches and offer fresh requests. Control
         // commands gate generation, so only offer once no control is pending
