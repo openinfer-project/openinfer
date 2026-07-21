@@ -1,18 +1,27 @@
 //! Typed Kimi decode scratch buffers.
 
-use anyhow::{Result, ensure};
+use anyhow::Result;
+use anyhow::ensure;
 use cudarc::driver::CudaSlice;
 use openinfer_kernels::gpu_buffers;
-use openinfer_kernels::tensor::{DeviceContext, GpuTensor, HiddenStates};
+use openinfer_kernels::ops::KIMI_K2_EP_WORLD;
+use openinfer_kernels::ops::KIMI_K2_MLA_KV_LORA_RANK;
+use openinfer_kernels::ops::KIMI_K2_MLA_QKV_A_OUT;
+use openinfer_kernels::ops::KIMI_K2_MLA_ROPE_DIM;
+use openinfer_kernels::ops::KimiMarlinRouteWorkspace;
+use openinfer_kernels::ops::KimiMarlinWna16Workspace;
+use openinfer_kernels::ops::argmax_batch_bf16_split_partials_len;
+use openinfer_kernels::tensor::DeviceContext;
+use openinfer_kernels::tensor::GpuTensor;
+use openinfer_kernels::tensor::HiddenStates;
 
-use crate::config::{
-    KIMI_K2_EXPERT_INTERMEDIATE, KIMI_K2_HIDDEN, KIMI_K2_Q_LORA_RANK, KIMI_K2_ROUTED_EXPERTS,
-    KIMI_K2_TOPK, KIMI_K2_VOCAB, KimiLocalDims,
-};
-use openinfer_kernels::ops::{
-    KIMI_K2_EP_WORLD, KIMI_K2_MLA_KV_LORA_RANK, KIMI_K2_MLA_QKV_A_OUT, KIMI_K2_MLA_ROPE_DIM,
-    KimiMarlinRouteWorkspace, KimiMarlinWna16Workspace, argmax_batch_bf16_split_partials_len,
-};
+use crate::config::KIMI_K2_EXPERT_INTERMEDIATE;
+use crate::config::KIMI_K2_HIDDEN;
+use crate::config::KIMI_K2_Q_LORA_RANK;
+use crate::config::KIMI_K2_ROUTED_EXPERTS;
+use crate::config::KIMI_K2_TOPK;
+use crate::config::KIMI_K2_VOCAB;
+use crate::config::KimiLocalDims;
 
 pub(crate) const MARLIN_W13_OUT_DIM: usize = 2 * KIMI_K2_EXPERT_INTERMEDIATE;
 

@@ -1,8 +1,9 @@
+use std::collections::HashSet;
+use std::fs;
+
 use anyhow::Result;
 use log::warn;
 use serde::Deserialize;
-use std::collections::HashSet;
-use std::fs;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct TensorParallelConfig {
@@ -503,7 +504,7 @@ struct TokenizerConfigIds {
 /// merge: `tokenizer.json` vocab and added_tokens (fatal on parse failure -
 /// the frontend cannot serve without it) plus `tokenizer_config.json`
 /// added_tokens_decoder (whole-file typed parse; failure drops all decoder
-/// tokens with a warning, unparseable keys are skipped per entry). The ids
+/// tokens with a warning, unparsable keys are skipped per entry). The ids
 /// must form a dense prefix - a row-range selection bound cannot mask holes -
 /// so a sparse id space fails the load instead of silently truncating the
 /// output space.

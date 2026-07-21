@@ -29,7 +29,8 @@
 //!
 //! ```rust
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! use kvbm_logical::{ExternalBlockAssignments, BlockSequence};
+//! use kvbm_logical::BlockSequence;
+//! use kvbm_logical::ExternalBlockAssignments;
 //!
 //! // Create a sequence with 3 complete blocks (4 tokens each).
 //! let tokens: Vec<u32> = (0..12).collect();
@@ -65,7 +66,8 @@
 //!
 //! ```rust
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! use kvbm_logical::{ExternalBlockAssignments, BlockSequence};
+//! use kvbm_logical::BlockSequence;
+//! use kvbm_logical::ExternalBlockAssignments;
 //!
 //! let tokens: Vec<u32> = (0..8).collect();
 //! let seq = BlockSequence::new(tokens, 4, None);
@@ -102,17 +104,15 @@
 //!
 //! ```rust
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! use kvbm_logical::{
-//!     BlockManager, BlockRegistry, BlockSequence,
-//!     LogicalBlockAssignments,
-//!     manager::FrequencyTrackingCapacity,
-//! };
+//! use kvbm_logical::BlockManager;
+//! use kvbm_logical::BlockRegistry;
+//! use kvbm_logical::BlockSequence;
+//! use kvbm_logical::LogicalBlockAssignments;
+//! use kvbm_logical::manager::FrequencyTrackingCapacity;
 //!
 //! // Build a manager with 10 blocks of size 4.
 //! let tracker = FrequencyTrackingCapacity::Small.create_tracker();
-//! let registry = BlockRegistry::builder()
-//!     .frequency_tracker(tracker)
-//!     .build();
+//! let registry = BlockRegistry::builder().frequency_tracker(tracker).build();
 //! let manager = BlockManager::<()>::builder()
 //!     .block_count(10)
 //!     .block_size(4)
@@ -157,16 +157,23 @@
 mod assignments;
 mod store;
 
-pub use assignments::{
-    ExternalBlockAssignments, LogicalBlockAssignmentError, LogicalBlockAssignments, zip_assigned,
-    zip_assigned_pending,
-};
-
 use std::ops::Range;
 
-use dynamo_tokens::{SaltHash, Token, TokenBlock, TokenBlockError, TokenBlockSequence, Tokens};
+pub use assignments::ExternalBlockAssignments;
+pub use assignments::LogicalBlockAssignmentError;
+pub use assignments::LogicalBlockAssignments;
+pub use assignments::zip_assigned;
+pub use assignments::zip_assigned_pending;
+use dynamo_tokens::SaltHash;
+use dynamo_tokens::Token;
+use dynamo_tokens::TokenBlock;
+use dynamo_tokens::TokenBlockError;
+use dynamo_tokens::TokenBlockSequence;
+use dynamo_tokens::Tokens;
 
-use crate::{BlockId, KvbmSequenceHashProvider, SequenceHash};
+use crate::BlockId;
+use crate::KvbmSequenceHashProvider;
+use crate::SequenceHash;
 
 /// Errors that can occur in block sequence operations.
 #[derive(Debug, thiserror::Error)]

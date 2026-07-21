@@ -11,10 +11,13 @@
 //!
 //! Requires a CUDA GPU; skipped from `--lib` unit runs.
 
-use cudarc::driver::{CudaContext, result};
+use cudarc::driver::CudaContext;
+use cudarc::driver::result;
 use half::bf16;
 use openinfer_kv_cache::KvBuffer;
-use openinfer_kv_offload::{OffloadConfig, OffloadEngine, QueryOutcome};
+use openinfer_kv_offload::OffloadConfig;
+use openinfer_kv_offload::OffloadEngine;
+use openinfer_kv_offload::QueryOutcome;
 
 const NUM_LAYERS: usize = 4;
 const NUM_KV_HEADS: usize = 2;

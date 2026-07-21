@@ -12,17 +12,25 @@
 //!   cargo test --release -p openinfer-glm52 --features glm52 --lib bookend_oracle -- --ignored --nocapture
 //! ```
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 
-use anyhow::{Context, Result, ensure};
-use half::bf16;
-use sha2::{Digest, Sha256};
-
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::ensure;
 use cudarc::driver::CudaSlice;
-use openinfer_kernels::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
+use half::bf16;
+use openinfer_kernels::tensor::DeviceContext;
+use openinfer_kernels::tensor::DeviceMatrix;
+use openinfer_kernels::tensor::DeviceVec;
+use sha2::Digest;
+use sha2::Sha256;
 
-use crate::bookend::{glm52_embed_into, glm52_final_norm_into, glm52_lm_head_into};
-use crate::config::{GLM52_HIDDEN, GLM52_VOCAB};
+use crate::bookend::glm52_embed_into;
+use crate::bookend::glm52_final_norm_into;
+use crate::bookend::glm52_lm_head_into;
+use crate::config::GLM52_HIDDEN;
+use crate::config::GLM52_VOCAB;
 use crate::rows::Rows;
 
 /// Allocating conveniences over the production `_into` bookends — the gate

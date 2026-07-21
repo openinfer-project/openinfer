@@ -1,5 +1,7 @@
+use cudarc::driver::sys::CUresult;
+use cudarc::driver::sys::CUstream;
+
 use super::Half;
-use cudarc::driver::sys::{CUresult, CUstream};
 
 // DeepSeek-V2-Lite private kernels (feature `deepseek-v2-lite`).
 // Sources: csrc/deepseek_v2_lite/*.cu.

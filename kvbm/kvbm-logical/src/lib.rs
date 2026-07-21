@@ -24,26 +24,37 @@ pub mod tinylfu;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
-use bincode::{Decode, Encode};
-use serde::{Deserialize, Serialize};
-
+use bincode::Decode;
+use bincode::Encode;
 // Re-export common types and traits
 pub use blocks::{
     BlockError, BlockMetadata, CompleteBlock, ImmutableBlock, LifecyclePin, LifecyclePinRef,
     MutableBlock, WeakBlock,
 };
-pub use integrations::{
-    ApplyError, DecodeOutcome, NoopDelegate, RequestSequence, SchedulableSequence,
-    SchedulableSequenceBuilder, ScheduleError, SequenceDelegate, SequenceEvent, SequenceState,
-};
+pub use integrations::ApplyError;
+pub use integrations::DecodeOutcome;
+pub use integrations::NoopDelegate;
+pub use integrations::RequestSequence;
+pub use integrations::SchedulableSequence;
+pub use integrations::SchedulableSequenceBuilder;
+pub use integrations::ScheduleError;
+pub use integrations::SequenceDelegate;
+pub use integrations::SequenceEvent;
+pub use integrations::SequenceState;
 pub use manager::BlockManager;
 pub use registry::BlockRegistry;
-pub use sequence::{
-    BlockSequence, BlockSequenceError, ExternalBlockAssignments, LogicalBlockAssignmentError,
-    LogicalBlockAssignments, zip_assigned, zip_assigned_pending,
-};
+pub use sequence::BlockSequence;
+pub use sequence::BlockSequenceError;
+pub use sequence::ExternalBlockAssignments;
+pub use sequence::LogicalBlockAssignmentError;
+pub use sequence::LogicalBlockAssignments;
+pub use sequence::zip_assigned;
+pub use sequence::zip_assigned_pending;
+use serde::Deserialize;
+use serde::Serialize;
 
 pub type BlockId = usize;
 pub type SequenceHash = dynamo_tokens::PositionalLineageHash;

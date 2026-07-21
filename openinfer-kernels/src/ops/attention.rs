@@ -1,10 +1,14 @@
 use anyhow::Result;
-use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
+use cudarc::driver::CudaSlice;
+use cudarc::driver::DevicePtr;
+use cudarc::driver::DevicePtrMut;
 use half::bf16;
 
 use crate::ffi;
 use crate::paged_kv::PagedKvLayout;
-use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
+use crate::tensor::DeviceContext;
+use crate::tensor::DeviceVec;
+use crate::tensor::HiddenStates;
 
 /// GQA group sizes (query heads / KV heads) instantiated by FlashInfer's
 /// `DISPATCH_GQA_GROUP_SIZE`; any other ratio throws at dispatch time.

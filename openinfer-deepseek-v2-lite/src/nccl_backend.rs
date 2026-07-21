@@ -1,37 +1,49 @@
-use std::{
-    collections::HashSet,
-    env,
-    ffi::{CStr, OsStr, c_char, c_int, c_void},
-    fs,
-    path::{Path, PathBuf},
-    ptr,
-    sync::{Arc, Mutex, MutexGuard},
-    thread,
-};
+use std::collections::HashSet;
+use std::env;
+use std::ffi::CStr;
+use std::ffi::OsStr;
+use std::ffi::c_char;
+use std::ffi::c_int;
+use std::ffi::c_void;
+use std::fs;
+use std::path::Path;
+use std::path::PathBuf;
+use std::ptr;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::MutexGuard;
+use std::thread;
 
-use anyhow::{Context, Result, bail, ensure};
-use cudarc::{
-    driver::{
-        CudaSlice, DevicePtr, DevicePtrMut,
-        sys::{
-            CUdeviceptr, CUgraph, CUgraphExec, CUstream,
-            CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-        },
-    },
-    nccl::sys::{ncclComm_t, ncclDataType_t, ncclRedOp_t, ncclResult_t},
-};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::bail;
+use anyhow::ensure;
+use cudarc::driver::CudaSlice;
+use cudarc::driver::DevicePtr;
+use cudarc::driver::DevicePtrMut;
+use cudarc::driver::sys::CUdeviceptr;
+use cudarc::driver::sys::CUgraph;
+use cudarc::driver::sys::CUgraphExec;
+use cudarc::driver::sys::CUstream;
+use cudarc::driver::sys::CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL;
+use cudarc::nccl::sys::ncclComm_t;
+use cudarc::nccl::sys::ncclDataType_t;
+use cudarc::nccl::sys::ncclRedOp_t;
+use cudarc::nccl::sys::ncclResult_t;
 use half::bf16;
 use libloading::Library;
-use openinfer_core::{
-    ffi as core_ffi, ops,
-    tensor::{DeviceContext, HiddenStates, HiddenStatesRef},
-};
-use openinfer_kernels::ops::{
-    dsv2_lite_accumulate_fixed_expert_into, dsv2_lite_accumulate_route_row_into,
-};
+use openinfer_core::ffi as core_ffi;
+use openinfer_core::ops;
+use openinfer_core::tensor::DeviceContext;
+use openinfer_core::tensor::HiddenStates;
+use openinfer_core::tensor::HiddenStatesRef;
+use openinfer_kernels::ops::dsv2_lite_accumulate_fixed_expert_into;
+use openinfer_kernels::ops::dsv2_lite_accumulate_route_row_into;
 use serde::Serialize;
 
-use crate::device::{activate, activate_graph_capture, graph_capture_activation_guard};
+use crate::device::activate;
+use crate::device::activate_graph_capture;
+use crate::device::graph_capture_activation_guard;
 
 #[cfg(test)]
 mod tests;

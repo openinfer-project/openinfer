@@ -1,9 +1,12 @@
 use log::debug;
+use openinfer_core::engine::FinishReason;
+use openinfer_core::engine::TokenLogprob;
+use openinfer_core::engine::TokenSink;
 
+use super::ActiveRequestState;
+use super::PendingRequest;
+use super::TokenEvent;
 use crate::executor::RequestId;
-use openinfer_core::engine::{FinishReason, TokenLogprob, TokenSink};
-
-use super::{ActiveRequestState, PendingRequest, TokenEvent};
 
 pub(super) struct PromptEchoEffect {
     pub(super) token_tx: TokenSink,

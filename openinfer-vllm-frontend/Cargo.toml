@@ -1,14 +1,14 @@
 [package]
-name = "openinfer-vllm-frontend"
-license = "Apache-2.0"
-version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
+name = "openinfer-vllm-frontend"
+version = "0.1.0"
 
 [dependencies]
-openinfer-engine = { workspace = true }
 anyhow = { workspace = true }
 axum = { workspace = true }
 log = { workspace = true }
+openinfer-engine = { workspace = true }
 rmp-serde = { workspace = true }
 rmpv = { workspace = true }
 serde = { workspace = true }

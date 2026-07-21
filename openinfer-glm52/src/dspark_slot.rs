@@ -2,15 +2,18 @@
 //! context rows, and the projected context pair. A child module of `dspark`
 //! (fields are `pub(super)`) split out for the module size budget.
 
-use anyhow::{Result, ensure};
+use anyhow::Result;
+use anyhow::ensure;
 use cudarc::driver::CudaSlice;
 use half::bf16;
+use openinfer_kernels::tensor::DeviceContext;
+use openinfer_kernels::tensor::HiddenStates;
 
-use openinfer_kernels::tensor::{DeviceContext, HiddenStates};
-
-use super::{
-    DSPARK_LAYERS, DSPARK_QKV_DIM, GLM52_DSPARK_BLOCK, GLM52_DSPARK_CONTEXT_DIM, GLM52_HIDDEN,
-};
+use super::DSPARK_LAYERS;
+use super::DSPARK_QKV_DIM;
+use super::GLM52_DSPARK_BLOCK;
+use super::GLM52_DSPARK_CONTEXT_DIM;
+use super::GLM52_HIDDEN;
 
 pub(super) struct DsparkLayerKv {
     pub(super) k: HiddenStates,

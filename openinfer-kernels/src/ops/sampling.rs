@@ -1,8 +1,15 @@
-use anyhow::{Result, anyhow, ensure};
-use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
+use anyhow::Result;
+use anyhow::anyhow;
+use anyhow::ensure;
+use cudarc::driver::CudaSlice;
+use cudarc::driver::DevicePtr;
+use cudarc::driver::DevicePtrMut;
 
 use crate::ffi;
-use crate::tensor::{DeviceContext, DeviceVec, HiddenStates, HiddenStatesRef};
+use crate::tensor::DeviceContext;
+use crate::tensor::DeviceVec;
+use crate::tensor::HiddenStates;
+use crate::tensor::HiddenStatesRef;
 
 /// One non-greedy row of a batched sampling call.
 ///

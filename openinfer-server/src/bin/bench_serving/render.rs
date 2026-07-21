@@ -1,18 +1,26 @@
 //! comfy_table renderers for the text report format.
 
 use std::fmt::Write as _;
-use std::io::{IsTerminal, stdout};
+use std::io::IsTerminal;
+use std::io::stdout;
 use std::time::Duration;
 
+use comfy_table::Cell;
+use comfy_table::CellAlignment;
+use comfy_table::Table;
 use comfy_table::modifiers::UTF8_ROUND_CORNERS;
-use comfy_table::presets::{ASCII_FULL_CONDENSED, UTF8_FULL_CONDENSED};
-use comfy_table::{Cell, CellAlignment, Table};
+use comfy_table::presets::ASCII_FULL_CONDENSED;
+use comfy_table::presets::UTF8_FULL_CONDENSED;
 
 use crate::metrics::summarize_durations;
-use crate::report::{
-    CurveReport, DecodeReport, DurationStats, MatrixReport, MixedLoadReport, PrefillReport,
-    RequestReport, RunInfo,
-};
+use crate::report::CurveReport;
+use crate::report::DecodeReport;
+use crate::report::DurationStats;
+use crate::report::MatrixReport;
+use crate::report::MixedLoadReport;
+use crate::report::PrefillReport;
+use crate::report::RequestReport;
+use crate::report::RunInfo;
 use crate::snapshot::format_delta;
 
 pub(crate) fn new_table() -> Table {

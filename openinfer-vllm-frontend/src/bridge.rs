@@ -1,39 +1,65 @@
-use std::collections::{BTreeSet, HashMap};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, atomic::AtomicU8};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::collections::BTreeSet;
+use std::collections::HashMap;
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU8;
+use std::time::Duration;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
-use anyhow::{Context, Result, bail};
-use log::{info, warn};
-use tokio::sync::{mpsc, watch};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::bail;
+use log::info;
+use log::warn;
+use openinfer_engine::engine::EngineHandle;
+use openinfer_engine::engine::GenerateRequest;
+use openinfer_engine::engine::LoadSnapshot;
+use openinfer_engine::engine::RequestAbortReason;
+use openinfer_engine::engine::RequestTag;
+use openinfer_engine::engine::TokenEvent;
+use openinfer_engine::engine::TokenSink;
+use openinfer_engine::engine::TokenStreamReceiver;
+use tokio::sync::mpsc;
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use vllm_engine_core_client::EngineId;
 use vllm_engine_core_client::protocol::dtype::ModelDtype;
 use vllm_engine_core_client::protocol::encode_msgpack;
 use vllm_engine_core_client::protocol::handshake::EngineCoreReadyResponse;
-use vllm_engine_core_client::protocol::logprobs::{Logprobs, MaybeWireLogprobs, PositionLogprobs};
-use vllm_engine_core_client::protocol::output::{
-    EngineCoreEvent, EngineCoreEventType, EngineCoreFinishReason, EngineCoreOutput,
-    EngineCoreOutputs, RequestBatchOutputs, StopReason, UtilityCallOutput,
-};
-use vllm_engine_core_client::protocol::request::{EngineCoreRequest, EngineCoreRequestType};
-use vllm_engine_core_client::protocol::stats::{PrefillStats, SchedulerStats};
-use vllm_engine_core_client::protocol::utility::{
-    UtilityCallId, UtilityOutput, UtilityResultEnvelope,
-};
-use zeromq::prelude::{Socket, SocketRecv, SocketSend};
+use vllm_engine_core_client::protocol::logprobs::Logprobs;
+use vllm_engine_core_client::protocol::logprobs::MaybeWireLogprobs;
+use vllm_engine_core_client::protocol::logprobs::PositionLogprobs;
+use vllm_engine_core_client::protocol::output::EngineCoreEvent;
+use vllm_engine_core_client::protocol::output::EngineCoreEventType;
+use vllm_engine_core_client::protocol::output::EngineCoreFinishReason;
+use vllm_engine_core_client::protocol::output::EngineCoreOutput;
+use vllm_engine_core_client::protocol::output::EngineCoreOutputs;
+use vllm_engine_core_client::protocol::output::RequestBatchOutputs;
+use vllm_engine_core_client::protocol::output::StopReason;
+use vllm_engine_core_client::protocol::output::UtilityCallOutput;
+use vllm_engine_core_client::protocol::request::EngineCoreRequest;
+use vllm_engine_core_client::protocol::request::EngineCoreRequestType;
+use vllm_engine_core_client::protocol::stats::PrefillStats;
+use vllm_engine_core_client::protocol::stats::SchedulerStats;
+use vllm_engine_core_client::protocol::utility::UtilityCallId;
+use vllm_engine_core_client::protocol::utility::UtilityOutput;
+use vllm_engine_core_client::protocol::utility::UtilityResultEnvelope;
+use zeromq::DealerSocket;
+use zeromq::PushSocket;
+use zeromq::SocketOptions;
+use zeromq::ZmqMessage;
+use zeromq::prelude::Socket;
+use zeromq::prelude::SocketRecv;
+use zeromq::prelude::SocketSend;
 use zeromq::util::PeerIdentity;
-use zeromq::{DealerSocket, PushSocket, SocketOptions, ZmqMessage};
 
-use openinfer_engine::engine::{
-    EngineHandle, GenerateRequest, LoadSnapshot, RequestAbortReason, RequestTag, TokenEvent,
-    TokenSink, TokenStreamReceiver,
-};
-
-use crate::wire::{
-    convert_finish_reason, convert_sampling, lora_adapter_from_sampling_params, requested_logprobs,
-    to_wire_position_logprobs,
-};
+use crate::wire::convert_finish_reason;
+use crate::wire::convert_sampling;
+use crate::wire::lora_adapter_from_sampling_params;
+use crate::wire::requested_logprobs;
+use crate::wire::to_wire_position_logprobs;
 
 pub(crate) struct LocalEngineBridge {
     pub(crate) input_address: String,

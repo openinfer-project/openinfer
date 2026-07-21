@@ -1,25 +1,56 @@
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
-use std::fs::{self, File};
+use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::fs::File;
+use std::fs::{self};
 use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::Path;
+use std::path::PathBuf;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
-use anyhow::{Context, Result, anyhow, bail};
-use clap::{Args, Parser, Subcommand};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::anyhow;
+use anyhow::bail;
+use clap::Args;
+use clap::Parser;
+use clap::Subcommand;
 use cudarc::driver::sys;
 use openinfer_cupti::profile_range_with_prepare;
 use openinfer_kernels::tensor::DeviceContext;
-use openinfer_qwen3::kernel_bench::{
-    AttentionDecodeCase, AttentionKernelShape, AttentionKernelSpec, AttentionKernelVariant,
-    AttentionPrefillCase, DecodePath, DenseCase, DenseKernelKind, DevicePeakBandwidth,
-    GemmProjection, HEAD_DIM, HIDDEN_SIZE, INTERMEDIATE_SIZE, L2CacheClear, NUM_KV_HEADS,
-    NUM_QO_HEADS, PAGE_SIZE, PrefillAttentionShape, PrefillAttentionSpec, PrefillAttentionVariant,
-    PrefillStage, REPORT_ITERS, SinglePrefillCase, SplitKvConfig, VOCAB_SIZE, cache_clear_bytes,
-};
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
+use openinfer_qwen3::kernel_bench::AttentionDecodeCase;
+use openinfer_qwen3::kernel_bench::AttentionKernelShape;
+use openinfer_qwen3::kernel_bench::AttentionKernelSpec;
+use openinfer_qwen3::kernel_bench::AttentionKernelVariant;
+use openinfer_qwen3::kernel_bench::AttentionPrefillCase;
+use openinfer_qwen3::kernel_bench::DecodePath;
+use openinfer_qwen3::kernel_bench::DenseCase;
+use openinfer_qwen3::kernel_bench::DenseKernelKind;
+use openinfer_qwen3::kernel_bench::DevicePeakBandwidth;
+use openinfer_qwen3::kernel_bench::GemmProjection;
+use openinfer_qwen3::kernel_bench::HEAD_DIM;
+use openinfer_qwen3::kernel_bench::HIDDEN_SIZE;
+use openinfer_qwen3::kernel_bench::INTERMEDIATE_SIZE;
+use openinfer_qwen3::kernel_bench::L2CacheClear;
+use openinfer_qwen3::kernel_bench::NUM_KV_HEADS;
+use openinfer_qwen3::kernel_bench::NUM_QO_HEADS;
+use openinfer_qwen3::kernel_bench::PAGE_SIZE;
+use openinfer_qwen3::kernel_bench::PrefillAttentionShape;
+use openinfer_qwen3::kernel_bench::PrefillAttentionSpec;
+use openinfer_qwen3::kernel_bench::PrefillAttentionVariant;
+use openinfer_qwen3::kernel_bench::PrefillStage;
+use openinfer_qwen3::kernel_bench::REPORT_ITERS;
+use openinfer_qwen3::kernel_bench::SinglePrefillCase;
+use openinfer_qwen3::kernel_bench::SplitKvConfig;
+use openinfer_qwen3::kernel_bench::VOCAB_SIZE;
+use openinfer_qwen3::kernel_bench::cache_clear_bytes;
+use serde::Deserialize;
+use serde::Serialize;
+use serde_json::Value;
+use serde_json::json;
+use sha2::Digest;
+use sha2::Sha256;
 
 const DEFAULT_MANIFEST: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/kernel_manifests/qwen3.toml");
 const DEFAULT_OP: &str = "paged_decode_attention";

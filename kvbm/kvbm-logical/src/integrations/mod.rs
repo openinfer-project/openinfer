@@ -9,7 +9,12 @@ mod request;
 mod scheduled;
 
 pub use request::RequestSequence;
-pub use scheduled::{
-    ApplyError, DecodeOutcome, NoopDelegate, SchedulableSequence, SchedulableSequenceBuilder,
-    ScheduleError, SequenceDelegate, SequenceEvent, SequenceState,
-};
+pub use scheduled::ApplyError;
+pub use scheduled::DecodeOutcome;
+pub use scheduled::NoopDelegate;
+pub use scheduled::SchedulableSequence;
+pub use scheduled::SchedulableSequenceBuilder;
+pub use scheduled::ScheduleError;
+pub use scheduled::SequenceDelegate;
+pub use scheduled::SequenceEvent;
+pub use scheduled::SequenceState;

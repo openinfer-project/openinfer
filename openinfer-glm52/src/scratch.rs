@@ -24,21 +24,24 @@
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
 use half::bf16;
-
-use openinfer_kernels::ops::{
-    GLM52_TP_TOKENS, Glm52DeepGemmMqaLogitsShape, Glm52FlashMlaSparseDecode,
-    argmax_batch_bf16_split_partials_len,
-};
+use openinfer_kernels::ops::GLM52_TP_TOKENS;
+use openinfer_kernels::ops::Glm52DeepGemmMqaLogitsShape;
+use openinfer_kernels::ops::Glm52FlashMlaSparseDecode;
+use openinfer_kernels::ops::argmax_batch_bf16_split_partials_len;
 use openinfer_kernels::tensor::DeviceContext;
 
-use crate::config::{GLM52_DENSE_INTERMEDIATE, GLM52_HIDDEN, GLM52_VOCAB};
+use crate::config::GLM52_DENSE_INTERMEDIATE;
+use crate::config::GLM52_HIDDEN;
+use crate::config::GLM52_VOCAB;
 use crate::dspark::GLM52_DSPARK_CONTEXT_DIM;
 use crate::fp8::Glm52MlpScratch;
 use crate::indexer::Glm52IndexerScratch;
 use crate::layer::Glm52LayerScratch;
-use crate::mla_decode::{Glm52MlaAttendScratch, Glm52MlaBackend};
+use crate::mla_decode::Glm52MlaAttendScratch;
+use crate::mla_decode::Glm52MlaBackend;
 use crate::mla_front::Glm52MlaFront;
-use crate::moe_decode::{GLM52_SHARED_EXPERT_INTERMEDIATE, Glm52RouterScratch};
+use crate::moe_decode::GLM52_SHARED_EXPERT_INTERMEDIATE;
+use crate::moe_decode::Glm52RouterScratch;
 use crate::rows::Rows;
 
 /// Everything one decode step writes, allocated once per rank and sized for

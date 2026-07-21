@@ -1,4 +1,5 @@
-use openinfer_kernels::triton_cubin::{self, QWEN35_GDR_CHUNK_SOLVE};
+use openinfer_kernels::triton_cubin::QWEN35_GDR_CHUNK_SOLVE;
+use openinfer_kernels::triton_cubin::{self};
 
 fn main() -> tvm_ffi::Result<()> {
     triton_cubin::register_global_functions()?;

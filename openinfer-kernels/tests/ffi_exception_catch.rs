@@ -2,10 +2,12 @@
 //! for Qwen3-14B — and asserts the FlashInfer throw surfaces as the -1
 //! sentinel plus a message. Before the guard this aborted the whole process.
 
-use std::ffi::{CStr, c_void};
+use std::ffi::CStr;
+use std::ffi::c_void;
 use std::ptr;
 
-use anyhow::{Result, ensure};
+use anyhow::Result;
+use anyhow::ensure;
 use openinfer_kernels::ffi;
 
 unsafe extern "C" {

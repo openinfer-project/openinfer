@@ -1,11 +1,11 @@
 [package]
-name = "openinfer-kimi-k2"
-license = "Apache-2.0"
-version = "0.1.0"
-edition = "2024"
 autobenches = false
 autobins = false
 autotests = false
+edition = "2024"
+license = "Apache-2.0"
+name = "openinfer-kimi-k2"
+version = "0.1.0"
 
 [dependencies]
 anyhow = { workspace = true }
@@ -19,8 +19,8 @@ memmap2 = { workspace = true }
 openinfer-bench = { workspace = true }
 openinfer-core = { workspace = true }
 openinfer-kernels = { workspace = true }
-openinfer-sample = { workspace = true }
 openinfer-kv-cache = { workspace = true }
+openinfer-sample = { workspace = true }
 rand = { workspace = true }
 safetensors = { workspace = true }
 serde = { workspace = true }
@@ -29,13 +29,9 @@ tokio = { workspace = true }
 
 [features]
 default = []
-kimi-k2 = ["openinfer-kernels/kimi-k2"]
 kernel-call-trace = ["openinfer-core/kernel-call-trace"]
-kernel-report = [
-    "dep:clap",
-    "kimi-k2",
-    "kernel-call-trace",
-]
+kernel-report = ["dep:clap", "kimi-k2", "kernel-call-trace"]
+kimi-k2 = ["openinfer-kernels/kimi-k2"]
 
 [[test]]
 name = "vllm_golden_gate"

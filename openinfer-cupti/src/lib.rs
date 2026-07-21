@@ -1,4 +1,8 @@
-use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use std::ffi::CStr;
+use std::ffi::CString;
+use std::ffi::c_char;
+use std::ffi::c_int;
+use std::ffi::c_void;
 
 type CuContext = *mut c_void;
 type CuptiCallback = Option<unsafe extern "C" fn(*mut c_void) -> c_int>;

@@ -38,16 +38,17 @@ mod registration;
 pub(crate) mod tests;
 
 // Re-export public types
-pub use attachments::{AttachmentError, TypedAttachments};
-pub use handle::BlockRegistrationHandle;
+use std::sync::Arc;
+use std::sync::Weak;
 
-use crate::{events::EventsManager, tinylfu::FrequencyTracker};
+pub use attachments::AttachmentError;
+pub use attachments::TypedAttachments;
+pub use handle::BlockRegistrationHandle;
+use handle::BlockRegistrationHandleInner;
 
 use crate::blocks::SequenceHash;
-
-use std::sync::{Arc, Weak};
-
-use handle::BlockRegistrationHandleInner;
+use crate::events::EventsManager;
+use crate::tinylfu::FrequencyTracker;
 
 pub(crate) type PositionalRadixTree<V> = prt::PositionalRadixTree<V, SequenceHash>;
 

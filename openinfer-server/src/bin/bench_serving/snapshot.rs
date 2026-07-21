@@ -3,19 +3,34 @@
 
 use std::fmt::Write as _;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 
-use anyhow::{Context, Result, ensure};
-use comfy_table::{Cell, CellAlignment};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::ensure;
+use comfy_table::Cell;
+use comfy_table::CellAlignment;
 use log::info;
 use openinfer::server_engine::ModelType;
 
-use crate::cli::{Cli, CompareArgs, MixedArgs, RunArgs, SnapshotArgs};
+use crate::cli::Cli;
+use crate::cli::CompareArgs;
+use crate::cli::MixedArgs;
+use crate::cli::RunArgs;
+use crate::cli::SnapshotArgs;
 use crate::exec::BenchModel;
 use crate::prompt::synthetic_prompt_tokens;
-use crate::render::{key_cell, new_table, numeric_cell, push_table};
-use crate::report::{BenchReport, SnapshotMixedItl, SnapshotProfile, SnapshotReport};
-use crate::runners::{build_request_metrics, measure_timings};
+use crate::render::key_cell;
+use crate::render::new_table;
+use crate::render::numeric_cell;
+use crate::render::push_table;
+use crate::report::BenchReport;
+use crate::report::SnapshotMixedItl;
+use crate::report::SnapshotProfile;
+use crate::report::SnapshotReport;
+use crate::runners::build_request_metrics;
+use crate::runners::measure_timings;
 
 pub(crate) const SNAPSHOT_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../bench_snapshots");
 pub(crate) const SNAPSHOT_PREFILL_OUTPUT_LEN: usize = 1;

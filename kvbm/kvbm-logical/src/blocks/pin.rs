@@ -28,7 +28,9 @@
 use std::sync::Arc;
 
 use crate::ManagerId;
-use crate::blocks::{BlockId, BlockRegistrationHandle, SequenceHash};
+use crate::blocks::BlockId;
+use crate::blocks::BlockRegistrationHandle;
+use crate::blocks::SequenceHash;
 
 /// Type-erased view of a registered slot's lifecycle. Implemented on the
 /// crate-private `ImmutableBlockInner<T>` so the policy parameter `T`
@@ -89,7 +91,9 @@ impl std::fmt::Debug for LifecyclePinRef {
 #[cfg(test)]
 mod tests {
     use crate::ManagerId;
-    use crate::testing::{TestMeta, create_iota_token_block, create_test_manager};
+    use crate::testing::TestMeta;
+    use crate::testing::create_iota_token_block;
+    use crate::testing::create_test_manager;
 
     /// Helper: register a single block in `manager` and return both the
     /// resulting `ImmutableBlock` and the `ManagerId` derived from its pin.

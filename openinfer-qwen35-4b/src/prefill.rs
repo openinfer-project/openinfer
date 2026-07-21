@@ -1,5 +1,7 @@
 use anyhow::Result;
-use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
+use cudarc::driver::CudaSlice;
+use cudarc::driver::DevicePtr;
+use cudarc::driver::DevicePtrMut;
 
 /// Sequence length used for conservative prefill scratch reservation.
 ///
@@ -18,16 +20,20 @@ pub(crate) const SCRATCH_ESTIMATE_SEQ: usize = 20_000;
 pub(crate) const PREFILL_CHUNK_LEN: usize = SCRATCH_ESTIMATE_SEQ;
 const HEAD_DIM: usize = 256;
 
+use openinfer_core::kv_pool::KvState;
+use openinfer_core::tensor::DeviceVec;
+use openinfer_core::tensor::HiddenStates;
+
 use super::prefill_buffers::GdrChunkwiseScratch35;
 use super::recurrent_state::RecurrentState;
-use super::weights::{
-    FullAttentionLayer, LayerKind, LinearAttentionLayer, Qwen35Model, TransformerBlock35,
-};
+use super::weights::FullAttentionLayer;
+use super::weights::LayerKind;
+use super::weights::LinearAttentionLayer;
+use super::weights::Qwen35Model;
+use super::weights::TransformerBlock35;
 use crate::ffi;
 use crate::ops;
 use crate::ops::PrefillPagedPlan;
-use openinfer_core::kv_pool::KvState;
-use openinfer_core::tensor::{DeviceVec, HiddenStates};
 
 fn checked_prefill_end_pos(
     base_pos: usize,

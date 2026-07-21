@@ -1,7 +1,12 @@
 use std::collections::HashSet;
 use std::fmt::Write as _;
 
-use super::{GraphDescription, GraphNode, GraphNodeKind, dependency_type_name, dims, dot_escape};
+use super::GraphDescription;
+use super::GraphNode;
+use super::GraphNodeKind;
+use super::dependency_type_name;
+use super::dims;
+use super::dot_escape;
 
 const MAX_VISIBLE_REPEAT_WIDTH: usize = 32;
 
@@ -433,7 +438,10 @@ fn compact_kernel_name(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{GraphDescription, GraphEdge, GraphNode, GraphNodeKind};
+    use super::super::GraphDescription;
+    use super::super::GraphEdge;
+    use super::super::GraphNode;
+    use super::super::GraphNodeKind;
     use super::compact_kernel_name;
 
     fn kernel(name: &str) -> GraphNode {

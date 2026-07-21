@@ -1,0 +1,5 @@
+# Rust formatting config. `cargo +nightly fmt` — several options below are
+# nightly-only (import grouping, doc-comment formatting).
+format_code_in_doc_comments = true
+group_imports = "StdExternalCrate"
+imports_granularity = "Item"

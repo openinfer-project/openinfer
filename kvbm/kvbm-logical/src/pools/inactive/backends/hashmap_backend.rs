@@ -6,12 +6,12 @@
 //! Maps `SequenceHash → BlockId` and delegates eviction order to a pluggable
 //! [`ReusePolicy`] (FIFO is the default).
 
+use super::ReusePolicy;
 use crate::BlockId;
 use crate::blocks::SequenceHash;
+use crate::pools::InactiveBlock;
+use crate::pools::SeqHashMap;
 use crate::pools::store::InactiveIndex;
-use crate::pools::{InactiveBlock, SeqHashMap};
-
-use super::ReusePolicy;
 
 pub(crate) struct HashMapBackend {
     /// Identity-hashed: `SequenceHash` is already a content hash.

@@ -1,34 +1,75 @@
-use anyhow::{Result, bail, ensure};
+use anyhow::Result;
+use anyhow::bail;
+use anyhow::ensure;
 use cudarc::driver::CudaSlice;
 use half::bf16;
+use openinfer_bench::attr_usize;
+use openinfer_bench::axis;
+use openinfer_bench::input;
+use openinfer_bench::measure_loop;
+use openinfer_bench::output;
+use openinfer_bench::zero_matrix;
+use openinfer_bench::zero_weight;
 // The model-agnostic harness — timing loop, latency stats, `KernelCall` accessors —
 // lives in `openinfer-bench`. Re-export the types the report bins consume so their
 // `openinfer_kimi_k2::kernel_report::{LatencyStats, MeasuredCall, bench_key}` imports
 // keep resolving here; only Kimi's `measure_*` providers and `measure_call` are local.
 pub use openinfer_bench::{LatencyStats, MeasuredCall, bench_key};
-use openinfer_bench::{attr_usize, axis, input, measure_loop, output, zero_matrix, zero_weight};
-use openinfer_kernels::{
-    ops::{
-        KIMI_K2_EXPERT_INTERMEDIATE, KIMI_K2_HIDDEN, KIMI_K2_INT4_GROUP_SIZE,
-        KIMI_K2_LOCAL_EXPERTS, KIMI_K2_MLA_ABS_Q_LOCAL_OUT_TP8, KIMI_K2_MLA_KV_B_LOCAL_OUT_TP8,
-        KIMI_K2_MLA_KV_LORA_RANK, KIMI_K2_MLA_LOCAL_HEADS_TP8, KIMI_K2_MLA_O_LOCAL_IN_TP8,
-        KIMI_K2_MLA_Q_LOCAL_OUT_TP8, KIMI_K2_MLA_Q_PE_LOCAL_OUT_TP8, KIMI_K2_MLA_QKV_A_OUT,
-        KIMI_K2_MLA_ROPE_DIM, KIMI_K2_TOPK, KimiInt4ExpertRole, KimiInt4NibbleOrder,
-        KimiInt4WeightManifest, KimiMarlinFusedW13Int4Weight, KimiMarlinInt4Weight,
-        KimiMarlinRouteWorkspace, KimiMarlinWna16Workspace, KimiMlaPagedKvLayout, KimiRouterBatch,
-        KimiRouterConfig, KimiRouterOutput, add_batch_into, embedding_batch_vocab_shard,
-        flashinfer_top1_batch_into, flashinfer_top1_row_states_bytes,
-        fused_add_rms_norm_round_batch_into, gemm_graphsafe_into_checked,
-        kimi_add_f32_bf16_to_bf16, kimi_flashinfer_batch_decode_mla_rt,
-        kimi_marlin_sum_topk_rows_f32, kimi_marlin_w13_swiglu, kimi_marlin_wna16_w2_gemm,
-        kimi_marlin_wna16_w13_gemm, kimi_mla_absorb_q_nope_rt, kimi_mla_rope_split_decode_rt,
-        kimi_mla_split_qkv_a, kimi_mla_split_qkv_a_norm, kimi_mla_v_up_rt,
-        kimi_moe_marlin_align_block_size, kimi_residual_add_scaled_f32,
-        kimi_router_noaux_tc_launch, repeat_f32_for_reduce_scatter_into, rms_norm_batch_into,
-        scale_f32_in_place, silu_mul_batch_into,
-    },
-    tensor::{DeviceContext, DeviceVec, GpuTensor, HiddenStates, KernelCall, NormWeight},
-};
+use openinfer_kernels::ops::KIMI_K2_EXPERT_INTERMEDIATE;
+use openinfer_kernels::ops::KIMI_K2_HIDDEN;
+use openinfer_kernels::ops::KIMI_K2_INT4_GROUP_SIZE;
+use openinfer_kernels::ops::KIMI_K2_LOCAL_EXPERTS;
+use openinfer_kernels::ops::KIMI_K2_MLA_ABS_Q_LOCAL_OUT_TP8;
+use openinfer_kernels::ops::KIMI_K2_MLA_KV_B_LOCAL_OUT_TP8;
+use openinfer_kernels::ops::KIMI_K2_MLA_KV_LORA_RANK;
+use openinfer_kernels::ops::KIMI_K2_MLA_LOCAL_HEADS_TP8;
+use openinfer_kernels::ops::KIMI_K2_MLA_O_LOCAL_IN_TP8;
+use openinfer_kernels::ops::KIMI_K2_MLA_Q_LOCAL_OUT_TP8;
+use openinfer_kernels::ops::KIMI_K2_MLA_Q_PE_LOCAL_OUT_TP8;
+use openinfer_kernels::ops::KIMI_K2_MLA_QKV_A_OUT;
+use openinfer_kernels::ops::KIMI_K2_MLA_ROPE_DIM;
+use openinfer_kernels::ops::KIMI_K2_TOPK;
+use openinfer_kernels::ops::KimiInt4ExpertRole;
+use openinfer_kernels::ops::KimiInt4NibbleOrder;
+use openinfer_kernels::ops::KimiInt4WeightManifest;
+use openinfer_kernels::ops::KimiMarlinFusedW13Int4Weight;
+use openinfer_kernels::ops::KimiMarlinInt4Weight;
+use openinfer_kernels::ops::KimiMarlinRouteWorkspace;
+use openinfer_kernels::ops::KimiMarlinWna16Workspace;
+use openinfer_kernels::ops::KimiMlaPagedKvLayout;
+use openinfer_kernels::ops::KimiRouterBatch;
+use openinfer_kernels::ops::KimiRouterConfig;
+use openinfer_kernels::ops::KimiRouterOutput;
+use openinfer_kernels::ops::add_batch_into;
+use openinfer_kernels::ops::embedding_batch_vocab_shard;
+use openinfer_kernels::ops::flashinfer_top1_batch_into;
+use openinfer_kernels::ops::flashinfer_top1_row_states_bytes;
+use openinfer_kernels::ops::fused_add_rms_norm_round_batch_into;
+use openinfer_kernels::ops::gemm_graphsafe_into_checked;
+use openinfer_kernels::ops::kimi_add_f32_bf16_to_bf16;
+use openinfer_kernels::ops::kimi_flashinfer_batch_decode_mla_rt;
+use openinfer_kernels::ops::kimi_marlin_sum_topk_rows_f32;
+use openinfer_kernels::ops::kimi_marlin_w13_swiglu;
+use openinfer_kernels::ops::kimi_marlin_wna16_w2_gemm;
+use openinfer_kernels::ops::kimi_marlin_wna16_w13_gemm;
+use openinfer_kernels::ops::kimi_mla_absorb_q_nope_rt;
+use openinfer_kernels::ops::kimi_mla_rope_split_decode_rt;
+use openinfer_kernels::ops::kimi_mla_split_qkv_a;
+use openinfer_kernels::ops::kimi_mla_split_qkv_a_norm;
+use openinfer_kernels::ops::kimi_mla_v_up_rt;
+use openinfer_kernels::ops::kimi_moe_marlin_align_block_size;
+use openinfer_kernels::ops::kimi_residual_add_scaled_f32;
+use openinfer_kernels::ops::kimi_router_noaux_tc_launch;
+use openinfer_kernels::ops::repeat_f32_for_reduce_scatter_into;
+use openinfer_kernels::ops::rms_norm_batch_into;
+use openinfer_kernels::ops::scale_f32_in_place;
+use openinfer_kernels::ops::silu_mul_batch_into;
+use openinfer_kernels::tensor::DeviceContext;
+use openinfer_kernels::tensor::DeviceVec;
+use openinfer_kernels::tensor::GpuTensor;
+use openinfer_kernels::tensor::HiddenStates;
+use openinfer_kernels::tensor::KernelCall;
+use openinfer_kernels::tensor::NormWeight;
 
 pub fn measure_call(call: &KernelCall, iters: u64) -> Result<MeasuredCall> {
     let stats = match call.op.as_str() {

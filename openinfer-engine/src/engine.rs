@@ -1,16 +1,17 @@
-use std::{
-    any::Any,
-    error::Error,
-    fmt,
-    path::PathBuf,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU8, Ordering},
-    },
-    thread::{self, JoinHandle},
-};
+use std::any::Any;
+use std::error::Error;
+use std::fmt;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicU8;
+use std::sync::atomic::Ordering;
+use std::thread::JoinHandle;
+use std::thread::{self};
 
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::mpsc;
+use tokio::sync::oneshot;
+use tokio::sync::watch;
 
 use crate::parallel::ParallelConfig;
 use crate::sampler::SamplingParams;
@@ -661,10 +662,9 @@ impl Drop for EngineInner {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    };
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
 
     use super::*;
 

@@ -13,33 +13,47 @@
 //! as-loaded and every projection relays its activation scale into the TRTLLM
 //! col-major TMA layout before the blockscale linear (the documented footgun).
 
-use anyhow::{Result, ensure};
+use anyhow::Result;
+use anyhow::ensure;
 use cudarc::driver::CudaSlice;
 use half::bf16;
-
+use openinfer_kernels::ops::GLM52_FLASHINFER_SPARSE_BYTES_PER_TOKEN;
+use openinfer_kernels::ops::GLM52_FLASHINFER_SPARSE_WORKSPACE_BYTES;
+use openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN;
 #[cfg(test)]
 use openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_PAGE_SIZE;
-use openinfer_kernels::ops::{
-    GLM52_FLASHINFER_SPARSE_BYTES_PER_TOKEN, GLM52_FLASHINFER_SPARSE_WORKSPACE_BYTES,
-    GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN, GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW,
-    GLM52_SPARSE_MLA_HEAD_SLOTS, Glm52FlashInferSparseDecode, Glm52FlashMlaSparseDecode,
-    Glm52MoeQuantShape, Glm52SparseMlaDecode, gemm_strided_batched_bf16,
-    glm52_flashinfer_sparse_mla_fp8_launch, glm52_flashinfer_sparse_mla_supported,
-    glm52_flashmla_sparse_decode_launch, glm52_flashmla_sparse_decode_metadata_launch,
-    glm52_fp8_per_token_group_quant_bf16_ue8m0_launch, glm52_mla_cache_pack_launch,
-    glm52_mla_front_pack_fp8_launch, glm52_mla_query_assemble_launch,
-    glm52_sparse_mla_decode_launch,
-};
+use openinfer_kernels::ops::GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW;
+use openinfer_kernels::ops::GLM52_SPARSE_MLA_HEAD_SLOTS;
+use openinfer_kernels::ops::Glm52FlashInferSparseDecode;
+use openinfer_kernels::ops::Glm52FlashMlaSparseDecode;
+use openinfer_kernels::ops::Glm52MoeQuantShape;
+use openinfer_kernels::ops::Glm52SparseMlaDecode;
+use openinfer_kernels::ops::gemm_strided_batched_bf16;
+use openinfer_kernels::ops::glm52_flashinfer_sparse_mla_fp8_launch;
+use openinfer_kernels::ops::glm52_flashinfer_sparse_mla_supported;
+use openinfer_kernels::ops::glm52_flashmla_sparse_decode_launch;
+use openinfer_kernels::ops::glm52_flashmla_sparse_decode_metadata_launch;
+use openinfer_kernels::ops::glm52_fp8_per_token_group_quant_bf16_ue8m0_launch;
+use openinfer_kernels::ops::glm52_mla_cache_pack_launch;
+use openinfer_kernels::ops::glm52_mla_front_pack_fp8_launch;
+use openinfer_kernels::ops::glm52_mla_query_assemble_launch;
+use openinfer_kernels::ops::glm52_sparse_mla_decode_launch;
 use openinfer_kernels::tensor::DeviceContext;
 
-use crate::config::{
-    GLM52_HEADS, GLM52_HIDDEN, GLM52_KV_LORA_RANK, GLM52_QK_HEAD_DIM, GLM52_QK_NOPE_HEAD_DIM,
-    GLM52_QK_ROPE_HEAD_DIM, GLM52_RMS_EPS as RMS_EPS, GLM52_V_HEAD_DIM,
-};
-use crate::fp8::{FP8_BLOCK, fp8_linear_into};
+use crate::config::GLM52_HEADS;
+use crate::config::GLM52_HIDDEN;
+use crate::config::GLM52_KV_LORA_RANK;
+use crate::config::GLM52_QK_HEAD_DIM;
+use crate::config::GLM52_QK_NOPE_HEAD_DIM;
+use crate::config::GLM52_QK_ROPE_HEAD_DIM;
+use crate::config::GLM52_RMS_EPS as RMS_EPS;
+use crate::config::GLM52_V_HEAD_DIM;
+use crate::fp8::FP8_BLOCK;
+use crate::fp8::fp8_linear_into;
+use crate::mla_front::Glm52MlaFront;
+use crate::mla_front::Glm52MlaLayerWeights;
 #[cfg(test)]
 use crate::mla_front::glm52_mla_front_into;
-use crate::mla_front::{Glm52MlaFront, Glm52MlaLayerWeights};
 use crate::rows::Rows;
 
 // Local short names for the config-owned architecture constants (the module

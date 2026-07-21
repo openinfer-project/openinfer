@@ -15,7 +15,6 @@ use crate::dspark::MarkovHead;
 /// - `fixed_bytes` does not scale with the pool (billed via the memory margin):
 ///   the draft weights plus the lane-level batched scratch sized for the whole
 ///   decode batch.
-///
 // TODO: the draft scratch is now a single lane-level `DFlashBatchScratch`
 // allocated once (dense buffers sized `max_batch * block_size`, plus one shared
 // varlen tail), not a per-request buffer. The per-token `tail_scratch` term and

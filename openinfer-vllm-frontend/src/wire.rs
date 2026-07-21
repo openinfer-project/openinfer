@@ -1,12 +1,12 @@
-use anyhow::{Result, bail};
-use vllm_engine_core_client::protocol::logprobs::{
-    PositionLogprobs, TokenLogprob as WireTokenLogprob,
-};
+use anyhow::Result;
+use anyhow::bail;
+use openinfer_engine::engine::FinishReason;
+use openinfer_engine::engine::TokenLogprob;
+use openinfer_engine::sampler::SamplingParams;
+use vllm_engine_core_client::protocol::logprobs::PositionLogprobs;
+use vllm_engine_core_client::protocol::logprobs::TokenLogprob as WireTokenLogprob;
 use vllm_engine_core_client::protocol::output::EngineCoreFinishReason;
 use vllm_engine_core_client::protocol::sampling::EngineCoreSamplingParams;
-
-use openinfer_engine::engine::{FinishReason, TokenLogprob};
-use openinfer_engine::sampler::SamplingParams;
 
 pub(crate) const LORA_ADAPTER_XARG: &str = "openinfer_lora_adapter";
 
@@ -143,9 +143,11 @@ pub(crate) fn convert_finish_reason(reason: FinishReason) -> EngineCoreFinishRea
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeSet, HashMap};
+    use std::collections::BTreeSet;
+    use std::collections::HashMap;
 
-    use vllm_engine_core_client::protocol::logprobs::{Logprobs, MaybeWireLogprobs};
+    use vllm_engine_core_client::protocol::logprobs::Logprobs;
+    use vllm_engine_core_client::protocol::logprobs::MaybeWireLogprobs;
 
     use super::*;
 

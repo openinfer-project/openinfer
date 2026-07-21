@@ -10,14 +10,20 @@
 
 use anyhow::Result;
 use half::bf16;
-
-use openinfer_kernels::ops::{GLM52_INDEXER_TOPK, Glm52IndexerCacheLayout};
+use openinfer_kernels::ops::GLM52_INDEXER_TOPK;
+use openinfer_kernels::ops::Glm52IndexerCacheLayout;
 use openinfer_kernels::tensor::DeviceContext;
 
-use crate::config::{GLM52_HIDDEN, GLM52_INDEX_HEAD_DIM, GLM52_Q_LORA_RANK, GLM52_ROPE_HALF};
-use crate::fp8::{FP8_BLOCK, Glm52ProjBytes};
-use crate::indexer::{Glm52IndexerLayerWeights, glm52_indexer_forward};
-use crate::model::{INDEX_CACHE_BLOCK, NUM_SMS};
+use crate::config::GLM52_HIDDEN;
+use crate::config::GLM52_INDEX_HEAD_DIM;
+use crate::config::GLM52_Q_LORA_RANK;
+use crate::config::GLM52_ROPE_HALF;
+use crate::fp8::FP8_BLOCK;
+use crate::fp8::Glm52ProjBytes;
+use crate::indexer::Glm52IndexerLayerWeights;
+use crate::indexer::glm52_indexer_forward;
+use crate::model::INDEX_CACHE_BLOCK;
+use crate::model::NUM_SMS;
 use crate::rows::Rows;
 
 const HIDDEN: usize = GLM52_HIDDEN;

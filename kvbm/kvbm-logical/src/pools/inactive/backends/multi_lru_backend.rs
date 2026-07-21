@@ -7,9 +7,9 @@
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
+use anyhow::Result;
+use anyhow::bail;
 use lru::LruCache;
-
-use anyhow::{Result, bail};
 
 use crate::BlockId;
 use crate::blocks::SequenceHash;
@@ -201,7 +201,8 @@ impl InactiveIndex for MultiLruBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{block_id_and_hash, tokens_for_id};
+    use crate::testing::block_id_and_hash;
+    use crate::testing::tokens_for_id;
     use crate::tinylfu::TinyLFUTracker;
 
     impl MultiLruBackend {

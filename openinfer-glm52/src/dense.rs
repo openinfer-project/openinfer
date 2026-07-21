@@ -11,9 +11,12 @@ use half::bf16;
 use openinfer_kernels::tensor::DeviceContext;
 
 use crate::config::GLM52_HIDDEN;
+use crate::fp8::Glm52MlpScratch;
 #[cfg(test)]
 use crate::fp8::Glm52ProjBytes;
-use crate::fp8::{Glm52MlpScratch, ProjWeight, fp8_mlp_into, pack_proj_pair};
+use crate::fp8::ProjWeight;
+use crate::fp8::fp8_mlp_into;
+use crate::fp8::pack_proj_pair;
 
 const HIDDEN: usize = GLM52_HIDDEN;
 const INTERMEDIATE: usize = crate::config::GLM52_DENSE_INTERMEDIATE;

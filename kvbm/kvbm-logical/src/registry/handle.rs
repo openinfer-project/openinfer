@@ -3,14 +3,11 @@
 
 //! Block registration handle and its inner implementation.
 
-use super::attachments::{AttachmentError, AttachmentStore, TypedAttachments};
-use super::{BlockRegistry, PositionalRadixTree};
-
-use crate::blocks::{BlockMetadata, SequenceHash};
-
-use std::any::{Any, TypeId};
+use std::any::Any;
+use std::any::TypeId;
 use std::marker::PhantomData;
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
+use std::sync::Weak;
 
 // Under `#[cfg(test)]`, swap in `tracing-mutex`'s parking_lot wrapper
 // so the test suite enforces the documented `attachments → store`
@@ -20,6 +17,14 @@ use std::sync::{Arc, Weak};
 use parking_lot::Mutex;
 #[cfg(test)]
 use tracing_mutex::parkinglot::Mutex;
+
+use super::BlockRegistry;
+use super::PositionalRadixTree;
+use super::attachments::AttachmentError;
+use super::attachments::AttachmentStore;
+use super::attachments::TypedAttachments;
+use crate::blocks::BlockMetadata;
+use crate::blocks::SequenceHash;
 
 /// Handle that represents a block registration in the global registry.
 /// This handle is cloneable and can be shared across pools.

@@ -114,7 +114,8 @@ impl InactiveIndex for LruBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{block_id_and_hash, tokens_for_id};
+    use crate::testing::block_id_and_hash;
+    use crate::testing::tokens_for_id;
 
     #[test]
     fn test_lru_eviction_order() {

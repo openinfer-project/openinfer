@@ -8,14 +8,14 @@ use crate::blocks::*;
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::*;
-
-    use crate::testing::config::{
-        COMMON_TEST_BLOCK_SIZES, generate_test_tokens, validate_test_block_size,
-    };
-    use crate::testing::{TestPoolSetupBuilder, create_test_token_block};
-
     use proptest::prelude::*;
+
+    use super::*;
+    use crate::testing::TestPoolSetupBuilder;
+    use crate::testing::config::COMMON_TEST_BLOCK_SIZES;
+    use crate::testing::config::generate_test_tokens;
+    use crate::testing::config::validate_test_block_size;
+    use crate::testing::create_test_token_block;
 
     proptest! {
         /// Property: complete() on a token block of mismatched size returns

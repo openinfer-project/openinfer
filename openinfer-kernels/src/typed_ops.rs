@@ -4,10 +4,16 @@
 //! dimensions are checked through const generics instead of runtime matrix metadata.
 
 use anyhow::Result;
-use cudarc::driver::{DevicePtr, DevicePtrMut};
+use cudarc::driver::DevicePtr;
+use cudarc::driver::DevicePtrMut;
 
 use crate::ffi;
-use crate::tensor::{DeviceContext, DeviceMatrix, GpuTensor, GpuWeight, HiddenStates, NormWeight};
+use crate::tensor::DeviceContext;
+use crate::tensor::DeviceMatrix;
+use crate::tensor::GpuTensor;
+use crate::tensor::GpuWeight;
+use crate::tensor::HiddenStates;
+use crate::tensor::NormWeight;
 
 // ── GEMM ─────────────────────────────────────────────────────────────
 

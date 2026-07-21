@@ -5,27 +5,35 @@
 //! honor exactly, and retires each request independently when validation,
 //! disconnect, EOS, length, or request-local decode errors occur.
 
-use std::{collections::VecDeque, mem, time::Instant};
+use std::collections::VecDeque;
+use std::mem;
+use std::time::Instant;
 
 mod grouping;
 mod trace;
 
-use anyhow::{Result, ensure};
+use anyhow::Result;
+use anyhow::ensure;
+use grouping::common_decode_position;
+use grouping::restore_surviving_rows;
+use grouping::take_decode_position_groups;
 use log::info;
-use openinfer_engine::{
-    engine::{FinishReason, GenerateRequest, TokenEvent, TokenSink, unix_now_s},
-    sampler::SamplingParams,
-};
+use openinfer_engine::engine::FinishReason;
+use openinfer_engine::engine::GenerateRequest;
+use openinfer_engine::engine::TokenEvent;
+use openinfer_engine::engine::TokenSink;
+use openinfer_engine::engine::unix_now_s;
+use openinfer_engine::sampler::SamplingParams;
 use tokio::sync::mpsc;
+use trace::RequestTrace;
+use trace::ScheduledTrace;
+use trace::http_trace_payload;
 
-use crate::{
-    Config,
-    attribution::DecodeAttributionProfile,
-    host_ops::DecodeCache,
-    runtime::{DeepSeekV2LiteEp2Generator, GenerationStats},
-};
-use grouping::{common_decode_position, restore_surviving_rows, take_decode_position_groups};
-use trace::{RequestTrace, ScheduledTrace, http_trace_payload};
+use crate::Config;
+use crate::attribution::DecodeAttributionProfile;
+use crate::host_ops::DecodeCache;
+use crate::runtime::DeepSeekV2LiteEp2Generator;
+use crate::runtime::GenerationStats;
 
 pub(crate) const DEFAULT_MAX_ACTIVE_REQUESTS: usize = 8;
 

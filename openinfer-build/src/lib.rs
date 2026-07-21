@@ -1,7 +1,6 @@
-use std::{
-    env,
-    path::{Path, PathBuf},
-};
+use std::env;
+use std::path::Path;
+use std::path::PathBuf;
 
 /// Finds a package's install root: probes `$env_var` first, then each of
 /// `default_paths`, for any of the `check_files` — several cover layout

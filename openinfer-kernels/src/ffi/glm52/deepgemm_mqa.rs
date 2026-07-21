@@ -1,4 +1,5 @@
-use cudarc::driver::sys::{CUresult, CUstream};
+use cudarc::driver::sys::CUresult;
+use cudarc::driver::sys::CUstream;
 
 unsafe extern "C" {
     pub fn glm52_deepgemm_paged_mqa_metadata_cuda(

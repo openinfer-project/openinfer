@@ -4,9 +4,10 @@
 
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
-
 use openinfer_core::weight_loader::precompute_rope;
-use openinfer_kernels::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
+use openinfer_kernels::tensor::DeviceContext;
+use openinfer_kernels::tensor::DeviceMatrix;
+use openinfer_kernels::tensor::DeviceVec;
 
 use super::*;
 

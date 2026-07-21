@@ -1,5 +1,8 @@
-use anyhow::{Result, ensure};
-use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
+use anyhow::Result;
+use anyhow::ensure;
+use cudarc::driver::CudaSlice;
+use cudarc::driver::DevicePtr;
+use cudarc::driver::DevicePtrMut;
 
 use crate::ffi;
 use crate::tensor::DeviceContext;

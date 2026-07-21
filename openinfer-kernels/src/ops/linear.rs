@@ -1,11 +1,20 @@
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::AtomicU8;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
-use anyhow::{Result, bail, ensure};
-use cudarc::driver::{DevicePtr, DevicePtrMut};
+use anyhow::Result;
+use anyhow::bail;
+use anyhow::ensure;
+use cudarc::driver::DevicePtr;
+use cudarc::driver::DevicePtrMut;
 use half::bf16;
 
 use crate::ffi;
-use crate::tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates, HiddenStatesRef};
+use crate::tensor::DeviceContext;
+use crate::tensor::DeviceMatrix;
+use crate::tensor::DeviceVec;
+use crate::tensor::HiddenStates;
+use crate::tensor::HiddenStatesRef;
 
 /// Generic strided-batched bf16 GEMM — one `cublasGemmStridedBatchedEx` on the
 /// graph-safe (workspace-free, decode/capture) cuBLAS handle. `lda`/`ldb`/`ldc`

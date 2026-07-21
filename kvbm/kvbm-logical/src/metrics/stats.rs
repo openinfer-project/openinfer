@@ -7,11 +7,15 @@
 //! This `StatsCollector` is the optional layer that computes derived statistics.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::sync::RwLock;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+use std::time::Instant;
 
-use super::pool_metrics::{BlockPoolMetrics, MetricsSnapshot};
+use super::pool_metrics::BlockPoolMetrics;
+use super::pool_metrics::MetricsSnapshot;
 
 /// Configuration for the stats collector.
 #[derive(Debug, Clone)]

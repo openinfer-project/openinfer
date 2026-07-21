@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
+use cudarc::driver::CudaSlice;
+use cudarc::driver::CudaStream;
+use cudarc::driver::DevicePtr;
 use half::bf16;
 
 use crate::KvLayout;

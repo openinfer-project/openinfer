@@ -1,20 +1,26 @@
-use std::{
-    cell::Cell,
-    collections::{BTreeMap, VecDeque},
-    path::Path,
-    time::Instant,
-};
+use std::cell::Cell;
+use std::collections::BTreeMap;
+use std::collections::VecDeque;
+use std::path::Path;
+use std::time::Instant;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::ensure;
 use bytesize::ByteSize;
-use cudarc::driver::{CudaEvent, CudaSlice};
-use log::{debug, error, info};
+use cudarc::driver::CudaEvent;
+use cudarc::driver::CudaSlice;
+use log::debug;
+use log::error;
+use log::info;
 use memmap2::Mmap;
 
-use super::{
-    Glm52ExpertRegionKind, Glm52RankGpuContext, Glm52RankLoadBundle, expected_tensor_contract,
-    expert_placement, mmap_file,
-};
+use super::Glm52ExpertRegionKind;
+use super::Glm52RankGpuContext;
+use super::Glm52RankLoadBundle;
+use super::expected_tensor_contract;
+use super::expert_placement;
+use super::mmap_file;
 
 // One mmap per event keeps source lifetimes explicit without the large-tail
 // regression observed when many shard mappings stay live together.

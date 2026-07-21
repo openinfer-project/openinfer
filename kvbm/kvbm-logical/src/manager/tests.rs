@@ -1,13 +1,15 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use rstest::rstest;
+
 use super::*;
 use crate::KvbmSequenceHashProvider;
 use crate::blocks::BlockError;
-use crate::testing::{
-    self, TestMeta, create_iota_token_block, create_test_token_block as testing_create_token_block,
-};
-use rstest::rstest;
+use crate::testing::TestMeta;
+use crate::testing::create_iota_token_block;
+use crate::testing::create_test_token_block as testing_create_token_block;
+use crate::testing::{self};
 
 // Type alias for backward compatibility
 type TestBlockData = TestMeta;
@@ -2344,11 +2346,12 @@ mod scan_matches_tests {
 // ============================================================================
 
 mod race_regression_tests {
-    use super::*;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
     use std::thread;
 
+    use super::*;
     use crate::pools::BlockDuplicationPolicy;
 
     fn build_manager_with_policy(
@@ -2629,11 +2632,11 @@ mod lock_order_enforcement_tests {
 // ============================================================================
 
 mod audit_counter_tests {
-    use super::*;
     use std::num::NonZeroUsize;
     use std::sync::Arc;
     use std::thread;
 
+    use super::*;
     use crate::SequenceHash;
     use crate::blocks::BlockId;
     use crate::manager::FrequencyTrackingCapacity;

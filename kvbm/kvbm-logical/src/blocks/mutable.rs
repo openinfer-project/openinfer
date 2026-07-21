@@ -15,7 +15,11 @@ use std::sync::Arc;
 use dynamo_tokens::TokenBlock;
 
 use crate::KvbmSequenceHashProvider;
-use crate::blocks::{BlockError, BlockId, BlockMetadata, CompleteBlock, SequenceHash};
+use crate::blocks::BlockError;
+use crate::blocks::BlockId;
+use crate::blocks::BlockMetadata;
+use crate::blocks::CompleteBlock;
+use crate::blocks::SequenceHash;
 use crate::pools::BlockStore;
 
 /// RAII guard for a block in the **Reset** state.

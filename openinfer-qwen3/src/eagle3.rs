@@ -2,9 +2,10 @@
 #![allow(dead_code)]
 
 use anyhow::Result;
+use openinfer_core::tensor::DeviceMatrix;
+use openinfer_core::tensor::DeviceVec;
 
 use crate::config::Eagle3Config;
-use openinfer_core::tensor::{DeviceMatrix, DeviceVec};
 
 mod loading;
 mod reservation;

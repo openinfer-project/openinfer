@@ -123,7 +123,8 @@ impl Drop for OwnedPagePermit {
 
 #[cfg(test)]
 mod tests {
-    use super::{PageId, PagePool};
+    use super::PageId;
+    use super::PagePool;
 
     #[test]
     fn acquires_pages_and_restores_on_drop() {

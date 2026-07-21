@@ -1,18 +1,18 @@
 [package]
-name = "openinfer-qwen35-4b"
-license = "Apache-2.0"
-version = "0.1.0"
-edition = "2024"
 autobenches = false
+edition = "2024"
+license = "Apache-2.0"
+name = "openinfer-qwen35-4b"
+version = "0.1.0"
 
 [dependencies]
-openinfer-core = { workspace = true }
-openinfer-kernels = { workspace = true }
-openinfer-sample = { workspace = true }
 anyhow = { workspace = true }
 cudarc = { workspace = true }
 half = { workspace = true }
 log = { workspace = true }
+openinfer-core = { workspace = true }
+openinfer-kernels = { workspace = true }
+openinfer-sample = { workspace = true }
 rand = { workspace = true }
 safetensors = { workspace = true }
 serde = { workspace = true }
@@ -58,6 +58,6 @@ name = "serving_tp2"
 required-features = ["qwen35-4b"]
 
 [[bench]]
-name = "qwen35_ops"
 harness = false
+name = "qwen35_ops"
 required-features = ["qwen35-4b"]

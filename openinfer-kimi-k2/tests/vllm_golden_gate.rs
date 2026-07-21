@@ -52,15 +52,20 @@
 //! Cargo.toml), so feature-less workspace test runs never see it.
 
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use std::time::Instant;
 
-use openinfer_core::engine::{
-    EngineHandle, EngineLoadOptions, EpBackend, TokenEvent, TokenLogprob, TokenSink,
-    TokenStreamReceiver,
-};
+use openinfer_core::engine::EngineHandle;
+use openinfer_core::engine::EngineLoadOptions;
+use openinfer_core::engine::EpBackend;
+use openinfer_core::engine::TokenEvent;
+use openinfer_core::engine::TokenLogprob;
+use openinfer_core::engine::TokenSink;
+use openinfer_core::engine::TokenStreamReceiver;
 use openinfer_core::parallel::ParallelConfig;
 use openinfer_core::sampler::SamplingParams;
-use safetensors::{Dtype, SafeTensors};
+use safetensors::Dtype;
+use safetensors::SafeTensors;
 
 const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),

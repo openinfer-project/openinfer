@@ -2,14 +2,25 @@ use std::ffi::c_void;
 use std::mem::size_of;
 use std::time::Duration;
 
-use anyhow::{Result, anyhow, bail};
-use cudarc::driver::{CudaEvent, CudaSlice, DevicePtr, DevicePtrMut, sys};
+use anyhow::Result;
+use anyhow::anyhow;
+use anyhow::bail;
+use cudarc::driver::CudaEvent;
+use cudarc::driver::CudaSlice;
+use cudarc::driver::DevicePtr;
+use cudarc::driver::DevicePtrMut;
+use cudarc::driver::sys;
 use half::bf16;
 use openinfer_kernels::ffi;
-use openinfer_kernels::ops::{PrefillPagedPlan, prefill_attention_paged_into};
+use openinfer_kernels::ops::PrefillPagedPlan;
+use openinfer_kernels::ops::prefill_attention_paged_into;
 use openinfer_kernels::paged_kv::PagedKvLayout;
-use openinfer_kernels::tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
-use serde::{Deserialize, Serialize};
+use openinfer_kernels::tensor::DeviceContext;
+use openinfer_kernels::tensor::DeviceMatrix;
+use openinfer_kernels::tensor::DeviceVec;
+use openinfer_kernels::tensor::HiddenStates;
+use serde::Deserialize;
+use serde::Serialize;
 
 pub const NUM_LAYERS: usize = 1;
 pub const NUM_QO_HEADS: usize = 32;
@@ -26,9 +37,9 @@ pub const MEMORY_TRANSFERS_PER_CLOCK: f64 = 2.0;
 pub const CACHE_CLEAR_L2_MULTIPLIER: usize = 2;
 pub const CACHE_CLEAR_MIN_BYTES: usize = 128 * 1024 * 1024;
 
+pub use crate::batch_decode_buffers::SplitKvCsr;
+pub use crate::batch_decode_buffers::build_split_kv_csr;
 pub use crate::split_kv::SplitKvConfig;
-
-pub use crate::batch_decode_buffers::{SplitKvCsr, build_split_kv_csr};
 
 pub const DEFAULT_SPLIT_KV_CONFIG: SplitKvConfig = SplitKvConfig::new(
     DEFAULT_SPLIT_KV_CHUNK_TOKENS,

@@ -6,10 +6,16 @@
 
 use std::ffi::c_void;
 
-use cudarc::driver::sys::{CUresult, CUstream};
-use tvm_ffi::{
-    Any, AnyView, Error, Function, RUNTIME_ERROR, Result as TvmResult, TYPE_ERROR, VALUE_ERROR,
-};
+use cudarc::driver::sys::CUresult;
+use cudarc::driver::sys::CUstream;
+use tvm_ffi::Any;
+use tvm_ffi::AnyView;
+use tvm_ffi::Error;
+use tvm_ffi::Function;
+use tvm_ffi::RUNTIME_ERROR;
+use tvm_ffi::Result as TvmResult;
+use tvm_ffi::TYPE_ERROR;
+use tvm_ffi::VALUE_ERROR;
 
 use crate::ffi;
 

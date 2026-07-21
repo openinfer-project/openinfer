@@ -1,13 +1,19 @@
 //! GLM5.2 tensor-parallel attention allreduce shared by TP4 and TP8.
 
-use anyhow::{Result, anyhow, ensure};
-use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
+use anyhow::Result;
+use anyhow::anyhow;
+use anyhow::ensure;
+use cudarc::driver::CudaSlice;
+use cudarc::driver::DevicePtr;
+use cudarc::driver::DevicePtrMut;
 use half::bf16;
 
+use super::moe_tp::GLM52_TP_HIDDEN;
+use super::moe_tp::GLM52_TP_MAX_RANKS;
+use super::moe_tp::GLM52_TP_TOKENS;
+use super::moe_tp::Glm52TpTopology;
 use crate::ffi;
 use crate::tensor::DeviceContext;
-
-use super::moe_tp::{GLM52_TP_HIDDEN, GLM52_TP_MAX_RANKS, GLM52_TP_TOKENS, Glm52TpTopology};
 
 pub const fn glm52_tp_ar_chunk_packets(topology: Glm52TpTopology) -> usize {
     (GLM52_TP_HIDDEN / topology.ranks()) * 2 / 12

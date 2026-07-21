@@ -14,15 +14,20 @@
 
 #![cfg(feature = "glm52")]
 
-use anyhow::{Result, ensure};
+use anyhow::Result;
+use anyhow::ensure;
 use half::bf16;
-use openinfer_kernels::ops::{
-    GLM52_FLASHMLA_SPARSE_HEADS, GLM52_FLASHMLA_SPARSE_PAGE_SIZE,
-    GLM52_FLASHMLA_SPARSE_QK_HEAD_DIM, GLM52_FLASHMLA_SPARSE_V_HEAD_DIM, Glm52FlashMlaSparseDecode,
-    Glm52SparseMlaDecode, glm52_flashmla_sparse_decode_launch,
-    glm52_flashmla_sparse_decode_metadata_launch, glm52_flashmla_sparse_decode_num_sm_parts,
-    glm52_sparse_mla_decode_launch, glm52_sparse_mla_reference_launch,
-};
+use openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_HEADS;
+use openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_PAGE_SIZE;
+use openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_QK_HEAD_DIM;
+use openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_V_HEAD_DIM;
+use openinfer_kernels::ops::Glm52FlashMlaSparseDecode;
+use openinfer_kernels::ops::Glm52SparseMlaDecode;
+use openinfer_kernels::ops::glm52_flashmla_sparse_decode_launch;
+use openinfer_kernels::ops::glm52_flashmla_sparse_decode_metadata_launch;
+use openinfer_kernels::ops::glm52_flashmla_sparse_decode_num_sm_parts;
+use openinfer_kernels::ops::glm52_sparse_mla_decode_launch;
+use openinfer_kernels::ops::glm52_sparse_mla_reference_launch;
 use openinfer_kernels::tensor::DeviceContext;
 
 const HEADS_FULL: usize = GLM52_FLASHMLA_SPARSE_HEADS; // 64 query slots

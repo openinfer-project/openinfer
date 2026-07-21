@@ -8,10 +8,10 @@
 
 #![cfg(feature = "glm52")]
 
-use openinfer_kernels::ops::{
-    GLM52_FLASHINFER_SPARSE_WORKSPACE_BYTES, Glm52FlashInferSparseDecode,
-    glm52_flashinfer_sparse_mla_fp8_launch, glm52_flashinfer_sparse_mla_supported,
-};
+use openinfer_kernels::ops::GLM52_FLASHINFER_SPARSE_WORKSPACE_BYTES;
+use openinfer_kernels::ops::Glm52FlashInferSparseDecode;
+use openinfer_kernels::ops::glm52_flashinfer_sparse_mla_fp8_launch;
+use openinfer_kernels::ops::glm52_flashinfer_sparse_mla_supported;
 use openinfer_kernels::tensor::DeviceContext;
 
 #[test]

@@ -1,11 +1,16 @@
 use std::net::TcpListener;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::anyhow;
+use anyhow::bail;
 use openinfer_core::engine::EngineLoadOptions;
 use reqwest::Client;
-use serde_json::{Value, json};
+use serde_json::Value;
+use serde_json::json;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 

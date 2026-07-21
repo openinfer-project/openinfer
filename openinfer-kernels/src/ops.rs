@@ -16,68 +16,142 @@ mod lora;
 mod norm;
 mod sampling;
 
-pub use attention::{
-    PrefillPagedPlan, SUPPORTED_GQA_GROUP_SIZES, dflash_qk_norm_rope_into, eagle3_rope_into,
-    paged_attention_batch_decode_hd256_into, paged_attention_batch_decode_into,
-    paged_attention_batch_decode_split_kv_into,
-    paged_attention_batch_decode_via_prefill_hd256_into, prefill_attention_paged_into,
-    qk_norm_partial_rope_batched_decode_hd256_into, qk_norm_rope_batch_decode_into,
-    single_decode_nhd_into, single_prefill_nhd_causal_into, single_prefill_nhd_noncausal_into,
-};
+pub use attention::PrefillPagedPlan;
+pub use attention::SUPPORTED_GQA_GROUP_SIZES;
+pub use attention::dflash_qk_norm_rope_into;
+pub use attention::eagle3_rope_into;
+pub use attention::paged_attention_batch_decode_hd256_into;
+pub use attention::paged_attention_batch_decode_into;
+pub use attention::paged_attention_batch_decode_split_kv_into;
+pub use attention::paged_attention_batch_decode_via_prefill_hd256_into;
+pub use attention::prefill_attention_paged_into;
+pub use attention::qk_norm_partial_rope_batched_decode_hd256_into;
+pub use attention::qk_norm_rope_batch_decode_into;
+pub use attention::single_decode_nhd_into;
+pub use attention::single_prefill_nhd_causal_into;
+pub use attention::single_prefill_nhd_noncausal_into;
 #[cfg(feature = "moe")]
-pub use deepep::{
-    DeepEp, DeepEpAbi, DeepEpBase, DeepEpDispatchScratch, DeepEpPrefillCounts, deepep_info,
-    deepep_unique_id,
-};
+pub use deepep::DeepEp;
+#[cfg(feature = "moe")]
+pub use deepep::DeepEpAbi;
+#[cfg(feature = "moe")]
+pub use deepep::DeepEpBase;
+#[cfg(feature = "moe")]
+pub use deepep::DeepEpDispatchScratch;
+#[cfg(feature = "moe")]
+pub use deepep::DeepEpPrefillCounts;
 #[cfg(feature = "glm52")]
-pub use deepep::{
-    Glm52DeepEp, Glm52DeepEpAbi, Glm52Ep4DeepEpAbi, Glm52Ep16DeepEpAbi, Glm52Ep32DeepEpAbi,
-    Glm52Ep64DeepEpAbi, glm52_deepep_info, glm52_ep_deepep_unique_id,
-};
+pub use deepep::Glm52DeepEp;
+#[cfg(feature = "glm52")]
+pub use deepep::Glm52DeepEpAbi;
+#[cfg(feature = "glm52")]
+pub use deepep::Glm52Ep4DeepEpAbi;
+#[cfg(feature = "glm52")]
+pub use deepep::Glm52Ep16DeepEpAbi;
+#[cfg(feature = "glm52")]
+pub use deepep::Glm52Ep32DeepEpAbi;
+#[cfg(feature = "glm52")]
+pub use deepep::Glm52Ep64DeepEpAbi;
+#[cfg(feature = "moe")]
+pub use deepep::deepep_info;
+#[cfg(feature = "moe")]
+pub use deepep::deepep_unique_id;
+#[cfg(feature = "glm52")]
+pub use deepep::glm52_deepep_info;
+#[cfg(feature = "glm52")]
+pub use deepep::glm52_ep_deepep_unique_id;
 #[cfg(feature = "deepseek-v2-lite")]
 pub use deepseek_v2_lite::*;
-pub use elementwise::{
-    accumulate_bf16_token_scaled_to_f32_into, add_batch, add_batch_into, add_into,
-    bf16_bytes_to_f32_into, bf16_hidden_to_f32_into, copy_hidden_rows_into,
-    copy_hidden_rows_raw_into, copy_hidden_token_range_into, extract_vec, extract_vec_into,
-    extract_vec_ref, extract_vec_ref_into, f32_to_bf16_hidden_into, gather_hidden_tokens_into,
-    repeat_f32_for_reduce_scatter_into, scale_f32_in_place, scaled_add_batch_into,
-    scaled_add_rows_indexed_into, scaled_add_rows_into, scaled_add_rows_token_range_into,
-    silu_mul_batch, silu_mul_batch_into, silu_mul_fused_batch_into, write_vec_into,
-};
-pub use embedding::{
-    embedding_batch, embedding_batch_vocab_shard, embedding_decode_into, embedding_rows_into,
-};
+pub use elementwise::accumulate_bf16_token_scaled_to_f32_into;
+pub use elementwise::add_batch;
+pub use elementwise::add_batch_into;
+pub use elementwise::add_into;
+pub use elementwise::bf16_bytes_to_f32_into;
+pub use elementwise::bf16_hidden_to_f32_into;
+pub use elementwise::copy_hidden_rows_into;
+pub use elementwise::copy_hidden_rows_raw_into;
+pub use elementwise::copy_hidden_token_range_into;
+pub use elementwise::extract_vec;
+pub use elementwise::extract_vec_into;
+pub use elementwise::extract_vec_ref;
+pub use elementwise::extract_vec_ref_into;
+pub use elementwise::f32_to_bf16_hidden_into;
+pub use elementwise::gather_hidden_tokens_into;
+pub use elementwise::repeat_f32_for_reduce_scatter_into;
+pub use elementwise::scale_f32_in_place;
+pub use elementwise::scaled_add_batch_into;
+pub use elementwise::scaled_add_rows_indexed_into;
+pub use elementwise::scaled_add_rows_into;
+pub use elementwise::scaled_add_rows_token_range_into;
+pub use elementwise::silu_mul_batch;
+pub use elementwise::silu_mul_batch_into;
+pub use elementwise::silu_mul_fused_batch_into;
+pub use elementwise::write_vec_into;
+pub use embedding::embedding_batch;
+pub use embedding::embedding_batch_vocab_shard;
+pub use embedding::embedding_decode_into;
+pub use embedding::embedding_rows_into;
 #[cfg(feature = "glm52")]
 pub use glm52::*;
 #[cfg(feature = "kimi-k2")]
 pub use kimi_k2::*;
+pub use linear::GEMM_LT_MAX_N;
+pub use linear::NumericPolicy;
+pub use linear::PinAlgoConfig;
 pub(crate) use linear::ensure_tuned_policy;
-pub use linear::{
-    GEMM_LT_MAX_N, NumericPolicy, PinAlgoConfig, gemm, gemm_graphsafe_into_checked,
-    gemm_graphsafe_ref_into_checked, gemm_into, gemm_into_checked, gemm_lt_pin_check,
-    gemm_lt_pin_into_checked, gemm_lt_pin_tune, gemm_lt_pin_warmup, gemm_lt_tune, gemm_per_token,
-    gemm_per_token_into_checked, gemm_rows_into, gemm_rows_into_checked, gemm_strided_batched_bf16,
-    gemm_token_range_into_checked, gemv, linear, numeric_policy, per_token_served, pin_served,
-    reset_numeric_policy_counters, set_numeric_policy,
-};
-pub use lora::{
-    LoraDecodeGroupedProjection, lora_decode_fused_delta_group3_into, lora_decode_fused_delta_into,
-    pack_lora_b_rows_into,
-};
-pub use norm::{
-    fused_add_rms_norm_batch_into, fused_add_rms_norm_into, fused_add_rms_norm_round_batch_into,
-    fused_add_rms_norm_round_into, layer_norm_into, rms_norm, rms_norm_batch_into,
-    rms_norm_batch_offset_into, rms_norm_gated_batch_into, rms_norm_into, rms_norm_offset_into,
-    rms_norm_rows_into,
-};
-pub use sampling::{
-    BatchSamplingRow, BatchSamplingScratch, argmax, argmax_batch_bf16_into,
-    argmax_batch_bf16_split_indexed_into, argmax_batch_bf16_split_partials_len, argmax_bf16_into,
-    argmax_bf16_split_into, flashinfer_top1_batch_into, flashinfer_top1_row_states_bytes,
-    gpu_sample_batch_into, logprob_topk_batch_bf16_into, markov_step_argmax_into,
-    markov_step_argmax_partials_len,
-};
+pub use linear::gemm;
+pub use linear::gemm_graphsafe_into_checked;
+pub use linear::gemm_graphsafe_ref_into_checked;
+pub use linear::gemm_into;
+pub use linear::gemm_into_checked;
+pub use linear::gemm_lt_pin_check;
+pub use linear::gemm_lt_pin_into_checked;
+pub use linear::gemm_lt_pin_tune;
+pub use linear::gemm_lt_pin_warmup;
+pub use linear::gemm_lt_tune;
+pub use linear::gemm_per_token;
+pub use linear::gemm_per_token_into_checked;
+pub use linear::gemm_rows_into;
+pub use linear::gemm_rows_into_checked;
+pub use linear::gemm_strided_batched_bf16;
+pub use linear::gemm_token_range_into_checked;
+pub use linear::gemv;
+pub use linear::linear;
+pub use linear::numeric_policy;
+pub use linear::per_token_served;
+pub use linear::pin_served;
+pub use linear::reset_numeric_policy_counters;
+pub use linear::set_numeric_policy;
+pub use lora::LoraDecodeGroupedProjection;
+pub use lora::lora_decode_fused_delta_group3_into;
+pub use lora::lora_decode_fused_delta_into;
+pub use lora::pack_lora_b_rows_into;
+pub use norm::fused_add_rms_norm_batch_into;
+pub use norm::fused_add_rms_norm_into;
+pub use norm::fused_add_rms_norm_round_batch_into;
+pub use norm::fused_add_rms_norm_round_into;
+pub use norm::layer_norm_into;
+pub use norm::rms_norm;
+pub use norm::rms_norm_batch_into;
+pub use norm::rms_norm_batch_offset_into;
+pub use norm::rms_norm_gated_batch_into;
+pub use norm::rms_norm_into;
+pub use norm::rms_norm_offset_into;
+pub use norm::rms_norm_rows_into;
+pub use sampling::BatchSamplingRow;
+pub use sampling::BatchSamplingScratch;
+pub use sampling::argmax;
+pub use sampling::argmax_batch_bf16_into;
+pub use sampling::argmax_batch_bf16_split_indexed_into;
+pub use sampling::argmax_batch_bf16_split_partials_len;
+pub use sampling::argmax_bf16_into;
+pub use sampling::argmax_bf16_split_into;
+pub use sampling::flashinfer_top1_batch_into;
+pub use sampling::flashinfer_top1_row_states_bytes;
+pub use sampling::gpu_sample_batch_into;
+pub use sampling::logprob_topk_batch_bf16_into;
+pub use sampling::markov_step_argmax_into;
+pub use sampling::markov_step_argmax_partials_len;
 
 /// Calling thread's last FFI exception message, ready to append to an error;
 /// empty unless `result` is the -1 sentinel set by the C++ guard. Public for

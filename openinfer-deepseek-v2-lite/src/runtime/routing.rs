@@ -72,7 +72,8 @@ impl MoeRoutePlan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{config::test_lite_config, ep::ExpertParallelConfig};
+    use crate::config::test_lite_config;
+    use crate::ep::ExpertParallelConfig;
 
     #[test]
     fn route_plan_preserves_token_major_expert_order() {

@@ -1,0 +1,26 @@
+# TOML formatter config. Run with `taplo format` (https://taplo.tamasfe.dev).
+# Scoped to Cargo manifests; vendored trees, the sibling dynamo workspaces, and
+# hand-authored data manifests (kernel_manifests) keep their own layout.
+exclude = [
+  "target/**",
+  "**/third_party/**",
+  "openinfer-dynamo-backend/**",
+  "openinfer-dynamo-frontend/**",
+  "**/kernel_manifests/**",
+]
+include = ["**/*.toml"]
+
+[formatting]
+align_entries = false
+allowed_blank_lines = 1
+array_auto_collapse = true
+array_auto_expand = true
+array_trailing_comma = true
+column_width = 80
+compact_arrays = true
+compact_inline_tables = false
+crlf = false
+indent_string = '  '
+indent_tables = false
+reorder_keys = true
+trailing_newline = true

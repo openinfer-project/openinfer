@@ -1,12 +1,14 @@
-use std::sync::{Arc, atomic::AtomicU8};
+use std::sync::Arc;
+use std::sync::atomic::AtomicU8;
 
-use openinfer_engine::engine::{RequestAbortReason, RequestTag};
+use openinfer_engine::engine::RequestAbortReason;
+use openinfer_engine::engine::RequestTag;
 use openinfer_engine::sampler::SamplingParams;
 use tokio::sync::mpsc;
 
-use super::grouping::{
-    DecodePositionGroupPlan, common_decode_position, decode_position_groups_for_positions,
-};
+use super::grouping::DecodePositionGroupPlan;
+use super::grouping::common_decode_position;
+use super::grouping::decode_position_groups_for_positions;
 use super::*;
 use crate::config::test_lite_config;
 

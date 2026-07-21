@@ -10,10 +10,16 @@
 
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
-use openinfer_kernels::ops::{embedding_rows_into, gemm_strided_batched_bf16, rms_norm_rows_into};
-use openinfer_kernels::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
+use openinfer_kernels::ops::embedding_rows_into;
+use openinfer_kernels::ops::gemm_strided_batched_bf16;
+use openinfer_kernels::ops::rms_norm_rows_into;
+use openinfer_kernels::tensor::DeviceContext;
+use openinfer_kernels::tensor::DeviceMatrix;
+use openinfer_kernels::tensor::DeviceVec;
 
-use crate::config::{GLM52_HIDDEN, GLM52_RMS_EPS, GLM52_VOCAB};
+use crate::config::GLM52_HIDDEN;
+use crate::config::GLM52_RMS_EPS;
+use crate::config::GLM52_VOCAB;
 use crate::rows::Rows;
 
 /// Token embedding lookup over `out.tokens()` rows: `embed[token_ids[r]] ->

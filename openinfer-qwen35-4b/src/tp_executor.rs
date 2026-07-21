@@ -4,27 +4,40 @@
 //! fails closed until the scheduler path can drive ordered eager decode.
 
 use std::collections::HashSet;
-use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, mpsc};
-use std::thread::{self, JoinHandle};
+use std::panic::AssertUnwindSafe;
+use std::panic::catch_unwind;
+use std::sync::Arc;
+use std::sync::Condvar;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::sync::mpsc;
+use std::thread::JoinHandle;
+use std::thread::{self};
 
 use anyhow::Result;
+use openinfer_core::kv_pool::KvState;
+use openinfer_core::sampler::SamplingParams;
 
 use crate::batch_decode_graph::MAX_BATCH;
 use crate::config::TensorParallelConfig;
 use crate::decode_buffers::BatchDecodeBuffers35;
-use crate::executor::{
-    DecodePlan, DecodeRequestResult, DecodeResult, DecodeStepItem, PrefillPlan,
-    PrefillRequestResult, PrefillResult, PrefillStepItem, RequestId,
-};
+use crate::executor::DecodePlan;
+use crate::executor::DecodeRequestResult;
+use crate::executor::DecodeResult;
+use crate::executor::DecodeStepItem;
+use crate::executor::PrefillPlan;
+use crate::executor::PrefillRequestResult;
+use crate::executor::PrefillResult;
+use crate::executor::PrefillStepItem;
+use crate::executor::RequestId;
 use crate::logprobs::snapshot_requested_logprobs;
 use crate::prefill::PREFILL_CHUNK_LEN;
 use crate::prefill_buffers::GdrChunkwiseScratch35;
-use crate::recurrent_state::{LinearStatePointerTables, RecurrentState};
-use crate::weights::{ModelRuntimeConfig, Qwen35Model};
-use openinfer_core::kv_pool::KvState;
-use openinfer_core::sampler::SamplingParams;
+use crate::recurrent_state::LinearStatePointerTables;
+use crate::recurrent_state::RecurrentState;
+use crate::weights::ModelRuntimeConfig;
+use crate::weights::Qwen35Model;
 
 const TP_NCCL_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const TP_RUNTIME_STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);

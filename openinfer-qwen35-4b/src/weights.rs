@@ -1,18 +1,31 @@
-use anyhow::Result;
-use cudarc::driver::CudaSlice;
-use cudarc::nccl::safe::{Comm, ReduceOp};
-use log::{debug, info};
-use safetensors::SafeTensors;
 use std::collections::HashMap;
 use std::time::Instant;
 
-use super::config::{Config35, LayerType, TensorParallelConfig};
-use openinfer_core::tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
-use openinfer_core::weight_loader::{
-    WeightPrefetch, deserialize_shards, load_shard_info_fixed, load_tensor_1d, load_tensor_1d_f32,
-    load_tensor_2d, load_tensor_2d_col_shard, load_tensor_2d_row_shard, mmap_shards,
-    precompute_rope,
-};
+use anyhow::Result;
+use cudarc::driver::CudaSlice;
+use cudarc::nccl::safe::Comm;
+use cudarc::nccl::safe::ReduceOp;
+use log::debug;
+use log::info;
+use openinfer_core::tensor::DeviceContext;
+use openinfer_core::tensor::DeviceMatrix;
+use openinfer_core::tensor::DeviceVec;
+use openinfer_core::tensor::HiddenStates;
+use openinfer_core::weight_loader::WeightPrefetch;
+use openinfer_core::weight_loader::deserialize_shards;
+use openinfer_core::weight_loader::load_shard_info_fixed;
+use openinfer_core::weight_loader::load_tensor_1d;
+use openinfer_core::weight_loader::load_tensor_1d_f32;
+use openinfer_core::weight_loader::load_tensor_2d;
+use openinfer_core::weight_loader::load_tensor_2d_col_shard;
+use openinfer_core::weight_loader::load_tensor_2d_row_shard;
+use openinfer_core::weight_loader::mmap_shards;
+use openinfer_core::weight_loader::precompute_rope;
+use safetensors::SafeTensors;
+
+use super::config::Config35;
+use super::config::LayerType;
+use super::config::TensorParallelConfig;
 
 /// Full attention layer weights (8 layers in Qwen3.5-4B).
 pub(super) struct FullAttentionLayer {

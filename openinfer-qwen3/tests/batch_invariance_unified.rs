@@ -1,14 +1,21 @@
 //! Single-GPU gate: a decode row's output must be bit-identical across co-batched prefill lengths
 //! (GEMM-N) and across the pure-decode and unified paths, under Pin and PerToken.
-use openinfer_core::sampler::SamplingParams;
-use openinfer_kernels::ops::{
-    NumericPolicy, per_token_served, pin_served, reset_numeric_policy_counters, set_numeric_policy,
-};
-use openinfer_qwen3::runtime::{
-    DecodePlan, DecodeRequestResult, DecodeStepItem, PrefillPlan, PrefillStepItem, Qwen3Executor,
-    RequestId, UnifiedPlan,
-};
 use std::sync::Mutex;
+
+use openinfer_core::sampler::SamplingParams;
+use openinfer_kernels::ops::NumericPolicy;
+use openinfer_kernels::ops::per_token_served;
+use openinfer_kernels::ops::pin_served;
+use openinfer_kernels::ops::reset_numeric_policy_counters;
+use openinfer_kernels::ops::set_numeric_policy;
+use openinfer_qwen3::runtime::DecodePlan;
+use openinfer_qwen3::runtime::DecodeRequestResult;
+use openinfer_qwen3::runtime::DecodeStepItem;
+use openinfer_qwen3::runtime::PrefillPlan;
+use openinfer_qwen3::runtime::PrefillStepItem;
+use openinfer_qwen3::runtime::Qwen3Executor;
+use openinfer_qwen3::runtime::RequestId;
+use openinfer_qwen3::runtime::UnifiedPlan;
 
 // Serialize the #[test]s — they share the process-global numeric policy.
 static POLICY_LOCK: Mutex<()> = Mutex::new(());

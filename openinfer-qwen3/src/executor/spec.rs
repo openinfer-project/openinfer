@@ -7,9 +7,14 @@
 
 use anyhow::Result;
 
-use crate::speculative::{DraftPlan, DraftResult, VerifyPlan, VerifyResult};
-
-use super::{Qwen3Executor, RequestId, StepCommand, WorkerStepOutcome};
+use super::Qwen3Executor;
+use super::RequestId;
+use super::StepCommand;
+use super::WorkerStepOutcome;
+use crate::speculative::DraftPlan;
+use crate::speculative::DraftResult;
+use crate::speculative::VerifyPlan;
+use crate::speculative::VerifyResult;
 
 impl Qwen3Executor {
     pub(super) fn execute_speculative_verify_impl(

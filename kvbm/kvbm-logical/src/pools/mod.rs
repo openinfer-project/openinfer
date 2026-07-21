@@ -21,13 +21,13 @@ pub mod tests;
 mod block_proptest;
 
 pub(crate) use inactive::backends;
-pub(crate) use store::{BlockStore, InactiveIndex};
+pub(crate) use store::BlockStore;
+pub(crate) use store::InactiveIndex;
 
 pub(crate) use crate::SequenceHash;
-use crate::blocks::BlockId;
-
 // Re-export block duplication policy
 pub use crate::blocks::BlockDuplicationPolicy;
+use crate::blocks::BlockId;
 
 /// A block that is free and available for allocation in the inactive pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -12,16 +12,15 @@ mod routing;
 mod tests;
 mod types;
 
-use crate::{
-    Config,
-    model::{DriverRankModel, ExpertRankModel},
-};
-
 use backend::EpBackendRuntime;
+pub use types::BatchedGenerationResult;
+pub use types::DecodeGraphReadinessReport;
+pub use types::GenerationResult;
+pub use types::GenerationStats;
 
-pub use types::{
-    BatchedGenerationResult, DecodeGraphReadinessReport, GenerationResult, GenerationStats,
-};
+use crate::Config;
+use crate::model::DriverRankModel;
+use crate::model::ExpertRankModel;
 
 pub struct DeepSeekV2LiteEp2Generator {
     model_path: PathBuf,

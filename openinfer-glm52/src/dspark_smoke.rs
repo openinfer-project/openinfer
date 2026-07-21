@@ -23,14 +23,17 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 use anyhow::Result;
 use half::bf16;
+use openinfer_kernels::tensor::DeviceContext;
+use openinfer_kernels::tensor::DeviceMatrix;
 
-use openinfer_kernels::tensor::{DeviceContext, DeviceMatrix};
-
-use crate::config::{GLM52_HIDDEN, GLM52_VOCAB};
-use crate::dspark::{
-    GLM52_DSPARK_CONTEXT_DIM, GLM52_DSPARK_DRAFTS, Glm52DsparkModel, Glm52DsparkScratch,
-    Glm52DsparkSlotState, dspark_cache_len,
-};
+use crate::config::GLM52_HIDDEN;
+use crate::config::GLM52_VOCAB;
+use crate::dspark::GLM52_DSPARK_CONTEXT_DIM;
+use crate::dspark::GLM52_DSPARK_DRAFTS;
+use crate::dspark::Glm52DsparkModel;
+use crate::dspark::Glm52DsparkScratch;
+use crate::dspark::Glm52DsparkSlotState;
+use crate::dspark::dspark_cache_len;
 
 const WARMUP: usize = 5;
 const ITERS: usize = 50;

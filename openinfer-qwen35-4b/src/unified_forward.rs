@@ -10,12 +10,12 @@
 //!      compiled GQA groups; eager prefill fallback for uncompiled ones).
 
 use anyhow::Result;
+use openinfer_core::kv_pool::KvState;
+use openinfer_core::tensor::HiddenStates;
 
 use super::batch_decode_graph::BatchDecodeGraphState;
 use super::recurrent_state::RecurrentState;
 use super::weights::Qwen35Model;
-use openinfer_core::kv_pool::KvState;
-use openinfer_core::tensor::HiddenStates;
 
 pub(crate) struct UnifiedStepOutput {
     pub(crate) prefill_logits: Option<HiddenStates>,
@@ -108,9 +108,10 @@ impl Qwen35Model {
 mod tests {
     use std::path::Path;
 
-    use super::*;
     use openinfer_core::kv_pool::KvState;
     use openinfer_core::tensor::HiddenStates;
+
+    use super::*;
 
     const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3.5-4B");
 

@@ -7,19 +7,24 @@
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
 use half::bf16;
-
-use super::batch_decode_buffers::BatchDecodeBuffers;
-use super::config::PREFILL_ATTENTION_CTA_TILE_Q;
-use super::prefill::PrefillBuffers;
-use super::weights::{Qwen3Model, TransformerBlock};
-use crate::lora::{DeviceLoraTokenGroup, build_lora_token_ranges, prepare_lora_token_groups};
 use openinfer_core::kv_pool::KvLayout;
 use openinfer_core::ops;
 use openinfer_core::ops::PrefillPagedPlan;
 use openinfer_core::sampler::SamplingParams;
 use openinfer_core::tensor::HiddenStates;
-use openinfer_kernels::ops::{NumericPolicy, numeric_policy};
-use openinfer_kv_cache::{KvBuffer, KvView};
+use openinfer_kernels::ops::NumericPolicy;
+use openinfer_kernels::ops::numeric_policy;
+use openinfer_kv_cache::KvBuffer;
+use openinfer_kv_cache::KvView;
+
+use super::batch_decode_buffers::BatchDecodeBuffers;
+use super::config::PREFILL_ATTENTION_CTA_TILE_Q;
+use super::prefill::PrefillBuffers;
+use super::weights::Qwen3Model;
+use super::weights::TransformerBlock;
+use crate::lora::DeviceLoraTokenGroup;
+use crate::lora::build_lora_token_ranges;
+use crate::lora::prepare_lora_token_groups;
 
 impl Qwen3Model {
     pub(crate) fn profile_unified_step_memory(

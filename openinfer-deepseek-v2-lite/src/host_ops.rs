@@ -1,8 +1,11 @@
-use anyhow::{Result, ensure};
+use anyhow::Result;
+use anyhow::ensure;
 use half::bf16;
-use openinfer_core::tensor::{DeviceContext, HiddenStates};
+use openinfer_core::tensor::DeviceContext;
+use openinfer_core::tensor::HiddenStates;
 
-use crate::{Config, device::activate};
+use crate::Config;
+use crate::device::activate;
 
 #[derive(Default)]
 pub(crate) struct DecodeCache {

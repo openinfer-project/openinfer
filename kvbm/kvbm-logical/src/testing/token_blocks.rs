@@ -3,7 +3,8 @@
 
 //! Token block creation helpers for tests.
 
-use dynamo_tokens::{TokenBlock, TokenBlockSequence};
+use dynamo_tokens::TokenBlock;
+use dynamo_tokens::TokenBlockSequence;
 
 use super::TEST_SALT;
 

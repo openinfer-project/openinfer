@@ -1,5 +1,7 @@
+use cudarc::driver::sys::CUresult;
+use cudarc::driver::sys::CUstream;
+
 use super::Half;
-use cudarc::driver::sys::{CUresult, CUstream};
 
 // Qwen3 LoRA fused decode kernels.
 unsafe extern "C" {

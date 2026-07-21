@@ -1,19 +1,28 @@
 //! Batched decode for Qwen3.5: N requests, 1 token each, shared full-attn kernels
 //! and per-request recurrent-state updates for linear attention.
 
-use anyhow::{Context, Result};
-use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
-
-use super::batch_decode_graph::{BATCH_BUCKETS, BatchDecodeGraphState, bucket_for};
-use super::decode_buffers::BatchDecodeBuffers35;
-use super::recurrent_state::{LinearStatePointerTables, RecurrentState};
-use super::weights::{
-    FullAttentionLayer, LayerKind, LinearAttentionLayer, Qwen35Model, TransformerBlock35,
-};
-use crate::ops;
-use openinfer_core::kv_pool::{KvLayout, KvState};
+use anyhow::Context;
+use anyhow::Result;
+use cudarc::driver::CudaSlice;
+use cudarc::driver::DevicePtr;
+use cudarc::driver::DevicePtrMut;
+use openinfer_core::kv_pool::KvLayout;
+use openinfer_core::kv_pool::KvState;
 use openinfer_core::sampler::SamplingParams;
 use openinfer_core::tensor::HiddenStates;
+
+use super::batch_decode_graph::BATCH_BUCKETS;
+use super::batch_decode_graph::BatchDecodeGraphState;
+use super::batch_decode_graph::bucket_for;
+use super::decode_buffers::BatchDecodeBuffers35;
+use super::recurrent_state::LinearStatePointerTables;
+use super::recurrent_state::RecurrentState;
+use super::weights::FullAttentionLayer;
+use super::weights::LayerKind;
+use super::weights::LinearAttentionLayer;
+use super::weights::Qwen35Model;
+use super::weights::TransformerBlock35;
+use crate::ops;
 
 static LOG_UNCOMPILED_DECODE_ROUTE: std::sync::Once = std::sync::Once::new();
 

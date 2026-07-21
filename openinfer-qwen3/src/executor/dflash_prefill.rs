@@ -7,7 +7,8 @@
 //! sampling surface, so capture is as valid for a sampled request as for a
 //! greedy one.
 
-use super::{PrefillStepItem, RequestId};
+use super::PrefillStepItem;
+use super::RequestId;
 
 /// Whether a prefill request is eligible to capture DFlash target context.
 pub(super) fn dflash_prefill_supported(req: &PrefillStepItem) -> bool {

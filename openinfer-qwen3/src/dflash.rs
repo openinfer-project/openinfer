@@ -1,12 +1,17 @@
-use anyhow::{Context, Result};
+use anyhow::Context;
+use anyhow::Result;
 use cudarc::driver::CudaSlice;
+use openinfer_core::ops;
+use openinfer_core::tensor::DeviceContext;
+use openinfer_core::tensor::DeviceMatrix;
+use openinfer_core::tensor::DeviceVec;
+use openinfer_core::tensor::HiddenStates;
 
 use crate::config::DFlashConfig;
-use crate::dspark::{MarkovHead, MarkovScratch};
-use crate::weights::{Qwen3Model, TransformerBlock};
-use openinfer_core::ops;
-use openinfer_core::tensor::HiddenStates;
-use openinfer_core::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
+use crate::dspark::MarkovHead;
+use crate::dspark::MarkovScratch;
+use crate::weights::Qwen3Model;
+use crate::weights::TransformerBlock;
 
 mod loading;
 mod reservation;
@@ -848,9 +853,10 @@ pub(crate) fn validate_dflash_config_for_target(
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::validate_dflash_config_for_target;
     use crate::config::Config;
-    use std::path::Path;
 
     #[test]
     fn downloaded_dflash_config_matches_qwen3_4b() {

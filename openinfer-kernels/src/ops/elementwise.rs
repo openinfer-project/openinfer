@@ -1,8 +1,14 @@
-use anyhow::{Result, anyhow};
-use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
+use anyhow::Result;
+use anyhow::anyhow;
+use cudarc::driver::CudaSlice;
+use cudarc::driver::DevicePtr;
+use cudarc::driver::DevicePtrMut;
 
 use crate::ffi;
-use crate::tensor::{DeviceContext, DeviceVec, HiddenStates, HiddenStatesRef};
+use crate::tensor::DeviceContext;
+use crate::tensor::DeviceVec;
+use crate::tensor::HiddenStates;
+use crate::tensor::HiddenStatesRef;
 
 /// Batched element-wise add: out = a + b (same shape HiddenStates)
 pub fn add_batch(ctx: &DeviceContext, a: &HiddenStates, b: &HiddenStates) -> Result<HiddenStates> {
@@ -730,9 +736,10 @@ pub fn write_vec_into(
 
 #[cfg(test)]
 mod tests {
+    use half::bf16;
+
     use super::*;
     use crate::tensor::DeviceMatrix;
-    use half::bf16;
 
     fn hidden_from_host(
         ctx: &DeviceContext,

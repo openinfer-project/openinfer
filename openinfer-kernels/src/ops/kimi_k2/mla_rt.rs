@@ -1,14 +1,18 @@
-use anyhow::{Result, bail};
-use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
+use anyhow::Result;
+use anyhow::bail;
+use cudarc::driver::CudaSlice;
+use cudarc::driver::DevicePtr;
+use cudarc::driver::DevicePtrMut;
 
-use crate::{
-    ffi,
-    tensor::{DeviceContext, DeviceMatrix, GpuTensor, HiddenStates},
-};
-
-use super::mla::{
-    KIMI_K2_MLA_KV_LORA_RANK, KIMI_K2_MLA_ROPE_DIM, KimiMlaPagedKvLayout, validate_paged_layout,
-};
+use super::mla::KIMI_K2_MLA_KV_LORA_RANK;
+use super::mla::KIMI_K2_MLA_ROPE_DIM;
+use super::mla::KimiMlaPagedKvLayout;
+use super::mla::validate_paged_layout;
+use crate::ffi;
+use crate::tensor::DeviceContext;
+use crate::tensor::DeviceMatrix;
+use crate::tensor::GpuTensor;
+use crate::tensor::HiddenStates;
 
 #[allow(clippy::too_many_arguments)]
 pub fn kimi_mla_rope_split_decode_rt(

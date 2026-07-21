@@ -9,20 +9,29 @@
 
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
-use log::{info, warn};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::bail;
+use log::info;
+use log::warn;
 use openinfer::sampler::SamplingParams;
 use openinfer::scheduler::KvCapacity;
 use openinfer::server_engine::ModelType;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 
-use crate::cli::{Cli, PrefillArgs};
+use crate::cli::Cli;
+use crate::cli::PrefillArgs;
 use crate::exec::BenchModel;
 use crate::metrics::summarize_durations;
 use crate::prompt::draw_distinct_prompts;
-use crate::report::{BenchReport, PrefillCell, PrefillReport, PrefillWorkload};
-use crate::runners::{normalize_sizes, run_info, validate_run_args};
+use crate::report::BenchReport;
+use crate::report::PrefillCell;
+use crate::report::PrefillReport;
+use crate::report::PrefillWorkload;
+use crate::runners::normalize_sizes;
+use crate::runners::run_info;
+use crate::runners::validate_run_args;
 
 pub(crate) fn run_prefill(
     model: &mut dyn BenchModel,

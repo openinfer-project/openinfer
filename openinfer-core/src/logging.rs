@@ -3,12 +3,18 @@
 use std::str::FromStr;
 use std::sync::Once;
 
-use chrono::{DateTime, Local};
+use chrono::DateTime;
+use chrono::Local;
 use colored::Colorize;
+use logforth::Diagnostic;
+use logforth::Error;
+use logforth::Layout;
 use logforth::diagnostic::ThreadLocalDiagnostic;
-use logforth::kv::{Key, Value, Visitor};
-use logforth::record::{Level, Record};
-use logforth::{Diagnostic, Error, Layout};
+use logforth::kv::Key;
+use logforth::kv::Value;
+use logforth::kv::Visitor;
+use logforth::record::Level;
+use logforth::record::Record;
 
 static INIT: Once = Once::new();
 

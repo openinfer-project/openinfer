@@ -45,25 +45,41 @@ mod testkit;
 
 use std::collections::VecDeque;
 
-use openinfer_core::engine::{GenerateRequest, LoadSnapshot, TokenEvent};
-use openinfer_kv_cache::{BlockPool, RequestKv};
-use openinfer_kv_offload::OffloadEngine;
-use openinfer_sample::mix_seed;
-use tokio::sync::{mpsc, watch};
-
-use crate::model::{
-    GLM52_MAX_BATCH_PER_RANK, GLM52_MODEL_LEN_ALIGN, Glm52StepKv, Glm52StepShape,
-    glm52_pool_blocks, glm52_table_width,
-};
-use crate::runner::{Glm52StepFlags, Glm52Worker};
-
-use admission::{admit_from_queue, intake};
-use graph::{GraphDumpRequest, dump_rank0_decode_graph, precapture_step_graphs};
-use load::{pending_is_empty, publish_load, running_counts};
+use admission::admit_from_queue;
+use admission::intake;
+use graph::GraphDumpRequest;
+use graph::dump_rank0_decode_graph;
+use graph::precapture_step_graphs;
+use load::pending_is_empty;
+use load::publish_load;
+use load::running_counts;
 pub(crate) use offload::REMOTE_FETCH_DEADLINE;
 use offload::VllmPdState;
-use plan::{collect_sampling_rows, feed_wants, launch_ahead_flags, plan_step_shapes};
-use slot::{GLM52_PADDING_STEP, Glm52SlotState, Glm52StepOutcome};
+use openinfer_core::engine::GenerateRequest;
+use openinfer_core::engine::LoadSnapshot;
+use openinfer_core::engine::TokenEvent;
+use openinfer_kv_cache::BlockPool;
+use openinfer_kv_cache::RequestKv;
+use openinfer_kv_offload::OffloadEngine;
+use openinfer_sample::mix_seed;
+use plan::collect_sampling_rows;
+use plan::feed_wants;
+use plan::launch_ahead_flags;
+use plan::plan_step_shapes;
+use slot::GLM52_PADDING_STEP;
+use slot::Glm52SlotState;
+use slot::Glm52StepOutcome;
+use tokio::sync::mpsc;
+use tokio::sync::watch;
+
+use crate::model::GLM52_MAX_BATCH_PER_RANK;
+use crate::model::GLM52_MODEL_LEN_ALIGN;
+use crate::model::Glm52StepKv;
+use crate::model::Glm52StepShape;
+use crate::model::glm52_pool_blocks;
+use crate::model::glm52_table_width;
+use crate::runner::Glm52StepFlags;
+use crate::runner::Glm52Worker;
 
 /// The KV page size (== the FlashMLA page / index-K block / model-len
 /// alignment — one 64 everywhere).

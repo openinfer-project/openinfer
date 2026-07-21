@@ -4,27 +4,41 @@
 //! [`run_scheduler_stream`] instead of re-implementing submit/drain.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use std::time::Instant;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::ensure;
 use log::info;
-
 use openinfer::sampler::SamplingParams;
 use openinfer::scheduler::SchedulerHandle;
 use openinfer::server_engine::ModelType;
 
-use crate::cli::{Cli, MixedArgs};
-use crate::exec::{BenchModel, run_scheduler_stream};
-use crate::metrics::{dur_ms, summarize_durations};
-use crate::prompt::{synthetic_prompt_tokens, synthetic_prompt_tokens_salted};
-use crate::report::{
-    BenchReport, DurationStats, InjectionRecord, MixedDecisionInputs, MixedLoadConfig,
-    MixedLoadItl, MixedLoadReport,
-};
+use crate::cli::Cli;
+use crate::cli::MixedArgs;
+use crate::exec::BenchModel;
+use crate::exec::run_scheduler_stream;
+use crate::metrics::dur_ms;
+use crate::metrics::summarize_durations;
+use crate::prompt::synthetic_prompt_tokens;
+use crate::prompt::synthetic_prompt_tokens_salted;
+use crate::report::BenchReport;
+use crate::report::DurationStats;
+use crate::report::InjectionRecord;
+use crate::report::MixedDecisionInputs;
+use crate::report::MixedLoadConfig;
+use crate::report::MixedLoadItl;
+use crate::report::MixedLoadReport;
 use crate::runners::run_info;
-use crate::snapshot::{delta_pct, git_short_commit, gpu_name, today_date};
+use crate::snapshot::delta_pct;
+use crate::snapshot::git_short_commit;
+use crate::snapshot::gpu_name;
+use crate::snapshot::today_date;
 
 /// One background decode stream's record over a mixed-load (or baseline) phase.
 struct BgStream {

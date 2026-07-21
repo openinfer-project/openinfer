@@ -1,15 +1,23 @@
 use anyhow::Result;
 use rand::rngs::StdRng;
 
-use crate::executor::{
-    DecodePlan, DecodeResult, DecodeStepItem, ModelExecutor, PrefillPlan, PrefillResult,
-    PrefillStepItem, UnifiedPlan, UnifiedResult,
-};
-use crate::speculative::{
-    DraftPlan, DraftRequestResult, DraftStepItem, VerifyPlan, VerifyResult, VerifyStepItem,
-};
-
-use super::{ActiveRequestState, PendingRequest};
+use super::ActiveRequestState;
+use super::PendingRequest;
+use crate::executor::DecodePlan;
+use crate::executor::DecodeResult;
+use crate::executor::DecodeStepItem;
+use crate::executor::ModelExecutor;
+use crate::executor::PrefillPlan;
+use crate::executor::PrefillResult;
+use crate::executor::PrefillStepItem;
+use crate::executor::UnifiedPlan;
+use crate::executor::UnifiedResult;
+use crate::speculative::DraftPlan;
+use crate::speculative::DraftRequestResult;
+use crate::speculative::DraftStepItem;
+use crate::speculative::VerifyPlan;
+use crate::speculative::VerifyResult;
+use crate::speculative::VerifyStepItem;
 
 pub(super) enum ExecutionPlan {
     Prefill {
@@ -251,9 +259,10 @@ fn sort_decode_results(results: &mut [crate::executor::DecodeRequestResult]) {
 
 #[cfg(test)]
 mod tests {
+    use openinfer_core::sampler::SamplingParams;
+
     use super::*;
     use crate::executor::RequestId;
-    use openinfer_core::sampler::SamplingParams;
 
     fn pending() -> PendingRequest {
         let (token_tx, _rx) = openinfer_core::engine::TokenSink::standalone();

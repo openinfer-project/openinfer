@@ -39,15 +39,22 @@
 //! `OPENINFER_TEST_MODEL_PATH` (target) and `OPENINFER_DFLASH_TEST_MODEL_PATH`
 //! (drafter); skips cleanly when either is absent.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 use std::time::Duration;
 
-use openinfer_core::engine::{EngineHandle, GenerateRequest, TokenEvent, TokenSink};
+use openinfer_core::engine::EngineHandle;
+use openinfer_core::engine::GenerateRequest;
+use openinfer_core::engine::TokenEvent;
+use openinfer_core::engine::TokenSink;
 use openinfer_core::sampler::SamplingParams;
-use openinfer_qwen3::{
-    DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES, DEFAULT_KV_PAGE_SIZE, DEFAULT_MAX_PREFILL_TOKENS,
-    DecodeOverlap, Qwen3LaunchOptions, Qwen3MemoryOptions, Qwen3OffloadOptions,
-};
+use openinfer_qwen3::DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES;
+use openinfer_qwen3::DEFAULT_KV_PAGE_SIZE;
+use openinfer_qwen3::DEFAULT_MAX_PREFILL_TOKENS;
+use openinfer_qwen3::DecodeOverlap;
+use openinfer_qwen3::Qwen3LaunchOptions;
+use openinfer_qwen3::Qwen3MemoryOptions;
+use openinfer_qwen3::Qwen3OffloadOptions;
 use vllm_text::tokenizer::DynTokenizer;
 
 mod common;

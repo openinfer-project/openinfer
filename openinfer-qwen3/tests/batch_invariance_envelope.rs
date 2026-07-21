@@ -2,12 +2,17 @@
 //! verifies it serves the swept Qwen3-4B envelope — Unified at N=101/201/513/1024/1279 and
 //! pure-Decode at bs=256 (exactly these points, not all N) — a shape it can't serve would bail.
 use openinfer_core::sampler::SamplingParams;
-use openinfer_kernels::ops::{
-    NumericPolicy, pin_served, reset_numeric_policy_counters, set_numeric_policy,
-};
-use openinfer_qwen3::runtime::{
-    DecodePlan, DecodeStepItem, PrefillPlan, PrefillStepItem, Qwen3Executor, RequestId, UnifiedPlan,
-};
+use openinfer_kernels::ops::NumericPolicy;
+use openinfer_kernels::ops::pin_served;
+use openinfer_kernels::ops::reset_numeric_policy_counters;
+use openinfer_kernels::ops::set_numeric_policy;
+use openinfer_qwen3::runtime::DecodePlan;
+use openinfer_qwen3::runtime::DecodeStepItem;
+use openinfer_qwen3::runtime::PrefillPlan;
+use openinfer_qwen3::runtime::PrefillStepItem;
+use openinfer_qwen3::runtime::Qwen3Executor;
+use openinfer_qwen3::runtime::RequestId;
+use openinfer_qwen3::runtime::UnifiedPlan;
 
 fn model_path_or_skip() -> Option<String> {
     if let Ok(p) = std::env::var("OPENINFER_TEST_MODEL_PATH") {

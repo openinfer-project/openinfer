@@ -1,7 +1,9 @@
-use super::{
-    DecodeGraphBlocker, EpBackendKind, FullDecodeGraphProbeReport, decode_graph_blockers,
-    decode_graph_readiness_status, full_decode_graph_probe_report,
-};
+use super::DecodeGraphBlocker;
+use super::EpBackendKind;
+use super::FullDecodeGraphProbeReport;
+use super::decode_graph_blockers;
+use super::decode_graph_readiness_status;
+use super::full_decode_graph_probe_report;
 
 #[test]
 fn nccl_readiness_has_no_static_blockers_after_probe_wiring() {

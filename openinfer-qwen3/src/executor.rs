@@ -1,46 +1,72 @@
-use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::path::Path;
+use std::path::PathBuf;
 use std::thread;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::ensure;
 use crossbeam_channel as channel;
-
-use crate::batch_decode::DecodeGraphUse;
-use crate::batch_decode_buffers::{BATCH_BUCKETS, BatchDecodeBuffers};
-use crate::config::{Config, TensorParallelConfig};
-use crate::weights::{KvBudget, ModelRuntimeConfig, Qwen3MemoryOptions, Qwen3Model};
-use crate::{Qwen3LoraOptions, Qwen3OffloadOptions};
 use openinfer_core::cuda_graph::CudaGraphDumpSummary;
-use openinfer_core::engine::{
-    LoadLoraAdapterRequest, TokenEvent, TokenLogprob, TokenSink, UnloadLoraAdapterRequest,
-    panic_message,
-};
+use openinfer_core::engine::LoadLoraAdapterRequest;
+use openinfer_core::engine::TokenEvent;
+use openinfer_core::engine::TokenLogprob;
+use openinfer_core::engine::TokenSink;
+use openinfer_core::engine::UnloadLoraAdapterRequest;
+use openinfer_core::engine::panic_message;
 use openinfer_core::kv_pool::KvLayout;
 use openinfer_core::ops;
 use openinfer_core::sampler::SamplingParams;
-use openinfer_core::tensor::{DeviceContext, HiddenStates};
-use openinfer_core::weight_loader::{WeightPrefetch, load_shard_info};
-use openinfer_kv_cache::{
-    KvBlockGuard, KvBuffer, KvCacheEvent, KvCacheManager, KvView, LoadReservation, PrefixProbe,
-    RegisteredBlock,
-};
-use openinfer_kv_offload::{LoadHandle, OffloadConfig, OffloadEngine};
+use openinfer_core::tensor::DeviceContext;
+use openinfer_core::tensor::HiddenStates;
+use openinfer_core::weight_loader::WeightPrefetch;
+use openinfer_core::weight_loader::load_shard_info;
+use openinfer_kv_cache::KvBlockGuard;
+use openinfer_kv_cache::KvBuffer;
+use openinfer_kv_cache::KvCacheEvent;
+use openinfer_kv_cache::KvCacheManager;
+use openinfer_kv_cache::KvView;
+use openinfer_kv_cache::LoadReservation;
+use openinfer_kv_cache::PrefixProbe;
+use openinfer_kv_cache::RegisteredBlock;
+use openinfer_kv_offload::LoadHandle;
+use openinfer_kv_offload::OffloadConfig;
+use openinfer_kv_offload::OffloadEngine;
 use tokio::sync::broadcast;
+
+use crate::Qwen3LoraOptions;
+use crate::Qwen3OffloadOptions;
+use crate::batch_decode::DecodeGraphUse;
+use crate::batch_decode_buffers::BATCH_BUCKETS;
+use crate::batch_decode_buffers::BatchDecodeBuffers;
+use crate::config::Config;
+use crate::config::TensorParallelConfig;
+use crate::weights::KvBudget;
+use crate::weights::ModelRuntimeConfig;
+use crate::weights::Qwen3MemoryOptions;
+use crate::weights::Qwen3Model;
 
 mod dflash_lane;
 mod dflash_prefill;
 mod remote_fetch;
-use remote_fetch::{QueryView, RemoteFetchAction, remote_fetch_action};
+use remote_fetch::QueryView;
+use remote_fetch::RemoteFetchAction;
+use remote_fetch::remote_fetch_action;
 mod spec;
 
-use crate::dflash::DFlashDraftModel;
-use crate::speculative::{
-    DraftPlan, DraftResult, DraftStepItem, VerifyPlan, VerifyResult, VerifyStepItem,
-    build_verify_results,
-};
 use dflash_lane::DFlashLaneState;
-use dflash_prefill::{DFlashPrefillAction, dflash_prefill_action};
+use dflash_prefill::DFlashPrefillAction;
+use dflash_prefill::dflash_prefill_action;
 
+use crate::dflash::DFlashDraftModel;
+use crate::speculative::DraftPlan;
+use crate::speculative::DraftResult;
+use crate::speculative::DraftStepItem;
+use crate::speculative::VerifyPlan;
+use crate::speculative::VerifyResult;
+use crate::speculative::VerifyStepItem;
+use crate::speculative::build_verify_results;
 use crate::verify_graph::VerifyGraphBuffers;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
@@ -637,7 +663,8 @@ fn tune_decode_gemm_algos(
     max_prefill_tokens: usize,
     run_envelope_check: bool,
 ) -> Result<()> {
-    use openinfer_kernels::ops::{NumericPolicy, numeric_policy};
+    use openinfer_kernels::ops::NumericPolicy;
+    use openinfer_kernels::ops::numeric_policy;
 
     let ctx = model.device_ctx();
     let hidden = model.config().hidden_size;
@@ -3041,8 +3068,9 @@ impl ModelExecutor for Qwen3Executor {
 
 #[cfg(test)]
 mod tests {
-    use super::ensure_lora_capacity;
     use std::collections::HashSet;
+
+    use super::ensure_lora_capacity;
 
     #[test]
     fn lora_capacity_rejects_new_adapter_at_limit() {

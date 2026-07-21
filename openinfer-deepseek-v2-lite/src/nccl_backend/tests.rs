@@ -1,15 +1,23 @@
-use std::{collections::HashSet, env, fs};
-
+use std::collections::HashSet;
+use std::env;
+use std::fs;
 #[cfg(unix)]
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
 
-use super::{
-    AllReduceChunk, NCCL_BF16_ALL_REDUCE_MAX_ELEMS_PER_CALL,
-    NCCL_F32_ALL_REDUCE_MAX_ELEMS_PER_CALL, add_nccl_python_wheel_candidates,
-    bf16_all_reduce_chunks, f32_all_reduce_chunks, format_nccl_version, nccl_library_candidates,
-    validate_nccl_version_for_compute_capabilities,
-};
-use super::{add_path_python_env_roots, add_python_env_root, nccl_python_wheel_lib_dirs_from_root};
+use super::AllReduceChunk;
+use super::NCCL_BF16_ALL_REDUCE_MAX_ELEMS_PER_CALL;
+use super::NCCL_F32_ALL_REDUCE_MAX_ELEMS_PER_CALL;
+use super::add_nccl_python_wheel_candidates;
+use super::add_path_python_env_roots;
+use super::add_python_env_root;
+use super::bf16_all_reduce_chunks;
+use super::f32_all_reduce_chunks;
+use super::format_nccl_version;
+use super::nccl_library_candidates;
+use super::nccl_python_wheel_lib_dirs_from_root;
+use super::validate_nccl_version_for_compute_capabilities;
 
 #[test]
 fn f32_all_reduce_chunks_preserve_short_counts_and_split_long_counts() {

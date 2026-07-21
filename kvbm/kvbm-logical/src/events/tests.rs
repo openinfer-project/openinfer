@@ -12,18 +12,21 @@ use std::time::Duration;
 
 use anyhow::Result;
 use bytes::Bytes;
+use dynamo_tokens::TokenBlockSequence;
 use futures::StreamExt;
 use futures::future::BoxFuture;
 use tokio::sync::mpsc;
 
 use super::batcher::BatchingConfig;
 use super::manager::EventsManager;
-use super::protocol::{KvCacheEvent, KvCacheEvents, KvbmCacheEvents};
+use super::protocol::KvCacheEvent;
+use super::protocol::KvCacheEvents;
+use super::protocol::KvbmCacheEvents;
 use super::publisher::KvbmCacheEventsPublisher;
+use crate::KvbmSequenceHashProvider;
+use crate::SequenceHash;
 use crate::pubsub::Publisher;
 use crate::registry::BlockRegistry;
-use crate::{KvbmSequenceHashProvider, SequenceHash};
-use dynamo_tokens::TokenBlockSequence;
 
 fn create_seq_hash_at_position(position: usize) -> SequenceHash {
     let tokens_per_block = 4;

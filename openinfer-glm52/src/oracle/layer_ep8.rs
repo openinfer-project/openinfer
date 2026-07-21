@@ -11,32 +11,52 @@
 
 use std::sync::Arc;
 
-use anyhow::{Context as _, Result, ensure};
+use anyhow::Context as _;
+use anyhow::Result;
+use anyhow::ensure;
 use half::bf16;
-use openinfer_kernels::ops::{
-    GLM52_FLASHMLA_SPARSE_PAGE_SIZE, GLM52_FLASHMLA_SPARSE_TOPK, Glm52FlashMlaSparseDecode,
-    Glm52IndexerCacheLayout, add_into, glm52_ep_deepep_unique_id,
-    glm52_flashmla_sparse_decode_num_sm_parts,
-};
+use openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_PAGE_SIZE;
+use openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_TOPK;
+use openinfer_kernels::ops::Glm52FlashMlaSparseDecode;
+use openinfer_kernels::ops::Glm52IndexerCacheLayout;
+use openinfer_kernels::ops::add_into;
+use openinfer_kernels::ops::glm52_ep_deepep_unique_id;
+use openinfer_kernels::ops::glm52_flashmla_sparse_decode_num_sm_parts;
 use openinfer_kernels::tensor::DeviceContext;
 
+use super::layer::GateLayerMlp;
+use super::layer::LayerTensors;
+use super::layer::MOE_ORACLE_CTX;
+use super::layer::MOE_ORACLE_HIDDEN_DIGEST;
+use super::layer::MOE_ORACLE_INPUT_SCALE;
+use super::layer::MOE_ORACLE_LAYER;
+use super::layer::MOE_ORACLE_LAYER_PROBES;
+use super::layer::MOE_ORACLE_LAYER_TOL;
+use super::layer::MOE_ORACLE_SEED;
+use super::layer::assert_layer_probes;
+use super::layer::checked_hidden;
+use super::layer::load_decoder_layer;
+use super::layer::load_rank_expert_bank;
+use super::layer::model_path;
+use crate::config::GLM52_INDEX_HEAD_DIM;
+use crate::config::GLM52_ROPE_HALF;
+use crate::config::GLM52_SM_SCALE;
 use crate::indexer::Glm52IndexerScratch;
-use crate::layer::{
-    Glm52DecodeStep, Glm52LayerCaches, Glm52LayerMlp, glm52_layer_attention_half,
-    glm52_layer_finish,
-};
+use crate::layer::Glm52DecodeStep;
+use crate::layer::Glm52LayerCaches;
+use crate::layer::Glm52LayerMlp;
+use crate::layer::glm52_layer_attention_half;
+use crate::layer::glm52_layer_finish;
 use crate::mla_decode::Glm52MlaSchedMetadata;
+use crate::model::GLM52_DECODE_BUCKETS;
+use crate::model::INDEX_CACHE_BLOCK;
+use crate::model::NUM_SMS;
+use crate::model::rope_tables;
+use crate::moe_decode::HIDDEN;
+use crate::moe_decode::run_router;
+use crate::moe_ep8::Glm52MoeEp8State;
+use crate::moe_ep8::glm52_moe_ep8_routed_forward;
 use crate::scratch::Glm52DecodeScratch;
-
-use super::layer::{
-    GateLayerMlp, LayerTensors, MOE_ORACLE_CTX, MOE_ORACLE_HIDDEN_DIGEST, MOE_ORACLE_INPUT_SCALE,
-    MOE_ORACLE_LAYER, MOE_ORACLE_LAYER_PROBES, MOE_ORACLE_LAYER_TOL, MOE_ORACLE_SEED,
-    assert_layer_probes, checked_hidden, load_decoder_layer, load_rank_expert_bank, model_path,
-};
-use crate::config::{GLM52_INDEX_HEAD_DIM, GLM52_ROPE_HALF, GLM52_SM_SCALE};
-use crate::model::{GLM52_DECODE_BUCKETS, INDEX_CACHE_BLOCK, NUM_SMS, rope_tables};
-use crate::moe_decode::{HIDDEN, run_router};
-use crate::moe_ep8::{Glm52MoeEp8State, glm52_moe_ep8_routed_forward};
 
 const EP_RANKS: usize = 8;
 /// Every global-token protocol value the production coordinator can agree on

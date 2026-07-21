@@ -7,23 +7,44 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::{Condvar, Mutex};
+use std::sync::Condvar;
+use std::sync::Mutex;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::bail;
+use anyhow::ensure;
 use cudarc::driver::CudaSlice;
 use half::bf16;
-use openinfer_kernels::ops::{
-    GLM52_TP_BANK_EXPERTS, GLM52_TP_HIDDEN, GLM52_TP_MAX_RANKS, GLM52_TP_TOKENS,
-    GLM52_TP_UNION_MAX, Glm52MoeTpBuffers, Glm52TpLlBuffer, Glm52TpTopology,
-    glm52_moe_tp_epoch_advance, glm52_moe_tp_layer_launch, glm52_moe_tp_max_blocks,
-    glm52_tp_ar_buffer_bytes, glm52_tp_ar_chunk_packets, glm52_tp_ar_launch,
-};
+use openinfer_kernels::ops::GLM52_TP_BANK_EXPERTS;
+use openinfer_kernels::ops::GLM52_TP_HIDDEN;
+use openinfer_kernels::ops::GLM52_TP_MAX_RANKS;
+use openinfer_kernels::ops::GLM52_TP_TOKENS;
+use openinfer_kernels::ops::GLM52_TP_UNION_MAX;
+use openinfer_kernels::ops::Glm52MoeTpBuffers;
+use openinfer_kernels::ops::Glm52TpLlBuffer;
+use openinfer_kernels::ops::Glm52TpTopology;
+use openinfer_kernels::ops::glm52_moe_tp_epoch_advance;
+use openinfer_kernels::ops::glm52_moe_tp_layer_launch;
+use openinfer_kernels::ops::glm52_moe_tp_max_blocks;
+use openinfer_kernels::ops::glm52_tp_ar_buffer_bytes;
+use openinfer_kernels::ops::glm52_tp_ar_chunk_packets;
+use openinfer_kernels::ops::glm52_tp_ar_launch;
 use openinfer_kernels::tensor::DeviceContext;
 
-use crate::config::{GLM52_EXPERT_INTERMEDIATE as INTERMEDIATE, GLM52_HIDDEN};
-use crate::moe_decode::{EXPERTS, QUANT_GROUP, W2_K, W2_N, W2_SCALE_COLS, W2_SCALE_ROWS};
-use crate::weights::{Glm52WeightManifest, expected_tensor_contract, mmap_file, retype_owned};
+use crate::config::GLM52_EXPERT_INTERMEDIATE as INTERMEDIATE;
+use crate::config::GLM52_HIDDEN;
+use crate::moe_decode::EXPERTS;
+use crate::moe_decode::QUANT_GROUP;
+use crate::moe_decode::W2_K;
+use crate::moe_decode::W2_N;
+use crate::moe_decode::W2_SCALE_COLS;
+use crate::moe_decode::W2_SCALE_ROWS;
+use crate::weights::Glm52WeightManifest;
+use crate::weights::expected_tensor_contract;
+use crate::weights::mmap_file;
+use crate::weights::retype_owned;
 
 const H: usize = GLM52_TP_HIDDEN;
 const RANKS: usize = GLM52_TP_MAX_RANKS;

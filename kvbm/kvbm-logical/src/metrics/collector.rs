@@ -6,10 +6,16 @@
 //! External labels (e.g. `instance_id`, `worker_id`) are appended at collection time,
 //! not baked in at metric creation time.
 
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use std::sync::RwLock;
 
-use prometheus::core::{Collector, Desc};
-use prometheus::proto::{Gauge, LabelPair, Metric, MetricFamily, MetricType};
+use prometheus::core::Collector;
+use prometheus::core::Desc;
+use prometheus::proto::Gauge;
+use prometheus::proto::LabelPair;
+use prometheus::proto::Metric;
+use prometheus::proto::MetricFamily;
+use prometheus::proto::MetricType;
 
 use super::pool_metrics::BlockPoolMetrics;
 
@@ -281,8 +287,9 @@ impl Collector for MetricsAggregator {
 #[cfg(test)]
 #[allow(deprecated)]
 mod tests {
-    use super::*;
     use prometheus::core::Collector;
+
+    use super::*;
 
     #[test]
     fn test_empty_aggregator_collects_nothing() {

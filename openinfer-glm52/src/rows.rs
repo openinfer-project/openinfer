@@ -16,7 +16,8 @@
 //! whose per-rank width lives in a rank config — the construction-time
 //! invariant and the typed signatures survive that move unchanged.
 
-use anyhow::{Result, ensure};
+use anyhow::Result;
+use anyhow::ensure;
 use cudarc::driver::CudaSlice;
 use half::bf16;
 use openinfer_kernels::tensor::DeviceContext;

@@ -3,7 +3,8 @@ use std::path::PathBuf;
 use openinfer_engine::engine::FinishReason;
 use serde::Serialize;
 
-use super::backend::{EpBackendKind, NCCL_BACKEND};
+use super::backend::EpBackendKind;
+use super::backend::NCCL_BACKEND;
 use crate::nccl_backend::NcclGraphSmokeReport;
 
 #[derive(Clone, Debug, Default)]

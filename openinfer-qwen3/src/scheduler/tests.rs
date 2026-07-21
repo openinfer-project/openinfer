@@ -1,18 +1,24 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::Result;
-use openinfer_core::engine::{
-    EngineControlError, LoadLoraAdapterRequest, UnloadLoraAdapterRequest,
-};
+use openinfer_core::engine::EngineControlError;
+use openinfer_core::engine::LoadLoraAdapterRequest;
+use openinfer_core::engine::UnloadLoraAdapterRequest;
 use openinfer_kv_cache::BlockPool;
 
 use super::*;
-use crate::executor::{
-    DecodePlan, DecodeRequestResult, PrefillPlan, PrefillRequestResult, PrefillResult,
-    PrefillStepItem, UnifiedPlan, UnifiedResult,
-};
+use crate::executor::DecodePlan;
+use crate::executor::DecodeRequestResult;
+use crate::executor::PrefillPlan;
+use crate::executor::PrefillRequestResult;
+use crate::executor::PrefillResult;
+use crate::executor::PrefillStepItem;
+use crate::executor::UnifiedPlan;
+use crate::executor::UnifiedResult;
 
 struct FakeExecutor {
     block_size: usize,
@@ -1075,8 +1081,9 @@ fn lora_control_waits_until_scheduler_idle() {
 // max-output budget. These were GPU-test-only; the truth table below pins the
 // branch behaviour with the existing FakeExecutor (only is_stop_token matters).
 
-use crate::speculative::VerifyRequestResult;
 use openinfer_core::engine::FinishReason;
+
+use crate::speculative::VerifyRequestResult;
 
 fn spec_active(
     id: u64,

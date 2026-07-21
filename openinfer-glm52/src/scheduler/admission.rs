@@ -8,12 +8,18 @@
 
 use std::collections::VecDeque;
 
-use openinfer_core::engine::{GenerateRequest, TokenEvent, unix_now_s};
+use openinfer_core::engine::GenerateRequest;
+use openinfer_core::engine::TokenEvent;
+use openinfer_core::engine::unix_now_s;
 use openinfer_kv_cache::BlockPool;
 
-use super::offload::{self, VllmAdmitOutcome, VllmPdState};
+use super::ActiveRequest;
+use super::PAGE;
+use super::RankSlots;
+use super::offload::VllmAdmitOutcome;
+use super::offload::VllmPdState;
+use super::offload::{self};
 use super::slot::Glm52SlotState;
-use super::{ActiveRequest, PAGE, RankSlots};
 use crate::runner::Glm52Worker;
 
 fn validate_request(req: &GenerateRequest, max_model_len: usize) -> Result<(), String> {
@@ -316,9 +322,11 @@ pub(super) fn admit_from_queue(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::scheduler::testkit::{request, sampled};
     use openinfer_sample::SamplingParams;
+
+    use super::*;
+    use crate::scheduler::testkit::request;
+    use crate::scheduler::testkit::sampled;
 
     #[test]
     fn malformed_sampling_params_die_at_intake() {

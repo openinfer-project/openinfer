@@ -20,32 +20,41 @@
 //!   cargo test --release -p openinfer-glm52 --features glm52 --lib layer_oracle -- --ignored --nocapture
 //! ```
 
-use std::{
-    collections::BTreeMap,
-    path::{Path, PathBuf},
-};
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::path::PathBuf;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::ensure;
 use half::bf16;
-use sha2::{Digest, Sha256};
+use openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_PAGE_SIZE;
+use openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_TOPK;
+use openinfer_kernels::ops::Glm52FlashMlaSparseDecode;
+use openinfer_kernels::ops::Glm52IndexerCacheLayout;
+use openinfer_kernels::ops::glm52_flashmla_sparse_decode_num_sm_parts;
+use openinfer_kernels::tensor::DeviceContext;
+use openinfer_kernels::tensor::DeviceVec;
+use sha2::Digest;
+use sha2::Sha256;
 
-use openinfer_kernels::ops::{
-    GLM52_FLASHMLA_SPARSE_PAGE_SIZE, GLM52_FLASHMLA_SPARSE_TOPK, Glm52FlashMlaSparseDecode,
-    Glm52IndexerCacheLayout, glm52_flashmla_sparse_decode_num_sm_parts,
-};
-use openinfer_kernels::tensor::{DeviceContext, DeviceVec};
-
-use crate::config::{GLM52_INDEX_HEAD_DIM, GLM52_ROPE_HALF, GLM52_SM_SCALE};
+use crate::config::GLM52_INDEX_HEAD_DIM;
+use crate::config::GLM52_ROPE_HALF;
+use crate::config::GLM52_SM_SCALE;
 use crate::fp8::Glm52ProjBytes;
 use crate::indexer::Glm52IndexerLayerWeights;
 use crate::indexer::Glm52IndexerScratch;
-use crate::layer::{
-    Glm52DecodeStep, Glm52DecoderLayerWeights, Glm52LayerCaches, Glm52LayerIndexer, Glm52LayerMlp,
-    glm52_decoder_layer_forward,
-};
+use crate::layer::Glm52DecodeStep;
+use crate::layer::Glm52DecoderLayerWeights;
+use crate::layer::Glm52LayerCaches;
+use crate::layer::Glm52LayerIndexer;
+use crate::layer::Glm52LayerMlp;
+use crate::layer::glm52_decoder_layer_forward;
 use crate::mla_decode::Glm52MlaSchedMetadata;
 use crate::mla_front::Glm52MlaLayerWeights;
-use crate::model::{INDEX_CACHE_BLOCK, NUM_SMS, rope_tables};
+use crate::model::INDEX_CACHE_BLOCK;
+use crate::model::NUM_SMS;
+use crate::model::rope_tables;
 use crate::moe_decode::Glm52MoeRoutedExpertBytes;
 use crate::scratch::Glm52DecodeScratch;
 

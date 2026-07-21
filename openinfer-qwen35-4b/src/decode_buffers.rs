@@ -1,12 +1,13 @@
 //! Sampling scratch and batched decode buffers for Qwen3.5.
 
 use anyhow::Result;
-
 use cudarc::driver::CudaSlice;
-
-use super::config::{Config35, TensorParallelConfig};
 use openinfer_core::kv_pool::KvState;
-use openinfer_core::tensor::{DeviceContext, HiddenStates};
+use openinfer_core::tensor::DeviceContext;
+use openinfer_core::tensor::HiddenStates;
+
+use super::config::Config35;
+use super::config::TensorParallelConfig;
 
 /// Pre-allocated GPU buffers for Qwen3.5 batch decode (N requests, 1 token each).
 pub(crate) struct BatchDecodeBuffers35 {

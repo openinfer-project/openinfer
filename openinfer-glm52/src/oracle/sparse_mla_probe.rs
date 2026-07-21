@@ -15,12 +15,14 @@ use anyhow::Result;
 use cudarc::driver::CudaSlice;
 use half::bf16;
 use openinfer_core::cuda_graph::CudaGraphState;
-use openinfer_kernels::ops::{
-    GLM52_FLASHMLA_SPARSE_PAGE_SIZE, GLM52_FLASHMLA_SPARSE_TOPK, Glm52FlashMlaSparseDecode,
-    Glm52SparseMlaDecode, glm52_flashmla_sparse_decode_launch,
-    glm52_flashmla_sparse_decode_metadata_launch, glm52_flashmla_sparse_decode_num_sm_parts,
-    glm52_sparse_mla_decode_launch,
-};
+use openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_PAGE_SIZE;
+use openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_TOPK;
+use openinfer_kernels::ops::Glm52FlashMlaSparseDecode;
+use openinfer_kernels::ops::Glm52SparseMlaDecode;
+use openinfer_kernels::ops::glm52_flashmla_sparse_decode_launch;
+use openinfer_kernels::ops::glm52_flashmla_sparse_decode_metadata_launch;
+use openinfer_kernels::ops::glm52_flashmla_sparse_decode_num_sm_parts;
+use openinfer_kernels::ops::glm52_sparse_mla_decode_launch;
 use openinfer_kernels::tensor::DeviceContext;
 
 const BATCH: usize = 8;

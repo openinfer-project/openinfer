@@ -23,32 +23,46 @@
 //! applied at the residual add ([`kimi_residual_add_scaled_bf16`]), matching
 //! the NCCL backend's convention.
 
-use anyhow::{Context, Result, ensure};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::ensure;
 use cudarc::driver::CudaSlice;
-use openinfer_kernels::{
-    ops::{
-        DeepEp, DeepEpDispatchScratch, KIMI_K2_EP_WORLD, KIMI_K2_LOCAL_EXPERTS,
-        KIMI_K2_ROUTER_SCALE, KIMI_K2_SHARED_GATE_UP, KimiMarlinInt4ExpertWeights,
-        KimiMarlinRouteWorkspace, KimiMarlinWna16Workspace, KimiRouterBatch, KimiRouterConfig,
-        KimiRouterOutput, deepep_info, kimi_deepep_build_marlin_routing_on_stream,
-        kimi_marlin_w13_swiglu_expanded, kimi_marlin_wna16_expanded_w2_gemm,
-        kimi_marlin_wna16_expanded_w13_gemm, kimi_residual_add_scaled_bf16,
-        kimi_router_noaux_tc_launch, kimi_shared_gate_up_cublaslt_into,
-        kimi_shared_gate_up_cublaslt_supports_batch_size,
-    },
-    tensor::{DeviceContext, GpuTensor, HiddenStates, NormWeight},
-    typed_ops,
-};
+use openinfer_kernels::ops::DeepEp;
+use openinfer_kernels::ops::DeepEpDispatchScratch;
+use openinfer_kernels::ops::KIMI_K2_EP_WORLD;
+use openinfer_kernels::ops::KIMI_K2_LOCAL_EXPERTS;
+use openinfer_kernels::ops::KIMI_K2_ROUTER_SCALE;
+use openinfer_kernels::ops::KIMI_K2_SHARED_GATE_UP;
+use openinfer_kernels::ops::KimiMarlinInt4ExpertWeights;
+use openinfer_kernels::ops::KimiMarlinRouteWorkspace;
+use openinfer_kernels::ops::KimiMarlinWna16Workspace;
+use openinfer_kernels::ops::KimiRouterBatch;
+use openinfer_kernels::ops::KimiRouterConfig;
+use openinfer_kernels::ops::KimiRouterOutput;
+use openinfer_kernels::ops::deepep_info;
+use openinfer_kernels::ops::kimi_deepep_build_marlin_routing_on_stream;
+use openinfer_kernels::ops::kimi_marlin_w13_swiglu_expanded;
+use openinfer_kernels::ops::kimi_marlin_wna16_expanded_w2_gemm;
+use openinfer_kernels::ops::kimi_marlin_wna16_expanded_w13_gemm;
+use openinfer_kernels::ops::kimi_residual_add_scaled_bf16;
+use openinfer_kernels::ops::kimi_router_noaux_tc_launch;
+use openinfer_kernels::ops::kimi_shared_gate_up_cublaslt_into;
+use openinfer_kernels::ops::kimi_shared_gate_up_cublaslt_supports_batch_size;
+use openinfer_kernels::tensor::DeviceContext;
+use openinfer_kernels::tensor::GpuTensor;
+use openinfer_kernels::tensor::HiddenStates;
+use openinfer_kernels::tensor::NormWeight;
+use openinfer_kernels::typed_ops;
 
-use crate::{
-    config::{
-        KIMI_K2_EXPERT_INTERMEDIATE, KIMI_K2_HIDDEN, KIMI_K2_RMS_NORM_EPS, KIMI_K2_ROUTED_EXPERTS,
-        KIMI_K2_TOPK,
-    },
-    weights::KimiRankExpertMarlinWeights,
-};
-
-use super::worker::{KimiMoeForwardCache, KimiWorkerDecodeScratch, MARLIN_W13_OUT_DIM};
+use super::worker::KimiMoeForwardCache;
+use super::worker::KimiWorkerDecodeScratch;
+use super::worker::MARLIN_W13_OUT_DIM;
+use crate::config::KIMI_K2_EXPERT_INTERMEDIATE;
+use crate::config::KIMI_K2_HIDDEN;
+use crate::config::KIMI_K2_RMS_NORM_EPS;
+use crate::config::KIMI_K2_ROUTED_EXPERTS;
+use crate::config::KIMI_K2_TOPK;
+use crate::weights::KimiRankExpertMarlinWeights;
 
 /// DeepEP expert alignment == Marlin block size: the property that lets
 /// Marlin consume the expanded recv buffer in place.

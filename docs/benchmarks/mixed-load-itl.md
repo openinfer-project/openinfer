@@ -152,7 +152,7 @@ as immunity.
 | 8k  | 906 | 898 | 900 |
 | 12k | 1408 | 1381 | 1422 |
 
-## Explaination
+## Explanation
 
 Two independent knobs explain every cell:
 

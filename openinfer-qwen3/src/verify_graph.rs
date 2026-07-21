@@ -23,13 +23,13 @@
 
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
-
 use openinfer_core::cuda_graph::CudaGraphState;
 use openinfer_core::kv_pool::KvLayout;
 use openinfer_core::ops;
 use openinfer_core::ops::PrefillPagedPlan;
 use openinfer_core::tensor::HiddenStates;
-use openinfer_kernels::ops::{NumericPolicy, numeric_policy};
+use openinfer_kernels::ops::NumericPolicy;
+use openinfer_kernels::ops::numeric_policy;
 use openinfer_kv_cache::KvView;
 
 use crate::batch_decode_buffers::BATCH_BUCKETS;

@@ -10,8 +10,11 @@
 use std::collections::HashSet;
 
 use half::bf16;
-use openinfer_kernels::tensor::{DeviceContext, HiddenStates};
-use openinfer_sample::{SampleScratch, SamplingParams, select_batch};
+use openinfer_kernels::tensor::DeviceContext;
+use openinfer_kernels::tensor::HiddenStates;
+use openinfer_sample::SampleScratch;
+use openinfer_sample::SamplingParams;
+use openinfer_sample::select_batch;
 
 /// Build a logits arena from per-row logits (row `i` is token `i`'s logits).
 fn make_arena(ctx: &DeviceContext, rows: &[Vec<f32>]) -> HiddenStates {

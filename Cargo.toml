@@ -1,56 +1,53 @@
 [workspace]
-resolver = "3"
 default-members = ["openinfer-server"]
 members = [
-    "openinfer-engine",
-    "openinfer-vllm-frontend",
-    "openinfer-sim",
-    "openinfer-vllm-support",
-    "openinfer-server",
-    "openinfer-core",
-    "openinfer-cupti",
-    "openinfer-kernels",
-    "openinfer-bench",
-    "openinfer-build",
-    "openinfer-deepseek-v2-lite",
-    "openinfer-glm52",
-    "openinfer-kimi-k2",
-    "openinfer-qwen3",
-    "openinfer-qwen35-4b",
-    "openinfer-sample",
-    "openinfer-kv-cache",
-    "openinfer-kv-offload",
-    # ---- dynamo kvbm (forked from upstream, Apache-2.0) ----
-    "kvbm/kvbm-logical",
+  "openinfer-engine",
+  "openinfer-vllm-frontend",
+  "openinfer-sim",
+  "openinfer-vllm-support",
+  "openinfer-server",
+  "openinfer-core",
+  "openinfer-cupti",
+  "openinfer-kernels",
+  "openinfer-bench",
+  "openinfer-build",
+  "openinfer-deepseek-v2-lite",
+  "openinfer-glm52",
+  "openinfer-kimi-k2",
+  "openinfer-qwen3",
+  "openinfer-qwen35-4b",
+  "openinfer-sample",
+  "openinfer-kv-cache",
+  "openinfer-kv-offload",
+  # ---- dynamo kvbm (forked from upstream, Apache-2.0) ----
+  "kvbm/kvbm-logical",
 ]
+resolver = "3"
 
 # openinfer-dynamo-backend / -frontend are their OWN workspaces (they depend on
 # dynamo-runtime / dynamo-llm). Excluding them keeps that heavy dep tree out of
 # this workspace's `--workspace` build + test graph, so the default openinfer
 # build stays pure Rust + CUDA with no NATS/etcd/tonic. Build from their own dirs.
-exclude = [
-    "openinfer-dynamo-backend",
-    "openinfer-dynamo-frontend",
-]
+exclude = ["openinfer-dynamo-backend", "openinfer-dynamo-frontend"]
 
 # Inherited by dynamo-ported crates that use `edition.workspace = true` etc.
 [workspace.package]
-version = "1.2.0"
-edition = "2024"
-description = "Dynamo Inference Framework"
 authors = ["NVIDIA Inc. <sw-dl-dynamo@nvidia.com>"]
-license = "Apache-2.0"
+description = "Dynamo Inference Framework"
+edition = "2024"
 homepage = "https://github.com/ai-dynamo/dynamo"
-repository = "https://github.com/ai-dynamo/dynamo.git"
 keywords = ["llm", "genai", "inference", "nvidia", "distributed"]
+license = "Apache-2.0"
+repository = "https://github.com/ai-dynamo/dynamo.git"
+version = "1.2.0"
 
 [workspace.dependencies]
 # ---- dynamo (upstream via git; kvbm-logical is a local fork) ----
 # Keep every ai-dynamo/dynamo dep on the SAME rev: crates from the same git
 # checkout unify their shared internal deps (dynamo-tokens), mixing revs would
 # split type identity.
-dynamo-tokens = { git = "https://github.com/ai-dynamo/dynamo", rev = "364cc8aa543d97f0563e17de3069d98ea051f33f" }
 dynamo-kv-hashing = { git = "https://github.com/ai-dynamo/dynamo", rev = "364cc8aa543d97f0563e17de3069d98ea051f33f" }
+dynamo-tokens = { git = "https://github.com/ai-dynamo/dynamo", rev = "364cc8aa543d97f0563e17de3069d98ea051f33f" }
 kvbm-logical = { path = "kvbm/kvbm-logical" }
 # ---- third-party ----
 anyhow = "1.0"
@@ -62,8 +59,11 @@ bincode = "2.0.1"
 bindgen = "0.72.1"
 bytes = { version = "1.10.1", features = ["serde"] }
 bytesize = "2.3.1"
-chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
 cc = "1.2"
+chrono = { version = "0.4", default-features = false, features = [
+  "serde",
+  "clock",
+] }
 clap = { version = "4.6.1", features = ["derive"] }
 colored = "3"
 comfy-table = "7.2"
@@ -79,64 +79,76 @@ crossbeam-channel = "0.5"
 # runtime, and the eager load is satisfied on the target deploy HW (verified
 # loading + serving on the 5090, driver 590 / CUDA 13.1).
 cudarc = { version = "0.19.3", features = [
-    "cuda-12090",
-    "cublas",
-    "f16",
-    "nccl",
-    # nvrtc: embedded pegaflow-core's transfer/kernel.rs references the nvrtc
-    # bindings unconditionally (its KernelBackend JIT-compiles the copy kernel),
-    # so the symbol is linked even with offload disabled. See the cudarc version
-    # note above for the 0.19.3-vs-0.19.5 (#263) lazy-loading tradeoff.
-    "nvrtc",
+  "cuda-12090",
+  "cublas",
+  "f16",
+  "nccl",
+  # nvrtc: embedded pegaflow-core's transfer/kernel.rs references the nvrtc
+  # bindings unconditionally (its KernelBackend JIT-compiles the copy kernel),
+  # so the symbol is linked even with offload disabled. See the cudarc version
+  # note above for the 0.19.3-vs-0.19.5 (#263) lazy-loading tradeoff.
+  "nvrtc",
 ] }
 cxx = "1.0.187"
 cxx-build = "1.0.187"
 dashmap = { version = "6.1.0", features = ["inline"] }
-derive_builder = "0.20"
 derive-getters = "0.5"
+derive_builder = "0.20"
 either = { version = "1.13", features = ["serde"] }
 etcd-client = { version = "0.17.0", features = ["tls"] }
 fastrace = { version = "0.7.17", features = ["enable"] }
 futures = "0.3"
 half = { version = "2.7", features = ["num-traits"] }
-humantime = "2.2.0"
 hex = "0.4"
+humantime = "2.2.0"
 indexmap = "2"
 is-terminal = "0.4"
-log = "0.4"
-logforth = { version = "0.29", features = ["starter-log", "layout-text", "diagnostic-task-local"] }
 libc = "0.2"
+log = "0.4"
+logforth = { version = "0.29", features = [
+  "starter-log",
+  "layout-text",
+  "diagnostic-task-local",
+] }
 memmap2 = "0.9"
 mio = "=1.1.1"
 mockall = "0.13.1"
 nvtx = "1.3.0"
 once_cell = "1.21.3"
-opentelemetry = { version = "0.31.0", features = ["trace", "logs"] }
-opentelemetry-appender-tracing = "0.31.0"
-opentelemetry-otlp = { version = "0.31.0", features = ["trace", "logs", "grpc-tonic"] }
-opentelemetry_sdk = { version = "0.31.0", features = ["trace", "logs", "rt-tokio"] }
-ordered-float = "4"
 oneshot = "0.1.11"
-parking_lot = "0.12.5"
 openinfer-bench = { path = "openinfer-bench" }
 openinfer-build = { path = "openinfer-build" }
 openinfer-core = { path = "openinfer-core" }
-openinfer-kv-cache = { path = "openinfer-kv-cache" }
-openinfer-kv-offload = { path = "openinfer-kv-offload" }
 openinfer-cupti = { path = "openinfer-cupti" }
-openinfer-glm52 = { path = "openinfer-glm52" }
+openinfer-deepseek-v2-lite = { path = "openinfer-deepseek-v2-lite" }
 openinfer-engine = { path = "openinfer-engine" }
+openinfer-glm52 = { path = "openinfer-glm52" }
 openinfer-kernels = { path = "openinfer-kernels" }
 openinfer-kimi-k2 = { path = "openinfer-kimi-k2" }
+openinfer-kv-cache = { path = "openinfer-kv-cache" }
+openinfer-kv-offload = { path = "openinfer-kv-offload" }
 openinfer-qwen3 = { path = "openinfer-qwen3" }
 openinfer-qwen35-4b = { path = "openinfer-qwen35-4b" }
 openinfer-sample = { path = "openinfer-sample" }
-openinfer-deepseek-v2-lite = { path = "openinfer-deepseek-v2-lite" }
 openinfer-vllm-frontend = { path = "openinfer-vllm-frontend" }
 openinfer-vllm-support = { path = "openinfer-vllm-support" }
+opentelemetry = { version = "0.31.0", features = ["trace", "logs"] }
+opentelemetry-appender-tracing = "0.31.0"
+opentelemetry-otlp = { version = "0.31.0", features = [
+  "trace",
+  "logs",
+  "grpc-tonic",
+] }
+opentelemetry_sdk = { version = "0.31.0", features = [
+  "trace",
+  "logs",
+  "rt-tokio",
+] }
+ordered-float = "4"
+parking_lot = "0.12.5"
 pkg-config = "0.3.32"
-prometheus = "0.14"
 postcard = { version = "1.1.3", features = ["alloc", "use-std"] }
+prometheus = "0.14"
 pyo3 = { version = "0.27.1", features = ["anyhow"] }
 rand = "0.10"
 smallvec = { version = "1.15.1", features = ["serde", "union"] }
@@ -144,18 +156,14 @@ syscalls = "0.7.0"
 thiserror = "2.0.17"
 # logforth consumes the `log` facade only; the `log` feature bridges tracing
 # events into log so they reach logforth instead of vanishing silently.
-tracing = { version = "0.1.41", features = ["log"] }
-tracing-core = "0.1.34"
-tracing-log = "0.2.0"
-tracing-subscriber = { version = "0.3.20", features = ["env-filter", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["stream"] }
 rmp-serde = "1.3"
 rmpv = "1.3"
-reqwest = { version = "0.12", default-features = false, features = ["stream"] }
 safetensors = "0.7"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.149"
-tempfile = "3"
 sha2 = "0.11"
+tempfile = "3"
 tmq = "0.5.0"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
@@ -163,7 +171,11 @@ tokio-util = "0.7"
 toml = "1.1"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
+tracing = { version = "0.1.41", features = ["log"] }
+tracing-core = "0.1.34"
+tracing-log = "0.2.0"
 tracing-opentelemetry = "0.32.0"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "json"] }
 url = { version = "2.5", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 validator = { version = "0.20.0", features = ["derive"] }
@@ -174,8 +186,8 @@ vllm-text = { git = "https://github.com/vllm-project/vllm.git", rev = "8e61b646e
 vllm-tokenizer = { git = "https://github.com/vllm-project/vllm.git", rev = "8e61b646e2d157f9b93451fa048f9c8530c8a67b" }
 xxhash-rust = { version = "0.8", features = ["xxh3", "const_xxh3"] }
 zeromq = { version = "0.6.0", default-features = false, features = [
-    "tokio-runtime",
-    "all-transport",
+  "tokio-runtime",
+  "all-transport",
 ] }
 
 [workspace.lints.clippy]
@@ -206,12 +218,12 @@ unused_peekable = "warn"
 dbg_macro = "warn"
 exit = "warn"
 get_unwrap = "warn"
-print_stdout = "allow"
 print_stderr = "allow"
+print_stdout = "allow"
 rc_buffer = "warn"
 rc_mutex = "warn"
 rest_pat_in_fully_bound_structs = "warn"
 
 [workspace.lints.rust]
-unsafe_op_in_unsafe_fn = "warn"
 unreachable_pub = "warn"
+unsafe_op_in_unsafe_fn = "warn"

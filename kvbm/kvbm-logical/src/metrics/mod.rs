@@ -13,8 +13,11 @@ mod pool_metrics;
 mod stats;
 
 pub use collector::MetricsAggregator;
-pub use pool_metrics::{BlockPoolMetrics, MetricsSnapshot};
-pub use stats::{StatsCollector, StatsConfig, StatsSnapshot};
+pub use pool_metrics::BlockPoolMetrics;
+pub use pool_metrics::MetricsSnapshot;
+pub use stats::StatsCollector;
+pub use stats::StatsConfig;
+pub use stats::StatsSnapshot;
 
 /// Returns the short (unqualified) type name for `T`.
 ///

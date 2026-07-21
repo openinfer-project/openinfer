@@ -2,13 +2,21 @@ use std::collections::HashMap;
 use std::ffi::CStr;
 use std::fmt::Write as _;
 use std::io::Write as _;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::path::Path;
+use std::path::PathBuf;
+use std::process::Child;
+use std::process::Command;
+use std::process::Output;
+use std::process::Stdio;
 
-use anyhow::{Context, Result, ensure};
-use cudarc::driver::sys::{self, CUgraphNode};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::ensure;
+use cudarc::driver::sys::CUgraphNode;
+use cudarc::driver::sys::{self};
 
-use super::{CudaGraphState, check};
+use super::CudaGraphState;
+use super::check;
 
 mod render;
 
@@ -470,10 +478,14 @@ fn dot_escape(value: &str) -> String {
 mod tests {
     use std::fmt::Write as _;
 
-    use super::{
-        GraphDescription, GraphEdge, GraphNode, GraphNodeKind, communicate, demangle, dot_escape,
-        format_driver_api_version,
-    };
+    use super::GraphDescription;
+    use super::GraphEdge;
+    use super::GraphNode;
+    use super::GraphNodeKind;
+    use super::communicate;
+    use super::demangle;
+    use super::dot_escape;
+    use super::format_driver_api_version;
 
     #[test]
     fn dot_label_escaping_preserves_graph_syntax() {

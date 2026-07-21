@@ -9,12 +9,16 @@
 //!     -p openinfer-qwen3 --test batch_invariance_decode_gemm_graph -- --nocapture
 
 use openinfer_core::sampler::SamplingParams;
-use openinfer_kernels::ops::{
-    NumericPolicy, pin_served, reset_numeric_policy_counters, set_numeric_policy,
-};
-use openinfer_qwen3::runtime::{
-    DecodePlan, DecodeStepItem, PrefillPlan, PrefillStepItem, Qwen3Executor, RequestId,
-};
+use openinfer_kernels::ops::NumericPolicy;
+use openinfer_kernels::ops::pin_served;
+use openinfer_kernels::ops::reset_numeric_policy_counters;
+use openinfer_kernels::ops::set_numeric_policy;
+use openinfer_qwen3::runtime::DecodePlan;
+use openinfer_qwen3::runtime::DecodeStepItem;
+use openinfer_qwen3::runtime::PrefillPlan;
+use openinfer_qwen3::runtime::PrefillStepItem;
+use openinfer_qwen3::runtime::Qwen3Executor;
+use openinfer_qwen3::runtime::RequestId;
 
 const LOGPROBS: usize = 64;
 const MAX_OUTPUT_TOKENS: usize = 4;

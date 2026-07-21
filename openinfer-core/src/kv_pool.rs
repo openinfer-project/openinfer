@@ -1,10 +1,13 @@
 use std::sync::Arc;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
+use anyhow::bail;
 use cudarc::driver::CudaSlice;
 use half::bf16;
 
-use crate::page_pool::{OwnedPagePermit, PageId, PagePool};
+use crate::page_pool::OwnedPagePermit;
+use crate::page_pool::PageId;
+use crate::page_pool::PagePool;
 use crate::tensor::DeviceContext;
 
 /// Page-first geometry: dimensions and derived strides for one page.
@@ -73,7 +76,7 @@ struct KvPoolInner {
 ///          └─ page_size × num_kv_heads × head_dim each ─┘
 /// ```
 ///
-/// Cheaply clonable (Arc). Multiple `KvState`s share the same pool.
+/// Cheaply cloneable (Arc). Multiple `KvState`s share the same pool.
 #[derive(Clone)]
 pub struct KvPool {
     inner: Arc<KvPoolInner>,

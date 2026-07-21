@@ -12,17 +12,24 @@ mod builder;
 #[cfg(test)]
 mod tests;
 
-pub use builder::{
-    BlockManagerBuilderError, BlockManagerConfigBuilder, BlockManagerResetError,
-    FrequencyTrackingCapacity, InactiveBackendConfig, LineageEviction,
-};
-
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::blocks::{BlockMetadata, CompleteBlock, ImmutableBlock, MutableBlock};
+pub use builder::BlockManagerBuilderError;
+pub use builder::BlockManagerConfigBuilder;
+pub use builder::BlockManagerResetError;
+pub use builder::FrequencyTrackingCapacity;
+pub use builder::InactiveBackendConfig;
+pub use builder::LineageEviction;
+
+use crate::blocks::BlockMetadata;
+use crate::blocks::CompleteBlock;
+use crate::blocks::ImmutableBlock;
+use crate::blocks::MutableBlock;
 use crate::metrics::BlockPoolMetrics;
-use crate::pools::{BlockDuplicationPolicy, BlockStore, SequenceHash};
+use crate::pools::BlockDuplicationPolicy;
+use crate::pools::BlockStore;
+use crate::pools::SequenceHash;
 use crate::registry::BlockRegistry;
 
 /// Manages the full block lifecycle over the unified [`BlockStore`].

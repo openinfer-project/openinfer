@@ -1,10 +1,17 @@
-use crate::executor::{DecodeRequestResult, ModelExecutor, PrefillRequestResult};
-use crate::speculative::VerifyRequestResult;
 use openinfer_core::engine::FinishReason;
 
-use super::effects::{DecodeEffect, PendingEffect, PromptEchoEffect, ScheduledEffect, StepEffects};
+use super::ActiveRequestState;
+use super::PendingRequest;
+use super::effects::DecodeEffect;
+use super::effects::PendingEffect;
+use super::effects::PromptEchoEffect;
+use super::effects::ScheduledEffect;
+use super::effects::StepEffects;
 use super::plan::ExecutionArtifacts;
-use super::{ActiveRequestState, PendingRequest};
+use crate::executor::DecodeRequestResult;
+use crate::executor::ModelExecutor;
+use crate::executor::PrefillRequestResult;
+use crate::speculative::VerifyRequestResult;
 
 pub(super) fn resolve_step(
     executor: &impl ModelExecutor,

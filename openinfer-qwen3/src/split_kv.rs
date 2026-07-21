@@ -1,7 +1,8 @@
 //! Split-KV decode chunking config: the chunk-size formula and the
 //! `split_kv_{chunk}x{max}` label/parse round-trip for the manifest variant sweep.
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 
 /// One split-KV decode configuration: a per-chunk token floor and a per-request chunk cap.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

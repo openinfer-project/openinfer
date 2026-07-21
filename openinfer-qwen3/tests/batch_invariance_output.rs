@@ -5,16 +5,25 @@
 //!
 //! Needs one CUDA GPU, `OPENINFER_TEST_MODEL_PATH`, and `--test-threads=1`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::Path;
-use std::sync::{Arc, Mutex, atomic::AtomicU8};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicU8;
 
-use openinfer_core::engine::{
-    EngineHandle, EngineLoadOptions, GenerateRequest, RequestAbortReason, RequestTag, TokenEvent,
-    TokenSink, TokenStreamReceiver, TokenStreamSender,
-};
+use openinfer_core::engine::EngineHandle;
+use openinfer_core::engine::EngineLoadOptions;
+use openinfer_core::engine::GenerateRequest;
+use openinfer_core::engine::RequestAbortReason;
+use openinfer_core::engine::RequestTag;
+use openinfer_core::engine::TokenEvent;
+use openinfer_core::engine::TokenSink;
+use openinfer_core::engine::TokenStreamReceiver;
+use openinfer_core::engine::TokenStreamSender;
 use openinfer_core::sampler::SamplingParams;
-use openinfer_kernels::ops::{NumericPolicy, numeric_policy};
+use openinfer_kernels::ops::NumericPolicy;
+use openinfer_kernels::ops::numeric_policy;
 use tokio::sync::mpsc;
 
 const A_TOKENS: usize = 64;

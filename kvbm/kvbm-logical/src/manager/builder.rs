@@ -6,22 +6,22 @@
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use crate::metrics::{BlockPoolMetrics, MetricsAggregator, short_type_name};
-use crate::tinylfu::TinyLFUTracker;
-
-use crate::{
-    blocks::BlockMetadata,
-    pools::{
-        BlockDuplicationPolicy, BlockStore, InactiveIndex,
-        backends::{
-            FifoReusePolicy, HashMapBackend, LeafPolicy, LineageBackend, LruBackend,
-            MultiLruBackend,
-        },
-    },
-    registry::BlockRegistry,
-};
-
 use super::BlockManager;
+use crate::blocks::BlockMetadata;
+use crate::metrics::BlockPoolMetrics;
+use crate::metrics::MetricsAggregator;
+use crate::metrics::short_type_name;
+use crate::pools::BlockDuplicationPolicy;
+use crate::pools::BlockStore;
+use crate::pools::InactiveIndex;
+use crate::pools::backends::FifoReusePolicy;
+use crate::pools::backends::HashMapBackend;
+use crate::pools::backends::LeafPolicy;
+use crate::pools::backends::LineageBackend;
+use crate::pools::backends::LruBackend;
+use crate::pools::backends::MultiLruBackend;
+use crate::registry::BlockRegistry;
+use crate::tinylfu::TinyLFUTracker;
 
 /// Capacity settings for the TinyLFU frequency tracker used by
 /// [`BlockRegistry`] and the multi-level LRU backend.

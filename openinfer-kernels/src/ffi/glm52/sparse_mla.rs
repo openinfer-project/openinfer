@@ -1,4 +1,5 @@
-use cudarc::driver::sys::{CUresult, CUstream};
+use cudarc::driver::sys::CUresult;
+use cudarc::driver::sys::CUstream;
 
 use crate::ffi::Half;
 

@@ -1,5 +1,6 @@
-use super::*;
 use openinfer_kernels::ffi;
+
+use super::*;
 
 pub(in crate::runner) fn all_reduce_hidden_via_f32_in_place<const DIM: usize>(
     ctx: &DeviceContext,

@@ -1,9 +1,14 @@
+use std::ptr::null;
+use std::ptr::null_mut;
+
 use anyhow::Result;
-use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
-use std::ptr::{null, null_mut};
+use cudarc::driver::CudaSlice;
+use cudarc::driver::DevicePtr;
+use cudarc::driver::DevicePtrMut;
 
 use crate::ffi;
-use crate::tensor::{DeviceContext, HiddenStates};
+use crate::tensor::DeviceContext;
+use crate::tensor::HiddenStates;
 
 pub struct LoraDecodeGroupedProjection<'a> {
     pub a_packed: &'a CudaSlice<half::bf16>,

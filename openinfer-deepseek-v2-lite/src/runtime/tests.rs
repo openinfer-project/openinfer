@@ -1,8 +1,10 @@
-use super::{
-    backend::{EpBackendKind, parse_backend, validate_backend_and_devices},
-    helpers::{append_generated_token, ensure_same_prompt_batch_rows_match},
-};
 use openinfer_engine::engine::FinishReason;
+
+use super::backend::EpBackendKind;
+use super::backend::parse_backend;
+use super::backend::validate_backend_and_devices;
+use super::helpers::append_generated_token;
+use super::helpers::ensure_same_prompt_batch_rows_match;
 
 #[test]
 fn append_generated_token_handles_eos_stop_vs_ignore() {

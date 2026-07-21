@@ -1,6 +1,9 @@
 //! CLI surface: global options, subcommands, and per-command argument structs.
 
-use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
+use clap::Args as ClapArgs;
+use clap::Parser;
+use clap::Subcommand;
+use clap::ValueEnum;
 use openinfer_core::engine::EpBackend;
 
 pub(crate) const DEFAULT_MODEL_PATH: &str =

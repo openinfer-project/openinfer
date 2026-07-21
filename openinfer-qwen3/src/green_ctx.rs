@@ -12,8 +12,11 @@
 
 use std::ptr;
 
-use anyhow::{Result, bail};
-use cudarc::driver::sys::{self, CUdevice, CUstream};
+use anyhow::Result;
+use anyhow::bail;
+use cudarc::driver::sys::CUdevice;
+use cudarc::driver::sys::CUstream;
+use cudarc::driver::sys::{self};
 
 /// How prefill and decode share the GPU within a scheduler step. Selected on
 /// the CLI via `--decode-overlap`.

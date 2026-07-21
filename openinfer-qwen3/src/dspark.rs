@@ -23,11 +23,14 @@
 
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
+use openinfer_core::ops;
+use openinfer_core::tensor::DeviceContext;
+use openinfer_core::tensor::DeviceMatrix;
+use openinfer_core::tensor::HiddenStates;
+use openinfer_kernels::ops::markov_step_argmax_into;
+use openinfer_kernels::ops::markov_step_argmax_partials_len;
 
 use crate::config::DFlashConfig;
-use openinfer_core::ops;
-use openinfer_core::tensor::{DeviceContext, DeviceMatrix, HiddenStates};
-use openinfer_kernels::ops::{markov_step_argmax_into, markov_step_argmax_partials_len};
 
 pub(crate) const MARKOV_W1_TENSOR: &str = "markov_head.markov_w1.weight";
 pub(crate) const MARKOV_W2_TENSOR: &str = "markov_head.markov_w2.weight";

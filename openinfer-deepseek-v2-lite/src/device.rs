@@ -1,7 +1,9 @@
 use std::cell::Cell;
 
-use anyhow::{Result, ensure};
-use openinfer_core::{ffi, tensor::DeviceContext};
+use anyhow::Result;
+use anyhow::ensure;
+use openinfer_core::ffi;
+use openinfer_core::tensor::DeviceContext;
 
 thread_local! {
     static ACTIVE_DEVICE: Cell<Option<usize>> = const { Cell::new(None) };

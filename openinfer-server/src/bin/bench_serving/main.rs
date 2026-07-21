@@ -22,13 +22,16 @@
 use std::path::Path;
 use std::time::Instant;
 
-use anyhow::{Context, Result};
+use anyhow::Context;
+use anyhow::Result;
 use clap::Parser;
 use log::debug;
 use openinfer::logging;
 use openinfer::scheduler::SchedulerHandle;
-use openinfer::server_engine::{ModelType, detect_model_type};
-use openinfer_core::engine::{EngineLoadOptions, EpBackend};
+use openinfer::server_engine::ModelType;
+use openinfer::server_engine::detect_model_type;
+use openinfer_core::engine::EngineLoadOptions;
+use openinfer_core::engine::EpBackend;
 #[cfg(feature = "kimi-k2")]
 use openinfer_core::parallel::ParallelConfig;
 use openinfer_vllm_support::load_tokenizer as load_vllm_tokenizer;
@@ -45,13 +48,17 @@ mod render;
 mod report;
 mod runners;
 mod snapshot;
-use cli::{Cli, Command};
+use cli::Cli;
+use cli::Command;
+use exec::BenchModel;
 #[cfg(feature = "deepseek-v2-lite")]
 use exec::DeepSeekV2LiteBenchModel;
-use exec::{BenchModel, SchedulerBenchModel};
+use exec::SchedulerBenchModel;
 use metrics::dur_ms;
-use runners::{emit_report, run_command};
-use snapshot::{run_compare, run_snapshot};
+use runners::emit_report;
+use runners::run_command;
+use snapshot::run_compare;
+use snapshot::run_snapshot;
 
 fn command_seed(cli: &Cli) -> u64 {
     match &cli.command {

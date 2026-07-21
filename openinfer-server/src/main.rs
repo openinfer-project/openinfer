@@ -3,17 +3,22 @@ mod config;
 use std::time::Instant;
 
 use anyhow::Context;
-use clap::{CommandFactory, FromArgMatches};
+use clap::CommandFactory;
+use clap::FromArgMatches;
+use config::Args;
 use log::info;
 use openinfer::logging;
-use openinfer::server_engine::{ModelType, detect_model_type};
+use openinfer::server_engine::ModelType;
+use openinfer::server_engine::detect_model_type;
 use openinfer_core::engine::EngineHandle;
 #[cfg(feature = "qwen35-4b")]
 use openinfer_core::engine::EngineLoadOptions;
 #[cfg(feature = "qwen3")]
-use openinfer_qwen3::{Qwen3LaunchOptions, Qwen3LoraOptions, Qwen3OffloadOptions};
-
-use config::Args;
+use openinfer_qwen3::Qwen3LaunchOptions;
+#[cfg(feature = "qwen3")]
+use openinfer_qwen3::Qwen3LoraOptions;
+#[cfg(feature = "qwen3")]
+use openinfer_qwen3::Qwen3OffloadOptions;
 
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]

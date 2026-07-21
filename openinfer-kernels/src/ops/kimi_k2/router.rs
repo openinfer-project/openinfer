@@ -1,8 +1,14 @@
-use anyhow::{Result, anyhow, ensure};
-use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
+use anyhow::Result;
+use anyhow::anyhow;
+use anyhow::ensure;
+use cudarc::driver::CudaSlice;
+use cudarc::driver::DevicePtr;
+use cudarc::driver::DevicePtrMut;
 
 use crate::ffi;
-use crate::tensor::{DeviceContext, GpuTensor, GpuWeight};
+use crate::tensor::DeviceContext;
+use crate::tensor::GpuTensor;
+use crate::tensor::GpuWeight;
 
 pub const KIMI_K2_ROUTER_HIDDEN: usize = 7168;
 pub const KIMI_K2_ROUTER_EXPERTS: usize = 384;

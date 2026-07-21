@@ -3,11 +3,12 @@
 
 //! Attachment system for storing arbitrary typed data on registration handles.
 
-use super::handle::BlockRegistrationHandle;
-
-use std::any::{Any, TypeId};
+use std::any::Any;
+use std::any::TypeId;
 use std::collections::HashMap;
 use std::marker::PhantomData;
+
+use super::handle::BlockRegistrationHandle;
 
 /// Error types for attachment operations
 #[derive(Debug, Clone, PartialEq, Eq)]

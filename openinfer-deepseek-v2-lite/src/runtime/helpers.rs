@@ -1,8 +1,10 @@
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
+use anyhow::bail;
 use openinfer_engine::engine::FinishReason;
-use sha2::{Digest, Sha256};
+use sha2::Digest;
+use sha2::Sha256;
 
 pub(super) fn token_sha256(tokens: &[u32]) -> String {
     let mut hasher = Sha256::new();

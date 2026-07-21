@@ -24,7 +24,8 @@
 //! `BlockStore.inner` (Mutex). Never the reverse.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
+use std::sync::Weak;
 
 // Under `#[cfg(test)]` use `tracing-mutex`'s parking_lot wrapper, which
 // is API-identical to `parking_lot::Mutex` but builds a global
@@ -37,17 +38,18 @@ use parking_lot::Mutex;
 #[cfg(test)]
 use tracing_mutex::parkinglot::Mutex;
 
-use crate::BlockId;
-use crate::blocks::{
-    BlockDuplicationPolicy, BlockMetadata, CompleteBlock, ImmutableBlockInner, MutableBlock,
-    SequenceHash,
-};
-use crate::metrics::BlockPoolMetrics;
-use crate::registry::BlockRegistrationHandle;
-
 // Identity hashing for `SequenceHash`-keyed maps lives in `pools` — it is
 // shared by `active_by_hash` here and by the inactive-pool backends.
 use super::SeqHashMap;
+use crate::BlockId;
+use crate::blocks::BlockDuplicationPolicy;
+use crate::blocks::BlockMetadata;
+use crate::blocks::CompleteBlock;
+use crate::blocks::ImmutableBlockInner;
+use crate::blocks::MutableBlock;
+use crate::blocks::SequenceHash;
+use crate::metrics::BlockPoolMetrics;
+use crate::registry::BlockRegistrationHandle;
 
 /// Index trait for inactive-pool eviction backends. T-free: backends only
 /// need `(SequenceHash, BlockId)` pairs.

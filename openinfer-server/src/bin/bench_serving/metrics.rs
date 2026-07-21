@@ -2,7 +2,9 @@
 
 use std::time::Duration;
 
-use crate::report::{CountStats, DurationStats, GeneratedTokenTrace};
+use crate::report::CountStats;
+use crate::report::DurationStats;
+use crate::report::GeneratedTokenTrace;
 
 pub(crate) fn dur_ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1000.0

@@ -1,6 +1,8 @@
 use std::env;
 
-use anyhow::{Result, bail, ensure};
+use anyhow::Result;
+use anyhow::bail;
+use anyhow::ensure;
 use openinfer_core::tensor::DeviceContext;
 
 use crate::nccl_backend::NaiveNcclEp2Backend;

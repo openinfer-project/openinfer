@@ -1,15 +1,22 @@
-use anyhow::{Context, Result};
+use anyhow::Context;
+use anyhow::Result;
 use log::debug;
+use openinfer_core::tensor::DeviceContext;
+use openinfer_core::tensor::DeviceMatrix;
+use openinfer_core::tensor::DeviceVec;
+use openinfer_core::weight_loader::deserialize_shards;
+use openinfer_core::weight_loader::load_shard_info;
+use openinfer_core::weight_loader::load_tensor_1d;
+use openinfer_core::weight_loader::load_tensor_2d;
+use openinfer_core::weight_loader::load_tensor_bool_host;
+use openinfer_core::weight_loader::load_tensor_i64_host;
+use openinfer_core::weight_loader::mmap_shards;
+use openinfer_core::weight_loader::precompute_rope;
 
+use super::Eagle3DraftModel;
+use super::Eagle3Layer;
 use crate::config::Eagle3Config;
 use crate::weights::Qwen3Model;
-use openinfer_core::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
-use openinfer_core::weight_loader::{
-    deserialize_shards, load_shard_info, load_tensor_1d, load_tensor_2d, load_tensor_bool_host,
-    load_tensor_i64_host, mmap_shards, precompute_rope,
-};
-
-use super::{Eagle3DraftModel, Eagle3Layer};
 
 impl Eagle3DraftModel {
     /// Load an EAGLE-3 drafter from a HF safetensors directory, validating its

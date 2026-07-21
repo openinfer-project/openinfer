@@ -3,11 +3,10 @@
 
 //! Shared test utilities and pool/guard integration tests.
 
-use super::super::{
-    blocks::*,
-    pools::*,
-    testing::{self, TestMeta},
-};
+use super::super::blocks::*;
+use super::super::pools::*;
+use super::super::testing::TestMeta;
+use super::super::testing::{self};
 
 /// Re-export TestMeta as TestData for backward compatibility with older tests.
 pub type TestData = TestMeta;
@@ -15,13 +14,12 @@ pub type TestData = TestMeta;
 #[cfg(test)]
 #[allow(unused, dead_code)]
 pub(crate) mod fixtures {
-    use super::*;
-
     use std::sync::Arc;
 
     use dynamo_tokens::TokenBlock;
 
     pub use super::testing::tokens_for_id;
+    use super::*;
 
     pub fn create_token_block(tokens: &[u32], block_size: u32) -> TokenBlock {
         testing::create_test_token_block(tokens, block_size)

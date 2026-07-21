@@ -1,16 +1,20 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{KvbmSequenceHashProvider, tinylfu::TinyLFUTracker};
+use std::any::TypeId;
+use std::sync::Arc;
 
 use super::attachments::AttachmentError;
 use super::*;
-
-use crate::testing::{self, MetadataA, MetadataB, MetadataC, TestMeta};
-use crate::{BlockManager, blocks::BlockDuplicationPolicy};
-
-use std::any::TypeId;
-use std::sync::Arc;
+use crate::BlockManager;
+use crate::KvbmSequenceHashProvider;
+use crate::blocks::BlockDuplicationPolicy;
+use crate::testing::MetadataA;
+use crate::testing::MetadataB;
+use crate::testing::MetadataC;
+use crate::testing::TestMeta;
+use crate::testing::{self};
+use crate::tinylfu::TinyLFUTracker;
 
 type TestMetadata = TestMeta;
 
@@ -432,7 +436,8 @@ fn test_resurrect_via_register_returns_existing_under_reject_policy() {
 
 #[test]
 fn test_touch_callback_fires() {
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::AtomicU32;
+    use std::sync::atomic::Ordering;
 
     let registry = BlockRegistry::new();
     let seq_hash = create_test_token_block(&[1, 2, 3, 4]).kvbm_sequence_hash();
@@ -456,7 +461,8 @@ fn test_touch_callback_fires() {
 
 #[test]
 fn test_touch_multiple_callbacks() {
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::AtomicU32;
+    use std::sync::atomic::Ordering;
 
     let registry = BlockRegistry::new();
     let seq_hash = create_test_token_block(&[5, 6, 7, 8]).kvbm_sequence_hash();

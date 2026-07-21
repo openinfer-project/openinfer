@@ -5,11 +5,16 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use openinfer_core::engine::EngineLoadOptions;
-use openinfer_kernels::ops::{NumericPolicy, numeric_policy, set_numeric_policy};
-use openinfer_qwen3::{
-    DEFAULT_MAX_PREFILL_TOKENS, DecodeOverlap, Qwen3LoraOptions, Qwen3MemoryOptions,
-    Qwen3OffloadOptions, start_engine_with_lora_control, start_engine_with_offload,
-};
+use openinfer_kernels::ops::NumericPolicy;
+use openinfer_kernels::ops::numeric_policy;
+use openinfer_kernels::ops::set_numeric_policy;
+use openinfer_qwen3::DEFAULT_MAX_PREFILL_TOKENS;
+use openinfer_qwen3::DecodeOverlap;
+use openinfer_qwen3::Qwen3LoraOptions;
+use openinfer_qwen3::Qwen3MemoryOptions;
+use openinfer_qwen3::Qwen3OffloadOptions;
+use openinfer_qwen3::start_engine_with_lora_control;
+use openinfer_qwen3::start_engine_with_offload;
 
 // Serialize the reject #[test]s — they share the process-global numeric policy.
 static POLICY_LOCK: Mutex<()> = Mutex::new(());

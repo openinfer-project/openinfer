@@ -38,16 +38,17 @@ mod mutable;
 mod pin;
 
 pub use complete::CompleteBlock;
-pub use immutable::{ImmutableBlock, WeakBlock};
-pub use mutable::MutableBlock;
-pub use pin::{LifecyclePin, LifecyclePinRef};
-
+pub use immutable::ImmutableBlock;
 pub(crate) use immutable::ImmutableBlockInner;
+pub use immutable::WeakBlock;
+pub use mutable::MutableBlock;
+pub use pin::LifecyclePin;
+pub use pin::LifecyclePinRef;
 
+pub use crate::BlockId;
+pub use crate::SequenceHash;
 pub use crate::registry::BlockRegistrationHandle;
 pub use crate::registry::BlockRegistry;
-
-pub use crate::{BlockId, SequenceHash};
 
 /// Marker trait for types that can serve as block-level metadata.
 ///

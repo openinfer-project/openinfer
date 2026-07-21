@@ -1,8 +1,7 @@
-use std::{
-    collections::BTreeMap,
-    env,
-    time::{Duration, Instant},
-};
+use std::collections::BTreeMap;
+use std::env;
+use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::Result;
 use cudarc::driver::sys;

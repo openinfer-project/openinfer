@@ -9,35 +9,53 @@ mod plan;
 use std::sync::OnceLock;
 use std::sync::mpsc as std_mpsc;
 use std::thread;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use anyhow::Result;
-use log::{debug, info, warn};
-use rand::SeedableRng;
-use rand::rngs::StdRng;
-use tokio::sync::{mpsc, watch};
-
-use crate::batch_decode_graph::BatchDecodeGraphState;
-use crate::executor::{
-    DecodeRequestResult, DecodeResult, PrefillRequestResult, PrefillResult, RequestId,
-};
-use crate::logprobs::snapshot_requested_logprobs;
-use crate::recurrent_state::RecurrentState;
-use crate::tp_executor::{Qwen35TpExecutor, TpDecodeStepItem, TpPrefillChunkItem};
-use crate::weights::Qwen35Model;
-use openinfer_core::engine::{
-    EngineHandle as SchedulerHandle, FinishReason, GenerateRequest as SchedulerRequest, KvCapacity,
-    LoadSnapshot, TokenEvent, TokenLogprob, TokenSink, panic_message,
-};
+use log::debug;
+use log::info;
+use log::warn;
+use openinfer_core::engine::EngineHandle as SchedulerHandle;
+use openinfer_core::engine::FinishReason;
+use openinfer_core::engine::GenerateRequest as SchedulerRequest;
+use openinfer_core::engine::KvCapacity;
+use openinfer_core::engine::LoadSnapshot;
+use openinfer_core::engine::TokenEvent;
+use openinfer_core::engine::TokenLogprob;
+use openinfer_core::engine::TokenSink;
+use openinfer_core::engine::panic_message;
 use openinfer_core::kv_pool::KvState;
 use openinfer_core::sampler::SamplingParams;
 use openinfer_core::tensor::HiddenStates;
+use rand::SeedableRng;
+use rand::rngs::StdRng;
+use tokio::sync::mpsc;
+use tokio::sync::watch;
 
-use self::plan::{
-    ActiveKvBudget, ExecutionPlan, PrefillKvBudget, RejectReason, admit_pending_requests,
-    compaction_after_retire, max_kv_tokens, plan_prefill_chunks, prefilling_future_pages,
-    slot_for_new_request,
-};
+use self::plan::ActiveKvBudget;
+use self::plan::ExecutionPlan;
+use self::plan::PrefillKvBudget;
+use self::plan::RejectReason;
+use self::plan::admit_pending_requests;
+use self::plan::compaction_after_retire;
+use self::plan::max_kv_tokens;
+use self::plan::plan_prefill_chunks;
+use self::plan::prefilling_future_pages;
+use self::plan::slot_for_new_request;
+use crate::batch_decode_graph::BatchDecodeGraphState;
+use crate::executor::DecodeRequestResult;
+use crate::executor::DecodeResult;
+use crate::executor::PrefillRequestResult;
+use crate::executor::PrefillResult;
+use crate::executor::RequestId;
+use crate::logprobs::snapshot_requested_logprobs;
+use crate::recurrent_state::RecurrentState;
+use crate::tp_executor::Qwen35TpExecutor;
+use crate::tp_executor::TpDecodeStepItem;
+use crate::tp_executor::TpPrefillChunkItem;
+use crate::weights::Qwen35Model;
 
 // ── Internal types ──────────────────────────────────────────────────────
 

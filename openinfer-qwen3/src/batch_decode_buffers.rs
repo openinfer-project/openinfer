@@ -1,16 +1,17 @@
 //! Pre-allocated GPU buffers for batched decode (multiple requests, 1 token each).
 
 use anyhow::Result;
-
 use cudarc::driver::CudaSlice;
 use log::info;
-
 use openinfer_core::cuda_graph::CudaGraphState;
-use openinfer_core::tensor::{DeviceContext, HiddenStates};
+use openinfer_core::tensor::DeviceContext;
+use openinfer_core::tensor::HiddenStates;
+use openinfer_kernels::ops::NumericPolicy;
+use openinfer_kernels::ops::gemm_lt_pin_warmup;
+use openinfer_kernels::ops::numeric_policy;
+use openinfer_kv_cache::KvView;
 
 use crate::split_kv::SplitKvConfig;
-use openinfer_kernels::ops::{NumericPolicy, gemm_lt_pin_warmup, numeric_policy};
-use openinfer_kv_cache::KvView;
 
 /// Bucket sizes for CUDA Graph capture. Actual batch is padded to the nearest bucket.
 /// Based on vLLM's cudagraph capture list up to 256; graphs are captured lazily per
@@ -525,9 +526,11 @@ impl BatchDecodeBuffers {
 
 #[cfg(test)]
 mod tests {
-    use super::{BatchDecodeBuffers, build_split_kv_csr};
     use openinfer_core::tensor::DeviceContext;
     use openinfer_kv_cache::KvView;
+
+    use super::BatchDecodeBuffers;
+    use super::build_split_kv_csr;
 
     #[test]
     fn shared_prefix_views_are_counted_by_reference() {

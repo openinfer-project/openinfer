@@ -1,16 +1,16 @@
 [package]
-name = "openinfer-sample"
-license = "Apache-2.0"
-version = "0.1.0"
-edition = "2024"
 autobenches = false
+edition = "2024"
+license = "Apache-2.0"
+name = "openinfer-sample"
+version = "0.1.0"
 
 [dependencies]
-openinfer-engine = { workspace = true }
-openinfer-kernels = { workspace = true }
 anyhow = { workspace = true }
 cudarc = { workspace = true }
 half = { workspace = true }
+openinfer-engine = { workspace = true }
+openinfer-kernels = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
@@ -19,5 +19,5 @@ criterion = { workspace = true }
 workspace = true
 
 [[bench]]
-name = "select_batch"
 harness = false
+name = "select_batch"

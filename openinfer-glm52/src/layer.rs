@@ -22,21 +22,30 @@
 //! table / slot mapping. The carry is threaded through `topk_carry`: a full
 //! layer overwrites it, a shared layer requires it.
 
-use anyhow::{Context as _, Result, ensure};
+use anyhow::Context as _;
+use anyhow::Result;
+use anyhow::ensure;
 use cudarc::driver::CudaSlice;
 use half::bf16;
+use openinfer_kernels::ops::add_into;
+use openinfer_kernels::ops::fused_add_rms_norm_round_into;
 #[cfg(test)]
 use openinfer_kernels::ops::rms_norm_rows_into;
-use openinfer_kernels::ops::{add_into, fused_add_rms_norm_round_into};
-use openinfer_kernels::tensor::{DeviceContext, DeviceVec};
+use openinfer_kernels::tensor::DeviceContext;
+use openinfer_kernels::tensor::DeviceVec;
 
-use crate::config::{GLM52_HIDDEN, GLM52_RMS_EPS as RMS_EPS};
+use crate::config::GLM52_HIDDEN;
+use crate::config::GLM52_RMS_EPS as RMS_EPS;
 use crate::dense::Glm52DenseMlpWeights;
 #[cfg(test)]
 use crate::dense::glm52_dense_mlp_forward_into;
-use crate::indexer::{Glm52IndexerLayerWeights, glm52_indexer_forward_into};
-use crate::mla_decode::{Glm52MlaSchedMetadata, glm52_mla_attend_into};
-use crate::mla_front::{Glm52MlaLayerWeights, glm52_mla_front_q_into, glm52_mla_front_rest_into};
+use crate::indexer::Glm52IndexerLayerWeights;
+use crate::indexer::glm52_indexer_forward_into;
+use crate::mla_decode::Glm52MlaSchedMetadata;
+use crate::mla_decode::glm52_mla_attend_into;
+use crate::mla_front::Glm52MlaLayerWeights;
+use crate::mla_front::glm52_mla_front_q_into;
+use crate::mla_front::glm52_mla_front_rest_into;
 use crate::moe_ep8::Glm52MoeEp8LayerWeights;
 use crate::rows::Rows;
 use crate::scratch::Glm52DecodeScratch;

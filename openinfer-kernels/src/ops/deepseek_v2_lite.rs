@@ -1,9 +1,16 @@
-use anyhow::{Result, anyhow, ensure};
-use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
+use anyhow::Result;
+use anyhow::anyhow;
+use anyhow::ensure;
+use cudarc::driver::CudaSlice;
+use cudarc::driver::DevicePtr;
+use cudarc::driver::DevicePtrMut;
 use half::bf16;
 
 use crate::ffi;
-use crate::tensor::{DeviceContext, DeviceMatrix, HiddenStates, HiddenStatesRef};
+use crate::tensor::DeviceContext;
+use crate::tensor::DeviceMatrix;
+use crate::tensor::HiddenStates;
+use crate::tensor::HiddenStatesRef;
 
 const DSV2_LITE_ACCUM_THREADS: usize = 256;
 

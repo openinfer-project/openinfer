@@ -4,7 +4,9 @@ use half::bf16;
 
 use super::PrefillPagedPlan;
 use crate::kv_pool::KvLayout;
-use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
+use crate::tensor::DeviceContext;
+use crate::tensor::DeviceVec;
+use crate::tensor::HiddenStates;
 
 #[allow(clippy::too_many_arguments)]
 pub fn prefill_attention_paged_into(

@@ -6,7 +6,8 @@
 #![cfg(feature = "glm52")]
 
 use half::bf16;
-use openinfer_kernels::ops::{GLM52_MIN_GEMV_MAX_TOKENS, glm52_indexer_weights_proj_launch};
+use openinfer_kernels::ops::GLM52_MIN_GEMV_MAX_TOKENS;
+use openinfer_kernels::ops::glm52_indexer_weights_proj_launch;
 use openinfer_kernels::tensor::DeviceContext;
 
 const HIDDEN: usize = 6144;

@@ -1,14 +1,21 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 
-use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand, ValueEnum};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::bail;
+use clap::Parser;
+use clap::Subcommand;
+use clap::ValueEnum;
 use log::info;
 use openinfer_kernels::tensor::KernelCall;
-use openinfer_kimi_k2::batch_decode_trace::{
-    MODEL, trace_decode_kernel_calls, trace_runtime_decode_kernel_calls,
-};
-use openinfer_kimi_k2::kernel_report::{MeasuredCall, bench_key, measure_call};
+use openinfer_kimi_k2::batch_decode_trace::MODEL;
+use openinfer_kimi_k2::batch_decode_trace::trace_decode_kernel_calls;
+use openinfer_kimi_k2::batch_decode_trace::trace_runtime_decode_kernel_calls;
+use openinfer_kimi_k2::kernel_report::MeasuredCall;
+use openinfer_kimi_k2::kernel_report::bench_key;
+use openinfer_kimi_k2::kernel_report::measure_call;
 use serde::Serialize;
 
 const DEFAULT_ITERS: u64 = 32;

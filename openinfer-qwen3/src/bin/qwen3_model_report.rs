@@ -1,28 +1,59 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::anyhow;
+use anyhow::bail;
 use clap::Parser;
-use comfy_table::{Cell, Color, ContentArrangement, Table, presets::UTF8_FULL};
-use cudarc::driver::{CudaSlice, sys};
+use comfy_table::Cell;
+use comfy_table::Color;
+use comfy_table::ContentArrangement;
+use comfy_table::Table;
+use comfy_table::presets::UTF8_FULL;
+use cudarc::driver::CudaSlice;
+use cudarc::driver::sys;
 use half::bf16;
-use openinfer_bench::{
-    Accum, CallSiteRow, LatencyStats, RollupRow, accumulate, attr_usize, axis, call_site_row,
-    input, output, rollup_row, zero_matrix,
-};
+use openinfer_bench::Accum;
+use openinfer_bench::CallSiteRow;
+use openinfer_bench::LatencyStats;
+use openinfer_bench::RollupRow;
+use openinfer_bench::accumulate;
+use openinfer_bench::attr_usize;
+use openinfer_bench::axis;
+use openinfer_bench::call_site_row;
+use openinfer_bench::input;
+use openinfer_bench::output;
+use openinfer_bench::rollup_row;
+use openinfer_bench::zero_matrix;
 use openinfer_core::kv_pool::KvLayout;
 use openinfer_core::ops;
-use openinfer_kernels::ops::{
-    NumericPolicy, per_token_served, pin_served, reset_numeric_policy_counters, set_numeric_policy,
-};
-use openinfer_kernels::tensor::{DeviceContext, DeviceVec, HiddenStates, KernelCall, TensorSpec};
-use openinfer_qwen3::batch_decode_trace::{
-    HEAD_DIM_VALUE, KV_DIM_VALUE, MODEL, NUM_KV_HEADS, NUM_LAYERS, NUM_Q_HEADS, PHASE_DECODE,
-    RMS_NORM_EPS, normalize_call_site, trace_decode_kernel_calls,
-};
-use openinfer_qwen3::kernel_bench::{L2CacheClear, build_split_kv_csr};
+use openinfer_kernels::ops::NumericPolicy;
+use openinfer_kernels::ops::per_token_served;
+use openinfer_kernels::ops::pin_served;
+use openinfer_kernels::ops::reset_numeric_policy_counters;
+use openinfer_kernels::ops::set_numeric_policy;
+use openinfer_kernels::tensor::DeviceContext;
+use openinfer_kernels::tensor::DeviceVec;
+use openinfer_kernels::tensor::HiddenStates;
+use openinfer_kernels::tensor::KernelCall;
+use openinfer_kernels::tensor::TensorSpec;
+use openinfer_qwen3::batch_decode_trace::HEAD_DIM_VALUE;
+use openinfer_qwen3::batch_decode_trace::KV_DIM_VALUE;
+use openinfer_qwen3::batch_decode_trace::MODEL;
+use openinfer_qwen3::batch_decode_trace::NUM_KV_HEADS;
+use openinfer_qwen3::batch_decode_trace::NUM_LAYERS;
+use openinfer_qwen3::batch_decode_trace::NUM_Q_HEADS;
+use openinfer_qwen3::batch_decode_trace::PHASE_DECODE;
+use openinfer_qwen3::batch_decode_trace::RMS_NORM_EPS;
+use openinfer_qwen3::batch_decode_trace::normalize_call_site;
+use openinfer_qwen3::batch_decode_trace::trace_decode_kernel_calls;
+use openinfer_qwen3::kernel_bench::L2CacheClear;
+use openinfer_qwen3::kernel_bench::build_split_kv_csr;
 use serde::Serialize;
 
 const DEFAULT_ITERS: u64 = 32;

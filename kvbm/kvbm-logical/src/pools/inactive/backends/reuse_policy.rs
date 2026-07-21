@@ -6,7 +6,8 @@
 //! Different policies (FIFO, LRU, etc.) control which inactive registered
 //! block should be allocated next when the reset pool is exhausted.
 
-use super::{BlockId, InactiveBlock};
+use super::BlockId;
+use super::InactiveBlock;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ReusePolicyError {

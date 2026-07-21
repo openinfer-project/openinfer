@@ -1,22 +1,29 @@
 use anyhow::Result;
-use crossbeam_channel::{Receiver, Sender, bounded};
+use crossbeam_channel::Receiver;
+use crossbeam_channel::Sender;
+use crossbeam_channel::bounded;
 use log::error;
-use openinfer_core::engine::{FinishReason, GenerateRequest, TokenEvent, TokenSink};
-use openinfer_kv_cache::{BlockPool, RequestKv};
+use openinfer_core::engine::FinishReason;
+use openinfer_core::engine::GenerateRequest;
+use openinfer_core::engine::TokenEvent;
+use openinfer_core::engine::TokenSink;
+use openinfer_kv_cache::BlockPool;
+use openinfer_kv_cache::RequestKv;
 use rand::rngs::StdRng;
 use tokio::sync::mpsc;
 
-use crate::runner::{
-    executor::{DP_MAX_BATCH_PER_RANK, ForwardExecutor},
-    load_balancer::DpLoadBalancer,
-    moe_deepep::DEEPEP_MAX_DISPATCH_TOKENS,
-    worker::{KimiKvStepPages, KimiOneTokenForwardReport, KimiRowOptions},
-};
-
-use super::lifecycle::{
-    preflight_prefill_candidate, request_lifetime_blocks, send_scheduled, validate_kv_capacity,
-};
+use super::lifecycle::preflight_prefill_candidate;
+use super::lifecycle::request_lifetime_blocks;
+use super::lifecycle::send_scheduled;
+use super::lifecycle::validate_kv_capacity;
 use super::row_options;
+use crate::runner::executor::DP_MAX_BATCH_PER_RANK;
+use crate::runner::executor::ForwardExecutor;
+use crate::runner::load_balancer::DpLoadBalancer;
+use crate::runner::moe_deepep::DEEPEP_MAX_DISPATCH_TOKENS;
+use crate::runner::worker::KimiKvStepPages;
+use crate::runner::worker::KimiOneTokenForwardReport;
+use crate::runner::worker::KimiRowOptions;
 
 /// Stable per-rank decode arena capacity. Logical slot IDs are arena rows, so
 /// every TP1 DP8 decode/prefill command must keep this capacity stable.

@@ -13,16 +13,23 @@
 //! two-shot; the stream-enqueued standalone chain is an upper bound, since
 //! production rides the whole-step graph).
 
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::Arc;
+use std::sync::Barrier;
+use std::sync::Mutex;
 use std::time::Instant;
 
-use anyhow::{Result, ensure};
+use anyhow::Result;
+use anyhow::ensure;
 use half::bf16;
 use openinfer_core::cuda_graph::CudaGraphState;
-use openinfer_kernels::ops::{
-    GLM52_TP_HIDDEN, GLM52_TP_TOKENS, Glm52TpLlBuffer, Glm52TpTopology, glm52_moe_tp_epoch_advance,
-    glm52_tp_ar_buffer_bytes, glm52_tp_ar_chunk_packets, glm52_tp_ar_launch,
-};
+use openinfer_kernels::ops::GLM52_TP_HIDDEN;
+use openinfer_kernels::ops::GLM52_TP_TOKENS;
+use openinfer_kernels::ops::Glm52TpLlBuffer;
+use openinfer_kernels::ops::Glm52TpTopology;
+use openinfer_kernels::ops::glm52_moe_tp_epoch_advance;
+use openinfer_kernels::ops::glm52_tp_ar_buffer_bytes;
+use openinfer_kernels::ops::glm52_tp_ar_chunk_packets;
+use openinfer_kernels::ops::glm52_tp_ar_launch;
 use openinfer_kernels::tensor::DeviceContext;
 
 const RANKS: usize = 8;

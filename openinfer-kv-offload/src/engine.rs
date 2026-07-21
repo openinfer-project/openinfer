@@ -7,14 +7,19 @@
 //! `Vec<u8>` here — the caller (scheduler) derives them from kvbm sequence
 //! hashes, so this layer never depends on the logical-cache hashing scheme.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::Mutex;
 
 use cudarc::driver::CudaStream;
 use openinfer_kv_cache::KvBuffer;
-use pegaflow_core::{
-    EngineError, LayerSave, P2pTransferService, PegaEngine, PrefetchStatus, QueryLeaseId,
-    StorageConfig, TransferMode,
-};
+use pegaflow_core::EngineError;
+use pegaflow_core::LayerSave;
+use pegaflow_core::P2pTransferService;
+use pegaflow_core::PegaEngine;
+use pegaflow_core::PrefetchStatus;
+use pegaflow_core::QueryLeaseId;
+use pegaflow_core::StorageConfig;
+use pegaflow_core::TransferMode;
 use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;

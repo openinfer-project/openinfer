@@ -36,12 +36,12 @@
 
 mod eviction;
 
-pub(crate) use eviction::LeafPolicy;
-
 use std::collections::HashMap;
-use std::hash::{BuildHasher, Hasher};
+use std::hash::BuildHasher;
+use std::hash::Hasher;
 
 use dynamo_tokens::PositionalLineageHash;
+pub(crate) use eviction::LeafPolicy;
 
 use crate::BlockId;
 use crate::blocks::SequenceHash;
@@ -892,7 +892,7 @@ mod tests {
         // Leaf FIFO: [B, Y].
 
         let order: Vec<BlockId> = backend.allocate(4).into_iter().map(|(_, id)| id).collect();
-        // B; A re-leafs→tail; Y; X re-leafs→tail; A; X.
+        // B; A re-leaves→tail; Y; X re-leaves→tail; A; X.
         assert_eq!(order, vec![b_id, y_id, a_id, x_id]);
     }
 

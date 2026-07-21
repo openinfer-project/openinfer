@@ -13,14 +13,22 @@
 //! offsets (exclusive form). Combine never applies router weights — the
 //! caller weights expert outputs before `decode_combine`.
 
-use std::ffi::{CStr, c_char, c_int, c_void};
+use std::ffi::CStr;
+use std::ffi::c_char;
+use std::ffi::c_int;
+use std::ffi::c_void;
 use std::ptr::NonNull;
 
-use anyhow::{Result, anyhow, ensure};
-use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
+use anyhow::Result;
+use anyhow::anyhow;
+use anyhow::ensure;
+use cudarc::driver::CudaSlice;
+use cudarc::driver::DevicePtr;
+use cudarc::driver::DevicePtrMut;
 use half::bf16;
 
-use crate::ffi::{self, DeepEpInfo};
+use crate::ffi::DeepEpInfo;
+use crate::ffi::{self};
 use crate::tensor::DeviceContext;
 
 /// The C table of one shim instantiation. Every method forwards to the

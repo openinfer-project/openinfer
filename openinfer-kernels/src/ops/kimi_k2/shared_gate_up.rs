@@ -1,10 +1,16 @@
-use anyhow::{Result, bail, ensure};
-use cudarc::driver::{DevicePtr, DevicePtrMut};
+use anyhow::Result;
+use anyhow::bail;
+use anyhow::ensure;
+use cudarc::driver::DevicePtr;
+use cudarc::driver::DevicePtrMut;
 
+use super::experts::KIMI_K2_HIDDEN;
+use super::experts::KIMI_K2_SHARED_GATE_UP;
 use crate::ffi;
-use crate::tensor::{DeviceContext, DeviceMatrix, GpuTensor, HiddenStates};
-
-use super::experts::{KIMI_K2_HIDDEN, KIMI_K2_SHARED_GATE_UP};
+use crate::tensor::DeviceContext;
+use crate::tensor::DeviceMatrix;
+use crate::tensor::GpuTensor;
+use crate::tensor::HiddenStates;
 
 const KIMI_SHARED_GATE_UP_CUBLASLT_MAX_BATCH: usize = 64;
 

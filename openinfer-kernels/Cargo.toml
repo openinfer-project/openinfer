@@ -1,8 +1,8 @@
 [package]
-name = "openinfer-kernels"
-license = "Apache-2.0"
-version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
+name = "openinfer-kernels"
+version = "0.1.0"
 
 [dependencies]
 anyhow = { workspace = true }
@@ -20,12 +20,12 @@ default = []
 tvm-ffi-triton-cubin = ["dep:tvm-ffi", "qwen35-4b"]
 # Qwen3.5 Triton AOT kernels (GDR chunkwise prefill) — the only feature that
 # needs Python + Triton at build time.
-qwen35-4b = []
 deepseek-v2-lite = []
+qwen35-4b = []
 # Shared MoE/MLA third-party substrate: DeepEP, DeepGEMM, and FlashMLA.
-moe = []
 glm52 = ["moe"]
 kimi-k2 = ["moe"]
+moe = []
 
 [[example]]
 name = "triton_cubin_tvm_ffi"

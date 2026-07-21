@@ -1,18 +1,26 @@
 //! Safetensors weight loading and RoPE precomputation.
 
-use anyhow::Result;
-use cudarc::driver::CudaSlice;
-use half::bf16;
-use log::{info, warn};
-use memmap2::Mmap;
-use safetensors::{Dtype, SafeTensors};
 use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::FileExt;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
-use crate::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
+use anyhow::Result;
+use cudarc::driver::CudaSlice;
+use half::bf16;
+use log::info;
+use log::warn;
+use memmap2::Mmap;
+use safetensors::Dtype;
+use safetensors::SafeTensors;
+
+use crate::tensor::DeviceContext;
+use crate::tensor::DeviceMatrix;
+use crate::tensor::DeviceVec;
 
 /// Load shard metadata. Returns (shard_file_paths, weight_map: tensor_name -> shard_index)
 pub fn load_shard_info(model_path: &str) -> Result<(Vec<String>, HashMap<String, usize>)> {

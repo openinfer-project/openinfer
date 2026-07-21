@@ -5,35 +5,65 @@ use std::fmt::Write as _;
 use std::fs;
 use std::time::Duration;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::ensure;
 use cudarc::driver::Profiler;
 use cudarc::runtime::result::device as cuda_device;
-use log::{debug, info};
+use log::debug;
+use log::info;
 use openinfer::sampler::SamplingParams;
 use openinfer::server_engine::ModelType;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use vllm_text::tokenizer::DynTokenizer;
 
-use crate::cli::{Cli, Command, CurveArgs, MatrixArgs, OutputFormat, RequestArgs, RunArgs};
-use crate::exec::{BenchModel, GenTimings};
-use crate::metrics::{
-    aggregate_tok_s, dur_ms, generated_token_trace, summarize_counts, summarize_durations,
-};
-use crate::prompt::{
-    SYNTHETIC_PATTERN, SYNTHETIC_TOKEN_HI, SYNTHETIC_TOKEN_LO, resolve_prompt_input,
-    synthetic_prompt_tokens, synthetic_random_prompt,
-};
-use crate::render::{
-    push_table, render_curve_meta, render_curve_table, render_decode_meta, render_decode_table,
-    render_duration_table, render_matrix_meta, render_matrix_table, render_mixed_text,
-    render_prefill_meta, render_prefill_table, render_request_meta, render_request_summary,
-};
-use crate::report::{
-    BenchReport, CurveReport, CurveWindow, CurveWorkload, GeneratedTokenTrace, MatrixCell,
-    MatrixReport, MatrixWorkload, RequestIterationTiming, RequestMetrics, RequestReport,
-    RequestWorkload, RunInfo,
-};
+use crate::cli::Cli;
+use crate::cli::Command;
+use crate::cli::CurveArgs;
+use crate::cli::MatrixArgs;
+use crate::cli::OutputFormat;
+use crate::cli::RequestArgs;
+use crate::cli::RunArgs;
+use crate::exec::BenchModel;
+use crate::exec::GenTimings;
+use crate::metrics::aggregate_tok_s;
+use crate::metrics::dur_ms;
+use crate::metrics::generated_token_trace;
+use crate::metrics::summarize_counts;
+use crate::metrics::summarize_durations;
+use crate::prompt::SYNTHETIC_PATTERN;
+use crate::prompt::SYNTHETIC_TOKEN_HI;
+use crate::prompt::SYNTHETIC_TOKEN_LO;
+use crate::prompt::resolve_prompt_input;
+use crate::prompt::synthetic_prompt_tokens;
+use crate::prompt::synthetic_random_prompt;
+use crate::render::push_table;
+use crate::render::render_curve_meta;
+use crate::render::render_curve_table;
+use crate::render::render_decode_meta;
+use crate::render::render_decode_table;
+use crate::render::render_duration_table;
+use crate::render::render_matrix_meta;
+use crate::render::render_matrix_table;
+use crate::render::render_mixed_text;
+use crate::render::render_prefill_meta;
+use crate::render::render_prefill_table;
+use crate::render::render_request_meta;
+use crate::render::render_request_summary;
+use crate::report::BenchReport;
+use crate::report::CurveReport;
+use crate::report::CurveWindow;
+use crate::report::CurveWorkload;
+use crate::report::GeneratedTokenTrace;
+use crate::report::MatrixCell;
+use crate::report::MatrixReport;
+use crate::report::MatrixWorkload;
+use crate::report::RequestIterationTiming;
+use crate::report::RequestMetrics;
+use crate::report::RequestReport;
+use crate::report::RequestWorkload;
+use crate::report::RunInfo;
 
 pub(crate) const DEFAULT_REQUEST_PROMPT: &str = "Tell me a story";
 pub(crate) const DEFAULT_CURVE_PROMPT_LEN: usize = 512;

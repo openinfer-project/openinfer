@@ -33,24 +33,41 @@
 //! invariant. The whole layer is host-quiet (no D2H, shapes fixed per batch
 //! size) — CUDA-graph capturable, same bar as PR3.
 
-use anyhow::{Context as _, Result, ensure};
+use anyhow::Context as _;
+use anyhow::Result;
+use anyhow::ensure;
 use cudarc::driver::CudaSlice;
 use half::bf16;
 use openinfer_kernels::ffi::DeepEpInfo;
-use openinfer_kernels::ops::{
-    DeepEpDispatchScratch, GLM52_DEEPGEMM_GROUPED_EXPERT_ALIGNMENT, GLM52_DEEPGEMM_MASKED_CAP,
-    GLM52_DEEPGEMM_MASKED_GROUPS, Glm52DeepEp, Glm52DeepGemmGroupedFp8Kind, Glm52MoeQuantShape,
-    glm52_deepep_info, glm52_deepgemm_grouped_fp8_metadata_launch,
-    glm52_deepgemm_masked_grouped_fp8_launch, glm52_deepgemm_masked_out_to_aligned_launch,
-    glm52_fp8_per_token_group_quant_bf16_masked_launch,
-    glm52_silu_and_mul_weighted_per_token_group_quant_bf16_masked_launch,
-};
+use openinfer_kernels::ops::DeepEpDispatchScratch;
+use openinfer_kernels::ops::GLM52_DEEPGEMM_GROUPED_EXPERT_ALIGNMENT;
+use openinfer_kernels::ops::GLM52_DEEPGEMM_MASKED_CAP;
+use openinfer_kernels::ops::GLM52_DEEPGEMM_MASKED_GROUPS;
+use openinfer_kernels::ops::Glm52DeepEp;
+use openinfer_kernels::ops::Glm52DeepGemmGroupedFp8Kind;
+use openinfer_kernels::ops::Glm52MoeQuantShape;
+use openinfer_kernels::ops::glm52_deepep_info;
+use openinfer_kernels::ops::glm52_deepgemm_grouped_fp8_metadata_launch;
+use openinfer_kernels::ops::glm52_deepgemm_masked_grouped_fp8_launch;
+use openinfer_kernels::ops::glm52_deepgemm_masked_out_to_aligned_launch;
+use openinfer_kernels::ops::glm52_fp8_per_token_group_quant_bf16_masked_launch;
+use openinfer_kernels::ops::glm52_silu_and_mul_weighted_per_token_group_quant_bf16_masked_launch;
 use openinfer_kernels::tensor::DeviceContext;
 
-use crate::moe_decode::{
-    EXPERTS, Glm52MoeExpertBank, Glm52MoeRouterWeights, Glm52MoeSharedExpert, HIDDEN,
-    HIDDEN_SCALE_COLS, QUANT_GROUP, RoutedTopk, TOPK, W2_K, W2_N, W2_SCALE_COLS, W13_K, W13_N,
-};
+use crate::moe_decode::EXPERTS;
+use crate::moe_decode::Glm52MoeExpertBank;
+use crate::moe_decode::Glm52MoeRouterWeights;
+use crate::moe_decode::Glm52MoeSharedExpert;
+use crate::moe_decode::HIDDEN;
+use crate::moe_decode::HIDDEN_SCALE_COLS;
+use crate::moe_decode::QUANT_GROUP;
+use crate::moe_decode::RoutedTopk;
+use crate::moe_decode::TOPK;
+use crate::moe_decode::W2_K;
+use crate::moe_decode::W2_N;
+use crate::moe_decode::W2_SCALE_COLS;
+use crate::moe_decode::W13_K;
+use crate::moe_decode::W13_N;
 
 /// One rank's weights for one EP8 MoE layer: router and shared expert run
 /// where the token lives (every rank, under the DP8 coordinator); the bank

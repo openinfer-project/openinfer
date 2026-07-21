@@ -1,20 +1,28 @@
-use std::{
-    collections::VecDeque,
-    thread,
-    time::{Duration, Instant},
-};
+use std::collections::VecDeque;
+use std::thread;
+use std::time::Duration;
+use std::time::Instant;
 
 pub(in crate::runner) mod dp;
 mod lifecycle;
 
-use crate::runner::executor::ForwardExecutor;
-use crate::runner::worker::{KimiKvStepPages, KimiRowOptions};
-use anyhow::{Context, Result};
-use lifecycle::{preflight_prefill_candidate, send_scheduled, validate_kv_capacity};
+use anyhow::Context;
+use anyhow::Result;
+use lifecycle::preflight_prefill_candidate;
+use lifecycle::send_scheduled;
+use lifecycle::validate_kv_capacity;
 use log::error;
-use openinfer_core::engine::{FinishReason, GenerateRequest, TokenEvent, TokenSink};
-use openinfer_kv_cache::{BlockPool, RequestKv};
+use openinfer_core::engine::FinishReason;
+use openinfer_core::engine::GenerateRequest;
+use openinfer_core::engine::TokenEvent;
+use openinfer_core::engine::TokenSink;
+use openinfer_kv_cache::BlockPool;
+use openinfer_kv_cache::RequestKv;
 use tokio::sync::mpsc;
+
+use crate::runner::executor::ForwardExecutor;
+use crate::runner::worker::KimiKvStepPages;
+use crate::runner::worker::KimiRowOptions;
 
 const KIMI_RUNNER_MAX_BATCH: usize = 64;
 const KIMI_DECODE_ADMISSION_MICROBATCH: usize = 64;
@@ -612,13 +620,13 @@ impl KimiK2Scheduler {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
+    use std::sync::Mutex;
 
     use openinfer_core::sampler::SamplingParams;
 
-    use crate::runner::worker::KimiOneTokenForwardReport;
-
     use super::*;
+    use crate::runner::worker::KimiOneTokenForwardReport;
 
     #[derive(Debug, Eq, PartialEq)]
     enum ForwardCall {

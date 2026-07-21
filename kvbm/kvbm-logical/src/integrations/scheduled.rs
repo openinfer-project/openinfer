@@ -149,12 +149,12 @@
 use std::sync::Arc;
 
 use derive_builder::Builder;
-
-use crate::blocks::BlockMetadata;
-use crate::manager::BlockManager;
+use dynamo_tokens::SaltHash;
+use dynamo_tokens::Token;
 
 use super::request::RequestSequence;
-use dynamo_tokens::{SaltHash, Token};
+use crate::blocks::BlockMetadata;
+use crate::manager::BlockManager;
 
 // =============================================================================
 // State types
@@ -1031,9 +1031,11 @@ impl<T: BlockMetadata> std::fmt::Debug for SchedulableSequence<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::testing::{TestMeta, create_test_manager};
     use std::sync::Mutex;
+
+    use super::*;
+    use crate::testing::TestMeta;
+    use crate::testing::create_test_manager;
 
     const BLOCK_SIZE: u32 = 4;
 

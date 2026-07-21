@@ -25,10 +25,12 @@ mod weights;
 
 use std::path::Path;
 
-use anyhow::{Result, anyhow};
-use openinfer_core::engine::{EngineHandle, EngineLoadOptions, EpBackend};
-
+use anyhow::Result;
+use anyhow::anyhow;
 pub use kernel_plan::kernel_plan;
+use openinfer_core::engine::EngineHandle;
+use openinfer_core::engine::EngineLoadOptions;
+use openinfer_core::engine::EpBackend;
 pub use scheduler::DEFAULT_MAX_PREFILL_TOKENS;
 
 /// Low-level Qwen3.5 execution interface.
@@ -37,10 +39,16 @@ pub use scheduler::DEFAULT_MAX_PREFILL_TOKENS;
 /// should use `start_engine` instead.
 pub mod runtime {
     pub use crate::batch_decode_graph::MAX_BATCH;
-    pub use crate::executor::{
-        DecodePlan, DecodeRequestResult, DecodeResult, DecodeStepItem, PrefillPlan,
-        PrefillRequestResult, PrefillResult, PrefillStepItem, Qwen35Executor, RequestId,
-    };
+    pub use crate::executor::DecodePlan;
+    pub use crate::executor::DecodeRequestResult;
+    pub use crate::executor::DecodeResult;
+    pub use crate::executor::DecodeStepItem;
+    pub use crate::executor::PrefillPlan;
+    pub use crate::executor::PrefillRequestResult;
+    pub use crate::executor::PrefillResult;
+    pub use crate::executor::PrefillStepItem;
+    pub use crate::executor::Qwen35Executor;
+    pub use crate::executor::RequestId;
     pub use crate::scheduler::start_with_capacity;
     pub use crate::tp_executor::Qwen35TpExecutor;
     pub use crate::weights::Qwen35Model;
@@ -48,9 +56,9 @@ pub mod runtime {
 
 /// Public operator surface used by Qwen3.5-local benches.
 pub mod runtime_ops {
-    pub use crate::ops::{
-        gated_delta_rule_prefill_chunkwise_into, rms_norm_batch_offset_into, rms_norm_offset_into,
-    };
+    pub use crate::ops::gated_delta_rule_prefill_chunkwise_into;
+    pub use crate::ops::rms_norm_batch_offset_into;
+    pub use crate::ops::rms_norm_offset_into;
 }
 
 pub fn start_engine(

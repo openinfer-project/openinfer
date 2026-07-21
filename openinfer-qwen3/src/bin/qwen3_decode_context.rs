@@ -1,13 +1,21 @@
 use std::hint::black_box;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use std::time::Instant;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::anyhow;
+use anyhow::bail;
 use openinfer_core::sampler::SamplingParams;
-use openinfer_qwen3::runtime::{
-    DecodePlan, DecodeStepItem, PrefillPlan, PrefillStepItem, Qwen3Executor, RequestId,
-};
+use openinfer_qwen3::runtime::DecodePlan;
+use openinfer_qwen3::runtime::DecodeStepItem;
+use openinfer_qwen3::runtime::PrefillPlan;
+use openinfer_qwen3::runtime::PrefillStepItem;
+use openinfer_qwen3::runtime::Qwen3Executor;
+use openinfer_qwen3::runtime::RequestId;
+use rand::RngExt;
+use rand::SeedableRng;
 use rand::rngs::StdRng;
-use rand::{RngExt, SeedableRng};
 
 const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3-4B");
 const DEFAULT_CONTEXTS: &[usize] = &[128, 512, 1024, 2048, 4096, 8192, 10_000];

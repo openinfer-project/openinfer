@@ -2,14 +2,27 @@
 ///
 /// Tests the Qwen3.5 reduced-capacity scheduler path (batch prefill +
 /// CUDA Graph decode) with sequential, concurrent, and consumer-drop requests.
-use std::{collections::HashSet, path::Path, time::Instant};
+use std::collections::HashSet;
+/// E2E scheduler integration test for Qwen3.5-4B.
+///
+/// Tests the Qwen3.5 reduced-capacity scheduler path (batch prefill +
+/// CUDA Graph decode) with sequential, concurrent, and consumer-drop requests.
+use std::path::Path;
+/// E2E scheduler integration test for Qwen3.5-4B.
+///
+/// Tests the Qwen3.5 reduced-capacity scheduler path (batch prefill +
+/// CUDA Graph decode) with sequential, concurrent, and consumer-drop requests.
+use std::time::Instant;
 
 use log::info;
-
-use openinfer_core::engine::{
-    EngineHandle, EngineLoadOptions, FinishReason, GenerateRequest, TokenEvent, TokenLogprob,
-    TokenSink, TokenStreamReceiver,
-};
+use openinfer_core::engine::EngineHandle;
+use openinfer_core::engine::EngineLoadOptions;
+use openinfer_core::engine::FinishReason;
+use openinfer_core::engine::GenerateRequest;
+use openinfer_core::engine::TokenEvent;
+use openinfer_core::engine::TokenLogprob;
+use openinfer_core::engine::TokenSink;
+use openinfer_core::engine::TokenStreamReceiver;
 use openinfer_core::sampler::SamplingParams;
 use vllm_text::tokenizer::DynTokenizer;
 

@@ -4,25 +4,37 @@
 //! sparse decode, o_proj) lives in `mla_decode` and consumes the front's
 //! buffers.
 
-use anyhow::{Result, ensure};
+use anyhow::Result;
+use anyhow::ensure;
 use cudarc::driver::CudaSlice;
 use half::bf16;
+use openinfer_kernels::ops::GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW;
+use openinfer_kernels::ops::glm52_gemv_mma_routes;
+use openinfer_kernels::ops::glm52_gemv_split_reduce_launch;
+use openinfer_kernels::ops::glm52_mla_ckv_split_launch;
+use openinfer_kernels::ops::rms_norm_rows_into;
+use openinfer_kernels::tensor::DeviceContext;
+use openinfer_kernels::tensor::DeviceVec;
 
-use openinfer_kernels::ops::{
-    GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW, glm52_gemv_mma_routes, glm52_gemv_split_reduce_launch,
-    glm52_mla_ckv_split_launch, rms_norm_rows_into,
-};
-use openinfer_kernels::tensor::{DeviceContext, DeviceVec};
-
-use crate::config::{
-    GLM52_HEADS, GLM52_HIDDEN, GLM52_KV_A_OUT, GLM52_KV_LORA_RANK, GLM52_Q_LORA_RANK,
-    GLM52_QK_HEAD_DIM, GLM52_QK_NOPE_HEAD_DIM, GLM52_QK_ROPE_HEAD_DIM, GLM52_RMS_EPS as RMS_EPS,
-    GLM52_V_HEAD_DIM,
-};
-use crate::fp8::{
-    FP8_BLOCK, Glm52ProjBytes, ProjWeight, bytes_to_f32, e4m3_to_f32, fp8_linear_into,
-    fp8_linear_pair_into, fp8_linear_partials_into, pack_proj_pair,
-};
+use crate::config::GLM52_HEADS;
+use crate::config::GLM52_HIDDEN;
+use crate::config::GLM52_KV_A_OUT;
+use crate::config::GLM52_KV_LORA_RANK;
+use crate::config::GLM52_Q_LORA_RANK;
+use crate::config::GLM52_QK_HEAD_DIM;
+use crate::config::GLM52_QK_NOPE_HEAD_DIM;
+use crate::config::GLM52_QK_ROPE_HEAD_DIM;
+use crate::config::GLM52_RMS_EPS as RMS_EPS;
+use crate::config::GLM52_V_HEAD_DIM;
+use crate::fp8::FP8_BLOCK;
+use crate::fp8::Glm52ProjBytes;
+use crate::fp8::ProjWeight;
+use crate::fp8::bytes_to_f32;
+use crate::fp8::e4m3_to_f32;
+use crate::fp8::fp8_linear_into;
+use crate::fp8::fp8_linear_pair_into;
+use crate::fp8::fp8_linear_partials_into;
+use crate::fp8::pack_proj_pair;
 use crate::rows::Rows;
 
 // Local short names for the config-owned architecture constants (the module

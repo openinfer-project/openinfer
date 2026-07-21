@@ -9,10 +9,14 @@
 //!     --test batch_invariance_gemm -- --nocapture --test-threads=1
 
 use half::bf16;
-use openinfer_kernels::ops::{
-    GEMM_LT_MAX_N, gemm_into_checked, gemm_lt_pin_into_checked, gemm_lt_pin_tune, gemm_per_token,
-};
-use openinfer_kernels::tensor::{DeviceContext, DeviceMatrix, HiddenStates};
+use openinfer_kernels::ops::GEMM_LT_MAX_N;
+use openinfer_kernels::ops::gemm_into_checked;
+use openinfer_kernels::ops::gemm_lt_pin_into_checked;
+use openinfer_kernels::ops::gemm_lt_pin_tune;
+use openinfer_kernels::ops::gemm_per_token;
+use openinfer_kernels::tensor::DeviceContext;
+use openinfer_kernels::tensor::DeviceMatrix;
+use openinfer_kernels::tensor::HiddenStates;
 
 /// (label, M = out rows, K = in cols). down_proj is the shape whose winning
 /// split-K varied across N in the original repro — the strongest drift.

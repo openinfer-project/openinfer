@@ -4,7 +4,8 @@ use openinfer_core::parallel::ParallelConfig;
 
 use crate::runner::affinity::KimiRankThreadPlacementPlan;
 use crate::runner::worker::KimiK2RankPlacement;
-use crate::weights::{KimiRankSlicedLoadPlan, KimiRankWeightNames};
+use crate::weights::KimiRankSlicedLoadPlan;
+use crate::weights::KimiRankWeightNames;
 
 #[derive(Clone, Debug)]
 pub(crate) struct KimiK2RunnerConfig {

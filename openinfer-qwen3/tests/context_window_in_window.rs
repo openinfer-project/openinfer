@@ -22,7 +22,10 @@
 
 use std::path::Path;
 
-use openinfer_core::engine::{EngineLoadOptions, GenerateRequest, TokenEvent, TokenSink};
+use openinfer_core::engine::EngineLoadOptions;
+use openinfer_core::engine::GenerateRequest;
+use openinfer_core::engine::TokenEvent;
+use openinfer_core::engine::TokenSink;
 use openinfer_core::sampler::SamplingParams;
 
 const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3-4B");

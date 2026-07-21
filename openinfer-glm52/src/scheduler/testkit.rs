@@ -1,10 +1,13 @@
 //! Shared fixtures for the scheduler module tests.
 
-use openinfer_core::engine::{FinishReason, GenerateRequest};
-use openinfer_kv_cache::{BlockPool, RequestKv};
+use openinfer_core::engine::FinishReason;
+use openinfer_core::engine::GenerateRequest;
+use openinfer_kv_cache::BlockPool;
+use openinfer_kv_cache::RequestKv;
 
 use super::PAGE;
-use super::slot::{Glm52SlotState, Glm52StepOutcome};
+use super::slot::Glm52SlotState;
+use super::slot::Glm52StepOutcome;
 
 pub(super) const EOS: &[u32] = &[7];
 

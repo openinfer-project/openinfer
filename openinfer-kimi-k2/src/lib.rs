@@ -14,9 +14,10 @@
 use std::path::Path;
 
 use anyhow::Result;
+use openinfer_core::engine::EngineHandle;
+use openinfer_core::engine::EngineLoadOptions;
 #[cfg(feature = "kimi-k2")]
 use openinfer_core::engine::EpBackend;
-use openinfer_core::engine::{EngineHandle, EngineLoadOptions};
 
 #[cfg(feature = "kimi-k2")]
 pub mod batch_decode_trace;
@@ -30,7 +31,8 @@ mod typed_scratch;
 #[cfg(feature = "kimi-k2")]
 mod weights;
 
-pub use config::{KIMI_K2_LAYERS, probe_config_json};
+pub use config::KIMI_K2_LAYERS;
+pub use config::probe_config_json;
 
 #[cfg(feature = "kimi-k2")]
 #[allow(clippy::needless_pass_by_value)]

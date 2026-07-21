@@ -1,11 +1,18 @@
-use criterion::{BenchmarkId, Criterion, Throughput};
-use openinfer_core::tensor::{DeviceContext, DeviceVec, HiddenStates};
+use criterion::BenchmarkId;
+use criterion::Criterion;
+use criterion::Throughput;
+use openinfer_core::tensor::DeviceContext;
+use openinfer_core::tensor::DeviceVec;
+use openinfer_core::tensor::HiddenStates;
 use openinfer_qwen35_4b::runtime_ops as ops;
 
-use super::common::{
-    EPS, QWEN35_4B_HIDDEN, configure_group, device_vec, hidden_states, iter_sync,
-    positive_device_vec,
-};
+use super::common::EPS;
+use super::common::QWEN35_4B_HIDDEN;
+use super::common::configure_group;
+use super::common::device_vec;
+use super::common::hidden_states;
+use super::common::iter_sync;
+use super::common::positive_device_vec;
 
 pub(crate) fn bench_qwen35_norm_ops(c: &mut Criterion) {
     let hidden = QWEN35_4B_HIDDEN;

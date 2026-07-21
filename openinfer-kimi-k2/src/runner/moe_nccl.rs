@@ -22,33 +22,46 @@
 //! - [`forward_moe_layer_batch_into`] — single-prompt prefill, fresh
 //!   allocations, combine via bulk `all_reduce`.
 
-use anyhow::{Context, Result};
-use cudarc::nccl::{ReduceOp, safe::Comm};
-use openinfer_kernels::{
-    ops::{
-        KIMI_K2_EP_WORLD, KIMI_K2_ROUTER_SCALE, KimiMarlinRouteWorkspace, KimiMarlinWna16Workspace,
-        KimiRouterBatch, KimiRouterConfig, KimiRouterOutput, kimi_add_f32_bf16_to_bf16,
-        kimi_marlin_sum_topk_rows_f32, kimi_marlin_w13_swiglu, kimi_marlin_wna16_w2_gemm,
-        kimi_marlin_wna16_w13_gemm, kimi_moe_marlin_align_block_size, kimi_residual_add_scaled_f32,
-        kimi_router_noaux_tc_launch, repeat_f32_for_reduce_scatter_into, scale_f32_in_place,
-    },
-    tensor::{DeviceContext, GpuTensor, HiddenStates, NormWeight},
-    typed_ops,
-};
+use anyhow::Context;
+use anyhow::Result;
+use cudarc::nccl::ReduceOp;
+use cudarc::nccl::safe::Comm;
+use openinfer_kernels::ops::KIMI_K2_EP_WORLD;
+use openinfer_kernels::ops::KIMI_K2_ROUTER_SCALE;
+use openinfer_kernels::ops::KimiMarlinRouteWorkspace;
+use openinfer_kernels::ops::KimiMarlinWna16Workspace;
+use openinfer_kernels::ops::KimiRouterBatch;
+use openinfer_kernels::ops::KimiRouterConfig;
+use openinfer_kernels::ops::KimiRouterOutput;
+use openinfer_kernels::ops::kimi_add_f32_bf16_to_bf16;
+use openinfer_kernels::ops::kimi_marlin_sum_topk_rows_f32;
+use openinfer_kernels::ops::kimi_marlin_w13_swiglu;
+use openinfer_kernels::ops::kimi_marlin_wna16_w2_gemm;
+use openinfer_kernels::ops::kimi_marlin_wna16_w13_gemm;
+use openinfer_kernels::ops::kimi_moe_marlin_align_block_size;
+use openinfer_kernels::ops::kimi_residual_add_scaled_f32;
+use openinfer_kernels::ops::kimi_router_noaux_tc_launch;
+use openinfer_kernels::ops::repeat_f32_for_reduce_scatter_into;
+use openinfer_kernels::ops::scale_f32_in_place;
+use openinfer_kernels::tensor::DeviceContext;
+use openinfer_kernels::tensor::GpuTensor;
+use openinfer_kernels::tensor::HiddenStates;
+use openinfer_kernels::tensor::NormWeight;
+use openinfer_kernels::typed_ops;
 
-use crate::{
-    config::{
-        KIMI_K2_EXPERT_INTERMEDIATE, KIMI_K2_HIDDEN, KIMI_K2_RMS_NORM_EPS, KIMI_K2_ROUTED_EXPERTS,
-        KIMI_K2_TOPK,
-    },
-    weights::KimiRankExpertMarlinWeights,
-};
-
-use super::worker::{
-    KimiMoeForwardCache, KimiWorkerDecodeScratch, MARLIN_W13_OUT_DIM, all_reduce_f32_in_place,
-    kimi_marlin_block_size, maybe_all_reduce_hidden_via_f32_in_place,
-    reduce_scatter_f32_hidden_into,
-};
+use super::worker::KimiMoeForwardCache;
+use super::worker::KimiWorkerDecodeScratch;
+use super::worker::MARLIN_W13_OUT_DIM;
+use super::worker::all_reduce_f32_in_place;
+use super::worker::kimi_marlin_block_size;
+use super::worker::maybe_all_reduce_hidden_via_f32_in_place;
+use super::worker::reduce_scatter_f32_hidden_into;
+use crate::config::KIMI_K2_EXPERT_INTERMEDIATE;
+use crate::config::KIMI_K2_HIDDEN;
+use crate::config::KIMI_K2_RMS_NORM_EPS;
+use crate::config::KIMI_K2_ROUTED_EXPERTS;
+use crate::config::KIMI_K2_TOPK;
+use crate::weights::KimiRankExpertMarlinWeights;
 
 /// CUDA-graph-safe batch decode MoE. The post-attention norm has already been
 /// applied into `scratch.mla.normed`; this records the norm-ready event before

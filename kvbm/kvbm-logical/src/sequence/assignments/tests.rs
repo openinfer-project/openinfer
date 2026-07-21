@@ -1,10 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::sequence::{BlockSequence, BlockSequenceError};
-use crate::{BlockId, KvbmSequenceHashProvider, SequenceHash};
-
 use super::ExternalBlockAssignments;
+use crate::BlockId;
+use crate::KvbmSequenceHashProvider;
+use crate::SequenceHash;
+use crate::sequence::BlockSequence;
+use crate::sequence::BlockSequenceError;
 
 const TEST_BLOCK_SIZE: u32 = 4;
 
@@ -1352,7 +1354,8 @@ fn test_get_pending_at_position_out_of_range() {
 // zip_assigned tests
 // =========================================================================
 
-use super::{zip_assigned, zip_assigned_pending};
+use super::zip_assigned;
+use super::zip_assigned_pending;
 
 #[test]
 fn test_zip_assigned_full_overlap() {

@@ -1,10 +1,16 @@
 use anyhow::Result;
-use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
+use cudarc::driver::CudaSlice;
+use cudarc::driver::DevicePtr;
+use cudarc::driver::DevicePtrMut;
+use openinfer_core::tensor::DeviceContext;
+use openinfer_core::tensor::DeviceVec;
+use openinfer_core::tensor::HiddenStates;
 
-use crate::config::{GDN_AOT_KEY_HEAD_DIM, GDN_AOT_VALUE_HEAD_DIM, LINEAR_CONV_MAX_KERNEL_DIM};
+use crate::config::GDN_AOT_KEY_HEAD_DIM;
+use crate::config::GDN_AOT_VALUE_HEAD_DIM;
+use crate::config::LINEAR_CONV_MAX_KERNEL_DIM;
 use crate::ffi;
 use crate::prefill_buffers::GdrChunkwiseScratch35;
-use openinfer_core::tensor::{DeviceContext, DeviceVec, HiddenStates};
 
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
@@ -546,13 +552,15 @@ mod tests {
     use anyhow::Result;
     use cudarc::driver::DevicePtrMut;
     use half::bf16;
+    use openinfer_core::tensor::DeviceContext;
+    use openinfer_core::tensor::DeviceVec;
+    use openinfer_core::tensor::HiddenStates;
 
-    use super::{
-        conv1d_prefill_batch_into, gated_delta_rule_decode_batch_into,
-        gated_delta_rule_decode_vec_into, gated_delta_rule_prefill_chunkwise_into,
-    };
+    use super::conv1d_prefill_batch_into;
+    use super::gated_delta_rule_decode_batch_into;
+    use super::gated_delta_rule_decode_vec_into;
+    use super::gated_delta_rule_prefill_chunkwise_into;
     use crate::prefill_buffers::GdrChunkwiseScratch35;
-    use openinfer_core::tensor::{DeviceContext, DeviceVec, HiddenStates};
 
     fn bf16_vec(data: &[f32]) -> Vec<bf16> {
         data.iter().map(|&x| bf16::from_f32(x)).collect()

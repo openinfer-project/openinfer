@@ -5,25 +5,30 @@
 //! not measure serving latency, throughput, SLO compliance, soak behavior, or
 //! production readiness; those claims belong to retained benchmark artifacts.
 
-use std::{
-    env, fs,
-    path::{Path, PathBuf},
-    sync::{Arc, Barrier},
-    thread,
-};
+use std::env;
+use std::fs;
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::Barrier;
+use std::thread;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::ensure;
 use openinfer_deepseek_v2_lite::DeepSeekV2LiteEp2Generator;
-use openinfer_engine::{
-    engine::{
-        EngineLoadOptions, FinishReason, GenerateRequest, TokenEvent, TokenSink,
-        TokenStreamReceiver,
-    },
-    sampler::SamplingParams,
-};
+use openinfer_engine::engine::EngineLoadOptions;
+use openinfer_engine::engine::FinishReason;
+use openinfer_engine::engine::GenerateRequest;
+use openinfer_engine::engine::TokenEvent;
+use openinfer_engine::engine::TokenSink;
+use openinfer_engine::engine::TokenStreamReceiver;
+use openinfer_engine::sampler::SamplingParams;
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
-use vllm_text::tokenizer::{HuggingFaceTokenizer, Tokenizer};
+use sha2::Digest;
+use sha2::Sha256;
+use vllm_text::tokenizer::HuggingFaceTokenizer;
+use vllm_text::tokenizer::Tokenizer;
 
 const EXPECTED_GENERATED_TOKENS: usize = 16;
 const EXPECTED_OUTPUT_SHA256_PAIRS: &[(&str, &str, &str)] = &[

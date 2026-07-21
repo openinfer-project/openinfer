@@ -15,22 +15,34 @@
 //! compact-layout plumbing, exactly what this gate exists to catch.
 
 use std::path::PathBuf;
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::Arc;
+use std::sync::Barrier;
+use std::sync::Mutex;
 
-use anyhow::{Result, ensure};
+use anyhow::Result;
+use anyhow::ensure;
 use half::bf16;
-use openinfer_kernels::ops::{
-    GLM52_FLASHMLA_SPARSE_PAGE_SIZE, GLM52_FLASHMLA_SPARSE_TOPK, Glm52FlashMlaSparseDecode,
-    Glm52TpLlBuffer, Glm52TpTopology, glm52_flashmla_sparse_decode_num_sm_parts,
-    glm52_moe_tp_epoch_advance, glm52_tp_ar_buffer_bytes, glm52_tp_ar_chunk_packets,
-    glm52_tp_ar_launch,
-};
-use openinfer_kernels::tensor::{DeviceContext, DeviceVec};
+use openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_PAGE_SIZE;
+use openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_TOPK;
+use openinfer_kernels::ops::Glm52FlashMlaSparseDecode;
+use openinfer_kernels::ops::Glm52TpLlBuffer;
+use openinfer_kernels::ops::Glm52TpTopology;
+use openinfer_kernels::ops::glm52_flashmla_sparse_decode_num_sm_parts;
+use openinfer_kernels::ops::glm52_moe_tp_epoch_advance;
+use openinfer_kernels::ops::glm52_tp_ar_buffer_bytes;
+use openinfer_kernels::ops::glm52_tp_ar_chunk_packets;
+use openinfer_kernels::ops::glm52_tp_ar_launch;
+use openinfer_kernels::tensor::DeviceContext;
+use openinfer_kernels::tensor::DeviceVec;
 
-use super::mla::{Layer0Tensors, load_layer0, seeded_hidden};
-use crate::config::{GLM52_ROPE_HALF, GLM52_SM_SCALE};
+use super::mla::Layer0Tensors;
+use super::mla::load_layer0;
+use super::mla::seeded_hidden;
+use crate::config::GLM52_ROPE_HALF;
+use crate::config::GLM52_SM_SCALE;
 use crate::fp8::ProjWeight;
-use crate::mla_decode::{Glm52MlaSchedMetadata, glm52_mla_decode_forward};
+use crate::mla_decode::Glm52MlaSchedMetadata;
+use crate::mla_decode::glm52_mla_decode_forward;
 use crate::mla_front::Glm52MlaLayerWeights;
 use crate::model::rope_tables;
 use crate::rows::Rows;

@@ -1,7 +1,9 @@
-use super::*;
 use std::path::Path;
 
-use openinfer_core::engine::{EngineLoadOptions, EpBackend};
+use openinfer_core::engine::EngineLoadOptions;
+use openinfer_core::engine::EpBackend;
+
+use super::*;
 
 #[test]
 fn send_rejection_reports_kv_lifetime_request_tokens() {

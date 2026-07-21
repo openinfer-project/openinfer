@@ -1,34 +1,43 @@
-use std::{
-    collections::BTreeSet,
-    path::Path,
-    sync::{Arc, Barrier},
-    thread,
-    time::Instant,
-};
+use std::collections::BTreeSet;
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::Barrier;
+use std::thread;
+use std::time::Instant;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::bail;
+use anyhow::ensure;
 use bytesize::ByteSize;
 use crossbeam_channel::bounded;
-use log::{debug, info};
-use openinfer_core::{
-    engine::{EngineHandle, EngineLoadOptions, EpBackend, GenerateRequest},
-    parallel::ParallelConfig,
-};
+use log::debug;
+use log::info;
+use openinfer_core::engine::EngineHandle;
+use openinfer_core::engine::EngineLoadOptions;
+use openinfer_core::engine::EpBackend;
+use openinfer_core::engine::GenerateRequest;
+use openinfer_core::parallel::ParallelConfig;
+use openinfer_kv_cache::BlockPool;
 use tokio::sync::mpsc;
 
-use crate::{
-    config::{KimiK2ParallelShape, load_stop_token_ids},
-    runner::{
-        affinity::pin_scheduler_thread,
-        config::KimiK2RunnerConfig,
-        executor::{ForwardExecutor, Tp1Dp8ForwardExecutor, Tp8Dp1ForwardExecutor},
-        load_balancer::DpLoadBalancer,
-        scheduler::{KimiK2Scheduler, dp::DpCoordinator},
-        worker::{KIMI_KV_PAGE_SIZE, KimiRankWeightLoadReport, KimiRankWorker, build_placements},
-    },
-    weights::{KimiRankGpuContext, KimiRankSlicedLoadPlan, ensure_text_only_model_index},
-};
-use openinfer_kv_cache::BlockPool;
+use crate::config::KimiK2ParallelShape;
+use crate::config::load_stop_token_ids;
+use crate::runner::affinity::pin_scheduler_thread;
+use crate::runner::config::KimiK2RunnerConfig;
+use crate::runner::executor::ForwardExecutor;
+use crate::runner::executor::Tp1Dp8ForwardExecutor;
+use crate::runner::executor::Tp8Dp1ForwardExecutor;
+use crate::runner::load_balancer::DpLoadBalancer;
+use crate::runner::scheduler::KimiK2Scheduler;
+use crate::runner::scheduler::dp::DpCoordinator;
+use crate::runner::worker::KIMI_KV_PAGE_SIZE;
+use crate::runner::worker::KimiRankWeightLoadReport;
+use crate::runner::worker::KimiRankWorker;
+use crate::runner::worker::build_placements;
+use crate::weights::KimiRankGpuContext;
+use crate::weights::KimiRankSlicedLoadPlan;
+use crate::weights::ensure_text_only_model_index;
 
 /// TP8 replicates the KV pool on every rank: 8192 pages × 16 tokens ×
 /// (576 ckv + 64 kpe) bf16 ≈ 9.2 GiB per rank — the same footprint as the

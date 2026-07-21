@@ -11,8 +11,10 @@
 use std::sync::Arc;
 
 use super::handle::BlockRegistrationHandle;
-
-use crate::blocks::{BlockDuplicationPolicy, BlockMetadata, CompleteBlock, ImmutableBlockInner};
+use crate::blocks::BlockDuplicationPolicy;
+use crate::blocks::BlockMetadata;
+use crate::blocks::CompleteBlock;
+use crate::blocks::ImmutableBlockInner;
 use crate::pools::BlockStore;
 use crate::pools::store::upgrade_or_resurrect;
 

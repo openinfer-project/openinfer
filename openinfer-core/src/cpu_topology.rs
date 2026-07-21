@@ -1,10 +1,14 @@
-use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
-    ffi::{CStr, c_char},
-};
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
+use std::collections::HashSet;
+use std::ffi::CStr;
+use std::ffi::c_char;
 
-use anyhow::{Context, Result, ensure};
-use cudarc::driver::{result as cuda_driver_result, sys as cuda_driver_sys};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::ensure;
+use cudarc::driver::result as cuda_driver_result;
+use cudarc::driver::sys as cuda_driver_sys;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct CpuId(u16);

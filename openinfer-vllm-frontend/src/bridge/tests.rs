@@ -9,7 +9,9 @@
 
 use std::sync::atomic::Ordering;
 
-use openinfer_engine::engine::{FinishReason, RequestAbortReason, TokenLogprob};
+use openinfer_engine::engine::FinishReason;
+use openinfer_engine::engine::RequestAbortReason;
+use openinfer_engine::engine::TokenLogprob;
 
 use super::*;
 

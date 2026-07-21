@@ -1,5 +1,7 @@
-use std::cell::{Cell, RefCell};
-use std::sync::{Mutex, OnceLock};
+use std::cell::Cell;
+use std::cell::RefCell;
+use std::sync::Mutex;
+use std::sync::OnceLock;
 
 use anyhow::Result;
 use openinfer_kernels::tensor::KernelCall;

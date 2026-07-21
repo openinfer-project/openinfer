@@ -3,13 +3,16 @@ use std::any::Any;
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
 use half::bf16;
-
-use super::config::PREFILL_ATTENTION_CTA_TILE_Q;
-use super::weights::{Qwen3Model, TransformerBlock};
-use crate::lora::{DeviceLoraTokenGroup, build_lora_token_ranges, prepare_lora_token_groups};
 use openinfer_core::kv_pool::KvLayout;
 use openinfer_core::ops;
 use openinfer_core::ops::PrefillPagedPlan;
+
+use super::config::PREFILL_ATTENTION_CTA_TILE_Q;
+use super::weights::Qwen3Model;
+use super::weights::TransformerBlock;
+use crate::lora::DeviceLoraTokenGroup;
+use crate::lora::build_lora_token_ranges;
+use crate::lora::prepare_lora_token_groups;
 
 // Thread-local deferred-drop queue for decode-overlap mode. Buffers pushed here
 // during prefill (under stream override) are dropped later when
@@ -27,7 +30,8 @@ fn defer_drop<T: 'static>(val: T) {
 pub(crate) fn drain_deferred_drops() {
     DEFERRED_DROPS.with(|q| q.borrow_mut().clear());
 }
-use openinfer_core::tensor::{DeviceContext, HiddenStates};
+use openinfer_core::tensor::DeviceContext;
+use openinfer_core::tensor::HiddenStates;
 use openinfer_kv_cache::KvView;
 
 /// Pre-allocated scratch buffers for one prefill forward pass.

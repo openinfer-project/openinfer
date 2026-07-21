@@ -12,10 +12,12 @@
 #![cfg(feature = "glm52")]
 
 use half::bf16;
-use openinfer_kernels::ops::{
-    GLM52_MOE_EP_WO_TILE_ROWS, Glm52DeepGemmGroupedFp8Kind, glm52_moe_ep_wo_masked_mma_launch,
-    glm52_moe_ep_wo_max_tiles, glm52_moe_ep_wo_silu_launch, glm52_moe_ep_wo_tiles_launch,
-};
+use openinfer_kernels::ops::GLM52_MOE_EP_WO_TILE_ROWS;
+use openinfer_kernels::ops::Glm52DeepGemmGroupedFp8Kind;
+use openinfer_kernels::ops::glm52_moe_ep_wo_masked_mma_launch;
+use openinfer_kernels::ops::glm52_moe_ep_wo_max_tiles;
+use openinfer_kernels::ops::glm52_moe_ep_wo_silu_launch;
+use openinfer_kernels::ops::glm52_moe_ep_wo_tiles_launch;
 use openinfer_kernels::tensor::DeviceContext;
 
 const ALIGN: usize = 64;

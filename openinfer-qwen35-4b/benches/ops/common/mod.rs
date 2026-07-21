@@ -3,11 +3,17 @@
 use std::hint::black_box;
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
-use criterion::{Bencher, BenchmarkGroup, measurement::WallTime};
+use anyhow::Result;
+use anyhow::anyhow;
+use criterion::Bencher;
+use criterion::BenchmarkGroup;
+use criterion::measurement::WallTime;
 use cudarc::driver::CudaSlice;
 use half::bf16;
-use openinfer_core::tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
+use openinfer_core::tensor::DeviceContext;
+use openinfer_core::tensor::DeviceMatrix;
+use openinfer_core::tensor::DeviceVec;
+use openinfer_core::tensor::HiddenStates;
 
 pub(crate) const VECTOR_DIM: usize = 1024;
 pub(crate) const OUT_DIM: usize = 1024;

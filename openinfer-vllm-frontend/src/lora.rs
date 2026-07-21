@@ -2,21 +2,30 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::Context;
+use anyhow::Result;
 use axum::Json;
 use axum::Router;
-use axum::body::{Body, Bytes, to_bytes};
-use axum::extract::{Request, State};
-use axum::http::{HeaderValue, StatusCode, header::CONTENT_LENGTH};
-use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
-use serde::{Deserialize, Serialize};
+use axum::body::Body;
+use axum::body::Bytes;
+use axum::body::to_bytes;
+use axum::extract::Request;
+use axum::extract::State;
+use axum::http::HeaderValue;
+use axum::http::StatusCode;
+use axum::http::header::CONTENT_LENGTH;
+use axum::response::IntoResponse;
+use axum::response::Response;
+use axum::routing::get;
+use axum::routing::post;
+use openinfer_engine::engine::EngineControlError;
+use openinfer_engine::engine::EngineHandle;
+use openinfer_engine::engine::LoadLoraAdapterRequest;
+use openinfer_engine::engine::UnloadLoraAdapterRequest;
+use serde::Deserialize;
+use serde::Serialize;
 use tokio::sync::RwLock;
 use tower::ServiceExt;
-
-use openinfer_engine::engine::{
-    EngineControlError, EngineHandle, LoadLoraAdapterRequest, UnloadLoraAdapterRequest,
-};
 
 use crate::wire::LORA_ADAPTER_XARG;
 
@@ -357,9 +366,8 @@ async fn lora_models_response(
 
 #[cfg(test)]
 mod tests {
-    use tokio::sync::mpsc;
-
     use openinfer_engine::engine::GenerateRequest;
+    use tokio::sync::mpsc;
 
     use super::*;
 

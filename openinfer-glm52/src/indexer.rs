@@ -29,26 +29,43 @@
 //!   +-- local top-k offsets -> global KV slots
 //! ```
 
-use anyhow::{Result, ensure};
+use anyhow::Result;
+use anyhow::ensure;
 use cudarc::driver::CudaSlice;
 use half::bf16;
-
-use openinfer_kernels::ops::{
-    GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW, GLM52_INDEXER_HEAD_DIM, GLM52_INDEXER_TOPK,
-    Glm52DeepGemmMqaLogitsShape, Glm52IndexerCacheInsert, Glm52IndexerCacheLayout,
-    Glm52IndexerLocalTopKToSlots, Glm52IndexerTopK, Glm52MoeQuantShape, bf16_bytes_to_f32_into,
-    glm52_deepgemm_paged_mqa_logits_launch, glm52_deepgemm_paged_mqa_metadata_launch,
-    glm52_flashinfer_topk_2048_launch, glm52_fp8_per_token_group_quant_bf16_launch,
-    glm52_indexer_k_quant_and_cache_launch, glm52_indexer_local_topk_to_slots_launch,
-    glm52_indexer_rope_launch, glm52_indexer_weights_fold_launch,
-    glm52_indexer_weights_proj_launch, layer_norm_into,
-};
+use openinfer_kernels::ops::GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW;
+use openinfer_kernels::ops::GLM52_INDEXER_HEAD_DIM;
+use openinfer_kernels::ops::GLM52_INDEXER_TOPK;
+use openinfer_kernels::ops::Glm52DeepGemmMqaLogitsShape;
+use openinfer_kernels::ops::Glm52IndexerCacheInsert;
+use openinfer_kernels::ops::Glm52IndexerCacheLayout;
+use openinfer_kernels::ops::Glm52IndexerLocalTopKToSlots;
+use openinfer_kernels::ops::Glm52IndexerTopK;
+use openinfer_kernels::ops::Glm52MoeQuantShape;
+use openinfer_kernels::ops::bf16_bytes_to_f32_into;
+use openinfer_kernels::ops::glm52_deepgemm_paged_mqa_logits_launch;
+use openinfer_kernels::ops::glm52_deepgemm_paged_mqa_metadata_launch;
+use openinfer_kernels::ops::glm52_flashinfer_topk_2048_launch;
+use openinfer_kernels::ops::glm52_fp8_per_token_group_quant_bf16_launch;
+use openinfer_kernels::ops::glm52_indexer_k_quant_and_cache_launch;
+use openinfer_kernels::ops::glm52_indexer_local_topk_to_slots_launch;
+use openinfer_kernels::ops::glm52_indexer_rope_launch;
+use openinfer_kernels::ops::glm52_indexer_weights_fold_launch;
+use openinfer_kernels::ops::glm52_indexer_weights_proj_launch;
+use openinfer_kernels::ops::layer_norm_into;
 use openinfer_kernels::tensor::DeviceContext;
 
-use crate::config::{GLM52_HIDDEN, GLM52_INDEX_HEAD_DIM, GLM52_INDEX_HEADS, GLM52_Q_LORA_RANK};
-use crate::fp8::{FP8_BLOCK, ProjWeight, fp8_linear_into};
+use crate::config::GLM52_HIDDEN;
+use crate::config::GLM52_INDEX_HEAD_DIM;
+use crate::config::GLM52_INDEX_HEADS;
+use crate::config::GLM52_Q_LORA_RANK;
+use crate::fp8::FP8_BLOCK;
 #[cfg(test)]
-use crate::fp8::{Glm52ProjBytes, fp8_linear};
+use crate::fp8::Glm52ProjBytes;
+use crate::fp8::ProjWeight;
+#[cfg(test)]
+use crate::fp8::fp8_linear;
+use crate::fp8::fp8_linear_into;
 use crate::rows::Rows;
 
 const HIDDEN: usize = GLM52_HIDDEN;

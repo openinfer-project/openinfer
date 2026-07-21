@@ -3,10 +3,12 @@
 
 use std::ops::Range;
 
-use crate::{BlockId, KvbmSequenceHashProvider, SequenceHash};
 use dynamo_tokens::TokenBlock;
 
 use super::super::store::BlockStore;
+use crate::BlockId;
+use crate::KvbmSequenceHashProvider;
+use crate::SequenceHash;
 use crate::sequence::BlockSequenceError;
 
 /// Per-tier block_id tracking with an offset into the sequence.

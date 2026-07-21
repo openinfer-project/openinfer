@@ -22,18 +22,22 @@ mod unified_forward;
 mod verify_graph;
 mod weights;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 
 use anyhow::Result;
-use log::{info, warn};
-use openinfer_core::engine::{EngineHandle, EngineLoadOptions, EpBackend, ModelInfo};
-
 pub use kernel_plan::kernel_plan;
+use log::info;
+use log::warn;
+use openinfer_core::engine::EngineHandle;
+use openinfer_core::engine::EngineLoadOptions;
+use openinfer_core::engine::EpBackend;
+use openinfer_core::engine::ModelInfo;
 pub use scheduler::DEFAULT_MAX_PREFILL_TOKENS;
-pub use weights::{
-    DEFAULT_GPU_MEMORY_UTILIZATION, DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES, DEFAULT_KV_PAGE_SIZE,
-    Qwen3MemoryOptions,
-};
+pub use weights::DEFAULT_GPU_MEMORY_UTILIZATION;
+pub use weights::DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES;
+pub use weights::DEFAULT_KV_PAGE_SIZE;
+pub use weights::Qwen3MemoryOptions;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Qwen3LoraOptions {
@@ -199,11 +203,18 @@ impl Default for Qwen3OffloadOptions {
 /// model-local benchmarks. The root server should use `start_engine` instead.
 pub mod runtime {
     pub use crate::batch_decode_buffers::split_chunk_size_for;
-    pub use crate::executor::{
-        DecodePlan, DecodeRequestResult, DecodeResult, DecodeStepItem, PrefillPlan,
-        PrefillRequestResult, PrefillResult, PrefillStepItem, Qwen3Executor, RequestId,
-        UnifiedPlan, UnifiedResult,
-    };
+    pub use crate::executor::DecodePlan;
+    pub use crate::executor::DecodeRequestResult;
+    pub use crate::executor::DecodeResult;
+    pub use crate::executor::DecodeStepItem;
+    pub use crate::executor::PrefillPlan;
+    pub use crate::executor::PrefillRequestResult;
+    pub use crate::executor::PrefillResult;
+    pub use crate::executor::PrefillStepItem;
+    pub use crate::executor::Qwen3Executor;
+    pub use crate::executor::RequestId;
+    pub use crate::executor::UnifiedPlan;
+    pub use crate::executor::UnifiedResult;
 }
 
 pub fn probe_model(model_path: &Path) -> Result<Option<ModelInfo>> {
@@ -522,7 +533,8 @@ pub fn start_engine_with_lora_control(
 }
 
 fn apply_batch_invariant_policy(batch_invariant: bool) {
-    use openinfer_kernels::ops::{NumericPolicy, set_numeric_policy};
+    use openinfer_kernels::ops::NumericPolicy;
+    use openinfer_kernels::ops::set_numeric_policy;
     let policy = if batch_invariant {
         NumericPolicy::Pin
     } else {

@@ -24,21 +24,31 @@
 //! through the re-exported [`gpu_sample_batch_into`] and its logprobs through
 //! [`token_logprob_from_row`].
 
-use anyhow::{Result, anyhow, ensure};
-use cudarc::driver::{CudaSlice, PinnedHostSlice};
-
+use anyhow::Result;
+use anyhow::anyhow;
+use anyhow::ensure;
+use cudarc::driver::CudaSlice;
+use cudarc::driver::PinnedHostSlice;
 use openinfer_engine::engine::TokenLogprob;
-use openinfer_kernels::ops::{
-    argmax_batch_bf16_split_indexed_into, argmax_batch_bf16_split_partials_len,
-    logprob_topk_batch_bf16_into,
-};
-use openinfer_kernels::tensor::{DeviceContext, HiddenStates, has_stream_override};
-
 pub use openinfer_engine::sampler::SamplingParams;
 /// Low-level batched sampling, re-exported so a model that must drive its own
 /// greedy path still reaches the single sampler entry rather than dipping into
 /// `openinfer-kernels` directly — e.g. Kimi-K2 (see the module docs).
-pub use openinfer_kernels::ops::{BatchSamplingRow, BatchSamplingScratch, gpu_sample_batch_into};
+pub use openinfer_kernels::ops::BatchSamplingRow;
+/// Low-level batched sampling, re-exported so a model that must drive its own
+/// greedy path still reaches the single sampler entry rather than dipping into
+/// `openinfer-kernels` directly — e.g. Kimi-K2 (see the module docs).
+pub use openinfer_kernels::ops::BatchSamplingScratch;
+use openinfer_kernels::ops::argmax_batch_bf16_split_indexed_into;
+use openinfer_kernels::ops::argmax_batch_bf16_split_partials_len;
+/// Low-level batched sampling, re-exported so a model that must drive its own
+/// greedy path still reaches the single sampler entry rather than dipping into
+/// `openinfer-kernels` directly — e.g. Kimi-K2 (see the module docs).
+pub use openinfer_kernels::ops::gpu_sample_batch_into;
+use openinfer_kernels::ops::logprob_topk_batch_bf16_into;
+use openinfer_kernels::tensor::DeviceContext;
+use openinfer_kernels::tensor::HiddenStates;
+use openinfer_kernels::tensor::has_stream_override;
 
 /// Allocate-once device buffers for [`select_batch`], sized for `max_rows` × `vocab`.
 ///
@@ -468,8 +478,9 @@ pub fn token_logprobs_batch(
 
 #[cfg(test)]
 mod tests {
-    use super::token_logprob_from_row;
     use half::bf16;
+
+    use super::token_logprob_from_row;
 
     #[test]
     fn token_logprob_matches_exact_log_softmax() {

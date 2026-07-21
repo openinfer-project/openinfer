@@ -6,7 +6,9 @@
 //! All increment/decrement methods use `Ordering::Relaxed` for zero overhead on the hot path.
 //! The [`MetricsAggregator`] reads these atomics at scrape time and builds Prometheus protos.
 
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::AtomicI64;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 /// Raw atomic metrics for a single block pool (one per `BlockManager<T>`).
 ///

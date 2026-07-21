@@ -16,11 +16,16 @@
 mod engine;
 mod vllm_hash;
 
-pub use engine::{
-    HostConfig, KvArena, LoadHandle, OffloadConfig, OffloadEngine, OffloadHost, P2pConfig,
-    QueryHit, QueryOutcome,
-};
-pub use vllm_hash::{VLLM_HASH_BYTES, VllmBlockHasher};
-
+pub use engine::HostConfig;
+pub use engine::KvArena;
+pub use engine::LoadHandle;
+pub use engine::OffloadConfig;
+pub use engine::OffloadEngine;
+pub use engine::OffloadHost;
+pub use engine::P2pConfig;
+pub use engine::QueryHit;
+pub use engine::QueryOutcome;
 // Re-exported so callers name pegaflow's engine types through this bridge.
 pub use pegaflow_core::{EngineError, PegaEngine, QueryLeaseId};
+pub use vllm_hash::VLLM_HASH_BYTES;
+pub use vllm_hash::VllmBlockHasher;

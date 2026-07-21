@@ -2,13 +2,17 @@
 //! the scheduler stream helper, and the per-model bench adapters.
 
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use std::time::Instant;
 
-use anyhow::{Result, ensure};
-use rand::rngs::StdRng;
-
+use anyhow::Result;
+use anyhow::ensure;
 use openinfer::sampler::SamplingParams;
-use openinfer::scheduler::{SchedulerHandle, SchedulerRequest, TokenEvent, TokenSink};
+use openinfer::scheduler::SchedulerHandle;
+use openinfer::scheduler::SchedulerRequest;
+use openinfer::scheduler::TokenEvent;
+use openinfer::scheduler::TokenSink;
+use rand::rngs::StdRng;
 
 pub(crate) struct GenTimings {
     pub(crate) ttft: Duration,

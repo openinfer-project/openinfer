@@ -1,20 +1,23 @@
 //! Batched decode: process N requests' tokens in one forward pass.
 
 use anyhow::Result;
-
 use cudarc::driver::CudaSlice;
 use half::bf16;
-
-use super::batch_decode_buffers::{
-    BATCH_BUCKETS, BatchDecodeBuffers, DecodeAttentionPath, bucket_for,
-};
-use super::batch_decode_dag::BatchDecodeDag;
-use super::weights::{PackedLoraProjection, Qwen3Model, TransformerBlock};
-use crate::lora::LoraProjectionKind;
 use openinfer_core::kv_pool::KvLayout;
 use openinfer_core::ops;
-use openinfer_kernels::tensor::{KvDim, QDim};
+use openinfer_kernels::tensor::KvDim;
+use openinfer_kernels::tensor::QDim;
 use openinfer_kv_cache::KvView;
+
+use super::batch_decode_buffers::BATCH_BUCKETS;
+use super::batch_decode_buffers::BatchDecodeBuffers;
+use super::batch_decode_buffers::DecodeAttentionPath;
+use super::batch_decode_buffers::bucket_for;
+use super::batch_decode_dag::BatchDecodeDag;
+use super::weights::PackedLoraProjection;
+use super::weights::Qwen3Model;
+use super::weights::TransformerBlock;
+use crate::lora::LoraProjectionKind;
 
 #[cfg(feature = "kernel-call-trace")]
 macro_rules! dag_label {

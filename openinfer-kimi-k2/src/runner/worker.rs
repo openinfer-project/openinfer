@@ -1,58 +1,92 @@
-use std::{
-    path::{Path, PathBuf},
-    sync::{Arc, Barrier},
-    thread,
-    time::Instant,
-};
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::Barrier;
+use std::thread;
+use std::time::Instant;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::ensure;
 use bytesize::ByteSize;
-use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
-use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
-use cudarc::nccl::{
-    ReduceOp,
-    safe::{Comm, Id},
-};
+use crossbeam_channel::Receiver;
+use crossbeam_channel::Sender;
+use crossbeam_channel::bounded;
+use crossbeam_channel::unbounded;
+use cudarc::driver::CudaSlice;
+use cudarc::driver::DevicePtr;
+use cudarc::driver::DevicePtrMut;
+use cudarc::nccl::ReduceOp;
+use cudarc::nccl::safe::Comm;
+use cudarc::nccl::safe::Id;
 use log::debug;
 use openinfer_core::cuda_graph::CudaGraphState;
 use openinfer_core::engine::TokenLogprob;
 #[cfg(feature = "kernel-call-trace")]
 use openinfer_core::ops::call_trace;
-use openinfer_kernels::{
-    ops::{
-        KIMI_K2_LOCAL_EXPERTS, KIMI_K2_MLA_KV_A_OUT, KIMI_K2_MLA_KV_LORA_RANK,
-        KIMI_K2_MLA_Q_HEAD_DIM, KIMI_K2_MLA_QKV_A_OUT, KIMI_K2_MLA_ROPE_DIM,
-        KIMI_K2_MLA_V_HEAD_DIM, KIMI_O_PROJ_CUBLASLT_INPUT, KimiMarlinRouteWorkspace,
-        KimiMarlinWna16Workspace, KimiMlaPagedKvLayout, flashinfer_top1_row_states_bytes,
-        kimi_flashinfer_batch_decode_mla_rt, kimi_flashinfer_single_prefill_mla_rt,
-        kimi_mla_absorb_q_nope_rt, kimi_mla_assemble_cached_kv_rt, kimi_mla_gather_cached_ckv_rt,
-        kimi_mla_paged_kv_append, kimi_mla_rope_apply_kpe, kimi_mla_rope_assemble_prefill_rt,
-        kimi_mla_rope_split_decode_rt, kimi_mla_split_qkv_a, kimi_mla_split_qkv_a_norm,
-        kimi_mla_v_up_rt, kimi_o_proj_cublaslt_into, kimi_o_proj_cublaslt_supports_batch_size,
-    },
-    tensor::{
-        DeviceContext, DeviceMatrix, DeviceVec, GpuTensor, GpuWeight, HiddenStates, NormWeight,
-    },
-    typed_ops,
-};
+use openinfer_kernels::ops::KIMI_K2_LOCAL_EXPERTS;
+use openinfer_kernels::ops::KIMI_K2_MLA_KV_A_OUT;
+use openinfer_kernels::ops::KIMI_K2_MLA_KV_LORA_RANK;
+use openinfer_kernels::ops::KIMI_K2_MLA_Q_HEAD_DIM;
+use openinfer_kernels::ops::KIMI_K2_MLA_QKV_A_OUT;
+use openinfer_kernels::ops::KIMI_K2_MLA_ROPE_DIM;
+use openinfer_kernels::ops::KIMI_K2_MLA_V_HEAD_DIM;
+use openinfer_kernels::ops::KIMI_O_PROJ_CUBLASLT_INPUT;
+use openinfer_kernels::ops::KimiMarlinRouteWorkspace;
+use openinfer_kernels::ops::KimiMarlinWna16Workspace;
+use openinfer_kernels::ops::KimiMlaPagedKvLayout;
+use openinfer_kernels::ops::flashinfer_top1_row_states_bytes;
+use openinfer_kernels::ops::kimi_flashinfer_batch_decode_mla_rt;
+use openinfer_kernels::ops::kimi_flashinfer_single_prefill_mla_rt;
+use openinfer_kernels::ops::kimi_mla_absorb_q_nope_rt;
+use openinfer_kernels::ops::kimi_mla_assemble_cached_kv_rt;
+use openinfer_kernels::ops::kimi_mla_gather_cached_ckv_rt;
+use openinfer_kernels::ops::kimi_mla_paged_kv_append;
+use openinfer_kernels::ops::kimi_mla_rope_apply_kpe;
+use openinfer_kernels::ops::kimi_mla_rope_assemble_prefill_rt;
+use openinfer_kernels::ops::kimi_mla_rope_split_decode_rt;
+use openinfer_kernels::ops::kimi_mla_split_qkv_a;
+use openinfer_kernels::ops::kimi_mla_split_qkv_a_norm;
+use openinfer_kernels::ops::kimi_mla_v_up_rt;
+use openinfer_kernels::ops::kimi_o_proj_cublaslt_into;
+use openinfer_kernels::ops::kimi_o_proj_cublaslt_supports_batch_size;
+use openinfer_kernels::tensor::DeviceContext;
+use openinfer_kernels::tensor::DeviceMatrix;
+use openinfer_kernels::tensor::DeviceVec;
+use openinfer_kernels::tensor::GpuTensor;
+use openinfer_kernels::tensor::GpuWeight;
+use openinfer_kernels::tensor::HiddenStates;
+use openinfer_kernels::tensor::NormWeight;
+use openinfer_kernels::typed_ops;
 
-use crate::{
-    config::{
-        KIMI_K2_DENSE_LAYERS, KIMI_K2_HIDDEN, KIMI_K2_LAYERS, KIMI_K2_MOE_LAYERS,
-        KIMI_K2_Q_LORA_RANK, KIMI_K2_QK_ROPE_HEAD_DIM, KIMI_K2_RMS_NORM_EPS, KIMI_K2_ROPE_THETA,
-        KIMI_K2_TOPK, KIMI_K2_YARN_BETA_FAST, KIMI_K2_YARN_BETA_SLOW, KIMI_K2_YARN_FACTOR,
-        KIMI_K2_YARN_ORIGINAL_MAX_POS,
-    },
-    runner::affinity::{KimiRankThreadPlacement, pin_rank_worker_thread},
-    weights::{
-        KimiGpuRawTensor, KimiLayerWeightKindNames, KimiLayerWeightNames,
-        KimiRankExpertMarlinWeights, KimiRankGpuContext, KimiRankGpuWeights,
-        KimiRankSlicedLoadPlan, KimiRankWeightNames, KimiRouterDeviceWeights, KimiRouterGpuWeights,
-        load_rank_sliced_weights_to_gpu,
-    },
-};
-
-pub(super) use crate::typed_scratch::{KimiWorkerDecodeScratch, MARLIN_W13_OUT_DIM};
+use crate::config::KIMI_K2_DENSE_LAYERS;
+use crate::config::KIMI_K2_HIDDEN;
+use crate::config::KIMI_K2_LAYERS;
+use crate::config::KIMI_K2_MOE_LAYERS;
+use crate::config::KIMI_K2_Q_LORA_RANK;
+use crate::config::KIMI_K2_QK_ROPE_HEAD_DIM;
+use crate::config::KIMI_K2_RMS_NORM_EPS;
+use crate::config::KIMI_K2_ROPE_THETA;
+use crate::config::KIMI_K2_TOPK;
+use crate::config::KIMI_K2_YARN_BETA_FAST;
+use crate::config::KIMI_K2_YARN_BETA_SLOW;
+use crate::config::KIMI_K2_YARN_FACTOR;
+use crate::config::KIMI_K2_YARN_ORIGINAL_MAX_POS;
+use crate::runner::affinity::KimiRankThreadPlacement;
+use crate::runner::affinity::pin_rank_worker_thread;
+pub(super) use crate::typed_scratch::KimiWorkerDecodeScratch;
+pub(super) use crate::typed_scratch::MARLIN_W13_OUT_DIM;
+use crate::weights::KimiGpuRawTensor;
+use crate::weights::KimiLayerWeightKindNames;
+use crate::weights::KimiLayerWeightNames;
+use crate::weights::KimiRankExpertMarlinWeights;
+use crate::weights::KimiRankGpuContext;
+use crate::weights::KimiRankGpuWeights;
+use crate::weights::KimiRankSlicedLoadPlan;
+use crate::weights::KimiRankWeightNames;
+use crate::weights::KimiRouterDeviceWeights;
+use crate::weights::KimiRouterGpuWeights;
+use crate::weights::load_rank_sliced_weights_to_gpu;
 
 const KIMI_MARLIN_MAX_BLOCK_SIZE: usize = 64;
 const KIMI_DECODE_MAX_BATCH: usize = 64;
@@ -783,10 +817,10 @@ mod cache;
 mod load;
 mod runtime;
 // Collective + Marlin helpers shared with the sibling `moe_nccl` backend.
-pub(super) use runtime::{
-    all_reduce_f32_in_place, kimi_marlin_block_size, maybe_all_reduce_hidden_via_f32_in_place,
-    reduce_scatter_f32_hidden_into,
-};
+pub(super) use runtime::all_reduce_f32_in_place;
+pub(super) use runtime::kimi_marlin_block_size;
+pub(super) use runtime::maybe_all_reduce_hidden_via_f32_in_place;
+pub(super) use runtime::reduce_scatter_f32_hidden_into;
 mod forward;
 mod state;
 
@@ -824,8 +858,9 @@ pub(super) fn build_placements(device_ordinals: &[usize]) -> Result<Vec<KimiK2Ra
 
 #[cfg(test)]
 mod tests {
+    use super::KimiKvStepPages;
     use super::cache::build_slot_page_table;
-    use super::{KimiKvStepPages, decode_batch_bucket};
+    use super::decode_batch_bucket;
 
     #[test]
     fn decode_batch_bucket_rounds_up_to_power_of_two_buckets() {

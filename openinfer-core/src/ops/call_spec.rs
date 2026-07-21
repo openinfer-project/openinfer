@@ -1,9 +1,37 @@
-use openinfer_kernels::tensor::{
-    AxisSpec, AxisTag, Batch, BatchPlusOne, Bf16, Contiguous1D, F32, HeadDim, Hidden,
-    HiddenStatesLayout, I32, InDim, Inter2, Intermediate, KernelCall, Kv, KvDim, KvHead, Layer,
-    OutDim, OutTotal, Page, PageSlot, PagedKvPageFirst, PosInPage, QDim, RopeDim, RowMajor2D, Seq,
-    TensorSpec, Tile, Token, U32, Vocab,
-};
+use openinfer_kernels::tensor::AxisSpec;
+use openinfer_kernels::tensor::AxisTag;
+use openinfer_kernels::tensor::Batch;
+use openinfer_kernels::tensor::BatchPlusOne;
+use openinfer_kernels::tensor::Bf16;
+use openinfer_kernels::tensor::Contiguous1D;
+use openinfer_kernels::tensor::F32;
+use openinfer_kernels::tensor::HeadDim;
+use openinfer_kernels::tensor::Hidden;
+use openinfer_kernels::tensor::HiddenStatesLayout;
+use openinfer_kernels::tensor::I32;
+use openinfer_kernels::tensor::InDim;
+use openinfer_kernels::tensor::Inter2;
+use openinfer_kernels::tensor::Intermediate;
+use openinfer_kernels::tensor::KernelCall;
+use openinfer_kernels::tensor::Kv;
+use openinfer_kernels::tensor::KvDim;
+use openinfer_kernels::tensor::KvHead;
+use openinfer_kernels::tensor::Layer;
+use openinfer_kernels::tensor::OutDim;
+use openinfer_kernels::tensor::OutTotal;
+use openinfer_kernels::tensor::Page;
+use openinfer_kernels::tensor::PageSlot;
+use openinfer_kernels::tensor::PagedKvPageFirst;
+use openinfer_kernels::tensor::PosInPage;
+use openinfer_kernels::tensor::QDim;
+use openinfer_kernels::tensor::RopeDim;
+use openinfer_kernels::tensor::RowMajor2D;
+use openinfer_kernels::tensor::Seq;
+use openinfer_kernels::tensor::TensorSpec;
+use openinfer_kernels::tensor::Tile;
+use openinfer_kernels::tensor::Token;
+use openinfer_kernels::tensor::U32;
+use openinfer_kernels::tensor::Vocab;
 
 /// A traced decode-attention call's kernel path; `SplitKv` carries its resolved chunk + cap.
 #[derive(Clone, Copy, Debug)]

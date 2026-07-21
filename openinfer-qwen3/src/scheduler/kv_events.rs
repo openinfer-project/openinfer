@@ -14,9 +14,12 @@
 use std::collections::HashMap;
 
 use log::warn;
-use openinfer_core::engine::{KvBlockEvent, KvStoredBlock};
-use openinfer_kv_cache::{KvCacheEvent, RegisteredBlock};
-use tokio::sync::{broadcast, mpsc};
+use openinfer_core::engine::KvBlockEvent;
+use openinfer_core::engine::KvStoredBlock;
+use openinfer_kv_cache::KvCacheEvent;
+use openinfer_kv_cache::RegisteredBlock;
+use tokio::sync::broadcast;
+use tokio::sync::mpsc;
 
 pub(super) struct KvEventProducer {
     /// Neutral feed to the engine handle's KV-event consumer (the router pump).

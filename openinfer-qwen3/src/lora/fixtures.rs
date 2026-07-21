@@ -7,10 +7,14 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-use half::{bf16, f16};
-use safetensors::{Dtype, View};
+use half::bf16;
+use half::f16;
+use safetensors::Dtype;
+use safetensors::View;
 
-use super::{ADAPTER_CONFIG_FILE, ADAPTER_WEIGHTS_FILE, tensor_name};
+use super::ADAPTER_CONFIG_FILE;
+use super::ADAPTER_WEIGHTS_FILE;
+use super::tensor_name;
 
 #[derive(Clone)]
 pub struct FixtureTensor {

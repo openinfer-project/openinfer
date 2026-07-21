@@ -25,21 +25,39 @@
 //! same bar as the EP8 chain); the tile kernel device-traps on a cross-rank
 //! token-count disagreement.
 
-use anyhow::{Context as _, Result, ensure};
+use anyhow::Context as _;
+use anyhow::Result;
+use anyhow::ensure;
 use cudarc::driver::CudaSlice;
 use half::bf16;
 use openinfer_kernels::ffi::DeepEpInfo;
-use openinfer_kernels::ops::{
-    DeepEpAbi, DeepEpBase, DeepEpDispatchScratch, GLM52_DEEPGEMM_GROUPED_EXPERT_ALIGNMENT,
-    Glm52DeepEpAbi, Glm52DeepGemmGroupedFp8Kind, Glm52Ep4DeepEpAbi, Glm52Ep16DeepEpAbi,
-    Glm52Ep32DeepEpAbi, Glm52Ep64DeepEpAbi, glm52_moe_ep_wo_masked_mma_launch,
-    glm52_moe_ep_wo_max_tiles, glm52_moe_ep_wo_silu_launch, glm52_moe_ep_wo_tiles_launch,
-};
+use openinfer_kernels::ops::DeepEpAbi;
+use openinfer_kernels::ops::DeepEpBase;
+use openinfer_kernels::ops::DeepEpDispatchScratch;
+use openinfer_kernels::ops::GLM52_DEEPGEMM_GROUPED_EXPERT_ALIGNMENT;
+use openinfer_kernels::ops::Glm52DeepEpAbi;
+use openinfer_kernels::ops::Glm52DeepGemmGroupedFp8Kind;
+use openinfer_kernels::ops::Glm52Ep4DeepEpAbi;
+use openinfer_kernels::ops::Glm52Ep16DeepEpAbi;
+use openinfer_kernels::ops::Glm52Ep32DeepEpAbi;
+use openinfer_kernels::ops::Glm52Ep64DeepEpAbi;
+use openinfer_kernels::ops::glm52_moe_ep_wo_masked_mma_launch;
+use openinfer_kernels::ops::glm52_moe_ep_wo_max_tiles;
+use openinfer_kernels::ops::glm52_moe_ep_wo_silu_launch;
+use openinfer_kernels::ops::glm52_moe_ep_wo_tiles_launch;
 use openinfer_kernels::tensor::DeviceContext;
 
 use crate::model::GLM52_MAX_BATCH_PER_RANK;
-use crate::moe_decode::{EXPERTS, Glm52MoeExpertBank, HIDDEN, RoutedTopk, TOPK, W2_K, W2_N, W13_N};
-use crate::moe_ep8::{Glm52MoeEp8State, glm52_moe_ep8_routed_forward};
+use crate::moe_decode::EXPERTS;
+use crate::moe_decode::Glm52MoeExpertBank;
+use crate::moe_decode::HIDDEN;
+use crate::moe_decode::RoutedTopk;
+use crate::moe_decode::TOPK;
+use crate::moe_decode::W2_K;
+use crate::moe_decode::W2_N;
+use crate::moe_decode::W13_N;
+use crate::moe_ep8::Glm52MoeEp8State;
+use crate::moe_ep8::glm52_moe_ep8_routed_forward;
 
 /// Per-rank DeepEP context plus every buffer the weight-only chain touches,
 /// allocated once at startup at worst-case capacity (pointer-stable for

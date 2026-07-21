@@ -22,23 +22,37 @@
 
 use std::path::Path;
 
-use anyhow::{Context as _, Result, ensure};
-use cudarc::driver::{CudaSlice, DevicePtr};
-
+use anyhow::Context as _;
+use anyhow::Result;
+use anyhow::ensure;
+use cudarc::driver::CudaSlice;
+use cudarc::driver::DevicePtr;
 use openinfer_core::cuda_graph::CudaGraphState;
-use openinfer_core::weight_loader::{
-    deserialize_shards, load_shard_info, load_tensor_1d, load_tensor_2d, mmap_shards,
-    precompute_rope,
-};
-use openinfer_kernels::ops::{
-    add_batch_into, copy_hidden_token_range_into, dflash_qk_norm_rope_into, embedding_batch,
-    fused_add_rms_norm_round_batch_into, gemm_into_checked, gemm_rows_into_checked,
-    markov_step_argmax_into, markov_step_argmax_partials_len, rms_norm_batch_into,
-    silu_mul_batch_into, single_prefill_nhd_noncausal_into,
-};
-use openinfer_kernels::tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
+use openinfer_core::weight_loader::deserialize_shards;
+use openinfer_core::weight_loader::load_shard_info;
+use openinfer_core::weight_loader::load_tensor_1d;
+use openinfer_core::weight_loader::load_tensor_2d;
+use openinfer_core::weight_loader::mmap_shards;
+use openinfer_core::weight_loader::precompute_rope;
+use openinfer_kernels::ops::add_batch_into;
+use openinfer_kernels::ops::copy_hidden_token_range_into;
+use openinfer_kernels::ops::dflash_qk_norm_rope_into;
+use openinfer_kernels::ops::embedding_batch;
+use openinfer_kernels::ops::fused_add_rms_norm_round_batch_into;
+use openinfer_kernels::ops::gemm_into_checked;
+use openinfer_kernels::ops::gemm_rows_into_checked;
+use openinfer_kernels::ops::markov_step_argmax_into;
+use openinfer_kernels::ops::markov_step_argmax_partials_len;
+use openinfer_kernels::ops::rms_norm_batch_into;
+use openinfer_kernels::ops::silu_mul_batch_into;
+use openinfer_kernels::ops::single_prefill_nhd_noncausal_into;
+use openinfer_kernels::tensor::DeviceContext;
+use openinfer_kernels::tensor::DeviceMatrix;
+use openinfer_kernels::tensor::DeviceVec;
+use openinfer_kernels::tensor::HiddenStates;
 
-use crate::config::{GLM52_HIDDEN, GLM52_VOCAB};
+use crate::config::GLM52_HIDDEN;
+use crate::config::GLM52_VOCAB;
 use crate::model::GLM52_MAX_BATCH_PER_RANK;
 
 /// Draft block width: anchor + 7 mask positions. Equals the top decode bucket

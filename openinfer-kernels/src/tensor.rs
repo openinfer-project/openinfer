@@ -1,12 +1,17 @@
 //! Device tensor types and CUDA context.
 
-use anyhow::{Result, anyhow};
-use cudarc::driver::sys::CUstream;
-use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
-use half::bf16;
-use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 use std::sync::Arc;
+
+use anyhow::Result;
+use anyhow::anyhow;
+use cudarc::driver::CudaContext;
+use cudarc::driver::CudaSlice;
+use cudarc::driver::CudaStream;
+use cudarc::driver::sys::CUstream;
+use half::bf16;
+use serde::Deserialize;
+use serde::Serialize;
 
 use crate::ffi;
 

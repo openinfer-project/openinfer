@@ -21,24 +21,27 @@
 //! Set `OPENINFER_GLM52_ORACLE_DUMP=/path/taps.safetensors` (harness `--emit
 //! safetensors`) to additionally diff the whole output tensor, not just probes.
 
-use std::{
-    collections::BTreeMap,
-    path::{Path, PathBuf},
-};
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::path::PathBuf;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::ensure;
 use half::bf16;
-use sha2::{Digest, Sha256};
-
-use openinfer_kernels::ops::{
-    GLM52_FLASHMLA_SPARSE_PAGE_SIZE, GLM52_FLASHMLA_SPARSE_TOPK, Glm52FlashMlaSparseDecode,
-    glm52_flashmla_sparse_decode_num_sm_parts,
-};
+use openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_PAGE_SIZE;
+use openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_TOPK;
+use openinfer_kernels::ops::Glm52FlashMlaSparseDecode;
+use openinfer_kernels::ops::glm52_flashmla_sparse_decode_num_sm_parts;
 use openinfer_kernels::tensor::DeviceContext;
+use sha2::Digest;
+use sha2::Sha256;
 
-use crate::config::{GLM52_ROPE_HALF, GLM52_SM_SCALE};
+use crate::config::GLM52_ROPE_HALF;
+use crate::config::GLM52_SM_SCALE;
 use crate::fp8::Glm52ProjBytes;
-use crate::mla_decode::{Glm52MlaSchedMetadata, glm52_mla_decode_forward};
+use crate::mla_decode::Glm52MlaSchedMetadata;
+use crate::mla_decode::glm52_mla_decode_forward;
 use crate::mla_front::Glm52MlaLayerWeights;
 use crate::model::rope_tables;
 

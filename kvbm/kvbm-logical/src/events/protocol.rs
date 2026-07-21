@@ -12,7 +12,8 @@
 //! - [`KvCacheEvents`]: Batched events with multiple sequence hashes
 //! - [`KvbmCacheEvents`]: Wire format with instance/cluster context
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 use tokio::sync::broadcast;
 
 use crate::SequenceHash;
@@ -91,11 +92,12 @@ impl Drop for EventReleaseHandle {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::KvbmSequenceHashProvider;
     use dynamo_tokens::TokenBlockSequence;
     use tokio_stream::StreamExt;
     use tokio_stream::wrappers::BroadcastStream;
+
+    use super::*;
+    use crate::KvbmSequenceHashProvider;
 
     #[test]
     fn test_event_serialization() {

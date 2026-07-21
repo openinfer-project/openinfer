@@ -1,12 +1,10 @@
 [package]
-name = "openinfer-core"
-license = "Apache-2.0"
-version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
+name = "openinfer-core"
+version = "0.1.0"
 
 [dependencies]
-openinfer-engine = { workspace = true }
-openinfer-kernels = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
 colored = { workspace = true }
@@ -16,6 +14,8 @@ libc = { workspace = true }
 log = { workspace = true }
 logforth = { workspace = true }
 memmap2 = { workspace = true }
+openinfer-engine = { workspace = true }
+openinfer-kernels = { workspace = true }
 parking_lot = { workspace = true }
 safetensors = { workspace = true }
 serde_json = { workspace = true }

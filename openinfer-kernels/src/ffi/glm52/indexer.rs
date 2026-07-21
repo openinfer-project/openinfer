@@ -1,5 +1,7 @@
+use cudarc::driver::sys::CUresult;
+use cudarc::driver::sys::CUstream;
+
 use crate::ffi::Half;
-use cudarc::driver::sys::{CUresult, CUstream};
 
 unsafe extern "C" {
     pub fn glm52_indexer_k_quant_and_cache_cuda(

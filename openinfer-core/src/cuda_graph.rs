@@ -1,18 +1,21 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use log::debug;
-
 use cudarc::driver::CudaContext;
+use cudarc::driver::sys::CUgraph;
+use cudarc::driver::sys::CUgraphExec;
 use cudarc::driver::sys::CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH;
 use cudarc::driver::sys::CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL;
-use cudarc::driver::sys::{self, CUgraph, CUgraphExec};
+use cudarc::driver::sys::{self};
+use log::debug;
 
-use crate::tensor::{DeviceContext, active_cu_stream};
+use crate::tensor::DeviceContext;
+use crate::tensor::active_cu_stream;
 
 mod dump;
 
-pub use dump::{CudaGraphDumpSummary, validate_graph_dump_request};
+pub use dump::CudaGraphDumpSummary;
+pub use dump::validate_graph_dump_request;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CudaGraphPhase {

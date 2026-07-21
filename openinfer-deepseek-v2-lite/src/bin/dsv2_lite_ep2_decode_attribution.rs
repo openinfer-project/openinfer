@@ -3,18 +3,25 @@
 //! This binary records in-process attribution and correctness metadata. It does
 //! not exercise HTTP serving or establish serving SLO or production readiness.
 
-use std::{
-    env, fs,
-    path::{Path, PathBuf},
-    process::Command,
-};
+use std::env;
+use std::fs;
+use std::path::Path;
+use std::path::PathBuf;
+use std::process::Command;
 
-use anyhow::{Context, Result, bail, ensure};
-use openinfer_deepseek_v2_lite::{DecodeGraphReadinessReport, DeepSeekV2LiteEp2Generator};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::bail;
+use anyhow::ensure;
+use openinfer_deepseek_v2_lite::DecodeGraphReadinessReport;
+use openinfer_deepseek_v2_lite::DeepSeekV2LiteEp2Generator;
 use openinfer_engine::engine::EngineLoadOptions;
-use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
-use vllm_text::tokenizer::{HuggingFaceTokenizer, Tokenizer};
+use serde_json::Value;
+use serde_json::json;
+use sha2::Digest;
+use sha2::Sha256;
+use vllm_text::tokenizer::HuggingFaceTokenizer;
+use vllm_text::tokenizer::Tokenizer;
 
 const PROMPT: &str = "Hello";
 const OUTPUT_LEN: usize = 16;

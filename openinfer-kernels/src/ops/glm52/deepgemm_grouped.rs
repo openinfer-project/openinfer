@@ -5,8 +5,12 @@
 //! aligned slots `decode_combine` addresses. See
 //! `csrc/glm52/glm52_deepgemm_grouped.cu`.
 
-use anyhow::{Result, anyhow, ensure};
-use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
+use anyhow::Result;
+use anyhow::anyhow;
+use anyhow::ensure;
+use cudarc::driver::CudaSlice;
+use cudarc::driver::DevicePtr;
+use cudarc::driver::DevicePtrMut;
 use half::bf16;
 
 use crate::ffi;

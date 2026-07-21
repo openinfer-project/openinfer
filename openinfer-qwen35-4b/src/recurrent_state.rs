@@ -5,10 +5,12 @@
 //! - Conv state: [qkv_dim × (conv_kernel_dim - 1)] bf16
 
 use anyhow::Result;
-use cudarc::driver::{CudaSlice, DevicePtrMut};
+use cudarc::driver::CudaSlice;
+use cudarc::driver::DevicePtrMut;
+use openinfer_core::tensor::DeviceContext;
+use openinfer_core::tensor::DeviceVec;
 
 use super::config::Config35;
-use openinfer_core::tensor::{DeviceContext, DeviceVec};
 
 /// Per-layer recurrent state for a single linear attention layer.
 pub(crate) struct LayerRecurrentState {

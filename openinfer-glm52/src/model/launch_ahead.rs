@@ -3,11 +3,16 @@
 //! step executes) and its harvest. Split from `model/mod.rs`; see
 //! `decode_step` there for the consume/lease protocol.
 
-use anyhow::{Result, ensure};
-use openinfer_kernels::ops::{embedding_rows_into, glm52_decode_feed_launch};
+use anyhow::Result;
+use anyhow::ensure;
+use openinfer_kernels::ops::embedding_rows_into;
+use openinfer_kernels::ops::glm52_decode_feed_launch;
 use openinfer_kernels::tensor::DeviceContext;
 
-use super::{GLM52_MAX_BATCH_PER_RANK, GLM52_VOCAB, Glm52RankModel, Glm52StepShape};
+use super::GLM52_MAX_BATCH_PER_RANK;
+use super::GLM52_VOCAB;
+use super::Glm52RankModel;
+use super::Glm52StepShape;
 
 /// A speculative next-step whole-graph replay already enqueued on the decode
 /// stream: the feed kernel advanced the device input buffers in place and

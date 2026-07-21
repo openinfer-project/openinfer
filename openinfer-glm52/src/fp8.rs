@@ -9,15 +9,16 @@
 //! shared expert all share these helpers; only the EP8 routed-expert chain
 //! (multi-row) stays on the grouped CUTLASS path.
 
-use anyhow::{Result, ensure};
+use anyhow::Result;
+use anyhow::ensure;
 use cudarc::driver::CudaSlice;
 use half::bf16;
-
-use openinfer_kernels::ops::{
-    GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW, glm52_fp8_weight_only_gemv_launch,
-    glm52_fp8_weight_only_gemv_pair_launch, glm52_fp8_weight_only_gemv_partials_launch,
-    glm52_gemv_reduce_silu_mul_launch, glm52_silu_and_mul_bf16_launch,
-};
+use openinfer_kernels::ops::GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW;
+use openinfer_kernels::ops::glm52_fp8_weight_only_gemv_launch;
+use openinfer_kernels::ops::glm52_fp8_weight_only_gemv_pair_launch;
+use openinfer_kernels::ops::glm52_fp8_weight_only_gemv_partials_launch;
+use openinfer_kernels::ops::glm52_gemv_reduce_silu_mul_launch;
+use openinfer_kernels::ops::glm52_silu_and_mul_bf16_launch;
 use openinfer_kernels::tensor::DeviceContext;
 
 pub(crate) const FP8_BLOCK: usize = 128;
@@ -421,8 +422,10 @@ pub(crate) fn fp8_mlp_into(
 
 #[cfg(test)]
 mod tests {
+    use openinfer_kernels::ops::glm52_gemv_mma_routes;
+    use openinfer_kernels::ops::glm52_gemv_split_reduce_launch;
+
     use super::*;
-    use openinfer_kernels::ops::{glm52_gemv_mma_routes, glm52_gemv_split_reduce_launch};
 
     /// e4m3fn bytes avoiding the NaN encodings (0x7F / 0xFF).
     fn synth_fp8(len: usize, salt: usize) -> Vec<u8> {

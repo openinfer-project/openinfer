@@ -9,11 +9,10 @@
 
 #![allow(dead_code)]
 
+use super::token_blocks::create_test_token_block;
 use crate::BlockId;
 use crate::KvbmSequenceHashProvider;
 use crate::pools::SequenceHash;
-
-use super::token_blocks::create_test_token_block;
 
 /// Compute the [`SequenceHash`] for a token sequence.
 pub(crate) fn hash_for_tokens(tokens: &[u32]) -> SequenceHash {

@@ -5,18 +5,26 @@
 
 use std::collections::VecDeque;
 
-use openinfer_core::engine::{FinishReason, GenerateRequest, LoadSnapshot, TokenSink};
+use openinfer_core::engine::FinishReason;
+use openinfer_core::engine::GenerateRequest;
+use openinfer_core::engine::LoadSnapshot;
+use openinfer_core::engine::TokenSink;
 use openinfer_kv_cache::BlockPool;
 use openinfer_sample::SamplingParams;
 
-use crate::model::GLM52_MAX_BATCH_PER_RANK;
-
+use super::ActiveRequest;
+use super::PAGE;
+use super::RankSlots;
 use super::admission::lifetime_blocks;
+use super::admit_from_queue;
 use super::graph::graph_dump_bucket;
+use super::publish_load;
 use super::slot::GLM52_DSPARK_EP8_SPAN_DRAFTS;
-use super::slot::{Glm52SlotState, Glm52StepOutcome};
-use super::testkit::{EOS, request};
-use super::{ActiveRequest, PAGE, RankSlots, admit_from_queue, publish_load};
+use super::slot::Glm52SlotState;
+use super::slot::Glm52StepOutcome;
+use super::testkit::EOS;
+use super::testkit::request;
+use crate::model::GLM52_MAX_BATCH_PER_RANK;
 
 #[test]
 fn graph_dump_uses_a_serving_shape_for_each_topology() {

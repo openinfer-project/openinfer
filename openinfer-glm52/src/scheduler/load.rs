@@ -2,7 +2,8 @@
 
 use std::collections::VecDeque;
 
-use openinfer_core::engine::{GenerateRequest, LoadSnapshot};
+use openinfer_core::engine::GenerateRequest;
+use openinfer_core::engine::LoadSnapshot;
 use openinfer_kv_cache::BlockPool;
 use tokio::sync::watch;
 

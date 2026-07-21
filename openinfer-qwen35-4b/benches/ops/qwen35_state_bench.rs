@@ -1,13 +1,20 @@
-use criterion::{BenchmarkId, Criterion, Throughput};
+use criterion::BenchmarkId;
+use criterion::Criterion;
+use criterion::Throughput;
 use openinfer_core::tensor::DeviceContext;
 use openinfer_qwen35_4b::prefill_buffers::GdrChunkwiseScratch35;
 use openinfer_qwen35_4b::runtime_ops as ops;
 
-use super::common::{
-    QWEN35_4B_LINEAR_K_DIM, QWEN35_4B_LINEAR_K_HEADS, QWEN35_4B_LINEAR_V_DIM,
-    QWEN35_4B_LINEAR_V_HEADS, configure_group, f32_slice, hidden_states, iter_sync,
-    positive_device_vec, zero_f32_slice,
-};
+use super::common::QWEN35_4B_LINEAR_K_DIM;
+use super::common::QWEN35_4B_LINEAR_K_HEADS;
+use super::common::QWEN35_4B_LINEAR_V_DIM;
+use super::common::QWEN35_4B_LINEAR_V_HEADS;
+use super::common::configure_group;
+use super::common::f32_slice;
+use super::common::hidden_states;
+use super::common::iter_sync;
+use super::common::positive_device_vec;
+use super::common::zero_f32_slice;
 
 pub(crate) fn bench_qwen35_state_ops(c: &mut Criterion) {
     // Qwen3.5-4B linear attention: q=16×128, k=16×128, v=32×128

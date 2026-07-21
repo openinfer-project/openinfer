@@ -1,7 +1,8 @@
-use super::Half;
 #[cfg(feature = "qwen35-4b")]
 use cudarc::driver::sys::CUresult;
 use cudarc::driver::sys::CUstream;
+
+use super::Half;
 
 // Qwen3.5-4B private kernels (hybrid linear + HD256 full attention).
 // Sources: csrc/qwen35/*.cu; the *_hd256 paged variants live in csrc/shared/paged_attention.cu.

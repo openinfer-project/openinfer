@@ -2,7 +2,8 @@ use std::path::Path;
 
 use anyhow::Result;
 use clap::Parser;
-use openinfer_sim::{SimulatedEngineConfig, start_engine};
+use openinfer_sim::SimulatedEngineConfig;
+use openinfer_sim::start_engine;
 
 const DEFAULT_MODEL_ID: &str = "Qwen/Qwen3-0.6B";
 

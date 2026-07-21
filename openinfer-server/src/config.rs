@@ -1,8 +1,11 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use anyhow::{Result, bail};
-use clap::{CommandFactory, Parser, ValueEnum};
+use anyhow::Result;
+use anyhow::bail;
+use clap::CommandFactory;
+use clap::Parser;
+use clap::ValueEnum;
 use openinfer::server_engine::ModelType;
 use openinfer::vllm_frontend::LoraModule;
 use openinfer_core::engine::EpBackend;

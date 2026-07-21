@@ -13,7 +13,10 @@
 
 use std::sync::Arc;
 
-use crate::blocks::{BlockId, BlockMetadata, MutableBlock, SequenceHash};
+use crate::blocks::BlockId;
+use crate::blocks::BlockMetadata;
+use crate::blocks::MutableBlock;
+use crate::blocks::SequenceHash;
 use crate::pools::BlockStore;
 
 /// RAII guard for a block in the **Staged** state.

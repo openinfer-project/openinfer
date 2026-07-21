@@ -8,11 +8,12 @@
 
 #![allow(dead_code)]
 
+use std::collections::BTreeMap;
+use std::collections::HashMap;
+
+use super::BlockId;
+use super::InactiveBlock;
 use super::reuse_policy::*;
-
-use std::collections::{BTreeMap, HashMap};
-
-use super::{BlockId, InactiveBlock};
 
 /// Monotonic sequence number used as priority key for FIFO ordering.
 pub type PriorityKey = u64;

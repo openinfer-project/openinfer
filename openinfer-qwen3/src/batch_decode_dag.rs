@@ -9,17 +9,39 @@ use cudarc::driver::CudaSlice;
 use half::bf16;
 use openinfer_core::kv_pool::KvLayout;
 #[cfg(feature = "kernel-call-trace")]
-use openinfer_core::ops::call_spec::{
-    self, PagedDecodeCallSpec, PagedDecodePath, embedding_batch_call,
-    fused_add_rms_norm_batch_call, gemm_call, gemm_rows_call, qk_norm_rope_batch_decode_call,
-    rms_norm_batch_call, silu_mul_fused_batch_call,
-};
+use openinfer_core::ops::call_spec::PagedDecodeCallSpec;
+#[cfg(feature = "kernel-call-trace")]
+use openinfer_core::ops::call_spec::PagedDecodePath;
+#[cfg(feature = "kernel-call-trace")]
+use openinfer_core::ops::call_spec::embedding_batch_call;
+#[cfg(feature = "kernel-call-trace")]
+use openinfer_core::ops::call_spec::fused_add_rms_norm_batch_call;
+#[cfg(feature = "kernel-call-trace")]
+use openinfer_core::ops::call_spec::gemm_call;
+#[cfg(feature = "kernel-call-trace")]
+use openinfer_core::ops::call_spec::gemm_rows_call;
+#[cfg(feature = "kernel-call-trace")]
+use openinfer_core::ops::call_spec::qk_norm_rope_batch_decode_call;
+#[cfg(feature = "kernel-call-trace")]
+use openinfer_core::ops::call_spec::rms_norm_batch_call;
+#[cfg(feature = "kernel-call-trace")]
+use openinfer_core::ops::call_spec::silu_mul_fused_batch_call;
+#[cfg(feature = "kernel-call-trace")]
+use openinfer_core::ops::call_spec::{self};
 #[cfg(feature = "kernel-call-trace")]
 use openinfer_core::ops::call_trace;
-use openinfer_core::tensor::{DeviceMatrix, DeviceVec, HiddenStates};
-use openinfer_kernels::tensor::{AxisTag, Hidden, InDim, Intermediate, QDim, Vocab};
+use openinfer_core::tensor::DeviceMatrix;
+use openinfer_core::tensor::DeviceVec;
+use openinfer_core::tensor::HiddenStates;
+use openinfer_kernels::tensor::AxisTag;
+use openinfer_kernels::tensor::Hidden;
+use openinfer_kernels::tensor::InDim;
+use openinfer_kernels::tensor::Intermediate;
+use openinfer_kernels::tensor::QDim;
+use openinfer_kernels::tensor::Vocab;
 
-use crate::batch_decode_buffers::{BatchDecodeBuffers, DecodeAttentionPath};
+use crate::batch_decode_buffers::BatchDecodeBuffers;
+use crate::batch_decode_buffers::DecodeAttentionPath;
 use crate::weights::Qwen3Model;
 
 #[cfg(feature = "kernel-call-trace")]

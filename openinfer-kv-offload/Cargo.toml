@@ -1,8 +1,8 @@
 [package]
-name = "openinfer-kv-offload"
-license = "Apache-2.0"
-version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
+name = "openinfer-kv-offload"
+version = "0.1.0"
 
 [dependencies]
 # Embedded in-process: pegaflow-core is the host/SSD/RDMA KV offload tier.
@@ -18,11 +18,13 @@ edition = "2024"
 # cuda-12090 + nvrtc + runtime, which covers pegaflow-core and
 # pegaflow-transfer. `rdma` enables pegaflow-transfer: cross-node block fetch
 # (RDMA READ) + MetaServer discovery — the P/D disaggregation data plane.
-pegaflow-core = { git = "https://github.com/novitalabs/pegaflow.git", rev = "1473c5355d879b4fea23101760cb2a0074642ada", default-features = false, features = ["rdma"] }
-openinfer-kv-cache = { workspace = true }
 cudarc = { workspace = true }
 half = { workspace = true }
 log = { workspace = true }
+openinfer-kv-cache = { workspace = true }
+pegaflow-core = { git = "https://github.com/novitalabs/pegaflow.git", rev = "1473c5355d879b4fea23101760cb2a0074642ada", default-features = false, features = [
+  "rdma",
+] }
 tokio = { workspace = true }
 tokio-stream = { workspace = true, features = ["net"] }
 xxhash-rust = { workspace = true }

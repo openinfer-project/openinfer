@@ -1,15 +1,20 @@
-use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
-    fs,
-    path::{Path, PathBuf},
-};
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
+use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
+use std::path::PathBuf;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::ensure;
 use memmap2::Mmap;
-use safetensors::{Dtype, SafeTensors};
+use safetensors::Dtype;
+use safetensors::SafeTensors;
 use serde::Deserialize;
 
-use crate::{Config, ep::ExpertParallelLayout};
+use crate::Config;
+use crate::ep::ExpertParallelLayout;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TensorInfo {
@@ -358,7 +363,8 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
-    use crate::{config::test_lite_config, ep::ExpertParallelConfig};
+    use crate::config::test_lite_config;
+    use crate::ep::ExpertParallelConfig;
 
     #[test]
     fn driver_rank0_load_plan_keeps_routed_experts_rank_local() {

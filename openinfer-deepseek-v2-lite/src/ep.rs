@@ -1,6 +1,7 @@
 use std::ops::Range;
 
-use anyhow::{Result, ensure};
+use anyhow::Result;
+use anyhow::ensure;
 
 use crate::Config;
 

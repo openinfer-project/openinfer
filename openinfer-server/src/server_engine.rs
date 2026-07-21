@@ -1,8 +1,10 @@
-use std::{fmt, path::Path};
+use std::fmt;
+use std::path::Path;
 
-use anyhow::{Context, Result};
-
-pub use openinfer_core::engine::{FinishReason, TokenLogprob};
+use anyhow::Context;
+use anyhow::Result;
+pub use openinfer_core::engine::FinishReason;
+pub use openinfer_core::engine::TokenLogprob;
 
 // ── Model type detection ────────────────────────────────────────────────
 

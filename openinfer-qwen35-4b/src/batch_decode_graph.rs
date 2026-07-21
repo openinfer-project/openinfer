@@ -1,7 +1,6 @@
 //! CUDA Graph state for Qwen3.5 batched decode with bucket padding.
 
 use anyhow::Result;
-
 use openinfer_core::cuda_graph::CudaGraphState;
 use openinfer_core::kv_pool::KvPool;
 use openinfer_core::tensor::DeviceContext;
@@ -9,7 +8,8 @@ use openinfer_core::tensor::DeviceContext;
 use super::config::Config35;
 use super::config::TensorParallelConfig;
 use super::decode_buffers::BatchDecodeBuffers35;
-use super::recurrent_state::{LinearStatePointerTables, RecurrentState};
+use super::recurrent_state::LinearStatePointerTables;
+use super::recurrent_state::RecurrentState;
 
 /// Bucket sizes for CUDA Graph capture. Actual batch is padded to nearest bucket.
 pub(crate) const BATCH_BUCKETS: &[usize] = &[1, 2, 4, 8, 16, 32, 64];

@@ -21,12 +21,18 @@
 //! resurrecting an evicted block from the store's inactive pool through
 //! the registry (slow path).
 
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
+use std::sync::Weak;
 
 use crate::ManagerId;
-use crate::blocks::pin::{LifecyclePin, LifecyclePinRef};
-use crate::blocks::{BlockId, BlockMetadata, BlockRegistrationHandle, SequenceHash};
-use crate::pools::{BlockStore, store::upgrade_or_resurrect};
+use crate::blocks::BlockId;
+use crate::blocks::BlockMetadata;
+use crate::blocks::BlockRegistrationHandle;
+use crate::blocks::SequenceHash;
+use crate::blocks::pin::LifecyclePin;
+use crate::blocks::pin::LifecyclePinRef;
+use crate::pools::BlockStore;
+use crate::pools::store::upgrade_or_resurrect;
 
 /// Internal owner of a registered slot. Every clone of an
 /// [`ImmutableBlock`] shares an `Arc<ImmutableBlockInner<T>>`. When the

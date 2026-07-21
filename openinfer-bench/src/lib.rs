@@ -8,9 +8,15 @@
 //! keeps only its own `measure_*` providers (which call into [`measure_loop`])
 //! and its own schedule walk (which feeds [`accumulate`]).
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::Result;
+use anyhow::anyhow;
+use anyhow::bail;
 use cudarc::driver::sys;
-use openinfer_kernels::tensor::{DeviceContext, DeviceMatrix, GpuWeight, KernelCall, TensorSpec};
+use openinfer_kernels::tensor::DeviceContext;
+use openinfer_kernels::tensor::DeviceMatrix;
+use openinfer_kernels::tensor::GpuWeight;
+use openinfer_kernels::tensor::KernelCall;
+use openinfer_kernels::tensor::TensorSpec;
 use serde::Serialize;
 
 #[derive(Clone, Debug, Serialize)]

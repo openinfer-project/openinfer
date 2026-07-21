@@ -6,12 +6,16 @@
 
 use openinfer_sample::SamplingParams;
 
-use crate::config::GLM52_VOCAB;
-use crate::model::{GLM52_DECODE_BUCKETS, GLM52_MAX_BATCH_PER_RANK, Glm52StepKv, Glm52StepShape};
-use crate::runner::{Glm52RowSample, Glm52StepFlags};
-
+use super::PAGE;
+use super::RankSlots;
 use super::slot::Glm52SlotState;
-use super::{PAGE, RankSlots};
+use crate::config::GLM52_VOCAB;
+use crate::model::GLM52_DECODE_BUCKETS;
+use crate::model::GLM52_MAX_BATCH_PER_RANK;
+use crate::model::Glm52StepKv;
+use crate::model::Glm52StepShape;
+use crate::runner::Glm52RowSample;
+use crate::runner::Glm52StepFlags;
 
 /// Build the all-padding step KV used while pre-capturing graph buckets.
 pub(super) fn padding_step_kv(
@@ -242,7 +246,12 @@ mod tests {
     use super::*;
     use crate::scheduler::ActiveRequest;
     use crate::scheduler::slot::Glm52StepOutcome;
-    use crate::scheduler::testkit::{EOS, commit, request, sampled, state, test_kv};
+    use crate::scheduler::testkit::EOS;
+    use crate::scheduler::testkit::commit;
+    use crate::scheduler::testkit::request;
+    use crate::scheduler::testkit::sampled;
+    use crate::scheduler::testkit::state;
+    use crate::scheduler::testkit::test_kv;
 
     fn shape(bucket: usize, active_rows: usize) -> Glm52StepShape {
         let mut slots = [0u8; GLM52_MAX_BATCH_PER_RANK];

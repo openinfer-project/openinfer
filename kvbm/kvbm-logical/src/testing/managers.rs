@@ -7,7 +7,9 @@ use std::sync::Arc;
 
 use super::metered_tracker::MeteredFrequencyTracker;
 use crate::blocks::BlockMetadata;
-use crate::manager::{BlockManager, BlockManagerConfigBuilder, FrequencyTrackingCapacity};
+use crate::manager::BlockManager;
+use crate::manager::BlockManagerConfigBuilder;
+use crate::manager::FrequencyTrackingCapacity;
 use crate::registry::BlockRegistry;
 
 /// Create a basic test manager with LRU backend.

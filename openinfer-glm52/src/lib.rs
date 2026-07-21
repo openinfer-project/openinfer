@@ -34,30 +34,47 @@ mod scheduler;
 mod scratch;
 mod weights;
 
-use std::{
-    collections::BTreeSet,
-    path::{Path, PathBuf},
-    time::Instant,
-};
+use std::collections::BTreeSet;
+use std::path::Path;
+use std::path::PathBuf;
+use std::time::Instant;
 
-use anyhow::{Context as _, Result, bail, ensure};
+use anyhow::Context as _;
+use anyhow::Result;
+use anyhow::bail;
+use anyhow::ensure;
 use bytesize::ByteSize;
-use openinfer_core::engine::{EngineHandle, KvCapacity, LoadSnapshot};
-use openinfer_kv_offload::{HostConfig, KvArena, OffloadEngine, OffloadHost};
+pub use config::GLM52_DENSE_LAYERS;
+pub use config::GLM52_HIDDEN;
+pub use config::GLM52_INDEX_TOPK;
+pub use config::GLM52_LAYERS;
+pub use config::GLM52_MOE_LAYERS;
+pub use config::GLM52_ROUTED_EXPERTS;
+pub use config::GLM52_TOPK;
+pub use config::GLM52_VOCAB;
+pub use config::probe_config_json;
+use openinfer_core::engine::EngineHandle;
+use openinfer_core::engine::KvCapacity;
+use openinfer_core::engine::LoadSnapshot;
+use openinfer_kv_offload::HostConfig;
+use openinfer_kv_offload::KvArena;
+use openinfer_kv_offload::OffloadEngine;
+use openinfer_kv_offload::OffloadHost;
 use remote::Glm52RemoteNode;
-use runner::{Glm52RankPlacement, Glm52RankWorker, Glm52Worker};
-
 pub use remote::serve_rank_host;
-use tokio::sync::{mpsc, watch};
-use weights::{GLM52_EP_RANKS, Glm52RankLoadBundle, Glm52WeightManifest};
+use runner::Glm52RankPlacement;
+use runner::Glm52RankWorker;
+use runner::Glm52Worker;
+use tokio::sync::mpsc;
+use tokio::sync::watch;
+use weights::GLM52_EP_RANKS;
+use weights::Glm52RankLoadBundle;
+use weights::Glm52WeightManifest;
 
 use crate::config::GLM52_MAX_CONTEXT;
-use crate::model::{GLM52_MODEL_LEN_ALIGN, glm52_arena_bytes, glm52_pool_blocks};
-
-pub use config::{
-    GLM52_DENSE_LAYERS, GLM52_HIDDEN, GLM52_INDEX_TOPK, GLM52_LAYERS, GLM52_MOE_LAYERS,
-    GLM52_ROUTED_EXPERTS, GLM52_TOPK, GLM52_VOCAB, probe_config_json,
-};
+use crate::model::GLM52_MODEL_LEN_ALIGN;
+use crate::model::glm52_arena_bytes;
+use crate::model::glm52_pool_blocks;
 
 /// GLM5.2 parallel shape. EP8 is the production layout today; TP4 is the
 /// GB300 bring-up target.

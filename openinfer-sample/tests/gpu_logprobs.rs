@@ -3,8 +3,12 @@
 
 use half::bf16;
 use openinfer_engine::engine::TokenLogprob;
-use openinfer_kernels::tensor::{DeviceContext, HiddenStates, StreamOverrideGuard};
-use openinfer_sample::{LogprobRequest, token_logprob_from_row, token_logprobs_batch};
+use openinfer_kernels::tensor::DeviceContext;
+use openinfer_kernels::tensor::HiddenStates;
+use openinfer_kernels::tensor::StreamOverrideGuard;
+use openinfer_sample::LogprobRequest;
+use openinfer_sample::token_logprob_from_row;
+use openinfer_sample::token_logprobs_batch;
 
 const TOL: f32 = 5e-5;
 

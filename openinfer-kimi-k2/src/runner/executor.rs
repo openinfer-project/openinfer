@@ -1,12 +1,13 @@
 mod tp1_dp8;
 mod tp8_dp1;
 
+use anyhow::Result;
 pub(super) use tp1_dp8::Tp1Dp8ForwardExecutor;
 pub(super) use tp8_dp1::Tp8Dp1ForwardExecutor;
 
-use anyhow::Result;
-
-use super::worker::{KimiKvStepPages, KimiOneTokenForwardReport, KimiRowOptions};
+use super::worker::KimiKvStepPages;
+use super::worker::KimiOneTokenForwardReport;
+use super::worker::KimiRowOptions;
 
 pub(super) const DP_MAX_BATCH_PER_RANK: usize = 8;
 

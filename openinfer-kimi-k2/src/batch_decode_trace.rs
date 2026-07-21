@@ -1,25 +1,46 @@
-use anyhow::{Result, ensure};
+use anyhow::Result;
+use anyhow::ensure;
 #[cfg(feature = "kernel-call-trace")]
-use openinfer_core::{
-    engine::{EngineLoadOptions, GenerateRequest, TokenEvent, TokenSink},
-    ops::call_trace,
-    sampler::SamplingParams,
-};
-use openinfer_kernels::tensor::{
-    AxisSpec, Bf16, Contiguous1D, F32, HiddenStatesLayout, I32, KernelCall, RowMajor2D, TensorSpec,
-    U32,
-};
+use openinfer_core::engine::EngineLoadOptions;
+#[cfg(feature = "kernel-call-trace")]
+use openinfer_core::engine::GenerateRequest;
+#[cfg(feature = "kernel-call-trace")]
+use openinfer_core::engine::TokenEvent;
+#[cfg(feature = "kernel-call-trace")]
+use openinfer_core::engine::TokenSink;
+#[cfg(feature = "kernel-call-trace")]
+use openinfer_core::ops::call_trace;
+#[cfg(feature = "kernel-call-trace")]
+use openinfer_core::sampler::SamplingParams;
+use openinfer_kernels::ops::KIMI_K2_EXPERT_INTERMEDIATE;
+use openinfer_kernels::ops::KIMI_K2_MLA_ABS_Q_LOCAL_OUT_TP8;
+use openinfer_kernels::ops::KIMI_K2_MLA_KV_B_LOCAL_OUT_TP8;
+use openinfer_kernels::ops::KIMI_K2_MLA_KV_LORA_RANK;
+use openinfer_kernels::ops::KIMI_K2_MLA_O_LOCAL_IN_TP8;
+use openinfer_kernels::ops::KIMI_K2_MLA_Q_LOCAL_OUT_TP8;
+use openinfer_kernels::ops::KIMI_K2_MLA_Q_PE_LOCAL_OUT_TP8;
+use openinfer_kernels::ops::KIMI_K2_MLA_QKV_A_OUT;
+use openinfer_kernels::ops::KIMI_K2_MLA_ROPE_DIM;
+use openinfer_kernels::ops::KIMI_K2_ROUTER_SCALE;
+use openinfer_kernels::tensor::AxisSpec;
+use openinfer_kernels::tensor::Bf16;
+use openinfer_kernels::tensor::Contiguous1D;
+use openinfer_kernels::tensor::F32;
+use openinfer_kernels::tensor::HiddenStatesLayout;
+use openinfer_kernels::tensor::I32;
+use openinfer_kernels::tensor::KernelCall;
+use openinfer_kernels::tensor::RowMajor2D;
+use openinfer_kernels::tensor::TensorSpec;
+use openinfer_kernels::tensor::U32;
 
-use crate::config::{
-    KIMI_K2_DENSE_INTERMEDIATE, KIMI_K2_HIDDEN, KIMI_K2_LAYERS, KIMI_K2_MOE_LAYERS,
-    KIMI_K2_Q_LORA_RANK, KIMI_K2_ROUTED_EXPERTS, KIMI_K2_TOPK, KIMI_K2_VOCAB,
-};
-use openinfer_kernels::ops::{
-    KIMI_K2_EXPERT_INTERMEDIATE, KIMI_K2_MLA_ABS_Q_LOCAL_OUT_TP8, KIMI_K2_MLA_KV_B_LOCAL_OUT_TP8,
-    KIMI_K2_MLA_KV_LORA_RANK, KIMI_K2_MLA_O_LOCAL_IN_TP8, KIMI_K2_MLA_Q_LOCAL_OUT_TP8,
-    KIMI_K2_MLA_Q_PE_LOCAL_OUT_TP8, KIMI_K2_MLA_QKV_A_OUT, KIMI_K2_MLA_ROPE_DIM,
-    KIMI_K2_ROUTER_SCALE,
-};
+use crate::config::KIMI_K2_DENSE_INTERMEDIATE;
+use crate::config::KIMI_K2_HIDDEN;
+use crate::config::KIMI_K2_LAYERS;
+use crate::config::KIMI_K2_MOE_LAYERS;
+use crate::config::KIMI_K2_Q_LORA_RANK;
+use crate::config::KIMI_K2_ROUTED_EXPERTS;
+use crate::config::KIMI_K2_TOPK;
+use crate::config::KIMI_K2_VOCAB;
 
 pub const MODEL: &str = "kimi-k2";
 pub const PHASE_DECODE: &str = "decode";

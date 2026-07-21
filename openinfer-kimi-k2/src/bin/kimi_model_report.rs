@@ -1,18 +1,34 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 
-use anyhow::{Context, Result, bail};
-use clap::{Parser, ValueEnum};
-use openinfer_bench::{Accum, CallSiteRow, RollupRow, accumulate, call_site_row, rollup_row};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::bail;
+use clap::Parser;
+use clap::ValueEnum;
+use openinfer_bench::Accum;
+use openinfer_bench::CallSiteRow;
+use openinfer_bench::RollupRow;
+use openinfer_bench::accumulate;
+use openinfer_bench::call_site_row;
+use openinfer_bench::rollup_row;
 use openinfer_kernels::ops::KIMI_K2_EP_WORLD;
 use openinfer_kernels::tensor::KernelCall;
 use openinfer_kimi_k2::KIMI_K2_LAYERS;
-use openinfer_kimi_k2::batch_decode_trace::{
-    MODEL, PHASE_DECODE, TP_WORLD_SIZE, normalize_call_site, trace_decode_kernel_calls,
-    trace_runtime_decode_kernel_calls,
-};
-use openinfer_kimi_k2::kernel_report::{LatencyStats, MeasuredCall, bench_key, measure_call};
+use openinfer_kimi_k2::batch_decode_trace::MODEL;
+use openinfer_kimi_k2::batch_decode_trace::PHASE_DECODE;
+use openinfer_kimi_k2::batch_decode_trace::TP_WORLD_SIZE;
+use openinfer_kimi_k2::batch_decode_trace::normalize_call_site;
+use openinfer_kimi_k2::batch_decode_trace::trace_decode_kernel_calls;
+use openinfer_kimi_k2::batch_decode_trace::trace_runtime_decode_kernel_calls;
+use openinfer_kimi_k2::kernel_report::LatencyStats;
+use openinfer_kimi_k2::kernel_report::MeasuredCall;
+use openinfer_kimi_k2::kernel_report::bench_key;
+use openinfer_kimi_k2::kernel_report::measure_call;
 use serde::Serialize;
 
 const DEFAULT_ITERS: u64 = 16;

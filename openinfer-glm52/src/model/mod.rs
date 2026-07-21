@@ -16,38 +16,60 @@
 //! row count, and the per-bucket fixed row count keeps every step's kernel
 //! shapes identical within a bucket (the whole-step CUDA graphs' contract).
 
-use anyhow::{Context as _, Result, ensure};
-use cudarc::driver::{CudaSlice, CudaStream, DevicePtr as _, PinnedHostSlice};
+use anyhow::Context as _;
+use anyhow::Result;
+use anyhow::ensure;
+use cudarc::driver::CudaSlice;
+use cudarc::driver::CudaStream;
+use cudarc::driver::DevicePtr as _;
+use cudarc::driver::PinnedHostSlice;
 use half::bf16;
 use openinfer_core::cuda_graph::CudaGraphDumpSummary;
 use openinfer_core::cuda_graph::CudaGraphState;
-use openinfer_kernels::ops::{
-    GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN, GLM52_FLASHMLA_SPARSE_PAGE_SIZE,
-    GLM52_FLASHMLA_SPARSE_TOPK, GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW, GLM52_MLA_CACHE_BYTES,
-    Glm52FlashMlaSparseDecode, Glm52IndexerCacheLayout, Glm52VllmFixupKind, embedding_rows_into,
-    glm52_flashmla_sparse_decode_num_sm_parts, glm52_fp8_weight_only_gemv_launch,
-    glm52_vllm_rope_fixup_launch,
-};
-use openinfer_kernels::tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStatesRef};
+use openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN;
+use openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_PAGE_SIZE;
+use openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_TOPK;
+use openinfer_kernels::ops::GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW;
+use openinfer_kernels::ops::GLM52_MLA_CACHE_BYTES;
+use openinfer_kernels::ops::Glm52FlashMlaSparseDecode;
+use openinfer_kernels::ops::Glm52IndexerCacheLayout;
+use openinfer_kernels::ops::Glm52VllmFixupKind;
+use openinfer_kernels::ops::embedding_rows_into;
+use openinfer_kernels::ops::glm52_flashmla_sparse_decode_num_sm_parts;
+use openinfer_kernels::ops::glm52_fp8_weight_only_gemv_launch;
+use openinfer_kernels::ops::glm52_vllm_rope_fixup_launch;
+use openinfer_kernels::tensor::DeviceContext;
+use openinfer_kernels::tensor::DeviceMatrix;
+use openinfer_kernels::tensor::DeviceVec;
+use openinfer_kernels::tensor::HiddenStatesRef;
 use openinfer_kv_offload::KvArena;
-use openinfer_sample::{
-    BatchSamplingRow, BatchSamplingScratch, effectively_greedy, gpu_sample_batch_into, mix_seed,
-};
+use openinfer_sample::BatchSamplingRow;
+use openinfer_sample::BatchSamplingScratch;
+use openinfer_sample::effectively_greedy;
+use openinfer_sample::gpu_sample_batch_into;
+use openinfer_sample::mix_seed;
 
 use crate::bookend::glm52_lm_head_into;
-use crate::config::{
-    GLM52_HIDDEN, GLM52_INDEX_HEAD_DIM, GLM52_INDEX_TOPK, GLM52_LAYERS, GLM52_ROPE_HALF,
-    GLM52_SM_SCALE, GLM52_VOCAB, glm52_layer_has_full_indexer,
-};
+use crate::config::GLM52_HIDDEN;
+use crate::config::GLM52_INDEX_HEAD_DIM;
+use crate::config::GLM52_INDEX_TOPK;
+use crate::config::GLM52_LAYERS;
+use crate::config::GLM52_ROPE_HALF;
+use crate::config::GLM52_SM_SCALE;
+use crate::config::GLM52_VOCAB;
+use crate::config::glm52_layer_has_full_indexer;
 use crate::indexer::Glm52IndexerScratch;
-use crate::layer::{Glm52DecodeStep, Glm52DecoderLayerWeights, Glm52LayerCaches};
-use crate::mla_decode::{
-    Glm52MlaSchedMetadata, glm52_mla_backend_preflight, glm52_select_mla_backend,
-};
+use crate::layer::Glm52DecodeStep;
+use crate::layer::Glm52DecoderLayerWeights;
+use crate::layer::Glm52LayerCaches;
+use crate::mla_decode::Glm52MlaSchedMetadata;
+use crate::mla_decode::glm52_mla_backend_preflight;
+use crate::mla_decode::glm52_select_mla_backend;
 use crate::moe_ep_wo::Glm52MoeEpState;
 use crate::moe_tp::Glm52MoeTpRank;
 use crate::scratch::Glm52DecodeScratch;
-use crate::weights::{Glm52RankGpuWeights, retype_owned};
+use crate::weights::Glm52RankGpuWeights;
+use crate::weights::retype_owned;
 
 mod build;
 mod launch_ahead;

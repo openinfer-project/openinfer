@@ -2,12 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 [package]
-name = "kvbm-logical"
-version = "1.2.0"
-edition.workspace = true
 authors.workspace = true
+edition.workspace = true
 license.workspace = true
+name = "kvbm-logical"
 repository.workspace = true
+version = "1.2.0"
 
 [dependencies]
 dashmap = { workspace = true }
@@ -15,8 +15,8 @@ dynamo-tokens = { workspace = true }
 
 anyhow = { workspace = true }
 async-stream = "0.3"
-bytes = "1.10"
 bincode = { version = "2.0.1", features = ["serde", "derive"] }
+bytes = "1.10"
 derive_builder = { workspace = true }
 futures = { workspace = true }
 indexmap = { workspace = true }
@@ -53,6 +53,6 @@ tracing-subscriber = { workspace = true }
 # Criterion benchmark for the match_blocks / acquire hot path. Needs the
 # `testing` feature for src/testing/ helpers (create_test_manager, etc.).
 [[bench]]
-name = "block_manager"
 harness = false
+name = "block_manager"
 required-features = ["testing"]

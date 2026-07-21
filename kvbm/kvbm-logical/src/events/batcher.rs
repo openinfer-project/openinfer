@@ -14,7 +14,10 @@ use futures::Stream;
 use futures::StreamExt;
 use tokio::pin;
 
-use super::protocol::{InstanceId, KvCacheEvent, KvCacheEvents, KvbmCacheEvents};
+use super::protocol::InstanceId;
+use super::protocol::KvCacheEvent;
+use super::protocol::KvCacheEvents;
+use super::protocol::KvbmCacheEvents;
 use crate::SequenceHash;
 
 /// Configuration for event batching.
@@ -224,10 +227,11 @@ impl EventBatcher {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::KvbmSequenceHashProvider;
     use dynamo_tokens::TokenBlockSequence;
     use futures::stream;
+
+    use super::*;
+    use crate::KvbmSequenceHashProvider;
 
     fn create_seq_hash_at_position(position: usize) -> SequenceHash {
         let tokens_per_block = 4;

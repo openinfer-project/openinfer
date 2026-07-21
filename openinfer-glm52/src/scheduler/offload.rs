@@ -11,13 +11,22 @@
 //! guarantees offload implies the prefix cache is on.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::Context as _;
 use openinfer_core::engine::GenerateRequest;
-use openinfer_kv_cache::{BlockPool, KvBlockGuard, PrefixProbe, RequestKv};
-use openinfer_kv_offload::{OffloadEngine, QueryOutcome, VLLM_HASH_BYTES, VllmBlockHasher};
+use openinfer_kv_cache::BlockPool;
+use openinfer_kv_cache::KvBlockGuard;
+use openinfer_kv_cache::PrefixProbe;
+use openinfer_kv_cache::RequestKv;
+use openinfer_kv_offload::OffloadEngine;
+use openinfer_kv_offload::QueryOutcome;
+use openinfer_kv_offload::VLLM_HASH_BYTES;
+use openinfer_kv_offload::VllmBlockHasher;
 
 use super::PAGE;
 

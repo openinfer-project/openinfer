@@ -5,7 +5,8 @@
 
 use openinfer_core::engine::FinishReason;
 
-use crate::dspark::{GLM52_DSPARK_DRAFTS, accept_prefix_match};
+use crate::dspark::GLM52_DSPARK_DRAFTS;
+use crate::dspark::accept_prefix_match;
 
 /// What a rank forwards this step. Idle rows feed the padding input; their
 /// KV/index-cache writes land in the pool's reserved padding page, which no
@@ -312,7 +313,9 @@ impl SpecStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scheduler::testkit::{EOS, commit, state};
+    use crate::scheduler::testkit::EOS;
+    use crate::scheduler::testkit::commit;
+    use crate::scheduler::testkit::state;
 
     #[test]
     fn prefill_rides_decode_then_emits() {

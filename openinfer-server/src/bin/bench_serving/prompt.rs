@@ -2,9 +2,12 @@
 
 use std::fs;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::ensure;
+use rand::RngExt;
+use rand::SeedableRng;
 use rand::rngs::StdRng;
-use rand::{RngExt, SeedableRng};
 use vllm_text::tokenizer::DynTokenizer;
 
 use crate::cli::PromptInputArgs;

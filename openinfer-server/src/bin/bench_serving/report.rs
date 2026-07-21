@@ -1,6 +1,7 @@
 //! Serializable report and metric types emitted by the benchmark runners.
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct RunInfo {

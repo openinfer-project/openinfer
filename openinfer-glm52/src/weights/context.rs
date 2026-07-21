@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
-use anyhow::{Context, Result, ensure};
-use cudarc::driver::{CudaContext, CudaStream};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::ensure;
+use cudarc::driver::CudaContext;
+use cudarc::driver::CudaStream;
 
 #[derive(Clone)]
 pub(crate) struct Glm52RankGpuContext {

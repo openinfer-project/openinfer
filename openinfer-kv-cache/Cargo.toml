@@ -1,16 +1,16 @@
 [package]
-name = "openinfer-kv-cache"
-license = "Apache-2.0"
-version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
+name = "openinfer-kv-cache"
+version = "0.1.0"
 
 [dependencies]
-openinfer-kernels = { workspace = true }
-kvbm-logical = { workspace = true }
-dynamo-kv-hashing = { workspace = true }
 anyhow = { workspace = true }
 cudarc = { workspace = true }
+dynamo-kv-hashing = { workspace = true }
 half = { workspace = true }
+kvbm-logical = { workspace = true }
+openinfer-kernels = { workspace = true }
 tokio = { workspace = true }
 
 [lints]

@@ -21,8 +21,12 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use openinfer_core::sampler::SamplingParams;
-use openinfer_qwen3::runtime::{PrefillPlan, PrefillStepItem, Qwen3Executor, RequestId};
-use openinfer_qwen3::{Qwen3LoraOptions, Qwen3OffloadOptions};
+use openinfer_qwen3::Qwen3LoraOptions;
+use openinfer_qwen3::Qwen3OffloadOptions;
+use openinfer_qwen3::runtime::PrefillPlan;
+use openinfer_qwen3::runtime::PrefillStepItem;
+use openinfer_qwen3::runtime::Qwen3Executor;
+use openinfer_qwen3::runtime::RequestId;
 
 const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3-4B");
 const BLOCK: usize = 16;

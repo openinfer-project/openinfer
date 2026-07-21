@@ -23,19 +23,30 @@ use std::path::Path;
 
 use anyhow::Result;
 #[cfg(feature = "deepseek-v2-lite")]
-use openinfer_engine::engine::EpBackend;
-use openinfer_engine::engine::{EngineHandle, EngineLoadOptions};
-
+pub use attribution::CallSiteRollup;
 #[cfg(feature = "deepseek-v2-lite")]
-pub use attribution::{CallSiteRollup, DecodeAttributionProfile, SectionRollup, SectionSample};
+pub use attribution::DecodeAttributionProfile;
+#[cfg(feature = "deepseek-v2-lite")]
+pub use attribution::SectionRollup;
+#[cfg(feature = "deepseek-v2-lite")]
+pub use attribution::SectionSample;
 pub use config::Config;
 use config::SUPPORTED_HIDDEN_SIZE;
 use ep::SUPPORTED_ROUTED_EXPERTS;
+use openinfer_engine::engine::EngineHandle;
+use openinfer_engine::engine::EngineLoadOptions;
 #[cfg(feature = "deepseek-v2-lite")]
-pub use runtime::{
-    BatchedGenerationResult, DecodeGraphReadinessReport, DeepSeekV2LiteEp2Generator,
-    GenerationResult, GenerationStats,
-};
+use openinfer_engine::engine::EpBackend;
+#[cfg(feature = "deepseek-v2-lite")]
+pub use runtime::BatchedGenerationResult;
+#[cfg(feature = "deepseek-v2-lite")]
+pub use runtime::DecodeGraphReadinessReport;
+#[cfg(feature = "deepseek-v2-lite")]
+pub use runtime::DeepSeekV2LiteEp2Generator;
+#[cfg(feature = "deepseek-v2-lite")]
+pub use runtime::GenerationResult;
+#[cfg(feature = "deepseek-v2-lite")]
+pub use runtime::GenerationStats;
 
 pub fn probe_config_json(json: &serde_json::Value) -> Result<bool> {
     let Some(model_type) = json.get("model_type").and_then(serde_json::Value::as_str) else {

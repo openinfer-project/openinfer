@@ -2,10 +2,16 @@
 //! param-mix points. Greedy is the batched argmax floor; sampling is the
 //! FlashInfer pass; mixed is the common serving case. Requires a GPU.
 
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::BenchmarkId;
+use criterion::Criterion;
+use criterion::criterion_group;
+use criterion::criterion_main;
 use half::bf16;
-use openinfer_kernels::tensor::{DeviceContext, HiddenStates};
-use openinfer_sample::{SampleScratch, SamplingParams, select_batch};
+use openinfer_kernels::tensor::DeviceContext;
+use openinfer_kernels::tensor::HiddenStates;
+use openinfer_sample::SampleScratch;
+use openinfer_sample::SamplingParams;
+use openinfer_sample::select_batch;
 
 fn arena(ctx: &DeviceContext, vocab: usize, batch: usize) -> HiddenStates {
     let mut hs = HiddenStates::zeros(ctx, vocab, batch).unwrap();

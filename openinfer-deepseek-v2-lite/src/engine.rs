@@ -1,11 +1,15 @@
-use std::{path::Path, time::Instant};
+use std::path::Path;
+use std::time::Instant;
 
-use anyhow::{Context, Result};
+use anyhow::Context;
+use anyhow::Result;
 use log::info;
-use openinfer_engine::engine::{EngineHandle, EngineLoadOptions};
+use openinfer_engine::engine::EngineHandle;
+use openinfer_engine::engine::EngineLoadOptions;
 use tokio::sync::mpsc;
 
-use crate::{runtime::DeepSeekV2LiteEp2Generator, scheduler::MixedRequestScheduler};
+use crate::runtime::DeepSeekV2LiteEp2Generator;
+use crate::scheduler::MixedRequestScheduler;
 
 pub(crate) fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<EngineHandle> {
     let started = Instant::now();

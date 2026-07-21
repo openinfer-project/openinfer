@@ -10,9 +10,9 @@
 #![cfg(feature = "glm52")]
 
 use half::bf16;
-use openinfer_kernels::ops::{
-    GLM52_TP_HIDDEN, glm52_vocab_parallel_pack_launch, glm52_vocab_parallel_unpack_launch,
-};
+use openinfer_kernels::ops::GLM52_TP_HIDDEN;
+use openinfer_kernels::ops::glm52_vocab_parallel_pack_launch;
+use openinfer_kernels::ops::glm52_vocab_parallel_unpack_launch;
 use openinfer_kernels::tensor::DeviceContext;
 
 const RANKS: usize = 4;

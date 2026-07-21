@@ -101,12 +101,16 @@
 //! | `is_complete()`           | `generated_tokens >= max_output_tokens`         |
 //! | `new_tokens_for_prefill()`| Tokens not covered by cache hits               |
 
-use crate::KvbmSequenceHashProvider;
-use crate::blocks::{BlockMetadata, ImmutableBlock};
-use crate::manager::BlockManager;
-use crate::sequence::{BlockSequence, LogicalBlockAssignmentError, LogicalBlockAssignments};
+use dynamo_tokens::SaltHash;
+use dynamo_tokens::Token;
 
-use dynamo_tokens::{SaltHash, Token};
+use crate::KvbmSequenceHashProvider;
+use crate::blocks::BlockMetadata;
+use crate::blocks::ImmutableBlock;
+use crate::manager::BlockManager;
+use crate::sequence::BlockSequence;
+use crate::sequence::LogicalBlockAssignmentError;
+use crate::sequence::LogicalBlockAssignments;
 
 /// Manages a request's block lifecycle through direct RAII integration with
 /// [`BlockManager`], bypassing the `MoveBlock` signal protocol.
@@ -562,7 +566,8 @@ impl<T: BlockMetadata> std::fmt::Debug for RequestSequence<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{TestMeta, create_test_manager};
+    use crate::testing::TestMeta;
+    use crate::testing::create_test_manager;
 
     const BLOCK_SIZE: u32 = 4;
 

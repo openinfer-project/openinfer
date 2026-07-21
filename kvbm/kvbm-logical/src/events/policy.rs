@@ -91,9 +91,11 @@ impl EventEmissionPolicy for AllEventsPolicy {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::{KvbmSequenceHashProvider, SequenceHash};
     use dynamo_tokens::TokenBlockSequence;
+
+    use super::*;
+    use crate::KvbmSequenceHashProvider;
+    use crate::SequenceHash;
 
     fn create_seq_hash_at_position(position: usize) -> SequenceHash {
         // Create a sequence with enough blocks to reach the desired position

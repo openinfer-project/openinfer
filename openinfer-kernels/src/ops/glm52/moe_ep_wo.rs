@@ -5,14 +5,17 @@
 //! W2 writes straight into the aligned slots `decode_combine` addresses.
 //! See `csrc/glm52/glm52_moe_ep_wo.cu`.
 
-use anyhow::{Result, anyhow, ensure};
-use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
+use anyhow::Result;
+use anyhow::anyhow;
+use anyhow::ensure;
+use cudarc::driver::CudaSlice;
+use cudarc::driver::DevicePtr;
+use cudarc::driver::DevicePtrMut;
 use half::bf16;
 
+use super::deepgemm_grouped::Glm52DeepGemmGroupedFp8Kind;
 use crate::ffi;
 use crate::tensor::DeviceContext;
-
-use super::deepgemm_grouped::Glm52DeepGemmGroupedFp8Kind;
 
 /// Aligned rows per work tile (8 | 64 = the DeepEP expert alignment, so a
 /// tile never straddles an expert segment).

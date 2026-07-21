@@ -1,5 +1,6 @@
 use anyhow::Result;
-use openinfer_core::tensor::{DeviceContext, HiddenStates};
+use openinfer_core::tensor::DeviceContext;
+use openinfer_core::tensor::HiddenStates;
 
 pub(crate) fn snapshot_requested_logprobs(
     ctx: &DeviceContext,

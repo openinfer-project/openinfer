@@ -1,10 +1,14 @@
-use anyhow::{Result, anyhow, ensure};
-use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
+use anyhow::Result;
+use anyhow::anyhow;
+use anyhow::ensure;
+use cudarc::driver::CudaSlice;
+use cudarc::driver::DevicePtr;
+use cudarc::driver::DevicePtrMut;
 
+use super::moe_tp::GLM52_TP_HIDDEN;
+use super::moe_tp::GLM52_TP_MAX_RANKS;
 use crate::ffi;
 use crate::tensor::DeviceContext;
-
-use super::moe_tp::{GLM52_TP_HIDDEN, GLM52_TP_MAX_RANKS};
 
 const VOCAB_CANDIDATE_FIELDS: usize = 4;
 

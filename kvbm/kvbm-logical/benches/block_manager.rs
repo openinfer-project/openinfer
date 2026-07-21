@@ -20,14 +20,19 @@
 //!
 //! Run: `cargo bench -p kvbm-logical --features testing`
 
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
-
+use criterion::BenchmarkId;
+use criterion::Criterion;
+use criterion::black_box;
+use criterion::criterion_group;
+use criterion::criterion_main;
 use kvbm_logical::BlockManager;
 use kvbm_logical::KvbmSequenceHashProvider;
 use kvbm_logical::SequenceHash;
 use kvbm_logical::blocks::ImmutableBlock;
-use kvbm_logical::manager::{BlockManagerConfigBuilder, LineageEviction};
-use kvbm_logical::testing::{TestMeta, create_test_manager_with_backend};
+use kvbm_logical::manager::BlockManagerConfigBuilder;
+use kvbm_logical::manager::LineageEviction;
+use kvbm_logical::testing::TestMeta;
+use kvbm_logical::testing::create_test_manager_with_backend;
 
 const BLOCK_SIZE: u32 = 4; // `create_test_manager_with_backend` builds 4-token blocks.
 const SIZES: [usize; 3] = [8, 32, 128];

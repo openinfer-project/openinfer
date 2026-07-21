@@ -10,32 +10,45 @@ mod kv_events;
 mod plan;
 mod resolve;
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::path::Path;
 use std::thread;
 
 use anyhow::Result;
-use log::{debug, info, warn};
+use log::debug;
+use log::info;
+use log::warn;
+use openinfer_core::engine::EngineCommand;
+use openinfer_core::engine::EngineControlRequest;
+use openinfer_core::engine::EngineHandle;
+use openinfer_core::engine::GenerateRequest;
+use openinfer_core::engine::KvCapacity;
+use openinfer_core::engine::LoadSnapshot;
+use openinfer_core::engine::TokenEvent;
+use openinfer_core::engine::TokenSink;
+use openinfer_core::sampler::SamplingParams;
+use openinfer_kernels::ops::NumericPolicy;
+use openinfer_kernels::ops::numeric_policy;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use tokio::sync::{mpsc, watch};
-
-use crate::executor::{ModelExecutor, Qwen3Executor, RequestId};
-use crate::weights::Qwen3MemoryOptions;
-use crate::{Qwen3LoraOptions, Qwen3OffloadOptions};
-use openinfer_core::engine::{
-    EngineCommand, EngineControlRequest, EngineHandle, GenerateRequest, KvCapacity, LoadSnapshot,
-    TokenEvent, TokenSink,
-};
-use openinfer_core::sampler::SamplingParams;
-use openinfer_kernels::ops::{NumericPolicy, numeric_policy};
+use tokio::sync::mpsc;
+use tokio::sync::watch;
 
 use self::effects::apply_effects;
 use self::kv_events::KvEventProducer;
-use self::plan::{
-    ExecutionArtifacts, ExecutionPlan, build_next_plan, execute_plan, should_speculative_decode,
-};
+use self::plan::ExecutionArtifacts;
+use self::plan::ExecutionPlan;
+use self::plan::build_next_plan;
+use self::plan::execute_plan;
+use self::plan::should_speculative_decode;
 use self::resolve::resolve_step;
+use crate::Qwen3LoraOptions;
+use crate::Qwen3OffloadOptions;
+use crate::executor::ModelExecutor;
+use crate::executor::Qwen3Executor;
+use crate::executor::RequestId;
+use crate::weights::Qwen3MemoryOptions;
 
 // ── Internal types ──────────────────────────────────────────────────────
 

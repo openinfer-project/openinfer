@@ -1,9 +1,17 @@
-use anyhow::{Result, bail, ensure};
-use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
+use anyhow::Result;
+use anyhow::bail;
+use anyhow::ensure;
+use cudarc::driver::CudaSlice;
+use cudarc::driver::DevicePtr;
+use cudarc::driver::DevicePtrMut;
 use half::bf16;
 
 use crate::ffi;
-use crate::tensor::{AxisSpec, DeviceContext, GpuTensor, KernelCall, TensorSpec};
+use crate::tensor::AxisSpec;
+use crate::tensor::DeviceContext;
+use crate::tensor::GpuTensor;
+use crate::tensor::KernelCall;
+use crate::tensor::TensorSpec;
 
 pub const KIMI_K2_HIDDEN: usize = 7168;
 pub const KIMI_K2_EXPERT_INTERMEDIATE: usize = 2048;

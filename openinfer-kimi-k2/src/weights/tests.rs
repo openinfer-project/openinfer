@@ -1,13 +1,20 @@
-use super::*;
-use super::{
-    load::{KimiTensorLoadSlice, KimiTensorLoadSpec, sliced_tensor_bytes},
-    manifest::{
-        KimiAttentionManifest, KimiDenseMlpManifest, KimiInt4ProjectionManifest,
-        KimiK2WeightManifest, KimiLayerKindManifest, KimiLayerManifest, KimiMoeLayerManifest,
-        KimiRoutedExpertManifest, KimiRouterManifest, KimiSharedExpertManifest, KimiTensorEntry,
-    },
-};
 use serde_json::json;
+
+use super::load::KimiTensorLoadSlice;
+use super::load::KimiTensorLoadSpec;
+use super::load::sliced_tensor_bytes;
+use super::manifest::KimiAttentionManifest;
+use super::manifest::KimiDenseMlpManifest;
+use super::manifest::KimiInt4ProjectionManifest;
+use super::manifest::KimiK2WeightManifest;
+use super::manifest::KimiLayerKindManifest;
+use super::manifest::KimiLayerManifest;
+use super::manifest::KimiMoeLayerManifest;
+use super::manifest::KimiRoutedExpertManifest;
+use super::manifest::KimiRouterManifest;
+use super::manifest::KimiSharedExpertManifest;
+use super::manifest::KimiTensorEntry;
+use super::*;
 
 #[test]
 fn rank_tensor_names_filter_local_experts() {

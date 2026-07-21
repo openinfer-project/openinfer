@@ -3,14 +3,18 @@ use anyhow::Result;
 #[cfg(feature = "kernel-call-trace")]
 use openinfer_core::ops::call_trace;
 #[cfg(feature = "kernel-call-trace")]
-use openinfer_kernels::ops::{NumericPolicy, numeric_policy};
+use openinfer_kernels::ops::NumericPolicy;
+#[cfg(feature = "kernel-call-trace")]
+use openinfer_kernels::ops::numeric_policy;
 #[cfg(feature = "kernel-call-trace")]
 use openinfer_kernels::tensor::KernelCall;
 
 #[cfg(feature = "kernel-call-trace")]
 use crate::batch_decode_buffers::BatchDecodeBuffers;
 #[cfg(feature = "kernel-call-trace")]
-use crate::weights::{ModelRuntimeConfig, Qwen3Model};
+use crate::weights::ModelRuntimeConfig;
+#[cfg(feature = "kernel-call-trace")]
+use crate::weights::Qwen3Model;
 
 pub const MODEL: &str = "qwen3";
 pub const PHASE_DECODE: &str = "decode";

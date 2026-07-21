@@ -18,13 +18,19 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use openinfer_core::engine::{LoadLoraAdapterRequest, TokenLogprob};
+use openinfer_core::engine::LoadLoraAdapterRequest;
+use openinfer_core::engine::TokenLogprob;
 use openinfer_core::sampler::SamplingParams;
-use openinfer_qwen3::lora_fixtures::{self as fixtures, FixtureTensor};
-use openinfer_qwen3::runtime::{
-    DecodePlan, DecodeStepItem, PrefillPlan, PrefillStepItem, Qwen3Executor, RequestId,
-};
-use safetensors::{Dtype, SafeTensors};
+use openinfer_qwen3::lora_fixtures::FixtureTensor;
+use openinfer_qwen3::lora_fixtures::{self as fixtures};
+use openinfer_qwen3::runtime::DecodePlan;
+use openinfer_qwen3::runtime::DecodeStepItem;
+use openinfer_qwen3::runtime::PrefillPlan;
+use openinfer_qwen3::runtime::PrefillStepItem;
+use openinfer_qwen3::runtime::Qwen3Executor;
+use openinfer_qwen3::runtime::RequestId;
+use safetensors::Dtype;
+use safetensors::SafeTensors;
 
 const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3-4B");
 const GOLDEN: &str = concat!(

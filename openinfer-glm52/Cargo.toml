@@ -1,9 +1,9 @@
 [package]
-name = "openinfer-glm52"
-license = "Apache-2.0"
-version = "0.1.0"
-edition = "2024"
 autobenches = false
+edition = "2024"
+license = "Apache-2.0"
+name = "openinfer-glm52"
+version = "0.1.0"
 
 [dependencies]
 anyhow = { workspace = true }

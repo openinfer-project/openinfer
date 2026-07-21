@@ -1,8 +1,12 @@
 //! GLM5.2 weight-only FP8 GEMV and bf16 SwiGLU helpers used by dense,
 //! attention, indexer, and shared-expert projections.
 
-use anyhow::{Result, anyhow, ensure};
-use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
+use anyhow::Result;
+use anyhow::anyhow;
+use anyhow::ensure;
+use cudarc::driver::CudaSlice;
+use cudarc::driver::DevicePtr;
+use cudarc::driver::DevicePtrMut;
 use half::bf16;
 
 use crate::ffi;

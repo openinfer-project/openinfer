@@ -1,22 +1,32 @@
-use anyhow::{Context, Result, ensure};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::ensure;
 use half::bf16;
-use openinfer_core::{
-    ops,
-    tensor::{DeviceVec, HiddenStates},
-};
+use openinfer_core::ops;
+use openinfer_core::tensor::DeviceVec;
+use openinfer_core::tensor::HiddenStates;
 
-use super::{DeepSeekV2LiteEp2Generator, backend::EpBackendKind, types::GenerationStats};
-use crate::{
-    attribution::DecodeAttributionProfile,
-    device::activate,
-    host_ops::{
-        DecodeCache, LayerCache, append_kv_and_build_queries,
-        append_kv_and_build_queries_decode_batch, compute_attention_host,
-        compute_attention_host_decode_batch, hidden_from_bf16_host, hidden_from_f32_host,
-        hidden_to_f32, normalize_compressed_kv, rms_norm_hidden_host, rms_norm_host,
-    },
-    model::{AttentionWeights, MlpWeights, dense_mlp_forward, dense_mlp_forward_per_token},
-};
+use super::DeepSeekV2LiteEp2Generator;
+use super::backend::EpBackendKind;
+use super::types::GenerationStats;
+use crate::attribution::DecodeAttributionProfile;
+use crate::device::activate;
+use crate::host_ops::DecodeCache;
+use crate::host_ops::LayerCache;
+use crate::host_ops::append_kv_and_build_queries;
+use crate::host_ops::append_kv_and_build_queries_decode_batch;
+use crate::host_ops::compute_attention_host;
+use crate::host_ops::compute_attention_host_decode_batch;
+use crate::host_ops::hidden_from_bf16_host;
+use crate::host_ops::hidden_from_f32_host;
+use crate::host_ops::hidden_to_f32;
+use crate::host_ops::normalize_compressed_kv;
+use crate::host_ops::rms_norm_hidden_host;
+use crate::host_ops::rms_norm_host;
+use crate::model::AttentionWeights;
+use crate::model::MlpWeights;
+use crate::model::dense_mlp_forward;
+use crate::model::dense_mlp_forward_per_token;
 
 impl DeepSeekV2LiteEp2Generator {
     pub(super) fn embed_tokens(&self, token_ids: &[u32]) -> Result<HiddenStates> {

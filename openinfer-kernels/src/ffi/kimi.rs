@@ -1,5 +1,7 @@
+use cudarc::driver::sys::CUresult;
+use cudarc::driver::sys::CUstream;
+
 use super::Half;
-use cudarc::driver::sys::{CUresult, CUstream};
 
 // Kimi K2 private kernels (feature `kimi-k2`).
 // Sources: csrc/kimi_k2/*.cu (+ vendored vllm-marlin headers).

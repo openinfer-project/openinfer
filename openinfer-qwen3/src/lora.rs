@@ -1,17 +1,27 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::bail;
+use anyhow::ensure;
 use cudarc::driver::CudaSlice;
-use half::{bf16, f16};
+use half::bf16;
+use half::f16;
 use openinfer_core::ops;
-use openinfer_core::tensor::{DeviceContext, DeviceMatrix, HiddenStates};
+use openinfer_core::tensor::DeviceContext;
+use openinfer_core::tensor::DeviceMatrix;
+use openinfer_core::tensor::HiddenStates;
+use safetensors::Dtype;
+use safetensors::SafeTensors;
 use safetensors::tensor::TensorView;
-use safetensors::{Dtype, SafeTensors};
 use serde::Deserialize;
 
-use crate::config::{Config, TensorParallelConfig};
+use crate::config::Config;
+use crate::config::TensorParallelConfig;
 
 const ADAPTER_CONFIG_FILE: &str = "adapter_config.json";
 const ADAPTER_WEIGHTS_FILE: &str = "adapter_model.safetensors";
@@ -769,7 +779,8 @@ fn shard_projection_for_tensor_parallel(
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::fixtures::{self, FixtureTensor};
+    use super::fixtures::FixtureTensor;
+    use super::fixtures::{self};
     use super::*;
 
     fn tiny_config() -> Config {

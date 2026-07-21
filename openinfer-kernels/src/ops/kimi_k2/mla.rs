@@ -1,10 +1,14 @@
-use anyhow::{Result, bail, ensure};
-use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
+use anyhow::Result;
+use anyhow::bail;
+use anyhow::ensure;
+use cudarc::driver::CudaSlice;
+use cudarc::driver::DevicePtr;
+use cudarc::driver::DevicePtrMut;
 
-use crate::{
-    ffi,
-    tensor::{DeviceContext, GpuTensor, NormWeight},
-};
+use crate::ffi;
+use crate::tensor::DeviceContext;
+use crate::tensor::GpuTensor;
+use crate::tensor::NormWeight;
 
 pub const KIMI_K2_MLA_LOCAL_HEADS_TP8: usize = 8;
 pub const KIMI_K2_MLA_Q_HEAD_DIM: usize = 192;

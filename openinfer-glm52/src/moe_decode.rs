@@ -1,18 +1,25 @@
 //! Shared GLM5.2 MoE weights and router used by the EP8 and TP8 production
 //! paths.
 
-use anyhow::{Result, ensure};
+use anyhow::Result;
+use anyhow::ensure;
 use cudarc::driver::CudaSlice;
 use half::bf16;
-use openinfer_kernels::ops::{
-    GLM52_TP_TOKENS, Glm52RouterBatch, Glm52RouterConfig, Glm52RouterOutput,
-    glm52_router_noaux_tc_launch,
-};
+use openinfer_kernels::ops::GLM52_TP_TOKENS;
+use openinfer_kernels::ops::Glm52RouterBatch;
+use openinfer_kernels::ops::Glm52RouterConfig;
+use openinfer_kernels::ops::Glm52RouterOutput;
+use openinfer_kernels::ops::glm52_router_noaux_tc_launch;
 use openinfer_kernels::tensor::DeviceContext;
 
-use crate::fp8::{Glm52MlpScratch, ProjWeight, fp8_mlp_into, pack_proj_pair};
+use crate::fp8::Glm52MlpScratch;
 #[cfg(test)]
-use crate::fp8::{Glm52ProjBytes, bytes_to_f32};
+use crate::fp8::Glm52ProjBytes;
+use crate::fp8::ProjWeight;
+#[cfg(test)]
+use crate::fp8::bytes_to_f32;
+use crate::fp8::fp8_mlp_into;
+use crate::fp8::pack_proj_pair;
 
 pub(crate) const HIDDEN: usize = crate::config::GLM52_HIDDEN;
 pub(crate) const EXPERTS: usize = crate::config::GLM52_ROUTED_EXPERTS;

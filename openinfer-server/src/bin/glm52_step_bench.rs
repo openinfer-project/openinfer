@@ -21,14 +21,20 @@
 
 use std::path::PathBuf;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use std::time::Instant;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::bail;
+use anyhow::ensure;
 use clap::Parser;
-
 use openinfer::logging;
 use openinfer::sampler::SamplingParams;
-use openinfer::scheduler::{SchedulerHandle, SchedulerRequest, TokenEvent, TokenSink};
+use openinfer::scheduler::SchedulerHandle;
+use openinfer::scheduler::SchedulerRequest;
+use openinfer::scheduler::TokenEvent;
+use openinfer::scheduler::TokenSink;
 
 #[derive(Parser, Debug)]
 #[command(

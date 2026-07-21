@@ -439,7 +439,8 @@ mod tests {
     #[test]
     fn test_manual_decay_via_atomic_policy() {
         use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::Ordering;
 
         struct ManualDecayPolicy {
             trigger: Arc<AtomicBool>,

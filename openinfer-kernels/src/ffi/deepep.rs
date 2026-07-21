@@ -1,4 +1,6 @@
-use std::ffi::{c_char, c_int, c_void};
+use std::ffi::c_char;
+use std::ffi::c_int;
+use std::ffi::c_void;
 
 /// Raw bindings for the DeepEP elastic shim (csrc/deepep/deepep.h).
 ///

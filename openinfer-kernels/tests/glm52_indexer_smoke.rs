@@ -14,8 +14,10 @@ use std::ffi::c_void;
 use std::mem::size_of;
 use std::ptr;
 
-use anyhow::{Result, ensure};
-use cudarc::driver::sys::{CUresult, CUstream};
+use anyhow::Result;
+use anyhow::ensure;
+use cudarc::driver::sys::CUresult;
+use cudarc::driver::sys::CUstream;
 use half::bf16;
 use openinfer_kernels::ffi;
 

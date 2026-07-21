@@ -3,18 +3,21 @@
 //! (sm_90a only, AOT-instantiated per topk) plus a deterministic fixed-order
 //! combine. The EP8 (64-head) path stays on FlashMLA (`flashmla_sparse.rs`).
 
-use anyhow::{Result, anyhow, ensure};
-use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
+use anyhow::Result;
+use anyhow::anyhow;
+use anyhow::ensure;
+use cudarc::driver::CudaSlice;
+use cudarc::driver::DevicePtr;
+use cudarc::driver::DevicePtrMut;
 use half::bf16;
 
+use super::flashmla_sparse::GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN;
+use super::flashmla_sparse::GLM52_FLASHMLA_SPARSE_HEADS;
+use super::flashmla_sparse::GLM52_FLASHMLA_SPARSE_PAGE_SIZE;
+use super::flashmla_sparse::GLM52_FLASHMLA_SPARSE_QK_HEAD_DIM;
+use super::flashmla_sparse::GLM52_FLASHMLA_SPARSE_V_HEAD_DIM;
 use crate::ffi;
 use crate::tensor::DeviceContext;
-
-use super::flashmla_sparse::{
-    GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN, GLM52_FLASHMLA_SPARSE_HEADS,
-    GLM52_FLASHMLA_SPARSE_PAGE_SIZE, GLM52_FLASHMLA_SPARSE_QK_HEAD_DIM,
-    GLM52_FLASHMLA_SPARSE_V_HEAD_DIM,
-};
 
 /// Split count and partial store width of the kernel pair. Also baked into
 /// the TileLang generator (`NUM_SPLITS`/`HEAD_SLOTS_OUT`) and the CUDA

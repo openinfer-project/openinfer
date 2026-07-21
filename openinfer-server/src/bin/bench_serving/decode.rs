@@ -17,20 +17,36 @@
 //! guard refuses the sweep if any cell exceeds the pool.
 
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use std::time::Instant;
 
-use anyhow::{Context, Result, anyhow, bail, ensure};
-use log::{info, warn};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::anyhow;
+use anyhow::bail;
+use anyhow::ensure;
+use log::info;
+use log::warn;
 use openinfer::sampler::SamplingParams;
-use openinfer::scheduler::{KvCapacity, SchedulerHandle, SchedulerRequest, TokenEvent, TokenSink};
+use openinfer::scheduler::KvCapacity;
+use openinfer::scheduler::SchedulerHandle;
+use openinfer::scheduler::SchedulerRequest;
+use openinfer::scheduler::TokenEvent;
+use openinfer::scheduler::TokenSink;
 use openinfer::server_engine::ModelType;
 
-use crate::cli::{Cli, DecodeArgs};
-use crate::exec::{BenchModel, run_scheduler_stream};
+use crate::cli::Cli;
+use crate::cli::DecodeArgs;
+use crate::exec::BenchModel;
+use crate::exec::run_scheduler_stream;
 use crate::metrics::summarize_durations;
 use crate::prompt::draw_distinct_prompts;
-use crate::report::{BenchReport, DecodeCell, DecodeReport, DecodeWorkload};
-use crate::runners::{normalize_sizes, run_info};
+use crate::report::BenchReport;
+use crate::report::DecodeCell;
+use crate::report::DecodeReport;
+use crate::report::DecodeWorkload;
+use crate::runners::normalize_sizes;
+use crate::runners::run_info;
 
 /// Tokens of the prompt allowed to be uncached and still count as a hit. Prefix
 /// caching commits whole blocks (block_size 16), so the tail partial block is

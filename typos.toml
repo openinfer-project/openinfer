@@ -1,0 +1,31 @@
+# Spelling checker config. Run with `typos` (https://github.com/crate-ci/typos).
+# Vendored third-party trees are excluded wholesale; the identifier fragments
+# below are real symbol names / vendor API spellings, not misspellings.
+
+[files]
+extend-exclude = [
+  "openinfer-kernels/third_party/",
+  "openinfer-kernels/csrc/kimi_k2/vllm_marlin/",
+  "**/*.cubin",
+  "Cargo.lock",
+]
+
+[default.extend-words]
+# FP8 scale format "UE8M0" — tokenizer splits off a bare "UE"/"ue".
+UE = "UE"
+ue = "ue"
+# CUDA attribute names: cudaDevAttrMaxSharedMemoryPerBlockOptin, ...Optin.
+Optin = "Optin"
+# Verb forms truncated by the tokenizer: SAVEs, RESTOREs.
+RESTOR = "RESTOR"
+SAV = "SAV"
+# Symbol-name fragments (a_log, bias_a, mismatch/cache-miss, *Vas structs, ...).
+PN = "PN"
+Vas = "Vas"
+alog = "alog"
+ba = "ba"
+daa = "daa"
+ded = "ded"
+mis = "mis"
+thr = "thr"
+vas = "vas"

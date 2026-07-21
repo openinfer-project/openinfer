@@ -1,4 +1,7 @@
-use openinfer_core::engine::{FinishReason, GenerateRequest, TokenEvent, unix_now_s};
+use openinfer_core::engine::FinishReason;
+use openinfer_core::engine::GenerateRequest;
+use openinfer_core::engine::TokenEvent;
+use openinfer_core::engine::unix_now_s;
 
 use crate::runner::worker::KIMI_MAX_REQUEST_TOKENS;
 
