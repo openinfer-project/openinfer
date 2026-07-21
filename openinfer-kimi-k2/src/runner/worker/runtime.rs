@@ -327,19 +327,65 @@ pub(super) fn read_local_top1_batch_values(
     active_rows: usize,
     top1_values: &mut CudaSlice<half::bf16>,
     out: &mut CudaSlice<i32>,
+    packets: &mut CudaSlice<u8>,
+    packets_host: &mut PinnedHostSlice<u8>,
 ) -> Result<Vec<(u32, f32)>> {
-    ctx.sync()?;
-    let top_ids = ctx
-        .stream
-        .clone_dtoh(&*out)
-        .map_err(|err| anyhow::anyhow!("D2H Kimi batched top1 ids read failed: {err}"))?;
-    let top_values = ctx
-        .stream
-        .clone_dtoh(&*top1_values)
-        .map_err(|err| anyhow::anyhow!("D2H Kimi batched top1 values read failed: {err}"))?;
+    ensure!(
+        active_rows <= logits.seq_len,
+        "read_local_top1_batch_values: active_rows {} exceeds logits seq_len {}",
+        active_rows,
+        logits.seq_len
+    );
+    ensure!(
+        out.len() >= active_rows && top1_values.len() >= active_rows,
+        "read_local_top1_batch_values: scratch len {} / {} < active_rows {}",
+        out.len(),
+        top1_values.len(),
+        active_rows
+    );
+    ensure!(
+        packets.len() >= active_rows * 8,
+        "read_local_top1_batch_values: packets len {} < active_rows * 8 {}",
+        packets.len(),
+        active_rows * 8
+    );
+
+    {
+        let (ids_ptr, _ids_guard) = out.device_ptr_mut(&ctx.stream);
+        let (values_ptr, _values_guard) = top1_values.device_ptr_mut(&ctx.stream);
+        let (packets_ptr, _packets_guard) = packets.device_ptr_mut(&ctx.stream);
+        unsafe {
+            ffi::pack_top1_packets_cuda(
+                ids_ptr as *const i32,
+                values_ptr as *const ffi::Half,
+                packets_ptr as *mut core::ffi::c_void,
+                active_rows as i32,
+                ctx.stream.cu_stream(),
+            );
+        }
+    }
+
+    let active_bytes = active_rows * 8;
+    {
+        let (host_slice, guard) = unsafe { packets_host.stream_synced_mut_slice(&ctx.stream) };
+        ctx.stream
+            .memcpy_dtoh(
+                &packets.slice(0..active_bytes),
+                &mut host_slice[..active_bytes],
+            )
+            .map_err(|err| anyhow::anyhow!("D2H Kimi batched top1 packet read failed: {err}"))?;
+        drop(guard); // records the pinned buffer's event on the stream
+    }
+    let host = packets_host
+        .as_slice()
+        .map_err(|err| anyhow::anyhow!("Kimi batched top1 packet wait failed: {err}"))?;
+
     let mut rows = Vec::with_capacity(active_rows);
     for row in 0..active_rows {
-        let top_id = top_ids[row];
+        let base = row * 8;
+        let top_id =
+            i32::from_le_bytes([host[base], host[base + 1], host[base + 2], host[base + 3]]);
+        let value_bits = u16::from_le_bytes([host[base + 4], host[base + 5]]);
         ensure!(
             top_id >= 0 && (top_id as usize) < logits.hidden_dim,
             "Kimi batched local top1 id {} at row {} out of logits range {}",
@@ -347,7 +393,7 @@ pub(super) fn read_local_top1_batch_values(
             row,
             logits.hidden_dim
         );
-        rows.push((top_id as u32, top_values[row].to_f32()));
+        rows.push((top_id as u32, half::bf16::from_bits(value_bits).to_f32()));
     }
     Ok(rows)
 }

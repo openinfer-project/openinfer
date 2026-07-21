@@ -755,5 +755,15 @@ unsafe extern "C" {
 }
 
 unsafe extern "C" {
+    pub fn pack_top1_packets_cuda(
+        ids: *const i32,
+        values: *const Half,
+        packets: *mut core::ffi::c_void,
+        rows: i32,
+        stream: CUstream,
+    );
+}
+
+unsafe extern "C" {
     pub fn openinfer_kernels_last_error() -> *const std::os::raw::c_char;
 }

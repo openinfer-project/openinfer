@@ -8,7 +8,7 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use bytesize::ByteSize;
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
-use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
+use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut, HostSlice, PinnedHostSlice};
 use cudarc::nccl::{
     ReduceOp,
     safe::{Comm, Id},

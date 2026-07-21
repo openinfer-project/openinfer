@@ -386,6 +386,8 @@ impl KimiRankThreadState {
             active_len,
             &mut decode_arena.scratch.sampling.top1_value_scratch,
             &mut decode_arena.scratch.sampling.top1_out,
+            &mut decode_arena.scratch.sampling.top1_packets,
+            &mut decode_arena.scratch.sampling.top1_packets_host,
         )?;
         let mut picks: Vec<(u32, f32)> = local_top1;
         for (sampling_row, token) in sampling_rows.iter().zip(&sampled) {
