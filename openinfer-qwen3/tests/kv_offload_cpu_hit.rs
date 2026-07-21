@@ -14,8 +14,8 @@
 //! byte path; this covers the live executor wiring. If the load landed in the
 //! wrong layer/segment/block the warm logits would be whole nats off.
 //!
-//! Requires a CUDA GPU and Qwen3-4B weights; skips cleanly when absent
-//! (point `OPENINFER_TEST_MODEL_PATH` at the weights to run it).
+//! Requires a CUDA GPU, Qwen3-4B weights, and a PegaFlow server sharing the
+//! host IPC namespace. Set `OPENINFER_PEGAFLOW_SERVER` to run it.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -28,10 +28,6 @@ const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3-4
 const BLOCK: usize = 16;
 const LOGPROBS: usize = 16;
 const MAX_OUTPUT: usize = 8;
-/// 512 MiB host tier — comfortably more than the handful of dense Qwen3-4B
-/// blocks this test offloads (~2.25 MiB/block).
-const HOST_TIER_BYTES: usize = 512 << 20;
-
 /// Warm-vs-cold bounds, following the prefix-cache methodology: the CPU-restored
 /// KV is byte-identical to the original GPU compute, so the only legitimate
 /// drift is the prefill GEMM shrinking to the uncached tail (bf16 reduction
@@ -131,12 +127,16 @@ fn live_gpu_and_cpu_prefix_hits() {
     let Some(model_path) = model_path_or_skip() else {
         return;
     };
+    let Ok(server_addr) = std::env::var("OPENINFER_PEGAFLOW_SERVER") else {
+        eprintln!("skipping qwen3 kv_offload_cpu_hit: set OPENINFER_PEGAFLOW_SERVER to run it");
+        return;
+    };
     let mut ex = Qwen3Executor::from_runtime_with_lora_options(
         &model_path,
         false,
         &[0],
         Qwen3LoraOptions::default(),
-        Qwen3OffloadOptions::enabled(HOST_TIER_BYTES),
+        Qwen3OffloadOptions::external(server_addr).with_namespace("qwen3-test-checkpoint"),
         openinfer_qwen3::DEFAULT_MAX_PREFILL_TOKENS,
         None,
         openinfer_qwen3::Qwen3MemoryOptions::default(),

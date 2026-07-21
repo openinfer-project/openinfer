@@ -43,7 +43,7 @@ use std::{
 use anyhow::{Context as _, Result, bail, ensure};
 use bytesize::ByteSize;
 use openinfer_core::engine::{EngineHandle, KvCapacity, LoadSnapshot};
-use openinfer_kv_offload::{HostConfig, KvArena, OffloadEngine, OffloadHost};
+use openinfer_kv_offload::{KvArena, OffloadEngine, OffloadHost};
 use remote::Glm52RemoteNode;
 use runner::{Glm52RankPlacement, Glm52RankWorker, Glm52Worker};
 
@@ -316,8 +316,8 @@ mod topology_tests {
     }
 }
 
-/// Host-tier KV offload knobs. One `PegaEngine` (one pinned pool) backs all
-/// 8 DP ranks under a single namespace: the MLA latent has no TP sharding
+/// External PegaFlow KV offload for all 8 DP ranks under one namespace. The
+/// MLA latent has no TP sharding
 /// and the non-expert weights are replicated, so any rank's KV for a token
 /// prefix is as good as any other's — the same tolerance as reusing a
 /// rank's own prefix cache (FP reduction order may differ across the batch
@@ -325,33 +325,14 @@ mod topology_tests {
 /// any rank saved.
 #[derive(Clone, Debug)]
 pub struct Glm52KvOffloadOptions {
-    /// Host pinned-memory pool size in bytes, shared by all ranks.
-    pub pinned_pool_bytes: usize,
-    /// Back the pool with hugepages (the box must hold a reservation —
-    /// check `HugePages_Total`).
-    pub use_hugepages: bool,
-    /// `Some` joins the cross-instance P2P mesh: saved block hashes register
-    /// with the MetaServer and missing prefixes are pulled from peer
-    /// instances over RDMA — the P/D disaggregation data plane.
-    pub p2p: Option<Glm52P2pOptions>,
+    /// Out-of-process PegaFlow gRPC endpoint.
+    pub server_addr: String,
+    /// Stable deployment/checkpoint identity for native OpenInfer peers.
+    pub namespace: Option<String>,
     /// `Some` when the P/D prefill peer is vLLM (pegaflow connector): offload
     /// query keys switch from kvbm lineage hashes to vLLM's prefix-cache hash
     /// scheme so this decode node can find the blocks vLLM registered.
-    /// Requires `p2p` (the peer's KV lives in its pegaflow-server's pool,
-    /// even on the same host).
     pub vllm_compat: Option<Glm52VllmCompatOptions>,
-}
-
-/// Cross-instance P2P KV sharing (see `openinfer_kv_offload::P2pConfig`).
-#[derive(Clone, Debug)]
-pub struct Glm52P2pOptions {
-    /// MetaServer gRPC address, e.g. `http://10.0.0.100:50056`.
-    pub metaserver_addr: String,
-    /// This engine's routable `IP:port` (doubles as the embedded transfer
-    /// service's bind address). Must be reachable by every peer.
-    pub advertise_addr: String,
-    /// RDMA NIC device names to register the pinned pool on.
-    pub rdma_nics: Vec<String>,
 }
 
 /// Decode-node settings for a P/D deployment whose prefill node is vLLM with
@@ -435,17 +416,6 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
         kv_offload.is_none() || moe_topo == Glm52MoeTopo::Ep8,
         "GLM5.2 --kv-offload requires the EP8 topology (tp8 replicates KV on all ranks; \
          a host-tier restore would land on one)"
-    );
-    // The vLLM prefill peer's KV lives in its pegaflow-server's pool (a
-    // separate process even on the same host); without the P2P mesh the
-    // compat keys would query an empty local tier and every request would
-    // wait out the full miss window.
-    ensure!(
-        kv_offload
-            .as_ref()
-            .is_none_or(|kv| kv.vllm_compat.is_none() || kv.p2p.is_some()),
-        "GLM5.2 --kv-pd-vllm-seed requires the KV P2P mesh (--kv-p2p-metaserver-addr, \
-         --kv-p2p-advertise-addr, --kv-p2p-nics)"
     );
     // The miss window must sit inside the in-flight-fetch ceiling, or the
     // registration phase could never hand over to the fetch phase.
@@ -728,16 +698,21 @@ fn start_engine(
     // down, and the launch error surfaces only after the ~100 s DeepEP
     // device timeout. The TP8 LL rendezvous rejecting a topology (poison
     // pill, NVLink probe) is a real failure landing exactly in this window.
-    let rank_arenas =
-        match build_rank_models(&loaded.workers, max_model_len, moe_topo, dspark_enabled) {
-            Ok(rank_arenas) => rank_arenas,
-            Err(err) => {
-                for worker in &loaded.workers {
-                    let _ = worker.request_shutdown();
-                }
-                return Err(err);
+    let rank_arenas = match build_rank_models(
+        &loaded.workers,
+        max_model_len,
+        moe_topo,
+        dspark_enabled,
+        kv_offload.is_some(),
+    ) {
+        Ok(rank_arenas) => rank_arenas,
+        Err(err) => {
+            for worker in &loaded.workers {
+                let _ = worker.request_shutdown();
             }
-        };
+            return Err(err);
+        }
+    };
     let vllm_compat = kv_offload
         .as_ref()
         .and_then(|opts| opts.vllm_compat.clone());
@@ -903,11 +878,14 @@ fn build_rank_models(
     max_model_len: usize,
     moe_topo: Glm52MoeTopo,
     dspark_enabled: bool,
+    exportable_kv: bool,
 ) -> Result<Vec<Vec<KvArena>>> {
     let build_started = Instant::now();
     let responses = workers
         .iter()
-        .map(|worker| worker.build_model_async(max_model_len, moe_topo, dspark_enabled))
+        .map(|worker| {
+            worker.build_model_async(max_model_len, moe_topo, dspark_enabled, exportable_kv)
+        })
         .collect::<Result<Vec<_>>>()?;
     let mut rank_arenas = Vec::with_capacity(responses.len());
     for (rank, response) in responses.into_iter().enumerate() {
@@ -970,20 +948,8 @@ fn build_offload_engines(
             .all(|arena| arena.bytes_per_block == mla_page_size * mla_bytes_per_token)),
         "GLM5.2 KV offload ranks disagree on MLA cache layout"
     );
-    let host = OffloadHost::new(HostConfig {
-        pinned_pool_bytes: opts.pinned_pool_bytes,
-        use_hugepages: opts.use_hugepages,
-        runtime_threads: 2,
-        p2p: opts
-            .p2p
-            .as_ref()
-            .map(|p2p| openinfer_kv_offload::P2pConfig {
-                metaserver_addr: p2p.metaserver_addr.clone(),
-                advertise_addr: p2p.advertise_addr.clone(),
-                rdma_nics: p2p.rdma_nics.clone(),
-            }),
-    })
-    .map_err(|err| anyhow::anyhow!("GLM5.2 KV offload host: {err}"))?;
+    let host = OffloadHost::connect(&opts.server_addr, 2)
+        .map_err(|err| anyhow::anyhow!("GLM5.2 KV offload host: {err}"))?;
     // vLLM-compat mode joins the *P side's* content domain: the pegaflow
     // connector derives an 8-hex namespace from vLLM config (and logs it at
     // startup); reproducing that derivation would mean chasing Python repr
@@ -991,7 +957,10 @@ fn build_offload_engines(
     let namespace = match &opts.vllm_compat {
         Some(compat) => compat.namespace.clone(),
         None => format!(
-            "openinfer-glm52-l{GLM52_LAYERS}-p{}-mla{}-idxk{}",
+            "openinfer-glm52-{}-l{GLM52_LAYERS}-p{}-mla{}-idxk{}",
+            opts.namespace
+                .as_deref()
+                .context("GLM5.2 native KV offload requires a checkpoint namespace")?,
             mla_page_size,
             mla_bytes_per_token,
             config::GLM52_INDEX_HEAD_DIM + 4,
@@ -1029,10 +998,9 @@ fn build_offload_engines(
             .filter(|&layer| config::glm52_layer_has_full_indexer(layer))
             .count();
     log::info!(
-        "GLM5.2 KV offload up: {} pinned host pool (hugepages: {}), namespace {namespace}, \
+        "GLM5.2 KV offload up: server={}, namespace {namespace}, \
          {} rank instances x {arenas_per_rank} arenas",
-        ByteSize(opts.pinned_pool_bytes as u64),
-        opts.use_hugepages,
+        opts.server_addr,
         engines.len(),
     );
     Ok(engines)

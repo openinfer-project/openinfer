@@ -98,6 +98,7 @@ enum Glm52RankCommand {
         max_model_len: usize,
         moe_topo: crate::Glm52MoeTopo,
         dspark_enabled: bool,
+        exportable_kv: bool,
         resp: Sender<Result<Vec<KvArena>>>,
     },
     /// Collective: create the DeepEP context (barriers across ranks). Issued
@@ -252,6 +253,7 @@ impl Glm52RankWorker {
         max_model_len: usize,
         moe_topo: crate::Glm52MoeTopo,
         dspark_enabled: bool,
+        exportable_kv: bool,
     ) -> Result<Receiver<Result<Vec<KvArena>>>> {
         let (resp_tx, resp_rx) = bounded(1);
         self.tx
@@ -259,6 +261,7 @@ impl Glm52RankWorker {
                 max_model_len,
                 moe_topo,
                 dspark_enabled,
+                exportable_kv,
                 resp: resp_tx,
             })
             .map_err(|_| anyhow::anyhow!("GLM5.2 rank worker channel closed"))?;
@@ -419,13 +422,14 @@ impl Glm52Worker {
         max_model_len: usize,
         moe_topo: crate::Glm52MoeTopo,
         dspark_enabled: bool,
+        exportable_kv: bool,
     ) -> Result<Receiver<Result<Vec<KvArena>>>> {
         match self {
             Self::Local(worker) => {
-                worker.build_model_async(max_model_len, moe_topo, dspark_enabled)
+                worker.build_model_async(max_model_len, moe_topo, dspark_enabled, exportable_kv)
             }
             Self::Remote(worker) => {
-                worker.build_model_async(max_model_len, moe_topo, dspark_enabled)
+                worker.build_model_async(max_model_len, moe_topo, dspark_enabled, exportable_kv)
             }
         }
     }
@@ -621,6 +625,7 @@ impl Glm52RankThreadState {
         max_model_len: usize,
         moe_topo: crate::Glm52MoeTopo,
         dspark_enabled: bool,
+        exportable_kv: bool,
     ) -> Result<Vec<KvArena>> {
         let mut weights = self
             .loaded
@@ -636,6 +641,7 @@ impl Glm52RankThreadState {
                 .uses_tensor_replicated_moe()
                 .then_some(self.placement.rank),
             dspark_enabled,
+            exportable_kv,
         )?);
         let arenas = model.kv_arenas(&dev_ctx.stream)?;
         let aux_ctx = self.ctx.auxiliary_device_context("decode aux")?;
@@ -923,9 +929,15 @@ fn rank_worker_loop(rx: &Receiver<Glm52RankCommand>, mut state: Glm52RankThreadS
                 max_model_len,
                 moe_topo,
                 dspark_enabled,
+                exportable_kv,
                 resp,
             } => {
-                let _ = resp.send(state.build_model(max_model_len, moe_topo, dspark_enabled));
+                let _ = resp.send(state.build_model(
+                    max_model_len,
+                    moe_topo,
+                    dspark_enabled,
+                    exportable_kv,
+                ));
             }
             Glm52RankCommand::SetupComm {
                 unique_id,

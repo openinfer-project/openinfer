@@ -1,9 +1,9 @@
-//! In-process KV cache offload bridge between openinfer and pegaflow.
+//! KV cache offload client between OpenInfer and an external PegaFlow server.
 //!
 //! openinfer owns the GPU paged-KV (`openinfer-kv-cache::KvBuffer`, page-first
 //! layout) and the logical prefix cache (kvbm `BlockPool`). pegaflow owns the
-//! deeper tiers (host pinned memory, SSD, RDMA). [`OffloadEngine`] is the
-//! connector "brain" that moves blocks between them and decides when.
+//! deeper tiers (host pinned memory, SSD, RDMA). [`OffloadEngine`] registers
+//! the GPU allocation over CUDA IPC and issues save/query/load RPCs.
 //!
 //! Dense-attention v1 (Qwen3-4B): the GPU prefix hit stays native to kvbm's
 //! `BlockPool`; this connector covers the CPU tier and stacks a CPU-hit prefix
@@ -14,13 +14,13 @@
 //! polls its [`LoadHandle`] each scheduler tick.
 
 mod engine;
+mod external;
 mod vllm_hash;
 
 pub use engine::{
-    HostConfig, KvArena, LoadHandle, OffloadConfig, OffloadEngine, OffloadHost, P2pConfig,
-    QueryHit, QueryOutcome,
+    KvArena, LoadHandle, OffloadConfig, OffloadEngine, OffloadHost, QueryHit, QueryLeaseId,
+    QueryOutcome,
 };
 pub use vllm_hash::{VLLM_HASH_BYTES, VllmBlockHasher};
 
-// Re-exported so callers name pegaflow's engine types through this bridge.
-pub use pegaflow_core::{EngineError, PegaEngine, QueryLeaseId};
+pub use pegaflow_core::EngineError;

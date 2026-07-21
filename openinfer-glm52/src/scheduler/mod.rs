@@ -405,11 +405,11 @@ pub(crate) fn run_dp8_coordinator(
     // Drain in-flight release saves and drop the offload engines BEFORE the
     // workers drop the models: the registered arenas' device memory must
     // outlive every D2H copy (the `with_arenas` contract), and pegaflow's
-    // save worker cannot cancel a copy already handed to it. `flush_saves`
-    // is deadline-bounded, so a stuck host tier cannot hang teardown.
-    if let Some(offload) = offload {
-        for rank in &offload {
-            rank.engine.flush_saves();
+    // save worker cannot cancel a copy already handed to it. Shutdown waits
+    // for the server's unregister acknowledgement before the arenas are freed.
+    if let Some(mut offload) = offload {
+        for rank in &mut offload {
+            rank.engine.shutdown();
         }
         drop(offload);
     }

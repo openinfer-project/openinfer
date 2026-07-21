@@ -108,7 +108,8 @@ fn batch_invariant_rejects_kv_offload() {
     let err = start_engine_with_offload(
         Path::new("/nonexistent-model"),
         EngineLoadOptions::default(),
-        Qwen3OffloadOptions::enabled(1 << 30),
+        Qwen3OffloadOptions::external("http://127.0.0.1:50055")
+            .with_namespace("qwen3-test-checkpoint"),
         true,
         DEFAULT_MAX_PREFILL_TOKENS,
         Qwen3MemoryOptions::default(),

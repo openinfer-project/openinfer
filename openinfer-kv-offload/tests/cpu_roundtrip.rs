@@ -4,8 +4,8 @@
 //! to pegaflow's host tier, evicts the GPU-side data implicitly by loading into
 //! a *different* set of blocks, and checks the bytes match. This exercises the
 //! whole connector — strided per-layer registration (`block_stride` ≠ copy
-//! size), the K/V split, the async save, the prefix query, and the in-process
-//! oneshot load — on actual device memory. If the layout math were wrong the
+//! size), the K/V split, the async save, the prefix query, and the cross-process
+//! load state — on actual device memory. If the layout math were wrong the
 //! loaded bytes would land in the wrong layer/segment/block and the compare
 //! would fail.
 //!
@@ -55,11 +55,15 @@ fn block_hash(logical: usize) -> Vec<u8> {
 
 #[test]
 fn gpu_cpu_gpu_roundtrip_preserves_kv_bytes() {
+    let Ok(server_addr) = std::env::var("OPENINFER_PEGAFLOW_SERVER") else {
+        eprintln!("skipping cpu_roundtrip: set OPENINFER_PEGAFLOW_SERVER to run it");
+        return;
+    };
     let ctx = CudaContext::new(0).expect("cuda device 0");
     ctx.bind_to_thread().expect("bind ctx to test thread");
     let stream = ctx.default_stream();
 
-    let buffer = KvBuffer::new(
+    let buffer = KvBuffer::new_exportable(
         &stream,
         NUM_LAYERS,
         NUM_KV_HEADS,
@@ -93,12 +97,8 @@ fn gpu_cpu_gpu_roundtrip_preserves_kv_bytes() {
     stream.synchronize().expect("sync after fill");
 
     // ── Build the offload engine (registers the fused buffer) ──
-    let engine = OffloadEngine::new(
-        OffloadConfig::new("roundtrip-test", 0, 64 * 1024 * 1024),
-        &buffer,
-        &stream,
-    )
-    .expect("build OffloadEngine");
+    let config = OffloadConfig::new("roundtrip-test", 0, server_addr);
+    let engine = OffloadEngine::new(&config, &buffer, &stream).expect("build OffloadEngine");
 
     let hashes: Vec<Vec<u8>> = (0..src_blocks.len()).map(block_hash).collect();
     let src_ids: Vec<i32> = src_blocks.iter().map(|&b| b as i32).collect();
@@ -121,7 +121,7 @@ fn gpu_cpu_gpu_roundtrip_preserves_kv_bytes() {
     // ── Load CPU→GPU into a *different* set of blocks ──
     let dst_ids: Vec<i32> = dst_blocks.iter().map(|&b| b as i32).collect();
     engine
-        .load(lease, dst_ids)
+        .load(&lease, dst_ids)
         .expect("submit load")
         .wait()
         .expect("load completes");

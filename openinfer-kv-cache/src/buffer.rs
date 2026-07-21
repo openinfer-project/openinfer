@@ -29,11 +29,56 @@ impl KvBuffer {
         page_size: usize,
         num_blocks: usize,
     ) -> anyhow::Result<Self> {
+        Self::allocate(
+            stream,
+            num_layers,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            num_blocks,
+            false,
+        )
+    }
+
+    /// Allocate through legacy `cuMemAlloc` so the fused arena can be exported
+    /// to an out-of-process CUDA IPC consumer.
+    pub fn new_exportable(
+        stream: &Arc<CudaStream>,
+        num_layers: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        page_size: usize,
+        num_blocks: usize,
+    ) -> anyhow::Result<Self> {
+        Self::allocate(
+            stream,
+            num_layers,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            num_blocks,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn allocate(
+        stream: &Arc<CudaStream>,
+        num_layers: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        page_size: usize,
+        num_blocks: usize,
+        exportable: bool,
+    ) -> anyhow::Result<Self> {
         let layout = KvLayout::new(num_layers, num_kv_heads, head_dim, page_size);
         let total_elements = num_blocks * layout.page_stride;
-        let buffer: CudaSlice<bf16> = stream
-            .alloc_zeros(total_elements)
-            .map_err(|e| anyhow::anyhow!("KvBuffer alloc failed: {e}"))?;
+        let buffer: CudaSlice<bf16> = if exportable {
+            openinfer_kernels::exportable::alloc_ipc_zeros(stream, total_elements)
+        } else {
+            stream.alloc_zeros(total_elements)
+        }
+        .map_err(|e| anyhow::anyhow!("KvBuffer alloc failed: {e}"))?;
         Ok(Self {
             inner: Arc::new(Inner {
                 buffer,
