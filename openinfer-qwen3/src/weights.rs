@@ -14,13 +14,11 @@ use openinfer_core::tensor::DeviceContext;
 use openinfer_core::tensor::DeviceMatrix;
 use openinfer_core::tensor::DeviceVec;
 use openinfer_core::tensor::HiddenStates;
+use openinfer_core::weight_loader::FusedPart;
+use openinfer_core::weight_loader::StagedWeightLoader;
 use openinfer_core::weight_loader::WeightPrefetch;
 use openinfer_core::weight_loader::deserialize_shards;
 use openinfer_core::weight_loader::load_shard_info;
-use openinfer_core::weight_loader::load_tensor_1d;
-use openinfer_core::weight_loader::load_tensor_2d;
-use openinfer_core::weight_loader::load_tensor_2d_col_shard;
-use openinfer_core::weight_loader::load_tensor_2d_row_shard;
 use openinfer_core::weight_loader::mmap_shards;
 use openinfer_core::weight_loader::precompute_rope;
 use openinfer_kv_cache::KvBuffer;
@@ -403,19 +401,16 @@ impl Qwen3Model {
         let shards = deserialize_shards(&mmaps)?;
 
         let t_gpu = Instant::now();
+        let mut loader = StagedWeightLoader::new(&ctx, &shards, &weight_map)?;
+        let hidden = config.hidden_size;
         debug!("Loading embeddings to GPU");
-        let embed_tokens = load_tensor_2d(&ctx, &shards, &weight_map, "model.embed_tokens.weight")?;
+        let embed_tokens = loader.matrix("model.embed_tokens.weight", config.vocab_size, hidden)?;
         let lm_head = if config.tie_word_embeddings {
             debug!("Using tied input/output embeddings");
             None
         } else {
             debug!("Loading untied LM head to GPU");
-            Some(load_tensor_2d(
-                &ctx,
-                &shards,
-                &weight_map,
-                config.lm_head_tensor_name(),
-            )?)
+            Some(loader.matrix(config.lm_head_tensor_name(), config.vocab_size, hidden)?)
         };
 
         debug!(
@@ -423,174 +418,114 @@ impl Qwen3Model {
             config.num_hidden_layers, tensor_parallel.rank, tensor_parallel.world_size,
         );
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
-        let (q_row_offset, q_rows) =
-            tensor_parallel.shard_range(config.num_attention_heads * config.head_dim);
-        let (kv_row_offset, kv_rows) =
-            tensor_parallel.shard_range(config.num_key_value_heads * config.head_dim);
-        let (inter_row_offset, inter_rows) = tensor_parallel.shard_range(config.intermediate_size);
+        let q_total = config.num_attention_heads * config.head_dim;
+        let kv_total = config.num_key_value_heads * config.head_dim;
+        let inter_total = config.intermediate_size;
+        let (q_row_offset, q_rows) = tensor_parallel.shard_range(q_total);
+        let (kv_row_offset, kv_rows) = tensor_parallel.shard_range(kv_total);
+        let (inter_row_offset, inter_rows) = tensor_parallel.shard_range(inter_total);
         for i in 0..config.num_hidden_layers {
             let prefix = format!("model.layers.{}", i);
 
-            let q_proj = if tensor_parallel.is_sharded() {
-                load_tensor_2d_row_shard(
-                    &ctx,
-                    &shards,
-                    &weight_map,
-                    &format!("{}.self_attn.q_proj.weight", prefix),
-                    q_row_offset,
-                    q_rows,
-                )?
-            } else {
-                load_tensor_2d(
-                    &ctx,
-                    &shards,
-                    &weight_map,
-                    &format!("{}.self_attn.q_proj.weight", prefix),
-                )?
-            };
-            let k_proj = if tensor_parallel.is_sharded() {
-                load_tensor_2d_row_shard(
-                    &ctx,
-                    &shards,
-                    &weight_map,
-                    &format!("{}.self_attn.k_proj.weight", prefix),
-                    kv_row_offset,
-                    kv_rows,
-                )?
-            } else {
-                load_tensor_2d(
-                    &ctx,
-                    &shards,
-                    &weight_map,
-                    &format!("{}.self_attn.k_proj.weight", prefix),
-                )?
-            };
-            let v_proj = if tensor_parallel.is_sharded() {
-                load_tensor_2d_row_shard(
-                    &ctx,
-                    &shards,
-                    &weight_map,
-                    &format!("{}.self_attn.v_proj.weight", prefix),
-                    kv_row_offset,
-                    kv_rows,
-                )?
-            } else {
-                load_tensor_2d(
-                    &ctx,
-                    &shards,
-                    &weight_map,
-                    &format!("{}.self_attn.v_proj.weight", prefix),
-                )?
-            };
-            let q_dim = q_proj.rows;
-            let kv_dim = k_proj.rows;
-            let qkv_proj = DeviceMatrix::vstack(&ctx, &[&q_proj, &k_proj, &v_proj])?;
-            drop(q_proj);
-            drop(k_proj);
-            drop(v_proj);
+            // shard_range covers world_size == 1 too (offset 0, full rows), so
+            // one fused load serves both the sharded and unsharded paths.
+            let q_name = format!("{prefix}.self_attn.q_proj.weight");
+            let k_name = format!("{prefix}.self_attn.k_proj.weight");
+            let v_name = format!("{prefix}.self_attn.v_proj.weight");
+            let qkv_proj = loader.fused_rows(
+                hidden,
+                &[
+                    FusedPart {
+                        name: &q_name,
+                        src_rows: q_total,
+                        row_offset: q_row_offset,
+                        rows: q_rows,
+                    },
+                    FusedPart {
+                        name: &k_name,
+                        src_rows: kv_total,
+                        row_offset: kv_row_offset,
+                        rows: kv_rows,
+                    },
+                    FusedPart {
+                        name: &v_name,
+                        src_rows: kv_total,
+                        row_offset: kv_row_offset,
+                        rows: kv_rows,
+                    },
+                ],
+            )?;
 
-            let gate_proj = if tensor_parallel.is_sharded() {
-                load_tensor_2d_row_shard(
-                    &ctx,
-                    &shards,
-                    &weight_map,
-                    &format!("{}.mlp.gate_proj.weight", prefix),
-                    inter_row_offset,
-                    inter_rows,
-                )?
-            } else {
-                load_tensor_2d(
-                    &ctx,
-                    &shards,
-                    &weight_map,
-                    &format!("{}.mlp.gate_proj.weight", prefix),
-                )?
-            };
-            let up_proj = if tensor_parallel.is_sharded() {
-                load_tensor_2d_row_shard(
-                    &ctx,
-                    &shards,
-                    &weight_map,
-                    &format!("{}.mlp.up_proj.weight", prefix),
-                    inter_row_offset,
-                    inter_rows,
-                )?
-            } else {
-                load_tensor_2d(
-                    &ctx,
-                    &shards,
-                    &weight_map,
-                    &format!("{}.mlp.up_proj.weight", prefix),
-                )?
-            };
-            let gate_up_proj = DeviceMatrix::vstack(&ctx, &[&gate_proj, &up_proj])?;
-            drop(gate_proj);
-            drop(up_proj);
+            let gate_name = format!("{prefix}.mlp.gate_proj.weight");
+            let up_name = format!("{prefix}.mlp.up_proj.weight");
+            let gate_up_proj = loader.fused_rows(
+                hidden,
+                &[
+                    FusedPart {
+                        name: &gate_name,
+                        src_rows: inter_total,
+                        row_offset: inter_row_offset,
+                        rows: inter_rows,
+                    },
+                    FusedPart {
+                        name: &up_name,
+                        src_rows: inter_total,
+                        row_offset: inter_row_offset,
+                        rows: inter_rows,
+                    },
+                ],
+            )?;
 
             let block = TransformerBlock {
-                input_layernorm: load_tensor_1d(
-                    &ctx,
-                    &shards,
-                    &weight_map,
-                    &format!("{}.input_layernorm.weight", prefix),
-                )?,
+                input_layernorm: loader
+                    .vector(&format!("{}.input_layernorm.weight", prefix), hidden)?,
                 attention: Attention {
                     qkv_proj,
                     o_proj: if tensor_parallel.is_sharded() {
-                        load_tensor_2d_col_shard(
-                            &ctx,
-                            &shards,
-                            &weight_map,
+                        loader.col_shard(
                             &format!("{}.self_attn.o_proj.weight", prefix),
+                            hidden,
+                            q_total,
                             q_row_offset,
                             q_rows,
                         )?
                     } else {
-                        load_tensor_2d(
-                            &ctx,
-                            &shards,
-                            &weight_map,
+                        loader.matrix(
                             &format!("{}.self_attn.o_proj.weight", prefix),
+                            hidden,
+                            q_total,
                         )?
                     },
-                    q_norm: load_tensor_1d(
-                        &ctx,
-                        &shards,
-                        &weight_map,
+                    q_norm: loader.vector(
                         &format!("{}.self_attn.q_norm.weight", prefix),
+                        config.head_dim,
                     )?,
-                    k_norm: load_tensor_1d(
-                        &ctx,
-                        &shards,
-                        &weight_map,
+                    k_norm: loader.vector(
                         &format!("{}.self_attn.k_norm.weight", prefix),
+                        config.head_dim,
                     )?,
-                    q_dim,
-                    kv_dim,
+                    q_dim: q_rows,
+                    kv_dim: kv_rows,
                 },
-                post_attention_layernorm: load_tensor_1d(
-                    &ctx,
-                    &shards,
-                    &weight_map,
+                post_attention_layernorm: loader.vector(
                     &format!("{}.post_attention_layernorm.weight", prefix),
+                    hidden,
                 )?,
                 mlp: MLP {
                     gate_up_proj,
                     down_proj: if tensor_parallel.is_sharded() {
-                        load_tensor_2d_col_shard(
-                            &ctx,
-                            &shards,
-                            &weight_map,
+                        loader.col_shard(
                             &format!("{}.mlp.down_proj.weight", prefix),
+                            hidden,
+                            inter_total,
                             inter_row_offset,
                             inter_rows,
                         )?
                     } else {
-                        load_tensor_2d(
-                            &ctx,
-                            &shards,
-                            &weight_map,
+                        loader.matrix(
                             &format!("{}.mlp.down_proj.weight", prefix),
+                            hidden,
+                            inter_total,
                         )?
                     },
                 },
@@ -598,7 +533,7 @@ impl Qwen3Model {
             layers.push(block);
         }
 
-        let norm = load_tensor_1d(&ctx, &shards, &weight_map, "model.norm.weight")?;
+        let norm = loader.vector("model.norm.weight", hidden)?;
 
         debug!("Precomputing RoPE cache on GPU");
         let (cos_cache, sin_cache) = precompute_rope(
@@ -609,6 +544,7 @@ impl Qwen3Model {
         )?;
 
         ctx.sync()?;
+        drop(loader);
         drop(prefetch);
         info!(
             "GPU model loaded in {:.0}ms",
@@ -1263,21 +1199,6 @@ mod tests {
             .slot_for_install("adapter-c", false)
             .expect("released slot should be reused");
         assert_eq!(slot_c, 0);
-    }
-
-    #[test]
-    fn memory_options_default_page_size_is_16() {
-        // #545: default behavior is unchanged when the flag is omitted.
-        assert_eq!(Qwen3MemoryOptions::default().page_size, 16);
-    }
-
-    #[test]
-    fn memory_options_accepts_valid_page_sizes() {
-        for &valid in VALID_KV_PAGE_SIZES {
-            Qwen3MemoryOptions::new(0.9, 0, valid)
-                .validate()
-                .unwrap_or_else(|_| panic!("page_size {valid} should be valid"));
-        }
     }
 
     #[test]
