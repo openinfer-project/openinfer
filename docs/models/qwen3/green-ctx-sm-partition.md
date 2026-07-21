@@ -68,6 +68,7 @@ Power climbs with QPS: at QPS 8 the board still has headroom (draw oscillates ~5
 
 - **`gemm_lt` is still disabled under the stream override** (`5af4fd5`, to avoid the cuBLASLt workspace Xid-31 path). So split-path decode keeps its CUDA graph but loses the per-shape Lt tuning — a remaining decode-side lever, not yet re-measured under the partition.
 - **A single request never exercises the split path** — smoke-test with concurrent load or you are only testing the full-SM graph.
+- **Record async completion with the retained Green Context handle.** A Green Context stream does not reliably identify its owner through `cuStreamGetGreenCtx` when the derived context was never made current. The split command therefore carries `gctx_prefill` from `OverlapStreams` and records its blocking, timing-disabled event with `cuGreenCtxRecordEvent`; the shared-primary-context path still uses `cuEventRecord`. This keeps idle scheduler waits blocking and prevents an invalid or unrecorded event from bypassing prefill completion.
 - **`pkill` from an ssh one-liner matches its own command line** — use `pkill -f "[t]arget/release/openinfer"`, and kill/launch in separate ssh invocations.
 - Build on the 5090 with `CUDA_HOME=/usr/local/cuda-13.1` (stale `/usr/local/cuda` → cuBLAS 12.9 N=1025 cliff; see `serving-perf-5090.md`). Verify `ldd target/release/openinfer | grep cublas` shows `.so.13`.
 

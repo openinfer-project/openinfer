@@ -79,6 +79,15 @@ pub(crate) fn fence_producers_before_override(
     Ok(())
 }
 
+/// A `CUgreenCtx` wrapper that can cross the worker command channel.
+/// The owning [`OverlapStreams`] keeps the context alive while a copied handle
+/// is used to record the split prefill completion event.
+#[derive(Clone, Copy, Debug)]
+#[repr(transparent)]
+pub(crate) struct SendGreenContext(pub sys::CUgreenCtx);
+
+unsafe impl Send for SendGreenContext {}
+
 /// Two CUDA streams used to overlap prefill and decode within one scheduler
 /// step. In [`DecodeOverlap::GreenCtx`] mode they are pinned to disjoint SM
 /// partitions via Green Contexts; in [`DecodeOverlap::SharedSm`] mode they are
@@ -138,7 +147,31 @@ fn create_primary_stream() -> Result<CUstream> {
     Ok(stream)
 }
 
+/// Record an event after work submitted to `stream`.
+///
+/// A Green Context stream must pass its owning context explicitly. Deriving it
+/// from the stream is unreliable because `cuGreenCtxStreamCreate` ignores the
+/// caller's current context, so stream context queries can report no Green
+/// Context even for an SM-pinned stream.
+pub(crate) fn record_stream_event(
+    stream: CUstream,
+    event: sys::CUevent,
+    green_ctx: Option<SendGreenContext>,
+) -> Result<()> {
+    let record = match green_ctx {
+        Some(green_ctx) => unsafe { sys::cuGreenCtxRecordEvent(green_ctx.0, event) },
+        None => unsafe { sys::cuEventRecord(event, stream) },
+    };
+    check_cu(record, "recording async prefill event")
+}
+
 impl OverlapStreams {
+    pub(crate) fn prefill_green_context(&self) -> Option<SendGreenContext> {
+        self.green
+            .as_ref()
+            .map(|green| SendGreenContext(green.gctx_prefill))
+    }
+
     /// Set up the overlap streams for the given device, or `None` when overlap
     /// is [`DecodeOverlap::Off`] (the executor keeps its single stream).
     pub(crate) fn create(device_ordinal: usize, overlap: DecodeOverlap) -> Result<Option<Self>> {
