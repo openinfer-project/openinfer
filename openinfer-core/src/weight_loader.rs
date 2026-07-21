@@ -401,11 +401,11 @@ impl<'a> StagedWeightLoader<'a> {
                 .is_some_and(|end| end <= src_cols),
             "col range out of bounds for '{name}': col_offset={col_offset} take={take} total_cols={src_cols}"
         );
-        let host = gather_cols(full, src_rows, src_cols, col_offset, take);
         // SAFETY: fully overwritten by the staged upload below.
-        let mut data = unsafe { self.ctx.stream.alloc::<bf16>(host.len()) }
+        let mut data = unsafe { self.ctx.stream.alloc::<bf16>(src_rows * take) }
             .map_err(|e| anyhow::anyhow!("Alloc failed for '{name}': {e}"))?;
-        self.stager.upload(&host, &mut data, 0)?;
+        self.stager
+            .upload_cols(full, src_cols, col_offset, take, &mut data)?;
         Ok(DeviceMatrix {
             data,
             rows: src_rows,
