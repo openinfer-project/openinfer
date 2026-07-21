@@ -2,7 +2,7 @@
 
 > **TL;DR:** Enabling Green Context SM partitioning (`--decode-overlap green-ctx --decode-sm-pct 20`) runs prefill and decode on disjoint SM partitions (decode 32 SM / prefill 138 SM on a 5090's 170 SM) so a decode no longer stalls behind a co-scheduled prefill in the unified step. On the 5090 mid-band (`vllm bench serve` random in=1024/out=128, QPS 8–12) this **halves ITL p99** (44.8→22.5 / 46.7→24.7 / 56.6→26.9 ms) and cuts TPOT mean (up to −22% @QPS12) — at the cost of a **2–4× TTFT regression** (prefill loses SMs *and* is deferred to the next scheduler iteration). Restoring decode's CUDA graph under the partition (the "two-graph" change) adds a further **~5% ITL p99 / 1–4% TPOT** with zero correctness cost. Net: this is a TTFT↔ITL/TPOT trade, not a free win — turn it on only when steady-state token smoothness matters more than first-token latency.
 >
-> **Last touched:** 2026-06
+> **Last touched:** 2026-07
 
 Select the prefill/decode overlap mode with one CLI flag (`--decode-overlap`, off by default):
 
@@ -66,6 +66,7 @@ Power climbs with QPS: at QPS 8 the board still has headroom (draw oscillates ~5
 - **The Xid 31/43 hit during bring-up was a cross-stream buffer use-after-free, and it is fixed — not an open driver risk.** Prefill temp buffers (`token_ids`, `PrefillBuffers`) were allocated/freed on `ctx.stream` while still in flight on the override stream. The fix: sync `ctx.stream` before installing the stream override, and defer those buffers' drop until the prefill stream syncs (`prefill::DEFERRED_DROPS`, commits `bec0082`/`b39e4fe`/`aa4beec`/`65834e8`). The separate theory that `cuGreenCtxStreamCreate` *itself* faults on driver 590 + >16 GB resident did **not** reproduce: this 5090 (driver 590.48.01, ~27 GB resident — 19.3 GB of it KV) ran green-ctx clean across both 2026-06-19 sweeps and the 2026-06-20 three-mode smoke (split path fired, 0 Xid). green-ctx still fails loud if stream creation ever errors for any reason; fall back with `--decode-overlap stream`.
 - **`gemm_lt` is still disabled under the stream override** (`5af4fd5`, to avoid the cuBLASLt workspace Xid-31 path). So split-path decode keeps its CUDA graph but loses the per-shape Lt tuning — a remaining decode-side lever, not yet re-measured under the partition.
 - **A single request never exercises the split path** — smoke-test with concurrent load or you are only testing the full-SM graph.
+- **Record async completion with the retained Green Context handle.** A Green Context stream does not reliably identify its owner through `cuStreamGetGreenCtx` when the derived context was never made current. The split command therefore carries `gctx_prefill` from `OverlapStreams` and records its blocking, timing-disabled event with `cuGreenCtxRecordEvent`; the shared-primary-context path still uses `cuEventRecord`. This keeps idle scheduler waits blocking and prevents an invalid or unrecorded event from bypassing prefill completion.
 - **`pkill` from an ssh one-liner matches its own command line** — use `pkill -f "[t]arget/release/openinfer"`, and kill/launch in separate ssh invocations.
 - Build on the 5090 with `CUDA_HOME=/usr/local/cuda-13.1` (stale `/usr/local/cuda` → cuBLAS 12.9 N=1025 cliff; see `serving-perf-5090.md`). Verify `ldd target/release/openinfer | grep cublas` shows `.so.13`.
 

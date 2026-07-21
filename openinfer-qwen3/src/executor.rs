@@ -505,6 +505,7 @@ fn execute_step_on_lane(
             decode_requests,
             decode_kv_views,
             prefill_stream,
+            prefill_green_ctx,
             decode_stream,
             sample_seed,
         } => {
@@ -568,15 +569,31 @@ fn execute_step_on_lane(
                 let decode_result =
                     build_batch_decode_request_results(lane, decode_requests, *sample_seed)?;
 
-                // Record event on prefill stream for non-blocking poll.
-                let mut event: cudarc::driver::sys::CUevent = std::ptr::null_mut();
-                unsafe {
-                    cudarc::driver::sys::cuEventCreate(
-                        &raw mut event,
-                        cudarc::driver::sys::CUevent_flags_enum::CU_EVENT_DISABLE_TIMING as u32,
-                    );
-                    cudarc::driver::sys::cuEventRecord(event, prefill_stream.0);
-                }
+                // Record after the prefill launches. Green Context streams need
+                // cuGreenCtxRecordEvent; plain overlap streams use cuEventRecord.
+                // Both creation and recording are checked before the event is
+                // handed to the scheduler.
+                let event = match crate::green_ctx::record_stream_event(
+                    prefill_stream.0,
+                    *prefill_green_ctx,
+                ) {
+                    Ok(event) => event,
+                    Err(error) => {
+                        // The prefill kernels were already launched. Before
+                        // returning the event error, establish stream
+                        // quiescence so local GPU buffers can be dropped safely.
+                        let sync =
+                            unsafe { cudarc::driver::sys::cuStreamSynchronize(prefill_stream.0) };
+                        if sync != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                            log::error!(
+                                "FATAL: prefill event setup failed ({error:#}) and \
+                                 cuStreamSynchronize(prefill) also failed ({sync:?}); aborting"
+                            );
+                            std::process::abort();
+                        }
+                        return Err(error);
+                    }
+                };
 
                 // Store prefill state for deferred sync+sample.
                 lane.inflight_prefill = Some(InflightPrefillState {
@@ -955,6 +972,16 @@ pub(crate) trait ModelExecutor: Send {
     /// done, `None` if still in-flight.
     fn poll_async_prefill(&mut self) -> Option<PrefillResult> {
         None
+    }
+
+    /// Block until the async prefill completes and return its result. The
+    /// scheduler calls this only when no other work can make progress, so an
+    /// event wait is preferable to polling the CUDA event in a tight loop.
+    /// CUDA synchronization failures fail-stop inside the real executor. A
+    /// returned error therefore means post-wait state/result resolution failed
+    /// after the completion event established stream quiescence.
+    fn wait_async_prefill(&mut self) -> Result<PrefillResult> {
+        anyhow::bail!("async prefill wait is not implemented for this executor")
     }
 
     // ── KV block-event feed (no-op unless built with the event feed on) ──
@@ -2744,6 +2771,7 @@ impl ModelExecutor for Qwen3Executor {
                 decode_requests: plan.decode_requests.to_vec(),
                 decode_kv_views,
                 prefill_stream: overlap.prefill_stream,
+                prefill_green_ctx: overlap.prefill_green_context(),
                 decode_stream: overlap.decode_stream,
                 sample_seed: plan.sample_seed,
             }
@@ -3037,9 +3065,16 @@ impl ModelExecutor for Qwen3Executor {
         let state = self.async_prefill.as_ref()?;
         // Non-blocking check: is the prefill stream done?
         let status = unsafe { cudarc::driver::sys::cuEventQuery(state.event) };
-        if status != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-            // Not ready yet (CUDA_ERROR_NOT_READY)
-            return None;
+        match status {
+            cudarc::driver::sys::CUresult::CUDA_ERROR_NOT_READY => return None,
+            cudarc::driver::sys::CUresult::CUDA_SUCCESS => {}
+            other => {
+                // An invalid/unrecorded event does not establish stream
+                // quiescence. Dropping the executor here could free buffers
+                // while the overlap stream still uses them.
+                log::error!("FATAL: cuEventQuery(async prefill) failed ({other:?}); aborting");
+                std::process::abort();
+            }
         }
         // Prefill is done — resolve it via the worker.
         let event = self.async_prefill.take().unwrap().event;
@@ -3063,6 +3098,26 @@ impl ModelExecutor for Qwen3Executor {
             self.save_sealed_blocks(req_result.request_id);
         }
         Some(result)
+    }
+
+    fn wait_async_prefill(&mut self) -> Result<PrefillResult> {
+        let state = self
+            .async_prefill
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no async prefill is in flight"))?;
+        let status = unsafe { cudarc::driver::sys::cuEventSynchronize(state.event) };
+        if status != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+            // The event is the only proof that the prefill stream stopped using
+            // its temporary buffers. Returning an error would immediately drop
+            // the executor and race those frees, so fail-stop the process.
+            log::error!("FATAL: cuEventSynchronize(async prefill) failed ({status:?}); aborting");
+            std::process::abort();
+        }
+
+        // `poll_async_prefill` performs the event cleanup and worker-side
+        // result resolution after the event is known to be complete.
+        self.poll_async_prefill()
+            .ok_or_else(|| anyhow::anyhow!("async prefill completed without a result"))
     }
 }
 
@@ -3577,6 +3632,7 @@ enum StepCommand {
         decode_requests: Vec<DecodeStepItem>,
         decode_kv_views: Vec<KvView>,
         prefill_stream: crate::green_ctx::SendStream,
+        prefill_green_ctx: Option<crate::green_ctx::SendGreenContext>,
         decode_stream: crate::green_ctx::SendStream,
         sample_seed: u64,
     },
