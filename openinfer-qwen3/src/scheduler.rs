@@ -46,6 +46,7 @@ use self::resolve::resolve_step;
 use crate::Qwen3LoraOptions;
 use crate::Qwen3OffloadOptions;
 use crate::executor::ModelExecutor;
+use crate::executor::PrefillResult;
 use crate::executor::Qwen3Executor;
 use crate::executor::RequestId;
 use crate::weights::Qwen3MemoryOptions;
@@ -507,6 +508,33 @@ fn publish_load<E: ModelExecutor>(
     });
 }
 
+/// Apply a completed decode-overlap prefill. The pending requests are kept in
+/// the scheduler until this point because their first token and KV state are
+/// produced by the async prefill stream.
+fn apply_async_prefill_result<E: ModelExecutor>(
+    executor: &mut E,
+    active: &mut Vec<ActiveRequestState>,
+    prefilling: &mut Vec<PendingRequest>,
+    inflight: &mut Option<Vec<PendingRequest>>,
+    result: PrefillResult,
+) {
+    let pending = inflight
+        .take()
+        .expect("async prefill result without pending requests");
+    info!(
+        "decode-overlap: async prefill completed ({} reqs)",
+        pending.len()
+    );
+    let scheduled_at_unix_s = openinfer_core::engine::unix_now_s();
+    let artifacts = ExecutionArtifacts::Prefill {
+        pending,
+        result,
+        scheduled_at_unix_s,
+    };
+    let effects = resolve_step(&*executor, active, artifacts);
+    apply_effects(executor, active, prefilling, effects);
+}
+
 fn scheduler_loop<E>(
     mut executor: E,
     mut submit_rx: mpsc::UnboundedReceiver<GenerateRequest>,
@@ -558,19 +586,13 @@ fn scheduler_loop<E>(
         // 0. Poll in-flight async prefill (decode-overlap mode).
         if inflight_prefill_pending.is_some() {
             if let Some(prefill_result) = executor.poll_async_prefill() {
-                let pending = inflight_prefill_pending.take().unwrap();
-                info!(
-                    "decode-overlap: async prefill completed ({} reqs)",
-                    pending.len()
+                apply_async_prefill_result(
+                    &mut executor,
+                    &mut active,
+                    &mut prefilling,
+                    &mut inflight_prefill_pending,
+                    prefill_result,
                 );
-                let scheduled_at_unix_s = openinfer_core::engine::unix_now_s();
-                let artifacts = ExecutionArtifacts::Prefill {
-                    pending,
-                    result: prefill_result,
-                    scheduled_at_unix_s,
-                };
-                let effects = resolve_step(&executor, &active, artifacts);
-                apply_effects(&mut executor, &mut active, &mut prefilling, effects);
             }
         }
 
@@ -590,8 +612,38 @@ fn scheduler_loop<E>(
 
         // 3. Nothing active and nothing admittable → block. Prefer blocking on
         // an in-flight load (so its request prefills next) over a new submit;
-        // only truly idle (no loads either) do we block on the channel.
+        // an in-flight decode-overlap prefill over a new submit; only truly
+        // idle (no loads or GPU work) do we block on the channel.
         if active.is_empty() && deferred.is_empty() && prefilling.is_empty() {
+            if inflight_prefill_pending.is_some() {
+                match executor.wait_async_prefill() {
+                    Ok(prefill_result) => apply_async_prefill_result(
+                        &mut executor,
+                        &mut active,
+                        &mut prefilling,
+                        &mut inflight_prefill_pending,
+                        prefill_result,
+                    ),
+                    Err(error) => {
+                        warn!("decode-overlap: async prefill wait failed: {error:#}");
+                        // CUDA event synchronization failures abort inside the
+                        // real executor. A returned error is a post-wait state
+                        // or result mismatch, so report it and stop this broken
+                        // scheduler instance; executor teardown owns the
+                        // remaining request resources.
+                        let message = format!("{error:#}");
+                        for req in inflight_prefill_pending.as_ref().unwrap() {
+                            let _ = req.token_tx.send(TokenEvent::Error {
+                                message: message.clone(),
+                                prompt_tokens: req.prompt_tokens.len(),
+                                completion_tokens: 0,
+                            });
+                        }
+                        return;
+                    }
+                }
+                continue;
+            }
             if !loading.is_empty() {
                 let reserve_floor = admitted_future_blocks(&executor, &active, &prefilling);
                 block_on_loading(&mut executor, &mut deferred, &mut loading, reserve_floor);

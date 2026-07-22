@@ -46,6 +46,15 @@ pub(crate) struct SendStream(pub CUstream);
 unsafe impl Send for SendStream {}
 unsafe impl Sync for SendStream {}
 
+/// A `CUgreenCtx` wrapper that can cross the worker command channel.
+/// The owning [`OverlapStreams`] keeps the context alive while a copied handle
+/// is used to record the split prefill completion event.
+#[derive(Clone, Copy, Debug)]
+#[repr(transparent)]
+pub(crate) struct SendGreenContext(pub sys::CUgreenCtx);
+
+unsafe impl Send for SendGreenContext {}
+
 /// Two CUDA streams used to overlap prefill and decode within one scheduler
 /// step. In [`DecodeOverlap::GreenCtx`] mode they are pinned to disjoint SM
 /// partitions via Green Contexts; in [`DecodeOverlap::SharedSm`] mode they are
@@ -105,7 +114,57 @@ fn create_primary_stream() -> Result<CUstream> {
     Ok(stream)
 }
 
+/// Record an event after work submitted to `stream`.
+///
+/// A Green Context stream must pass its owning context explicitly. Deriving it
+/// from the stream is unreliable because `cuGreenCtxStreamCreate` ignores the
+/// caller's current context, so stream context queries can report no Green
+/// Context even for an SM-pinned stream.
+pub(crate) fn record_stream_event(
+    stream: CUstream,
+    green_ctx: Option<SendGreenContext>,
+) -> Result<sys::CUevent> {
+    let mut event: sys::CUevent = ptr::null_mut();
+    check_cu(
+        unsafe {
+            sys::cuEventCreate(
+                &raw mut event,
+                sys::CUevent_flags_enum::CU_EVENT_BLOCKING_SYNC as u32
+                    | sys::CUevent_flags_enum::CU_EVENT_DISABLE_TIMING as u32,
+            )
+        },
+        "cuEventCreate (async prefill)",
+    )?;
+
+    let record = match green_ctx {
+        Some(green_ctx) => unsafe { sys::cuGreenCtxRecordEvent(green_ctx.0, event) },
+        None => unsafe { sys::cuEventRecord(event, stream) },
+    };
+    if record != sys::CUresult::CUDA_SUCCESS {
+        let destroy = unsafe { sys::cuEventDestroy_v2(event) };
+        return Err(async_prefill_record_error(record, destroy));
+    }
+    Ok(event)
+}
+
+fn async_prefill_record_error(record: sys::CUresult, destroy: sys::CUresult) -> anyhow::Error {
+    if destroy == sys::CUresult::CUDA_SUCCESS {
+        anyhow::anyhow!("recording async prefill event failed: {record:?}")
+    } else {
+        anyhow::anyhow!(
+            "recording async prefill event failed: {record:?}; \
+             cuEventDestroy_v2 cleanup also failed: {destroy:?}"
+        )
+    }
+}
+
 impl OverlapStreams {
+    pub(crate) fn prefill_green_context(&self) -> Option<SendGreenContext> {
+        self.green
+            .as_ref()
+            .map(|green| SendGreenContext(green.gctx_prefill))
+    }
+
     /// Set up the overlap streams for the given device, or `None` when overlap
     /// is [`DecodeOverlap::Off`] (the executor keeps its single stream).
     pub(crate) fn create(device_ordinal: usize, overlap: DecodeOverlap) -> Result<Option<Self>> {
@@ -319,3 +378,21 @@ impl Drop for OverlapStreams {
 
 // SAFETY: OverlapStreams is only used from the executor's single GPU worker thread.
 unsafe impl Send for OverlapStreams {}
+
+#[cfg(test)]
+mod tests {
+    use super::async_prefill_record_error;
+    use super::sys;
+
+    #[test]
+    fn async_prefill_record_error_preserves_cleanup_failure() {
+        let error = async_prefill_record_error(
+            sys::CUresult::CUDA_ERROR_INVALID_HANDLE,
+            sys::CUresult::CUDA_ERROR_DEINITIALIZED,
+        )
+        .to_string();
+
+        assert!(error.contains("recording async prefill event failed: CUDA_ERROR_INVALID_HANDLE"));
+        assert!(error.contains("cuEventDestroy_v2 cleanup also failed: CUDA_ERROR_DEINITIALIZED"));
+    }
+}
