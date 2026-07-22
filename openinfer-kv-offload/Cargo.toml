@@ -7,11 +7,12 @@ edition = "2024"
 [dependencies]
 # The client shares PegaFlow's wire-compatible error/save types but does not
 # embed its storage engine or RDMA stack.
-pegaflow-core = { git = "https://github.com/novitalabs/pegaflow.git", rev = "29c7fba", default-features = false }
-pegaflow-proto = { git = "https://github.com/novitalabs/pegaflow.git", rev = "29c7fba" }
+pegaflow-core = { git = "https://github.com/novitalabs/pegaflow.git", rev = "6e0baa71991c2adef892efccc4f6da40ecf2194a", default-features = false }
+pegaflow-proto = { git = "https://github.com/novitalabs/pegaflow.git", rev = "6e0baa71991c2adef892efccc4f6da40ecf2194a" }
 openinfer-kv-cache = { workspace = true }
 cudarc = { workspace = true }
 half = { workspace = true }
+libc = { workspace = true }
 log = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }

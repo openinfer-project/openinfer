@@ -269,6 +269,8 @@ impl OffloadEngine {
             config.device_id,
             reg,
             false,
+            buffer.export_fd(),
+            buffer.export_alloc_size(),
         )
     }
 
@@ -281,6 +283,11 @@ impl OffloadEngine {
             config.device_id,
             Registration::from_arenas(arenas),
             false,
+            // The multi-arena path (GLM5.2's rank-local MLA/index-K arenas) is
+            // not yet migrated to VMM export; a native VMM server will reject
+            // this at register time. Qwen3 uses OffloadEngine::new instead.
+            None,
+            None,
         )
     }
 
@@ -302,6 +309,9 @@ impl OffloadEngine {
             device_id,
             Registration::from_arenas(arenas),
             page_first,
+            // See `with_arenas`: multi-arena VMM export is future work.
+            None,
+            None,
         )
     }
 
@@ -312,6 +322,8 @@ impl OffloadEngine {
         device_id: i32,
         reg: Registration,
         page_first: bool,
+        export_fd: Option<std::os::fd::BorrowedFd<'_>>,
+        alloc_size: Option<usize>,
     ) -> Result<Self, EngineError> {
         assert_outside_runtime("register");
         let instance_id = host.instance_id(instance_id);
@@ -334,6 +346,8 @@ impl OffloadEngine {
                 block_stride_bytes: &reg.block_stride_bytes,
                 segments: &reg.segments,
                 page_first,
+                export_fd,
+                alloc_size,
             }))?;
 
         Ok(Self {

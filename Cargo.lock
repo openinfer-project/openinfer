@@ -3070,6 +3070,7 @@ version = "0.1.0"
 dependencies = [
  "cudarc",
  "half",
+ "libc",
  "log",
  "openinfer-kv-cache",
  "pegaflow-core",
@@ -3374,7 +3375,7 @@ dependencies = [
 [[package]]
 name = "pegaflow-common"
 version = "0.23.4"
-source = "git+https://github.com/novitalabs/pegaflow.git?rev=29c7fba#29c7fbad851d660ac8c11e9a0a38d5f4b2b4c57b"
+source = "git+https://github.com/novitalabs/pegaflow.git?rev=6e0baa71991c2adef892efccc4f6da40ecf2194a#6e0baa71991c2adef892efccc4f6da40ecf2194a"
 dependencies = [
  "colored",
  "libc",
@@ -3385,7 +3386,7 @@ dependencies = [
 [[package]]
 name = "pegaflow-core"
 version = "0.23.4"
-source = "git+https://github.com/novitalabs/pegaflow.git?rev=29c7fba#29c7fbad851d660ac8c11e9a0a38d5f4b2b4c57b"
+source = "git+https://github.com/novitalabs/pegaflow.git?rev=6e0baa71991c2adef892efccc4f6da40ecf2194a#6e0baa71991c2adef892efccc4f6da40ecf2194a"
 dependencies = [
  "ahash",
  "bytesize",
@@ -3414,7 +3415,7 @@ dependencies = [
 [[package]]
 name = "pegaflow-proto"
 version = "0.23.4"
-source = "git+https://github.com/novitalabs/pegaflow.git?rev=29c7fba#29c7fbad851d660ac8c11e9a0a38d5f4b2b4c57b"
+source = "git+https://github.com/novitalabs/pegaflow.git?rev=6e0baa71991c2adef892efccc4f6da40ecf2194a#6e0baa71991c2adef892efccc4f6da40ecf2194a"
 dependencies = [
  "prost",
  "tonic",

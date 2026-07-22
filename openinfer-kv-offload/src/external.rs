@@ -1,11 +1,9 @@
-use std::collections::HashMap;
-use std::mem::MaybeUninit;
+use std::os::fd::{AsRawFd, BorrowedFd};
 
-use cudarc::driver::{CudaContext, sys};
 use pegaflow_core::{EngineError, LayerSave};
 use pegaflow_proto::proto::engine::engine_client::EngineClient;
 use pegaflow_proto::proto::engine::{
-    CudaIpcTensor, FlushRequest, HealthRequest, LeaseLoad, LoadRequest, QueryRequest,
+    FlushRequest, HealthRequest, LeaseLoad, LoadRequest, NativeKvTensor, QueryRequest,
     RegisterContextRequest, ReleaseRequest, ResponseStatus, SaveLayer, SaveRequest, SessionRequest,
     TransferMode, UnregisterRequest, query_response,
 };
@@ -33,6 +31,13 @@ pub(super) struct ExternalRegistration<'a> {
     pub block_stride_bytes: &'a [usize],
     pub segments: &'a [usize],
     pub page_first: bool,
+    /// Exported POSIX fd for the fused VMM allocation. Sent to the server over
+    /// its fd side-channel before the register RPC. `None` is a hard error for
+    /// native registration (there is no other way to share the allocation).
+    pub export_fd: Option<std::os::fd::BorrowedFd<'a>>,
+    /// Byte size of that allocation (granularity-aligned). The server reserves
+    /// and maps exactly this. `None` alongside `export_fd` is an error.
+    pub alloc_size: Option<usize>,
 }
 
 pub(super) enum ExternalQuery {
@@ -43,6 +48,10 @@ pub(super) enum ExternalQuery {
 #[derive(Clone)]
 pub(super) struct ExternalClient {
     client: EngineClient<Channel>,
+    /// Server's fd side-channel path, learned from the Health response. Native
+    /// VMM registration sends the exported allocation fd here before the gRPC
+    /// register RPC. Empty if the server has no local fd channel.
+    fd_socket_path: String,
 }
 
 pub(super) struct ExternalSession {
@@ -80,15 +89,19 @@ impl ExternalClient {
             .map_err(|err| rpc_error("health", &err))?
             .into_inner();
         require_ok("health", response.status)?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            fd_socket_path: response.fd_socket_path,
+        })
     }
 
     pub(super) async fn register(
         &self,
         registration: ExternalRegistration<'_>,
     ) -> Result<ExternalSession, EngineError> {
-        let cuda_ipc_tensors = export_cuda_ipc_tensors(
-            registration.device_id,
+        // Build the per-layer strided views into the fused VMM allocation. The
+        // backing fd travels out-of-band (below), not in this metadata.
+        let native_kv_tensors = build_native_kv_tensors(
             registration.data_ptrs,
             registration.size_bytes,
             registration.block_stride_bytes,
@@ -97,6 +110,33 @@ impl ExternalClient {
         let pp_rank = as_u32(registration.pp_rank, "pp_rank")?;
         let tp_size = as_u32(registration.tp_size, "tp_size")?;
         let world_size = as_u32(registration.world_size, "world_size")?;
+
+        // Send the allocation fd on the server's side-channel BEFORE the
+        // register RPC, so the fd is waiting when the handler claims it. A VMM
+        // allocation cannot be shared any other way — fail loudly if either the
+        // fd or the server's channel path is missing.
+        let export_fd = registration.export_fd.ok_or_else(|| {
+            EngineError::InvalidArgument(
+                "native VMM registration requires an exported allocation fd".into(),
+            )
+        })?;
+        let alloc_size = registration.alloc_size.ok_or_else(|| {
+            EngineError::InvalidArgument(
+                "native VMM registration requires the allocation size".into(),
+            )
+        })?;
+        if self.fd_socket_path.is_empty() {
+            return Err(EngineError::Storage(
+                "external PegaFlow server did not advertise an fd side-channel path".into(),
+            ));
+        }
+        send_export_fd(
+            &self.fd_socket_path,
+            registration.instance_id,
+            registration.device_id,
+            export_fd,
+        )
+        .await?;
 
         let mut session_client = self.client.clone();
         let session = tokio::time::timeout(
@@ -148,7 +188,8 @@ impl ExternalClient {
             client_version: pegaflow_proto::VERSION.to_string(),
             transfer_mode: TransferMode::Direct as i32,
             page_first: registration.page_first,
-            cuda_ipc_tensors,
+            native_kv_tensors,
+            native_alloc_size: as_u64(alloc_size, "alloc_size")?,
         };
         let mut client = self.client.clone();
         let response = match tokio::time::timeout(
@@ -386,97 +427,117 @@ fn abort_cleanup_failure(context: &str, err: &EngineError) -> ! {
     std::process::abort();
 }
 
-fn export_cuda_ipc_tensors(
-    device_id: i32,
+/// Build per-layer strided views for the register RPC. Each view's
+/// `offset_bytes` is relative to the fused allocation base (the smallest layer
+/// pointer), matching how the server offsets into its imported mapping.
+fn build_native_kv_tensors(
     data_ptrs: &[u64],
     size_bytes: &[usize],
     block_stride_bytes: &[usize],
-) -> Result<Vec<CudaIpcTensor>, EngineError> {
+) -> Result<Vec<NativeKvTensor>, EngineError> {
     if data_ptrs.len() != size_bytes.len() || data_ptrs.len() != block_stride_bytes.len() {
         return Err(EngineError::InvalidArgument(format!(
-            "CUDA IPC export metadata length mismatch: pointers={}, sizes={}, block strides={}",
+            "native export metadata length mismatch: pointers={}, sizes={}, block strides={}",
             data_ptrs.len(),
             size_bytes.len(),
             block_stride_bytes.len()
         )));
     }
-    let device = usize::try_from(device_id).map_err(|_| {
-        EngineError::InvalidArgument(format!("device_id {device_id} must be non-negative"))
-    })?;
-    let context = CudaContext::new(device)
-        .map_err(|err| EngineError::CudaInit(format!("retain device {device}: {err}")))?;
-    context
-        .bind_to_thread()
-        .map_err(|err| EngineError::CudaInit(format!("bind device {device}: {err}")))?;
-
-    let mut handles = HashMap::<u64, Vec<u8>>::new();
+    // The allocation base is the smallest layer pointer; page-first layout lays
+    // every layer out at base + layer_index * layer_bytes.
+    let base = data_ptrs
+        .iter()
+        .copied()
+        .min()
+        .ok_or_else(|| EngineError::InvalidArgument("native export has no arenas".into()))?;
     data_ptrs
         .iter()
         .copied()
         .zip(size_bytes.iter().copied())
         .zip(block_stride_bytes.iter().copied())
         .map(|((data_ptr, view_size), block_stride)| {
-            let mut allocation_base = 0;
-            let mut allocation_size = 0;
-            // SAFETY: every pointer comes from a live registered KV arena in
-            // this bound CUDA context; both outputs are valid stack storage.
-            unsafe {
-                sys::cuMemGetAddressRange_v2(
-                    &raw mut allocation_base,
-                    &raw mut allocation_size,
-                    data_ptr,
-                )
-                .result()
-                .map_err(|err| cuda_error("query allocation range", err))?;
-            }
-            let offset = data_ptr.checked_sub(allocation_base).ok_or_else(|| {
+            let offset = data_ptr.checked_sub(base).ok_or_else(|| {
                 EngineError::Storage(format!(
-                    "CUDA allocation base {allocation_base:#x} exceeds view pointer {data_ptr:#x}"
+                    "layer pointer {data_ptr:#x} precedes allocation base {base:#x}"
                 ))
             })?;
-            let end = usize::try_from(offset)
-                .ok()
-                .and_then(|offset| offset.checked_add(view_size))
-                .ok_or_else(|| EngineError::Storage("CUDA IPC view range overflows".to_string()))?;
-            if end > allocation_size {
-                return Err(EngineError::InvalidArgument(format!(
-                    "CUDA IPC view {offset}..{end} exceeds allocation size {allocation_size}"
-                )));
-            }
-
-            let handle = if let Some(handle) = handles.get(&allocation_base) {
-                handle.clone()
-            } else {
-                let mut handle = MaybeUninit::<sys::CUipcMemHandle>::uninit();
-                // SAFETY: allocation_base is the live base returned above and
-                // handle is valid uninitialized output storage.
-                unsafe {
-                    sys::cuIpcGetMemHandle(handle.as_mut_ptr(), allocation_base)
-                        .result()
-                        .map_err(|err| cuda_error("export CUDA IPC handle", err))?;
-                }
-                // SAFETY: CUDA initialized the complete fixed-size handle.
-                let handle = unsafe { handle.assume_init() };
-                // SAFETY: CUipcMemHandle is an opaque byte payload with a fixed
-                // C layout and remains live for this copy.
-                let bytes = unsafe {
-                    std::slice::from_raw_parts(
-                        (&raw const handle).cast::<u8>(),
-                        std::mem::size_of::<sys::CUipcMemHandle>(),
-                    )
-                }
-                .to_vec();
-                handles.insert(allocation_base, bytes.clone());
-                bytes
-            };
-            Ok(CudaIpcTensor {
-                handle,
+            Ok(NativeKvTensor {
                 offset_bytes: offset,
                 size_bytes: as_u64(view_size, "size_bytes")?,
                 block_stride_bytes: as_u64(block_stride, "block_stride_bytes")?,
             })
         })
         .collect()
+}
+
+/// Send `fd` to the server's fd side-channel at `socket_path`, tagged with
+/// `instance_id\0device_id` so the register handler can claim it by key. Uses a
+/// blocking `sendmsg`/SCM_RIGHTS on a std Unix socket (fd passing has no async
+/// wrapper); the payload is one small datagram, so this does not block long.
+async fn send_export_fd(
+    socket_path: &str,
+    instance_id: &str,
+    device_id: i32,
+    fd: BorrowedFd<'_>,
+) -> Result<(), EngineError> {
+    let socket_path = socket_path.to_string();
+    let instance_id = instance_id.to_string();
+    let raw_fd = fd.as_raw_fd();
+    // Run the blocking syscall off the async worker. `raw_fd` stays valid: the
+    // caller's `BorrowedFd` outlives this await, and the server dups it.
+    tokio::task::spawn_blocking(move || {
+        send_fd_blocking(&socket_path, &instance_id, device_id, raw_fd)
+    })
+    .await
+    .map_err(|err| EngineError::Storage(format!("fd side-channel task join failed: {err}")))?
+}
+
+fn send_fd_blocking(
+    socket_path: &str,
+    instance_id: &str,
+    device_id: i32,
+    raw_fd: std::os::fd::RawFd,
+) -> Result<(), EngineError> {
+    use std::os::unix::net::UnixStream;
+
+    let stream = UnixStream::connect(socket_path).map_err(|err| {
+        EngineError::Storage(format!("connect fd side-channel {socket_path}: {err}"))
+    })?;
+    let sock = stream.as_raw_fd();
+
+    // Payload: "<instance_id>\0<device_id>".
+    let payload = format!("{instance_id}\0{device_id}");
+    let mut iov = libc::iovec {
+        iov_base: payload.as_ptr() as *mut libc::c_void,
+        iov_len: payload.len(),
+    };
+    let mut cmsg_space = [0u8; 64]; // CMSG_SPACE(size_of::<RawFd>()) with margin
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg_space.as_mut_ptr().cast();
+    msg.msg_controllen = cmsg_space.len();
+
+    // SAFETY: msg has a valid control buffer; we populate exactly one
+    // SCM_RIGHTS header carrying one fd.
+    unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<std::os::fd::RawFd>() as u32) as _;
+        std::ptr::write_unaligned(libc::CMSG_DATA(cmsg).cast::<std::os::fd::RawFd>(), raw_fd);
+        msg.msg_controllen = (*cmsg).cmsg_len;
+    }
+
+    // SAFETY: msg is fully initialized with a valid iov and control message.
+    let sent = unsafe { libc::sendmsg(sock, &msg, 0) };
+    if sent < 0 {
+        return Err(EngineError::Storage(format!(
+            "sendmsg fd on side-channel: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
 }
 
 fn require_ok(operation: &str, status: Option<ResponseStatus>) -> Result<(), EngineError> {
@@ -494,10 +555,6 @@ fn require_ok(operation: &str, status: Option<ResponseStatus>) -> Result<(), Eng
 
 fn rpc_error(operation: &str, err: &tonic::Status) -> EngineError {
     EngineError::Storage(format!("external PegaFlow {operation} RPC: {err}"))
-}
-
-fn cuda_error(operation: &str, err: cudarc::driver::result::DriverError) -> EngineError {
-    EngineError::Storage(format!("{operation}: {err}"))
 }
 
 fn as_u32(value: usize, field: &str) -> Result<u32, EngineError> {
