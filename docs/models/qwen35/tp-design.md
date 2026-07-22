@@ -18,7 +18,7 @@ Reuse the Qwen3 TP shape:
 - `RequestId` request identity
 - coarse-grained prefill/decode/unified/drop step protocol
 - rank-local worker-owned model state
-- rank-local CUDA context, cuBLAS, graph, and NCCL resources
+- rank-local CUDA context, cuBLAS, and NCCL resources
 - hidden all-reduce after row-parallel projections
 - replicated embedding/lm_head as the first-pass simplification
 
@@ -44,7 +44,7 @@ These decisions are settled before implementation starts.
 - Each rank worker owns and mutates its own full linear-attention conv state and GDR recurrent state copy.
 - The scheduler owns logical request lifecycle and logical KV/page lifecycle only.
 - Full-attention KV is physically rank-local and sharded by local KV heads, but one logical request/page assignment is mirrored across all ranks.
-- `DropRequest`, finish cleanup, cancellation cleanup, and slot reuse must release or reset the corresponding rank-local KV/recurrent/conv state on every rank.
+- `DropRequest`, finish cleanup, cancellation cleanup, and client disconnect must release or reset the corresponding rank-local KV/recurrent/conv state on every rank by `RequestId`.
 - Qwen3.5 gated `q_proj` slicing is an explicit acceptance gate: every rank must receive both q rows and gate rows for its local query heads.
 - MLP gate/up row sharding and down column sharding require explicit reconstruction or layout tests.
 
@@ -67,7 +67,7 @@ Qwen3.5 has two separable TP problems.
 
 The dense part is already proven by Qwen3: full-attention head sharding, local KV heads, MLP intermediate sharding, all-reduce after row-parallel projections, and worker-thread CUDA/NCCL execution.
 
-The linear-attention part is Qwen3.5-specific: conv state and GDR recurrent state are long-lived request state, current GDR AOT kernels are built for the global value-head shape, and slot compaction / graph padding / `DropRequest` must all preserve rank-local recurrent state. If dense TP and GDR TP land together, failures are hard to attribute. Phase 1 narrows correctness debugging to runtime + dense sharding; Phase 2 then isolates the GDR/recurrent contract.
+The linear-attention part is Qwen3.5-specific: conv state and GDR recurrent state are long-lived request state, current GDR AOT kernels are built for the global value-head shape, and `DropRequest` cleanup plus re-admission must preserve rank-local recurrent-state boundaries. If dense TP and GDR TP land together, failures are hard to attribute. Phase 1 narrows correctness debugging to runtime + dense sharding; Phase 2 then isolates the GDR/recurrent contract. CUDA Graph slot, padding, and compaction semantics remain a separate follow-up RFC.
 
 ## Architecture Summary
 
@@ -168,7 +168,7 @@ State ownership:
 - rank workers own rank-local model shards, rank-local physical KV buffers, rank-local decode buffers, and rank-local recurrent/conv state
 - rank 0 is not special for state mutation; it follows the same worker command protocol as other ranks
 - non-primary workers may return acknowledgement or step failure only, while the primary worker returns artifacts for scheduler-side result resolution
-- all workers must observe the same ordered `RunPrefillStep`, `RunDecodeStep`, `RunUnifiedStep`, `DropRequest`, and `Shutdown` commands
+- all workers must observe the same ordered `RunPrefillChunks`, `RunDecodeStep`, `DropRequest`, and `Shutdown` commands
 
 CUDA Graph:
 
@@ -182,8 +182,8 @@ Validation scope:
 - Qwen3.5 HF logits gate
 - Qwen3.5 scheduler e2e
 - long prompt / chunked prefill path
-- slot-compaction replay
-- finish/drop followed by slot reuse without stale recurrent or conv state
+- finish, explicit drop, cancellation, and client-disconnect cleanup by `RequestId`
+- subsequent admission with a new `RequestId` observes no stale KV, recurrent, or conv state
 - gated `q_proj` head-local q/gate slicing test
 - MLP gate/up shard and down shard reconstruction/layout test
 - basic TP2 serving smoke
@@ -194,7 +194,7 @@ Validation scope:
 
 P2a implements eager TP `RunUnifiedStep` while retaining the Phase 1 replicated linear-attention/GDR weights, kernels, conv state, recurrent state, and scratch shapes.
 
-Every rank receives the same canonical `UnifiedPlan`: ordered prefill and decode items, each carrying a `RequestId` and the request-local execution inputs needed for that row. The order is the collective-order contract; every rank executes the actual plan rows in that order. P2a does not introduce padded rows, CUDA Graph slots, D2D state movement, or a cross-rank slot-compaction protocol.
+Every rank receives the same canonical `UnifiedPlan`: ordered prefill and decode items, each carrying a `RequestId` and the request-local execution inputs needed for that row. The order is the collective-order contract; every rank executes the actual plan rows in that order. P2a does not introduce CUDA Graph padded-slot semantics, D2D state movement, or a cross-rank slot-compaction protocol.
 
 State and artifacts are keyed by `RequestId`:
 
