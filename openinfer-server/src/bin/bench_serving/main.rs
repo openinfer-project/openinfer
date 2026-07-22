@@ -275,6 +275,10 @@ mod tests {
     use openinfer::sampler::SamplingParams;
 
     use super::*;
+    use crate::exec::assert_dsv2_lite_sampling_contract;
+    use crate::exec::timings_from_dsv2_lite_attribution;
+    use crate::exec::timings_from_dsv2_lite_batched_generation;
+    use crate::runners::build_request_metrics;
 
     #[test]
     fn dsv2_lite_sampling_contract_accepts_bench_params() {
