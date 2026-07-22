@@ -139,6 +139,7 @@ pub fn trace_runtime_decode_kernel_calls(
         for request_idx in 0..batch_size {
             let (token_tx, mut token_rx) = TokenSink::standalone();
             engine.submit(GenerateRequest {
+                trace_parent: None,
                 request_id: Some(format!("kimi-trace-{request_idx}")),
                 queued_at_unix_s: None,
                 data_parallel_rank: None,

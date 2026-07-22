@@ -97,6 +97,7 @@ fn generate_tokens(
 
     handle
         .submit(GenerateRequest {
+            trace_parent: None,
             request_id: None,
             queued_at_unix_s: None,
             data_parallel_rank: None,

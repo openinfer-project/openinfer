@@ -11,6 +11,8 @@ use std::time::UNIX_EPOCH;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
+use fastrace::Span;
+use fastrace::collector::SpanContext;
 use log::info;
 use log::warn;
 use openinfer_engine::engine::EngineHandle;
@@ -372,8 +374,24 @@ impl LocalEngineBridge {
         let tag: RequestTag = Arc::from(request_id.as_str());
         let abort_reason = Arc::new(AtomicU8::new(RequestAbortReason::None as u8));
         let token_tx = TokenSink::new(tag.clone(), event_tx.clone(), Arc::clone(&abort_reason));
+        // Open the request's root span here, before submit, so its context can
+        // travel into the scheduler as the parent of the queue/prefill/decode
+        // spans. When tracing is off we must build a *noop* span rather than a
+        // real one: fastrace is compiled with `enable`, so `Span::root` with a
+        // sampled context always allocates and reports. Gating on `is_enabled()`
+        // keeps the default (tracing-off) path free of per-request span work,
+        // and `from_span` on a noop span yields `None` so the scheduler skips
+        // its span work too.
+        let trace_root = if openinfer_engine::tracing_state::is_enabled() {
+            Span::root("request", SpanContext::random())
+                .with_property(|| ("request_id", tag.to_string()))
+        } else {
+            Span::noop()
+        };
+        let trace_parent = SpanContext::from_span(&trace_root);
         self.handle
             .submit(GenerateRequest {
+                trace_parent,
                 request_id: Some(request_id),
                 queued_at_unix_s: Some(request.arrival_time),
                 data_parallel_rank: Some(self.engine_index as usize),
@@ -387,7 +405,7 @@ impl LocalEngineBridge {
             })
             .context("failed to submit request to scheduler")?;
 
-        streams.insert(tag, RequestStreamState::new(abort_reason));
+        streams.insert(tag, RequestStreamState::new(abort_reason, trace_root));
         Ok(())
     }
 }
@@ -402,15 +420,25 @@ struct RequestStreamState {
     first_token_prefill_stats: Option<PrefillStats>,
     abort_reason: Arc<AtomicU8>,
     has_emitted_tokens: bool,
+    /// Request-lifetime root span (submit → finish). The scheduler opens
+    /// queue/prefill/decode as children of this via the `SpanContext` passed in
+    /// `GenerateRequest.trace_parent`, so the host-side phase breakdown is timed
+    /// where the work actually happens (inside the scheduler), not inferred from
+    /// event arrival at this downstream demux. `Span::noop()` when tracing is
+    /// off. Held only for its `Drop`: dropping this state (on request completion
+    /// or abort) ends the root span and closes the trace.
+    #[allow(dead_code)]
+    trace_root: Span,
 }
 
 impl RequestStreamState {
-    fn new(abort_reason: Arc<AtomicU8>) -> Self {
+    fn new(abort_reason: Arc<AtomicU8>, trace_root: Span) -> Self {
         Self {
             first_token_events: None,
             first_token_prefill_stats: None,
             abort_reason,
             has_emitted_tokens: false,
+            trace_root,
         }
     }
 
@@ -465,6 +493,7 @@ fn dispatch_burst(
             outputs.push(output);
         }
         if terminated {
+            // Dropping the state ends both spans, closing the request trace.
             streams.remove(&tag);
             finished_requests.insert(tag.to_string());
         }

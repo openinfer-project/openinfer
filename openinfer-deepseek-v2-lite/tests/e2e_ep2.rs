@@ -625,6 +625,7 @@ fn run_mixed_serving_generation(model_path: &Path, model_path_label: &str) -> Re
     for (id, _prompt, prompt_tokens, max_tokens, ignore_eos) in encoded_cases {
         let (token_tx, token_rx) = TokenSink::standalone();
         let req = GenerateRequest {
+            trace_parent: None,
             request_id: Some(id.clone()),
             queued_at_unix_s: None,
             data_parallel_rank: None,
@@ -710,6 +711,7 @@ fn run_mixed_serving_position_fallback(
     for (id, prompt_tokens, max_tokens, ignore_eos) in encoded_cases {
         let (token_tx, token_rx) = TokenSink::standalone();
         let req = GenerateRequest {
+            trace_parent: None,
             request_id: Some(id.clone()),
             queued_at_unix_s: None,
             data_parallel_rank: None,
@@ -779,6 +781,7 @@ fn run_mixed_serving_rejection_isolation(
 ) -> Result<()> {
     let (invalid_tx, mut invalid_rx) = TokenSink::standalone();
     let invalid_req = GenerateRequest {
+        trace_parent: None,
         request_id: Some("mixed-invalid-logprobs".to_string()),
         queued_at_unix_s: None,
         data_parallel_rank: None,
@@ -793,6 +796,7 @@ fn run_mixed_serving_rejection_isolation(
 
     let (valid_tx, mut valid_rx) = TokenSink::standalone();
     let valid_req = GenerateRequest {
+        trace_parent: None,
         request_id: Some(valid_id.to_string()),
         queued_at_unix_s: None,
         data_parallel_rank: None,

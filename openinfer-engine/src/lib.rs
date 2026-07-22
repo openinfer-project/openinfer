@@ -3,3 +3,4 @@
 pub mod engine;
 pub mod parallel;
 pub mod sampler;
+pub mod tracing_state;

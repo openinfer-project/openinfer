@@ -70,6 +70,7 @@ fn in_window_prompt_past_old_rope_table_is_served() {
     let (token_tx, mut rx) = TokenSink::standalone();
     handle
         .submit(GenerateRequest {
+            trace_parent: None,
             request_id: None,
             queued_at_unix_s: None,
             data_parallel_rank: None,

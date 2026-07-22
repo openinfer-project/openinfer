@@ -97,7 +97,6 @@ impl PrefillBuffers {
 }
 
 impl Qwen3Model {
-    #[fastrace::trace(name = "get_embeddings_batch")]
     pub(super) fn get_embeddings_batch(&self, token_ids: &[u32]) -> Result<HiddenStates> {
         let seq_len = token_ids.len();
         let hidden_dim = self.config.hidden_size;

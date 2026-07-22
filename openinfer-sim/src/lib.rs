@@ -208,6 +208,7 @@ mod tests {
 
         run_simulated_request(
             GenerateRequest {
+                trace_parent: None,
                 request_id: Some("req-scripted".to_string()),
                 queued_at_unix_s: Some(1.0),
                 data_parallel_rank: None,
@@ -254,6 +255,7 @@ mod tests {
 
         run_simulated_request(
             GenerateRequest {
+                trace_parent: None,
                 request_id: Some("req-trunc".to_string()),
                 queued_at_unix_s: Some(1.0),
                 data_parallel_rank: None,
@@ -306,6 +308,7 @@ mod tests {
 
         run_simulated_request(
             GenerateRequest {
+                trace_parent: None,
                 request_id: Some("req-1".to_string()),
                 queued_at_unix_s: Some(1.0),
                 data_parallel_rank: None,

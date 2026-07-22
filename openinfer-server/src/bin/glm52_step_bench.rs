@@ -257,6 +257,7 @@ fn run_stream(
     let (token_tx, mut token_rx) = TokenSink::standalone();
     handle
         .submit(SchedulerRequest {
+            trace_parent: None,
             request_id: Some(request_id),
             queued_at_unix_s: None,
             data_parallel_rank: None,

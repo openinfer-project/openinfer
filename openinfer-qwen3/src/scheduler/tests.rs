@@ -802,6 +802,7 @@ fn request(
     let (token_tx, token_rx) = TokenSink::standalone();
     (
         GenerateRequest {
+            trace_parent: None,
             request_id: None,
             queued_at_unix_s: None,
             data_parallel_rank: None,
@@ -962,6 +963,7 @@ fn retiring_multiple_active_requests_tolerates_unsorted_indices() {
         &mut executor,
         &mut active,
         &mut Vec::new(),
+        &mut super::phase_trace::PhaseTracker::default(),
         effects::StepEffects {
             scheduled: Vec::new(),
             prompt_echoes: Vec::new(),

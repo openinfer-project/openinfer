@@ -1101,6 +1101,7 @@ mod tests {
     fn dummy_request(prompt_tokens: Vec<u32>, max_tokens: usize) -> GenerateRequest {
         let (token_tx, _token_rx) = TokenSink::standalone();
         GenerateRequest {
+            trace_parent: None,
             request_id: None,
             queued_at_unix_s: None,
             data_parallel_rank: None,

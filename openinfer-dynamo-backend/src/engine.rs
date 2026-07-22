@@ -282,6 +282,7 @@ impl LLMEngine for OpeninferBackend {
         let sink = TokenSink::new(tag, tx, Arc::clone(&abort_reason));
 
         let req = GenerateRequest {
+            trace_parent: None,
             request_id: Some(ctx.id().to_string()),
             queued_at_unix_s: request.request_timestamp_ms.map(|ms| ms / 1000.0),
             data_parallel_rank: None,

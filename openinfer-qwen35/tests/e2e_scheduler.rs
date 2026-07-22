@@ -135,6 +135,7 @@ fn generate_tokens_with_logprobs(
 
     handle
         .submit(GenerateRequest {
+            trace_parent: None,
             request_id: None,
             queued_at_unix_s: None,
             data_parallel_rank: None,
@@ -225,6 +226,7 @@ fn expect_context_window_rejection(handle: &EngineHandle, max_context_tokens: us
 
     handle
         .submit(GenerateRequest {
+            trace_parent: None,
             request_id: Some("over-context-window".to_string()),
             queued_at_unix_s: None,
             data_parallel_rank: None,
@@ -436,6 +438,7 @@ fn run_full_scheduler_e2e(
             let (token_tx, token_rx) = TokenSink::standalone();
             handle
                 .submit(GenerateRequest {
+                    trace_parent: None,
                     request_id: None,
                     queued_at_unix_s: None,
                     data_parallel_rank: None,
@@ -476,6 +479,7 @@ fn run_full_scheduler_e2e(
             let (token_tx, token_rx) = TokenSink::standalone();
             handle
                 .submit(GenerateRequest {
+                    trace_parent: None,
                     request_id: Some(name.to_string()),
                     queued_at_unix_s: None,
                     data_parallel_rank: None,
@@ -517,6 +521,7 @@ fn run_full_scheduler_e2e(
         drop(rx);
         handle
             .submit(GenerateRequest {
+                trace_parent: None,
                 request_id: None,
                 queued_at_unix_s: None,
                 data_parallel_rank: None,

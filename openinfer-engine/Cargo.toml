@@ -5,6 +5,7 @@ name = "openinfer-engine"
 version = "0.1.0"
 
 [dependencies]
+fastrace = { workspace = true }
 log = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }

@@ -25,6 +25,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     logging::init_default();
+    openinfer_core::tracing::init();
 
     let matches = Args::command().get_matches();
     let args =
@@ -132,6 +133,10 @@ async fn main() -> anyhow::Result<()> {
         .await
     }
     .context("vLLM frontend server failed")?;
+
+    // Export the final batch of request spans before the runtime tears down.
+    // No-op when tracing was never enabled.
+    openinfer_core::tracing::flush();
 
     Ok(())
 }

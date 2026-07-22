@@ -97,6 +97,9 @@ derive_builder = "0.20"
 either = { version = "1.13", features = ["serde"] }
 etcd-client = { version = "0.17.0", features = ["tls"] }
 fastrace = { version = "0.7.17", features = ["enable"] }
+# 0.17 tracks opentelemetry 0.31 (matches the otlp/sdk stack below); 0.18+ jumps
+# to otel 0.32 and would pull a second, incompatible opentelemetry into the tree.
+fastrace-opentelemetry = "0.17"
 futures = "0.3"
 half = { version = "2.7", features = ["num-traits"] }
 hex = "0.4"

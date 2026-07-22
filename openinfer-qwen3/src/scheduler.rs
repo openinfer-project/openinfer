@@ -7,6 +7,7 @@
 
 mod effects;
 mod kv_events;
+mod phase_trace;
 mod plan;
 mod resolve;
 
@@ -115,6 +116,21 @@ impl PendingRequest {
     fn remaining_prompt_tokens(&self) -> usize {
         self.prompt_tokens.len() - self.prefill_pos
     }
+}
+
+/// Assign a fresh id to an incoming request, open its `queue` phase span, and
+/// push it onto `deferred`. Centralizes the three drain sites so the queue span
+/// always opens exactly when the request enters the scheduler's backlog.
+fn admit_new_request(
+    deferred: &mut Vec<PendingRequest>,
+    tracker: &mut phase_trace::PhaseTracker,
+    next_request_id: &mut u64,
+    req: GenerateRequest,
+) {
+    let id = RequestId(*next_request_id);
+    *next_request_id += 1;
+    tracker.enter_queue(id, req.trace_parent);
+    deferred.push(PendingRequest::from_scheduler_request(id, req));
 }
 
 /// Pull the next prefill step set off the front of `prefilling`, capping the
@@ -462,7 +478,14 @@ fn promote_ready(
 /// executor while the request waited in `deferred`. Without this they would
 /// leak (blocks pinned, map entry stranded) for the engine's lifetime. Idempotent
 /// and harmless for requests that were never prefetched.
-fn release_rejected<E: ModelExecutor>(executor: &mut E, req: &PendingRequest) {
+fn release_rejected<E: ModelExecutor>(
+    executor: &mut E,
+    tracker: &mut phase_trace::PhaseTracker,
+    req: &PendingRequest,
+) {
+    // Close the request's queue span and drop its tracker entry; a rejected
+    // request never reaches prefill/decode, so this is its only cleanup point.
+    tracker.finish(req.request_id);
     if let Err(e) = executor.drop_request(req.request_id) {
         warn!(
             "failed to release state for rejected {:?}: {e}",
@@ -517,6 +540,9 @@ fn scheduler_loop<E>(
     let mut rng = StdRng::seed_from_u64(seed);
     let mut active: Vec<ActiveRequestState> = Vec::new();
     let mut next_request_id = 0u64;
+    // Host-side phase tracer (queue/prefill/decode spans). No-op when tracing
+    // is off — requests then carry no trace parent.
+    let mut tracker = phase_trace::PhaseTracker::default();
     // Requests that could not be admitted due to KV budget pressure.
     // Held here so they aren't lost; re-evaluated every loop iteration.
     let mut deferred: Vec<PendingRequest> = Vec::new();
@@ -566,17 +592,19 @@ fn scheduler_loop<E>(
                     scheduled_at_unix_s,
                 };
                 let effects = resolve_step(&executor, &active, artifacts);
-                apply_effects(&mut executor, &mut active, &mut prefilling, effects);
+                apply_effects(
+                    &mut executor,
+                    &mut active,
+                    &mut prefilling,
+                    &mut tracker,
+                    effects,
+                );
             }
         }
 
         // 1. Drain all incoming requests into deferred.
         while let Ok(req) = submit_rx.try_recv() {
-            deferred.push(PendingRequest::from_scheduler_request(
-                RequestId(next_request_id),
-                req,
-            ));
-            next_request_id += 1;
+            admit_new_request(&mut deferred, &mut tracker, &mut next_request_id, req);
         }
 
         // 2. Reclaim settled prefetches, then offer fresh requests to prefetch.
@@ -594,21 +622,13 @@ fn scheduler_loop<E>(
                 continue;
             }
             if let Some(req) = submit_rx.blocking_recv() {
-                deferred.push(PendingRequest::from_scheduler_request(
-                    RequestId(next_request_id),
-                    req,
-                ));
-                next_request_id += 1;
+                admit_new_request(&mut deferred, &mut tracker, &mut next_request_id, req);
             } else {
                 info!("Scheduler: all handles dropped, exiting");
                 return;
             }
             while let Ok(req) = submit_rx.try_recv() {
-                deferred.push(PendingRequest::from_scheduler_request(
-                    RequestId(next_request_id),
-                    req,
-                ));
-                next_request_id += 1;
+                admit_new_request(&mut deferred, &mut tracker, &mut next_request_id, req);
             }
             continue;
         }
@@ -616,7 +636,7 @@ fn scheduler_loop<E>(
         let lora_validation = reject_unknown_lora_requests(deferred, &executor);
         for rejected in &lora_validation.rejected {
             send_unknown_lora_rejection(rejected);
-            release_rejected(&mut executor, rejected);
+            release_rejected(&mut executor, &mut tracker, rejected);
         }
 
         let admission = admit_deferred_requests(
@@ -633,7 +653,7 @@ fn scheduler_loop<E>(
         );
         for (rejected, reason) in &admission.rejected {
             send_rejection(rejected, *reason);
-            release_rejected(&mut executor, rejected);
+            release_rejected(&mut executor, &mut tracker, rejected);
         }
         prefilling.extend(admission.pending);
         deferred = admission.deferred;
@@ -651,6 +671,12 @@ fn scheduler_loop<E>(
                 ),
             )
         };
+        // These requests' prompt work is about to hit the GPU this step: close
+        // their queue span, open prefill. Idempotent, so chunked prefill across
+        // steps opens the prefill span once (on the first chunk).
+        for req in &pending {
+            tracker.enter_prefill(req.request_id);
+        }
 
         let Some(plan) = runtime_plan(&executor, &active, pending) else {
             continue;
@@ -690,6 +716,7 @@ fn scheduler_loop<E>(
                             fail_touched_requests(
                                 &mut executor,
                                 &mut active,
+                                &mut tracker,
                                 failure_targets,
                                 &e.to_string(),
                             );
@@ -699,7 +726,13 @@ fn scheduler_loop<E>(
 
                 // Only apply decode effects from the unified result.
                 let effects = resolve_step(&executor, &active, artifacts);
-                apply_effects(&mut executor, &mut active, &mut prefilling, effects);
+                apply_effects(
+                    &mut executor,
+                    &mut active,
+                    &mut prefilling,
+                    &mut tracker,
+                    effects,
+                );
 
                 // Track the pending prefill for next-iteration polling.
                 inflight_prefill_pending = Some(pending_for_poll);
@@ -712,12 +745,24 @@ fn scheduler_loop<E>(
             Ok(v) => v,
             Err(e) => {
                 warn!("Execution step failed: {e}");
-                fail_touched_requests(&mut executor, &mut active, failure_targets, &e.to_string());
+                fail_touched_requests(
+                    &mut executor,
+                    &mut active,
+                    &mut tracker,
+                    failure_targets,
+                    &e.to_string(),
+                );
                 continue;
             }
         };
         let effects = resolve_step(&executor, &active, artifacts);
-        apply_effects(&mut executor, &mut active, &mut prefilling, effects);
+        apply_effects(
+            &mut executor,
+            &mut active,
+            &mut prefilling,
+            &mut tracker,
+            effects,
+        );
     }
 }
 
@@ -739,6 +784,7 @@ fn scheduler_loop_with_lora_control<E>(
     let mut prefilling: Vec<PendingRequest> = Vec::new();
     let mut pending_control: VecDeque<EngineControlRequest> = VecDeque::new();
     let mut post_control_deferred: Vec<PendingRequest> = Vec::new();
+    let mut tracker = phase_trace::PhaseTracker::default();
 
     info!("Scheduler ready with LoRA control");
 
@@ -760,6 +806,7 @@ fn scheduler_loop_with_lora_control<E>(
                 &mut pending_control,
                 &mut post_control_deferred,
                 &mut next_request_id,
+                &mut tracker,
             );
         }
 
@@ -796,6 +843,7 @@ fn scheduler_loop_with_lora_control<E>(
                     &mut pending_control,
                     &mut post_control_deferred,
                     &mut next_request_id,
+                    &mut tracker,
                 );
                 // Back to the top like the non-LoRA loop: republish the load
                 // snapshot (the new request must show as waiting before its
@@ -810,7 +858,7 @@ fn scheduler_loop_with_lora_control<E>(
         let lora_validation = reject_unknown_lora_requests(deferred, &executor);
         for rejected in &lora_validation.rejected {
             send_unknown_lora_rejection(rejected);
-            release_rejected(&mut executor, rejected);
+            release_rejected(&mut executor, &mut tracker, rejected);
         }
 
         let admission = admit_deferred_requests(
@@ -827,12 +875,15 @@ fn scheduler_loop_with_lora_control<E>(
         );
         for (rejected, reason) in &admission.rejected {
             send_rejection(rejected, *reason);
-            release_rejected(&mut executor, rejected);
+            release_rejected(&mut executor, &mut tracker, rejected);
         }
         prefilling.extend(admission.pending);
         deferred = admission.deferred;
         // LoRA rejects --batch-invariant upstream, so Pin never runs on this path.
         let pending = take_prefill_chunks(&mut prefilling, max_prefill_tokens, false);
+        for req in &pending {
+            tracker.enter_prefill(req.request_id);
+        }
 
         if active.is_empty() && pending.is_empty() {
             // A parked load must still be polled to completion before we block.
@@ -848,6 +899,7 @@ fn scheduler_loop_with_lora_control<E>(
                     &mut pending_control,
                     &mut post_control_deferred,
                     &mut next_request_id,
+                    &mut tracker,
                 );
             } else {
                 info!("Scheduler: all handles dropped, exiting");
@@ -864,12 +916,24 @@ fn scheduler_loop_with_lora_control<E>(
             Ok(v) => v,
             Err(e) => {
                 warn!("Execution step failed: {e}");
-                fail_touched_requests(&mut executor, &mut active, failure_targets, &e.to_string());
+                fail_touched_requests(
+                    &mut executor,
+                    &mut active,
+                    &mut tracker,
+                    failure_targets,
+                    &e.to_string(),
+                );
                 continue;
             }
         };
         let effects = resolve_step(&executor, &active, artifacts);
-        apply_effects(&mut executor, &mut active, &mut prefilling, effects);
+        apply_effects(
+            &mut executor,
+            &mut active,
+            &mut prefilling,
+            &mut tracker,
+            effects,
+        );
     }
 }
 
@@ -879,11 +943,14 @@ fn enqueue_engine_command(
     pending_control: &mut VecDeque<EngineControlRequest>,
     post_control_deferred: &mut Vec<PendingRequest>,
     next_request_id: &mut u64,
+    tracker: &mut phase_trace::PhaseTracker,
 ) {
     match command {
         EngineCommand::Generate(req) => {
-            let pending = PendingRequest::from_scheduler_request(RequestId(*next_request_id), req);
+            let id = RequestId(*next_request_id);
             *next_request_id += 1;
+            tracker.enter_queue(id, req.trace_parent);
+            let pending = PendingRequest::from_scheduler_request(id, req);
             if pending_control.is_empty() {
                 deferred.push(pending);
             } else {
@@ -1288,6 +1355,7 @@ fn pending_failure_target(req: &PendingRequest) -> RequestFailureTarget {
 fn fail_touched_requests(
     executor: &mut impl ModelExecutor,
     active: &mut Vec<ActiveRequestState>,
+    tracker: &mut phase_trace::PhaseTracker,
     targets: Vec<RequestFailureTarget>,
     message: &str,
 ) {
@@ -1297,6 +1365,9 @@ fn fail_touched_requests(
             prompt_tokens: target.prompt_tokens,
             completion_tokens: target.completion_tokens,
         });
+        // Close the request's open phase span; an execution error is a
+        // termination path like any other finish.
+        tracker.finish(target.request_id);
         if let Err(error) = executor.drop_request(target.request_id) {
             warn!(
                 "failed to drop request state after execution error for {:?}: {error}",

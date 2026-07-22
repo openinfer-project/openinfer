@@ -93,6 +93,7 @@ impl Harness {
         let token_tx = TokenSink::new(tag.clone(), self.tx.clone(), abort);
         self.handle
             .submit(GenerateRequest {
+                trace_parent: None,
                 request_id: Some(request_id),
                 queued_at_unix_s: None,
                 data_parallel_rank: None,

@@ -43,6 +43,7 @@ pub(super) fn request(
 ) -> GenerateRequest {
     let (token_tx, _token_rx) = openinfer_core::engine::TokenSink::standalone();
     GenerateRequest {
+        trace_parent: None,
         request_id: None,
         queued_at_unix_s: None,
         data_parallel_rank: None,

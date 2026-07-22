@@ -7,6 +7,7 @@ version = "0.1.0"
 [dependencies]
 anyhow = { workspace = true }
 axum = { workspace = true }
+fastrace = { workspace = true }
 log = { workspace = true }
 openinfer-engine = { workspace = true }
 rmp-serde = { workspace = true }

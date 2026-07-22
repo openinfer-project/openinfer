@@ -332,6 +332,7 @@ fn submit(
     let (tx, rx) = TokenSink::standalone();
     engine
         .submit(openinfer_core::engine::GenerateRequest {
+            trace_parent: None,
             request_id: Some(label.clone()),
             queued_at_unix_s: None,
             data_parallel_rank: None,

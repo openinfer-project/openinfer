@@ -765,6 +765,7 @@ mod tests {
     ) -> (GenerateRequest, openinfer_core::engine::TokenStreamReceiver) {
         let (token_tx, token_rx) = TokenSink::standalone();
         let req = GenerateRequest {
+            trace_parent: None,
             request_id: None,
             queued_at_unix_s: None,
             data_parallel_rank: None,

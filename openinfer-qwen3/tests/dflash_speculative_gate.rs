@@ -149,6 +149,7 @@ fn generate(
     let (token_tx, mut rx) = TokenSink::standalone();
     handle
         .submit(GenerateRequest {
+            trace_parent: None,
             request_id: None,
             queued_at_unix_s: None,
             data_parallel_rank: None,
@@ -192,6 +193,7 @@ fn generate_concurrent(handle: &EngineHandle, requests: Vec<(Vec<u32>, usize)>) 
             let (token_tx, rx) = TokenSink::standalone();
             handle
                 .submit(GenerateRequest {
+                    trace_parent: None,
                     request_id: None,
                     queued_at_unix_s: None,
                     data_parallel_rank: None,
@@ -245,6 +247,7 @@ fn prefill_next(handle: &EngineHandle, context: Vec<u32>, logprobs: usize) -> St
     let (token_tx, mut rx) = TokenSink::standalone();
     handle
         .submit(GenerateRequest {
+            trace_parent: None,
             request_id: None,
             queued_at_unix_s: None,
             data_parallel_rank: None,
@@ -705,6 +708,7 @@ fn dflash_request_in_draft_headroom_is_rejected_not_panicked() {
     let (token_tx, mut rx) = TokenSink::standalone();
     handle
         .submit(GenerateRequest {
+            trace_parent: None,
             request_id: None,
             queued_at_unix_s: None,
             data_parallel_rank: None,

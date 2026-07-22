@@ -110,6 +110,7 @@ pub(super) fn apply_effects(
     executor: &mut impl crate::executor::ModelExecutor,
     active: &mut Vec<ActiveRequestState>,
     prefilling: &mut Vec<PendingRequest>,
+    tracker: &mut super::phase_trace::PhaseTracker,
     effects: StepEffects,
 ) {
     // `Finished` events are not sent inline: they are collected here and
@@ -162,6 +163,7 @@ pub(super) fn apply_effects(
                         completion_tokens,
                     },
                 ));
+                tracker.finish(request_id);
                 let _ = executor.drop_request(request_id);
                 to_retire.push(index);
             }
@@ -194,6 +196,7 @@ pub(super) fn apply_effects(
                         },
                     ));
                 }
+                tracker.finish(request_id);
                 let _ = executor.drop_request(request_id);
                 to_retire.push(index);
             }
@@ -216,6 +219,7 @@ pub(super) fn apply_effects(
                         "request dropped: client disconnected: request_id={:?} tokens_generated={}",
                         request_id, completion_tokens
                     );
+                    tracker.finish(request_id);
                     let _ = executor.drop_request(request_id);
                     to_retire.push(index);
                 } else {
@@ -256,6 +260,7 @@ pub(super) fn apply_effects(
                         "request dropped: client disconnected: request_id={:?} tokens_generated={}",
                         request_id, completion_tokens
                     );
+                    tracker.finish(request_id);
                     let _ = executor.drop_request(request_id);
                     to_retire.push(index);
                 }
@@ -298,6 +303,7 @@ pub(super) fn apply_effects(
                         },
                     ));
                 }
+                tracker.finish(request_id);
                 let _ = executor.drop_request(request_id);
                 to_retire.push(index);
             }
@@ -318,6 +324,7 @@ pub(super) fn apply_effects(
         match effect {
             PendingEffect::ContinuePrefill { req } => {
                 if req.token_tx.is_closed() {
+                    tracker.finish(req.request_id);
                     let _ = executor.drop_request(req.request_id);
                 } else {
                     continued.push(req);
@@ -342,6 +349,7 @@ pub(super) fn apply_effects(
                         completion_tokens,
                     },
                 ));
+                tracker.finish(request_id);
                 let _ = executor.drop_request(request_id);
             }
             PendingEffect::EmitAndFinish {
@@ -370,6 +378,7 @@ pub(super) fn apply_effects(
                         },
                     ));
                 }
+                tracker.finish(request_id);
                 let _ = executor.drop_request(request_id);
             }
             PendingEffect::Promote {
@@ -385,8 +394,10 @@ pub(super) fn apply_effects(
                     })
                     .is_ok()
                 {
+                    tracker.enter_decode(state.request_id);
                     active.push(state);
                 } else {
+                    tracker.finish(state.request_id);
                     let _ = executor.drop_request(state.request_id);
                 }
             }

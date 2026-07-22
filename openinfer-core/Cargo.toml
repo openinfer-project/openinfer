@@ -9,16 +9,22 @@ anyhow = { workspace = true }
 chrono = { workspace = true }
 colored = { workspace = true }
 cudarc = { workspace = true }
+fastrace = { workspace = true }
+fastrace-opentelemetry = { workspace = true }
 half = { workspace = true }
 libc = { workspace = true }
 log = { workspace = true }
 logforth = { workspace = true }
 memmap2 = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+opentelemetry_sdk = { workspace = true }
 openinfer-engine = { workspace = true }
 openinfer-kernels = { workspace = true }
 parking_lot = { workspace = true }
 safetensors = { workspace = true }
 serde_json = { workspace = true }
+tokio = { workspace = true }
 
 [features]
 default = []

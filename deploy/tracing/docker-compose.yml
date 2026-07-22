@@ -1,0 +1,45 @@
+# Trace backend: Grafana + Tempo.
+#
+# Tempo stores spans and answers TraceQL; Grafana is the UI. openinfer exports
+# over OTLP/gRPC (unchanged Rust side) — point OPENINFER_TRACE_OTLP_ENDPOINT at
+# Tempo's 4317.
+#
+#   docker compose -f deploy/tracing/docker-compose.yml up -d
+#   OPENINFER_TRACE_OTLP_ENDPOINT=http://127.0.0.1:4317 \
+#     cargo run --release -- --model-path /path/to/Qwen3-4B
+#   # open http://localhost:3000 → Explore → Tempo → TraceQL, e.g.
+#   #   { name="ttft" && duration > 500ms }
+#   # to find every request whose time-to-first-token blew past 500ms.
+#
+# Switching backend later (VictoriaTraces, etc.) is an endpoint/image change,
+# not a code change — everything downstream of OTLP is swappable.
+
+services:
+  tempo:
+    image: grafana/tempo:2.6.1
+    container_name: openinfer-tempo
+    restart: unless-stopped
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    volumes:
+      - ./tempo.yaml:/etc/tempo/tempo.yaml:ro
+    ports:
+      - "4317:4317"    # OTLP gRPC (openinfer exports here)
+      - "4318:4318"    # OTLP HTTP
+      - "3200:3200"    # Tempo query API (Grafana talks to this internally)
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    container_name: openinfer-grafana
+    restart: unless-stopped
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      # Enable the TraceQL editor and search UX.
+      GF_FEATURE_TOGGLES_ENABLE: "traceqlEditor traceqlSearch"
+    volumes:
+      - ./grafana-datasource.yaml:/etc/grafana/provisioning/datasources/tempo.yaml:ro
+    ports:
+      - "3000:3000"    # Grafana UI
+    depends_on:
+      - tempo

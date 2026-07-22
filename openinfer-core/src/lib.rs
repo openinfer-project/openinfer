@@ -11,4 +11,5 @@ pub mod page_pool;
 pub mod parallel;
 pub mod sampler;
 pub mod tensor;
+pub mod tracing;
 pub mod weight_loader;

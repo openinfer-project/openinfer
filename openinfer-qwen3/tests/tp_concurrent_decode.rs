@@ -125,6 +125,7 @@ fn tp2_graph_dump_when_available_and_concurrent_decode_complete() {
             let (token_tx, rx) = TokenSink::standalone();
             handle
                 .submit(GenerateRequest {
+                    trace_parent: None,
                     request_id: None,
                     queued_at_unix_s: None,
                     data_parallel_rank: None,
