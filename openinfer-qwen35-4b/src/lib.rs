@@ -287,7 +287,8 @@ mod tests {
             1,
             Qwen35SchedulerPolicy::Auto,
         )
-        .unwrap_err()
+        .err()
+        .expect("scheduler policy validation should reject TP launch")
         .to_string();
 
         assert!(err.contains("scheduler policy"));
