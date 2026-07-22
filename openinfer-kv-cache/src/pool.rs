@@ -287,6 +287,8 @@ impl LoadReservation {
     }
 
     /// Number of reserved destination blocks.
+    // `is_empty` was dead code (hawk sweep, #743); `len` stands alone.
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.blocks.len()
     }
