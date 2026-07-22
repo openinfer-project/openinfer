@@ -535,16 +535,22 @@ fn execute_step_on_lane(
             // H2D copies are complete before green streams touch them.
             lane.model.device_ctx().sync()?;
 
+            // Arm before entering execute_prefill: a failed forward may still
+            // have submitted kernels. Until lane.inflight_prefill owns the
+            // launched work, every return path must first quiesce this stream.
+            let mut launched_prefill = LaunchedStreamGuard::new_prefill(prefill_stream.0);
+
             // Launch prefill on prefill partition stream.
-            let (prefill_logits, _, _) = {
+            let prefill_logits = {
                 let _prefill_override = unsafe { StreamOverrideGuard::activate(prefill_stream.0) };
-                lane.execute_prefill(
+                let (prefill_logits, _, _) = lane.execute_prefill(
                     &prefill_prompts,
                     prefill_kv_views,
                     &prefill_lora_adapters,
                     false,
                     None,
-                )?
+                )?;
+                crate::prefill::DeferredDrop::new(prefill_logits)
             };
 
             // Launch decode on the decode partition stream. CUDA graph stays
@@ -552,6 +558,7 @@ fn execute_step_on_lane(
             // the active stream override, so the replayed kernel nodes stay
             // pinned to the decode SM partition (CUDA PG §4.6.5 — capture stream
             // determines a node's execution context).
+            let mut launched_decode = LaunchedStreamGuard::new(decode_stream.0, "decode");
             {
                 let _decode_override = unsafe { StreamOverrideGuard::activate(decode_stream.0) };
                 lane.execute_decode(&decode_tokens, decode_kv_views, &decode_lora_adapters)?;
@@ -559,10 +566,7 @@ fn execute_step_on_lane(
 
             // Only sync decode stream — decode result is ready for sampling.
             // Prefill continues async on GPU; polled later via event.
-            let r = unsafe { cudarc::driver::sys::cuStreamSynchronize(decode_stream.0) };
-            if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-                anyhow::bail!("cuStreamSynchronize(decode) failed: {r:?}");
-            }
+            launched_decode.quiesce();
 
             if collect_result {
                 // Sample decode tokens immediately.
@@ -573,48 +577,29 @@ fn execute_step_on_lane(
                 // cuGreenCtxRecordEvent; plain overlap streams use cuEventRecord.
                 // Both creation and recording are checked before the event is
                 // handed to the scheduler.
-                let event = match crate::green_ctx::record_stream_event(
-                    prefill_stream.0,
-                    *prefill_green_ctx,
-                ) {
-                    Ok(event) => event,
-                    Err(error) => {
-                        // The prefill kernels were already launched. Before
-                        // returning the event error, establish stream
-                        // quiescence so local GPU buffers can be dropped safely.
-                        let sync =
-                            unsafe { cudarc::driver::sys::cuStreamSynchronize(prefill_stream.0) };
-                        if sync != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-                            log::error!(
-                                "FATAL: prefill event setup failed ({error:#}) and \
-                                 cuStreamSynchronize(prefill) also failed ({sync:?}); aborting"
-                            );
-                            std::process::abort();
-                        }
-                        return Err(error);
-                    }
-                };
+                let event =
+                    crate::green_ctx::record_stream_event(prefill_stream.0, *prefill_green_ctx)?;
+                let prefill_event = AsyncPrefillEvent::new(event);
+                let prefill_requests = prefill_requests.clone();
 
                 // Store prefill state for deferred sync+sample.
                 lane.inflight_prefill = Some(InflightPrefillState {
                     prefill_stream: prefill_stream.0,
-                    prefill_logits,
-                    prefill_requests: prefill_requests.clone(),
+                    prefill_logits: prefill_logits.into_inner(),
+                    prefill_requests,
                     sample_seed: *sample_seed,
                 });
+                launched_prefill.disarm();
 
                 Ok(WorkerStepOutcome::SplitDecodeReady {
                     decode: DecodeResult {
                         requests: decode_result,
                     },
-                    prefill_event: SendEvent(event),
+                    prefill_event,
                 })
             } else {
                 // Non-primary worker: still need to sync prefill before returning.
-                let r = unsafe { cudarc::driver::sys::cuStreamSynchronize(prefill_stream.0) };
-                if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-                    anyhow::bail!("cuStreamSynchronize(prefill) failed: {r:?}");
-                }
+                launched_prefill.quiesce();
                 Ok(WorkerStepOutcome::Ack)
             }
         }
@@ -1088,18 +1073,216 @@ struct ExecutorKvEvents {
 
 /// State for an in-flight async prefill on the prefill overlap stream.
 struct AsyncPrefillState {
-    event: cudarc::driver::sys::CUevent,
+    event: AsyncPrefillEvent,
 }
 
 // SAFETY: AsyncPrefillState is only accessed from the single executor/scheduler
 // thread that owns the GPU context. The raw CUevent pointer is not shared.
 unsafe impl Send for AsyncPrefillState {}
 
-/// Wrapper to send CUevent across the worker→executor channel boundary.
-/// SAFETY: The event is created on the worker thread's GPU context and consumed
-/// on the executor thread (same device, sequential access).
-struct SendEvent(cudarc::driver::sys::CUevent);
-unsafe impl Send for SendEvent {}
+/// Owns an event from worker creation through executor-side completion.
+///
+/// Dropping an event before the executor installs it still establishes GPU
+/// quiescence. This covers worker aggregation failures and every early return
+/// in the worker-to-executor handoff without relying on callers to remember a
+/// cleanup branch.
+struct AsyncPrefillEvent {
+    raw: cudarc::driver::sys::CUevent,
+    #[cfg(test)]
+    synchronize_override: Option<fn(cudarc::driver::sys::CUevent) -> cudarc::driver::sys::CUresult>,
+    #[cfg(test)]
+    destroy_override: Option<fn(cudarc::driver::sys::CUevent) -> cudarc::driver::sys::CUresult>,
+}
+
+impl AsyncPrefillEvent {
+    fn new(raw: cudarc::driver::sys::CUevent) -> Self {
+        Self {
+            raw,
+            #[cfg(test)]
+            synchronize_override: None,
+            #[cfg(test)]
+            destroy_override: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_operations(
+        raw: cudarc::driver::sys::CUevent,
+        synchronize: fn(cudarc::driver::sys::CUevent) -> cudarc::driver::sys::CUresult,
+        destroy: fn(cudarc::driver::sys::CUevent) -> cudarc::driver::sys::CUresult,
+    ) -> Self {
+        Self {
+            raw,
+            synchronize_override: Some(synchronize),
+            destroy_override: Some(destroy),
+        }
+    }
+
+    fn raw(&self) -> cudarc::driver::sys::CUevent {
+        self.raw
+    }
+
+    fn synchronize(&self) -> cudarc::driver::sys::CUresult {
+        #[cfg(test)]
+        if let Some(synchronize) = self.synchronize_override {
+            return synchronize(self.raw);
+        }
+        unsafe { cudarc::driver::sys::cuEventSynchronize(self.raw) }
+    }
+
+    #[cfg(test)]
+    fn destroy(&self, event: cudarc::driver::sys::CUevent) -> cudarc::driver::sys::CUresult {
+        if let Some(destroy) = self.destroy_override {
+            return destroy(event);
+        }
+        unsafe { cudarc::driver::sys::cuEventDestroy_v2(event) }
+    }
+
+    /// Destroy an event after query/synchronize already proved completion.
+    fn destroy_completed(mut self, operation: &'static str) {
+        let event = std::mem::replace(&mut self.raw, std::ptr::null_mut());
+        #[cfg(test)]
+        let status = self.destroy(event);
+        #[cfg(not(test))]
+        let status = unsafe { cudarc::driver::sys::cuEventDestroy_v2(event) };
+        handle_completed_prefill_event_destroy(status, operation);
+    }
+}
+
+// SAFETY: The event is created on a worker thread and then moved through a
+// channel to the executor thread on the same device. Access is sequential.
+unsafe impl Send for AsyncPrefillEvent {}
+
+impl Drop for AsyncPrefillEvent {
+    fn drop(&mut self) {
+        if self.raw.is_null() {
+            return;
+        }
+        let status = self.synchronize();
+        if status != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+            log::error!(
+                "FATAL: an untransferred async prefill event could not establish stream \
+                 quiescence ({status:?}); aborting"
+            );
+            std::process::abort();
+        }
+        #[cfg(test)]
+        let destroy = self.destroy(self.raw);
+        #[cfg(not(test))]
+        let destroy = unsafe { cudarc::driver::sys::cuEventDestroy_v2(self.raw) };
+        handle_completed_prefill_event_destroy(destroy, "untransferred async prefill");
+        self.raw = std::ptr::null_mut();
+    }
+}
+
+/// CUDA calls may submit work before returning an error. Keep this guard armed
+/// across each fallible launch interval. Prefill disarms only after
+/// `LocalQwen3Lane::inflight_prefill` owns it; decode explicitly quiesces before
+/// its result can be applied. A prefill synchronization also drains temporaries
+/// whose destruction was deferred by the launched forward.
+struct LaunchedStreamGuard {
+    stream: cudarc::driver::sys::CUstream,
+    operation: &'static str,
+    armed: bool,
+    drain_prefill_deferred_drops: bool,
+    #[cfg(test)]
+    synchronize_override:
+        Option<fn(cudarc::driver::sys::CUstream) -> cudarc::driver::sys::CUresult>,
+}
+
+impl LaunchedStreamGuard {
+    fn new(stream: cudarc::driver::sys::CUstream, operation: &'static str) -> Self {
+        Self {
+            stream,
+            operation,
+            armed: true,
+            drain_prefill_deferred_drops: false,
+            #[cfg(test)]
+            synchronize_override: None,
+        }
+    }
+
+    fn new_prefill(stream: cudarc::driver::sys::CUstream) -> Self {
+        Self {
+            stream,
+            operation: "prefill",
+            armed: true,
+            drain_prefill_deferred_drops: true,
+            #[cfg(test)]
+            synchronize_override: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_synchronizer(
+        stream: cudarc::driver::sys::CUstream,
+        operation: &'static str,
+        drain_prefill_deferred_drops: bool,
+        synchronize: fn(cudarc::driver::sys::CUstream) -> cudarc::driver::sys::CUresult,
+    ) -> Self {
+        Self {
+            stream,
+            operation,
+            armed: true,
+            drain_prefill_deferred_drops,
+            synchronize_override: Some(synchronize),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    fn quiesce(&mut self) {
+        self.synchronize_or_abort();
+        self.disarm();
+    }
+
+    fn synchronize_or_abort(&self) {
+        #[cfg(test)]
+        let status = if let Some(synchronize) = self.synchronize_override {
+            synchronize(self.stream)
+        } else {
+            unsafe { cudarc::driver::sys::cuStreamSynchronize(self.stream) }
+        };
+        #[cfg(not(test))]
+        let status = unsafe { cudarc::driver::sys::cuStreamSynchronize(self.stream) };
+
+        if status != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+            let operation = self.operation;
+            log::error!(
+                "FATAL: launched {operation} work was not safely handed off and \
+                 cuStreamSynchronize({operation}) failed ({status:?}); aborting"
+            );
+            std::process::abort();
+        }
+        if self.drain_prefill_deferred_drops {
+            crate::prefill::drain_deferred_drops();
+        }
+    }
+}
+
+impl Drop for LaunchedStreamGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.synchronize_or_abort();
+        }
+    }
+}
+
+fn handle_completed_prefill_event_destroy(
+    status: cudarc::driver::sys::CUresult,
+    operation: &'static str,
+) {
+    if status != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+        // Completion is already proven, so this cannot race KV/buffer reuse.
+        // Keep serving while making the driver-resource leak observable.
+        log::error!(
+            "cuEventDestroy_v2({operation}) failed after async prefill completion \
+             was proven ({status:?}); continuing"
+        );
+    }
+}
 
 /// One request's in-flight CPU-tier KV prefetch.
 ///
@@ -2734,6 +2917,14 @@ impl ModelExecutor for Qwen3Executor {
     }
 
     fn execute_unified(&mut self, plan: UnifiedPlan<'_>) -> Result<UnifiedResult> {
+        // Scheduler admission normally prevents overlap here. Resolve first if
+        // a direct caller reaches this method with an older prefill in flight,
+        // before a new worker step can replace its worker-side state.
+        if self.async_prefill.is_some() {
+            self.wait_async_prefill()
+                .context("resolve previous async prefill before unified step")?;
+        }
+
         // 1. Create RequestKvs for prefill requests (first chunk only), clamp
         // chunk budgets, schedule KV for this step's tokens
         let mut prefill_requests = plan.prefill_requests.to_vec();
@@ -2822,10 +3013,12 @@ impl ModelExecutor for Qwen3Executor {
             }
             WorkerStepOutcome::SplitDecodeReady {
                 decode: decode_result,
-                prefill_event: SendEvent(event),
+                prefill_event,
             } => {
                 // SM-partition path: decode done, prefill still in-flight.
-                // Apply decode immediately.
+                // `prefill_event` remains armed across every fallible decode
+                // update. An early return synchronizes it before the scheduler
+                // can recycle any request KV pages.
                 for req_result in &decode_result.requests {
                     let rkv = self
                         .request_kvs
@@ -2836,28 +3029,11 @@ impl ModelExecutor for Qwen3Executor {
                 for req_result in &decode_result.requests {
                     self.save_sealed_blocks(req_result.request_id);
                 }
-                // Store event for non-blocking poll by scheduler.
-                // If a previous async prefill wasn't consumed, wait for it now.
-                if let Some(old) = self.async_prefill.take() {
-                    unsafe {
-                        cudarc::driver::sys::cuEventSynchronize(old.event);
-                    }
-                    unsafe {
-                        cudarc::driver::sys::cuEventDestroy_v2(old.event);
-                    }
-                    // Force resolve the worker's inflight prefill too
-                    if let Ok(rx) = self.primary.resolve_prefill() {
-                        if let Ok(Ok(result)) = rx.recv() {
-                            for req_result in &result.requests {
-                                let _ = self.apply_prefill_result(req_result);
-                            }
-                            for req_result in &result.requests {
-                                self.save_sealed_blocks(req_result.request_id);
-                            }
-                        }
-                    }
-                }
-                self.async_prefill = Some(AsyncPrefillState { event });
+                // This is the durable executor-side handoff. From here on the
+                // scheduler's poll/wait path owns completion and cleanup.
+                self.async_prefill = Some(AsyncPrefillState {
+                    event: prefill_event,
+                });
                 // Return a UnifiedResult with empty prefill — scheduler will
                 // get prefill results via poll_async_prefill.
                 Ok(UnifiedResult {
@@ -3064,7 +3240,7 @@ impl ModelExecutor for Qwen3Executor {
     fn poll_async_prefill(&mut self) -> Option<PrefillResult> {
         let state = self.async_prefill.as_ref()?;
         // Non-blocking check: is the prefill stream done?
-        let status = unsafe { cudarc::driver::sys::cuEventQuery(state.event) };
+        let status = unsafe { cudarc::driver::sys::cuEventQuery(state.event.raw()) };
         match status {
             cudarc::driver::sys::CUresult::CUDA_ERROR_NOT_READY => return None,
             cudarc::driver::sys::CUresult::CUDA_SUCCESS => {}
@@ -3078,9 +3254,7 @@ impl ModelExecutor for Qwen3Executor {
         }
         // Prefill is done — resolve it via the worker.
         let event = self.async_prefill.take().unwrap().event;
-        unsafe {
-            cudarc::driver::sys::cuEventDestroy_v2(event);
-        }
+        event.destroy_completed("completed async prefill");
 
         // Ask worker to sync + sample the prefill result.
         let Ok(rx) = self.primary.resolve_prefill() else {
@@ -3105,7 +3279,7 @@ impl ModelExecutor for Qwen3Executor {
             .async_prefill
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("no async prefill is in flight"))?;
-        let status = unsafe { cudarc::driver::sys::cuEventSynchronize(state.event) };
+        let status = unsafe { cudarc::driver::sys::cuEventSynchronize(state.event.raw()) };
         if status != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
             // The event is the only proof that the prefill stream stopped using
             // its temporary buffers. Returning an error would immediately drop
@@ -3124,8 +3298,134 @@ impl ModelExecutor for Qwen3Executor {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
 
+    use super::AsyncPrefillEvent;
+    use super::LaunchedStreamGuard;
     use super::ensure_lora_capacity;
+    use crate::prefill::DeferredDrop;
+
+    static STREAM_SYNCHRONIZATIONS: AtomicUsize = AtomicUsize::new(0);
+    static EVENT_SYNCHRONIZATIONS: AtomicUsize = AtomicUsize::new(0);
+    static EVENT_DESTROYS: AtomicUsize = AtomicUsize::new(0);
+    static DEFERRED_DROP_ORDER: AtomicUsize = AtomicUsize::new(0);
+
+    struct DropAfterPrefillSync;
+
+    impl Drop for DropAfterPrefillSync {
+        fn drop(&mut self) {
+            assert_eq!(DEFERRED_DROP_ORDER.load(Ordering::SeqCst), 1);
+            DEFERRED_DROP_ORDER.store(2, Ordering::SeqCst);
+        }
+    }
+
+    fn successful_stream_synchronize(
+        _stream: cudarc::driver::sys::CUstream,
+    ) -> cudarc::driver::sys::CUresult {
+        STREAM_SYNCHRONIZATIONS.fetch_add(1, Ordering::SeqCst);
+        cudarc::driver::sys::CUresult::CUDA_SUCCESS
+    }
+
+    fn successful_event_synchronize(
+        _event: cudarc::driver::sys::CUevent,
+    ) -> cudarc::driver::sys::CUresult {
+        EVENT_SYNCHRONIZATIONS.fetch_add(1, Ordering::SeqCst);
+        cudarc::driver::sys::CUresult::CUDA_SUCCESS
+    }
+
+    fn successful_event_destroy(
+        _event: cudarc::driver::sys::CUevent,
+    ) -> cudarc::driver::sys::CUresult {
+        EVENT_DESTROYS.fetch_add(1, Ordering::SeqCst);
+        cudarc::driver::sys::CUresult::CUDA_SUCCESS
+    }
+
+    fn ordered_stream_synchronize(
+        _stream: cudarc::driver::sys::CUstream,
+    ) -> cudarc::driver::sys::CUresult {
+        DEFERRED_DROP_ORDER
+            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+            .expect("prefill stream must synchronize before deferred resources drop");
+        cudarc::driver::sys::CUresult::CUDA_SUCCESS
+    }
+
+    fn return_after_launch() -> anyhow::Result<()> {
+        let _guard = LaunchedStreamGuard::with_synchronizer(
+            std::ptr::null_mut(),
+            "prefill",
+            true,
+            successful_stream_synchronize,
+        );
+        anyhow::bail!("injected post-launch failure")
+    }
+
+    #[test]
+    fn async_prefill_ownership_guards_cover_early_return_and_handoff() {
+        STREAM_SYNCHRONIZATIONS.store(0, Ordering::SeqCst);
+        EVENT_SYNCHRONIZATIONS.store(0, Ordering::SeqCst);
+        EVENT_DESTROYS.store(0, Ordering::SeqCst);
+
+        assert!(return_after_launch().is_err());
+        assert_eq!(STREAM_SYNCHRONIZATIONS.load(Ordering::SeqCst), 1);
+
+        {
+            let mut guard = LaunchedStreamGuard::with_synchronizer(
+                std::ptr::null_mut(),
+                "prefill",
+                true,
+                successful_stream_synchronize,
+            );
+            guard.quiesce();
+        }
+        assert_eq!(STREAM_SYNCHRONIZATIONS.load(Ordering::SeqCst), 2);
+
+        {
+            let mut guard = LaunchedStreamGuard::with_synchronizer(
+                std::ptr::null_mut(),
+                "prefill",
+                true,
+                successful_stream_synchronize,
+            );
+            guard.disarm();
+        }
+        assert_eq!(STREAM_SYNCHRONIZATIONS.load(Ordering::SeqCst), 2);
+
+        let fake_event: cudarc::driver::sys::CUevent = std::ptr::dangling_mut();
+        drop(AsyncPrefillEvent::with_operations(
+            fake_event,
+            successful_event_synchronize,
+            successful_event_destroy,
+        ));
+        assert_eq!(EVENT_SYNCHRONIZATIONS.load(Ordering::SeqCst), 1);
+        assert_eq!(EVENT_DESTROYS.load(Ordering::SeqCst), 1);
+
+        AsyncPrefillEvent::with_operations(
+            fake_event,
+            successful_event_synchronize,
+            successful_event_destroy,
+        )
+        .destroy_completed("test completion");
+        assert_eq!(EVENT_SYNCHRONIZATIONS.load(Ordering::SeqCst), 1);
+        assert_eq!(EVENT_DESTROYS.load(Ordering::SeqCst), 2);
+
+        DEFERRED_DROP_ORDER.store(0, Ordering::SeqCst);
+        let guard = LaunchedStreamGuard::with_synchronizer(
+            std::ptr::null_mut(),
+            "prefill",
+            true,
+            ordered_stream_synchronize,
+        );
+        {
+            let _override = unsafe {
+                openinfer_kernels::tensor::StreamOverrideGuard::activate(std::ptr::null_mut())
+            };
+            drop(DeferredDrop::new(DropAfterPrefillSync));
+        }
+        assert_eq!(DEFERRED_DROP_ORDER.load(Ordering::SeqCst), 0);
+        drop(guard);
+        assert_eq!(DEFERRED_DROP_ORDER.load(Ordering::SeqCst), 2);
+    }
 
     #[test]
     fn lora_capacity_rejects_new_adapter_at_limit() {
@@ -3161,6 +3461,9 @@ mod tests {
 
 impl Drop for Qwen3Executor {
     fn drop(&mut self) {
+        // Establish prefill quiescence before worker shutdown drops the lane's
+        // inflight state and its GPU buffers.
+        drop(self.async_prefill.take());
         self.primary.shutdown();
         for worker in &mut self.workers {
             worker.shutdown();
@@ -3394,7 +3697,10 @@ impl LocalQwen3Lane {
         // Sync prefill stream
         let r = unsafe { cudarc::driver::sys::cuStreamSynchronize(state.prefill_stream) };
         if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-            anyhow::bail!("cuStreamSynchronize(prefill) failed: {r:?}");
+            // The state owns GPU buffers that may still be referenced by the
+            // stream. Returning would drop them without proof of quiescence.
+            log::error!("FATAL: cuStreamSynchronize(inflight prefill) failed ({r:?}); aborting");
+            std::process::abort();
         }
 
         // Now safe to drop deferred GPU buffers (prefill kernels are done).
@@ -3746,7 +4052,7 @@ enum WorkerStepOutcome {
         decode: DecodeResult,
         /// Event recorded on prefill stream after all prefill kernels;
         /// query this to check if prefill is done without blocking.
-        prefill_event: SendEvent,
+        prefill_event: AsyncPrefillEvent,
     },
     SpeculativeVerify(VerifyResult),
     SpeculativeDraft(DraftResult),
