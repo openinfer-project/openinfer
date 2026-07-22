@@ -1,5 +1,6 @@
 //! Safetensors weight loading and RoPE precomputation.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::FileExt;
@@ -265,29 +266,49 @@ fn find_tensor<'a>(
     }
 }
 
-#[allow(clippy::cast_ptr_alignment)]
-fn tensor_as_bf16<'d>(
+fn tensor_bf16_bytes<'d>(
     tensor: &safetensors::tensor::TensorView<'d>,
     name: &str,
-) -> Result<&'d [bf16]> {
+) -> Result<&'d [u8]> {
     anyhow::ensure!(
         tensor.dtype() == Dtype::BF16,
         "Tensor '{name}': expected dtype BF16, got {:?}",
         tensor.dtype()
     );
     let data = tensor.data();
-    // safetensors does not guarantee data-section alignment, and a misaligned
-    // bf16 view is UB.
     anyhow::ensure!(
-        (data.as_ptr() as usize).is_multiple_of(std::mem::align_of::<bf16>()),
-        "Tensor '{name}': data is not aligned for bf16"
+        data.len().is_multiple_of(std::mem::size_of::<bf16>()),
+        "Tensor '{name}': {} bytes is not a whole number of bf16 elements",
+        data.len()
     );
-    Ok(unsafe {
-        std::slice::from_raw_parts(
-            data.as_ptr().cast::<bf16>(),
-            data.len() / std::mem::size_of::<bf16>(),
-        )
-    })
+    Ok(data)
+}
+
+/// Aligned payloads borrow zero-copy; misaligned ones (legal in safetensors)
+/// decode into an owned buffer, since a misaligned bf16 view is UB.
+#[allow(clippy::cast_ptr_alignment)]
+fn tensor_bf16_cow<'d>(
+    tensor: &safetensors::tensor::TensorView<'d>,
+    name: &str,
+) -> Result<Cow<'d, [bf16]>> {
+    let data = tensor_bf16_bytes(tensor, name)?;
+    if (data.as_ptr() as usize).is_multiple_of(std::mem::align_of::<bf16>()) {
+        // SAFETY: alignment checked; any bit pattern is a valid bf16.
+        Ok(Cow::Borrowed(unsafe {
+            std::slice::from_raw_parts(
+                data.as_ptr().cast::<bf16>(),
+                data.len() / std::mem::size_of::<bf16>(),
+            )
+        }))
+    } else {
+        Ok(Cow::Owned(
+            data.as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&b| bf16::from_bits(u16::from_le_bytes(b)))
+                .collect(),
+        ))
+    }
 }
 
 /// One row-consecutive part of a fused matrix: `rows` rows starting at
@@ -299,9 +320,9 @@ pub struct FusedPart<'a> {
     pub rows: usize,
 }
 
-/// Staged weight loading over one deserialized checkpoint: every method
-/// validates dtype, alignment, and the caller's config-derived dimensions at
-/// the load boundary, then uploads through the pinned staging pipeline.
+/// Validating BF16 checkpoint loader backed by pinned staging: every method
+/// checks dtype and config-derived dimensions at the load boundary; payload
+/// alignment is not required.
 pub struct StagedWeightLoader<'a> {
     ctx: &'a DeviceContext,
     stager: WeightStager,
@@ -323,7 +344,7 @@ impl<'a> StagedWeightLoader<'a> {
         })
     }
 
-    fn tensor_2d(&self, name: &str, rows: usize, cols: usize) -> Result<&'a [bf16]> {
+    fn tensor_2d(&self, name: &str, rows: usize, cols: usize) -> Result<&'a [u8]> {
         let tensor = find_tensor(self.shards, self.weight_map, name)?;
         let shape = tensor.shape();
         anyhow::ensure!(
@@ -334,13 +355,13 @@ impl<'a> StagedWeightLoader<'a> {
             shape[0] == rows && shape[1] == cols,
             "Tensor '{name}' has shape {shape:?}, config expects [{rows}, {cols}]"
         );
-        tensor_as_bf16(&tensor, name)
+        tensor_bf16_bytes(&tensor, name)
     }
 
     pub fn matrix(&mut self, name: &str, rows: usize, cols: usize) -> Result<DeviceMatrix> {
         let src = self.tensor_2d(name, rows, cols)?;
         // SAFETY: fully overwritten by the staged upload below.
-        let mut data = unsafe { self.ctx.stream.alloc::<bf16>(src.len()) }
+        let mut data = unsafe { self.ctx.stream.alloc::<bf16>(rows * cols) }
             .map_err(|e| anyhow::anyhow!("Alloc failed for '{name}': {e}"))?;
         self.stager.upload(src, &mut data, 0)?;
         Ok(DeviceMatrix { data, rows, cols })
@@ -364,7 +385,10 @@ impl<'a> StagedWeightLoader<'a> {
                 part.rows,
                 part.src_rows
             );
-            srcs.push(&full[part.row_offset * cols..(part.row_offset + part.rows) * cols]);
+            let elem = std::mem::size_of::<bf16>();
+            srcs.push(
+                &full[part.row_offset * cols * elem..(part.row_offset + part.rows) * cols * elem],
+            );
             total_rows += part.rows;
         }
         // SAFETY: every element is overwritten by the staged uploads below.
@@ -375,7 +399,7 @@ impl<'a> StagedWeightLoader<'a> {
         let mut dst_offset = 0;
         for src in srcs {
             self.stager.upload(src, &mut data, dst_offset)?;
-            dst_offset += src.len();
+            dst_offset += src.len() / std::mem::size_of::<bf16>();
         }
         Ok(DeviceMatrix {
             data,
@@ -421,8 +445,8 @@ impl<'a> StagedWeightLoader<'a> {
             shape.len() == 1 && shape[0] == len,
             "Tensor '{name}' has shape {shape:?}, config expects [{len}]"
         );
-        let src = tensor_as_bf16(&tensor, name)?;
-        DeviceVec::from_host(self.ctx, src)
+        let src = tensor_bf16_cow(&tensor, name)?;
+        DeviceVec::from_host(self.ctx, &src)
     }
 }
 
@@ -475,7 +499,7 @@ pub fn load_tensor_2d_row_shard(
             total_rows
         ));
     }
-    let elems = tensor_as_bf16(&tensor, name)?;
+    let elems = tensor_bf16_cow(&tensor, name)?;
     let start = row_offset * cols;
     let end = (row_offset + rows) * cols;
     DeviceMatrix::from_host(ctx, &elems[start..end], rows, cols)
@@ -525,8 +549,8 @@ pub fn load_tensor_2d_col_shard(
             total_cols
         ));
     }
-    let elems = tensor_as_bf16(&tensor, name)?;
-    let host = gather_cols(elems, rows, total_cols, col_offset, cols);
+    let elems = tensor_bf16_cow(&tensor, name)?;
+    let host = gather_cols(&elems, rows, total_cols, col_offset, cols);
     DeviceMatrix::from_host(ctx, &host, rows, cols)
 }
 
@@ -698,4 +722,43 @@ pub fn load_shard_info_fixed(model_path: &str) -> Result<(Vec<String>, HashMap<S
     }
 
     Ok((shard_files, weight_map))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::borrow::Cow;
+
+    use safetensors::Dtype;
+    use safetensors::tensor::TensorView;
+
+    use super::tensor_bf16_cow;
+
+    #[test]
+    fn tensor_bf16_cow_borrows_aligned_and_decodes_unaligned() {
+        let vals: [u16; 4] = [0x3f80, 0x0001, 0xbf12, 0x7fff];
+        let mut bytes = vec![0u8; vals.len() * 2 + 3];
+        // A Vec<u8> base has no alignment guarantee; derive both offsets from
+        // the actual address so each branch is forced deterministically.
+        let base = bytes.as_ptr() as usize;
+        let aligned_off = base.next_multiple_of(2) - base;
+        for (off, expect_borrowed) in [(aligned_off, true), (aligned_off + 1, false)] {
+            for (i, v) in vals.iter().enumerate() {
+                bytes[off + i * 2..off + i * 2 + 2].copy_from_slice(&v.to_le_bytes());
+            }
+            let view = TensorView::new(
+                Dtype::BF16,
+                vec![vals.len()],
+                &bytes[off..off + vals.len() * 2],
+            )
+            .unwrap();
+            let cow = tensor_bf16_cow(&view, "w").unwrap();
+            assert_eq!(
+                matches!(cow, Cow::Borrowed(_)),
+                expect_borrowed,
+                "off={off}"
+            );
+            let got: Vec<u16> = cow.iter().map(|b| b.to_bits()).collect();
+            assert_eq!(got, vals, "off={off}");
+        }
+    }
 }
