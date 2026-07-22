@@ -468,6 +468,7 @@ impl Eagle3Config {
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code, clippy::struct_excessive_bools)]
 struct AddedTokenConfig {
     #[serde(default)]
     id: Option<u32>,
