@@ -86,7 +86,7 @@ async fn main() -> anyhow::Result<()> {
         load_engine(&args, model_type)
     });
 
-    if enable_lora {
+    let serve_result = if enable_lora {
         // LoRA routes need the engine handle when the router is built, so this
         // path stays sequential.
         let handle = engine_load
@@ -132,11 +132,13 @@ async fn main() -> anyhow::Result<()> {
         )
         .await
     }
-    .context("vLLM frontend server failed")?;
+    .context("vLLM frontend server failed");
 
     // Export the final batch of request spans before the runtime tears down.
-    // No-op when tracing was never enabled.
+    // Flush before propagating an error too — a failed server is exactly where
+    // the last buffered spans matter. No-op when tracing was never enabled.
     openinfer_core::tracing::flush();
+    serve_result?;
 
     Ok(())
 }

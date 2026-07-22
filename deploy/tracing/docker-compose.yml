@@ -8,8 +8,9 @@
 #   OPENINFER_TRACE_OTLP_ENDPOINT=http://127.0.0.1:4317 \
 #     cargo run --release -- --model-path /path/to/Qwen3-4B
 #   # open http://localhost:3000 → Explore → Tempo → TraceQL, e.g.
-#   #   { name="ttft" && duration > 500ms }
-#   # to find every request whose time-to-first-token blew past 500ms.
+#   #   { name="prefill" && duration > 500ms }
+#   # to find requests whose prompt phase (first chunk on GPU → first token)
+#   # blew past 500ms. Emitted spans: request → {queue, prefill, decode}.
 #
 # Switching backend later (VictoriaTraces, etc.) is an endpoint/image change,
 # not a code change — everything downstream of OTLP is swappable.
@@ -22,10 +23,11 @@ services:
     command: ["-config.file=/etc/tempo/tempo.yaml"]
     volumes:
       - ./tempo.yaml:/etc/tempo/tempo.yaml:ro
+    # Host ports bind to loopback only: this stack is a local inspection tool,
+    # and Grafana below allows anonymous access — don't expose it on the LAN.
     ports:
-      - "4317:4317"    # OTLP gRPC (openinfer exports here)
-      - "4318:4318"    # OTLP HTTP
-      - "3200:3200"    # Tempo query API (Grafana talks to this internally)
+      - "127.0.0.1:4317:4317"  # OTLP gRPC (openinfer exports here)
+      - "127.0.0.1:3200:3200"  # Tempo query API (Grafana talks to this internally)
 
   grafana:
     image: grafana/grafana:11.3.0
@@ -33,13 +35,14 @@ services:
     restart: unless-stopped
     environment:
       GF_AUTH_ANONYMOUS_ENABLED: "true"
-      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
+      # Viewer, not Admin: Explore/dashboards need no write access.
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Viewer"
       GF_AUTH_DISABLE_LOGIN_FORM: "true"
       # Enable the TraceQL editor and search UX.
       GF_FEATURE_TOGGLES_ENABLE: "traceqlEditor traceqlSearch"
     volumes:
       - ./grafana-datasource.yaml:/etc/grafana/provisioning/datasources/tempo.yaml:ro
     ports:
-      - "3000:3000"    # Grafana UI
+      - "127.0.0.1:3000:3000"  # Grafana UI
     depends_on:
       - tempo
