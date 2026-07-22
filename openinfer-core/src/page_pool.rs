@@ -84,10 +84,6 @@ impl OwnedPagePermit {
         self.pages.len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.pages.is_empty()
-    }
-
     /// Try to acquire `n` more pages, appending them to this permit.
     /// Returns `true` on success. On failure the permit is unchanged.
     pub fn try_grow(&mut self, n: usize) -> bool {

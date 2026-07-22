@@ -413,18 +413,6 @@ impl AttentionDecodeCase {
         self.split_config
     }
 
-    pub fn split_chunk_size(&self) -> usize {
-        self.split_config.actual_chunk_size(self.kv_len)
-    }
-
-    pub fn split_active_chunks_per_request(&self) -> usize {
-        self.split_config.active_chunks(self.kv_len)
-    }
-
-    pub fn split_padded_slots(&self) -> usize {
-        self.split_padded_slots
-    }
-
     pub fn cu_context_ptr(&self) -> *mut c_void {
         self.ctx.ctx.cu_ctx().cast::<c_void>()
     }
@@ -908,14 +896,6 @@ impl AttentionPrefillCase {
         Ok(())
     }
 
-    pub fn measure_cold_l2(
-        &mut self,
-        criterion_iters: u64,
-        cache_clear: &mut L2CacheClear,
-    ) -> Result<Duration> {
-        self.measure_stage_cold_l2(criterion_iters, PrefillStage::Full, cache_clear)
-    }
-
     pub fn measure_stage_cold_l2(
         &mut self,
         criterion_iters: u64,
@@ -1097,15 +1077,6 @@ pub enum GemmProjection {
 }
 
 impl GemmProjection {
-    pub const ALL: [Self; 6] = [
-        Self::QProj,
-        Self::KvProj,
-        Self::OProj,
-        Self::GateUpHalf,
-        Self::DownProj,
-        Self::LmHead,
-    ];
-
     pub fn parse(raw: &str) -> Option<Self> {
         Some(match raw {
             "q_proj" => Self::QProj,
@@ -1227,7 +1198,6 @@ enum DenseBuffers {
 /// pre-measure launch.
 pub struct DenseCase {
     pub ctx: DeviceContext,
-    rows: usize,
     buffers: DenseBuffers,
     start: CudaEvent,
     end: CudaEvent,
@@ -1392,17 +1362,12 @@ impl DenseCase {
             .new_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))?;
         let case = Self {
             ctx,
-            rows,
             buffers,
             start,
             end,
         };
         case.ctx.sync()?;
         Ok(case)
-    }
-
-    pub fn rows(&self) -> usize {
-        self.rows
     }
 
     pub fn cu_context_ptr(&self) -> *mut c_void {

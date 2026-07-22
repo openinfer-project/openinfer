@@ -545,14 +545,6 @@ impl<const DIM: usize> GpuTensor<DIM> {
         Ok(Self { data, seq_len })
     }
 
-    pub const fn dim() -> usize {
-        DIM
-    }
-
-    pub fn num_elements(&self) -> usize {
-        DIM * self.seq_len
-    }
-
     pub fn from_device_matrix_rows(m: DeviceMatrix) -> Result<Self> {
         anyhow::ensure!(
             m.cols == DIM,
@@ -564,22 +556,6 @@ impl<const DIM: usize> GpuTensor<DIM> {
             data: m.data,
             seq_len: m.rows,
         })
-    }
-
-    pub fn as_untyped(&self) -> HiddenStatesRef<'_> {
-        HiddenStatesRef {
-            data: &self.data,
-            hidden_dim: DIM,
-            seq_len: self.seq_len,
-        }
-    }
-
-    pub fn as_untyped_mut(&mut self) -> HiddenStatesMut<'_> {
-        HiddenStatesMut {
-            data: &mut self.data,
-            hidden_dim: DIM,
-            seq_len: self.seq_len,
-        }
     }
 }
 
@@ -599,14 +575,6 @@ impl<const OUT: usize, const IN: usize> GpuWeight<OUT, IN> {
             m.cols,
         );
         Ok(Self { data: m.data })
-    }
-
-    pub fn as_untyped_ref(&self) -> DeviceMatrixRef<'_> {
-        DeviceMatrixRef {
-            data: &self.data,
-            rows: OUT,
-            cols: IN,
-        }
     }
 }
 
@@ -665,20 +633,6 @@ pub struct HiddenStatesRef<'a> {
     pub data: &'a CudaSlice<bf16>,
     pub hidden_dim: usize,
     pub seq_len: usize,
-}
-
-/// Non-owning mutable reference to `HiddenStates`-shaped data.
-pub struct HiddenStatesMut<'a> {
-    pub data: &'a mut CudaSlice<bf16>,
-    pub hidden_dim: usize,
-    pub seq_len: usize,
-}
-
-/// Non-owning reference to `DeviceMatrix`-shaped data.
-pub struct DeviceMatrixRef<'a> {
-    pub data: &'a CudaSlice<bf16>,
-    pub rows: usize,
-    pub cols: usize,
 }
 
 #[cfg(test)]

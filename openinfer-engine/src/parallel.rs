@@ -47,10 +47,4 @@ impl ParallelConfig {
         assert!(global_rank < self.ep_size);
         global_rank
     }
-
-    #[must_use]
-    pub fn tp_group(&self, dp_rank: usize) -> std::ops::Range<usize> {
-        let start = dp_rank * self.tp_size;
-        start..start + self.tp_size
-    }
 }

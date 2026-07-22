@@ -63,63 +63,6 @@ impl PrefillPagedPlan {
         })
     }
 
-    pub fn new_batch(
-        ctx: &DeviceContext,
-        descs: &[KvDesc<'_>],
-        start_positions: &[usize],
-        seq_lens: &[usize],
-        num_q_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-    ) -> Result<Self> {
-        Self::new_batch_with_cta_tile_q(
-            ctx,
-            descs,
-            start_positions,
-            seq_lens,
-            num_q_heads,
-            num_kv_heads,
-            head_dim,
-            0,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_batch_with_cta_tile_q(
-        ctx: &DeviceContext,
-        descs: &[KvDesc<'_>],
-        start_positions: &[usize],
-        seq_lens: &[usize],
-        num_q_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-        cta_tile_q_override: i32,
-    ) -> Result<Self> {
-        let page_indices: Vec<Vec<i32>> = descs
-            .iter()
-            .map(|desc| {
-                desc.page_indices()
-                    .iter()
-                    .map(|p| p.index() as i32)
-                    .collect()
-            })
-            .collect();
-        let last_page_lens: Vec<usize> = descs.iter().map(KvDesc::last_page_len).collect();
-        Ok(Self {
-            inner: openinfer_kernels::ops::PrefillPagedPlan::new_batch_with_cta_tile_q(
-                ctx,
-                &page_indices,
-                &last_page_lens,
-                start_positions,
-                seq_lens,
-                num_q_heads,
-                num_kv_heads,
-                head_dim,
-                cta_tile_q_override,
-            )?,
-        })
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub fn from_raw_batch_with_cta_tile_q(
         ctx: &DeviceContext,
@@ -202,12 +145,6 @@ impl PrefillPagedPlan {
     }
     pub fn last_page_len_d(&self) -> &CudaSlice<i32> {
         self.inner.last_page_len_d()
-    }
-    pub fn batch_indices_d(&self) -> &CudaSlice<i32> {
-        self.inner.batch_indices_d()
-    }
-    pub fn positions_d(&self) -> &CudaSlice<i32> {
-        self.inner.positions_d()
     }
     pub fn q_indptr_d(&self) -> &CudaSlice<i32> {
         self.inner.q_indptr_d()

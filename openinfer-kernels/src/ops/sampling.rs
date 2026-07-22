@@ -74,10 +74,6 @@ impl BatchSamplingScratch {
             vocab,
         })
     }
-
-    pub fn max_rows(&self) -> usize {
-        self.max_rows
-    }
 }
 
 /// Batched temperature/top-k/top-p sampling: gathers the requested bf16 arena
@@ -326,43 +322,6 @@ pub fn argmax(ctx: &DeviceContext, x: &DeviceVec) -> Result<u32> {
     Ok(result[0] as u32)
 }
 
-/// Single-row bf16 argmax into pre-allocated device outputs (`value[0]`,
-/// `index[0]`). Slice-level twin of [`argmax_batch_bf16_into`] (same kernel,
-/// rows=1, lowest index wins ties, NaN never wins) for callers whose logits
-/// live in a persistent decode arena. The bf16 top value is emitted so the
-/// caller can keep the crash-early non-finite guard after the 2-byte D2H.
-pub fn argmax_bf16_into(
-    ctx: &DeviceContext,
-    logits: &CudaSlice<half::bf16>,
-    n: usize,
-    value: &mut CudaSlice<half::bf16>,
-    index: &mut CudaSlice<i32>,
-) -> Result<()> {
-    if n == 0 || logits.len() < n {
-        return Err(anyhow!(
-            "argmax_bf16_into logits too small: have {}, need {n}",
-            logits.len()
-        ));
-    }
-    if value.is_empty() || index.is_empty() {
-        return Err(anyhow!("argmax_bf16_into outputs must hold one element"));
-    }
-    let (x_ptr, _gx) = logits.device_ptr(&ctx.stream);
-    let (v_ptr, _gv) = value.device_ptr_mut(&ctx.stream);
-    let (i_ptr, _gi) = index.device_ptr_mut(&ctx.stream);
-    unsafe {
-        ffi::argmax_batch_bf16_cuda(
-            x_ptr as *const ffi::Half,
-            v_ptr as *mut ffi::Half,
-            i_ptr as *mut i32,
-            1,
-            n as i32,
-            crate::tensor::active_cu_stream(ctx),
-        );
-    }
-    Ok(())
-}
-
 pub fn argmax_batch_bf16_into(
     ctx: &DeviceContext,
     logits: &HiddenStates,
@@ -421,8 +380,9 @@ pub fn markov_step_argmax_partials_len(rows: usize, vocab: usize) -> usize {
 }
 
 /// Row-wise two-stage bf16 argmax over `rows` rows of `n`: tile-parallel
-/// partials then one finalize block per row. Same per-row total order as
-/// [`argmax_bf16_into`] (lowest GLOBAL index wins ties, NaN never wins) — the
+/// partials then one finalize block per row. Same per-row total order as the
+/// retired single-row `argmax_bf16_into` (lowest GLOBAL index wins ties, NaN
+/// never wins) — the
 /// partials carry global indices, so each row's result is bit-identical to
 /// the single-block scan (and independent of the other rows) while each vocab
 /// row spreads over ~n/4096 CTAs instead of one. `partial_*` must hold

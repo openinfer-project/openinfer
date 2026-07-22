@@ -537,11 +537,6 @@ impl<A: DeepEpAbi> DeepEpBase<A> {
         })
     }
 
-    /// The baked capacities of this instance's shim config.
-    pub fn info(&self) -> &DeepEpInfo {
-        &self.info
-    }
-
     /// Decode dispatch: deterministic prologue + dispatch + copy epilogue in
     /// one stream-ordered call, fixed worst-case output shapes. The recv
     /// buffers must be sized at the published worst case

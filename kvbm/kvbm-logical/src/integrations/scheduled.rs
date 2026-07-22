@@ -895,11 +895,6 @@ impl<T: BlockMetadata> SchedulableSequence<T> {
         self.inner.total_tokens().saturating_sub(self.kv_position)
     }
 
-    /// Reference to the delegate.
-    pub fn delegate(&self) -> &Arc<dyn SequenceDelegate> {
-        &self.delegate
-    }
-
     // Forwarded from RequestSequence
 
     delegate_to_inner! {

@@ -152,21 +152,6 @@ impl Qwen35Model {
             },
         )
     }
-
-    pub fn from_safetensors_with_device_options(
-        model_path: &str,
-        enable_cuda_graph: bool,
-        device_ordinal: usize,
-    ) -> Result<Self> {
-        Self::from_safetensors_with_runtime(
-            model_path,
-            ModelRuntimeConfig {
-                enable_cuda_graph,
-                device_ordinal,
-                ..Default::default()
-            },
-        )
-    }
 }
 
 impl Qwen35Model {

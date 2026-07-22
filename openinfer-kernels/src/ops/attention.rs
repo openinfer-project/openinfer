@@ -84,29 +84,6 @@ impl PrefillPagedPlan {
         self.cta_tile_q
     }
 
-    pub fn new(
-        ctx: &DeviceContext,
-        page_indices_i32: &[i32],
-        last_page_len: usize,
-        start_pos: usize,
-        seq_len: usize,
-        num_q_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-    ) -> Result<Self> {
-        Self::new_with_cta_tile_q(
-            ctx,
-            page_indices_i32,
-            last_page_len,
-            start_pos,
-            seq_len,
-            num_q_heads,
-            num_kv_heads,
-            head_dim,
-            0,
-        )
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_cta_tile_q(
         ctx: &DeviceContext,
@@ -183,33 +160,6 @@ impl PrefillPagedPlan {
             total_tokens: seq_len,
             cta_tile_q,
         })
-    }
-
-    /// Build plan for multiple requests (batch prefill).
-    ///
-    /// Page lists must already reflect the post-advance state (pages allocated,
-    /// seq_len advanced) for each request.
-    pub fn new_batch(
-        ctx: &DeviceContext,
-        page_indices: &[Vec<i32>],
-        last_page_lens: &[usize],
-        start_positions: &[usize],
-        seq_lens: &[usize],
-        num_q_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-    ) -> Result<Self> {
-        Self::new_batch_with_cta_tile_q(
-            ctx,
-            page_indices,
-            last_page_lens,
-            start_positions,
-            seq_lens,
-            num_q_heads,
-            num_kv_heads,
-            head_dim,
-            0,
-        )
     }
 
     #[allow(clippy::too_many_arguments)]

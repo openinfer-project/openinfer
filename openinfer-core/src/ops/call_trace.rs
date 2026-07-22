@@ -80,15 +80,6 @@ pub fn record_call(call: KernelCall) {
     }
 }
 
-pub fn with_label<T>(label: impl Into<String>, f: impl FnOnce() -> T) -> T {
-    LABEL_STACK.with(|stack| stack.borrow_mut().push(label.into()));
-    let result = f();
-    LABEL_STACK.with(|stack| {
-        stack.borrow_mut().pop();
-    });
-    result
-}
-
 pub fn current_label(default_op: &str) -> String {
     LABEL_STACK.with(|stack| {
         stack
