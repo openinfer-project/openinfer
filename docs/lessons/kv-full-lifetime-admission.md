@@ -1,6 +1,6 @@
 # Full-Lifetime KV Admission
 
-> **TL;DR:** Without preemption, admitting a request means reserving enough KV capacity for every token it can write before termination, not only its prompt. Temporarily over-budget requests wait; requests that can never fit are rejected explicitly; every terminal path releases request-owned state. Validate both pressure behavior and a post-pressure completion, because a server can remain reachable while generation is permanently wedged.
+> **TL;DR:** Without preemption, admitting a request means reserving its peak physical KV footprint across the block manager's full request lifecycle, not only its prompt or final committed token count. Temporarily over-budget requests wait; requests that can never fit are rejected explicitly; every terminal path releases request-owned state. Validate both pressure behavior and a post-pressure completion, because a server can remain reachable while generation is permanently wedged.
 >
 > **Last touched:** 2026-07
 
@@ -11,8 +11,8 @@ This lesson was extracted from the Qwen3 issue #85 KV-pressure hang, but the inv
 A scheduler must not admit more potential KV growth than the pool can satisfy:
 
 ```text
-reserved(active requests)
-+ worst_case_kv(new request)
+reserved_peak_footprint(active requests)
++ peak_kv_footprint(new request)
 <= usable_pool_capacity
 ```
 
@@ -20,11 +20,13 @@ Prefill-only admission is unsafe. Several requests can all fit their prompts, en
 
 Full-lifetime reservation is conservative: a request may stop early and use less than its reservation. Until the scheduler supports preemption or another recoverable overcommit policy, that lost concurrency is the cost of guaranteeing progress.
 
-## Count KV writes, not API tokens
+## Measure the block-manager peak
 
-Derive the budget from the model's state transition. Do not assume every sampled token is immediately present in KV.
+Derive the budget from both the model's state transition and the block manager's allocation lifecycle. Do not assume every sampled token is immediately present in KV, or that the final committed-token count is the peak number of physical pages held.
 
-For Qwen3, prefill writes the prompt and returns the first sampled output. That sampled token enters KV only when a later decode step consumes it. A request with prompt length `P` and maximum completion length `N` therefore writes at most `P + N - 1` KV tokens. Other model loops may have a different relationship.
+For Qwen3, prefill writes the prompt and returns the first sampled output. The request commits at most `P + N - 1` KV positions for prompt length `P` and completion limit `N`, but kvbm's `schedule_decode` can provision the next decode block before the final input token is applied. A multi-token request can therefore hold `ceil((P + N) / block_size)` blocks at its peak; a one-token completion never schedules decode and only needs the prompt footprint. The scheduler's boundary tests compare this reservation against the real block-pool peak and cover cases where the older `P + N - 1` formula is short by one page.
+
+This allocator-specific peak is not universal. Qwen3.5's current state machine and KV pool reserve from `P + N - 1`; other models may preallocate, append, or retire pages at different points. Encode the formula beside the owning scheduler and test it against the actual allocator lifecycle.
 
 Round the resulting token count through the actual page geometry. Boundary tests should pin cases just below, exactly at, and just above a page transition; otherwise an off-by-one can hide behind page rounding.
 

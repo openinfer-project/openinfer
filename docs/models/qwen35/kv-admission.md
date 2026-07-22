@@ -16,7 +16,7 @@
   - GitHub issue #254 - desired outcome is full-lifetime admission, clean rejection for impossible requests, and no batch-wide abort from KV exhaustion.
   - `openinfer-qwen35/src/scheduler.rs` - production scheduler currently calls prompt-only admission and reports execution errors as normal finishes in several paths.
   - `openinfer-qwen35/src/scheduler/plan.rs` - CPU-testable admission seam currently reserves prompt pages only.
-  - `openinfer-qwen3/src/scheduler.rs` - reference implementation for `prompt_len + max_tokens - 1` KV accounting and impossible-request rejection.
+  - `openinfer-qwen3/src/scheduler.rs` - reference admission and impossible-request-rejection pattern; its kvbm lifecycle now reserves a different peak (`prompt_len + max_tokens` for multi-token requests), so Qwen3.5 keeps its own allocator-derived `prompt_len + max_tokens - 1` formula.
   - `openinfer-core/src/kv_pool.rs` - confirms `KvState::ensure_capacity` grows physical pages lazily and pool capacity includes the reserved padding page.
 - **Relevant history**:
   - `docs/lessons/kv-full-lifetime-admission.md` - the original failure mode kept the server alive while completions hung, so validation must include both pressure result and a post-pressure completion.

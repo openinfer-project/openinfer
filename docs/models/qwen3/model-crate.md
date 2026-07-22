@@ -8,7 +8,7 @@
 
 | Path | Owns | Does not own |
 | --- | --- | --- |
-| `openinfer-qwen3/` | Qwen3 config and weights, launch policy, scheduler, executor, prefill/decode/unified DAGs, LoRA/speculative paths, model tests, kernel plan | HTTP serving, reusable kernel implementations |
+| `openinfer-qwen3/` | Qwen3 config and weights, launch policy, scheduler, executor, prefill/decode/unified DAGs, LoRA/speculative paths, model tests, kernel benchmark manifest and reports | HTTP serving, reusable kernel implementations |
 | `openinfer-kernels/` | Reusable Rust kernel wrappers, CUDA/Triton sources, FFI, tensor operation implementations | Qwen3 scheduling and request policy |
 | `openinfer-engine/` | Generic engine handle, requests/events, sampling contracts, parallel configuration | Model-specific execution |
 | `openinfer-core/` | Shared runtime helpers, tensor/device context, CUDA Graph and tracing support | Qwen3 weights or scheduler decisions |
@@ -23,7 +23,7 @@ The physical directory is the crate boundary. Historical `crates/openinfer-qwen3
 2. `launch` validates model-specific option combinations and creates the Qwen3 scheduler/executor.
 3. The scheduler owns request admission and batching. It produces prefill, decode, or unified plans.
 4. `Qwen3Executor` owns GPU execution and per-request KV state. Tensor-parallel execution fans each step out to rank-local workers.
-5. Qwen3 DAG code invokes operations exported by `openinfer-kernels`; the model-owned `kernel_plan` provides the routing index from phases to those operations.
+5. Qwen3 DAG call sites route each phase to operations exported by `openinfer-kernels`; `kernel_manifests/qwen3.toml` and the model report binaries describe benchmark and reporting coverage.
 6. Results return through the generic `EngineHandle` event contract, so the frontend does not depend on Qwen3 internals.
 
 ## Where to make changes
