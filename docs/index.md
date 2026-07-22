@@ -170,6 +170,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | `playbooks/model-optimization-pipeline.md` | Per-model optimization methodology: 2 standard profiles, vLLM baseline, e2e dashboard + append-only optimization log. |
 | `playbooks/profiling-guide.md` | GPU profiling playbook: nsys pitfalls, diagnostic paths, measured kernel comparisons. |
 | `playbooks/accuracy-parity-playbook.md` | Accuracy debugging playbook: truth-source rules, first-diff workflow, bf16 rounding traps, and verified Qwen3.5 parity commands. |
+| `playbooks/hawk-visibility-audit.md` | hawk workspace 可见性审计：必须 all-features（单 profile 的 dead_public 61% 假阳性），三个必需环境变量，kvbm fork 边界。 |
 
 ## lessons
 

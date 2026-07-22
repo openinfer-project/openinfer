@@ -1,0 +1,15 @@
+[[production]]
+package = "openinfer-server"
+bin = "openinfer"
+reason = "shipped inference server binary"
+
+[[production]]
+package = "openinfer-server"
+bin = "bench_serving"
+reason = "shipped serving benchmark tool binary"
+
+# Cover every model line (qwen3, qwen35-4b, deepseek-v2-lite, kimi-k2, glm52)
+# so feature-gated consumers keep their APIs out of the findings.
+[[feature-profile]]
+name = "all"
+all-features = true
