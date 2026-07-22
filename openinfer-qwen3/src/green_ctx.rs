@@ -155,14 +155,40 @@ fn create_primary_stream() -> Result<CUstream> {
 /// Context even for an SM-pinned stream.
 pub(crate) fn record_stream_event(
     stream: CUstream,
-    event: sys::CUevent,
     green_ctx: Option<SendGreenContext>,
-) -> Result<()> {
+) -> Result<sys::CUevent> {
+    let mut event: sys::CUevent = ptr::null_mut();
+    check_cu(
+        unsafe {
+            sys::cuEventCreate(
+                &raw mut event,
+                sys::CUevent_flags_enum::CU_EVENT_BLOCKING_SYNC as u32
+                    | sys::CUevent_flags_enum::CU_EVENT_DISABLE_TIMING as u32,
+            )
+        },
+        "cuEventCreate (async prefill)",
+    )?;
+
     let record = match green_ctx {
         Some(green_ctx) => unsafe { sys::cuGreenCtxRecordEvent(green_ctx.0, event) },
         None => unsafe { sys::cuEventRecord(event, stream) },
     };
-    check_cu(record, "recording async prefill event")
+    if record != sys::CUresult::CUDA_SUCCESS {
+        let destroy = unsafe { sys::cuEventDestroy_v2(event) };
+        return Err(async_prefill_record_error(record, destroy));
+    }
+    Ok(event)
+}
+
+fn async_prefill_record_error(record: sys::CUresult, destroy: sys::CUresult) -> anyhow::Error {
+    if destroy == sys::CUresult::CUDA_SUCCESS {
+        anyhow::anyhow!("recording async prefill event failed: {record:?}")
+    } else {
+        anyhow::anyhow!(
+            "recording async prefill event failed: {record:?}; \
+             cuEventDestroy_v2 cleanup also failed: {destroy:?}"
+        )
+    }
 }
 
 impl OverlapStreams {
@@ -382,3 +408,21 @@ impl Drop for OverlapStreams {
 
 // SAFETY: OverlapStreams is only used from the executor's single GPU worker thread.
 unsafe impl Send for OverlapStreams {}
+
+#[cfg(test)]
+mod tests {
+    use super::async_prefill_record_error;
+    use super::sys;
+
+    #[test]
+    fn async_prefill_record_error_preserves_cleanup_failure() {
+        let error = async_prefill_record_error(
+            sys::CUresult::CUDA_ERROR_INVALID_HANDLE,
+            sys::CUresult::CUDA_ERROR_DEINITIALIZED,
+        )
+        .to_string();
+
+        assert!(error.contains("recording async prefill event failed: CUDA_ERROR_INVALID_HANDLE"));
+        assert!(error.contains("cuEventDestroy_v2 cleanup also failed: CUDA_ERROR_DEINITIALIZED"));
+    }
+}

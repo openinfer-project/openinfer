@@ -1,4 +1,6 @@
 use std::any::Any;
+use std::ops::Deref;
+use std::ops::DerefMut;
 
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
@@ -14,65 +16,66 @@ use crate::lora::DeviceLoraTokenGroup;
 use crate::lora::build_lora_token_ranges;
 use crate::lora::prepare_lora_token_groups;
 
-// Prefill temporaries free on ctx.stream but are consumed by override-stream
-// kernels; `park()` defers them into the open parking window until that
-// stream syncs. No window open (non-overlap) → drops in place.
+// Thread-local deferred-drop queue for decode-overlap mode. Buffers pushed here
+// during prefill (under stream override) are dropped later when
+// `drain_deferred_drops()` runs after the prefill stream is synchronized.
 thread_local! {
-    static PREFILL_TEMP_WINDOW: std::cell::RefCell<Option<Vec<Box<dyn Any>>>> =
-        const { std::cell::RefCell::new(None) };
+    static DEFERRED_DROPS: std::cell::RefCell<Vec<Box<dyn Any>>> =
+        std::cell::RefCell::new(Vec::new());
 }
 
-fn park<T: 'static>(val: T) {
-    PREFILL_TEMP_WINDOW.with(|w| {
-        if let Some(items) = w.borrow_mut().as_mut() {
-            items.push(Box::new(val));
-        }
-    });
+/// Defer an object's drop until `drain_deferred_drops()` is called.
+pub(crate) fn defer_drop<T: 'static>(val: T) {
+    DEFERRED_DROPS.with(|q| q.borrow_mut().push(Box::new(val)));
 }
 
-/// Owns parked prefill temporaries until the override stream is synchronized.
-pub(crate) struct PrefillTempBin {
-    stream: Option<cudarc::driver::sys::CUstream>,
-    items: Vec<Box<dyn Any>>,
+/// Owns a GPU temporary that must outlive work submitted through a stream
+/// override. On the ordinary model stream it behaves like a plain value.
+pub(crate) struct DeferredDrop<T: 'static> {
+    value: Option<T>,
+    defer: bool,
 }
 
-impl PrefillTempBin {
-    pub(crate) fn armed(stream: cudarc::driver::sys::CUstream) -> Self {
-        PREFILL_TEMP_WINDOW.with(|w| *w.borrow_mut() = Some(Vec::new()));
+impl<T: 'static> DeferredDrop<T> {
+    pub(crate) fn new(value: T) -> Self {
         Self {
-            stream: Some(stream),
-            items: Vec::new(),
+            value: Some(value),
+            defer: openinfer_kernels::tensor::has_stream_override(),
         }
     }
 
-    pub(crate) fn close(&mut self) {
-        if let Some(mut captured) = PREFILL_TEMP_WINDOW.with(|w| w.borrow_mut().take()) {
-            self.items.append(&mut captured);
-        }
+    pub(crate) fn into_inner(mut self) -> T {
+        self.value.take().expect("deferred value already taken")
     }
+}
 
-    /// Drains the prefill stream; aborts if synchronization fails.
-    pub(crate) fn synchronize(&mut self) {
-        self.close();
-        if let Some(stream) = self.stream {
-            let r = unsafe { cudarc::driver::sys::cuStreamSynchronize(stream) };
-            if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-                log::error!(
-                    "FATAL: cuStreamSynchronize(prefill) failed ({r:?}); aborting rather than \
-                     free buffers the prefill stream may still be reading"
-                );
-                std::process::abort();
-            }
-            self.stream = None;
-            self.items.clear();
+impl<T: 'static> Deref for DeferredDrop<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        self.value.as_ref().expect("deferred value already taken")
+    }
+}
+
+impl<T: 'static> DerefMut for DeferredDrop<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.value.as_mut().expect("deferred value already taken")
+    }
+}
+
+impl<T: 'static> Drop for DeferredDrop<T> {
+    fn drop(&mut self) {
+        if self.defer
+            && let Some(value) = self.value.take()
+        {
+            defer_drop(value);
         }
     }
 }
 
-impl Drop for PrefillTempBin {
-    fn drop(&mut self) {
-        self.synchronize();
-    }
+/// Drop all deferred objects. Call after prefill stream sync.
+pub(crate) fn drain_deferred_drops() {
+    DEFERRED_DROPS.with(|q| q.borrow_mut().clear());
 }
 use openinfer_core::tensor::DeviceContext;
 use openinfer_core::tensor::HiddenStates;
@@ -145,23 +148,18 @@ impl Qwen3Model {
         let seq_len = token_ids.len();
         let hidden_dim = self.config.hidden_size;
 
-        let token_ids_gpu = self
-            .ctx
-            .stream
-            .clone_htod(token_ids)
-            .map_err(|e| anyhow::anyhow!("H2D copy failed: {}", e))?;
+        // Copy token IDs to GPU
+        let token_ids_gpu = DeferredDrop::new(
+            self.ctx
+                .stream
+                .clone_htod(token_ids)
+                .map_err(|e| anyhow::anyhow!("H2D copy failed: {}", e))?,
+        );
 
-        let mut out = HiddenStates::zeros(&self.ctx, hidden_dim, seq_len)?;
+        let mut out = DeferredDrop::new(HiddenStates::zeros(&self.ctx, hidden_dim, seq_len)?);
         crate::green_ctx::fence_producers_before_override(&self.ctx)?;
-        let launched =
-            ops::embedding_batch(&self.ctx, &self.embed_tokens, &token_ids_gpu, &mut out);
-        park(token_ids_gpu);
-        if let Err(e) = launched {
-            park(out);
-            return Err(e);
-        }
-
-        Ok(out)
+        ops::embedding_batch(&self.ctx, &self.embed_tokens, &token_ids_gpu, &mut out)?;
+        Ok(out.into_inner())
     }
 
     /// Embed a device-resident token buffer into a pre-allocated output, with
@@ -422,8 +420,16 @@ impl Qwen3Model {
     /// Used when `echo=true` to return prompt token log-probabilities.
     /// Applies final RMS norm + lm_head projection in a single batched GEMM.
     /// Returns `HiddenStates` with shape `[vocab_size, total_tokens]`.
-    fn compute_all_position_logits(&self, hidden: &HiddenStates) -> Result<HiddenStates> {
-        let mut normed = HiddenStates::zeros(&self.ctx, hidden.hidden_dim, hidden.seq_len)?;
+    pub(crate) fn compute_all_position_logits(
+        &self,
+        hidden: &HiddenStates,
+    ) -> Result<HiddenStates> {
+        let mut normed = DeferredDrop::new(HiddenStates::zeros(
+            &self.ctx,
+            hidden.hidden_dim,
+            hidden.seq_len,
+        )?);
+        crate::green_ctx::fence_producers_before_override(&self.ctx)?;
         ops::rms_norm_batch_into(
             &self.ctx,
             hidden,
@@ -431,7 +437,13 @@ impl Qwen3Model {
             self.config.rms_norm_eps,
             &mut normed,
         );
-        ops::gemm(&self.ctx, self.output_projection(), &normed)
+        let mut logits = DeferredDrop::new(HiddenStates::zeros(
+            &self.ctx,
+            self.output_projection().rows,
+            hidden.seq_len,
+        )?);
+        ops::gemm_into_checked(&self.ctx, self.output_projection(), &normed, &mut logits)?;
+        Ok(logits.into_inner())
     }
 
     /// Batched last-token logits: gather the given token columns out of
@@ -443,21 +455,11 @@ impl Qwen3Model {
         token_indices: &[i32],
     ) -> Result<HiddenStates> {
         let n = token_indices.len();
-        // Allocate all buffers up front so one producer fence orders them ahead
-        // of the override-stream gather/norm/GEMM.
-        let indices_d = self.ctx.stream.clone_htod(token_indices)?;
-        let mut gathered = HiddenStates::zeros(&self.ctx, hidden.hidden_dim, n)?;
-        let mut normed = HiddenStates::zeros(&self.ctx, hidden.hidden_dim, n)?;
-        let mut logits = HiddenStates::zeros(&self.ctx, self.output_projection().rows, n)?;
+        let indices_d = DeferredDrop::new(self.ctx.stream.clone_htod(token_indices)?);
+        let mut gathered = DeferredDrop::new(HiddenStates::zeros(&self.ctx, hidden.hidden_dim, n)?);
         crate::green_ctx::fence_producers_before_override(&self.ctx)?;
-
-        let gather =
-            ops::gather_hidden_tokens_into(&self.ctx, hidden, &indices_d, n, &mut gathered);
-        park(indices_d);
-        if let Err(e) = gather {
-            park(gathered);
-            return Err(e);
-        }
+        ops::gather_hidden_tokens_into(&self.ctx, hidden, &indices_d, n, &mut gathered)?;
+        let mut normed = DeferredDrop::new(HiddenStates::zeros(&self.ctx, hidden.hidden_dim, n)?);
         ops::rms_norm_batch_into(
             &self.ctx,
             &gathered,
@@ -465,15 +467,13 @@ impl Qwen3Model {
             self.config.rms_norm_eps,
             &mut normed,
         );
-        let gemm =
-            ops::gemm_into_checked(&self.ctx, self.output_projection(), &normed, &mut logits);
-        park(gathered);
-        park(normed);
-        if let Err(e) = gemm {
-            park(logits);
-            return Err(e);
-        }
-        Ok(logits)
+        let mut logits = DeferredDrop::new(HiddenStates::zeros(
+            &self.ctx,
+            self.output_projection().rows,
+            n,
+        )?);
+        ops::gemm_into_checked(&self.ctx, self.output_projection(), &normed, &mut logits)?;
+        Ok(logits.into_inner())
     }
 
     /// Concatenates all prompts' tokens, runs one GEMM per layer for the
@@ -522,7 +522,7 @@ impl Qwen3Model {
             .iter()
             .map(openinfer_kv_cache::KvView::last_page_len)
             .collect();
-        let plan = PrefillPagedPlan::from_raw_batch_with_cta_tile_q(
+        let plan = DeferredDrop::new(PrefillPagedPlan::from_raw_batch_with_cta_tile_q(
             &self.ctx,
             &page_indices,
             &last_page_lens,
@@ -532,58 +532,60 @@ impl Qwen3Model {
             self.local_num_key_value_heads(),
             self.config.head_dim,
             PREFILL_ATTENTION_CTA_TILE_Q,
-        )?;
+        )?);
 
         let all_tokens: Vec<u32> = prompts.iter().flat_map(|p| p.iter().copied()).collect();
-        let mut hidden = self.get_embeddings_batch(&all_tokens)?;
+        let hidden = DeferredDrop::new(self.get_embeddings_batch(&all_tokens)?);
 
-        // Failed launches may still leave kernels reading these inputs.
-        let result = self
-            .process_all_layers_batch_multi(
-                &mut hidden,
-                layout,
-                kv_buffer,
-                &plan,
-                &lora_groups,
-                capture_layer_ids,
-            )
-            .and_then(|captured_hidden| {
-                let all_logits = if echo {
-                    Some(self.compute_all_position_logits(&hidden)?)
-                } else {
-                    None
-                };
+        // Forward through all layers
+        let (hidden, captured_hidden) = self.process_all_layers_batch_multi(
+            hidden.into_inner(),
+            layout,
+            kv_buffer,
+            &plan,
+            &lora_groups,
+            capture_layer_ids,
+        )?;
+        let hidden = DeferredDrop::new(hidden);
+        let captured_hidden = captured_hidden.map(DeferredDrop::new);
 
-                let mut last_indices = Vec::with_capacity(batch_size);
-                let mut offset = 0usize;
-                for &seq_len in &seq_lens {
-                    last_indices.push((offset + seq_len - 1) as i32);
-                    offset += seq_len;
-                }
-                let logits = self.batch_token_logits(&hidden, &last_indices)?;
-                Ok((logits, all_logits, captured_hidden))
-            });
+        // All-position logits for echo (before we extract last-token logits)
+        let all_logits = if echo {
+            Some(DeferredDrop::new(
+                self.compute_all_position_logits(&hidden)?,
+            ))
+        } else {
+            None
+        };
 
-        for group in &mut lora_groups {
-            if let Some(indices) = group.token_indices_d.take() {
-                park(indices);
-            }
+        let mut last_indices = Vec::with_capacity(batch_size);
+        let mut offset = 0usize;
+        for &seq_len in &seq_lens {
+            last_indices.push((offset + seq_len - 1) as i32);
+            offset += seq_len;
         }
-        park(hidden);
-        park(plan);
+        let logits = DeferredDrop::new(self.batch_token_logits(&hidden, &last_indices)?);
 
-        result
+        Ok((
+            logits.into_inner(),
+            all_logits.map(DeferredDrop::into_inner),
+            captured_hidden.map(DeferredDrop::into_inner),
+        ))
     }
 
     fn process_all_layers_batch_multi(
         &self,
-        hidden: &mut HiddenStates,
+        hidden: HiddenStates,
         layout: &KvLayout,
         kv_buffer: &cudarc::driver::CudaSlice<half::bf16>,
         plan: &PrefillPagedPlan,
         lora_groups: &[DeviceLoraTokenGroup<'_>],
         capture_layer_ids: Option<&[usize]>,
-    ) -> Result<Option<HiddenStates>> {
+    ) -> Result<(HiddenStates, Option<HiddenStates>)> {
+        // Install ownership before any validation/allocation can return. If a
+        // later launch fails, these values move to the deferred queue while the
+        // caller's armed prefill guard establishes stream quiescence.
+        let mut hidden = DeferredDrop::new(hidden);
         let total_tokens = hidden.seq_len;
         let inter_dim = self.local_intermediate_size();
         let q_dim = self.local_q_dim();
@@ -603,22 +605,22 @@ impl Qwen3Model {
         let mut captured_hidden = if capture_layer_ids.is_empty() {
             None
         } else {
-            Some(HiddenStates::zeros(
+            Some(DeferredDrop::new(HiddenStates::zeros(
                 &self.ctx,
                 self.config.hidden_size * capture_layer_ids.len(),
                 total_tokens,
-            )?)
+            )?))
         };
         let mut next_capture = 0usize;
 
-        let mut bufs = PrefillBuffers::new(
+        let mut bufs = DeferredDrop::new(PrefillBuffers::new(
             &self.ctx,
             self.config.hidden_size,
             q_dim,
             kv_dim,
             inter_dim,
             total_tokens,
-        )?;
+        )?);
 
         crate::green_ctx::fence_producers_before_override(&self.ctx)?;
 
@@ -627,7 +629,7 @@ impl Qwen3Model {
                 self.forward_layer_batch_paged(
                     layer_idx,
                     layer,
-                    hidden,
+                    &mut hidden,
                     kv_buffer,
                     layout,
                     plan,
@@ -640,7 +642,7 @@ impl Qwen3Model {
                         .expect("capture buffer exists when ids are non-empty");
                     ops::copy_hidden_rows_into(
                         &self.ctx,
-                        hidden,
+                        &hidden,
                         out,
                         next_capture * self.config.hidden_size,
                     )?;
@@ -649,9 +651,11 @@ impl Qwen3Model {
             }
             Ok(())
         })();
-        park(bufs);
         run?;
 
-        Ok(captured_hidden)
+        Ok((
+            hidden.into_inner(),
+            captured_hidden.map(DeferredDrop::into_inner),
+        ))
     }
 }
