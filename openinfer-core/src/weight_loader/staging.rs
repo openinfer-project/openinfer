@@ -25,6 +25,15 @@ struct StagingBuf {
     dma_done: CudaEvent,
 }
 
+/// Validated execution plan for one strided column-shard upload.
+pub(crate) struct ColShardPlan {
+    stride_b: usize,
+    off_b: usize,
+    take_b: usize,
+    rows: usize,
+    dst_at: u64,
+}
+
 /// Pinned double-buffering overlaps the source read with the H2D copy that
 /// pageable `clone_htod` would serialize; sources are raw bytes.
 pub(crate) struct WeightStager {
@@ -53,127 +62,53 @@ impl WeightStager {
         })
     }
 
-    /// Stage `src` into `dst` at element `dst_offset`. The copy is async on
-    /// the stager's stream; `src` is copied out synchronously and not read
-    /// after return.
-    pub(crate) fn upload(
-        &mut self,
-        src: &[u8],
-        dst: &mut CudaSlice<bf16>,
-        dst_offset: usize,
-    ) -> Result<()> {
-        self.ensure_uploadable(dst)?;
-        anyhow::ensure!(
-            src.len().is_multiple_of(BF16_SIZE),
-            "staged upload source of {} bytes is not a whole number of bf16 elements",
-            src.len()
-        );
-        anyhow::ensure!(
-            dst_offset
-                .checked_mul(BF16_SIZE)
-                .and_then(|off| off.checked_add(src.len()))
-                .is_some_and(|end| end <= dst.len() * BF16_SIZE),
-            "staged upload out of bounds: dst_offset {dst_offset} + src bytes {} > dst len {}",
-            src.len(),
-            dst.len()
-        );
-        let stream = self.stream.clone();
-        let (dst_ptr, _dst_order) = dst.device_ptr_mut(&stream);
+    /// # Safety
+    /// `dst_at` must address `src.len()` writable bytes still allocated on the
+    /// stager's stream, as validated by [`prepare`].
+    pub(crate) unsafe fn upload_at(&mut self, src: &[u8], dst_at: u64) -> Result<()> {
         for (i, chunk) in src.chunks(STAGE_BYTES).enumerate() {
-            let dst_at = dst_ptr + (dst_offset * BF16_SIZE + i * STAGE_BYTES) as u64;
+            let chunk_at = dst_at + (i * STAGE_BYTES) as u64;
             let fill = |stage: *mut u8| {
                 // SAFETY: `chunk.len() <= STAGE_BYTES`, and the privately
                 // owned buffer cannot overlap `chunk`.
                 unsafe { fill_pinned(chunk, stage) };
             };
-            // SAFETY: the chunks partition `src`, so `dst_at` stays inside
-            // `dst` per the entry ensure, with `chunk.len() <= STAGE_BYTES`.
-            unsafe { self.stage_chunk(chunk.len(), dst_at, fill) }?;
+            // SAFETY: the chunks partition `src`, so `chunk_at` stays inside
+            // the validated destination range, with `chunk.len() <= STAGE_BYTES`.
+            unsafe { self.stage_chunk(chunk.len(), chunk_at, fill) }?;
         }
         Ok(())
     }
 
-    /// Strided variant of [`Self::upload`]: gathers `take`-column row
-    /// segments straight into the pinned buffers (column counts in
-    /// elements).
-    pub(crate) fn upload_cols(
-        &mut self,
-        src: &[u8],
-        total_cols: usize,
-        col_offset: usize,
-        take: usize,
-        dst: &mut CudaSlice<bf16>,
-    ) -> Result<()> {
-        self.ensure_uploadable(dst)?;
-        let stride_b = total_cols
-            .checked_mul(BF16_SIZE)
-            .filter(|&s| s > 0 && src.len().is_multiple_of(s));
-        anyhow::ensure!(
-            stride_b.is_some(),
-            "strided upload source of {} bytes is not a multiple of {total_cols} bf16 columns",
-            src.len()
-        );
-        let stride_b = stride_b.unwrap();
-        anyhow::ensure!(
-            col_offset
-                .checked_add(take)
-                .is_some_and(|end| end <= total_cols),
-            "col range out of bounds: col_offset={col_offset} take={take} total_cols={total_cols}"
-        );
-        let take_b = take * BF16_SIZE;
-        anyhow::ensure!(
-            (1..=STAGE_BYTES).contains(&take_b),
-            "column shard width {take} outside 1..={}",
-            STAGE_BYTES / BF16_SIZE
-        );
-        let rows = src.len() / stride_b;
-        anyhow::ensure!(
-            rows.checked_mul(take).is_some_and(|n| n == dst.len()),
-            "staged upload shape mismatch: {rows} rows x {take} cols vs dst len {}",
-            dst.len()
-        );
-        let rows_per_chunk = STAGE_BYTES / take_b;
-        let off_b = col_offset * BF16_SIZE;
-        let stream = self.stream.clone();
-        let (dst_ptr, _dst_order) = dst.device_ptr_mut(&stream);
+    /// # Safety
+    /// `plan` must come from [`prepare_cols`] for this `src`, with its
+    /// destination still allocated on the stager's stream.
+    pub(crate) unsafe fn upload_cols_at(&mut self, src: &[u8], plan: &ColShardPlan) -> Result<()> {
+        let rows_per_chunk = STAGE_BYTES / plan.take_b;
         let mut row = 0;
-        while row < rows {
-            let chunk_rows = rows_per_chunk.min(rows - row);
-            let dst_at = dst_ptr + (row * take_b) as u64;
+        while row < plan.rows {
+            let chunk_rows = rows_per_chunk.min(plan.rows - row);
+            let dst_at = plan.dst_at + (row * plan.take_b) as u64;
             let fill = |stage: *mut u8| {
                 // SAFETY: the privately owned buffer cannot overlap `src`,
                 // and the subslice covers `chunk_rows` full rows since
                 // `off_b + take_b <= stride_b`.
                 unsafe {
                     fill_pinned_strided(
-                        &src[row * stride_b..],
-                        stride_b,
-                        off_b,
-                        take_b,
+                        &src[row * plan.stride_b..],
+                        plan.stride_b,
+                        plan.off_b,
+                        plan.take_b,
                         chunk_rows,
                         stage,
                     );
                 }
             };
-            // SAFETY: the destination rows lie inside `dst` per the
-            // rows x take bound, with `chunk_rows * take_b <= STAGE_BYTES`.
-            unsafe { self.stage_chunk(chunk_rows * take_b, dst_at, fill) }?;
+            // SAFETY: the destination rows lie inside the validated range per
+            // the rows x take bound, with `chunk_rows * take_b <= STAGE_BYTES`.
+            unsafe { self.stage_chunk(chunk_rows * plan.take_b, dst_at, fill) }?;
             row += chunk_rows;
         }
-        Ok(())
-    }
-
-    // Both the events and `dst`'s stream-ordered allocation are only ordered
-    // against work on the stager's own stream.
-    fn ensure_uploadable(&self, dst: &CudaSlice<bf16>) -> Result<()> {
-        anyhow::ensure!(
-            Arc::ptr_eq(dst.stream(), &self.stream),
-            "staged upload into a buffer allocated on a different stream than the stager's"
-        );
-        anyhow::ensure!(
-            !crate::tensor::has_stream_override(),
-            "staged upload under a thread-local stream override is unsupported"
-        );
         Ok(())
     }
 
@@ -227,6 +162,97 @@ impl WeightStager {
     }
 }
 
+// Both the stager's events and `dst`'s stream-ordered allocation are only
+// ordered against work on `stream`, which must be the stager's own stream.
+fn ensure_uploadable(stream: &Arc<CudaStream>, dst: &CudaSlice<bf16>) -> Result<()> {
+    anyhow::ensure!(
+        Arc::ptr_eq(dst.stream(), stream),
+        "staged upload into a buffer allocated on a different stream than the stager's"
+    );
+    anyhow::ensure!(
+        !crate::tensor::has_stream_override(),
+        "staged upload under a thread-local stream override is unsupported"
+    );
+    Ok(())
+}
+
+/// Validates a contiguous staged upload and returns the destination device
+/// address for a deferred [`WeightStager::upload_at`].
+pub(crate) fn prepare(
+    stream: &Arc<CudaStream>,
+    src: &[u8],
+    dst: &mut CudaSlice<bf16>,
+    dst_offset: usize,
+) -> Result<u64> {
+    ensure_uploadable(stream, dst)?;
+    anyhow::ensure!(
+        src.len().is_multiple_of(BF16_SIZE),
+        "staged upload source of {} bytes is not a whole number of bf16 elements",
+        src.len()
+    );
+    anyhow::ensure!(
+        dst_offset
+            .checked_mul(BF16_SIZE)
+            .and_then(|off| off.checked_add(src.len()))
+            .is_some_and(|end| end <= dst.len() * BF16_SIZE),
+        "staged upload out of bounds: dst_offset {dst_offset} + src bytes {} > dst len {}",
+        src.len(),
+        dst.len()
+    );
+    // Dropping the guard immediately is fine only because the runtime context
+    // disables cudarc event tracking; revisit if that ever changes.
+    let (dst_ptr, _dst_order) = dst.device_ptr_mut(stream);
+    Ok(dst_ptr + (dst_offset * BF16_SIZE) as u64)
+}
+
+/// Validates a strided staged upload and returns its execution plan for a
+/// deferred [`WeightStager::upload_cols_at`] (column counts in elements).
+pub(crate) fn prepare_cols(
+    stream: &Arc<CudaStream>,
+    src: &[u8],
+    total_cols: usize,
+    col_offset: usize,
+    take: usize,
+    dst: &mut CudaSlice<bf16>,
+) -> Result<ColShardPlan> {
+    ensure_uploadable(stream, dst)?;
+    let stride_b = total_cols
+        .checked_mul(BF16_SIZE)
+        .filter(|&s| s > 0 && src.len().is_multiple_of(s));
+    anyhow::ensure!(
+        stride_b.is_some(),
+        "strided upload source of {} bytes is not a multiple of {total_cols} bf16 columns",
+        src.len()
+    );
+    let stride_b = stride_b.unwrap();
+    anyhow::ensure!(
+        col_offset
+            .checked_add(take)
+            .is_some_and(|end| end <= total_cols),
+        "col range out of bounds: col_offset={col_offset} take={take} total_cols={total_cols}"
+    );
+    let take_b = take * BF16_SIZE;
+    anyhow::ensure!(
+        (1..=STAGE_BYTES).contains(&take_b),
+        "column shard width {take} outside 1..={}",
+        STAGE_BYTES / BF16_SIZE
+    );
+    let rows = src.len() / stride_b;
+    anyhow::ensure!(
+        rows.checked_mul(take).is_some_and(|n| n == dst.len()),
+        "staged upload shape mismatch: {rows} rows x {take} cols vs dst len {}",
+        dst.len()
+    );
+    let (dst_ptr, _dst_order) = dst.device_ptr_mut(stream);
+    Ok(ColShardPlan {
+        stride_b,
+        off_b: col_offset * BF16_SIZE,
+        take_b,
+        rows,
+        dst_at: dst_ptr,
+    })
+}
+
 impl Drop for WeightStager {
     fn drop(&mut self) {
         // PinnedHostSlice's drop only waits on its embedded, never-recorded
@@ -243,7 +269,7 @@ impl Drop for WeightStager {
     }
 }
 
-fn drain_or_abort(stream: &CudaStream, context: &str) {
+pub(super) fn drain_or_abort(stream: &CudaStream, context: &str) {
     if let Err(sync_err) = stream.synchronize() {
         error!(
             "{context}; stream drain failed ({sync_err}); aborting instead of freeing pinned memory under an in-flight DMA"

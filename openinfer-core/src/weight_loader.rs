@@ -12,6 +12,7 @@ use std::sync::atomic::Ordering;
 
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
+use cudarc::driver::result::memcpy_htod_async;
 use half::bf16;
 use log::info;
 use log::warn;
@@ -24,6 +25,7 @@ use crate::tensor::DeviceMatrix;
 use crate::tensor::DeviceVec;
 
 mod staging;
+use staging::ColShardPlan;
 use staging::WeightStager;
 
 /// Load shard metadata. Returns (shard_file_paths, weight_map: tensor_name -> shard_index)
@@ -320,14 +322,52 @@ pub struct FusedPart<'a> {
     pub rows: usize,
 }
 
+/// Redeemed by [`StagedWeightLoader::take`] after `finish`.
+#[derive(Clone, Copy)]
+pub struct SlotId(usize);
+
+/// Redeemed by [`StagedWeightLoader::take_vec`] after `finish`.
+#[derive(Clone, Copy)]
+pub struct VecSlotId(usize);
+
+enum PendingUpload<'d> {
+    Contiguous { src: &'d [u8], dst_at: u64 },
+    ColShard { src: &'d [u8], plan: ColShardPlan },
+    Vector { src: Cow<'d, [bf16]>, dst_at: u64 },
+}
+
+fn bf16_bytes(src: &[bf16]) -> &[u8] {
+    // bf16 is a plain two-byte value; a byte view of it is always valid.
+    unsafe { std::slice::from_raw_parts(src.as_ptr().cast(), std::mem::size_of_val(src)) }
+}
+
+struct Slot {
+    data: Option<CudaSlice<bf16>>,
+    rows: usize,
+    cols: usize,
+}
+
+struct VecSlot {
+    data: Option<CudaSlice<bf16>>,
+    len: usize,
+}
+
 /// Validating BF16 checkpoint loader backed by pinned staging: every method
 /// checks dtype and config-derived dimensions at the load boundary; payload
-/// alignment is not required.
+/// alignment is not required. Uploads run in [`Self::finish`], after every
+/// tensor has been validated.
 pub struct StagedWeightLoader<'a> {
     ctx: &'a DeviceContext,
     stager: WeightStager,
     shards: &'a [SafeTensors<'a>],
     weight_map: &'a HashMap<String, usize>,
+    slots: Vec<Slot>,
+    vec_slots: Vec<VecSlot>,
+    pending: Vec<PendingUpload<'a>>,
+    retained: Vec<Vec<bf16>>,
+    finished: bool,
+    failed: bool,
+    alloc_ms: f64,
 }
 
 impl<'a> StagedWeightLoader<'a> {
@@ -341,7 +381,104 @@ impl<'a> StagedWeightLoader<'a> {
             stager: WeightStager::new(ctx)?,
             shards,
             weight_map,
+            slots: Vec::new(),
+            vec_slots: Vec::new(),
+            pending: Vec::new(),
+            retained: Vec::new(),
+            finished: false,
+            failed: false,
+            alloc_ms: 0.0,
         })
+    }
+
+    fn ensure_recording(&self) -> Result<()> {
+        anyhow::ensure!(
+            !self.finished && !self.failed,
+            "staged loader already finished"
+        );
+        Ok(())
+    }
+
+    fn push_slot(&mut self, data: CudaSlice<bf16>, rows: usize, cols: usize) -> SlotId {
+        self.slots.push(Slot {
+            data: Some(data),
+            rows,
+            cols,
+        });
+        SlotId(self.slots.len() - 1)
+    }
+
+    /// Executes every recorded upload; must run before [`Self::take`].
+    pub fn finish(&mut self) -> Result<()> {
+        anyhow::ensure!(
+            !self.finished && !self.failed,
+            "staged loader already finished"
+        );
+        // Poisoned until every upload lands; a failed finish cannot retry
+        // vacuously over the drained op list.
+        self.failed = true;
+        let uploads = self.pending.len();
+        let t_upload = std::time::Instant::now();
+        if let Err(err) = self.execute_uploads() {
+            // Soundness closes here, not in Drop (skippable via `mem::forget`):
+            // no submitted copy may outlive this call unresolved.
+            staging::drain_or_abort(&self.ctx.stream, "staged upload failure");
+            self.retained.clear();
+            return Err(err);
+        }
+        self.retained.clear();
+        self.failed = false;
+        self.finished = true;
+        info!(
+            "weight load: {} uploads, alloc_api_wall {:.0}ms, execute_and_drain_wall {:.0}ms",
+            uploads,
+            self.alloc_ms,
+            t_upload.elapsed().as_secs_f64() * 1e3
+        );
+        Ok(())
+    }
+
+    fn execute_uploads(&mut self) -> Result<()> {
+        for op in std::mem::take(&mut self.pending) {
+            match op {
+                // SAFETY: the destination is owned by `self.slots` (`take`
+                // refuses to hand it out before a successful finish) and the
+                // range was validated by prepare/prepare_cols at record time.
+                PendingUpload::Contiguous { src, dst_at } => unsafe {
+                    self.stager.upload_at(src, dst_at)?;
+                },
+                PendingUpload::ColShard { src, plan } => unsafe {
+                    self.stager.upload_cols_at(src, &plan)?;
+                },
+                // SAFETY: destination validated at record time; sources
+                // outlive the drain (borrowed: shards; owned: retained first).
+                PendingUpload::Vector { src, dst_at } => {
+                    let bytes = match src {
+                        Cow::Borrowed(borrowed) => bf16_bytes(borrowed),
+                        Cow::Owned(owned) => {
+                            self.retained.push(owned);
+                            bf16_bytes(self.retained.last().expect("just pushed"))
+                        }
+                    };
+                    unsafe {
+                        memcpy_htod_async(dst_at, bytes, self.ctx.stream.cu_stream())
+                            .map_err(|e| anyhow::anyhow!("vector upload failed: {e}"))?;
+                    }
+                }
+            }
+        }
+        self.ctx.sync()
+    }
+
+    /// Redeems a recorded matrix after a successful [`Self::finish`].
+    pub fn take(&mut self, slot: SlotId) -> DeviceMatrix {
+        assert!(self.finished, "take before successful finish");
+        let slot = &mut self.slots[slot.0];
+        DeviceMatrix {
+            data: slot.data.take().expect("slot already taken"),
+            rows: slot.rows,
+            cols: slot.cols,
+        }
     }
 
     fn tensor_2d(&self, name: &str, rows: usize, cols: usize) -> Result<&'a [u8]> {
@@ -358,18 +495,29 @@ impl<'a> StagedWeightLoader<'a> {
         tensor_bf16_bytes(&tensor, name)
     }
 
-    pub fn matrix(&mut self, name: &str, rows: usize, cols: usize) -> Result<DeviceMatrix> {
-        let src = self.tensor_2d(name, rows, cols)?;
-        // SAFETY: fully overwritten by the staged upload below.
-        let mut data = unsafe { self.ctx.stream.alloc::<bf16>(rows * cols) }
+    fn alloc_timed(&mut self, elems: usize, name: &str) -> Result<CudaSlice<bf16>> {
+        let t = std::time::Instant::now();
+        // SAFETY: overwritten by its recorded upload before `take` can
+        // expose it.
+        let data = unsafe { self.ctx.stream.alloc::<bf16>(elems) }
             .map_err(|e| anyhow::anyhow!("Alloc failed for '{name}': {e}"))?;
-        self.stager.upload(src, &mut data, 0)?;
-        Ok(DeviceMatrix { data, rows, cols })
+        self.alloc_ms += t.elapsed().as_secs_f64() * 1e3;
+        Ok(data)
+    }
+
+    pub fn matrix(&mut self, name: &str, rows: usize, cols: usize) -> Result<SlotId> {
+        self.ensure_recording()?;
+        let src = self.tensor_2d(name, rows, cols)?;
+        let mut data = self.alloc_timed(rows * cols, name)?;
+        let dst_at = staging::prepare(&self.ctx.stream, src, &mut data, 0)?;
+        self.pending.push(PendingUpload::Contiguous { src, dst_at });
+        Ok(self.push_slot(data, rows, cols))
     }
 
     /// Row-concatenation of `parts`, each a validated row range of its
     /// source tensor; all sources must have exactly `cols` columns.
-    pub fn fused_rows(&mut self, cols: usize, parts: &[FusedPart]) -> Result<DeviceMatrix> {
+    pub fn fused_rows(&mut self, cols: usize, parts: &[FusedPart]) -> Result<SlotId> {
+        self.ensure_recording()?;
         anyhow::ensure!(!parts.is_empty(), "fused load needs at least one part");
         let mut total_rows = 0usize;
         let mut srcs = Vec::with_capacity(parts.len());
@@ -391,21 +539,14 @@ impl<'a> StagedWeightLoader<'a> {
             );
             total_rows += part.rows;
         }
-        // SAFETY: every element is overwritten by the staged uploads below.
-        let mut data =
-            unsafe { self.ctx.stream.alloc::<bf16>(total_rows * cols) }.map_err(|e| {
-                anyhow::anyhow!("Alloc failed for fused '{}' group: {e}", parts[0].name)
-            })?;
+        let mut data = self.alloc_timed(total_rows * cols, parts[0].name)?;
         let mut dst_offset = 0;
         for src in srcs {
-            self.stager.upload(src, &mut data, dst_offset)?;
+            let dst_at = staging::prepare(&self.ctx.stream, src, &mut data, dst_offset)?;
+            self.pending.push(PendingUpload::Contiguous { src, dst_at });
             dst_offset += src.len() / std::mem::size_of::<bf16>();
         }
-        Ok(DeviceMatrix {
-            data,
-            rows: total_rows,
-            cols,
-        })
+        Ok(self.push_slot(data, total_rows, cols))
     }
 
     /// `take` columns starting at `col_offset` of a source tensor validated
@@ -417,7 +558,8 @@ impl<'a> StagedWeightLoader<'a> {
         src_cols: usize,
         col_offset: usize,
         take: usize,
-    ) -> Result<DeviceMatrix> {
+    ) -> Result<SlotId> {
+        self.ensure_recording()?;
         let full = self.tensor_2d(name, src_rows, src_cols)?;
         anyhow::ensure!(
             col_offset
@@ -425,20 +567,23 @@ impl<'a> StagedWeightLoader<'a> {
                 .is_some_and(|end| end <= src_cols),
             "col range out of bounds for '{name}': col_offset={col_offset} take={take} total_cols={src_cols}"
         );
-        // SAFETY: fully overwritten by the staged upload below.
-        let mut data = unsafe { self.ctx.stream.alloc::<bf16>(src_rows * take) }
-            .map_err(|e| anyhow::anyhow!("Alloc failed for '{name}': {e}"))?;
-        self.stager
-            .upload_cols(full, src_cols, col_offset, take, &mut data)?;
-        Ok(DeviceMatrix {
-            data,
-            rows: src_rows,
-            cols: take,
-        })
+        let mut data = self.alloc_timed(src_rows * take, name)?;
+        let plan = staging::prepare_cols(
+            &self.ctx.stream,
+            full,
+            src_cols,
+            col_offset,
+            take,
+            &mut data,
+        )?;
+        self.pending
+            .push(PendingUpload::ColShard { src: full, plan });
+        Ok(self.push_slot(data, src_rows, take))
     }
 
-    /// Small tensors; plain pageable copy, no staging.
-    pub fn vector(&mut self, name: &str, len: usize) -> Result<DeviceVec> {
+    /// Small tensors; uploaded as plain pageable copies.
+    pub fn vector(&mut self, name: &str, len: usize) -> Result<VecSlotId> {
+        self.ensure_recording()?;
         let tensor = find_tensor(self.shards, self.weight_map, name)?;
         let shape = tensor.shape();
         anyhow::ensure!(
@@ -446,7 +591,33 @@ impl<'a> StagedWeightLoader<'a> {
             "Tensor '{name}' has shape {shape:?}, config expects [{len}]"
         );
         let src = tensor_bf16_cow(&tensor, name)?;
-        DeviceVec::from_host(self.ctx, &src)
+        let mut data = self.alloc_timed(len, name)?;
+        let dst_at = staging::prepare(&self.ctx.stream, bf16_bytes(&src), &mut data, 0)?;
+        self.pending.push(PendingUpload::Vector { src, dst_at });
+        self.vec_slots.push(VecSlot {
+            data: Some(data),
+            len,
+        });
+        Ok(VecSlotId(self.vec_slots.len() - 1))
+    }
+
+    /// Redeems a recorded vector after a successful [`Self::finish`].
+    pub fn take_vec(&mut self, slot: VecSlotId) -> DeviceVec {
+        assert!(self.finished, "take before successful finish");
+        let slot = &mut self.vec_slots[slot.0];
+        DeviceVec {
+            data: slot.data.take().expect("slot already taken"),
+            len: slot.len,
+        }
+    }
+}
+
+impl Drop for StagedWeightLoader<'_> {
+    // Second layer only: the soundness boundary closes inside `finish`.
+    fn drop(&mut self) {
+        if self.failed {
+            staging::drain_or_abort(&self.ctx.stream, "staged loader drop");
+        }
     }
 }
 
