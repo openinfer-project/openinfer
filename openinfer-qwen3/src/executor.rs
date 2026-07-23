@@ -1601,22 +1601,6 @@ impl Qwen3Executor {
         })
     }
 
-    pub fn block_size(&self) -> usize {
-        <Self as ModelExecutor>::block_size(self)
-    }
-
-    pub fn max_request_blocks(&self) -> usize {
-        <Self as ModelExecutor>::max_request_blocks(self)
-    }
-
-    pub fn available_blocks(&self) -> usize {
-        <Self as ModelExecutor>::available_blocks(self)
-    }
-
-    pub fn is_stop_token(&self, token_id: u32) -> bool {
-        <Self as ModelExecutor>::is_stop_token(self, token_id)
-    }
-
     pub fn drop_request(&mut self, request_id: RequestId) -> Result<()> {
         <Self as ModelExecutor>::drop_request(self, request_id)
     }
@@ -1675,11 +1659,6 @@ impl Qwen3Executor {
         let device_ordinal = self.device_ordinal;
         self.overlap = crate::green_ctx::OverlapStreams::create(device_ordinal, overlap)?;
         Ok(())
-    }
-
-    /// Whether prefill/decode overlap (two-stream or SM partition) is active.
-    pub fn decode_overlap_enabled(&self) -> bool {
-        self.overlap.is_some()
     }
 
     /// vLLM-style `--no-prefix-cache`. Behaviour depends on whether offload is

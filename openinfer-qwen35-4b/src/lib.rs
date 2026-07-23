@@ -4,8 +4,6 @@
 // builds stay Python-free.
 #![cfg(feature = "qwen35-4b")]
 
-pub mod kernel_plan;
-
 mod batch_decode;
 pub(crate) mod batch_decode_graph;
 pub(crate) mod config;
@@ -27,7 +25,6 @@ use std::path::Path;
 
 use anyhow::Result;
 use anyhow::anyhow;
-pub use kernel_plan::kernel_plan;
 use openinfer_core::engine::EngineHandle;
 use openinfer_core::engine::EngineLoadOptions;
 use openinfer_core::engine::EpBackend;
@@ -110,33 +107,6 @@ impl Qwen35LaunchOptions {
             (0..self.tp_size).collect()
         })
     }
-}
-
-/// Start the Qwen3.5 engine for the server. TP Phase 1 supports eager-only
-/// multi-GPU execution; single-GPU keeps the existing CUDA Graph-capable path.
-pub fn launch(
-    model_path: &Path,
-    device_ordinal: usize,
-    cuda_graph: bool,
-    max_prefill_tokens: usize,
-) -> Result<EngineHandle> {
-    launch_with_options(
-        model_path,
-        Qwen35LaunchOptions {
-            device_ordinal,
-            tp_size: 1,
-            cuda_graph,
-            max_batch: batch_decode_graph::MAX_BATCH,
-            max_prefill_tokens,
-        },
-    )
-}
-
-pub fn launch_with_options(
-    model_path: &Path,
-    options: Qwen35LaunchOptions,
-) -> Result<EngineHandle> {
-    launch_with_options_and_policy(model_path, options, Qwen35SchedulerPolicy::Off)
 }
 
 pub fn launch_with_options_and_policy(

@@ -115,26 +115,10 @@ macro_rules! typed_pipeline {
     };
 
     (@steps $ctx:expr, $eps:expr, $gemm_mode:ident, $seq_len:tt;
-        fused_add_norm ( $hidden:expr, $residual:expr => $y:expr, $w:expr );
-        $($rest:tt)*
-    ) => {
-        $crate::typed_ops::fused_add_rms_norm_into($ctx, $hidden, $residual, &$w, $eps, $y)?;
-        $crate::typed_pipeline!(@steps $ctx, $eps, $gemm_mode, $seq_len; $($rest)*)
-    };
-
-    (@steps $ctx:expr, $eps:expr, $gemm_mode:ident, $seq_len:tt;
         add ( $a:expr, $b:expr => $y:expr );
         $($rest:tt)*
     ) => {
         $crate::typed_ops::add_into($ctx, $a, $b, $y)?;
-        $crate::typed_pipeline!(@steps $ctx, $eps, $gemm_mode, $seq_len; $($rest)*)
-    };
-
-    (@steps $ctx:expr, $eps:expr, $gemm_mode:ident, $seq_len:tt;
-        silu_mul < $inter:path > ( $gate_up:expr => $y:expr );
-        $($rest:tt)*
-    ) => {
-        $crate::typed_ops::silu_mul_fused_into::<$inter>($ctx, $gate_up, $y)?;
         $crate::typed_pipeline!(@steps $ctx, $eps, $gemm_mode, $seq_len; $($rest)*)
     };
 

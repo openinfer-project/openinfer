@@ -501,30 +501,6 @@ impl<T: BlockMetadata> RequestSequence<T> {
         self.sequence.block_size()
     }
 
-    /// All block IDs in order: assigned ++ staged ++ unassigned.
-    ///
-    /// Block IDs identity-map to page indices in the GPU page pool.
-    pub fn page_indices(&self) -> Vec<u32> {
-        self.assignments
-            .all_block_ids()
-            .map(|&id| id as u32)
-            .collect()
-    }
-
-    /// Drop excess unassigned blocks beyond `keep` count.
-    /// Returns the number of blocks dropped (RAII returns them to reset pool).
-    pub fn drop_excess_unassigned(&mut self, keep: usize) -> usize {
-        let mut dropped = 0;
-        while self.assignments.unassigned_count() > keep {
-            if self.assignments.pop_last_unassigned().is_some() {
-                dropped += 1;
-            } else {
-                break;
-            }
-        }
-        dropped
-    }
-
     // =====================================================================
     // Crate-internal mutation accessors
     // =====================================================================

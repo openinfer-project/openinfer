@@ -1,5 +1,3 @@
-pub mod kernel_plan;
-
 mod batch_decode;
 mod batch_decode_buffers;
 mod batch_decode_dag;
@@ -26,13 +24,11 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use anyhow::Result;
-pub use kernel_plan::kernel_plan;
 use log::info;
 use log::warn;
 use openinfer_core::engine::EngineHandle;
 use openinfer_core::engine::EngineLoadOptions;
 use openinfer_core::engine::EpBackend;
-use openinfer_core::engine::ModelInfo;
 pub use scheduler::DEFAULT_MAX_PREFILL_TOKENS;
 pub use weights::DEFAULT_GPU_MEMORY_UTILIZATION;
 pub use weights::DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES;
@@ -155,9 +151,6 @@ pub struct Qwen3VllmCompatOptions {
 }
 
 impl Qwen3OffloadOptions {
-    /// 8 GiB host tier — a few thousand dense Qwen3-4B blocks.
-    pub const DEFAULT_PINNED_POOL_BYTES: usize = 8 << 30;
-
     pub fn disabled() -> Self {
         Self {
             enabled: false,
@@ -215,29 +208,6 @@ pub mod runtime {
     pub use crate::executor::RequestId;
     pub use crate::executor::UnifiedPlan;
     pub use crate::executor::UnifiedResult;
-}
-
-pub fn probe_model(model_path: &Path) -> Result<Option<ModelInfo>> {
-    let config_path = model_path.join("config.json");
-    let content = match std::fs::read_to_string(&config_path) {
-        Ok(content) => content,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err.into()),
-    };
-    let json: serde_json::Value = serde_json::from_str(&content)?;
-    if json.get("text_config").is_some() {
-        return Ok(None);
-    }
-
-    Ok(Some(ModelInfo {
-        id: "qwen3",
-        display_name: "Qwen3-4B".to_string(),
-        model_path: model_path.to_path_buf(),
-        max_model_len: json
-            .get("max_position_embeddings")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|value| u32::try_from(value).ok()),
-    }))
 }
 
 /// Server-facing launch knobs for the Qwen3 engine.

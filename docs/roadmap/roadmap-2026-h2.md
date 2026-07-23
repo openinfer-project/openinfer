@@ -81,7 +81,7 @@ The next model we add should be runnable by contributors, so the model roster ma
 
 ### 7. Kernel ledger → simulator MVP
 
-Carried from `execution.md`. Qwen3 and Qwen3.5 already have `kernel_plan()` descriptors; the cross-model ledger format and a Qwen3-4B simulator MVP come after observability lands, because the tracing spans are the measurement side of the loop. Value is *explaining* a TTFT/TPOT number, not predicting it.
+Carried from `execution.md`. ~~Qwen3 and Qwen3.5 already have `kernel_plan()` descriptors~~ (the descriptors had no readers and were removed in #743); the cross-model ledger format and a Qwen3-4B simulator MVP come after observability lands, because the tracing spans are the measurement side of the loop. Value is *explaining* a TTFT/TPOT number, not predicting it.
 
 ---
 

@@ -1,5 +1,4 @@
 use anyhow::Result;
-use anyhow::bail;
 use anyhow::ensure;
 use cudarc::driver::CudaSlice;
 use cudarc::driver::DevicePtr;
@@ -197,15 +196,6 @@ pub enum KimiInt4Encoding {
     SignedSymmetric,
 }
 
-impl KimiInt4Encoding {
-    #[must_use]
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::SignedSymmetric => "signed_symmetric",
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KimiInt4LogicalShape {
     pub out_dim: usize,
@@ -346,11 +336,6 @@ impl KimiInt4WeightManifest {
     }
 
     #[must_use]
-    pub fn weight_packed_spec(&self) -> TensorSpec {
-        self.weight_packed_checkpoint_spec()
-    }
-
-    #[must_use]
     pub fn weight_packed_checkpoint_spec(&self) -> TensorSpec {
         TensorSpec::named(
             "u8",
@@ -379,11 +364,6 @@ impl KimiInt4WeightManifest {
                 AxisSpec::named("out_x2", self.logical_shape.out_dim * 2),
             ],
         )
-    }
-
-    #[must_use]
-    pub fn weight_scale_spec(&self) -> TensorSpec {
-        self.weight_scale_checkpoint_spec()
     }
 
     #[must_use]
@@ -444,27 +424,6 @@ impl KimiMarlinInt4Weight<'_> {
         );
         Ok(())
     }
-
-    #[must_use]
-    pub fn manifest_call(&self) -> KernelCall {
-        KernelCall::new(
-            "kimi_k2.moe.int4_marlin_weight",
-            "Kimi-K2 vLLM Marlin WNA16 INT4 expert weight package",
-        )
-        .input(
-            "weight_packed_uint4b8",
-            self.manifest.weight_packed_marlin_uint4b8_spec(),
-        )
-        .input(
-            "weight_scale_permuted",
-            self.manifest.weight_scale_marlin_permuted_spec(),
-        )
-        .attr("encoding", "uint4b8_bias_8".to_string())
-        .attr("scale_layout", "vllm_group_major_perm64".to_string())
-        .attr("act_order", "false".to_string())
-        .attr("group_size", self.manifest.group_size.to_string())
-        .attr("local_experts", self.manifest.local_experts.to_string())
-    }
 }
 
 pub struct KimiMarlinFusedW13Int4Weight<'a> {
@@ -518,43 +477,6 @@ impl KimiMarlinFusedW13Int4Weight<'_> {
             self.weight_scale_permuted.len()
         );
         Ok(())
-    }
-
-    #[must_use]
-    pub fn manifest_call(&self) -> KernelCall {
-        KernelCall::new(
-            "kimi_k2.moe.int4_marlin_w13_weight",
-            "Kimi-K2 vLLM Marlin WNA16 fused W13 expert weight package",
-        )
-        .input(
-            "weight_packed_uint4b8",
-            TensorSpec::named(
-                "u32",
-                "expert_major_int4_packed_marlin_w13_uint4b8_noact",
-                [
-                    AxisSpec::named("local_expert", self.local_experts),
-                    AxisSpec::named("in_tile16", self.in_dim / 16),
-                    AxisSpec::named("out_x2", 2 * self.intermediate_dim * 2),
-                ],
-            ),
-        )
-        .input(
-            "weight_scale_permuted",
-            TensorSpec::named(
-                "bf16",
-                "expert_major_group_scale_marlin_w13_group_major_perm64",
-                [
-                    AxisSpec::named("local_expert", self.local_experts),
-                    AxisSpec::named("in_group", self.in_dim / self.group_size),
-                    AxisSpec::named("out", 2 * self.intermediate_dim),
-                ],
-            ),
-        )
-        .attr("encoding", "uint4b8_bias_8".to_string())
-        .attr("scale_layout", "vllm_w13_group_major_perm64".to_string())
-        .attr("act_order", "false".to_string())
-        .attr("group_size", self.group_size.to_string())
-        .attr("w13_order", "gate_then_up".to_string())
     }
 }
 
@@ -1574,18 +1496,6 @@ fn marlin_padded_route_capacity(active_tokens: usize, block_size: usize) -> Resu
     route_elems
         .checked_add(max_padding)
         .ok_or_else(|| anyhow::anyhow!("Marlin padded route capacity overflow"))
-}
-
-pub fn validate_ep_rank(ep_rank: usize) -> Result<()> {
-    if ep_rank < KIMI_K2_EP_WORLD {
-        Ok(())
-    } else {
-        bail!(
-            "Kimi-K2 EP rank must be < {}, got {}",
-            KIMI_K2_EP_WORLD,
-            ep_rank
-        )
-    }
 }
 
 #[cfg(test)]

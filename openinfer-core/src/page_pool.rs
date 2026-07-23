@@ -80,12 +80,10 @@ impl OwnedPagePermit {
         &self.pages
     }
 
+    // `is_empty` was dead code (hawk sweep, #743); `len` stands alone.
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.pages.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.pages.is_empty()
     }
 
     /// Try to acquire `n` more pages, appending them to this permit.

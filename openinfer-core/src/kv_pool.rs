@@ -160,10 +160,6 @@ impl KvState {
         self.seq_len
     }
 
-    pub fn num_pages(&self) -> usize {
-        self.permit.pages().len()
-    }
-
     pub fn last_page_len(&self) -> usize {
         if self.seq_len == 0 {
             0
@@ -219,10 +215,7 @@ impl KvState {
     /// Build kernel-facing metadata for this request's KV.
     pub fn desc(&self) -> KvDesc<'_> {
         KvDesc {
-            layout: self.pool.inner.layout,
-            buffer: &self.pool.inner.buffer,
             pages: self.permit.pages(),
-            seq_len: self.seq_len,
             last_page_len: self.last_page_len(),
         }
     }
@@ -244,22 +237,11 @@ impl KvState {
 /// Bundles pool geometry (strides) with request state (page list, seq_len).
 /// Forward code passes this opaquely to FFI calls.
 pub struct KvDesc<'a> {
-    layout: KvLayout,
-    buffer: &'a CudaSlice<bf16>,
     pages: &'a [PageId],
-    seq_len: usize,
     last_page_len: usize,
 }
 
 impl KvDesc<'_> {
-    pub fn layout(&self) -> &KvLayout {
-        &self.layout
-    }
-
-    pub fn seq_len(&self) -> usize {
-        self.seq_len
-    }
-
     pub fn last_page_len(&self) -> usize {
         self.last_page_len
     }
@@ -271,12 +253,6 @@ impl KvDesc<'_> {
     /// Page indices for this request (CPU-side).
     pub fn page_indices(&self) -> &[PageId] {
         self.pages
-    }
-
-    /// The backing buffer. Kernel integration will extract device pointers
-    /// via `buffer.device_ptr(&stream)`.
-    pub fn buffer(&self) -> &CudaSlice<bf16> {
-        self.buffer
     }
 }
 

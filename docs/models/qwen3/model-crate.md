@@ -72,12 +72,10 @@ pub struct EngineHandle {
 
 ```rust
 // openinfer-qwen3
-pub fn probe_model(model_path: &std::path::Path) -> anyhow::Result<Option<ModelInfo>>;
 pub fn start_engine(
     model_path: &std::path::Path,
     options: EngineLoadOptions,
 ) -> anyhow::Result<EngineHandle>;
-pub fn kernel_plan() -> &'static KernelPlan;
 ```
 
 `Qwen3Model`, `BatchDecodeBuffers`, and `KvState` should not be root-facing APIs. The deliberate low-level escape hatch is `openinfer_qwen3::runtime`, which exposes `Qwen3Executor` plus prefill/decode/unified plan types. That is the production phase boundary used by the scheduler and by model-local benches; root should still use `start_engine`.

@@ -14,7 +14,6 @@ pub const KIMI_K2_MLA_LOCAL_HEADS_TP8: usize = 8;
 pub const KIMI_K2_MLA_Q_HEAD_DIM: usize = 192;
 pub const KIMI_K2_MLA_V_HEAD_DIM: usize = 128;
 pub const KIMI_K2_MLA_ROPE_DIM: usize = KIMI_K2_MLA_Q_HEAD_DIM - KIMI_K2_MLA_V_HEAD_DIM;
-pub const KIMI_K2_MLA_NOPE_DIM: usize = KIMI_K2_MLA_Q_HEAD_DIM - KIMI_K2_MLA_ROPE_DIM;
 const KIMI_K2_MLA_Q_LORA_RANK: usize = 1536;
 pub const KIMI_K2_MLA_KV_LORA_RANK: usize = 512;
 pub const KIMI_K2_MLA_KV_A_OUT: usize = 576;

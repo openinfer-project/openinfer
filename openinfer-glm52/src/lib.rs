@@ -48,7 +48,6 @@ pub use config::GLM52_DENSE_LAYERS;
 pub use config::GLM52_HIDDEN;
 pub use config::GLM52_INDEX_TOPK;
 pub use config::GLM52_LAYERS;
-pub use config::GLM52_MOE_LAYERS;
 pub use config::GLM52_ROUTED_EXPERTS;
 pub use config::GLM52_TOPK;
 pub use config::GLM52_VOCAB;

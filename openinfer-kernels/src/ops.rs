@@ -144,7 +144,6 @@ pub use sampling::argmax;
 pub use sampling::argmax_batch_bf16_into;
 pub use sampling::argmax_batch_bf16_split_indexed_into;
 pub use sampling::argmax_batch_bf16_split_partials_len;
-pub use sampling::argmax_bf16_into;
 pub use sampling::argmax_bf16_split_into;
 pub use sampling::flashinfer_top1_batch_into;
 pub use sampling::flashinfer_top1_row_states_bytes;

@@ -18,8 +18,6 @@ use crate::weights::Qwen3Model;
 
 pub const MODEL: &str = "qwen3";
 pub const PHASE_DECODE: &str = "decode";
-pub const HIDDEN_SIZE: usize = 2560;
-pub const INTERMEDIATE_SIZE: usize = 9728;
 pub const NUM_LAYERS: usize = 36;
 pub const NUM_Q_HEADS: usize = 32;
 pub const NUM_KV_HEADS: usize = 8;

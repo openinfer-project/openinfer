@@ -101,10 +101,6 @@ impl BlockPool {
         })
     }
 
-    pub fn block_manager(&self) -> &BlockManager<()> {
-        &self.block_manager
-    }
-
     pub fn block_size(&self) -> usize {
         self.block_size
     }
@@ -291,13 +287,10 @@ impl LoadReservation {
     }
 
     /// Number of reserved destination blocks.
+    // `is_empty` was dead code (hawk sweep, #743); `len` stands alone.
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.blocks.len()
-    }
-
-    /// True when no destinations were reserved.
-    pub fn is_empty(&self) -> bool {
-        self.blocks.is_empty()
     }
 }
 
@@ -465,20 +458,12 @@ impl RequestKv {
         self.seq.kv_position()
     }
 
-    pub fn assigned_blocks(&self) -> usize {
-        self.seq.assigned_blocks()
-    }
-
     pub fn is_complete(&self) -> bool {
         self.seq.is_complete()
     }
 
     pub fn generated_tokens(&self) -> usize {
         self.seq.generated_tokens()
-    }
-
-    pub fn block_size(&self) -> usize {
-        self.seq.block_size()
     }
 
     /// Physical page IDs assigned to this request, in sequence order.
