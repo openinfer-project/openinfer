@@ -236,9 +236,9 @@ Validation scope:
 - `docs/models/qwen3/tp-design.md`
 - `openinfer-qwen3-4b/src/config.rs`
 - `openinfer-qwen3-4b/src/executor.rs`
-- `openinfer-qwen35-4b/src/config.rs`
-- `openinfer-qwen35-4b/src/weights.rs`
-- `openinfer-qwen35-4b/src/recurrent_state.rs`
-- `openinfer-qwen35-4b/src/batch_decode.rs`
+- `openinfer-qwen35/src/config.rs`
+- `openinfer-qwen35/src/weights.rs`
+- `openinfer-qwen35/src/recurrent_state.rs`
+- `openinfer-qwen35/src/batch_decode.rs`
 - vLLM `Qwen3NextForCausalLM`
 - vLLM `QwenGatedDeltaNetAttention`

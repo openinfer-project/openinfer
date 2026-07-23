@@ -13,11 +13,11 @@
 
 ## Code Shape
 
-- `openinfer-qwen35-4b/src/prefill.rs` returns each request's last hidden state and batches final `rms_norm_batch_offset_into` + `gemm`.
-- `openinfer-qwen35-4b/src/unified_forward.rs` returns batched prefill logits and leaves decode logits in the graph buffer.
-- `openinfer-qwen35-4b/src/batch_decode.rs`, `src/scheduler.rs`, and `src/executor.rs` sample from batched logits.
-- `openinfer-qwen35-4b/src/logprobs.rs` is the single helper for requested-logprobs snapshots and CPU logprob formatting.
-- `openinfer-qwen35-4b/tests/e2e_scheduler.rs` checks greedy `logprobs=0/1` token parity, logprob payload shape, and mixed concurrent logprob/no-logprob requests.
+- `openinfer-qwen35/src/prefill.rs` returns each request's last hidden state and batches final `rms_norm_batch_offset_into` + `gemm`.
+- `openinfer-qwen35/src/unified_forward.rs` returns batched prefill logits and leaves decode logits in the graph buffer.
+- `openinfer-qwen35/src/batch_decode.rs`, `src/scheduler.rs`, and `src/executor.rs` sample from batched logits.
+- `openinfer-qwen35/src/logprobs.rs` is the single helper for requested-logprobs snapshots and CPU logprob formatting.
+- `openinfer-qwen35/tests/e2e_scheduler.rs` checks greedy `logprobs=0/1` token parity, logprob payload shape, and mixed concurrent logprob/no-logprob requests.
 
 ## Verification
 
@@ -25,13 +25,13 @@
 cargo fmt --all --check
 git diff --check
 OPENINFER_CUDA_SM=120 OPENINFER_TRITON_PYTHON=<python-with-triton> \
-  cargo check --release -p openinfer-qwen35-4b --features qwen35-4b --tests
+  cargo check --release -p openinfer-qwen35 --features qwen35 --tests
 OPENINFER_CUDA_SM=120 OPENINFER_TRITON_PYTHON=<python-with-triton> \
   OPENINFER_TEST_MODEL_PATH=<Qwen3.5-4B> \
-  cargo test --release -p openinfer-qwen35-4b --features qwen35-4b --test hf_golden_gate -- --nocapture
+  cargo test --release -p openinfer-qwen35 --features qwen35 --test hf_golden_gate -- --nocapture
 OPENINFER_CUDA_SM=120 OPENINFER_TRITON_PYTHON=<python-with-triton> \
   OPENINFER_TEST_MODEL_PATH=<Qwen3.5-4B> \
-  cargo test --release -p openinfer-qwen35-4b --features qwen35-4b --test e2e_scheduler -- --nocapture
+  cargo test --release -p openinfer-qwen35 --features qwen35 --test e2e_scheduler -- --nocapture
 ```
 
 Results:
@@ -47,7 +47,7 @@ Environment: single RTX 5090 32GB, driver 580.76.05, CUDA 12.8, Rust 1.96.0, Tri
 Final short-output serving A/B:
 
 ```bash
-cargo run --release --features qwen35-4b --bin bench_serving -- \
+cargo run --release --features qwen35 --bin bench_serving -- \
   --model-path <Qwen3.5-4B> --format json --label <label> --out <label>.json \
   request --prompt-len 1 --output-len 1 --concurrency 4 --warmup 5 --iters 20 --seed 353
 ```

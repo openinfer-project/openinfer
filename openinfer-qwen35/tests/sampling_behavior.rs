@@ -79,7 +79,7 @@ fn sampling_params_steer_the_qwen35_sampler() {
         return;
     };
 
-    let handle = openinfer_qwen35_4b::start_engine(
+    let handle = openinfer_qwen35::start_engine(
         Path::new(&model_path),
         EngineLoadOptions {
             enable_cuda_graph: true,
@@ -88,7 +88,7 @@ fn sampling_params_steer_the_qwen35_sampler() {
             ..EngineLoadOptions::default()
         },
         4,
-        openinfer_qwen35_4b::DEFAULT_MAX_PREFILL_TOKENS,
+        openinfer_qwen35::DEFAULT_MAX_PREFILL_TOKENS,
     )
     .expect("failed to start Qwen3.5 engine");
     let tokenizer = common::load_tokenizer(&model_path);

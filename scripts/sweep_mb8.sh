@@ -2,7 +2,7 @@
 # Re-run the issue #470 mixed-load matrix with the legal capacity
 # `--max-batch 8 --bg-concurrency 4` (physical bucket == admission == 8),
 # as suggested by the maintainer. 3 qps x 4 prompt x 2 chunk = 24 valid cells.
-# Prereq: build bench_serving (--features qwen35-4b) and run from the repo root.
+# Prereq: build bench_serving (--features qwen35) and run from the repo root.
 set -u
 BIN=target/release/bench_serving
 DATA=datasets/mixed-load-itl-470-data-mb8

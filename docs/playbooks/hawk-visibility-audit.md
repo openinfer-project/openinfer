@@ -31,7 +31,7 @@ All three environment variables are required:
 
 - `RUSTC_BOOTSTRAP=1` — the repo pins nightly (`generic_const_exprs`); hawk only accepts the 1.97.1 stable compiler, so feature gates must be unlocked.
 - `OPENINFER_NCCL_ROOT` — under all-features, `openinfer-kernels/moe` builds the DeepEP shim, which needs NCCL >= 2.30.4.
-- `OPENINFER_TRITON_PYTHON` — the `qwen35-4b` build-time Triton AOT codegen (build.rs also falls back to `.venv/bin/python` on its own).
+- `OPENINFER_TRITON_PYTHON` — the `qwen35` build-time Triton AOT codegen (build.rs also falls back to `.venv/bin/python` on its own).
 
 Expected runtime: ~20 minutes cold (Triton AOT + Marlin nvcc dominate); artifacts are cached under `/tmp/cargo-hawk-target/<workspace>-<hash>`, so reruns take a few minutes.
 

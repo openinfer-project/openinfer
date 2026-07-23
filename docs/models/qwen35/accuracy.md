@@ -2,7 +2,7 @@
 
 > **TL;DR:** Qwen3.5 accuracy now has short and long HF-backed logits goldens (`tests/hf_golden_gate.rs`, `test_data/qwen35-4b-hf-golden.safetensors`, and `test_data/qwen35-4b-hf-long-golden.safetensors`). The HF fixtures use `AutoModelForCausalLM` with `use_cache=True` / `past_key_values`, so they match openinfer's prefill + decode shape. The long fixture crosses the old 4096-position RoPE cache boundary with 4097- and 8192-token prompts, and the #250 fix recovers full GSM8K 8-shot at `batch_size=1` to `strict-match` 79.38% / `flexible-extract` 79.30% vs the HF 79.45% baseline. The gate is size-portable: it derives a `4b`/`9b`/`27b` fixture key from the pointed model's config content; 9B and 27B now ship committed short + long fixtures and run the same logits gate — 9B confirms the #516 untied-lm_head fix, and 27B covers the #564 group-6 decode reroute. The older exact-text `test_data/Qwen3.5-4B.json` and its regeneration test are retired; `e2e_scheduler` stays a scheduler liveness/integration check that now also gates model-wide collapse (free-running output must not degenerate into token loops). A broader OpenInfer-owned rand/hash corpus is deferred until the project decides how to handle cross-architecture exact-token drift.
 >
-> **Last touched:** 2026-07. The HF logits gate passes on RTX 5090 `sm_120` and covers the qwen35-owned replay surfaces: sequential graph decode, bucket-straddling batched graph decode, slot-compaction replay after a mid-batch request drop, and a long-prompt sequential replay at 4097/8192 tokens. A full GSM8K 8-shot `lm_eval` run against `/v1/completions` also passes at HF-baseline accuracy. Current accuracy command is crate-local and needs an absolute `OPENINFER_TEST_MODEL_PATH`: `cargo test --release -p openinfer-qwen35-4b --test hf_golden_gate -- --nocapture`. Run `e2e_scheduler` only when scheduler request-flow behavior changes.
+> **Last touched:** 2026-07. The HF logits gate passes on RTX 5090 `sm_120` and covers the qwen35-owned replay surfaces: sequential graph decode, bucket-straddling batched graph decode, slot-compaction replay after a mid-batch request drop, and a long-prompt sequential replay at 4097/8192 tokens. A full GSM8K 8-shot `lm_eval` run against `/v1/completions` also passes at HF-baseline accuracy. Current accuracy command is crate-local and needs an absolute `OPENINFER_TEST_MODEL_PATH`: `cargo test --release -p openinfer-qwen35 --test hf_golden_gate -- --nocapture`. Run `e2e_scheduler` only when scheduler request-flow behavior changes.
 
 ## Goal
 
@@ -13,18 +13,18 @@
 ## Current State
 
 - Reusable debugging method now lives in [../../playbooks/accuracy-parity-playbook.md](../../playbooks/accuracy-parity-playbook.md).
-- `openinfer-qwen35-4b/tests/hf_golden_gate.rs` checks openinfer logits against pinned HF bf16 `past_key_values` oracles, a short + long pair per committed size (`4b`, `9b`, `27b`):
+- `openinfer-qwen35/tests/hf_golden_gate.rs` checks openinfer logits against pinned HF bf16 `past_key_values` oracles, a short + long pair per committed size (`4b`, `9b`, `27b`):
   - `test_data/qwen35-4b-hf-golden.safetensors` / `qwen35-4b-hf-long-golden.safetensors` — 4B short mixed-shape + long 4097/8192-token replay surfaces.
   - `test_data/qwen35-9b-hf-golden.safetensors` / `qwen35-9b-hf-long-golden.safetensors` — 9B (untied lm_head, #516) short + long, within the 4B tolerances.
   - `test_data/qwen35-27b-hf-golden.safetensors` / `qwen35-27b-hf-long-golden.safetensors` — 27B (group-6 full attention, decodes via the #564 reroute) short + long, within the 4B tolerances.
-- `openinfer-qwen35-4b/tests/e2e.rs`, `openinfer-qwen35-4b/tests/regen_test_data.rs`, and `test_data/Qwen3.5-4B.json` are retired. They were exact-text OpenInfer self-baselines, not HF accuracy gates.
-- `openinfer-qwen35-4b/tests/e2e_scheduler.rs` still loads the model and exercises sequential, repeated, concurrent, and consumer-drop scheduler paths, but it no longer reads an exact-text JSON fixture.
+- `openinfer-qwen35/tests/e2e.rs`, `openinfer-qwen35/tests/regen_test_data.rs`, and `test_data/Qwen3.5-4B.json` are retired. They were exact-text OpenInfer self-baselines, not HF accuracy gates.
+- `openinfer-qwen35/tests/e2e_scheduler.rs` still loads the model and exercises sequential, repeated, concurrent, and consumer-drop scheduler paths, but it no longer reads an exact-text JSON fixture.
 - A broader OpenInfer-owned rand/hash corpus was considered for issue #186, but checked-in exact token/hash data may drift across GPU architectures (`sm_80`, `sm_90`, `sm_120`). Keep that as follow-up design work until the cross-architecture stability policy is explicit.
 - `docs/models/qwen35/optimization.md` records historical exact-text baseline churn. New accuracy work should use the HF logits gate before interpreting prompt-level text drift.
 - The #250 GSM8K 8-shot recovery run now closes the task-score side of the old long-prompt divergence: openinfer scored `strict-match` 79.38% and `flexible-extract` 79.30% vs the HF 79.45% baseline.
 - Most of the historical op-level CPU-reference tests were retired along with
   the kernels they covered; the surviving low-level guard is
-  `openinfer-qwen35-4b/src/recurrent.rs`: `conv1d_prefill_handoff_matches_single_prefill`.
+  `openinfer-qwen35/src/recurrent.rs`: `conv1d_prefill_handoff_matches_single_prefill`.
   - `src/ops/tests.rs`: `test_argmax_tie_prefers_smallest_index_across_thread_strides`
 - Historical accuracy tooling was recorded for layer `0` prefill, but these paths are not present in the current tree after the model-crate split:
   - `src/bin/qwen35_dump_layer0.rs` dumps openinfer layer-0 checkpoints to JSON
@@ -64,7 +64,7 @@ OPENINFER_CUDA_SM=120 \
 OPENINFER_TRITON_PYTHON=$TRITON_PYTHON \
 OPENINFER_TEST_MODEL_PATH=$MODEL_PATH \
 OPENINFER_TEST_MODEL_REVISION=851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a \
-cargo test --release -p openinfer-qwen35-4b --test hf_golden_gate -- --nocapture
+cargo test --release -p openinfer-qwen35 --test hf_golden_gate -- --nocapture
 ```
 
 Observed floor from that run:
@@ -101,7 +101,7 @@ OPENINFER_CUDA_SM=120 \
 OPENINFER_TRITON_PYTHON=$TRITON_PYTHON \
 OPENINFER_TEST_MODEL_PATH=$MODEL_PATH \
 OPENINFER_TEST_MODEL_REVISION=851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a \
-cargo test --release -p openinfer-qwen35-4b --test hf_golden_gate -- --nocapture
+cargo test --release -p openinfer-qwen35 --test hf_golden_gate -- --nocapture
 ```
 
 Observed long-prompt floor from that run:

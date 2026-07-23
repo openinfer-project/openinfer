@@ -305,19 +305,17 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
             )
             .context("failed to start Qwen3 engine")?
         }
-        #[cfg(feature = "qwen35-4b")]
-        ModelType::Qwen35 => openinfer_qwen35_4b::launch_with_options_and_policy(
+        #[cfg(feature = "qwen35")]
+        ModelType::Qwen35 => openinfer_qwen35::launch_with_options_and_policy(
             &args.model_path,
-            openinfer_qwen35_4b::Qwen35LaunchOptions {
+            openinfer_qwen35::Qwen35LaunchOptions {
                 device_ordinal: args.device_ordinal,
                 tp_size: args.tp_size,
                 cuda_graph: args.cuda_graph,
-                max_batch: args
-                    .max_batch
-                    .unwrap_or(openinfer_qwen35_4b::MAX_DECODE_BATCH),
+                max_batch: args.max_batch.unwrap_or(openinfer_qwen35::MAX_DECODE_BATCH),
                 max_prefill_tokens: args
                     .max_prefill_tokens
-                    .unwrap_or(openinfer_qwen35_4b::DEFAULT_MAX_PREFILL_TOKENS),
+                    .unwrap_or(openinfer_qwen35::DEFAULT_MAX_PREFILL_TOKENS),
             },
             args.qwen35_scheduler_policy.resolve(),
         )

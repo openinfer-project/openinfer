@@ -26,13 +26,13 @@ OpenInfer build and gates:
 OPENINFER_CUDA_SM=120 \
 OPENINFER_TRITON_PYTHON=<python-with-triton> \
 CUDA_HOME=/usr/local/cuda-12.8 \
-cargo build --release -p openinfer-server --features qwen35-4b
+cargo build --release -p openinfer-server --features qwen35
 
 OPENINFER_TEST_MODEL_PATH=$MODEL \
-cargo test --release -p openinfer-qwen35-4b --features qwen35-4b --test hf_golden_gate -- --nocapture
+cargo test --release -p openinfer-qwen35 --features qwen35 --test hf_golden_gate -- --nocapture
 
 OPENINFER_TEST_MODEL_PATH=$MODEL \
-cargo test --release -p openinfer-qwen35-4b --features qwen35-4b --test e2e_scheduler -- --nocapture
+cargo test --release -p openinfer-qwen35 --features qwen35 --test e2e_scheduler -- --nocapture
 ```
 
 OpenInfer serve:

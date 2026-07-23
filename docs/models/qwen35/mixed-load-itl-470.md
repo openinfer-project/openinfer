@@ -255,7 +255,7 @@ as ON being better.
 Single cell (`ITL_STEP` goes to stderr, so redirect into the log for aggregation):
 
 ```bash
-cargo build -r -p openinfer-server --bin bench_serving --features qwen35-4b
+cargo build -r -p openinfer-server --bin bench_serving --features qwen35
 BIN=target/release/bench_serving
 # chunk ON = default budget; chunk OFF = add --max-prefill-tokens 99999999
 OPENINFER_ITL_DEBUG=1 RUST_LOG=info "$BIN" \

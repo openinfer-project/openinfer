@@ -2,8 +2,8 @@ use criterion::BenchmarkId;
 use criterion::Criterion;
 use criterion::Throughput;
 use openinfer_core::tensor::DeviceContext;
-use openinfer_qwen35_4b::prefill_buffers::GdrChunkwiseScratch35;
-use openinfer_qwen35_4b::runtime_ops as ops;
+use openinfer_qwen35::prefill_buffers::GdrChunkwiseScratch35;
+use openinfer_qwen35::runtime_ops as ops;
 
 use super::common::QWEN35_4B_LINEAR_K_DIM;
 use super::common::QWEN35_4B_LINEAR_K_HEADS;

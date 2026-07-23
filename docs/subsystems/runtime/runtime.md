@@ -37,7 +37,7 @@ Design points worth keeping in mind:
 ## What's been done
 
 - Shared runtime/API entry extracted into `openinfer-core`: sampler, page/KV pools, weight loading, CUDA Graph state, shared op adapters, `ModelForward` / `GenerationState`.
-- Per-model crates (`openinfer-qwen3`, `openinfer-qwen35-4b`) own their config, weights, prefill/decode execution, scheduler, and tests.
+- Per-model crates (`openinfer-qwen3`, `openinfer-qwen35`) own their config, weights, prefill/decode execution, scheduler, and tests.
 - Generation loop unified into `openinfer-core` against the trait — replaces ~120 lines of duplicated orchestration per model.
 - Internal modules (decode buffers, KV cache, recurrent state, FFI bindings, tokenizer streaming, weight-loader helpers) pulled back behind crate-local visibility. `unreachable_pub` is meaningful again.
 - Trace machinery removed from the active public surface.

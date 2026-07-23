@@ -17,7 +17,7 @@ Source benchmark for the README Qwen3.5 performance rows.
 | --- | --- |
 | GPU | 1x NVIDIA GeForce RTX 5090 (32 GB), driver 580.105.08, same GPU for each sequential run |
 | Model | Qwen3.5-4B, BF16 safetensors, TP1, text-only serving |
-| openinfer | branch based on upstream/main `a1846ca`, release build with `--features qwen35-4b`, CUDA Graph decode on by default |
+| openinfer | branch based on upstream/main `a1846ca`, release build with `--features qwen35`, CUDA Graph decode on by default |
 | vLLM | 0.23.0 from PyPI, latest stable release checked in June 2026 |
 | openinfer serve flags | `--no-prefix-cache`, CUDA Graph decode on by default |
 | vLLM serve flags | `--language-model-only`, `--no-enable-prefix-caching`, `--max-model-len 8192`, `--gpu-memory-utilization 0.9` |

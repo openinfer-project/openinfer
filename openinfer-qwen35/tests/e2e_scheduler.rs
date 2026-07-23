@@ -556,15 +556,15 @@ fn test_e2e_qwen35_scheduler() {
     info!("Loading Qwen3.5 model for scheduler test...");
     let start = Instant::now();
     let model =
-        openinfer_qwen35_4b::runtime::Qwen35Model::from_safetensors_with_options(&model_path, true)
+        openinfer_qwen35::runtime::Qwen35Model::from_safetensors_with_options(&model_path, true)
             .expect("Failed to load model");
     let tokenizer = common::load_tokenizer(&model_path);
     // Use reduced batch capacity (8) to fit on 16GB GPUs alongside the model.
-    let handle = openinfer_qwen35_4b::runtime::start_with_capacity(
+    let handle = openinfer_qwen35::runtime::start_with_capacity(
         model,
         42,
         8,
-        openinfer_qwen35_4b::DEFAULT_MAX_PREFILL_TOKENS,
+        openinfer_qwen35::DEFAULT_MAX_PREFILL_TOKENS,
     )
     .expect("Failed to start Qwen3.5 scheduler");
     info!("scheduler loaded in {:.2?}", start.elapsed());
@@ -582,7 +582,7 @@ fn test_e2e_qwen35_scheduler_tp2() {
     let start = Instant::now();
     let tokenizer = common::load_tokenizer(&model_path);
     // TP Phase 1 is eager-only; CUDA Graph must stay disabled for multi-device startup.
-    let handle = openinfer_qwen35_4b::start_engine_with_capacity(
+    let handle = openinfer_qwen35::start_engine_with_capacity(
         Path::new(&model_path),
         EngineLoadOptions {
             enable_cuda_graph: false,
@@ -591,7 +591,7 @@ fn test_e2e_qwen35_scheduler_tp2() {
             ..EngineLoadOptions::default()
         },
         8,
-        openinfer_qwen35_4b::DEFAULT_MAX_PREFILL_TOKENS,
+        openinfer_qwen35::DEFAULT_MAX_PREFILL_TOKENS,
     )
     .expect("Failed to start Qwen3.5 TP2 scheduler");
     info!("TP2 scheduler loaded in {:.2?}", start.elapsed());

@@ -1,8 +1,8 @@
 // The whole crate is gated: Qwen3.5 needs the Triton AOT kernels from
-// `openinfer-kernels/qwen35-4b`, which need Python + Triton at build time.
+// `openinfer-kernels/qwen35`, which need Python + Triton at build time.
 // Without the feature this compiles to an empty crate so plain workspace
 // builds stay Python-free.
-#![cfg(feature = "qwen35-4b")]
+#![cfg(feature = "qwen35")]
 
 mod batch_decode;
 pub(crate) mod batch_decode_graph;

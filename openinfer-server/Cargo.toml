@@ -34,7 +34,7 @@ openinfer-deepseek-v2-lite = { workspace = true, optional = true }
 openinfer-glm52 = { workspace = true, optional = true }
 openinfer-kimi-k2 = { workspace = true, optional = true }
 openinfer-qwen3 = { workspace = true, optional = true }
-openinfer-qwen35-4b = { workspace = true, optional = true }
+openinfer-qwen35 = { workspace = true, optional = true }
 openinfer-vllm-frontend = { workspace = true }
 openinfer-vllm-support = { workspace = true }
 rand = { workspace = true }
@@ -58,7 +58,7 @@ deepseek-v2-lite = [
 ]
 glm52 = ["dep:openinfer-glm52"]
 kimi-k2 = ["dep:openinfer-kimi-k2", "openinfer-kimi-k2/kimi-k2"]
-qwen35-4b = ["dep:openinfer-qwen35-4b", "openinfer-qwen35-4b/qwen35-4b"]
+qwen35 = ["dep:openinfer-qwen35", "openinfer-qwen35/qwen35"]
 
 [lints]
 workspace = true

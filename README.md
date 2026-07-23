@@ -43,7 +43,7 @@ and [Co-locating Prefill and Decode on One GPU](https://open-infer.org/blog/gree
 - Rust (2024 edition), CUDA Toolkit (nvcc, cuBLAS), CUDA-capable GPU
 - NVIDIA driver R545 (CUDA 12.3) or newer; `cuFuncGetName` sets this floor, while per-symbol lazy loading keeps the `cuda-12090` cudarc binding from requiring a CUDA 12.9 driver
 - The default build (Qwen3-4B / 8B) is pure Rust + CUDA — no Python at all
-- Python 3 + Triton for `qwen35-4b` feature builds (build-time only — no Python at runtime)
+- Python 3 + Triton for `qwen35` feature builds (build-time only — no Python at runtime)
 - The `kimi-k2` EP path additionally needs NCCL ≥ 2.27 at runtime (`ncclAlltoAll`)
 
 ### Build & Run
@@ -57,7 +57,7 @@ export CUDA_HOME=/usr/local/cuda
 cargo run --release
 ```
 
-> **Note**: The server CLI is in `openinfer-server`. Model crates such as `openinfer-qwen3`, `openinfer-qwen35-4b`, and `openinfer-kimi-k2` contain model logic and diagnostics but are not server entrypoints. Use `cargo run --release` from the workspace root, or `cargo run --release -p openinfer-server -- --model-path <path>`.
+> **Note**: The server CLI is in `openinfer-server`. Model crates such as `openinfer-qwen3`, `openinfer-qwen35`, and `openinfer-kimi-k2` contain model logic and diagnostics but are not server entrypoints. Use `cargo run --release` from the workspace root, or `cargo run --release -p openinfer-server -- --model-path <path>`.
 
 ```bash
 # Try it
@@ -80,7 +80,7 @@ curl -N http://localhost:8000/v1/completions \
 # Qwen3.5 requires the feature-gated Triton AOT kernels (Python + Triton at build time)
 uv venv && uv pip install triton
 export OPENINFER_TRITON_PYTHON=.venv/bin/python
-cargo run --release --features qwen35-4b -- --model-path models/Qwen3.5-4B
+cargo run --release --features qwen35 -- --model-path models/Qwen3.5-4B
 
 # Disable CUDA Graph (useful for debugging)
 cargo run --release -- --cuda-graph=false
@@ -91,7 +91,7 @@ cargo run --release -- --cuda-graph=false
 | Variable | Description |
 |----------|-------------|
 | `CUDA_HOME` | CUDA Toolkit path (default: `/usr/local/cuda`) |
-| `OPENINFER_TRITON_PYTHON` | Python with Triton for `qwen35-4b` build-time AOT compilation |
+| `OPENINFER_TRITON_PYTHON` | Python with Triton for `qwen35` build-time AOT compilation |
 | `OPENINFER_TILELANG_PYTHON` | Python with TileLang for the `glm52` sparse-MLA build-time kernel generation (sm_90a) |
 | `OPENINFER_CUDA_SM` | GPU SM target override when `nvidia-smi` unavailable (e.g. `120`) |
 
@@ -111,7 +111,7 @@ cargo run --release -p openinfer-server -- --model-path models/Qwen3-4B
 uv venv .venv --python 3.12
 uv pip install "triton-windows<3.7"
 $env:OPENINFER_TRITON_PYTHON = ".venv\Scripts\python.exe"
-cargo run --release --features qwen35-4b -- --model-path models/Qwen3.5-4B
+cargo run --release --features qwen35 -- --model-path models/Qwen3.5-4B
 ```
 
 </details>
@@ -122,7 +122,7 @@ cargo run --release --features qwen35-4b -- --model-path models/Qwen3.5-4B
 |-------|-------------|--------|--------|
 | [Qwen3-4B](https://huggingface.co/Qwen/Qwen3-4B) | Full attention (GQA) | 4B | Greedy + sampling, default feature, pure Rust + CUDA build |
 | [Qwen3-8B](https://huggingface.co/Qwen/Qwen3-8B) | Full attention (GQA) | 8B | Greedy + sampling, default feature, pure Rust + CUDA build |
-| [Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B) | Hybrid (24 linear + 8 full attention) | 4B | Greedy + sampling, feature-gated, `--features qwen35-4b` (build-time Triton) |
+| [Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B) / [9B](https://huggingface.co/Qwen/Qwen3.5-9B) / [27B](https://huggingface.co/Qwen/Qwen3.5-27B) | Hybrid Gated DeltaNet + full attention | 4B / 9B / 27B | Text-only BF16, greedy + sampling, feature-gated, `--features qwen35` (build-time Triton) |
 | [DeepSeek-V2-Lite](https://huggingface.co/deepseek-ai/DeepSeek-V2-Lite) | MoE + EP | 15.7B total / 2.4B active | Feature-gated, `--features deepseek-v2-lite`, 2-GPU EP2 correctness path |
 | [Kimi-K2-Instruct](https://huggingface.co/moonshotai/Kimi-K2-Instruct) | MLA + MoE + Marlin INT4 | 1T total / 32B active | Feature-gated, `--features kimi-k2`, 8-GPU EP path |
 
@@ -233,7 +233,7 @@ flowchart TB
     subgraph engines["Per-model engine crates"]
         direction LR
         qwen3["openinfer-qwen3<br/>full attention"]
-        qwen35["openinfer-qwen35-4b<br/>24 linear + 8 full attention"]
+        qwen35["openinfer-qwen35<br/>24 linear + 8 full attention"]
         dsv2["openinfer-deepseek-v2-lite<br/>MoE + EP"]
         kimi["openinfer-kimi-k2<br/>MLA + MoE + Marlin INT4"]
     end
@@ -325,8 +325,8 @@ cargo test --release --workspace --lib
 
 # Accuracy and integration tests (need GPU + model weights)
 OPENINFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release -p openinfer-qwen3 --test hf_golden_gate
-OPENINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p openinfer-qwen35-4b --features qwen35-4b --test hf_golden_gate
-OPENINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p openinfer-qwen35-4b --features qwen35-4b --test e2e_scheduler
+OPENINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p openinfer-qwen35 --features qwen35 --test hf_golden_gate
+OPENINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p openinfer-qwen35 --features qwen35 --test e2e_scheduler
 OPENINFER_TEST_MODEL_PATH=models/DeepSeek-V2-Lite cargo test --release -p openinfer-deepseek-v2-lite --features deepseek-v2-lite --test e2e_ep2 -- --nocapture
 ```
 
