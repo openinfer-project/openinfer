@@ -3,6 +3,8 @@
 use anyhow::Result;
 use openinfer_core::cuda_graph::CudaGraphState;
 use openinfer_core::kv_pool::KvPool;
+use openinfer_core::ops::PrefillPagedPlan;
+use openinfer_core::ops::PrefillPagedPlanCapacity;
 use openinfer_core::tensor::DeviceContext;
 
 use super::config::Config35;
@@ -54,6 +56,9 @@ pub(crate) struct BatchDecodeGraphState {
     pub(crate) linear_pointer_tables: LinearStatePointerTables,
     /// One `CudaGraphState` per BATCH_BUCKETS entry (indexed by position).
     pub(crate) graphs: Vec<CudaGraphState>,
+    /// Reusable metadata for the uncompiled-GQA hybrid decode fallback.
+    /// `None` for models with a compiled decode-attention kernel.
+    pub(crate) uncompiled_prefill_plan: Option<PrefillPagedPlan>,
 }
 
 impl BatchDecodeGraphState {
@@ -64,16 +69,17 @@ impl BatchDecodeGraphState {
         tensor_parallel: TensorParallelConfig,
         kv_pool: &KvPool,
         max_batch: usize,
+        uncompiled_prefill_plan_capacity: Option<PrefillPagedPlanCapacity>,
     ) -> Result<Self> {
         let padding_page_id = kv_pool.padding_page_id();
-        let max_total_pages = kv_pool.capacity_pages();
+        let kv_page_capacity = kv_pool.capacity_pages();
 
         let buffers = BatchDecodeBuffers35::new(
             ctx,
             config,
             tensor_parallel,
             max_batch,
-            max_total_pages,
+            kv_page_capacity,
             padding_page_id,
         )?;
 
@@ -97,11 +103,38 @@ impl BatchDecodeGraphState {
             .map(|_| CudaGraphState::new())
             .collect();
 
+        anyhow::ensure!(
+            uncompiled_prefill_plan_capacity.is_some() != config.decode_group_is_compiled(),
+            "Qwen3.5 reusable-plan capacity does not match decode route"
+        );
+        let uncompiled_prefill_plan = if let Some(capacity) = uncompiled_prefill_plan_capacity {
+            anyhow::ensure!(
+                max_batch <= capacity.max_batch(),
+                "Qwen3.5 graph batch {max_batch} exceeds reusable-plan batch capacity {}",
+                capacity.max_batch()
+            );
+            let bytes = capacity.preallocated_bytes()?;
+            log::info!(
+                "Qwen3.5 uncompiled-GQA PrefillPagedPlan: tokens={}, page_indices={}, batch={}, tiles={}, footprint={} bytes",
+                capacity.max_total_tokens(),
+                capacity.max_page_indices(),
+                capacity.max_batch(),
+                capacity.max_tiles(),
+                bytes,
+            );
+            Some(PrefillPagedPlan::new_preallocated_for_capacity(
+                ctx, capacity,
+            )?)
+        } else {
+            None
+        };
+
         Ok(Self {
             buffers,
             slot_states,
             linear_pointer_tables,
             graphs,
+            uncompiled_prefill_plan,
         })
     }
 

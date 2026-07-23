@@ -8,6 +8,21 @@ use openinfer_core::tensor::HiddenStates;
 
 use super::config::Config35;
 
+fn checked_product(factors: &[usize], label: &str) -> Result<usize> {
+    factors.iter().try_fold(1usize, |product, &factor| {
+        product
+            .checked_mul(factor)
+            .ok_or_else(|| anyhow::anyhow!("Qwen3.5 {label} size overflows usize"))
+    })
+}
+
+fn checked_sum(terms: &[usize], label: &str) -> Result<usize> {
+    terms.iter().try_fold(0usize, |sum, &term| {
+        sum.checked_add(term)
+            .ok_or_else(|| anyhow::anyhow!("Qwen3.5 {label} size overflows usize"))
+    })
+}
+
 /// Scratch buffers for a single Qwen3.5 linear-attention chunk-wise GDR prefill call.
 ///
 /// The first implementation target is intentionally narrow:
@@ -120,7 +135,7 @@ impl GdrChunkwiseScratch35 {
     ///
     /// Direct-paged prefill writes full-attention K/V into the paged pool, so
     /// HND KVCache staging buffers are no longer part of the prefill scratch.
-    pub(crate) fn estimate_bytes(config: &Config35, max_seq_len: usize) -> usize {
+    pub(crate) fn estimate_bytes(config: &Config35, max_seq_len: usize) -> Result<usize> {
         let num_vh = config.linear_num_value_heads;
         let key_dim = config.linear_key_head_dim;
         let val_dim = config.linear_value_head_dim;
@@ -128,23 +143,40 @@ impl GdrChunkwiseScratch35 {
         let num_chunks = max_seq_len.div_ceil(chunk_sz);
         let seq = max_seq_len;
 
-        let kv_hidden = num_vh * key_dim;
-        let vv_hidden = num_vh * val_dim;
+        let kv_hidden = checked_product(&[num_vh, key_dim], "prefill KV hidden")?;
+        let vv_hidden = checked_product(&[num_vh, val_dim], "prefill value hidden")?;
 
         // 1. GDR scratch (bf16 = 2 bytes, f32 = 4 bytes)
         let gdr_bytes = {
-            let f32_elems = seq * num_vh                            // g_cumsum
-                + seq * num_vh                                      // beta
-                + seq * num_vh * chunk_sz                           // a_tril
-                + num_chunks * num_vh * val_dim * key_dim; // chunk_state
-            let bf16_elems = seq * num_vh * chunk_sz                // a_inv
-                + kv_hidden * seq                                   // q_expanded
-                + kv_hidden * seq                                   // k_expanded
-                + vv_hidden * seq                                   // v_raw
-                + kv_hidden * seq                                   // w
-                + vv_hidden * seq                                   // u
-                + vv_hidden * seq; // v_new
-            f32_elems * 4 + bf16_elems * 2
+            let seq_vh = checked_product(&[seq, num_vh], "prefill per-head scratch")?;
+            let seq_vh_chunk = checked_product(&[seq, num_vh, chunk_sz], "prefill chunk matrix")?;
+            let chunk_state = checked_product(
+                &[num_chunks, num_vh, val_dim, key_dim],
+                "prefill chunk state",
+            )?;
+            let kv_seq = checked_product(&[kv_hidden, seq], "prefill KV sequence")?;
+            let vv_seq = checked_product(&[vv_hidden, seq], "prefill value sequence")?;
+            let f32_elems = checked_sum(
+                &[seq_vh, seq_vh, seq_vh_chunk, chunk_state],
+                "prefill f32 scratch",
+            )?;
+            let bf16_elems = checked_sum(
+                &[seq_vh_chunk, kv_seq, kv_seq, vv_seq, kv_seq, vv_seq, vv_seq],
+                "prefill bf16 scratch",
+            )?;
+            checked_sum(
+                &[
+                    checked_product(
+                        &[f32_elems, std::mem::size_of::<f32>()],
+                        "prefill f32 bytes",
+                    )?,
+                    checked_product(
+                        &[bf16_elems, std::mem::size_of::<bf16>()],
+                        "prefill bf16 bytes",
+                    )?,
+                ],
+                "prefill GDR scratch bytes",
+            )?
         };
 
         // 2. Per-layer transient peak (all bf16 = 2 bytes).
@@ -153,20 +185,44 @@ impl GdrChunkwiseScratch35 {
         let intermediate = config.intermediate_size;
 
         // Shared: hidden_batch + normed + hidden_plus_attn + normed_for_mlp
-        let shared_layer = hidden_dim * seq * 4;
+        let shared_layer = checked_product(&[hidden_dim, seq, 4], "prefill shared layer scratch")?;
 
         // Full attention: q_full(with gate) + k + v + attn_out + q_prepped
-        let full_qkv = config.num_attention_heads * config.head_dim * 2;
-        let full_kv = config.num_key_value_heads * config.head_dim;
-        let full_out = config.num_attention_heads * config.head_dim;
-        let full_attn_temps = (full_qkv + full_kv * 2 + full_out * 2) * seq;
+        let full_qkv = checked_product(
+            &[config.num_attention_heads, config.head_dim, 2],
+            "prefill full-attention Q",
+        )?;
+        let full_kv = checked_product(
+            &[config.num_key_value_heads, config.head_dim],
+            "prefill full-attention KV",
+        )?;
+        let full_out = checked_product(
+            &[config.num_attention_heads, config.head_dim],
+            "prefill full-attention output",
+        )?;
+        let full_attn_width = checked_sum(
+            &[
+                full_qkv,
+                checked_product(&[full_kv, 2], "prefill full-attention KV pair")?,
+                checked_product(&[full_out, 2], "prefill full-attention outputs")?,
+            ],
+            "prefill full-attention width",
+        )?;
+        let full_attn_temps =
+            checked_product(&[full_attn_width, seq], "prefill full-attention scratch")?;
 
         // MLP: gate_up_out + act_out (same peak footprint as separate gate/up)
-        let mlp_temps = intermediate * seq * 3;
+        let mlp_temps = checked_product(&[intermediate, seq, 3], "prefill MLP scratch")?;
 
-        let peak_layer = shared_layer + full_attn_temps.max(mlp_temps);
-        let per_layer_bytes = peak_layer * 2; // bf16
+        let peak_layer = checked_sum(
+            &[shared_layer, full_attn_temps.max(mlp_temps)],
+            "prefill layer peak",
+        )?;
+        let per_layer_bytes = checked_product(
+            &[peak_layer, std::mem::size_of::<bf16>()],
+            "prefill layer bytes",
+        )?;
 
-        gdr_bytes + per_layer_bytes
+        checked_sum(&[gdr_bytes, per_layer_bytes], "prefill scratch reserve")
     }
 }

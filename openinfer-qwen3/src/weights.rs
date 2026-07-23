@@ -10,6 +10,7 @@ use cudarc::nccl::safe::ReduceOp;
 use half::bf16;
 use log::debug;
 use log::info;
+use openinfer_core::ops::PrefillPagedPlanCapacity;
 use openinfer_core::tensor::DeviceContext;
 use openinfer_core::tensor::DeviceMatrix;
 use openinfer_core::tensor::DeviceVec;
@@ -103,6 +104,7 @@ pub(crate) struct KvBudget {
     pub(crate) head_dim: usize,
     pub(crate) block_size: usize,
     pub(crate) num_blocks: usize,
+    pub(crate) uncompiled_prefill_plan_capacity: Option<PrefillPagedPlanCapacity>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -986,6 +988,11 @@ impl Qwen3Model {
             "Qwen3 memory profile requires decode capacity above prefill rows"
         );
         let profile_rows = profile_prefill_rows + profile_decode_rows;
+        let uncompiled_prefill_plan_capacity = self.uncompiled_prefill_plan_capacity(
+            max_prefill_tokens,
+            max_decode_batch_size,
+            geometry.block_size,
+        )?;
         let profile_blocks =
             profile_temp_blocks(max_prefill_tokens, profile_decode_rows, geometry.block_size);
         let profile_kv_bytes = profile_blocks * bytes_per_block;
@@ -1034,6 +1041,7 @@ impl Qwen3Model {
         self.profile_unified_step_memory(
             max_prefill_tokens,
             profile_decode_rows,
+            uncompiled_prefill_plan_capacity,
             &profile_kv,
             &mut decode_bufs,
             &mut sample_scratch,
@@ -1045,19 +1053,33 @@ impl Qwen3Model {
         // the dummy step legal. The final KV pool is sized separately below, so
         // remove that profile-only backing store from the measured non-KV peak.
         let profile_peak_increase = peak_used_bytes.saturating_sub(initial_used_bytes);
-        let non_kv_peak_increase = profile_peak_increase.saturating_sub(profile_kv_bytes);
-        let non_kv_bytes = initial_used_bytes
-            .saturating_add(non_kv_peak_increase)
-            .saturating_add(memory_options.kv_cache_memory_margin_bytes);
+        let profile_plan_bytes = uncompiled_prefill_plan_capacity
+            .map(PrefillPagedPlanCapacity::preallocated_bytes)
+            .transpose()?
+            .unwrap_or(0);
+        let non_kv_peak_increase = profile_peak_increase
+            .saturating_sub(profile_kv_bytes)
+            .saturating_sub(profile_plan_bytes);
+        let base_non_kv_bytes = initial_used_bytes
+            .checked_add(non_kv_peak_increase)
+            .and_then(|bytes| bytes.checked_add(memory_options.kv_cache_memory_margin_bytes))
+            .ok_or_else(|| anyhow::anyhow!("Qwen3 non-KV memory reserve overflows usize"))?;
+        let persistent_plan_bytes = profile_plan_bytes;
+        let total_non_kv_bytes = base_non_kv_bytes
+            .checked_add(persistent_plan_bytes)
+            .ok_or_else(|| anyhow::anyhow!("Qwen3 total non-KV reserve overflows usize"))?;
         anyhow::ensure!(
-            requested_bytes > non_kv_bytes,
-            "Qwen3 memory profile leaves no room for KV cache: requested={} MiB, \
-             non_kv={} MiB, margin={} MiB",
+            requested_bytes > total_non_kv_bytes,
+            "Qwen3 memory profile leaves no room for KV cache and persistent uncompiled-GQA plan: requested={} MiB, base_non_kv={} MiB, plan={} MiB",
             requested_bytes / (1024 * 1024),
-            non_kv_bytes / (1024 * 1024),
-            memory_options.kv_cache_memory_margin_bytes / (1024 * 1024)
+            base_non_kv_bytes / (1024 * 1024),
+            persistent_plan_bytes / (1024 * 1024),
         );
-        let kv_budget_bytes = requested_bytes - non_kv_bytes;
+        let kv_budget_bytes = requested_bytes
+            .checked_sub(total_non_kv_bytes)
+            .ok_or_else(|| {
+                anyhow::anyhow!("Qwen3 total non-KV reserve exceeds requested device memory")
+            })?;
         let min_kv_bytes = 64 * bytes_per_block;
         anyhow::ensure!(
             kv_budget_bytes >= min_kv_bytes,
@@ -1067,23 +1089,26 @@ impl Qwen3Model {
         );
         log::info!(
             "memory profile: total={} MiB requested={} MiB ({:.0}%) initial_used={} MiB \
-             peak_non_kv_increase={} MiB margin={} MiB -> KV budget={} MiB",
+             peak_non_kv_increase={} MiB margin={} MiB persistent_plan={} MiB -> KV budget={} MiB",
             total_bytes / (1024 * 1024),
             requested_bytes / (1024 * 1024),
             memory_options.gpu_memory_utilization * 100.0,
             initial_used_bytes / (1024 * 1024),
             non_kv_peak_increase / (1024 * 1024),
             memory_options.kv_cache_memory_margin_bytes / (1024 * 1024),
+            persistent_plan_bytes / (1024 * 1024),
             kv_budget_bytes / (1024 * 1024),
         );
-        Ok(Self::kv_budget_from_bytes(
+        let mut budget = Self::kv_budget_from_bytes(
             geometry,
             bytes_per_block,
             dflash_kv_bytes_per_token,
             kv_budget_bytes,
             initial_free_bytes,
             "profiled",
-        ))
+        );
+        budget.uncompiled_prefill_plan_capacity = uncompiled_prefill_plan_capacity;
+        Ok(budget)
     }
 
     fn kv_budget_geometry(&self, page_size: usize) -> KvBudget {
@@ -1094,7 +1119,35 @@ impl Qwen3Model {
             head_dim: self.config.head_dim,
             block_size: page_size,
             num_blocks: 0,
+            uncompiled_prefill_plan_capacity: None,
         }
+    }
+
+    fn uncompiled_prefill_plan_capacity(
+        &self,
+        max_prefill_tokens: usize,
+        max_batch: usize,
+        page_size: usize,
+    ) -> Result<Option<PrefillPagedPlanCapacity>> {
+        if self.config.decode_group_is_compiled() {
+            return Ok(None);
+        }
+        // A step with prefill work can use at most max_batch - 1 decode rows;
+        // a decode-only step has only max_batch tokens. Admission reserves a
+        // slot for every active or prefilling request.
+        let max_total_tokens = max_prefill_tokens
+            .checked_add(max_batch.saturating_sub(1))
+            .ok_or_else(|| anyhow::anyhow!("Qwen3 prefill plan token capacity overflow"))?
+            .max(max_batch);
+        let group_size = self.local_num_attention_heads() / self.local_num_key_value_heads();
+        PrefillPagedPlanCapacity::for_context(
+            max_total_tokens,
+            max_batch,
+            self.config.max_position_embeddings,
+            page_size,
+            group_size,
+        )
+        .map(Some)
     }
 
     fn kv_bytes_per_block(geometry: &KvBudget) -> usize {

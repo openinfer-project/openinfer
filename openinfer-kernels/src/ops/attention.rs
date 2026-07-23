@@ -40,7 +40,98 @@ pub struct PrefillPagedPlan {
     cta_tile_q: i32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PrefillPagedPlanLayout {
+    page_indices: usize,
+    page_indptr: usize,
+    last_page_len: usize,
+    batch_indices: usize,
+    positions: usize,
+    q_indptr: usize,
+    request_indices: usize,
+    qo_tile_indices: usize,
+    kv_tile_indices: usize,
+    kv_chunk_size: usize,
+    total_num_rows: usize,
+}
+
+impl PrefillPagedPlanLayout {
+    fn new(
+        max_total_tokens: usize,
+        max_page_indices: usize,
+        max_batch: usize,
+        max_tiles: usize,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            i32::try_from(max_total_tokens).is_ok(),
+            "prefill plan max_total_tokens capacity exceeds i32: {max_total_tokens}"
+        );
+        anyhow::ensure!(
+            i32::try_from(max_page_indices).is_ok(),
+            "prefill plan max_page_indices capacity exceeds i32: {max_page_indices}"
+        );
+        anyhow::ensure!(
+            i32::try_from(max_batch).is_ok(),
+            "prefill plan max_batch capacity exceeds i32: {max_batch}"
+        );
+        anyhow::ensure!(
+            i32::try_from(max_tiles).is_ok(),
+            "prefill plan max_tiles capacity exceeds i32: {max_tiles}"
+        );
+        let max_batch_plus_one = max_batch
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("prefill plan max_batch capacity overflows"))?;
+        Ok(Self {
+            page_indices: max_page_indices,
+            page_indptr: max_batch_plus_one,
+            last_page_len: max_batch,
+            batch_indices: max_total_tokens,
+            positions: max_total_tokens,
+            q_indptr: max_batch_plus_one,
+            request_indices: max_tiles,
+            qo_tile_indices: max_tiles,
+            kv_tile_indices: max_tiles,
+            kv_chunk_size: max_batch,
+            total_num_rows: 1,
+        })
+    }
+
+    fn preallocated_bytes(self) -> Result<usize> {
+        let elements = [
+            self.page_indices,
+            self.page_indptr,
+            self.last_page_len,
+            self.batch_indices,
+            self.positions,
+            self.q_indptr,
+            self.request_indices,
+            self.qo_tile_indices,
+            self.kv_tile_indices,
+            self.kv_chunk_size,
+            self.total_num_rows,
+        ]
+        .into_iter()
+        .try_fold(0usize, usize::checked_add)
+        .ok_or_else(|| anyhow::anyhow!("prefill plan dimensions overflow footprint"))?;
+        elements
+            .checked_mul(std::mem::size_of::<i32>())
+            .ok_or_else(|| anyhow::anyhow!("prefill plan footprint overflows usize"))
+    }
+}
+
 impl PrefillPagedPlan {
+    /// Exact device bytes reserved by [`Self::new_preallocated`]. Every
+    /// metadata array stores 32-bit integers (including `total_num_rows`).
+    pub fn preallocated_bytes(
+        max_total_tokens: usize,
+        max_page_indices: usize,
+        max_batch: usize,
+        max_tiles: usize,
+    ) -> Result<usize> {
+        PrefillPagedPlanLayout::new(max_total_tokens, max_page_indices, max_batch, max_tiles)?
+            .preallocated_bytes()
+    }
+
     pub fn page_indices_d(&self) -> &CudaSlice<i32> {
         &self.page_indices_d
     }
@@ -212,22 +303,25 @@ impl PrefillPagedPlan {
     pub fn new_preallocated(
         ctx: &DeviceContext,
         max_total_tokens: usize,
-        max_total_pages: usize,
+        max_page_indices: usize,
         max_batch: usize,
         max_tiles: usize,
     ) -> Result<Self> {
+        let layout =
+            PrefillPagedPlanLayout::new(max_total_tokens, max_page_indices, max_batch, max_tiles)?;
+        layout.preallocated_bytes()?;
         Ok(Self {
-            page_indices_d: ctx.stream.alloc_zeros(max_total_pages)?,
-            page_indptr_d: ctx.stream.alloc_zeros(max_batch + 1)?,
-            last_page_len_d: ctx.stream.alloc_zeros(max_batch)?,
-            batch_indices_d: ctx.stream.alloc_zeros(max_total_tokens)?,
-            positions_d: ctx.stream.alloc_zeros(max_total_tokens)?,
-            q_indptr_d: ctx.stream.alloc_zeros(max_batch + 1)?,
-            request_indices_d: ctx.stream.alloc_zeros(max_tiles)?,
-            qo_tile_indices_d: ctx.stream.alloc_zeros(max_tiles)?,
-            kv_tile_indices_d: ctx.stream.alloc_zeros(max_tiles)?,
-            kv_chunk_size_d: ctx.stream.alloc_zeros(max_batch)?,
-            total_num_rows_d: ctx.stream.alloc_zeros(1)?,
+            page_indices_d: ctx.stream.alloc_zeros(layout.page_indices)?,
+            page_indptr_d: ctx.stream.alloc_zeros(layout.page_indptr)?,
+            last_page_len_d: ctx.stream.alloc_zeros(layout.last_page_len)?,
+            batch_indices_d: ctx.stream.alloc_zeros(layout.batch_indices)?,
+            positions_d: ctx.stream.alloc_zeros(layout.positions)?,
+            q_indptr_d: ctx.stream.alloc_zeros(layout.q_indptr)?,
+            request_indices_d: ctx.stream.alloc_zeros(layout.request_indices)?,
+            qo_tile_indices_d: ctx.stream.alloc_zeros(layout.qo_tile_indices)?,
+            kv_tile_indices_d: ctx.stream.alloc_zeros(layout.kv_tile_indices)?,
+            kv_chunk_size_d: ctx.stream.alloc_zeros(layout.kv_chunk_size)?,
+            total_num_rows_d: ctx.stream.alloc_zeros(layout.total_num_rows)?,
             num_tiles: 0,
             batch_size: 0,
             total_tokens: 0,
@@ -268,51 +362,85 @@ impl PrefillPagedPlan {
 
         anyhow::ensure!(
             host.all_page_indices.len() <= self.page_indices_d.len(),
-            "verify plan page_indices ({}) exceeds preallocated capacity ({})",
+            "prefill plan page_indices capacity exceeded: required={}, capacity={}",
             host.all_page_indices.len(),
             self.page_indices_d.len(),
         );
         anyhow::ensure!(
+            host.batch_size <= self.last_page_len_d.len(),
+            "prefill plan batch capacity exceeded: required={}, capacity={}",
+            host.batch_size,
+            self.last_page_len_d.len(),
+        );
+        anyhow::ensure!(
+            host.total_tokens <= self.batch_indices_d.len(),
+            "prefill plan total_tokens capacity exceeded: required={}, capacity={}",
+            host.total_tokens,
+            self.batch_indices_d.len(),
+        );
+        anyhow::ensure!(
+            host.request_indices_v.len() <= self.request_indices_d.len(),
+            "prefill plan tiles capacity exceeded: required={}, capacity={}",
+            host.request_indices_v.len(),
+            self.request_indices_d.len(),
+        );
+        anyhow::ensure!(
             host.page_indptr.len() <= self.page_indptr_d.len(),
-            "verify plan page_indptr ({}) exceeds preallocated capacity ({})",
+            "prefill plan page_indptr capacity exceeded: required={}, capacity={}",
             host.page_indptr.len(),
             self.page_indptr_d.len(),
         );
         anyhow::ensure!(
             host.last_page_lens_i32.len() <= self.last_page_len_d.len(),
-            "verify plan last_page_lens ({}) exceeds preallocated capacity ({})",
+            "prefill plan last_page_lens capacity exceeded: required={}, capacity={}",
             host.last_page_lens_i32.len(),
             self.last_page_len_d.len(),
         );
         anyhow::ensure!(
             host.batch_indices.len() <= self.batch_indices_d.len(),
-            "verify plan batch_indices ({}) exceeds preallocated capacity ({})",
+            "prefill plan batch_indices capacity exceeded: required={}, capacity={}",
             host.batch_indices.len(),
             self.batch_indices_d.len(),
         );
         anyhow::ensure!(
             host.positions.len() <= self.positions_d.len(),
-            "verify plan positions ({}) exceeds preallocated capacity ({})",
+            "prefill plan positions capacity exceeded: required={}, capacity={}",
             host.positions.len(),
             self.positions_d.len(),
         );
         anyhow::ensure!(
             host.q_indptr.len() <= self.q_indptr_d.len(),
-            "verify plan q_indptr ({}) exceeds preallocated capacity ({})",
+            "prefill plan q_indptr capacity exceeded: required={}, capacity={}",
             host.q_indptr.len(),
             self.q_indptr_d.len(),
         );
         anyhow::ensure!(
             host.request_indices_v.len() <= self.request_indices_d.len(),
-            "verify plan tiles ({}) exceeds preallocated capacity ({})",
+            "prefill plan request_indices capacity exceeded: required={}, capacity={}",
             host.request_indices_v.len(),
             self.request_indices_d.len(),
         );
         anyhow::ensure!(
+            host.qo_tile_indices_v.len() <= self.qo_tile_indices_d.len(),
+            "prefill plan qo_tile_indices capacity exceeded: required={}, capacity={}",
+            host.qo_tile_indices_v.len(),
+            self.qo_tile_indices_d.len(),
+        );
+        anyhow::ensure!(
+            host.kv_tile_indices_v.len() <= self.kv_tile_indices_d.len(),
+            "prefill plan kv_tile_indices capacity exceeded: required={}, capacity={}",
+            host.kv_tile_indices_v.len(),
+            self.kv_tile_indices_d.len(),
+        );
+        anyhow::ensure!(
             host.kv_chunk_sizes.len() <= self.kv_chunk_size_d.len(),
-            "verify plan kv_chunk_sizes ({}) exceeds preallocated capacity ({})",
+            "prefill plan kv_chunk_size capacity exceeded: required={}, capacity={}",
             host.kv_chunk_sizes.len(),
             self.kv_chunk_size_d.len(),
+        );
+        anyhow::ensure!(
+            !self.total_num_rows_d.is_empty(),
+            "prefill plan total_num_rows capacity is zero",
         );
 
         ctx.stream
@@ -379,10 +507,56 @@ impl BatchPlanHost {
         cta_tile_q_override: i32,
     ) -> Result<Self> {
         let batch_size = page_indices.len();
-        assert_eq!(batch_size, last_page_lens.len());
-        assert_eq!(batch_size, start_positions.len());
-        assert_eq!(batch_size, seq_lens.len());
-        let total_tokens: usize = seq_lens.iter().sum();
+        anyhow::ensure!(
+            batch_size == last_page_lens.len(),
+            "prefill plan batch dimension mismatch: page_indices={}, last_page_lens={}",
+            batch_size,
+            last_page_lens.len()
+        );
+        anyhow::ensure!(
+            batch_size == start_positions.len(),
+            "prefill plan batch dimension mismatch: page_indices={}, start_positions={}",
+            batch_size,
+            start_positions.len()
+        );
+        anyhow::ensure!(
+            batch_size == seq_lens.len(),
+            "prefill plan batch dimension mismatch: page_indices={}, seq_lens={}",
+            batch_size,
+            seq_lens.len()
+        );
+        anyhow::ensure!(num_q_heads > 0, "prefill plan num_q_heads must be positive");
+        anyhow::ensure!(
+            num_kv_heads > 0,
+            "prefill plan num_kv_heads must be positive"
+        );
+        anyhow::ensure!(
+            num_q_heads.is_multiple_of(num_kv_heads),
+            "prefill plan GQA dimensions incompatible: num_q_heads={}, num_kv_heads={}",
+            num_q_heads,
+            num_kv_heads
+        );
+        anyhow::ensure!(head_dim > 0, "prefill plan head_dim must be positive");
+        anyhow::ensure!(
+            i32::try_from(num_q_heads).is_ok(),
+            "prefill plan num_q_heads dimension exceeds i32: {}",
+            num_q_heads
+        );
+        anyhow::ensure!(
+            i32::try_from(num_kv_heads).is_ok(),
+            "prefill plan num_kv_heads dimension exceeds i32: {}",
+            num_kv_heads
+        );
+        anyhow::ensure!(
+            i32::try_from(head_dim).is_ok(),
+            "prefill plan head_dim dimension exceeds i32: {}",
+            head_dim
+        );
+        let total_tokens: usize = seq_lens.iter().try_fold(0usize, |total, &len| {
+            total
+                .checked_add(len)
+                .ok_or_else(|| anyhow::anyhow!("prefill plan total_tokens overflows usize"))
+        })?;
         let group_size = num_q_heads / num_kv_heads;
 
         // Page metadata (concatenated across requests, CSR format)
@@ -393,9 +567,27 @@ impl BatchPlanHost {
 
         for (i, pages) in page_indices.iter().enumerate() {
             all_page_indices.extend_from_slice(pages);
+            anyhow::ensure!(
+                i32::try_from(all_page_indices.len()).is_ok(),
+                "prefill plan page_indices dimension exceeds i32: {}",
+                all_page_indices.len()
+            );
             page_indptr.push(all_page_indices.len() as i32);
+            anyhow::ensure!(
+                i32::try_from(last_page_lens[i]).is_ok(),
+                "prefill plan last_page_len dimension exceeds i32: {}",
+                last_page_lens[i]
+            );
             last_page_lens_i32.push(last_page_lens[i] as i32);
-            kv_chunk_sizes.push((start_positions[i] + seq_lens[i]) as i32);
+            let kv_len = start_positions[i].checked_add(seq_lens[i]).ok_or_else(|| {
+                anyhow::anyhow!("prefill plan kv_chunk_size overflows usize for request {i}")
+            })?;
+            anyhow::ensure!(
+                i32::try_from(kv_len).is_ok(),
+                "prefill plan kv_chunk_size dimension exceeds i32: {}",
+                kv_len
+            );
+            kv_chunk_sizes.push(kv_len as i32);
         }
 
         // Per-token metadata
@@ -403,19 +595,39 @@ impl BatchPlanHost {
         let mut positions = Vec::with_capacity(total_tokens);
         for (i, &seq_len) in seq_lens.iter().enumerate() {
             let start = start_positions[i];
+            anyhow::ensure!(
+                i32::try_from(i).is_ok(),
+                "prefill plan batch index exceeds i32: {i}"
+            );
             batch_indices.extend(std::iter::repeat_n(i as i32, seq_len));
-            positions.extend((start..start + seq_len).map(|p| p as i32));
+            let end = start.checked_add(seq_len).ok_or_else(|| {
+                anyhow::anyhow!("prefill plan positions overflows usize for request {i}")
+            })?;
+            anyhow::ensure!(
+                i32::try_from(end).is_ok(),
+                "prefill plan positions dimension exceeds i32: {}",
+                end
+            );
+            positions.extend((start..end).map(|p| p as i32));
         }
 
         // Q token boundaries (CSR)
         let mut q_indptr = vec![0i32];
         for &seq_len in seq_lens {
             let prev = *q_indptr.last().unwrap();
-            q_indptr.push(prev + seq_len as i32);
+            let next = prev
+                .checked_add(seq_len as i32)
+                .ok_or_else(|| anyhow::anyhow!("prefill plan q_indptr dimension exceeds i32"))?;
+            q_indptr.push(next);
         }
 
         // Tile plan: use global cta_tile_q for consistent tiling
-        let cta_tile_q = unsafe {
+        anyhow::ensure!(
+            i32::try_from(total_tokens).is_ok(),
+            "prefill plan total_tokens dimension exceeds i32: {}",
+            total_tokens
+        );
+        let cta_tile_q_i32 = unsafe {
             ffi::batch_prefill_cta_tile_q_with_override(
                 total_tokens as i32,
                 num_q_heads as i32,
@@ -423,24 +635,40 @@ impl BatchPlanHost {
                 head_dim as i32,
                 cta_tile_q_override,
             )
-        } as usize;
+        };
         anyhow::ensure!(
-            cta_tile_q > 0,
+            cta_tile_q_i32 > 0,
             "invalid prefill CTA tile override {cta_tile_q_override}"
         );
+        let cta_tile_q = cta_tile_q_i32 as usize;
 
         let mut request_indices_v = Vec::new();
         let mut qo_tile_indices_v = Vec::new();
         let mut kv_tile_indices_v = Vec::new();
         for (req_idx, &seq_len) in seq_lens.iter().enumerate() {
-            let packed_qo_len = seq_len * group_size;
+            let packed_qo_len = seq_len.checked_mul(group_size).ok_or_else(|| {
+                anyhow::anyhow!("prefill plan packed query length overflows usize")
+            })?;
             let num_tiles_req = packed_qo_len.div_ceil(cta_tile_q);
             for tile in 0..num_tiles_req {
+                anyhow::ensure!(
+                    i32::try_from(req_idx).is_ok(),
+                    "prefill plan request index exceeds i32: {req_idx}"
+                );
+                anyhow::ensure!(
+                    i32::try_from(tile).is_ok(),
+                    "prefill plan qo tile index exceeds i32: {tile}"
+                );
                 request_indices_v.push(req_idx as i32);
                 qo_tile_indices_v.push(tile as i32);
                 kv_tile_indices_v.push(0i32);
             }
         }
+        anyhow::ensure!(
+            i32::try_from(request_indices_v.len()).is_ok(),
+            "prefill plan num_tiles dimension exceeds i32: {}",
+            request_indices_v.len()
+        );
         let num_tiles = request_indices_v.len() as i32;
 
         Ok(Self {
@@ -1638,4 +1866,165 @@ pub fn paged_attention_batch_decode_via_prefill_hd256_into(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::Result;
+    use cudarc::driver::DevicePtr;
+
+    use super::PrefillPagedPlan;
+    use super::PrefillPagedPlanLayout;
+    use crate::tensor::DeviceContext;
+
+    #[test]
+    fn preallocated_footprint_uses_allocation_layout() {
+        let layout = PrefillPagedPlanLayout::new(10, 7, 3, 5).unwrap();
+        let bytes = PrefillPagedPlan::preallocated_bytes(10, 7, 3, 5).unwrap();
+
+        assert_eq!(bytes, layout.preallocated_bytes().unwrap());
+        assert_eq!(
+            layout,
+            PrefillPagedPlanLayout {
+                page_indices: 7,
+                page_indptr: 4,
+                last_page_len: 3,
+                batch_indices: 10,
+                positions: 10,
+                q_indptr: 4,
+                request_indices: 5,
+                qo_tile_indices: 5,
+                kv_tile_indices: 5,
+                kv_chunk_size: 3,
+                total_num_rows: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn preallocated_footprint_rejects_i32_capacity_overflow() {
+        let error = PrefillPagedPlan::preallocated_bytes((i32::MAX as usize) + 1, 1, 1, 1)
+            .expect_err("metadata dimensions must fit the i32 kernel ABI");
+        assert!(error.to_string().contains("max_total_tokens"));
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn preallocated_update_preserves_all_pointers_and_reports_capacities() -> Result<()> {
+        let ctx = DeviceContext::new()?;
+        let layout = PrefillPagedPlanLayout::new(8, 8, 3, 64)?;
+        let mut plan = PrefillPagedPlan::new_preallocated(&ctx, 8, 8, 3, 64)?;
+
+        assert_eq!(plan.page_indices_d.len(), layout.page_indices);
+        assert_eq!(plan.page_indptr_d.len(), layout.page_indptr);
+        assert_eq!(plan.last_page_len_d.len(), layout.last_page_len);
+        assert_eq!(plan.batch_indices_d.len(), layout.batch_indices);
+        assert_eq!(plan.positions_d.len(), layout.positions);
+        assert_eq!(plan.q_indptr_d.len(), layout.q_indptr);
+        assert_eq!(plan.request_indices_d.len(), layout.request_indices);
+        assert_eq!(plan.qo_tile_indices_d.len(), layout.qo_tile_indices);
+        assert_eq!(plan.kv_tile_indices_d.len(), layout.kv_tile_indices);
+        assert_eq!(plan.kv_chunk_size_d.len(), layout.kv_chunk_size);
+        assert_eq!(plan.total_num_rows_d.len(), layout.total_num_rows);
+
+        macro_rules! pointers {
+            ($plan:expr) => {
+                [
+                    $plan.page_indices_d.device_ptr(&ctx.stream).0,
+                    $plan.page_indptr_d.device_ptr(&ctx.stream).0,
+                    $plan.last_page_len_d.device_ptr(&ctx.stream).0,
+                    $plan.batch_indices_d.device_ptr(&ctx.stream).0,
+                    $plan.positions_d.device_ptr(&ctx.stream).0,
+                    $plan.q_indptr_d.device_ptr(&ctx.stream).0,
+                    $plan.request_indices_d.device_ptr(&ctx.stream).0,
+                    $plan.qo_tile_indices_d.device_ptr(&ctx.stream).0,
+                    $plan.kv_tile_indices_d.device_ptr(&ctx.stream).0,
+                    $plan.kv_chunk_size_d.device_ptr(&ctx.stream).0,
+                    $plan.total_num_rows_d.device_ptr(&ctx.stream).0,
+                ]
+            };
+        }
+
+        let initial_pointers = pointers!(plan);
+        plan.update_batch_with_cta_tile_q(
+            &ctx,
+            &[vec![0, 1], vec![2]],
+            &[16, 1],
+            &[30, 0],
+            &[2, 1],
+            24,
+            4,
+            128,
+            0,
+        )?;
+        ctx.sync()?;
+        assert_eq!(pointers!(plan), initial_pointers);
+
+        plan.update_batch_with_cta_tile_q(
+            &ctx,
+            &[vec![0, 1, 2], vec![3, 4], vec![5]],
+            &[16, 8, 1],
+            &[47, 21, 14],
+            &[1, 3, 2],
+            24,
+            4,
+            128,
+            0,
+        )?;
+        ctx.sync()?;
+        assert_eq!(pointers!(plan), initial_pointers);
+
+        let page_error = plan
+            .update_batch_with_cta_tile_q(
+                &ctx,
+                &[vec![0, 1, 2], vec![3, 4, 5], vec![6, 7, 8]],
+                &[16, 16, 16],
+                &[47, 47, 47],
+                &[1, 1, 1],
+                24,
+                4,
+                128,
+                0,
+            )
+            .expect_err("logical page capacity must be enforced");
+        assert!(page_error.to_string().contains("page_indices capacity"));
+
+        let token_error = plan
+            .update_batch_with_cta_tile_q(
+                &ctx,
+                &[vec![0], vec![1], vec![2]],
+                &[16, 16, 16],
+                &[16, 16, 16],
+                &[3, 3, 3],
+                24,
+                4,
+                128,
+                0,
+            )
+            .expect_err("token capacity must be enforced");
+        assert!(token_error.to_string().contains("total_tokens capacity"));
+
+        let batch_error = plan
+            .update_batch_with_cta_tile_q(
+                &ctx,
+                &[vec![0], vec![1], vec![2], vec![3]],
+                &[16, 16, 16, 16],
+                &[16, 16, 16, 16],
+                &[1, 1, 1, 1],
+                24,
+                4,
+                128,
+                0,
+            )
+            .expect_err("batch capacity must be enforced");
+        assert!(batch_error.to_string().contains("batch capacity"));
+
+        let mut tile_limited = PrefillPagedPlan::new_preallocated(&ctx, 8, 8, 3, 1)?;
+        let tile_error = tile_limited
+            .update_batch_with_cta_tile_q(&ctx, &[vec![0]], &[16], &[16], &[3], 24, 4, 128, 16)
+            .expect_err("tile capacity must be enforced");
+        assert!(tile_error.to_string().contains("tiles capacity"));
+
+        Ok(())
+    }
 }

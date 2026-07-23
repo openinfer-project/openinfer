@@ -790,10 +790,10 @@ impl TpWorkerPrepared {
             .ctx
             .mem_get_info()
             .map_err(|err| anyhow::anyhow!("failed to query TP rank {rank} memory: {err}"))?;
-        let recurrent_bytes = RecurrentState::allocation_bytes(model.config());
+        let recurrent_bytes = RecurrentState::allocation_bytes(model.config())?;
         let prefill_scratch_tokens = prefill_scratch_tokens(max_prefill_tokens);
         let prefill_scratch_bytes =
-            GdrChunkwiseScratch35::estimate_bytes(model.config(), prefill_scratch_tokens);
+            GdrChunkwiseScratch35::estimate_bytes(model.config(), prefill_scratch_tokens)?;
         let max_batch = effective_recurrent_capacity(
             requested_max_batch,
             free_bytes,

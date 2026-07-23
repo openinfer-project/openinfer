@@ -10,6 +10,7 @@ use half::bf16;
 use openinfer_core::kv_pool::KvLayout;
 use openinfer_core::ops;
 use openinfer_core::ops::PrefillPagedPlan;
+use openinfer_core::ops::PrefillPagedPlanCapacity;
 use openinfer_core::sampler::SamplingParams;
 use openinfer_core::tensor::HiddenStates;
 use openinfer_kernels::ops::NumericPolicy;
@@ -31,6 +32,7 @@ impl Qwen3Model {
         &self,
         max_prefill_tokens: usize,
         profile_decode_rows: usize,
+        uncompiled_prefill_plan_capacity: Option<PrefillPagedPlanCapacity>,
         kv_buffer: &KvBuffer,
         decode_bufs: &mut BatchDecodeBuffers,
         sample_scratch: &mut openinfer_sample::SampleScratch,
@@ -99,6 +101,17 @@ impl Qwen3Model {
         )];
         let prefill_adapters: Vec<Option<&str>> = vec![None; num_prefill_reqs];
 
+        // The uncompiled-GQA profile exercises the same in-place metadata path
+        // used by serving. Keep this temporary plan graph-stable as well, so
+        // the measured peak includes its real persistent footprint.
+        anyhow::ensure!(
+            uncompiled_prefill_plan_capacity.is_some() != self.config.decode_group_is_compiled(),
+            "Qwen3 profile reusable-plan capacity does not match decode route"
+        );
+        let mut uncompiled_prefill_plan = uncompiled_prefill_plan_capacity
+            .map(|capacity| PrefillPagedPlan::new_preallocated_for_capacity(&self.ctx, capacity))
+            .transpose()?;
+
         let logits = self.unified_step_with_peak(
             &prefill_tokens_list,
             &prefill_single_views,
@@ -109,6 +122,7 @@ impl Qwen3Model {
             decode_bufs,
             kv_buffer.buffer(),
             &layout,
+            uncompiled_prefill_plan.as_mut(),
             mark_peak,
         )?;
         mark_peak()?;
@@ -145,6 +159,7 @@ impl Qwen3Model {
         decode_bufs: &mut BatchDecodeBuffers,
         kv_buffer: &CudaSlice<bf16>,
         layout: &KvLayout,
+        uncompiled_prefill_plan: Option<&mut PrefillPagedPlan>,
     ) -> Result<HiddenStates> {
         let mut mark_peak = || Ok(());
         self.unified_step_with_peak(
@@ -157,6 +172,7 @@ impl Qwen3Model {
             decode_bufs,
             kv_buffer,
             layout,
+            uncompiled_prefill_plan,
             &mut mark_peak,
         )
     }
@@ -172,6 +188,7 @@ impl Qwen3Model {
         decode_bufs: &mut BatchDecodeBuffers,
         kv_buffer: &CudaSlice<bf16>,
         layout: &KvLayout,
+        uncompiled_prefill_plan: Option<&mut PrefillPagedPlan>,
         mark_peak: &mut dyn FnMut() -> Result<()>,
     ) -> Result<HiddenStates> {
         let num_prefill_reqs = prefill_prompts.len();
@@ -236,7 +253,7 @@ impl Qwen3Model {
             NumericPolicy::Pin | NumericPolicy::PerToken
         ) && num_decode_reqs > 0
             && self.config.decode_group_is_compiled();
-        let plan = if split_decode_attention {
+        let split_prefill_plan = if split_decode_attention {
             let positions: Vec<i32> = decode_positions.iter().map(|&pos| pos as i32).collect();
             self.ctx
                 .stream
@@ -268,6 +285,12 @@ impl Qwen3Model {
                 None
             }
         } else {
+            None
+        };
+        let fresh_prefill_plan;
+        let plan = if split_decode_attention {
+            split_prefill_plan.as_ref()
+        } else {
             // One attention plan over prefill requests + decode rows (qo_len=1,
             // start at the decode position so the row attends its full history).
             let page_indices: Vec<Vec<i32>> = prefill_views
@@ -284,17 +307,42 @@ impl Qwen3Model {
             start_positions.extend_from_slice(&decode_positions);
             let mut seq_lens = prefill_seq_lens.clone();
             seq_lens.extend(std::iter::repeat_n(1, num_decode_reqs));
-            Some(PrefillPagedPlan::from_raw_batch_with_cta_tile_q(
-                &self.ctx,
-                &page_indices,
-                &last_page_lens,
-                &start_positions,
-                &seq_lens,
-                self.local_num_attention_heads(),
-                self.local_num_key_value_heads(),
-                self.config.head_dim,
-                PREFILL_ATTENTION_CTA_TILE_Q,
-            )?)
+            if self.config.decode_group_is_compiled() {
+                // Tuned keeps compiled GQA decode rows on the unified
+                // BatchPrefill path. Those models do not reserve the
+                // uncompiled fallback plan, so retain the original fresh-plan
+                // behavior for their startup profile and mixed steps.
+                fresh_prefill_plan = PrefillPagedPlan::from_raw_batch_with_cta_tile_q(
+                    &self.ctx,
+                    &page_indices,
+                    &last_page_lens,
+                    &start_positions,
+                    &seq_lens,
+                    self.local_num_attention_heads(),
+                    self.local_num_key_value_heads(),
+                    self.config.head_dim,
+                    PREFILL_ATTENTION_CTA_TILE_Q,
+                )?;
+                Some(&fresh_prefill_plan)
+            } else {
+                let plan = uncompiled_prefill_plan.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "uncompiled GQA decode requires a preallocated PrefillPagedPlan"
+                    )
+                })?;
+                plan.update_batch_with_cta_tile_q(
+                    &self.ctx,
+                    &page_indices,
+                    &last_page_lens,
+                    &start_positions,
+                    &seq_lens,
+                    self.local_num_attention_heads(),
+                    self.local_num_key_value_heads(),
+                    self.config.head_dim,
+                    PREFILL_ATTENTION_CTA_TILE_Q,
+                )?;
+                Some(&*plan)
+            }
         };
         mark_peak()?;
 
@@ -302,7 +350,7 @@ impl Qwen3Model {
         let hidden = self.unified_layers_with_peak(
             hidden,
             total_tokens,
-            plan.as_ref(),
+            plan,
             decode_bufs,
             split_decode_attention,
             total_prefill,
