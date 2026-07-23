@@ -1,7 +1,7 @@
 # Triton AOT Integration
 
 `openinfer` uses Triton AOT for the Qwen3.5 GDR chunkwise prefill kernels. The
-whole pipeline is gated behind the `qwen35-4b` feature of `openinfer-kernels` —
+whole pipeline is gated behind the `qwen35` feature of `openinfer-kernels` —
 a default build (Qwen3 only) never runs Triton and needs no Python.
 
 `openinfer-kernels` can also expose selected generated CUBIN launchers through
@@ -11,7 +11,7 @@ the generated C stubs remain the low-level CUDA launch owner.
 
 ## What this covers
 
-- Build-time generation of Triton AOT cubins for `gated_delta_rule_chunkwise_kernels.py` (with `--features qwen35-4b`)
+- Build-time generation of Triton AOT cubins for `gated_delta_rule_chunkwise_kernels.py` (with `--features qwen35`)
 - Generated C wrappers linked into the normal Rust build
 - Native CUDA covers basic ops (`add`, `silu_mul`, `embedding`) and decode-critical paths
 
@@ -65,7 +65,7 @@ Requires CUDA 12+, Python 3.9–3.12, and an NVIDIA GPU with compute capability 
 ## Build
 
 ```bash
-cargo build --release --features qwen35-4b
+cargo build --release --features qwen35
 ```
 
 Generated Triton artifacts are written to Cargo `OUT_DIR`, typically under:
@@ -90,8 +90,8 @@ arguments use TVM integers. The wrapper returns `()` on CUDA success and a TVM
 Run the focused GPU tests for the active Triton-backed paths:
 
 ```bash
-cargo test --release -p openinfer-qwen35-4b --features qwen35-4b recurrent::tests::conv1d_prefill_handoff_matches_single_prefill -- --nocapture
-OPENINFER_TEST_MODEL_PATH=/path/to/Qwen3.5-4B cargo test --release -p openinfer-qwen35-4b --features qwen35-4b --test e2e_scheduler -- --nocapture
+cargo test --release -p openinfer-qwen35 --features qwen35 recurrent::tests::conv1d_prefill_handoff_matches_single_prefill -- --nocapture
+OPENINFER_TEST_MODEL_PATH=/path/to/Qwen3.5-4B cargo test --release -p openinfer-qwen35 --features qwen35 --test e2e_scheduler -- --nocapture
 ```
 
 ## Common failures

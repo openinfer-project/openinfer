@@ -12,7 +12,7 @@
   - Maintainer RFC discussion for issue #257 - narrowed the first version to a GPU snapshot cache with one consistency rule for KV and recurrent state.
   - `docs/models/qwen3/prefix-cache.md` - provides the existing rules for block hashes, adapter isolation, final-token recompute, and keeping matched KV alive.
   - `docs/subsystems/runtime/qwen3-kvbm-integration-spec.md` - describes the content-hashed `BlockPool`/`RequestKv` cache that Qwen3.5 does not yet use.
-  - `openinfer-qwen35-4b/src/{scheduler.rs,prefill.rs,prefill_buffers.rs,recurrent.rs,recurrent_state.rs,weights.rs}` - confirmed the current request state flow, valid prefill boundaries, snapshot layout, and GPU memory reservation.
+  - `openinfer-qwen35/src/{scheduler.rs,prefill.rs,prefill_buffers.rs,recurrent.rs,recurrent_state.rs,weights.rs}` - confirmed the current request state flow, valid prefill boundaries, snapshot layout, and GPU memory reservation.
   - `openinfer-core/src/kv_pool.rs` and `openinfer-kv-cache/src/pool.rs` - confirmed that Qwen3.5 still uses anonymous RAII pages while Qwen3 can register, match, and pin content-hashed blocks.
 - **Relevant history**:
   - The first draft focused on CPU offload but did not say clearly who keeps KV and snapshots consistent. Review narrowed the first version to GPU allocation, lookup, lifetime, and whole-model snapshot creation.

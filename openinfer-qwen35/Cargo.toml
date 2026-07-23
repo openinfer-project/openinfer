@@ -2,7 +2,7 @@
 autobenches = false
 edition = "2024"
 license = "Apache-2.0"
-name = "openinfer-qwen35-4b"
+name = "openinfer-qwen35"
 version = "0.1.0"
 
 [dependencies]
@@ -32,32 +32,32 @@ vllm-text = { workspace = true }
 
 [features]
 default = []
-qwen35-4b = ["openinfer-kernels/qwen35-4b"]
+qwen35 = ["openinfer-kernels/qwen35"]
 
 [lints]
 workspace = true
 
 [[test]]
 name = "hf_golden_gate"
-required-features = ["qwen35-4b"]
+required-features = ["qwen35"]
 
 [[test]]
 name = "e2e_scheduler"
-required-features = ["qwen35-4b"]
+required-features = ["qwen35"]
 
 [[test]]
 name = "sampling_behavior"
-required-features = ["qwen35-4b"]
+required-features = ["qwen35"]
 
 [[test]]
 name = "chunked_prefill"
-required-features = ["qwen35-4b"]
+required-features = ["qwen35"]
 
 [[test]]
 name = "serving_tp2"
-required-features = ["qwen35-4b"]
+required-features = ["qwen35"]
 
 [[bench]]
 harness = false
 name = "qwen35_ops"
-required-features = ["qwen35-4b"]
+required-features = ["qwen35"]

@@ -1,4 +1,4 @@
-#[cfg(feature = "qwen35-4b")]
+#[cfg(feature = "qwen35")]
 use cudarc::driver::sys::CUresult;
 use cudarc::driver::sys::CUstream;
 
@@ -115,9 +115,9 @@ unsafe extern "C" {
 }
 
 // Chunk-wise GDR prefill kernels, Triton AOT-generated at build time. The
-// `qwen35-4b` feature is what pulls Python + Triton into the build; without it
+// `qwen35` feature is what pulls Python + Triton into the build; without it
 // these symbols don't exist.
-#[cfg(feature = "qwen35-4b")]
+#[cfg(feature = "qwen35")]
 unsafe extern "C" {
     pub fn gated_delta_rule_prefill_chunk_prepare_cuda(
         qkv: *const Half,

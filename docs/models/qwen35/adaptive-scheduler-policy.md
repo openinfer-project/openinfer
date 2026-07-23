@@ -31,7 +31,7 @@
 
 ### Step 1: Scheduler policy and pure decision helper
 
-- Added `Qwen35SchedulerPolicy::{Auto, Off}` in `openinfer-qwen35-4b`, defaulting existing Qwen3.5 launch paths to `Off`.
+- Added `Qwen35SchedulerPolicy::{Auto, Off}` in `openinfer-qwen35`, defaulting existing Qwen3.5 launch paths to `Off`.
 - Added `choose_prefill_budget(...)` in `scheduler/plan.rs` so the adaptive decision is unit-testable outside the GPU loop.
 - Policy rules:
   - `Off` preserves the fixed base prefill budget.
@@ -71,7 +71,7 @@ Validation host contract:
 | Driver / CUDA toolkit | NVIDIA driver `595.71.05`, `nvcc 12.8` |
 | Rust | `rustc/cargo 1.99.0-nightly` |
 | Source | upstream/main `8dd3953` plus this patch |
-| Feature | `qwen35-4b` |
+| Feature | `qwen35` |
 | Model | `Qwen/Qwen3.5-4B` downloaded through ModelScope on 2026-07-20 |
 | Model config | `model_type=qwen3_5`, `architectures=["Qwen3_5ForConditionalGeneration"]`, `config.json` sha256 `ddc63e1c717afa86c865bb5e01313d89d72bb53b97ad4a8a03ba8510c0621670` |
 | Build env | `OPENINFER_CUDA_SM=120`, `CUDA_HOME` set to CUDA 12.8, `OPENINFER_TRITON_PYTHON` set to a Triton 3.7.1 Python |
@@ -81,12 +81,12 @@ Remote checks:
 ```bash
 cargo fmt --all -- --check
 git diff --check
-cargo test -p openinfer-qwen35-4b --features qwen35-4b adaptive_prefill_budget -- --nocapture
-cargo test -p openinfer-server --features qwen35-4b qwen35 -- --nocapture
-cargo build --release -p openinfer-server --features qwen35-4b
-cargo build --release --bin bench_serving --features qwen35-4b
+cargo test -p openinfer-qwen35 --features qwen35 adaptive_prefill_budget -- --nocapture
+cargo test -p openinfer-server --features qwen35 qwen35 -- --nocapture
+cargo build --release -p openinfer-server --features qwen35
+cargo build --release --bin bench_serving --features qwen35
 OPENINFER_TEST_MODEL_PATH=<absolute model path> \
-  cargo test --release -p openinfer-qwen35-4b --features qwen35-4b --test e2e_scheduler -- --nocapture
+  cargo test --release -p openinfer-qwen35 --features qwen35 --test e2e_scheduler -- --nocapture
 ```
 
 Result: all checks passed. `e2e_scheduler` passed the single-GPU test; the TP2 test remained ignored on the one-GPU host.
@@ -97,7 +97,7 @@ These cells were gathered before review narrowed the PR to default-off, cap-pres
 
 Benchmark flags shared by those pre-review cells:
 
-- Engine: OpenInfer Qwen3.5 direct `bench_serving`, CUDA Graph enabled, feature `qwen35-4b`.
+- Engine: OpenInfer Qwen3.5 direct `bench_serving`, CUDA Graph enabled, feature `qwen35`.
 - Source: upstream/main `8dd3953` plus this patch.
 - Hardware/toolchain/model: same as the remote GPU contract above.
 - Sampling: synthetic random prompts, greedy, fixed output.

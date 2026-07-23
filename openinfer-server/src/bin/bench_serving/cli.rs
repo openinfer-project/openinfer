@@ -90,11 +90,11 @@ pub(crate) enum CliQwen35SchedulerPolicy {
 }
 
 impl CliQwen35SchedulerPolicy {
-    #[cfg(feature = "qwen35-4b")]
-    pub(crate) fn resolve(self) -> openinfer_qwen35_4b::Qwen35SchedulerPolicy {
+    #[cfg(feature = "qwen35")]
+    pub(crate) fn resolve(self) -> openinfer_qwen35::Qwen35SchedulerPolicy {
         match self {
-            Self::Off => openinfer_qwen35_4b::Qwen35SchedulerPolicy::Off,
-            Self::Auto => openinfer_qwen35_4b::Qwen35SchedulerPolicy::Auto,
+            Self::Off => openinfer_qwen35::Qwen35SchedulerPolicy::Off,
+            Self::Auto => openinfer_qwen35::Qwen35SchedulerPolicy::Auto,
         }
     }
 }

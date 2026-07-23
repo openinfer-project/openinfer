@@ -4,7 +4,7 @@ use criterion::Throughput;
 use openinfer_core::tensor::DeviceContext;
 use openinfer_core::tensor::DeviceVec;
 use openinfer_core::tensor::HiddenStates;
-use openinfer_qwen35_4b::runtime_ops as ops;
+use openinfer_qwen35::runtime_ops as ops;
 
 use super::common::EPS;
 use super::common::QWEN35_4B_HIDDEN;

@@ -25,14 +25,14 @@
   5. Validate formatting and the strongest local build/test checks available.
 - **Risks / open questions**:
   - The `tvm-ffi-triton-cubin` feature means `tvm-ffi-config` and `libtvm_ffi` are build prerequisites only for the optional bridge path.
-  - The wrapper depends on `qwen35-4b` because the wrapped Triton AOT symbol is only generated with that feature.
+  - The wrapper depends on `qwen35` because the wrapped Triton AOT symbol is only generated with that feature.
   - The current wrapper accepts raw device pointer and stream handles as TVM integers or opaque pointers; a future DLPack/tensor-handle wrapper can sit on top once the DSL artifact contract is stable.
 
 ## Execution Log
 
 ### Step 1: Optional dependency and wrapper surface
 - Added optional `tvm-ffi = "0.1.0-alpha.0"` to `openinfer-kernels` behind `tvm-ffi-triton-cubin`.
-- Made `tvm-ffi-triton-cubin` imply `qwen35-4b`, since the current wrapper targets a Qwen3.5 Triton AOT CUBIN symbol.
+- Made `tvm-ffi-triton-cubin` imply `qwen35`, since the current wrapper targets a Qwen3.5 Triton AOT CUBIN symbol.
 - Added `openinfer_kernels::triton_cubin`, which exposes metadata plus a packed TVM FFI callback for the generated Qwen3.5 GDR solve Triton AOT launcher.
 - Kept existing CUDA C ABI symbols and model call sites unchanged.
 
@@ -57,7 +57,7 @@
 - Addressed automated inline feedback by accepting TVM FFI packed integers as `i64` for pointer handles and scalar launch dimensions, with range checks before casting.
 
 ### Step 5: Rebase onto main
-- Rebasing onto `origin/main` renamed the kernel crate from `pegainfer-kernels` to `openinfer-kernels` and added the `qwen35-4b` Triton feature gate.
+- Rebasing onto `origin/main` renamed the kernel crate from `pegainfer-kernels` to `openinfer-kernels` and added the `qwen35` Triton feature gate.
 - Adapted the TVM bridge to the renamed crate, `openinfer_kernels` Rust import path, `openinfer.triton_cubin.*` TVM global prefix, and `OPENINFER_*` docs.
 - Rebase validation:
   - `cargo fmt --all --check` passed.

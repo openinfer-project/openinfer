@@ -349,7 +349,7 @@ pub(crate) fn run_mixed_load(
     // other model lines ignore it and keep their own capacity, so comparing
     // `bg_concurrency` against `cli.max_batch` for them would be a false alarm.
     // `ModelType::Qwen35` only exists under the feature, so gate the whole check.
-    #[cfg(feature = "qwen35-4b")]
+    #[cfg(feature = "qwen35")]
     if matches!(model_type, ModelType::Qwen35) && args.bg_concurrency >= cli.max_batch {
         let msg = format!(
             "slot starvation: --bg-concurrency ({}) >= --max-batch ({}), \

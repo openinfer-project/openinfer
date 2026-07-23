@@ -319,11 +319,11 @@ pub(crate) enum CliQwen35SchedulerPolicy {
 }
 
 impl CliQwen35SchedulerPolicy {
-    #[cfg(feature = "qwen35-4b")]
-    pub(crate) fn resolve(self) -> openinfer_qwen35_4b::Qwen35SchedulerPolicy {
+    #[cfg(feature = "qwen35")]
+    pub(crate) fn resolve(self) -> openinfer_qwen35::Qwen35SchedulerPolicy {
         match self {
-            Self::Off => openinfer_qwen35_4b::Qwen35SchedulerPolicy::Off,
-            Self::Auto => openinfer_qwen35_4b::Qwen35SchedulerPolicy::Auto,
+            Self::Off => openinfer_qwen35::Qwen35SchedulerPolicy::Off,
+            Self::Auto => openinfer_qwen35::Qwen35SchedulerPolicy::Auto,
         }
     }
 }
@@ -390,7 +390,7 @@ fn consumed_args(model_type: ModelType) -> &'static [&'static str] {
             "batch_invariant",
             "dflash_draft_model_path",
         ],
-        #[cfg(feature = "qwen35-4b")]
+        #[cfg(feature = "qwen35")]
         ModelType::Qwen35 => &[
             "device_ordinal",
             "tp_size",
@@ -505,13 +505,13 @@ impl Args {
         if !matches!(self.decode_overlap, CliDecodeOverlap::Off) && self.tp_size > 1 {
             bail!("--decode-overlap is single-GPU only; tp_size>1 has no prefill/decode overlap");
         }
-        #[cfg(feature = "qwen35-4b")]
+        #[cfg(feature = "qwen35")]
         if matches!(model_type, ModelType::Qwen35) {
             if let Some(max_batch) = self.max_batch {
-                if !(1..=openinfer_qwen35_4b::MAX_DECODE_BATCH).contains(&max_batch) {
+                if !(1..=openinfer_qwen35::MAX_DECODE_BATCH).contains(&max_batch) {
                     bail!(
                         "--max-batch must be in 1..={} for Qwen3.5, got {max_batch}",
-                        openinfer_qwen35_4b::MAX_DECODE_BATCH
+                        openinfer_qwen35::MAX_DECODE_BATCH
                     );
                 }
             }
@@ -678,7 +678,7 @@ fn parse_lora_module_fields(name: &str, path: &str) -> Result<LoraModule, String
 mod tests {
     use super::*;
 
-    #[cfg(any(feature = "glm52", feature = "qwen3", feature = "qwen35-4b"))]
+    #[cfg(any(feature = "glm52", feature = "qwen3", feature = "qwen35"))]
     fn parse_with_provided(argv: &[&str]) -> (Args, BTreeSet<String>) {
         use clap::FromArgMatches;
         let matches = Args::command()
@@ -698,7 +698,7 @@ mod tests {
             ModelType::KimiK2,
             #[cfg(feature = "qwen3")]
             ModelType::Qwen3,
-            #[cfg(feature = "qwen35-4b")]
+            #[cfg(feature = "qwen35")]
             ModelType::Qwen35,
         ]
         .to_vec()
@@ -723,7 +723,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "qwen35-4b")]
+    #[cfg(feature = "qwen35")]
     #[test]
     fn qwen35_accepts_tp_size() {
         let (args, provided) =
@@ -732,7 +732,7 @@ mod tests {
             .expect("Qwen3.5 should accept --tp-size for eager TP startup");
     }
 
-    #[cfg(feature = "qwen35-4b")]
+    #[cfg(feature = "qwen35")]
     #[test]
     fn qwen35_defaults_scheduler_policy_off() {
         let (args, provided) = parse_with_provided(&["openinfer"]);
@@ -744,7 +744,7 @@ mod tests {
         ));
     }
 
-    #[cfg(feature = "qwen35-4b")]
+    #[cfg(feature = "qwen35")]
     #[test]
     fn qwen35_accepts_scheduler_policy_off() {
         let (args, provided) =
@@ -757,7 +757,7 @@ mod tests {
         ));
     }
 
-    #[cfg(feature = "qwen35-4b")]
+    #[cfg(feature = "qwen35")]
     #[test]
     fn qwen35_rejects_tp_auto_scheduler_policy() {
         let (args, provided) = parse_with_provided(&[
@@ -775,7 +775,7 @@ mod tests {
         assert!(err.contains("single-GPU only"));
     }
 
-    #[cfg(feature = "qwen35-4b")]
+    #[cfg(feature = "qwen35")]
     #[test]
     fn qwen35_accepts_non_bucket_scheduler_max_batch() {
         let (args, provided) = parse_with_provided(&["openinfer", "--max-batch", "5"]);
@@ -784,7 +784,7 @@ mod tests {
         assert_eq!(args.max_batch, Some(5));
     }
 
-    #[cfg(feature = "qwen35-4b")]
+    #[cfg(feature = "qwen35")]
     #[test]
     fn qwen35_rejects_zero_scheduler_max_batch() {
         let (args, provided) = parse_with_provided(&["openinfer", "--max-batch", "0"]);

@@ -122,7 +122,7 @@ Phase 1 acceptance coverage:
 - Current-main rebase verification passes:
   - formatting check
   - Qwen3.5 release compilation for all test targets
-  - `openinfer-server` release compilation with only the `qwen35-4b` model feature
+  - `openinfer-server` release compilation with only the `qwen35` model feature
 
 Known validation constraints:
 

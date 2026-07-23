@@ -11,7 +11,7 @@ Every model line is behind a cargo feature; only `qwen3` is a default feature, s
 | Model | Crate | Feature flag | Architecture |
 |-------|-------|-------------|-------------|
 | Qwen3-4B / 8B | `openinfer-qwen3` | `qwen3` (default) | Full attention, TP support |
-| Qwen3.5-4B | `openinfer-qwen35-4b` | `--features qwen35-4b` (needs build-time Python + Triton) | 24 linear + 8 full attention |
+| Qwen3.5-4B / 9B / 27B | `openinfer-qwen35` | `--features qwen35` (needs build-time Python + Triton) | Hybrid Gated DeltaNet + full attention |
 | DeepSeek-V2-Lite | `openinfer-deepseek-v2-lite` | `--features deepseek-v2-lite` | MoE + EP, 2-GPU |
 | Kimi-K2 | `openinfer-kimi-k2` | `--features kimi-k2` | MLA + MoE + Marlin INT4, 8-GPU EP |
 | GLM5.2 | `openinfer-glm52` | `--features glm52` | MLA + MoE + FP8, 8-GPU EP (bring-up) |
@@ -25,7 +25,7 @@ Every model line is behind a cargo feature; only `qwen3` is a default feature, s
 cargo run --release -- --model-path models/Qwen3-4B
 
 # Feature-gated models
-cargo run --release --features qwen35-4b -- --model-path models/Qwen3.5-4B
+cargo run --release --features qwen35 -- --model-path models/Qwen3.5-4B
 cargo run --release --features kimi-k2 -- --model-path models/Kimi-K2
 cargo run --release --features deepseek-v2-lite -- --model-path models/DeepSeek-V2-Lite
 cargo run --release --features glm52 -- --model-path models/GLM5.2
@@ -33,7 +33,7 @@ cargo run --release --features glm52 -- --model-path models/GLM5.2
 
 **Key env vars:**
 - `OPENINFER_CUDA_SM` — GPU SM target override when `nvidia-smi` unavailable (e.g. `120` or `120,80`)
-- `OPENINFER_TRITON_PYTHON` — Python with Triton for `qwen35-4b` build-time AOT kernel generation (falls back to `.venv/bin/python`, then `python3`, then `python`)
+- `OPENINFER_TRITON_PYTHON` — Python with Triton for `qwen35` build-time AOT kernel generation (falls back to `.venv/bin/python`, then `python3`, then `python`)
 - `OPENINFER_TILELANG_PYTHON` — Python with TileLang for the `glm52` sparse-MLA build-time AOT (sm_90a targets only)
 - `OPENINFER_NCCL_ROOT` — NCCL root (>= 2.30.4) for DeepEP shim (`moe` feature)
 - `OPENINFER_FLASHINFER_INCLUDE` — FlashInfer include dir override
@@ -49,8 +49,8 @@ cargo test --release --workspace --lib
 
 # Accuracy and integration tests — require GPU + model weights
 cargo test --release -p openinfer-qwen3 --test hf_golden_gate
-OPENINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p openinfer-qwen35-4b --features qwen35-4b --test hf_golden_gate
-OPENINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p openinfer-qwen35-4b --features qwen35-4b --test e2e_scheduler
+OPENINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p openinfer-qwen35 --features qwen35 --test hf_golden_gate
+OPENINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p openinfer-qwen35 --features qwen35 --test e2e_scheduler
 
 # Single test (filter by name)
 cargo test --release --workspace --lib prefix_cache -- --nocapture
@@ -66,7 +66,7 @@ HTTP Request → vLLM frontend → EngineHandle → per-model scheduler/executor
               ┌──────────┬─────────────┬───────┼───────────┬──────────┐
               │          │             │       │           │          │
         openinfer-  openinfer-   openinfer-  openinfer-  openinfer-  ...
-        qwen3       qwen35-4b    dsv2-lite   kimi-k2     glm52
+        qwen3       qwen35       dsv2-lite   kimi-k2     glm52
       (full attn) (linear+full) (MoE+EP)   (MLA+MoE)  (MLA+MoE+FP8)
               │          │             │       │           │          │
               └──────────┴─────────────┴───────┼───────────┴──────────┘
@@ -91,7 +91,7 @@ HTTP Request → vLLM frontend → EngineHandle → per-model scheduler/executor
 
 **Build system**: the virtual workspace root has no package build script. `openinfer-kernels/build.rs` owns CUDA/Triton compilation:
 1. Compiles `openinfer-kernels/csrc/*.cu` with nvcc (auto-detects GPU SM targets)
-2. Feature-gated codegen: `qwen35-4b` runs Triton AOT via `openinfer-kernels/tools/triton/gen_triton_aot.py`; `kimi-k2` adds MLA/MoE/Marlin CUDA; `glm52` adds MLA/MoE/FP8 CUDA plus TileLang sparse-MLA codegen on sm_90a
+2. Feature-gated codegen: `qwen35` runs Triton AOT via `openinfer-kernels/tools/triton/gen_triton_aot.py`; `kimi-k2` adds MLA/MoE/Marlin CUDA; `glm52` adds MLA/MoE/FP8 CUDA plus TileLang sparse-MLA codegen on sm_90a
 
 ---
 

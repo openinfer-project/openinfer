@@ -60,7 +60,7 @@ async fn spawn_ready_server(
 ) -> Result<Qwen35Tp2Server> {
     let device_ordinals = common::tp2_device_ordinals();
     let handle = tokio::task::spawn_blocking(move || {
-        openinfer_qwen35_4b::start_engine_with_capacity(
+        openinfer_qwen35::start_engine_with_capacity(
             &engine_model_path,
             EngineLoadOptions {
                 enable_cuda_graph: false,
@@ -183,7 +183,7 @@ async fn assert_concurrent_completions(client: &Client, base_url: &str) -> Resul
 }
 
 fn assert_invalid_cuda_graph_tp_startup_fails(model_path: &str) -> Result<()> {
-    let error = match openinfer_qwen35_4b::start_engine_with_capacity(
+    let error = match openinfer_qwen35::start_engine_with_capacity(
         Path::new(model_path),
         EngineLoadOptions {
             enable_cuda_graph: true,

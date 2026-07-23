@@ -11,7 +11,7 @@
   - `docs/models/qwen35/model-crate.md` — confirmed that the model crate owns the scheduler and exposes it through the generic `EngineHandle`.
   - `docs/models/qwen35/roadmap.md` — confirmed the serving and lifecycle observability context.
   - `docs/subsystems/frontend/prometheus-metrics.md` — confirmed the existing `LoadSnapshot` bridge contract.
-  - `openinfer-qwen35-4b/src/scheduler.rs` before and after the metrics change — compared the wiring with the shared single-GPU/TP scheduler flow.
+  - `openinfer-qwen35/src/scheduler.rs` before and after the metrics change — compared the wiring with the shared single-GPU/TP scheduler flow.
 - **Relevant history**:
   - Qwen3 established the `LoadSnapshot` watch path consumed by the frontend bridge.
   - Qwen3.5 shares one scheduler loop between single-GPU and TP backends, so KV accounting must come from `SchedulerBackend`, not directly from `Qwen35Model`.
@@ -69,8 +69,8 @@ export OPENINFER_CUDA_SM=120
 export OPENINFER_TRITON_PYTHON="$PWD/.venv/bin/python"
 export OPENINFER_TEST_MODEL_PATH="$PWD/models/Qwen3.5-4B"
 
-cargo build --release -p openinfer-server --features qwen35-4b
-cargo test --release -p openinfer-qwen35-4b --features qwen35-4b \
+cargo build --release -p openinfer-server --features qwen35
+cargo test --release -p openinfer-qwen35 --features qwen35 \
   --test e2e_scheduler test_e2e_qwen35_scheduler -- --exact --nocapture
 ```
 

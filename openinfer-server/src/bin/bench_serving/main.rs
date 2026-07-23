@@ -14,7 +14,7 @@
         feature = "deepseek-v2-lite",
         feature = "kimi-k2",
         feature = "qwen3",
-        feature = "qwen35-4b"
+        feature = "qwen35"
     )),
     allow(unused_imports, unused_variables, dead_code)
 )]
@@ -85,11 +85,11 @@ fn validate_qwen35_scheduler_policy(
     model_type: ModelType,
     policy: CliQwen35SchedulerPolicy,
 ) -> Result<()> {
-    #[cfg(feature = "qwen35-4b")]
+    #[cfg(feature = "qwen35")]
     if matches!(model_type, ModelType::Qwen35) {
         return Ok(());
     }
-    #[cfg(not(feature = "qwen35-4b"))]
+    #[cfg(not(feature = "qwen35"))]
     let _ = model_type;
     if policy == CliQwen35SchedulerPolicy::Off {
         return Ok(());
@@ -99,16 +99,16 @@ fn validate_qwen35_scheduler_policy(
 
 fn validate_qwen35_max_batch(model_type: ModelType, max_batch: usize) -> Result<()> {
     anyhow::ensure!(max_batch > 0, "--max-batch must be > 0");
-    #[cfg(feature = "qwen35-4b")]
+    #[cfg(feature = "qwen35")]
     if matches!(model_type, ModelType::Qwen35) {
         anyhow::ensure!(
-            max_batch <= openinfer_qwen35_4b::MAX_DECODE_BATCH,
+            max_batch <= openinfer_qwen35::MAX_DECODE_BATCH,
             "--max-batch must be <= {} for Qwen3.5",
-            openinfer_qwen35_4b::MAX_DECODE_BATCH
+            openinfer_qwen35::MAX_DECODE_BATCH
         );
         return Ok(());
     }
-    #[cfg(not(feature = "qwen35-4b"))]
+    #[cfg(not(feature = "qwen35"))]
     let _ = model_type;
     Ok(())
 }
@@ -241,7 +241,7 @@ fn main() -> Result<()> {
             )?;
             finish(handle, cli.cuda_graph)
         }
-        #[cfg(feature = "qwen35-4b")]
+        #[cfg(feature = "qwen35")]
         ModelType::Qwen35 => {
             // Chunked-prefill budget from --max-prefill-tokens (mirrors the Qwen3
             // path); omit for the model default. Concurrent capacity from
@@ -249,8 +249,8 @@ fn main() -> Result<()> {
             let max_prefill_tokens = cli
                 .max_prefill_tokens
                 .filter(|&v| v > 0)
-                .unwrap_or(openinfer_qwen35_4b::DEFAULT_MAX_PREFILL_TOKENS);
-            let handle = openinfer_qwen35_4b::start_engine_with_capacity_and_policy(
+                .unwrap_or(openinfer_qwen35::DEFAULT_MAX_PREFILL_TOKENS);
+            let handle = openinfer_qwen35::start_engine_with_capacity_and_policy(
                 Path::new(&cli.model_path),
                 EngineLoadOptions {
                     enable_cuda_graph: cli.cuda_graph,

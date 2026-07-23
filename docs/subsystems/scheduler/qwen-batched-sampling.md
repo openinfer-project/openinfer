@@ -50,15 +50,15 @@
 - Validation machine gates passed:
   - `cargo check --release --offline -p openinfer-core -p openinfer-kernels`
   - `cargo check --release --offline -p openinfer-qwen3`
-  - `cargo check --release --offline -p openinfer-qwen35-4b --features qwen35-4b`
+  - `cargo check --release --offline -p openinfer-qwen35 --features qwen35`
   - `cargo test --release --offline -p openinfer-kernels batch_sampling_top_p_only_small_nucleus_collapses_to_argmax -- --nocapture`
   - `cargo test --release --offline -p openinfer-qwen3 --tests --no-run`
   - `cargo test --release --offline -p openinfer-qwen3 --test hf_golden_gate -- --nocapture`
   - `cargo test --release --offline -p openinfer-qwen3 --test sampling_behavior -- --nocapture`
-  - `cargo test --release --offline -p openinfer-qwen35-4b --features qwen35-4b --test hf_golden_gate -- --nocapture`
-  - `cargo test --release --offline -p openinfer-qwen35-4b --features qwen35-4b --test sampling_behavior -- --nocapture`
-  - `cargo test --release --offline -p openinfer-qwen35-4b --features qwen35-4b unified_step_decode_matches_graph_decode -- --nocapture`
-  - `cargo test --release --offline -p openinfer-qwen35-4b --features qwen35-4b --test e2e_scheduler -- --nocapture`
+  - `cargo test --release --offline -p openinfer-qwen35 --features qwen35 --test hf_golden_gate -- --nocapture`
+  - `cargo test --release --offline -p openinfer-qwen35 --features qwen35 --test sampling_behavior -- --nocapture`
+  - `cargo test --release --offline -p openinfer-qwen35 --features qwen35 unified_step_decode_matches_graph_decode -- --nocapture`
+  - `cargo test --release --offline -p openinfer-qwen35 --features qwen35 --test e2e_scheduler -- --nocapture`
 - Qwen3.5 scheduler e2e now alternates greedy and sampled requests in the concurrent phase, so the real decode batch covers mixed token-selection rows.
 - Qwen3.5 `sampling_behavior` now proves `temperature` / `top_k` / `top_p` still steer the scheduler path, `top_k=1` and tiny `top_p` collapse to greedy, and hot sampling still varies across runs.
 - `nsys profile --trace=cuda,nvtx --cuda-graph-trace=node --export=sqlite` on the Qwen3.5 mixed scheduler test showed:

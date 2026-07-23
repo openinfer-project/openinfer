@@ -2,9 +2,9 @@
 
 > **TL;DR:** Hybrid 24 linear + 8 full attn. This file is the historical optimization ledger; the current RTX 5090 comparison is in [Qwen3.5 serving: openinfer vs vLLM on RTX 5090](../../benchmarks/qwen35-4b-serving-vllm-rtx5090.md). The decode-tuning refresh fuses MLP gate/up and tunes decode cuBLASLt buckets, improving direct TPOT by `2.1-3.2%`; vLLM still leads 1024/256 HTTP decode and high-concurrency throughput.
 >
-> **Last touched:** 2026-06. Qwen3.5 runtime code lives in top-level `openinfer-qwen35-4b`; root `bench_serving` loads it through the generic `EngineHandle`. Current accuracy coverage is `OPENINFER_CUDA_SM=120 OPENINFER_TEST_MODEL_PATH=<absolute Qwen3.5-4B path> cargo test --release -p openinfer-qwen35-4b --test hf_golden_gate -- --nocapture`; run `e2e_scheduler` when scheduler request-flow behavior changes. The old exact-text e2e/regen baseline was retired by the HF logits gate in `docs/models/qwen35/accuracy.md`.
+> **Last touched:** 2026-06. Qwen3.5 runtime code lives in top-level `openinfer-qwen35`; root `bench_serving` loads it through the generic `EngineHandle`. Current accuracy coverage is `OPENINFER_CUDA_SM=120 OPENINFER_TEST_MODEL_PATH=<absolute Qwen3.5-4B path> cargo test --release -p openinfer-qwen35 --test hf_golden_gate -- --nocapture`; run `e2e_scheduler` when scheduler request-flow behavior changes. The old exact-text e2e/regen baseline was retired by the HF logits gate in `docs/models/qwen35/accuracy.md`.
 
-Historical command logs below keep the command paths that were actually run at the time. For new Qwen3.5 accuracy tests, use `-p openinfer-qwen35-4b --test hf_golden_gate`; for serving benchmarks, continue using root `cargo run --release --bin bench_serving -- --model-path models/Qwen3.5-4B ...`.
+Historical command logs below keep the command paths that were actually run at the time. For new Qwen3.5 accuracy tests, use `-p openinfer-qwen35 --test hf_golden_gate`; for serving benchmarks, continue using root `cargo run --release --bin bench_serving -- --model-path models/Qwen3.5-4B ...`.
 
 ## Goal
 

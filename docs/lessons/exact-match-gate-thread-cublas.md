@@ -7,7 +7,7 @@
 
 ## Scope
 
-This note records a cross-cutting runtime/correctness lesson, not a Qwen3.5-only story. It was lifted from the original Qwen3.5 debugging debrief because the concrete fix shipped, but the transferable lessons still matter. The triggering bug was fixed in `openinfer-qwen35-4b`, but the takeaways apply to any model crate that moves a model onto a worker thread or guards greedy decode with an exact-text gate.
+This note records a cross-cutting runtime/correctness lesson, not a Qwen3.5-only story. It was lifted from the original Qwen3.5 debugging debrief because the concrete fix shipped, but the transferable lessons still matter. The triggering bug was fixed in `openinfer-qwen35`, but the takeaways apply to any model crate that moves a model onto a worker thread or guards greedy decode with an exact-text gate.
 
 ## Background
 
@@ -18,7 +18,7 @@ The regression first appeared at `6a5b826` after cuBLAS handles became thread-lo
 - **Read**:
   - `docs/index.md` - Qwen3.5 accuracy and optimization docs are the relevant references.
   - `docs/models/qwen35/model-crate.md` - confirmed the model-crate split reproduced the same Qwen3.5 e2e failure on old HEAD.
-  - `git log -- openinfer-qwen35-4b openinfer-kernels ...` - identified Qwen3.5 and sampling-related commits since the last accuracy work (the historical bisect ran against the pre-split `src/model/qwen35` layout).
+  - `git log -- openinfer-qwen35 openinfer-kernels ...` - identified Qwen3.5 and sampling-related commits since the last accuracy work (the historical bisect ran against the pre-split `src/model/qwen35` layout).
 - **Relevant history**:
   - `docs/models/qwen35/model-crate.md` - old HEAD and the model-crate split both fail all 10 Qwen3.5 e2e cases with similar gibberish.
   - Commit history has a suspicious sampling change: `020970b refactor(sampling): switch greedy decode to flashinfer top1 (#73)`.
@@ -41,7 +41,7 @@ The regression first appeared at `6a5b826` after cuBLAS handles became thread-lo
 - That showed logits/sampling were already wrong at the first sampled token after prefill; decode KV accumulation was not the primary cause.
 
 ### Step 3: Fix scheduler thread binding
-- Updated `openinfer-qwen35-4b/src/scheduler.rs` so the scheduler thread:
+- Updated `openinfer-qwen35/src/scheduler.rs` so the scheduler thread:
   - calls `cuda_set_device` for the model device,
   - binds the existing `CudaContext` to the scheduler thread,
   - initializes thread-local cuBLAS handles on that thread,
@@ -65,8 +65,8 @@ The regression first appeared at `6a5b826` after cuBLAS handles became thread-lo
   - `cargo clippy --release --workspace --all-targets -- -D warnings`
   - Two-run same-seed regen comparison with a temporary model alias while evaluating FlashInfer top1 behavior.
   - `cargo test --release -p openinfer-kernels batch_sampling_top_p_only_small_nucleus_collapses_to_argmax -- --nocapture`
-  - `OPENINFER_TEST_MODEL_PATH=<absolute Qwen3.5-4B path> cargo test --release -p openinfer-qwen35-4b --test e2e -- --nocapture`
-  - `OPENINFER_TEST_MODEL_PATH=<absolute Qwen3.5-4B path> cargo test --release -p openinfer-qwen35-4b --test e2e_scheduler -- --nocapture`
+  - `OPENINFER_TEST_MODEL_PATH=<absolute Qwen3.5-4B path> cargo test --release -p openinfer-qwen35 --test e2e -- --nocapture`
+  - `OPENINFER_TEST_MODEL_PATH=<absolute Qwen3.5-4B path> cargo test --release -p openinfer-qwen35 --test e2e_scheduler -- --nocapture`
   - `git diff --check`
 
 ## Debrief

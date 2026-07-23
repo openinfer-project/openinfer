@@ -1,7 +1,7 @@
 # Qwen3.5-4B Model Crate
 
 **Created**: 2026-05-05
-**TL;DR**: `openinfer-qwen35-4b` now owns Qwen3.5 config, weights, prefill/decode/unified forward, recurrent state, scheduler, recurrent op wrappers, scheduler integration tests, and Qwen3.5 op benches. The whole crate is behind the `qwen35-4b` feature (`--features qwen35-4b` on `openinfer-server`) because its GDR prefill kernels are Triton AOT-generated — this keeps the default Qwen3 build Python-free. Root `openinfer` loads Qwen3.5 through `openinfer_qwen35_4b::start_engine(...)` / generic `EngineHandle`; root no longer exposes `openinfer::model::Qwen35Model` or `openinfer::scheduler_qwen35`. The original exact-text e2e/regen tests described in this migration record were later retired by the HF logits gate in `docs/models/qwen35/accuracy.md`.
+**TL;DR**: `openinfer-qwen35` now owns Qwen3.5 config, weights, prefill/decode/unified forward, recurrent state, scheduler, recurrent op wrappers, scheduler integration tests, and Qwen3.5 op benches. The whole crate is behind the `qwen35` feature (`--features qwen35` on `openinfer-server`) because its GDR prefill kernels are Triton AOT-generated — this keeps the default Qwen3 build Python-free. Root `openinfer` loads Qwen3.5 through `openinfer_qwen35::start_engine(...)` / generic `EngineHandle`; root no longer exposes `openinfer::model::Qwen35Model` or `openinfer::scheduler_qwen35`. The original exact-text e2e/regen tests described in this migration record were later retired by the HF logits gate in `docs/models/qwen35/accuracy.md`.
 **Last touched**: 2026-07
 
 ## Feature gate (2026-06)
@@ -10,14 +10,14 @@ Qwen3.5 is the only model line whose kernels need Python at build time (Triton
 AOT for the GDR chunkwise prefill). To make the stock build pure Rust + CUDA,
 the crate is feature-gated end to end:
 
-- `openinfer-kernels/qwen35-4b` gates the Triton AOT build step and the GDR
+- `openinfer-kernels/qwen35` gates the Triton AOT build step and the GDR
   chunk FFI declarations — without it, `build.rs` never probes for Python.
-- `openinfer-qwen35-4b` compiles to an empty crate without its `qwen35-4b`
+- `openinfer-qwen35` compiles to an empty crate without its `qwen35`
   feature (crate-root `#![cfg]`), so `cargo test --workspace --lib` stays
   Python-free; its tests/benches carry `required-features` and fail with an
   actionable message instead of a link error.
 - `openinfer-server` defaults to `qwen3` only; serve Qwen3.5 with
-  `cargo run --release --features qwen35-4b -- --model-path models/Qwen3.5-4B`.
+  `cargo run --release --features qwen35 -- --model-path models/Qwen3.5-4B`.
 
 The unused Triton HD256 prefill kernel (replaced by the native paged
 `batch_prefill_paged_cuda_hd256`) was deleted in the same change.
@@ -29,16 +29,16 @@ The unused Triton HD256 prefill kernel (replaced by the native paged
   - `docs/models/qwen3/model-crate.md` - Qwen3 already owns its scheduler, executor/runtime API, tests, benches, and root-facing `EngineHandle` entry.
   - `docs/models/qwen35/accuracy.md` - at the time of this migration, Qwen3.5 e2e tests were regression guards against `test_data/Qwen3.5-4B.json`; current accuracy coverage is the HF logits gate recorded there.
   - `docs/models/qwen35/optimization.md` - Qwen3.5 should keep its hybrid linear/full-attention scheduler/state architecture.
-  - GitHub issue #79 - acceptance criteria require `openinfer-qwen35-4b`, removal of root `openinfer::model::Qwen35Model` and `openinfer::scheduler_qwen35`, generic root `bench_serving`, and CUDA validation.
+  - GitHub issue #79 - acceptance criteria require `openinfer-qwen35`, removal of root `openinfer::model::Qwen35Model` and `openinfer::scheduler_qwen35`, generic root `bench_serving`, and CUDA validation.
   - `Cargo.toml`, `src/lib.rs`, `src/main.rs`, `src/ops.rs`, `src/scheduler.rs`, `src/model/qwen35.rs`, and `openinfer-qwen3/src/lib.rs` - mapped the current root Qwen3.5 surface and the Qwen3 crate interface to copy.
 - **Relevant history**:
   - `docs/models/qwen3/model-crate.md` - root should load model crates through `EngineHandle`; model-owned execution details should move behind crate-local modules.
 - **Plan**:
-  1. Add `openinfer-qwen35-4b` to the workspace with dependencies mirroring the Qwen3 crate plus the root dependencies Qwen3.5 currently uses.
+  1. Add `openinfer-qwen35` to the workspace with dependencies mirroring the Qwen3 crate plus the root dependencies Qwen3.5 currently uses.
   2. Move `src/model/qwen35.rs`, `src/model/qwen35/*`, `src/scheduler_qwen35.rs`, and Qwen3.5 recurrent op wrappers into the new crate, keeping CUDA/Triton kernel sources and FFI in `openinfer-kernels`.
   3. Rewrite imports so the new crate depends on `openinfer-core` and `openinfer-kernels`, not on root `openinfer`.
-  4. Expose `start_engine` and a deliberate `runtime` module from `openinfer-qwen35-4b`.
-  5. Update root `main.rs` and `src/bin/bench_serving.rs` to call `openinfer_qwen35_4b::start_engine`.
+  4. Expose `start_engine` and a deliberate `runtime` module from `openinfer-qwen35`.
+  5. Update root `main.rs` and `src/bin/bench_serving.rs` to call `openinfer_qwen35::start_engine`.
   6. Move Qwen3.5 e2e tests and regen test into the model crate; adjust model/test-data paths after the move.
   7. Remove root Qwen3.5 modules and compatibility exports, then audit root with `rg`.
   8. Verify with `cargo fmt --all --check`, `cargo metadata --no-deps --format-version 1`, and the CUDA-capable build/test commands available on this machine.
@@ -49,7 +49,7 @@ The unused Triton HD256 prefill kernel (replaced by the native paged
 ## Execution Log
 
 ### Step 1: Add model crate and move Qwen3.5 runtime
-- Added `openinfer-qwen35-4b` to the workspace and root dependencies.
+- Added `openinfer-qwen35` to the workspace and root dependencies.
 - Moved Qwen3.5-owned runtime files out of root:
   - `src/model/qwen35.rs`
   - `src/model/qwen35/*`
@@ -62,12 +62,12 @@ The unused Triton HD256 prefill kernel (replaced by the native paged
 
 ### Step 2: Move tests and benches
 - Moved root Qwen3.5 tests to the model crate at the time:
-  - `openinfer-qwen35-4b/tests/e2e.rs`
-  - `openinfer-qwen35-4b/tests/e2e_scheduler.rs`
-  - `openinfer-qwen35-4b/tests/regen_test_data.rs`
+  - `openinfer-qwen35/tests/e2e.rs`
+  - `openinfer-qwen35/tests/e2e_scheduler.rs`
+  - `openinfer-qwen35/tests/regen_test_data.rs`
 - The exact-text `e2e.rs` and `regen_test_data.rs` were later removed by the Qwen3.5 HF logits gate work; `e2e_scheduler.rs` remains as request-flow coverage.
-- Moved Qwen3.5-specific op benches to `openinfer-qwen35-4b/benches/qwen35_ops.rs`.
-- Moved the `conv1d_prefill_handoff_matches_single_prefill` operator test into `openinfer-qwen35-4b/src/recurrent.rs`, next to the wrapper it validates.
+- Moved Qwen3.5-specific op benches to `openinfer-qwen35/benches/qwen35_ops.rs`.
+- Moved the `conv1d_prefill_handoff_matches_single_prefill` operator test into `openinfer-qwen35/src/recurrent.rs`, next to the wrapper it validates.
 - Removed Qwen3.5-specific GEMV shapes from the root generic `ops_bench`; the model-specific benches now live with Qwen3.5.
 
 ### Step 3: Remove root Qwen3.5 compatibility surface
@@ -77,8 +77,8 @@ The unused Triton HD256 prefill kernel (replaced by the native paged
   - `src/model.rs`
   - `src/ffi.rs`
   - `src/kv_pool.rs`
-- Root `main.rs` now calls `openinfer_qwen35_4b::start_engine(...)` for Qwen3.5.
-- Root `bench_serving` now calls `openinfer_qwen35_4b::start_engine(...)` and still benchmarks via generic `EngineHandle`.
+- Root `main.rs` now calls `openinfer_qwen35::start_engine(...)` for Qwen3.5.
+- Root `bench_serving` now calls `openinfer_qwen35::start_engine(...)` and still benchmarks via generic `EngineHandle`.
 - The Qwen3.5 engine entry honors a single `EngineLoadOptions.device_ordinals` value and rejects multi-device input, matching the current single-GPU implementation instead of silently ignoring the option.
 - `rg` confirms there are no root references to `openinfer::model::Qwen35Model`, `openinfer::scheduler_qwen35`, or `src/model/qwen35`.
 
@@ -89,11 +89,11 @@ The unused Triton HD256 prefill kernel (replaced by the native paged
   - `OPENINFER_CUDA_SM=120 cargo check --release --workspace --all-targets`
   - `OPENINFER_CUDA_SM=120 cargo clippy --release --workspace --all-targets -- -D warnings`
   - `OPENINFER_CUDA_SM=120 cargo build --release`
-  - `OPENINFER_CUDA_SM=120 cargo test --release -p openinfer-qwen35-4b recurrent::tests::conv1d_prefill_handoff_matches_single_prefill -- --nocapture`
+  - `OPENINFER_CUDA_SM=120 cargo test --release -p openinfer-qwen35 recurrent::tests::conv1d_prefill_handoff_matches_single_prefill -- --nocapture`
   - `OPENINFER_CUDA_SM=120 cargo run --release --bin bench_serving -- --model-path $LOCAL_OPENINFER_DIR/models/Qwen3.5-4B request --prompt-len 1 --output-len 1 --warmup 0 --iters 1`
 - Initial Qwen3.5 e2e failure:
-  - `OPENINFER_CUDA_SM=120 OPENINFER_TEST_MODEL_PATH=$LOCAL_OPENINFER_DIR/models/Qwen3.5-4B cargo test --release -p openinfer-qwen35-4b --test e2e -- --nocapture`
-  - `OPENINFER_CUDA_SM=120 OPENINFER_TEST_MODEL_PATH=$LOCAL_OPENINFER_DIR/models/Qwen3.5-4B cargo test --release -p openinfer-qwen35-4b --test e2e_scheduler -- --nocapture`
+  - `OPENINFER_CUDA_SM=120 OPENINFER_TEST_MODEL_PATH=$LOCAL_OPENINFER_DIR/models/Qwen3.5-4B cargo test --release -p openinfer-qwen35 --test e2e -- --nocapture`
+  - `OPENINFER_CUDA_SM=120 OPENINFER_TEST_MODEL_PATH=$LOCAL_OPENINFER_DIR/models/Qwen3.5-4B cargo test --release -p openinfer-qwen35 --test e2e_scheduler -- --nocapture`
   - Both initially produced all-case gibberish-output mismatches.
 - Control run:
   - A temporary old-HEAD worktree at `$RESULT_ROOT/openinfer-head` ran `OPENINFER_CUDA_SM=120 OPENINFER_TRITON_PYTHON=$LOCAL_OPENINFER_DIR/.venv/bin/python OPENINFER_TEST_MODEL_PATH=$LOCAL_OPENINFER_DIR/models/Qwen3.5-4B CARGO_TARGET_DIR=$RESULT_ROOT/openinfer-head-target cargo test --release --test e2e_qwen35 -- --nocapture`.

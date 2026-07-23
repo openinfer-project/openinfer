@@ -21,7 +21,7 @@ uv --version      # Python package manager
 ## 2. Create Unified Python venv (optional for the default build)
 
 The default build (Qwen3 only) is pure Rust + CUDA and needs no Python. Set up
-`.venv` when you build feature-gated model lines (`qwen35-4b` needs triton) or
+`.venv` when you build feature-gated model lines (`qwen35` needs triton) or
 run the HF reference scripts (torch/transformers).
 
 ```bash
@@ -43,10 +43,10 @@ Verify:
 
 ```bash
 cargo build --release                          # Qwen3 only, no Python
-cargo build --release --features qwen35-4b     # adds Qwen3.5 (Triton AOT at build time)
+cargo build --release --features qwen35     # adds Qwen3.5 (Triton AOT at build time)
 ```
 
-First build takes ~30s. Compiles CUDA kernels (`openinfer-kernels/csrc/*.cu`); with `--features qwen35-4b` it also generates the Triton AOT kernels (`openinfer-kernels/tools/triton/*.py`).
+First build takes ~30s. Compiles CUDA kernels (`openinfer-kernels/csrc/*.cu`); with `--features qwen35` it also generates the Triton AOT kernels (`openinfer-kernels/tools/triton/*.py`).
 
 ## 4. Run Tests
 
@@ -116,8 +116,8 @@ Accuracy tests live in each model crate:
 
 ```bash
 cargo test -r -p openinfer-qwen3  --test hf_golden_gate   # Qwen3-4B logits vs stored HF golden (bf16 tolerance)
-cargo test -r -p openinfer-qwen35-4b --test hf_golden_gate   # Qwen3.5-4B logits vs stored HF golden (bf16 tolerance)
-cargo test -r -p openinfer-qwen35-4b --test e2e_scheduler    # Qwen3.5-4B scheduler request-flow integration
+cargo test -r -p openinfer-qwen35 --test hf_golden_gate   # Qwen3.5-4B logits vs stored HF golden (bf16 tolerance)
+cargo test -r -p openinfer-qwen35 --test e2e_scheduler    # Qwen3.5-4B scheduler request-flow integration
 ```
 
 Qwen3-4B no longer pins exact greedy text: a bit-wise baseline false-positives across GPUs (per-card bf16 GEMM drifts the low bits). `hf_golden_gate` instead teacher-forces a fixed set of sequences and asserts openinfer's logprobs land within the bf16 noise floor of a stored HuggingFace reference — across bs=1, batched, and the CUDA-graph path. The reasoning and tolerances are in `docs/models/qwen3/accuracy-gate.md`.

@@ -14,8 +14,8 @@
   - `docs/subsystems/scheduler/scheduler.md` - explains paged KV, scheduler ownership, and why pressure evidence needs a real serving run plus post-pressure completion.
   - `docs/models/qwen35/model-crate.md` - confirms Qwen3.5 scheduler/runtime ownership and test paths.
   - GitHub issue #254 - desired outcome is full-lifetime admission, clean rejection for impossible requests, and no batch-wide abort from KV exhaustion.
-  - `openinfer-qwen35-4b/src/scheduler.rs` - production scheduler currently calls prompt-only admission and reports execution errors as normal finishes in several paths.
-  - `openinfer-qwen35-4b/src/scheduler/plan.rs` - CPU-testable admission seam currently reserves prompt pages only.
+  - `openinfer-qwen35/src/scheduler.rs` - production scheduler currently calls prompt-only admission and reports execution errors as normal finishes in several paths.
+  - `openinfer-qwen35/src/scheduler/plan.rs` - CPU-testable admission seam currently reserves prompt pages only.
   - `openinfer-qwen3/src/scheduler.rs` - reference implementation for `prompt_len + max_tokens - 1` KV accounting and impossible-request rejection.
   - `openinfer-core/src/kv_pool.rs` - confirms `KvState::ensure_capacity` grows physical pages lazily and pool capacity includes the reserved padding page.
 - **Relevant history**:
@@ -34,13 +34,13 @@
 ## Execution Log
 
 ### Step 1: Qwen3.5 admission policy
-- Updated `openinfer-qwen35-4b/src/scheduler/plan.rs` so pending requests are sized by full lifetime KV demand: `prompt_len + max_tokens - 1`.
+- Updated `openinfer-qwen35/src/scheduler/plan.rs` so pending requests are sized by full lifetime KV demand: `prompt_len + max_tokens - 1`.
 - Added active-request budgeting with `ActiveKvBudget`. Active requests subtract only their remaining future page growth from `available_pages`, because `KvState` already holds their current pages through the shared `PagePool`.
 - Preserved Qwen3.5's existing FCFS deferral policy after the first temporary budget miss. Requests larger than `max_request_pages` are rejected and do not block later fitting requests.
 - Added a release assertion for the invariant that an active request's current KV pages cannot exceed its admitted lifetime pages.
 
 ### Step 2: Scheduler event semantics
-- Updated `openinfer-qwen35-4b/src/scheduler.rs` to build active budgets, pass the usable single-request cap (`capacity_pages - 1`, excluding the CUDA Graph padding page), and emit `TokenEvent::Rejected` for impossible requests.
+- Updated `openinfer-qwen35/src/scheduler.rs` to build active budgets, pass the usable single-request cap (`capacity_pages - 1`, excluding the CUDA Graph padding page), and emit `TokenEvent::Rejected` for impossible requests.
 - Converted Qwen3.5 execution/sampling failure paths from fake `Finished(Stop)` to `TokenEvent::Error`, so request failures surface as errors instead of clean stops.
 - Rejection message includes the prompt length and full lifetime request demand:
   - `request requires more KV pages than this model instance can provide: prompt_tokens=..., max_request_tokens=...`
@@ -73,21 +73,21 @@
   - restored FlashInfer CCCL headers from an existing CUDA 13 Python environment and used Triton 3.6 for `sm_120`.
 - Commands passed:
   - `cargo fmt --check`
-  - `cargo test --offline --release -p openinfer-qwen35-4b --lib scheduler::plan -- --nocapture` - `14 passed`.
-  - `cargo test --offline --release -p openinfer-qwen35-4b --lib -- --nocapture` - `22 passed` before the fake-loop test deletion.
-  - `cargo test --offline --release -p openinfer-qwen35-4b send_rejection_reports_kv_lifetime_context --lib -- --nocapture` - `1 passed` before the rejection label rename and test rename.
+  - `cargo test --offline --release -p openinfer-qwen35 --lib scheduler::plan -- --nocapture` - `14 passed`.
+  - `cargo test --offline --release -p openinfer-qwen35 --lib -- --nocapture` - `22 passed` before the fake-loop test deletion.
+  - `cargo test --offline --release -p openinfer-qwen35 send_rejection_reports_kv_lifetime_context --lib -- --nocapture` - `1 passed` before the rejection label rename and test rename.
   - `cargo test --offline --release -p openinfer-vllm-frontend rejected_request_is_reported_as_error --lib -- --nocapture` - `1 passed`.
   - `cargo build --offline --release -p openinfer-server` - passed with existing unused-import warnings in `openinfer-server`.
 - Review-fix validation on the H20 host after deleting the fake seam and renaming the rejection label:
   - `cargo fmt --check` passed with nightly Rust.
-  - `cargo test --offline --release -p openinfer-qwen35-4b send_rejection_reports_kv_lifetime_request_tokens --lib -- --nocapture` passed, `1 passed`.
-  - `cargo test --offline --release -p openinfer-qwen35-4b --lib -- --nocapture` passed, `20 passed`.
+  - `cargo test --offline --release -p openinfer-qwen35 send_rejection_reports_kv_lifetime_request_tokens --lib -- --nocapture` passed, `1 passed`.
+  - `cargo test --offline --release -p openinfer-qwen35 --lib -- --nocapture` passed, `20 passed`.
   - H20 real-model e2e was not rerun because the host had no `models/Qwen3.5-4B/config.json`, and downloading `Qwen/Qwen3.5-4B` revision `851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a` failed with `Network is unreachable`.
   - `cargo test --offline --release -p openinfer-vllm-frontend rejected_request_is_reported_as_error --lib -- --nocapture` was blocked by the local vendored vLLM `proto/vllm_grpc.proto` path, so the prior frontend bridge pass and GitHub CPU check remain the evidence for that surface.
 
 ### Step 5: Real Qwen3.5 e2e
 - Command:
-  - `OPENINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --offline --release -p openinfer-qwen35-4b --test e2e_scheduler -- --nocapture`
+  - `OPENINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --offline --release -p openinfer-qwen35 --test e2e_scheduler -- --nocapture`
 - Result before the extra release-assert hardening:
   - `test_e2e_qwen35_scheduler ... ok`
   - `1 passed`, finished in `12.95s`.

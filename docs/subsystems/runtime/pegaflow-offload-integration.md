@@ -51,7 +51,7 @@ openinfer 仓里 vendored 的 `kvbm-physical` / `kvbm-engine` 设计目标就是
 
 **边界结论**：connector 只收 **block-structured、content-addressable** 的 KV（MLA latent / full-attn paged）。recurrent/SSM state 不进 connector。稀疏的 active-set gather 是独立的、未来的课题。
 
-证据：Kimi `openinfer-kimi-k2/src/runner/{worker.rs:612-619, cache.rs:63-80, mla.rs:38-48}`、`scheduler.rs:16,27,146,180`、`pool.rs:123`；Qwen3.5 linear `openinfer-qwen35-4b/src/...recurrent.rs`、`batch_decode_graph.rs:82-86`。
+证据：Kimi `openinfer-kimi-k2/src/runner/{worker.rs:612-619, cache.rs:63-80, mla.rs:38-48}`、`scheduler.rs:16,27,146,180`、`pool.rs:123`；Qwen3.5 linear `openinfer-qwen35/src/...recurrent.rs`、`batch_decode_graph.rs:82-86`。
 
 ## 4. 路线
 
