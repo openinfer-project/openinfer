@@ -1,7 +1,9 @@
+use std::collections::HashSet;
 use std::fs;
 
 use anyhow::Context;
 use anyhow::Result;
+use log::warn;
 use serde::Deserialize;
 
 pub(crate) const PREFILL_ATTENTION_CTA_TILE_Q: i32 = 64;
@@ -30,6 +32,8 @@ pub(crate) struct Config {
     pub(crate) num_key_value_heads: usize,
     pub(crate) head_dim: usize,
     pub(crate) vocab_size: usize,
+    #[serde(skip)]
+    pub(crate) selection_vocab: usize,
     pub(crate) rms_norm_eps: f32,
     pub(crate) rope_theta: f32,
     #[serde(default = "default_max_position_embeddings")]
@@ -57,6 +61,7 @@ pub(crate) struct DFlashConfig {
     pub(crate) num_target_layers: usize,
     pub(crate) head_dim: usize,
     pub(crate) vocab_size: usize,
+    pub(crate) selection_vocab: usize,
     pub(crate) rms_norm_eps: f32,
     pub(crate) rope_theta: f32,
     pub(crate) max_position_embeddings: usize,
@@ -190,6 +195,7 @@ impl Config {
         let config_path = format!("{}/config.json", model_path);
         let content = fs::read_to_string(&config_path)?;
         let mut config: Config = serde_json::from_str(&content)?;
+        config.selection_vocab = config.vocab_size;
         anyhow::ensure!(
             config.num_key_value_heads > 0
                 && config
@@ -294,6 +300,7 @@ impl DFlashConfig {
             num_target_layers: raw.num_target_layers,
             head_dim: raw.head_dim,
             vocab_size: raw.vocab_size,
+            selection_vocab: raw.vocab_size,
             rms_norm_eps: raw.rms_norm_eps,
             rope_theta,
             max_position_embeddings: raw.max_position_embeddings,
@@ -323,7 +330,7 @@ impl DFlashConfig {
         self.anchor_first
     }
 
-    pub(crate) fn validate_for_target(&self, target: &Config) -> Result<()> {
+    pub(crate) fn validate_for_target(&mut self, target: &Config) -> Result<()> {
         anyhow::ensure!(
             self.hidden_size == target.hidden_size,
             "DFlash hidden_size {} does not match target {}",
@@ -402,6 +409,7 @@ impl DFlashConfig {
                 self.markov_head_type
             );
         }
+        self.selection_vocab = target.selection_vocab;
         Ok(())
     }
 }
@@ -459,6 +467,84 @@ impl Eagle3Config {
     }
 }
 
+#[derive(Deserialize)]
+#[allow(dead_code, clippy::struct_excessive_bools)]
+struct AddedTokenConfig {
+    #[serde(default)]
+    id: Option<u32>,
+    content: String,
+    #[serde(default)]
+    single_word: bool,
+    #[serde(default)]
+    lstrip: bool,
+    #[serde(default)]
+    rstrip: bool,
+    #[serde(default)]
+    normalized: bool,
+    #[serde(default)]
+    special: bool,
+}
+
+#[derive(Deserialize)]
+struct TokenizerJsonIds {
+    model: TokenizerModelIds,
+    #[serde(default)]
+    added_tokens: Vec<AddedTokenConfig>,
+}
+
+#[derive(Deserialize)]
+struct TokenizerModelIds {
+    vocab: std::collections::HashMap<String, u32>,
+}
+
+#[derive(Deserialize)]
+struct TokenizerConfigIds {
+    #[serde(default)]
+    added_tokens_decoder: std::collections::HashMap<String, AddedTokenConfig>,
+}
+
+/// Width of the frontend-decodable id space, mirroring the pinned frontend's
+/// three-source merge: `tokenizer.json` model vocab + added tokens, then
+/// `tokenizer_config.json`'s added-token decoder. A row-range output bound can
+/// only represent a dense prefix, so sparse id spaces fail model loading.
+pub(crate) fn tokenizer_effective_vocab(model_path: &str) -> Result<usize> {
+    let path = format!("{model_path}/tokenizer.json");
+    let content =
+        fs::read_to_string(&path).map_err(|e| anyhow::anyhow!("cannot read {path}: {e}"))?;
+    let tokenizer: TokenizerJsonIds =
+        serde_json::from_str(&content).map_err(|e| anyhow::anyhow!("cannot parse {path}: {e}"))?;
+    anyhow::ensure!(
+        !tokenizer.model.vocab.is_empty(),
+        "{path} model.vocab is empty"
+    );
+    let mut ids: HashSet<u32> = tokenizer.model.vocab.into_values().collect();
+    ids.extend(tokenizer.added_tokens.iter().filter_map(|token| token.id));
+
+    let config_path = format!("{model_path}/tokenizer_config.json");
+    if let Ok(text) = fs::read_to_string(&config_path) {
+        match serde_json::from_str::<TokenizerConfigIds>(&text) {
+            Ok(config) => ids.extend(
+                config
+                    .added_tokens_decoder
+                    .keys()
+                    .filter_map(|key| key.parse::<u32>().ok()),
+            ),
+            Err(error) => warn!(
+                "cannot parse {config_path}: {error}; skipping its added tokens like the frontend does"
+            ),
+        }
+    }
+
+    let width = ids.len();
+    let max_id = *ids.iter().max().expect("vocab checked non-empty") as usize;
+    anyhow::ensure!(
+        max_id + 1 == width,
+        "tokenizer id space is not dense (max id {max_id}, {width} distinct ids); \
+         a row-range selection bound cannot mask holes"
+    );
+    Ok(width)
+}
+
 impl TensorParallelConfig {
     pub(crate) fn validate_for(self, config: &Config) -> Result<()> {
         if self.world_size == 0 {
@@ -502,5 +588,50 @@ impl TensorParallelConfig {
 
     pub(crate) fn is_sharded(self) -> bool {
         self.world_size > 1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn effective_vocab_merges_all_frontend_id_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let tokenizer = r#"{
+  "model": { "vocab": { "a": 0, "b": 1, "c": 2 } },
+  "added_tokens": [ { "id": 3, "content": "<x>" } ]
+}"#;
+        std::fs::write(dir.path().join("tokenizer.json"), tokenizer).unwrap();
+        let config = r#"{ "added_tokens_decoder": { "4": { "content": "<z>" }, "5": { "content": "<w>" }, "x": { "content": "<bad-key>" } } }"#;
+        std::fs::write(dir.path().join("tokenizer_config.json"), config).unwrap();
+
+        assert_eq!(
+            super::tokenizer_effective_vocab(dir.path().to_str().unwrap()).unwrap(),
+            6
+        );
+    }
+
+    #[test]
+    fn effective_vocab_rejects_sparse_id_spaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let tokenizer = r#"{ "model": { "vocab": { "a": 0, "b": 1 } } }"#;
+        std::fs::write(dir.path().join("tokenizer.json"), tokenizer).unwrap();
+        let config = r#"{ "added_tokens_decoder": { "5": { "content": "<z>" } } }"#;
+        std::fs::write(dir.path().join("tokenizer_config.json"), config).unwrap();
+
+        assert!(super::tokenizer_effective_vocab(dir.path().to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn invalid_decoder_entry_drops_all_decoder_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let tokenizer = r#"{ "model": { "vocab": { "a": 0, "b": 1 } } }"#;
+        std::fs::write(dir.path().join("tokenizer.json"), tokenizer).unwrap();
+        let config = r#"{ "added_tokens_decoder": { "2": { "content": "<z>" }, "3": { "content": "<w>", "special": "not-a-bool" } } }"#;
+        std::fs::write(dir.path().join("tokenizer_config.json"), config).unwrap();
+
+        assert_eq!(
+            super::tokenizer_effective_vocab(dir.path().to_str().unwrap()).unwrap(),
+            2
+        );
     }
 }

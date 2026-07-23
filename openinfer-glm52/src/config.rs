@@ -1,5 +1,8 @@
 //! GLM5.2 constants and config probing.
 
+use std::collections::HashSet;
+use std::path::Path;
+
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
@@ -7,7 +10,13 @@ use anyhow::ensure;
 use serde_json::Value;
 
 pub const GLM52_HIDDEN: usize = 6144;
+/// Physical checkpoint width. The embedding keeps every row because DSpark's
+/// internal mask token is the first row beyond the frontend token space.
 pub const GLM52_VOCAB: usize = 154_880;
+/// Dense tokenizer prefix that may be emitted by target or draft sampling.
+/// The official tokenizer defines ids 0..=154855; checkpoint rows 154856..154879
+/// are not frontend-decodable.
+pub(crate) const GLM52_SELECTION_VOCAB: usize = 154_856;
 pub const GLM52_LAYERS: usize = 78;
 pub const GLM52_DENSE_LAYERS: usize = 3;
 /// The checkpoint's `max_position_embeddings` — `probe_config_json` pins the
@@ -63,6 +72,76 @@ pub(crate) fn glm52_layer_has_full_indexer(layer: usize) -> bool {
     layer
         .saturating_sub(GLM52_INDEX_SKIP_TOPK_OFFSET - 1)
         .is_multiple_of(GLM52_INDEX_TOPK_FREQ)
+}
+
+/// Width of the frontend-decodable id space. This mirrors the Qwen tokenizer
+/// merge: `tokenizer.json` model vocab + added tokens, then
+/// `tokenizer_config.json`'s added-token decoder. The model uses a compile-time
+/// output width for captured graphs, so startup validates the supplied
+/// tokenizer against [`GLM52_SELECTION_VOCAB`] instead of silently accepting
+/// a different token space.
+pub(crate) fn tokenizer_effective_vocab(model_path: &Path) -> Result<usize> {
+    let path = model_path.join("tokenizer.json");
+    let content = std::fs::read_to_string(&path)
+        .map_err(|err| anyhow::anyhow!("read {}: {err}", path.display()))?;
+    let tokenizer: Value = serde_json::from_str(&content)
+        .map_err(|err| anyhow::anyhow!("parse {}: {err}", path.display()))?;
+
+    let config_path = model_path.join("tokenizer_config.json");
+    let tokenizer_config = std::fs::read_to_string(&config_path).ok().and_then(|text| {
+        match serde_json::from_str::<Value>(&text) {
+            Ok(config) => Some(config),
+            Err(err) => {
+                log::warn!(
+                    "cannot parse {}: {err}; skipping its added tokens like the frontend does",
+                    config_path.display()
+                );
+                None
+            }
+        }
+    });
+    tokenizer_effective_vocab_from_json(&tokenizer, tokenizer_config.as_ref())
+}
+
+fn tokenizer_effective_vocab_from_json(
+    tokenizer: &Value,
+    tokenizer_config: Option<&Value>,
+) -> Result<usize> {
+    let vocab = tokenizer
+        .pointer("/model/vocab")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("tokenizer.json model.vocab must be an object"))?;
+    ensure!(!vocab.is_empty(), "tokenizer.json model.vocab is empty");
+    let mut ids = HashSet::with_capacity(vocab.len());
+    for (token, id) in vocab {
+        let id = id
+            .as_u64()
+            .with_context(|| format!("tokenizer model.vocab id for `{token}` is not unsigned"))?;
+        ids.insert(u32::try_from(id).context("tokenizer model.vocab id exceeds u32")?);
+    }
+    if let Some(added) = tokenizer.get("added_tokens").and_then(Value::as_array) {
+        for token in added {
+            let Some(id) = token.get("id").and_then(Value::as_u64) else {
+                continue;
+            };
+            ids.insert(u32::try_from(id).context("tokenizer added-token id exceeds u32")?);
+        }
+    }
+    if let Some(decoder) = tokenizer_config
+        .and_then(|config| config.get("added_tokens_decoder"))
+        .and_then(Value::as_object)
+    {
+        ids.extend(decoder.keys().filter_map(|key| key.parse::<u32>().ok()));
+    }
+
+    let width = ids.len();
+    let max_id = *ids.iter().max().expect("vocab checked non-empty") as usize;
+    ensure!(
+        max_id + 1 == width,
+        "tokenizer id space is not dense (max id {max_id}, {width} distinct ids); a row-range \
+         selection bound cannot mask holes"
+    );
+    Ok(width)
 }
 
 pub fn probe_config_json(json: &Value) -> Result<()> {
@@ -300,4 +379,36 @@ fn ensure_float_close(actual: f64, expected: f64, tolerance: f64, label: &str) -
         "{label} mismatch: got {actual}, expected {expected}"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tokenizer_effective_vocab_from_json;
+
+    #[test]
+    fn effective_vocab_merges_all_frontend_id_sources() {
+        let tokenizer = serde_json::json!({
+            "model": { "vocab": { "a": 0, "b": 1, "c": 2 } },
+            "added_tokens": [{ "id": 3, "content": "<x>" }]
+        });
+        let config = serde_json::json!({
+            "added_tokens_decoder": {
+                "4": { "content": "<y>" },
+                "5": { "content": "<z>" },
+                "bad": { "content": "<ignored>" }
+            }
+        });
+        assert_eq!(
+            tokenizer_effective_vocab_from_json(&tokenizer, Some(&config)).unwrap(),
+            6
+        );
+    }
+
+    #[test]
+    fn effective_vocab_rejects_sparse_id_spaces() {
+        let tokenizer = serde_json::json!({
+            "model": { "vocab": { "a": 0, "b": 2 } }
+        });
+        assert!(tokenizer_effective_vocab_from_json(&tokenizer, None).is_err());
+    }
 }

@@ -32,7 +32,7 @@ use openinfer_kernels::tensor::DeviceContext;
 
 use crate::config::GLM52_DENSE_INTERMEDIATE;
 use crate::config::GLM52_HIDDEN;
-use crate::config::GLM52_VOCAB;
+use crate::config::GLM52_SELECTION_VOCAB;
 use crate::dspark::GLM52_DSPARK_CONTEXT_DIM;
 use crate::fp8::Glm52MlpScratch;
 use crate::indexer::Glm52IndexerScratch;
@@ -69,7 +69,7 @@ pub(crate) struct Glm52DecodeScratch {
     /// copy nodes exist.
     pub(crate) captured: Option<Rows<GLM52_DSPARK_CONTEXT_DIM>>,
     pub(crate) final_normed: Rows<GLM52_HIDDEN>,
-    pub(crate) logits: Rows<GLM52_VOCAB>,
+    pub(crate) logits: Rows<GLM52_SELECTION_VOCAB>,
     /// Device greedy argmax outputs: each row's top logit bf16 value (for the
     /// crash-early non-finite guard) and its index — the step's per-row
     /// 6-byte D2H egress. The two-stage argmax stages per-4096-tile partials
@@ -138,12 +138,12 @@ impl Glm52DecodeScratch {
                 .transpose()?,
             final_normed: Rows::zeros(ctx, tokens)?,
             logits: Rows::zeros(ctx, tokens)?,
-            argmax_partial_values: ctx
-                .stream
-                .alloc_zeros::<f32>(argmax_batch_bf16_split_partials_len(tokens, GLM52_VOCAB))?,
-            argmax_partial_indices: ctx
-                .stream
-                .alloc_zeros::<i32>(argmax_batch_bf16_split_partials_len(tokens, GLM52_VOCAB))?,
+            argmax_partial_values: ctx.stream.alloc_zeros::<f32>(
+                argmax_batch_bf16_split_partials_len(tokens, GLM52_SELECTION_VOCAB),
+            )?,
+            argmax_partial_indices: ctx.stream.alloc_zeros::<i32>(
+                argmax_batch_bf16_split_partials_len(tokens, GLM52_SELECTION_VOCAB),
+            )?,
             argmax_values: ctx.stream.alloc_zeros::<bf16>(tokens)?,
             argmax_indices: ctx.stream.alloc_zeros::<i32>(tokens)?,
         })

@@ -30,6 +30,7 @@ use crate::bookend::glm52_embed_into;
 use crate::bookend::glm52_final_norm_into;
 use crate::bookend::glm52_lm_head_into;
 use crate::config::GLM52_HIDDEN;
+use crate::config::GLM52_SELECTION_VOCAB;
 use crate::config::GLM52_VOCAB;
 use crate::rows::Rows;
 
@@ -59,9 +60,13 @@ fn glm52_lm_head(
     ctx: &DeviceContext,
     normed: &Rows<GLM52_HIDDEN>,
     lm_head: &DeviceMatrix,
-) -> Result<Rows<GLM52_VOCAB>> {
+) -> Result<Rows<GLM52_SELECTION_VOCAB>> {
     let mut out = Rows::zeros(ctx, normed.tokens())?;
-    glm52_lm_head_into(ctx, normed, lm_head, &mut out)?;
+    let rows = glm52_lm_head_into(ctx, normed, lm_head, &mut out)?;
+    ensure!(
+        rows == GLM52_SELECTION_VOCAB,
+        "bookend oracle expected the full selectable logits prefix"
+    );
     Ok(out)
 }
 
@@ -248,7 +253,7 @@ fn bookend_oracle_gate() -> Result<()> {
 
     // ---- final norm + lm_head: probes + exact argmax ----
     ensure!(ORACLE_ARGMAX.len() == ORACLE_CTX, "argmax length mismatch");
-    let mut logits_all: Vec<f32> = Vec::with_capacity(ORACLE_CTX * GLM52_VOCAB);
+    let mut logits_all: Vec<f32> = Vec::with_capacity(ORACLE_CTX * GLM52_SELECTION_VOCAB);
     for position in 0..ORACLE_CTX {
         let mut hidden = Rows::<GLM52_HIDDEN>::zeros(&ctx, 1)?;
         ctx.stream.memcpy_htod(
@@ -281,17 +286,25 @@ fn bookend_oracle_gate() -> Result<()> {
     let tol = ORACLE_LOGITS_REL_TOL * ORACLE_LOGITS_RMS;
     let failures: Vec<_> = ORACLE_LOGITS_PROBES
         .iter()
-        .filter(|&&(idx, expected)| (logits_all[idx] - expected).abs() > tol)
+        .filter(|&&(checkpoint_idx, expected)| {
+            let row = checkpoint_idx / GLM52_VOCAB;
+            let token = checkpoint_idx % GLM52_VOCAB;
+            token >= GLM52_SELECTION_VOCAB
+                || (logits_all[row * GLM52_SELECTION_VOCAB + token] - expected).abs() > tol
+        })
         .collect();
     println!(
         "bookend logits: {}/{} probes within tol={tol:.6e}",
         ORACLE_LOGITS_PROBES.len() - failures.len(),
         ORACLE_LOGITS_PROBES.len()
     );
-    for &&(idx, expected) in failures.iter().take(10) {
+    for &&(checkpoint_idx, expected) in failures.iter().take(10) {
+        let row = checkpoint_idx / GLM52_VOCAB;
+        let token = checkpoint_idx % GLM52_VOCAB;
+        let actual = (token < GLM52_SELECTION_VOCAB)
+            .then(|| logits_all[row * GLM52_SELECTION_VOCAB + token]);
         println!(
-            "  probe[{idx}]: oracle {expected:.6} vs engine {:.6}",
-            logits_all[idx]
+            "  checkpoint probe[{checkpoint_idx}] token {token}: oracle {expected:.6} vs engine {actual:?}"
         );
     }
     ensure!(

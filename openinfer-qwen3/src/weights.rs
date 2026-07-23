@@ -27,6 +27,7 @@ use openinfer_kv_cache::KvBuffer;
 
 use super::config::Config;
 use super::config::TensorParallelConfig;
+use super::config::tokenizer_effective_vocab;
 use crate::batch_decode_buffers::BatchDecodeBuffers;
 use crate::lora::DeviceLoraAdapter;
 use crate::lora::DeviceLoraLayer;
@@ -391,7 +392,21 @@ impl Qwen3Model {
         debug!("Initializing GPU device {}", runtime.device_ordinal);
         let ctx = DeviceContext::new_with_device(runtime.device_ordinal)?;
 
-        let config = Config::from_file(model_path)?;
+        let mut config = Config::from_file(model_path)?;
+        let effective_vocab = tokenizer_effective_vocab(model_path)?;
+        anyhow::ensure!(
+            effective_vocab <= config.vocab_size,
+            "tokenizer defines ids up to {} but checkpoint vocab_size is {}",
+            effective_vocab - 1,
+            config.vocab_size,
+        );
+        config.selection_vocab = effective_vocab;
+        if effective_vocab < config.vocab_size {
+            info!(
+                "output projection: selection bounded to decodable vocab {} (checkpoint pads to {})",
+                effective_vocab, config.vocab_size
+            );
+        }
         let tensor_parallel = runtime.tensor_parallel.unwrap_or_default();
         tensor_parallel.validate_for(&config)?;
 

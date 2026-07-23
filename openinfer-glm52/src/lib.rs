@@ -71,6 +71,8 @@ use weights::Glm52RankLoadBundle;
 use weights::Glm52WeightManifest;
 
 use crate::config::GLM52_MAX_CONTEXT;
+use crate::config::GLM52_SELECTION_VOCAB;
+use crate::config::tokenizer_effective_vocab;
 use crate::model::GLM52_MODEL_LEN_ALIGN;
 use crate::model::glm52_arena_bytes;
 use crate::model::glm52_pool_blocks;
@@ -1113,6 +1115,12 @@ fn validate_startup(
     let json: serde_json::Value = serde_json::from_str(&content)
         .map_err(|err| anyhow::anyhow!("parse {}: {err}", config_path.display()))?;
     probe_config_json(&json)?;
+    let tokenizer_vocab = tokenizer_effective_vocab(model_path)?;
+    ensure!(
+        tokenizer_vocab == GLM52_SELECTION_VOCAB,
+        "GLM5.2 tokenizer defines {tokenizer_vocab} selectable ids, this build expects \
+         {GLM52_SELECTION_VOCAB} for its captured output buffers"
+    );
 
     let expected_devices = moe_topo.device_count();
     let remote_ranks: usize = options.rank_hosts.iter().map(|host| host.ranks).sum();

@@ -252,7 +252,7 @@ impl DFlashBatchScratch {
             up_out: HiddenStates::zeros(ctx, inter_dim, batch_rows)?,
             act_out: HiddenStates::zeros(ctx, inter_dim, batch_rows)?,
             logits_normed: HiddenStates::zeros(ctx, hidden_size, batch_rows)?,
-            logits: HiddenStates::zeros(ctx, config.vocab_size, batch_rows)?,
+            logits: HiddenStates::zeros(ctx, config.selection_vocab, batch_rows)?,
             tail_input: HiddenStates::zeros(ctx, hidden_size, tail_capacity)?,
             k_tail: HiddenStates::zeros(ctx, kv_dim, tail_capacity)?,
             v_tail: HiddenStates::zeros(ctx, kv_dim, tail_capacity)?,
@@ -757,7 +757,7 @@ impl DFlashDraftModel {
         for (i, state) in states.iter_mut().enumerate() {
             state.committed_len += context_lens[i];
         }
-        self.compute_logits_with_target_head_into(target, scratch);
+        self.compute_logits_with_target_head_into(target, scratch)?;
         Ok(&scratch.logits)
     }
 
@@ -823,7 +823,7 @@ impl DFlashDraftModel {
         &self,
         target: &Qwen3Model,
         scratch: &mut DFlashBatchScratch,
-    ) {
+    ) -> Result<()> {
         let ctx = target.device_ctx();
         ops::rms_norm_batch_into(
             ctx,
@@ -832,12 +832,14 @@ impl DFlashDraftModel {
             self.config.rms_norm_eps,
             &mut scratch.logits_normed,
         );
-        ops::gemm_into(
+        ops::gemm_rows_into_checked(
             ctx,
             target.output_projection(),
+            0,
+            self.config.selection_vocab,
             &scratch.logits_normed,
             &mut scratch.logits,
-        );
+        )
     }
 }
 
@@ -846,7 +848,7 @@ pub(crate) fn validate_dflash_config_for_target(
     dflash_path: &str,
     target_config: &crate::config::Config,
 ) -> Result<DFlashConfig> {
-    let config = DFlashConfig::from_file(dflash_path)?;
+    let mut config = DFlashConfig::from_file(dflash_path)?;
     config.validate_for_target(target_config)?;
     Ok(config)
 }

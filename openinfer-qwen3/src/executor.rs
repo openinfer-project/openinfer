@@ -1357,6 +1357,7 @@ impl Qwen3Executor {
                 Some(path) => {
                     let reservation = crate::dflash::DFlashMemoryReservation::from_path(
                         path,
+                        model.config().selection_vocab,
                         *BATCH_BUCKETS.last().unwrap(),
                     )?;
                     memory_options.kv_cache_memory_margin_bytes += reservation.fixed_bytes;

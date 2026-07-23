@@ -14,13 +14,12 @@ use openinfer_kernels::tensor::DeviceContext;
 use openinfer_kernels::tensor::DeviceMatrix;
 use openinfer_kernels::tensor::DeviceVec;
 
-use super::GLM52_MAX_BATCH_PER_RANK;
-use super::VOCAB_AR_SLOT;
 use crate::bookend::glm52_embed_into;
 use crate::bookend::glm52_final_norm_into;
 use crate::bookend::glm52_lm_head_into;
 use crate::config::GLM52_HIDDEN;
 use crate::config::GLM52_RMS_EPS;
+use crate::config::GLM52_SELECTION_VOCAB;
 use crate::config::GLM52_VOCAB;
 use crate::dense::glm52_dense_mlp_forward_into;
 use crate::layer::Glm52DecodeStep;
@@ -200,7 +199,7 @@ pub(super) fn run_step_body(
     }
 
     glm52_final_norm_into(ctx, &s.hidden, final_norm, &mut s.final_normed)?;
-    glm52_lm_head_into(ctx, &s.final_normed, lm_head, &mut s.logits)?;
+    let logit_rows = glm52_lm_head_into(ctx, &s.final_normed, lm_head, &mut s.logits)?;
     // Device greedy argmax per row (same semantics as a host scan: lowest
     // index wins ties, NaN never wins) — the step's egress shrinks from the
     // full vocab rows to 6 bytes per row, and the kernel chain ends on-device
@@ -212,7 +211,7 @@ pub(super) fn run_step_body(
         ctx,
         s.logits.data(),
         batch,
-        lm_head.rows,
+        logit_rows,
         &mut s.argmax_partial_values,
         &mut s.argmax_partial_indices,
         &mut s.argmax_values,
@@ -221,10 +220,10 @@ pub(super) fn run_step_body(
 
     if let Some(rank) = tp {
         ensure!(
-            lm_head.rows * rank.state.ranks() == GLM52_VOCAB
-                && vocab_start == rank.state.rank() * lm_head.rows,
+            logit_rows * rank.state.ranks() == GLM52_SELECTION_VOCAB
+                && vocab_start == rank.state.rank() * logit_rows,
             "GLM5.2 vocab shard [{vocab_start}..{}) does not match TP rank {}/{}",
-            vocab_start + lm_head.rows,
+            vocab_start + logit_rows,
             rank.state.rank(),
             rank.state.ranks()
         );
@@ -254,7 +253,7 @@ pub(super) fn run_step_body(
         )?;
     } else {
         ensure!(
-            lm_head.rows == GLM52_VOCAB && vocab_start == 0,
+            lm_head.rows == GLM52_VOCAB && logit_rows == GLM52_SELECTION_VOCAB && vocab_start == 0,
             "GLM5.2 non-TP decode received a sharded vocabulary head"
         );
     }

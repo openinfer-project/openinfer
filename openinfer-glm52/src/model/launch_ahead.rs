@@ -10,7 +10,7 @@ use openinfer_kernels::ops::glm52_decode_feed_launch;
 use openinfer_kernels::tensor::DeviceContext;
 
 use super::GLM52_MAX_BATCH_PER_RANK;
-use super::GLM52_VOCAB;
+use super::GLM52_SELECTION_VOCAB;
 use super::Glm52RankModel;
 use super::Glm52StepShape;
 
@@ -156,8 +156,8 @@ impl Glm52RankModel {
                 "GLM5.2 slot {slot} greedy argmax found no finite logit (top = {top_value})"
             );
             ensure!(
-                (0..GLM52_VOCAB as i32).contains(&top_index),
-                "GLM5.2 slot {slot} greedy argmax index {top_index} outside the vocab"
+                (0..GLM52_SELECTION_VOCAB as i32).contains(&top_index),
+                "GLM5.2 slot {slot} greedy argmax index {top_index} outside the selectable vocab"
             );
         }
 

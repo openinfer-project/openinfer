@@ -27,8 +27,13 @@ pub(crate) struct DFlashMemoryReservation {
 }
 
 impl DFlashMemoryReservation {
-    pub(crate) fn from_path(draft_path: &str, max_decode_batch_size: usize) -> Result<Self> {
-        let config = DFlashConfig::from_file(draft_path)?;
+    pub(crate) fn from_path(
+        draft_path: &str,
+        selection_vocab: usize,
+        max_decode_batch_size: usize,
+    ) -> Result<Self> {
+        let mut config = DFlashConfig::from_file(draft_path)?;
+        config.selection_vocab = selection_vocab;
         Ok(Self::from_config(&config, max_decode_batch_size))
     }
 
@@ -55,7 +60,7 @@ impl DFlashMemoryReservation {
         // Same total magnitude as the old per-request scratch summed over the
         // batch, but now one contiguous allocation.
         let dense_scratch_per_block_row =
-            BF16 * (config.vocab_size + 5 * hidden + 2 * q_dim + 3 * inter);
+            BF16 * (config.selection_vocab + 5 * hidden + 2 * q_dim + 3 * inter);
         let scratch_total = dense_scratch_per_block_row * config.block_size * max_decode_batch_size;
 
         // Draft weights (5 transformer layers + the context projection), +10% slack

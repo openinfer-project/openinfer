@@ -6,9 +6,9 @@
 
 use openinfer_sample::SamplingParams;
 
-use super::PAGE;
 use super::RankSlots;
 use super::slot::Glm52SlotState;
+use crate::config::GLM52_SELECTION_VOCAB;
 use crate::config::GLM52_VOCAB;
 use crate::model::GLM52_DECODE_BUCKETS;
 use crate::model::GLM52_MAX_BATCH_PER_RANK;
@@ -182,7 +182,7 @@ pub(super) fn launch_ahead_flags(
 /// The SAME predicate gates lease-granting and sampling-row collection, which
 /// is what keeps "sampled row never rides a launch-ahead step" structural.
 fn takes_argmax(params: &SamplingParams) -> bool {
-    openinfer_sample::effectively_greedy(params, GLM52_VOCAB)
+    openinfer_sample::effectively_greedy(params, GLM52_SELECTION_VOCAB)
 }
 
 /// Whether one active request's KV position permits leasing the next step: a
@@ -345,7 +345,7 @@ mod tests {
         // the argmax token) takes the argmax path, so it may ride the lease.
         let tiny_top_p = decoding_fleet(openinfer_sample::SamplingParams {
             temperature: 0.7,
-            top_p: 0.5 / GLM52_VOCAB as f32,
+            top_p: 0.5 / GLM52_SELECTION_VOCAB as f32,
             ..Default::default()
         });
         assert!(
@@ -437,7 +437,7 @@ mod tests {
             req: request(
                 vec![10],
                 openinfer_sample::SamplingParams {
-                    top_p: 0.5 / GLM52_VOCAB as f32,
+                    top_p: 0.5 / GLM52_SELECTION_VOCAB as f32,
                     ..sampled(0.8)
                 },
                 8,

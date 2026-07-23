@@ -9,6 +9,7 @@
 //! their row count and width by construction.
 
 use anyhow::Result;
+use anyhow::ensure;
 use cudarc::driver::CudaSlice;
 use openinfer_kernels::ops::embedding_rows_into;
 use openinfer_kernels::ops::gemm_strided_batched_bf16;
@@ -19,6 +20,7 @@ use openinfer_kernels::tensor::DeviceVec;
 
 use crate::config::GLM52_HIDDEN;
 use crate::config::GLM52_RMS_EPS;
+use crate::config::GLM52_SELECTION_VOCAB;
 use crate::config::GLM52_VOCAB;
 use crate::rows::Rows;
 
@@ -55,23 +57,34 @@ pub(crate) fn glm52_final_norm_into(
     )
 }
 
-/// lm_head projection over the buffers' `tokens()` rows: `lm_head @ normed ->
-/// [T, lm_head.rows]` compact logits. EP8 passes the full-vocabulary head;
-/// attention-TP decode passes this rank's contiguous vocabulary shard. One
+/// lm_head projection over the buffers' `tokens()` rows. EP passes the
+/// full checkpoint head but emits only the tokenizer-selectable prefix;
+/// attention-TP decode passes this rank's already-trimmed contiguous shard. One
 /// cuBLAS GEMM puts tokens on the n dimension, so the col-major
-/// `[lm_head.rows, T]` output is the compact row-major layout argmax consumes.
+/// `[logit_rows, T]` output is the compact row-major layout argmax consumes.
 pub(crate) fn glm52_lm_head_into(
     ctx: &DeviceContext,
     normed: &Rows<GLM52_HIDDEN>,
     lm_head: &DeviceMatrix,
-    out: &mut Rows<GLM52_VOCAB>,
-) -> Result<()> {
+    out: &mut Rows<GLM52_SELECTION_VOCAB>,
+) -> Result<usize> {
     let tokens = out.tokens();
+    let logit_rows = if lm_head.rows == GLM52_VOCAB {
+        GLM52_SELECTION_VOCAB
+    } else {
+        lm_head.rows
+    };
+    ensure!(
+        logit_rows <= GLM52_SELECTION_VOCAB
+            && (lm_head.rows == GLM52_VOCAB || GLM52_SELECTION_VOCAB.is_multiple_of(logit_rows)),
+        "GLM5.2 lm_head rows {} are neither the checkpoint head nor a selectable-vocab shard",
+        lm_head.rows
+    );
     gemm_strided_batched_bf16(
         ctx,
         true,
         false,
-        lm_head.rows,
+        logit_rows,
         tokens,
         GLM52_HIDDEN,
         &lm_head.data,
@@ -81,8 +94,9 @@ pub(crate) fn glm52_lm_head_into(
         GLM52_HIDDEN,
         0,
         out.data_mut(),
-        lm_head.rows,
+        logit_rows,
         0,
         1,
-    )
+    )?;
+    Ok(logit_rows)
 }

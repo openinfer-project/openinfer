@@ -55,6 +55,7 @@ use crate::config::GLM52_INDEX_HEAD_DIM;
 use crate::config::GLM52_INDEX_TOPK;
 use crate::config::GLM52_LAYERS;
 use crate::config::GLM52_ROPE_HALF;
+use crate::config::GLM52_SELECTION_VOCAB;
 use crate::config::GLM52_SM_SCALE;
 use crate::config::GLM52_VOCAB;
 use crate::config::glm52_layer_has_full_indexer;
@@ -581,11 +582,11 @@ impl Glm52RankModel {
         let (decode_lm_head, decode_vocab_start) = if let Some(rank) = attn_shard {
             let ranks = moe_topo.device_count();
             ensure!(
-                rank < ranks && GLM52_VOCAB.is_multiple_of(ranks),
+                rank < ranks && GLM52_SELECTION_VOCAB.is_multiple_of(ranks),
                 "GLM5.2 vocab TP shard {rank}/{ranks} cannot partition {} rows",
-                GLM52_VOCAB
+                GLM52_SELECTION_VOCAB
             );
-            let rows = GLM52_VOCAB / ranks;
+            let rows = GLM52_SELECTION_VOCAB / ranks;
             let start = rank * rows;
             let mut data = ctx.stream.alloc_zeros::<bf16>(rows * GLM52_HIDDEN)?;
             ctx.stream.memcpy_dtod(
@@ -757,7 +758,7 @@ impl Glm52RankModel {
             cos: ctx.stream.alloc_zeros::<bf16>(batch * GLM52_ROPE_HALF)?,
             sin: ctx.stream.alloc_zeros::<bf16>(batch * GLM52_ROPE_HALF)?,
             token_ids: ctx.stream.alloc_zeros::<u32>(batch)?,
-            sampling_scratch: BatchSamplingScratch::new(ctx, batch, GLM52_VOCAB)?,
+            sampling_scratch: BatchSamplingScratch::new(ctx, batch, GLM52_SELECTION_VOCAB)?,
             speculated: None,
             device_positions: [0; GLM52_MAX_BATCH_PER_RANK],
         })
@@ -881,7 +882,7 @@ impl Glm52RankModel {
                 shape.active_rows
             );
             ensure!(
-                !effectively_greedy(&s.params, GLM52_VOCAB),
+                !effectively_greedy(&s.params, GLM52_SELECTION_VOCAB),
                 "GLM5.2 effectively-greedy row {} routed to the sampler (coordinator bug)",
                 s.row
             );
@@ -904,7 +905,7 @@ impl Glm52RankModel {
         }
         let logits = HiddenStatesRef {
             data: bucket.scratch.logits.data(),
-            hidden_dim: GLM52_VOCAB,
+            hidden_dim: GLM52_SELECTION_VOCAB,
             seq_len: shape.bucket,
         };
         let as_row = |s: &crate::runner::Glm52RowSample| BatchSamplingRow {
