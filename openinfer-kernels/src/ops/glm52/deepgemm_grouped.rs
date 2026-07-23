@@ -16,8 +16,8 @@ use half::bf16;
 use crate::ffi;
 use crate::tensor::DeviceContext;
 
-pub const GLM52_DEEPGEMM_GROUPED_W13_KIND: i32 = 1;
-pub const GLM52_DEEPGEMM_GROUPED_W2_KIND: i32 = 2;
+const GLM52_DEEPGEMM_GROUPED_W13_KIND: i32 = 1;
+const GLM52_DEEPGEMM_GROUPED_W2_KIND: i32 = 2;
 /// Per-expert row alignment of the DeepEP recv segment layout (a fixed design
 /// constant shared with the vendored shim).
 pub const GLM52_DEEPGEMM_GROUPED_EXPERT_ALIGNMENT: usize = 64;

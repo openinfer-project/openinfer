@@ -762,6 +762,9 @@ fn serve_connection(stream: TcpStream) -> Result<()> {
             "GLM5.2 rank-host teardown exceeded {deadline:?} (worker stuck in a \
              collective missing peers?); exiting for a clean restart"
         );
+        // EP rank-host watchdog: a stuck collective can never make progress, so
+        // dying here and letting the orchestrator restart the rank is the protocol.
+        #[allow(clippy::exit)]
         std::process::exit(2);
     }
     let _ = teardown.join();

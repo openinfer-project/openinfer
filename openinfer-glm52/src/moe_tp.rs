@@ -64,13 +64,13 @@ const SLICE_I: usize = Glm52TpTopology::Tp8.slice_i();
 /// One pilot layer's TP slice bank: this rank's intermediate rows of all 257
 /// experts, in the layout the cooperative kernel consumes.
 pub(crate) struct Glm52MoeTpSliceBank {
-    pub(crate) tp_ranks: usize,
-    pub(crate) slice_i: usize,
-    pub(crate) slice_rows: usize,
-    pub(crate) w13: CudaSlice<u8>,        // fp8 [257, 512, 6144]
-    pub(crate) w13_scale: CudaSlice<f32>, // f32 [257, 4, 48]
-    pub(crate) w2: CudaSlice<u8>,         // fp8 [257, 6144, 256]
-    pub(crate) w2_scale: CudaSlice<f32>,  // f32 [257, 48, 2]
+    tp_ranks: usize,
+    slice_i: usize,
+    slice_rows: usize,
+    w13: CudaSlice<u8>,        // fp8 [257, 512, 6144]
+    w13_scale: CudaSlice<f32>, // f32 [257, 4, 48]
+    w2: CudaSlice<u8>,         // fp8 [257, 6144, 256]
+    w2_scale: CudaSlice<f32>,  // f32 [257, 48, 2]
 }
 
 /// Slice one expert's checkpoint tensors into the rank-r staging bank.

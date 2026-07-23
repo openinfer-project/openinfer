@@ -97,7 +97,7 @@ fn least_loaded_rank(running: &[usize], pending: &[VecDeque<GenerateRequest>]) -
         .expect("GLM5.2 must expose at least one logical rank")
 }
 
-pub(super) fn reject(req: &GenerateRequest, message: String) {
+fn reject(req: &GenerateRequest, message: String) {
     let prompt_tokens = req.prompt_tokens.len();
     let queued_at_unix_s = req.queued_at_unix_s.unwrap_or_else(unix_now_s);
     let _ = req.token_tx.send(TokenEvent::Scheduled {

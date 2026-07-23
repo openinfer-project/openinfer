@@ -24,7 +24,7 @@ pub struct FixtureTensor {
 }
 
 impl FixtureTensor {
-    pub fn filled(dtype: Dtype, shape: Vec<usize>, value: f32) -> Self {
+    pub(crate) fn filled(dtype: Dtype, shape: Vec<usize>, value: f32) -> Self {
         let elems = shape.iter().product::<usize>();
         let data = match dtype {
             Dtype::BF16 => bf16::from_f32(value).to_bits().to_le_bytes().repeat(elems),

@@ -108,23 +108,23 @@ pub struct Qwen35Model {
     pub(super) config: Config35,
     pub(super) tensor_parallel: TensorParallelConfig,
     pub(super) embed_tokens: DeviceMatrix,
-    pub(super) lm_head: Option<DeviceMatrix>,
+    lm_head: Option<DeviceMatrix>,
     pub(super) layers: Vec<TransformerBlock35>,
     pub(super) norm: DeviceVec,
     // Partial RoPE cache: [max_seq_len * rotary_dim]
     pub(super) cos_cache: DeviceVec,
     pub(super) sin_cache: DeviceVec,
     /// Shared paged KV pool for full-attention layers.
-    pub(super) kv_pool: openinfer_core::kv_pool::KvPool,
+    kv_pool: openinfer_core::kv_pool::KvPool,
     /// Decode-slot count the recurrent-state reserve was sized for.
     /// Physical decode capacity actually allocated (recurrent-state slots,
     /// decode buffers, CUDA-graph slots). Always a `BATCH_BUCKETS` value.
-    pub(super) reserved_decode_slots: usize,
+    reserved_decode_slots: usize,
     /// Scheduler concurrent-request cap requested at load (`--max-batch`). May
     /// sit below `reserved_decode_slots` when the request is not a bucket
     /// (e.g. `--max-batch 5` allocates bucket 8 but admits at most 5). See #470.
     pub(super) decode_admission_batch: usize,
-    pub(super) tp_comm: Option<Comm>,
+    tp_comm: Option<Comm>,
 }
 
 // SAFETY: A Qwen3.5 model instance is bound to one CUDA device and driven from
@@ -159,7 +159,7 @@ impl Qwen35Model {
     /// It need not be a decode bucket: the physical decode capacity is rounded
     /// up to the next `BATCH_BUCKETS` value while the scheduler still admits at
     /// most `max_batch` (see #470 and `decode_admission_batch`).
-    pub fn from_safetensors(
+    pub(crate) fn from_safetensors(
         model_path: &str,
         device_ordinal: usize,
         max_batch: usize,
@@ -588,7 +588,7 @@ impl Qwen35Model {
         self.all_reduce_hidden_untraced(hidden)
     }
 
-    pub(crate) fn all_reduce_hidden_untraced(&self, hidden: &mut HiddenStates) -> Result<()> {
+    fn all_reduce_hidden_untraced(&self, hidden: &mut HiddenStates) -> Result<()> {
         if let Some(comm) = &self.tp_comm {
             comm.all_reduce_in_place(&mut hidden.data, &ReduceOp::Sum)
                 .map_err(|e| anyhow::anyhow!("Qwen3.5 NCCL all-reduce failed: {e:?}"))?;
@@ -838,10 +838,10 @@ mod tests {
             hidden_size: 2560,
             intermediate_size: 9216,
             num_hidden_layers: 32,
-            vocab_size: 248320,
-            selection_vocab: 248320,
+            vocab_size: 248_320,
+            selection_vocab: 248_320,
             rms_norm_eps: 1e-6,
-            eos_token_id: 151645,
+            eos_token_id: 151_645,
             num_attention_heads: 16,
             num_key_value_heads: 4,
             head_dim: 256,

@@ -377,7 +377,7 @@ impl KimiK2ParallelShape {
     }
 
     #[must_use]
-    pub(crate) fn new(tp_world: usize, dp_world: usize) -> Self {
+    fn new(tp_world: usize, dp_world: usize) -> Self {
         let ep_world = tp_world * dp_world;
         Self {
             tp_world,

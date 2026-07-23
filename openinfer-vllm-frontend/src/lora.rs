@@ -215,7 +215,7 @@ async fn unload_lora_adapter(
     }
 }
 
-pub(crate) fn bad_request(message: impl Into<String>) -> Response {
+fn bad_request(message: impl Into<String>) -> Response {
     (
         StatusCode::BAD_REQUEST,
         Json(ErrorBody {

@@ -94,14 +94,14 @@ impl LinearStatePointerTables {
             for slot in recurrent_states.iter_mut().take(batch_size) {
                 let state_ptr = {
                     let (ptr, _guard) = slot.layers[layer_idx].state.device_ptr_mut(&ctx.stream);
-                    ptr as u64
+                    ptr
                 };
                 let conv_ptr = {
                     let (ptr, _guard) = slot.layers[layer_idx]
                         .conv_state
                         .data
                         .device_ptr_mut(&ctx.stream);
-                    ptr as u64
+                    ptr
                 };
                 state_ptrs.push(state_ptr);
                 conv_state_ptrs.push(conv_ptr);

@@ -541,7 +541,7 @@ impl Qwen35Model {
                         &linear_conv_state_ptrs[linear_idx],
                         padded_bs,
                         bufs,
-                    )?;
+                    );
                     linear_idx += 1;
                 }
             }
@@ -646,10 +646,7 @@ impl Qwen35Model {
                         &linear_conv_state_ptrs[linear_idx],
                         bs,
                         bufs,
-                    )
-                        .with_context(|| {
-                            format!("hybrid decode linear-attn layer_idx={layer_idx}, linear_idx={linear_idx}, bs={bs}")
-                        })?;
+                    );
                     linear_idx += 1;
                 }
             }
@@ -729,7 +726,7 @@ impl Qwen35Model {
         conv_state_ptrs: &CudaSlice<u64>,
         padded_bs: usize,
         bufs: &mut BatchDecodeBuffers35,
-    ) -> Result<()> {
+    ) {
         ops::gemm_into(&self.ctx, &attn.in_proj_qkv, &bufs.normed, &mut bufs.qkv);
         ops::gemm_into(&self.ctx, &attn.in_proj_z, &bufs.normed, &mut bufs.z);
         ops::gemm_into(&self.ctx, &attn.in_proj_b, &bufs.normed, &mut bufs.b_proj);
@@ -775,6 +772,5 @@ impl Qwen35Model {
             &bufs.normed_gated,
             &mut bufs.attn_results,
         );
-        Ok(())
     }
 }

@@ -139,7 +139,7 @@ impl Qwen3Model {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn forward_layer_batch_paged(
+    fn forward_layer_batch_paged(
         &self,
         layer_idx: usize,
         layer: &TransformerBlock,
@@ -379,10 +379,7 @@ impl Qwen3Model {
     /// Used when `echo=true` to return prompt token log-probabilities.
     /// Applies final RMS norm + lm_head projection in a single batched GEMM.
     /// Returns `HiddenStates` with shape `[vocab_size, total_tokens]`.
-    pub(crate) fn compute_all_position_logits(
-        &self,
-        hidden: &HiddenStates,
-    ) -> Result<HiddenStates> {
+    fn compute_all_position_logits(&self, hidden: &HiddenStates) -> Result<HiddenStates> {
         let mut normed = HiddenStates::zeros(&self.ctx, hidden.hidden_dim, hidden.seq_len)?;
         ops::rms_norm_batch_into(
             &self.ctx,

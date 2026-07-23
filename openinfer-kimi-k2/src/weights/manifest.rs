@@ -244,7 +244,7 @@ impl KimiK2WeightManifest {
         Ok(self)
     }
 
-    pub(crate) fn validate(&self) -> Result<()> {
+    fn validate(&self) -> Result<()> {
         ensure!(
             self.layers.len() == KIMI_K2_LAYERS,
             "Kimi manifest expected {KIMI_K2_LAYERS} layers, got {}",

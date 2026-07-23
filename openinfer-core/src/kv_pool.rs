@@ -221,7 +221,8 @@ impl KvState {
     }
 
     /// Reset for a new request: return all pages, zero seq_len.
-    pub fn reset(&mut self) {
+    #[cfg(test)]
+    fn reset(&mut self) {
         self.permit = self
             .pool
             .inner
@@ -242,16 +243,17 @@ pub struct KvDesc<'a> {
 }
 
 impl KvDesc<'_> {
-    pub fn last_page_len(&self) -> usize {
+    pub(crate) fn last_page_len(&self) -> usize {
         self.last_page_len
     }
 
-    pub fn num_pages(&self) -> usize {
+    #[cfg(test)]
+    fn num_pages(&self) -> usize {
         self.pages.len()
     }
 
     /// Page indices for this request (CPU-side).
-    pub fn page_indices(&self) -> &[PageId] {
+    pub(crate) fn page_indices(&self) -> &[PageId] {
         self.pages
     }
 }

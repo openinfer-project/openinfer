@@ -33,7 +33,7 @@ pub(crate) const W2_N: usize = HIDDEN; // 6144
 pub(crate) const W2_K: usize = INTERMEDIATE; // 2048
 
 pub(crate) const HIDDEN_SCALE_COLS: usize = HIDDEN / QUANT_GROUP; // 48
-pub(crate) const W13_SCALE_ROWS: usize = W13_N / QUANT_GROUP; // 32
+const W13_SCALE_ROWS: usize = W13_N / QUANT_GROUP; // 32
 pub(crate) const W2_SCALE_COLS: usize = W2_K / QUANT_GROUP; // 16
 pub(crate) const W2_SCALE_ROWS: usize = W2_N / QUANT_GROUP; // 48
 
@@ -124,7 +124,7 @@ pub(crate) struct Glm52MoeExpertBank {
 }
 
 impl Glm52MoeExpertBank {
-    pub(crate) fn new(
+    fn new(
         n_experts: usize,
         w13_weight: CudaSlice<u8>,
         w13_scale: CudaSlice<f32>,

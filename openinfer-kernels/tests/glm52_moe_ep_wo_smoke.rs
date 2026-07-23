@@ -170,10 +170,10 @@ fn run_chain_case(groups: usize, global_tokens: usize, expert_counts: &[(usize, 
 
     // --- masked mma GEMM (both operand shapes; W2 exercises the per-row
     // route-weight scaling of the f32 accumulator) --------------------------
-    let mut rng = Lcg(0x9e3779b97f4a7c15);
+    let mut rng = Lcg(0x9e37_79b9_7f4a_7c15);
     let mut row_weights = vec![0f32; expanded];
-    for v in row_weights.iter_mut() {
-        *v = (rng.unit_f32() + 1.5) * 0.5; // 0.25..1.25
+    for v in &mut row_weights {
+        *v = rng.unit_f32().midpoint(1.5); // 0.25..1.25
     }
     let row_weights_dev = ctx.stream.clone_htod(&row_weights).expect("rw H2D");
     for kind in [
@@ -199,7 +199,7 @@ fn run_chain_case(groups: usize, global_tokens: usize, expert_counts: &[(usize, 
             }
         }
         let mut act = vec![bf16::ZERO; expanded * k];
-        for v in act.iter_mut() {
+        for v in &mut act {
             *v = bf16::from_f32(rng.unit_f32());
         }
 
@@ -282,7 +282,7 @@ fn run_chain_case(groups: usize, global_tokens: usize, expert_counts: &[(usize, 
     // --- SiLU kernel --------------------------------------------------------
     let inter = 2048usize;
     let mut gate_up = vec![bf16::ZERO; expanded * 2 * inter];
-    for v in gate_up.iter_mut() {
+    for v in &mut gate_up {
         *v = bf16::from_f32(rng.unit_f32() * 2.0);
     }
     let gate_up_dev = ctx.stream.clone_htod(&gate_up).expect("gate_up H2D");

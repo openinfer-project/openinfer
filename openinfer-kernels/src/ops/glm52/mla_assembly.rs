@@ -9,18 +9,18 @@ use half::bf16;
 use crate::ffi;
 use crate::tensor::DeviceContext;
 
-pub const GLM52_MLA_HEADS: usize = 64;
-pub const GLM52_MLA_QK_NOPE: usize = 512;
-pub const GLM52_MLA_ROPE_DIM: usize = 64;
+const GLM52_MLA_HEADS: usize = 64;
+const GLM52_MLA_QK_NOPE: usize = 512;
+const GLM52_MLA_ROPE_DIM: usize = 64;
 /// cos/sin length used by interleave RoPE (rope_dim / 2).
-pub const GLM52_MLA_ROPE_HALF: usize = 32;
-pub const GLM52_MLA_QUERY_DIM: usize = GLM52_MLA_QK_NOPE + GLM52_MLA_ROPE_DIM; // 576
-pub const GLM52_MLA_KV_LORA: usize = 512;
-pub const GLM52_MLA_SCALE_GROUPS: usize = GLM52_MLA_KV_LORA / 128; // 4
+const GLM52_MLA_ROPE_HALF: usize = 32;
+const GLM52_MLA_QUERY_DIM: usize = GLM52_MLA_QK_NOPE + GLM52_MLA_ROPE_DIM; // 576
+const GLM52_MLA_KV_LORA: usize = 512;
+const GLM52_MLA_SCALE_GROUPS: usize = GLM52_MLA_KV_LORA / 128; // 4
 /// fp8_ds_mla token: 512 e4m3 ckv + 4 f32 scales + 64 bf16 rope-key.
 pub const GLM52_MLA_CACHE_BYTES: usize = 656;
 /// Standard E4M3 MLA token used by FlashInfer: 512 ckv + 64 rope-key.
-pub const GLM52_MLA_FLASHINFER_CACHE_BYTES: usize = 576;
+const GLM52_MLA_FLASHINFER_CACHE_BYTES: usize = 576;
 
 /// Assemble the FlashMLA sparse decode query `[GLM52_MLA_HEADS, 576]` =
 /// `[ql_nope(512) | rope(q_pe)(64)]` per head (bs=1 decode). `num_q_heads`

@@ -37,7 +37,7 @@ pub(crate) struct Glm52DsparkSlotState {
     pub(super) context_hidden: HiddenStates,
     /// The drafter's KV capacity ([`Glm52DsparkModel::cache_len`]) — the
     /// pending-context growth cap and the overflow guard bound.
-    pub(super) cache_len: usize,
+    cache_len: usize,
 }
 
 impl Glm52DsparkSlotState {

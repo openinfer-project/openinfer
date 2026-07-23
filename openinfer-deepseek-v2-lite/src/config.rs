@@ -10,7 +10,7 @@ use crate::ep::SUPPORTED_ROUTED_EXPERTS;
 pub(crate) const SUPPORTED_HIDDEN_SIZE: usize = 2048;
 
 #[derive(Clone, Debug, Deserialize)]
-pub struct RopeScaling {
+pub(crate) struct RopeScaling {
     pub beta_fast: usize,
     pub beta_slow: usize,
     pub factor: f32,
@@ -23,42 +23,44 @@ pub struct RopeScaling {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Config {
-    pub model_type: String,
-    pub bos_token_id: u32,
-    pub eos_token_id: u32,
-    pub vocab_size: usize,
-    pub hidden_size: usize,
-    pub intermediate_size: usize,
-    pub moe_intermediate_size: usize,
-    pub num_hidden_layers: usize,
-    pub first_k_dense_replace: usize,
-    pub moe_layer_freq: usize,
-    pub num_attention_heads: usize,
-    pub num_key_value_heads: usize,
-    pub q_lora_rank: Option<usize>,
-    pub kv_lora_rank: usize,
-    pub qk_nope_head_dim: usize,
-    pub qk_rope_head_dim: usize,
-    pub v_head_dim: usize,
-    pub n_routed_experts: usize,
-    pub n_shared_experts: usize,
+    model_type: String,
+    // Part of the HF config.json schema; nothing reads it yet.
+    #[allow(dead_code)]
+    bos_token_id: u32,
+    pub(crate) eos_token_id: u32,
+    pub(crate) vocab_size: usize,
+    pub(crate) hidden_size: usize,
+    pub(crate) intermediate_size: usize,
+    pub(crate) moe_intermediate_size: usize,
+    pub(crate) num_hidden_layers: usize,
+    pub(crate) first_k_dense_replace: usize,
+    moe_layer_freq: usize,
+    pub(crate) num_attention_heads: usize,
+    pub(crate) num_key_value_heads: usize,
+    q_lora_rank: Option<usize>,
+    pub(crate) kv_lora_rank: usize,
+    pub(crate) qk_nope_head_dim: usize,
+    pub(crate) qk_rope_head_dim: usize,
+    pub(crate) v_head_dim: usize,
+    pub(crate) n_routed_experts: usize,
+    n_shared_experts: usize,
     #[serde(rename = "num_experts_per_tok")]
-    pub num_experts_per_token: usize,
-    pub routed_scaling_factor: f32,
-    pub scoring_func: String,
-    pub topk_method: String,
-    pub n_group: usize,
-    pub topk_group: usize,
-    pub norm_topk_prob: bool,
-    pub rms_norm_eps: f32,
-    pub rope_theta: f32,
-    pub rope_scaling: Option<RopeScaling>,
-    pub max_position_embeddings: usize,
-    pub tie_word_embeddings: bool,
+    pub(crate) num_experts_per_token: usize,
+    routed_scaling_factor: f32,
+    scoring_func: String,
+    topk_method: String,
+    n_group: usize,
+    topk_group: usize,
+    norm_topk_prob: bool,
+    pub(crate) rms_norm_eps: f32,
+    pub(crate) rope_theta: f32,
+    pub(crate) rope_scaling: Option<RopeScaling>,
+    max_position_embeddings: usize,
+    pub(crate) tie_word_embeddings: bool,
 }
 
 impl Config {
-    pub fn from_model_dir(model_path: impl AsRef<Path>) -> Result<Self> {
+    pub(crate) fn from_model_dir(model_path: impl AsRef<Path>) -> Result<Self> {
         let config_path = model_path.as_ref().join("config.json");
         let content = fs::read_to_string(&config_path)?;
         let config: Self = serde_json::from_str(&content)?;
@@ -66,7 +68,7 @@ impl Config {
         Ok(config)
     }
 
-    pub fn validate_lite(&self) -> Result<()> {
+    pub(crate) fn validate_lite(&self) -> Result<()> {
         ensure!(
             self.model_type == "deepseek_v2",
             "DeepSeek-V2-Lite expects model_type=deepseek_v2, got {}",
@@ -191,36 +193,36 @@ impl Config {
         Ok(())
     }
 
-    pub fn is_moe_layer(&self, layer: usize) -> bool {
+    pub(crate) fn is_moe_layer(&self, layer: usize) -> bool {
         layer >= self.first_k_dense_replace
             && (layer - self.first_k_dense_replace).is_multiple_of(self.moe_layer_freq)
     }
 
-    pub fn query_head_dim(&self) -> usize {
+    pub(crate) fn query_head_dim(&self) -> usize {
         self.qk_nope_head_dim + self.qk_rope_head_dim
     }
 
-    pub fn q_proj_rows(&self) -> usize {
+    pub(crate) fn q_proj_rows(&self) -> usize {
         self.num_attention_heads * self.query_head_dim()
     }
 
-    pub fn kv_a_proj_rows(&self) -> usize {
+    pub(crate) fn kv_a_proj_rows(&self) -> usize {
         self.kv_lora_rank + self.qk_rope_head_dim
     }
 
-    pub fn kv_b_proj_rows(&self) -> usize {
+    pub(crate) fn kv_b_proj_rows(&self) -> usize {
         self.num_attention_heads * (self.qk_nope_head_dim + self.v_head_dim)
     }
 
-    pub fn o_proj_cols(&self) -> usize {
+    pub(crate) fn o_proj_cols(&self) -> usize {
         self.num_attention_heads * self.v_head_dim
     }
 
-    pub fn shared_moe_intermediate(&self) -> usize {
+    pub(crate) fn shared_moe_intermediate(&self) -> usize {
         self.n_shared_experts * self.moe_intermediate_size
     }
 
-    pub fn supported_plain_rope_context(&self) -> usize {
+    pub(crate) fn supported_plain_rope_context(&self) -> usize {
         self.rope_scaling
             .as_ref()
             .map_or(self.max_position_embeddings, |rope_scaling| {

@@ -9,7 +9,8 @@ use std::path::PathBuf;
 ///
 /// # Panics
 /// When nothing matches.
-pub fn find_package(
+#[cfg(test)]
+fn find_package(
     provider: &str,
     env_var: &str,
     default_paths: &[&str],
@@ -68,7 +69,7 @@ pub struct CudaToolkit {
     /// `{root}/bin/nvcc` when present, otherwise bare `nvcc` from `$PATH`.
     pub nvcc: PathBuf,
     pub include_dirs: Vec<PathBuf>,
-    pub lib_dirs: Vec<PathBuf>,
+    lib_dirs: Vec<PathBuf>,
 }
 
 impl CudaToolkit {
@@ -87,7 +88,7 @@ impl CudaToolkit {
         Self::from_root(root)
     }
 
-    pub fn from_root(root: PathBuf) -> Self {
+    fn from_root(root: PathBuf) -> Self {
         let nvcc = root.join("bin/nvcc");
         let nvcc = if nvcc.is_file() {
             nvcc

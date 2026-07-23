@@ -107,9 +107,9 @@ pub(crate) const KIMI_MAX_REQUEST_TOKENS: usize = 8192;
 /// garbage on a page no live request owns, which is benign by construction.
 #[derive(Clone, Debug)]
 pub(crate) struct KimiKvStepPages {
-    pub(crate) pages: Vec<i32>,
-    pub(crate) indptr: Vec<i32>,
-    pub(crate) padding_page: i32,
+    pages: Vec<i32>,
+    indptr: Vec<i32>,
+    padding_page: i32,
 }
 
 impl KimiKvStepPages {
@@ -160,7 +160,7 @@ pub(crate) struct KimiK2RankPlacement {
 }
 
 impl KimiK2RankPlacement {
-    pub(crate) fn new(rank: usize, device_ordinal: usize) -> Result<Self> {
+    fn new(rank: usize, device_ordinal: usize) -> Result<Self> {
         ensure!(rank < 8, "Kimi-K2 rank must be < 8, got {rank}");
         Ok(Self {
             rank,
@@ -643,7 +643,7 @@ struct KimiWorkerDecodeArena {
 /// path: one ckv + kpe buffer pair per layer, indexed by pool page IDs the
 /// scheduler assigns. Allocated once at weight load (crash early on OOM);
 /// the stable base pointers are what keep captured CUDA graphs valid.
-pub(super) struct KimiWorkerKvPool {
+struct KimiWorkerKvPool {
     layers: Vec<KimiWorkerMlaLayerCache>,
 }
 

@@ -77,7 +77,7 @@ impl RequestId {
         Self(value)
     }
 
-    pub fn get(self) -> u64 {
+    pub(crate) fn get(self) -> u64 {
         self.0
     }
 }
@@ -799,10 +799,10 @@ pub struct UnifiedPlan<'a> {
 
 #[derive(Clone, Debug)]
 pub struct PrefillRequestResult {
-    pub request_id: RequestId,
+    pub(crate) request_id: RequestId,
     pub first_token: u32,
     pub first_token_logprob: Option<TokenLogprob>,
-    pub prompt_logprobs: Option<Vec<Option<TokenLogprob>>>,
+    pub(crate) prompt_logprobs: Option<Vec<Option<TokenLogprob>>>,
     /// Prompt tokens served from the prefix cache (KV reused, not recomputed).
     pub cached_tokens: usize,
     /// Whether the prompt is fully prefilled. When false this step ran a
@@ -810,12 +810,12 @@ pub struct PrefillRequestResult {
     pub completed: bool,
     /// Prompt tokens with KV computed after this step (authoritative —
     /// includes prefix-cache hits the scheduler can't see).
-    pub prefill_pos: usize,
+    pub(crate) prefill_pos: usize,
 }
 
 #[derive(Clone, Debug)]
 pub struct DecodeRequestResult {
-    pub request_id: RequestId,
+    pub(crate) request_id: RequestId,
     pub token: u32,
     pub logprob: Option<TokenLogprob>,
 }
@@ -825,7 +825,7 @@ pub struct PrefillResult {
     /// Requests whose DFlash target context was captured this prefill step.
     /// Empty unless speculative decoding is enabled. The executor folds these
     /// into its `dflash_ready_requests` set once the prompt is fully prefilled.
-    pub dflash_context_captured_requests: Vec<RequestId>,
+    pub(crate) dflash_context_captured_requests: Vec<RequestId>,
 }
 
 pub struct DecodeResult {
@@ -1148,7 +1148,7 @@ impl Qwen3Executor {
         self.primary.dump_decode_graph_png(png_path.to_path_buf())
     }
 
-    pub(crate) fn single(
+    fn single(
         model: Qwen3Model,
         offload_opts: &Qwen3OffloadOptions,
         max_prefill_tokens: usize,
@@ -1631,7 +1631,7 @@ impl Qwen3Executor {
     /// Configure two-stream prefill/decode overlap (see [`crate::DecodeOverlap`]).
     /// A no-op for [`crate::DecodeOverlap::Off`]; otherwise sets up the streams,
     /// returning an error if the GPU/driver cannot honor the requested mode.
-    pub fn enable_decode_overlap(&mut self, overlap: crate::DecodeOverlap) -> Result<()> {
+    pub(crate) fn enable_decode_overlap(&mut self, overlap: crate::DecodeOverlap) -> Result<()> {
         // Pre-capture backstop: a runtime caller could set Pin then enable overlap here, bypassing the
         // engine-entry guard. launch_gemm_pin also bails on the resulting stream override, but only mid
         // graph-capture/replay (a hot-path failure) — rejecting here moves it to a safe point.
@@ -1674,7 +1674,7 @@ impl Qwen3Executor {
     /// A resident HBM block and its host-tier copy share one content hash, so
     /// the cache cannot be told to prefer L2 for a block still in HBM — the only
     /// way to force the bytes from L2 is to not keep the HBM copy around.
-    pub fn set_no_prefix_cache(&mut self, on: bool) {
+    pub(crate) fn set_no_prefix_cache(&mut self, on: bool) {
         if self.offload.is_some() {
             self.l1_retention_disabled = on;
         } else {
@@ -1689,7 +1689,7 @@ impl Qwen3Executor {
     /// is incompatible with KV offload. Disables the prefix cache: speculative
     /// capture needs clean, uncached target hidden states for every prompt
     /// token, and a prefix-cache hit skips the forward that would produce them.
-    pub fn load_dflash_draft_model(&mut self, draft_path: &str) -> Result<()> {
+    pub(crate) fn load_dflash_draft_model(&mut self, draft_path: &str) -> Result<()> {
         anyhow::ensure!(
             self.workers.is_empty(),
             "speculative decoding requires the single-GPU path (got {} extra ranks)",

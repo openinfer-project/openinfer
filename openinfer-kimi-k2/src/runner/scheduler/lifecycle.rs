@@ -8,7 +8,7 @@ use crate::runner::worker::KIMI_MAX_REQUEST_TOKENS;
 /// KV tokens a request can write over its lifetime. The final generated
 /// token is returned but never fed back, so its KV is never written (the
 /// same dangling-token contract as the qwen3 admission).
-pub(in crate::runner) fn request_max_kv_tokens(req: &GenerateRequest) -> usize {
+fn request_max_kv_tokens(req: &GenerateRequest) -> usize {
     req.prompt_tokens.len() + req.max_tokens.saturating_sub(1)
 }
 

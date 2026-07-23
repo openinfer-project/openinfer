@@ -164,7 +164,7 @@ const GEMM_LT_PIN_NONDET: i32 = -3;
 #[derive(Clone, Copy, Debug)]
 pub struct PinAlgoConfig {
     pub splitk: i32,
-    pub reduction_scheme: i32,
+    reduction_scheme: i32,
 }
 
 impl PinAlgoConfig {
@@ -479,7 +479,7 @@ pub fn gemm_graphsafe_ref_into_checked(
     gemm_ref_into_with_policy(ctx, weight, x, out, true)
 }
 
-pub fn gemm_per_token_into_checked(
+pub(crate) fn gemm_per_token_into_checked(
     ctx: &DeviceContext,
     weight: &DeviceMatrix,
     x: &HiddenStates,

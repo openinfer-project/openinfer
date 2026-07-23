@@ -110,7 +110,6 @@ pub use linear::gemm_lt_pin_tune;
 pub use linear::gemm_lt_pin_warmup;
 pub use linear::gemm_lt_tune;
 pub use linear::gemm_per_token;
-pub use linear::gemm_per_token_into_checked;
 pub use linear::gemm_rows_into;
 pub use linear::gemm_rows_into_checked;
 pub use linear::gemm_strided_batched_bf16;

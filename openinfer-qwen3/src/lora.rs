@@ -147,15 +147,15 @@ impl DeviceLoraLayer {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct LoraTokenRange<'a> {
-    pub(crate) adapter: &'a str,
+    adapter: &'a str,
     pub(crate) token_offset: usize,
     pub(crate) token_len: usize,
 }
 
-pub(crate) struct LoraTokenGroup<'a> {
-    pub(crate) adapter: &'a str,
-    pub(crate) ranges: Vec<&'a LoraTokenRange<'a>>,
-    pub(crate) token_count: usize,
+struct LoraTokenGroup<'a> {
+    adapter: &'a str,
+    ranges: Vec<&'a LoraTokenRange<'a>>,
+    token_count: usize,
 }
 
 pub(crate) struct DeviceLoraTokenGroup<'a> {
@@ -193,9 +193,7 @@ pub(crate) fn build_lora_token_ranges<'a>(
     ranges
 }
 
-pub(crate) fn group_lora_token_ranges<'a>(
-    ranges: &'a [LoraTokenRange<'a>],
-) -> Vec<LoraTokenGroup<'a>> {
+fn group_lora_token_ranges<'a>(ranges: &'a [LoraTokenRange<'a>]) -> Vec<LoraTokenGroup<'a>> {
     let mut groups: Vec<LoraTokenGroup<'a>> = Vec::new();
     for range in ranges {
         if let Some(group) = groups

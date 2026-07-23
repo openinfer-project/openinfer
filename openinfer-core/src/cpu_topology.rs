@@ -19,11 +19,12 @@ impl CpuId {
         Ok(Self(cpu))
     }
 
-    pub fn as_u16(self) -> u16 {
+    #[cfg(test)]
+    fn as_u16(self) -> u16 {
         self.0
     }
 
-    pub fn as_usize(self) -> usize {
+    fn as_usize(self) -> usize {
         usize::from(self.0)
     }
 }
@@ -36,8 +37,8 @@ impl std::fmt::Display for CpuId {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NumaCpuPool {
-    pub node: usize,
-    pub cpus: Vec<CpuId>,
+    node: usize,
+    cpus: Vec<CpuId>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -49,11 +50,11 @@ pub struct RankNumaNode {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RankCpuSlice {
     pub rank: usize,
-    pub numa_node: usize,
+    numa_node: usize,
     pub cpus: Vec<CpuId>,
 }
 
-pub fn parse_cpu_list(cpulist: &str) -> Result<Vec<CpuId>> {
+fn parse_cpu_list(cpulist: &str) -> Result<Vec<CpuId>> {
     let mut cpus = Vec::new();
     for part in cpulist.trim().split(',').filter(|part| !part.is_empty()) {
         if let Some((start, end)) = part.split_once('-') {
@@ -79,7 +80,8 @@ pub fn parse_cpu_list(cpulist: &str) -> Result<Vec<CpuId>> {
     Ok(cpus)
 }
 
-pub fn format_cpu_list(cpus: &[CpuId]) -> String {
+#[cfg(test)]
+fn format_cpu_list(cpus: &[CpuId]) -> String {
     if cpus.is_empty() {
         return "[]".to_string();
     }
@@ -103,6 +105,7 @@ pub fn format_cpu_list(cpus: &[CpuId]) -> String {
     ranges.join(",")
 }
 
+#[cfg(test)]
 fn push_cpu_range(ranges: &mut Vec<String>, start: u16, end: u16) {
     if start == end {
         ranges.push(start.to_string());
@@ -148,7 +151,7 @@ pub fn pin_current_thread_to_cpu(cpu: CpuId) -> Result<()> {
     }
 }
 
-pub fn cuda_device_pci_bus_id(device_ordinal: usize) -> Result<String> {
+fn cuda_device_pci_bus_id(device_ordinal: usize) -> Result<String> {
     let mut buf = [c_char::default(); 32];
     cuda_driver_result::init().map_err(|err| anyhow::anyhow!("{err:?}"))?;
     let device = cuda_driver_result::device::get(device_ordinal as i32)
@@ -164,7 +167,7 @@ pub fn cuda_device_pci_bus_id(device_ordinal: usize) -> Result<String> {
     }
 }
 
-pub fn pci_numa_node(pci_bus_id: &str) -> Result<usize> {
+fn pci_numa_node(pci_bus_id: &str) -> Result<usize> {
     let raw = std::fs::read_to_string(format!("/sys/bus/pci/devices/{pci_bus_id}/numa_node"))
         .with_context(|| format!("read NUMA node for PCI device {pci_bus_id}"))?;
     let node = raw

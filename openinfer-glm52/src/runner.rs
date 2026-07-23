@@ -50,7 +50,7 @@ pub(crate) struct Glm52RankWeightLoadReport {
     pub(crate) rank: usize,
     pub(crate) loaded_tensor_count: usize,
     pub(crate) loaded_total_bytes: usize,
-    pub(crate) resident_raw_bytes: usize,
+    resident_raw_bytes: usize,
     pub(crate) loaded_to_gpu: bool,
     /// This rank's device free VRAM right after the weights landed — the
     /// launch-time context-cap probe takes the fleet minimum.
@@ -357,7 +357,7 @@ impl Glm52RankWorker {
         Ok(resp_rx)
     }
 
-    pub(crate) fn dump_decode_graph_async(
+    fn dump_decode_graph_async(
         &self,
         bucket: usize,
         png_path: PathBuf,
@@ -375,7 +375,7 @@ impl Glm52RankWorker {
         Ok(resp_rx)
     }
 
-    pub(crate) fn shutdown(&mut self) -> Result<()> {
+    fn shutdown(&mut self) -> Result<()> {
         self.request_shutdown()?;
         self.join()
     }

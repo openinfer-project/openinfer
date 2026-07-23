@@ -68,8 +68,8 @@ impl Glm52ExpertLayerRegions {
 /// (raw checkpoint bytes), plus the per-layer packed expert regions.
 /// `from_device` constructors take entries out of these maps.
 pub(crate) struct Glm52RankGpuWeights {
-    pub(crate) tensors: BTreeMap<String, CudaSlice<u8>>,
-    pub(crate) expert_layers: BTreeMap<usize, Glm52ExpertLayerRegions>,
+    tensors: BTreeMap<String, CudaSlice<u8>>,
+    expert_layers: BTreeMap<usize, Glm52ExpertLayerRegions>,
     pub(crate) total_bytes: usize,
 }
 

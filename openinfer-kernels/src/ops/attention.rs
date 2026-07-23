@@ -80,7 +80,7 @@ impl PrefillPagedPlan {
     pub fn num_tiles(&self) -> i32 {
         self.num_tiles
     }
-    pub fn cta_tile_q(&self) -> i32 {
+    fn cta_tile_q(&self) -> i32 {
         self.cta_tile_q
     }
 

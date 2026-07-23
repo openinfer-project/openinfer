@@ -143,8 +143,8 @@ impl AxisSpec {
 /// Erased tensor metadata for schedules, reports, and future instrumentation.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct TensorSpec {
-    pub dtype: String,
-    pub layout: String,
+    pub(crate) dtype: String,
+    pub(crate) layout: String,
     pub axes: Vec<AxisSpec>,
 }
 
@@ -188,7 +188,7 @@ pub struct TensorArg {
 }
 
 impl TensorArg {
-    pub fn new(name: impl Into<String>, spec: TensorSpec) -> Self {
+    fn new(name: impl Into<String>, spec: TensorSpec) -> Self {
         Self {
             name: name.into(),
             spec,
@@ -208,7 +208,7 @@ pub struct AttrSpec {
 }
 
 impl AttrSpec {
-    pub fn new(name: impl Into<String>, value: String) -> Self {
+    fn new(name: impl Into<String>, value: String) -> Self {
         Self {
             name: name.into(),
             value,
@@ -561,7 +561,7 @@ impl<const DIM: usize> GpuTensor<DIM> {
 
 /// bf16 weight matrix with compile-time dimensions: `[OUT, IN]` row-major.
 pub struct GpuWeight<const OUT: usize, const IN: usize> {
-    pub data: CudaSlice<bf16>,
+    pub(crate) data: CudaSlice<bf16>,
 }
 
 impl<const OUT: usize, const IN: usize> GpuWeight<OUT, IN> {

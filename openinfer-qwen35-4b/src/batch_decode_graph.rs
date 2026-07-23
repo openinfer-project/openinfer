@@ -15,7 +15,7 @@ use super::recurrent_state::RecurrentState;
 pub(crate) const BATCH_BUCKETS: &[usize] = &[1, 2, 4, 8, 16, 32, 64];
 
 /// Maximum supported batch size (= largest bucket).
-pub const MAX_BATCH: usize = 64;
+pub(crate) const MAX_BATCH: usize = 64;
 
 /// Find the smallest bucket >= `bs`. Panics if `bs` > MAX_BATCH.
 pub(crate) fn bucket_for(bs: usize) -> usize {

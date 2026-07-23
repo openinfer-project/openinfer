@@ -2,22 +2,22 @@ use openinfer_engine::engine::FinishReason;
 
 #[derive(Clone, Debug)]
 pub(super) struct RequestTrace {
-    pub(super) queued_at_unix_s: f64,
-    pub(super) scheduled_at_unix_s: f64,
+    queued_at_unix_s: f64,
+    scheduled_at_unix_s: f64,
     pub(super) prefill_done_unix_s: Option<f64>,
     pub(super) first_token_emit_unix_s: Option<f64>,
-    pub(super) terminal_unix_s: Option<f64>,
+    terminal_unix_s: Option<f64>,
     pub(super) prefill_ms: Option<f64>,
-    pub(super) first_decode_ms: Option<f64>,
-    pub(super) decode_total_ms: f64,
-    pub(super) decode_step_count: usize,
-    pub(super) active_set_size_max: usize,
-    pub(super) pending_queue_size_max: usize,
-    pub(super) active_set_size_at_terminal: usize,
-    pub(super) pending_queue_size_at_terminal: usize,
-    pub(super) decode_batch_size_max: usize,
-    pub(super) batch_decode_steps: usize,
-    pub(super) singleton_decode_steps: usize,
+    first_decode_ms: Option<f64>,
+    decode_total_ms: f64,
+    decode_step_count: usize,
+    active_set_size_max: usize,
+    pending_queue_size_max: usize,
+    active_set_size_at_terminal: usize,
+    pending_queue_size_at_terminal: usize,
+    decode_batch_size_max: usize,
+    batch_decode_steps: usize,
+    singleton_decode_steps: usize,
 }
 
 #[derive(Debug)]
@@ -74,7 +74,7 @@ impl RequestTrace {
         }
     }
 
-    pub(super) fn note_active_set(&mut self, active_set_size: usize) {
+    fn note_active_set(&mut self, active_set_size: usize) {
         self.active_set_size_max = self.active_set_size_max.max(active_set_size);
     }
 

@@ -371,14 +371,14 @@ impl LayerTensors {
         Ok(Self { by_name })
     }
 
-    pub(crate) fn bytes(&self, name: &str) -> Result<&[u8]> {
+    fn bytes(&self, name: &str) -> Result<&[u8]> {
         self.by_name
             .get(name)
             .map(Vec::as_slice)
             .with_context(|| format!("layer tensor {name} not loaded"))
     }
 
-    pub(crate) fn proj(&self, stem: &str, n: usize, k: usize) -> Result<Glm52ProjBytes<'_>> {
+    fn proj(&self, stem: &str, n: usize, k: usize) -> Result<Glm52ProjBytes<'_>> {
         Ok(Glm52ProjBytes {
             weight: self.bytes(&format!("{stem}.weight"))?,
             scale: self.bytes(&format!("{stem}.weight_scale_inv"))?,
@@ -420,7 +420,7 @@ pub(crate) fn load_rank_expert_bank(
     crate::moe_decode::Glm52MoeExpertBank::pack_from_host(ctx, &experts)
 }
 
-pub(super) fn upload_u8(ctx: &DeviceContext, host: &[u8]) -> Result<cudarc::driver::CudaSlice<u8>> {
+fn upload_u8(ctx: &DeviceContext, host: &[u8]) -> Result<cudarc::driver::CudaSlice<u8>> {
     let mut dev = ctx.stream.alloc_zeros::<u8>(host.len())?;
     ctx.stream.memcpy_htod(host, &mut dev)?;
     Ok(dev)

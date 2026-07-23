@@ -10,7 +10,7 @@ use super::indexer::GLM52_INDEXER_HEAD_DIM;
 use crate::ffi;
 use crate::tensor::DeviceContext;
 
-pub const GLM52_INDEXER_ROPE_HALF: usize = 32;
+const GLM52_INDEXER_ROPE_HALF: usize = 32;
 
 /// Non-interleaved (half-split / NeoX-style) RoPE for the DSA indexer
 /// q `[n_heads, head_dim]` and k `[head_dim]` (in-place). Applies RoPE

@@ -9,18 +9,18 @@ use half::bf16;
 use crate::ffi;
 use crate::tensor::DeviceContext;
 
-pub const GLM52_ROUTER_HIDDEN: usize = 6144;
-pub const GLM52_ROUTER_EXPERTS: usize = 256;
-pub const GLM52_ROUTER_TOPK: usize = 8;
+const GLM52_ROUTER_HIDDEN: usize = 6144;
+const GLM52_ROUTER_EXPERTS: usize = 256;
+const GLM52_ROUTER_TOPK: usize = 8;
 /// `routed_scaling_factor` from the GLM5.2 checkpoint config, folded into the
 /// normalized top-k weights (the shared expert is added unscaled).
-pub const GLM52_ROUTED_RESIDUAL_SCALE: f32 = 2.5;
+const GLM52_ROUTED_RESIDUAL_SCALE: f32 = 2.5;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Glm52RouterConfig {
-    pub hidden_dim: usize,
-    pub n_experts: usize,
-    pub topk: usize,
+    hidden_dim: usize,
+    n_experts: usize,
+    topk: usize,
     pub route_scale: f32,
 }
 
@@ -34,7 +34,7 @@ impl Glm52RouterConfig {
         }
     }
 
-    pub fn validate(self) -> Result<()> {
+    fn validate(self) -> Result<()> {
         ensure!(
             self.hidden_dim == GLM52_ROUTER_HIDDEN,
             "GLM5.2 router hidden_dim must be {GLM52_ROUTER_HIDDEN}, got {}",
@@ -71,7 +71,7 @@ pub struct Glm52RouterBatch {
 }
 
 impl Glm52RouterBatch {
-    pub fn validate(self) -> Result<()> {
+    fn validate(self) -> Result<()> {
         ensure!(
             self.active_tokens > 0,
             "GLM5.2 router active_tokens must be positive"
@@ -91,7 +91,7 @@ pub struct Glm52RouterOutput<'a> {
     pub topk_idx: &'a mut CudaSlice<i32>,
 }
 
-pub fn validate_glm52_router_shapes(
+fn validate_glm52_router_shapes(
     config: Glm52RouterConfig,
     batch: Glm52RouterBatch,
     hidden: &CudaSlice<bf16>,

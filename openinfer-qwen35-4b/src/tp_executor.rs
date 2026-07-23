@@ -9,6 +9,7 @@ use std::panic::catch_unwind;
 use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
+use std::sync::PoisonError;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
@@ -89,7 +90,7 @@ struct TpRuntimePoison {
 
 impl TpRuntimePoison {
     fn poison(&self, reason: String) -> String {
-        let mut current = self.reason.lock().unwrap_or_else(|err| err.into_inner());
+        let mut current = self.reason.lock().unwrap_or_else(PoisonError::into_inner);
         current.get_or_insert(reason).clone()
     }
 
@@ -97,7 +98,7 @@ impl TpRuntimePoison {
         if let Some(reason) = self
             .reason
             .lock()
-            .unwrap_or_else(|err| err.into_inner())
+            .unwrap_or_else(PoisonError::into_inner)
             .clone()
         {
             anyhow::bail!("Qwen3.5 TP executor is poisoned: {reason}");
@@ -120,7 +121,7 @@ pub struct Qwen35TpExecutor {
 }
 
 #[derive(Clone)]
-pub struct TpPrefillChunkItem {
+pub(crate) struct TpPrefillChunkItem {
     request_id: RequestId,
     prompt_tokens: Vec<u32>,
     logprobs: usize,
@@ -129,7 +130,7 @@ pub struct TpPrefillChunkItem {
 }
 
 impl TpPrefillChunkItem {
-    pub fn new(
+    fn new(
         request_id: RequestId,
         prompt_tokens: Vec<u32>,
         logprobs: usize,
@@ -144,7 +145,7 @@ impl TpPrefillChunkItem {
         }
     }
 
-    pub fn new_with_sampling(
+    pub(crate) fn new_with_sampling(
         request_id: RequestId,
         prompt_tokens: Vec<u32>,
         logprobs: usize,
@@ -162,7 +163,7 @@ impl TpPrefillChunkItem {
 }
 
 #[derive(Clone)]
-pub struct TpDecodeStepItem {
+pub(crate) struct TpDecodeStepItem {
     request_id: RequestId,
     token_id: u32,
     logprobs: usize,
@@ -170,7 +171,7 @@ pub struct TpDecodeStepItem {
 }
 
 impl TpDecodeStepItem {
-    pub fn new(
+    pub(crate) fn new(
         request_id: RequestId,
         token_id: u32,
         logprobs: usize,
@@ -357,23 +358,23 @@ impl Qwen35TpExecutor {
         self.world_size
     }
 
-    pub fn max_batch(&self) -> usize {
+    pub(crate) fn max_batch(&self) -> usize {
         self.max_batch
     }
 
-    pub fn page_size(&self) -> usize {
+    pub(crate) fn page_size(&self) -> usize {
         self.page_size
     }
 
-    pub fn capacity_pages_for_requests(&self) -> usize {
+    pub(crate) fn capacity_pages_for_requests(&self) -> usize {
         self.capacity_pages_for_requests
     }
 
-    pub fn max_position_embeddings(&self) -> usize {
+    pub(crate) fn max_position_embeddings(&self) -> usize {
         self.max_position_embeddings
     }
 
-    pub fn is_stop_token(&self, token_id: u32) -> bool {
+    pub(crate) fn is_stop_token(&self, token_id: u32) -> bool {
         token_id == self.eos_token_id
     }
 
@@ -396,11 +397,11 @@ impl Qwen35TpExecutor {
         self.execute_prefill_chunks(&chunks)
     }
 
-    pub fn execute_prefill_chunks(&self, chunks: &[TpPrefillChunkItem]) -> Result<PrefillResult> {
+    fn execute_prefill_chunks(&self, chunks: &[TpPrefillChunkItem]) -> Result<PrefillResult> {
         self.execute_prefill_chunks_with_seed(chunks, 0)
     }
 
-    pub fn execute_prefill_chunks_with_seed(
+    pub(crate) fn execute_prefill_chunks_with_seed(
         &self,
         chunks: &[TpPrefillChunkItem],
         sample_seed: u64,
@@ -446,7 +447,7 @@ impl Qwen35TpExecutor {
         self.execute_decode_items(&requests, 0)
     }
 
-    pub fn execute_decode_items(
+    pub(crate) fn execute_decode_items(
         &self,
         requests: &[TpDecodeStepItem],
         sample_seed: u64,
@@ -620,18 +621,18 @@ impl TpStartupGate {
     }
 
     fn wait(&self) -> bool {
-        let mut decision = self.decision.lock().unwrap_or_else(|err| err.into_inner());
+        let mut decision = self.decision.lock().unwrap_or_else(PoisonError::into_inner);
         while *decision == TpStartupDecision::Pending {
             decision = self
                 .changed
                 .wait(decision)
-                .unwrap_or_else(|err| err.into_inner());
+                .unwrap_or_else(PoisonError::into_inner);
         }
         *decision == TpStartupDecision::Connect
     }
 
     fn set(&self, next: TpStartupDecision) {
-        let mut decision = self.decision.lock().unwrap_or_else(|err| err.into_inner());
+        let mut decision = self.decision.lock().unwrap_or_else(PoisonError::into_inner);
         if *decision == TpStartupDecision::Pending {
             *decision = next;
             self.changed.notify_all();
@@ -1386,11 +1387,10 @@ mod tests {
 
         gate.cancel();
 
-        assert_eq!(
-            done_rx
+        assert!(
+            !done_rx
                 .recv_timeout(std::time::Duration::from_secs(1))
-                .expect("cancelled startup gate should release workers within one second"),
-            false
+                .expect("cancelled startup gate should release workers within one second")
         );
         waiter.join().unwrap();
     }

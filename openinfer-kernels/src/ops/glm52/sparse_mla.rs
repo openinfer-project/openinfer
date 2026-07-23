@@ -24,18 +24,18 @@ use crate::tensor::DeviceContext;
 /// combine (`kNumSplits`/`kHeadSlots`); the launch passes them down and both
 /// layers validate, so a lone edit fails at the first launch instead of
 /// writing `o_part` out of bounds.
-pub const GLM52_SPARSE_MLA_NUM_SPLITS: usize = 16;
+const GLM52_SPARSE_MLA_NUM_SPLITS: usize = 16;
 pub const GLM52_SPARSE_MLA_HEAD_SLOTS: usize = 16;
 /// GLM5.2's softmax scale, baked into the TileLang kernel at generation
 /// time. Validated here by name — the CUDA entry would only report a bare
 /// INVALID_VALUE.
-pub const GLM52_SPARSE_MLA_SM_SCALE: f32 = 0.0625;
+const GLM52_SPARSE_MLA_SM_SCALE: f32 = 0.0625;
 /// The TileLang main kernel is AOT-instantiated per topk
 /// (`tools/tilelang/glm52/generate.py` `TOPKS`); production runs only the
 /// full DSA topk (the 256 short tier was dropped — see the note there for
 /// how to build it again). Keep in sync with the generator and the
 /// launcher's `supported_topk`.
-pub const GLM52_SPARSE_MLA_TOPKS: [usize; 1] = [2048];
+const GLM52_SPARSE_MLA_TOPKS: [usize; 1] = [2048];
 
 /// Launch contract for the right-sized sparse MLA decode. `heads` is the real
 /// head count (attention-TP shard, <= 16); the query stays full-width
@@ -79,19 +79,19 @@ impl Glm52SparseMlaDecode {
         Ok(())
     }
 
-    pub fn max_slots(self) -> usize {
+    fn max_slots(self) -> usize {
         self.num_blocks * GLM52_FLASHMLA_SPARSE_PAGE_SIZE
     }
 
-    pub fn q_len(self) -> usize {
+    fn q_len(self) -> usize {
         self.batch_size * GLM52_FLASHMLA_SPARSE_HEADS * GLM52_FLASHMLA_SPARSE_QK_HEAD_DIM
     }
 
-    pub fn packed_kv_cache_len(self) -> usize {
+    fn packed_kv_cache_len(self) -> usize {
         self.max_slots() * GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN
     }
 
-    pub fn topk_indices_len(self) -> usize {
+    fn topk_indices_len(self) -> usize {
         self.batch_size * self.topk
     }
 

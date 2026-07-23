@@ -175,7 +175,7 @@ impl<'a> BatchDecodeDag<'a> {
         not(feature = "kernel-call-trace"),
         allow(clippy::extra_unused_type_parameters)
     )]
-    pub(crate) fn gemm<Out: AxisTag, In: AxisTag>(
+    fn gemm<Out: AxisTag, In: AxisTag>(
         &self,
         label: DagLabel,
         weight: &DeviceMatrix,

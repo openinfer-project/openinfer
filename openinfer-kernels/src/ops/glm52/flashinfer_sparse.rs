@@ -8,10 +8,10 @@ use half::bf16;
 use crate::ffi;
 use crate::tensor::DeviceContext;
 
-pub const GLM52_FLASHINFER_SPARSE_HEADS: usize = 16;
-pub const GLM52_FLASHINFER_SPARSE_QK_HEAD_DIM: usize = 576;
-pub const GLM52_FLASHINFER_SPARSE_V_HEAD_DIM: usize = 512;
-pub const GLM52_FLASHINFER_SPARSE_PAGE_SIZE: usize = 64;
+const GLM52_FLASHINFER_SPARSE_HEADS: usize = 16;
+const GLM52_FLASHINFER_SPARSE_QK_HEAD_DIM: usize = 576;
+const GLM52_FLASHINFER_SPARSE_V_HEAD_DIM: usize = 512;
+const GLM52_FLASHINFER_SPARSE_PAGE_SIZE: usize = 64;
 pub const GLM52_FLASHINFER_SPARSE_BYTES_PER_TOKEN: usize = 576;
 pub const GLM52_FLASHINFER_SPARSE_WORKSPACE_BYTES: usize = 16 * 1024 * 1024;
 
@@ -25,7 +25,7 @@ pub struct Glm52FlashInferSparseDecode {
 }
 
 impl Glm52FlashInferSparseDecode {
-    pub fn validate(self) -> Result<()> {
+    fn validate(self) -> Result<()> {
         ensure!(
             matches!(self.batch_size, 1 | 2 | 4 | 8),
             "GLM5.2 FlashInfer sparse batch {} is not a decode bucket",
@@ -63,7 +63,7 @@ impl Glm52FlashInferSparseDecode {
             * GLM52_FLASHINFER_SPARSE_BYTES_PER_TOKEN
     }
 
-    pub fn topk_len(self) -> usize {
+    fn topk_len(self) -> usize {
         self.batch_size * self.topk
     }
 

@@ -54,7 +54,7 @@ pub(crate) struct DFlashConfig {
     pub(crate) num_hidden_layers: usize,
     pub(crate) num_attention_heads: usize,
     pub(crate) num_key_value_heads: usize,
-    pub(crate) num_target_layers: usize,
+    num_target_layers: usize,
     pub(crate) head_dim: usize,
     pub(crate) vocab_size: usize,
     pub(crate) rms_norm_eps: f32,
@@ -65,7 +65,7 @@ pub(crate) struct DFlashConfig {
     pub(crate) target_layer_ids: Vec<usize>,
     /// DSpark Markov head low-rank size; 0 disables the head (= plain DFlash).
     pub(crate) markov_rank: usize,
-    pub(crate) markov_head_type: String,
+    markov_head_type: String,
     /// Block draft layout. DeepSpec `Qwen3DSparkModel` checkpoints (both the
     /// markov and the `markov_rank == 0` ones) are *anchor-first*: block position
     /// 0 is already the first real prediction, so all `block_size` positions
@@ -74,7 +74,7 @@ pub(crate) struct DFlashConfig {
     /// `1..block_size` draft (verify span `block_size`). This is a property of the
     /// checkpoint, NOT of the markov head — keying it on the markov head silently
     /// mis-drafts a no-markov DeepSpec checkpoint (accept rate collapses to ~0).
-    pub(crate) anchor_first: bool,
+    anchor_first: bool,
     /// Whether the checkpoint carries a confidence head. Phase 1 does not use it
     /// (full-block verify, no confidence-scheduled truncation); surfaced at load
     /// so the operator knows that capability is being ignored. See

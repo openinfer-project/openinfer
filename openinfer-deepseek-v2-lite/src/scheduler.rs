@@ -35,7 +35,7 @@ use crate::host_ops::DecodeCache;
 use crate::runtime::DeepSeekV2LiteEp2Generator;
 use crate::runtime::GenerationStats;
 
-pub(crate) const DEFAULT_MAX_ACTIVE_REQUESTS: usize = 8;
+const DEFAULT_MAX_ACTIVE_REQUESTS: usize = 8;
 
 pub(crate) struct MixedRequestScheduler {
     generator: DeepSeekV2LiteEp2Generator,

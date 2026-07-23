@@ -54,43 +54,43 @@ use crate::weights::Qwen3MemoryOptions;
 
 /// An in-flight request being decoded.
 pub(super) struct ActiveRequestState {
-    pub(super) request_id: RequestId,
-    pub(super) lora_adapter: Option<String>,
-    pub(super) token_tx: TokenSink,
-    pub(super) last_token: u32,
-    pub(super) generated_count: usize,
-    pub(super) max_tokens: usize,
-    pub(super) prompt_len: usize,
-    pub(super) params: SamplingParams,
+    request_id: RequestId,
+    lora_adapter: Option<String>,
+    token_tx: TokenSink,
+    last_token: u32,
+    generated_count: usize,
+    max_tokens: usize,
+    prompt_len: usize,
+    params: SamplingParams,
     /// Number of top logprobs to return (0 = disabled).
-    pub(super) logprobs: usize,
+    logprobs: usize,
 }
 
 #[derive(Clone)]
 pub(super) struct PendingRequest {
-    pub(super) request_id: RequestId,
-    pub(super) lora_adapter: Option<String>,
-    pub(super) prompt_tokens: Vec<u32>,
-    pub(super) params: SamplingParams,
-    pub(super) max_tokens: usize,
-    pub(super) token_tx: TokenSink,
-    pub(super) logprobs: usize,
-    pub(super) echo: bool,
-    pub(super) queued_at_unix_s: Option<f64>,
+    request_id: RequestId,
+    lora_adapter: Option<String>,
+    prompt_tokens: Vec<u32>,
+    params: SamplingParams,
+    max_tokens: usize,
+    token_tx: TokenSink,
+    logprobs: usize,
+    echo: bool,
+    queued_at_unix_s: Option<f64>,
     /// Whether this request has already been offered to async KV prefetch.
     /// Offered at most once; a no-hit offer leaves the request in the normal
     /// admission flow with this set so it isn't re-probed every tick.
-    pub(super) prefetch_offered: bool,
+    prefetch_offered: bool,
     /// Prompt tokens whose KV is already computed (prefix-cache hits plus
     /// chunks applied in earlier steps). Updated from the executor's
     /// authoritative position after every chunk.
-    pub(super) prefill_pos: usize,
+    prefill_pos: usize,
     /// Prompt tokens to forward in the upcoming step. Set by
     /// `take_prefill_chunks` when the request is packed into a step.
-    pub(super) step_chunk: usize,
+    step_chunk: usize,
     /// Prefix-cache hits reported by the first chunk, carried across later
     /// chunks so the final result still reports them truthfully.
-    pub(super) cached_tokens: usize,
+    cached_tokens: usize,
 }
 
 impl PendingRequest {
@@ -254,11 +254,7 @@ fn servable_len(max_context: usize, max_blocks: usize, block_size: usize) -> u32
         .unwrap_or(u32::MAX)
 }
 
-pub(crate) fn start_with_executor<E>(
-    mut executor: E,
-    seed: u64,
-    max_prefill_tokens: usize,
-) -> EngineHandle
+fn start_with_executor<E>(mut executor: E, seed: u64, max_prefill_tokens: usize) -> EngineHandle
 where
     E: ModelExecutor + 'static,
 {
@@ -324,7 +320,7 @@ where
     }
 }
 
-pub(crate) fn start_with_executor_with_lora_control<E>(
+fn start_with_executor_with_lora_control<E>(
     executor: E,
     seed: u64,
     max_prefill_tokens: usize,

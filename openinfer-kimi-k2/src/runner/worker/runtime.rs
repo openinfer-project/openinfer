@@ -2,7 +2,7 @@ use openinfer_kernels::ffi;
 
 use super::*;
 
-pub(in crate::runner) fn all_reduce_hidden_via_f32_in_place<const DIM: usize>(
+fn all_reduce_hidden_via_f32_in_place<const DIM: usize>(
     ctx: &DeviceContext,
     hidden: &mut GpuTensor<DIM>,
     f32_scratch: &mut CudaSlice<f32>,
@@ -206,7 +206,7 @@ pub(super) fn sample_local_top1_with_value(
     )
 }
 
-pub(super) fn sample_local_top1_with_value_reuse(
+fn sample_local_top1_with_value_reuse(
     ctx: &DeviceContext,
     logits: &DeviceVec,
     top1_value_scratch: &mut CudaSlice<half::bf16>,

@@ -272,6 +272,8 @@ struct SingleGpuBackend {
     graph_state: BatchDecodeGraphState,
 }
 
+// One instance per scheduler; the size asymmetry costs nothing here.
+#[allow(clippy::large_enum_variant)]
 enum SchedulerBackend {
     Single(SingleGpuBackend),
     Tp(TpSchedulerBackend),
@@ -328,7 +330,7 @@ impl SingleGpuBackend {
     }
 
     fn batch_prefill_logits(&self, chunk: &mut ScheduledChunk) -> Result<HiddenStates> {
-        let window_refs: Vec<&[u32]> = chunk.windows.iter().map(|w| w.as_slice()).collect();
+        let window_refs: Vec<&[u32]> = chunk.windows.iter().map(Vec::as_slice).collect();
         let ScheduledChunkBackendState::Single { kvs, recs } = &mut chunk.backend_state else {
             anyhow::bail!("single-GPU prefill received TP chunk state");
         };
@@ -342,7 +344,7 @@ impl SingleGpuBackend {
         chunk: &mut ScheduledChunk,
         active: &mut [ActiveRequest35],
     ) -> Result<crate::unified_forward::UnifiedStepOutput> {
-        let window_refs: Vec<&[u32]> = chunk.windows.iter().map(|w| w.as_slice()).collect();
+        let window_refs: Vec<&[u32]> = chunk.windows.iter().map(Vec::as_slice).collect();
         let ScheduledChunkBackendState::Single { kvs, recs } = &mut chunk.backend_state else {
             anyhow::bail!("single-GPU unified step received TP chunk state");
         };
@@ -740,7 +742,7 @@ fn align_prefill_results(
                 )
             })?;
         tokens[idx] = *first_token;
-        logprobs[idx] = first_token_logprob.clone();
+        logprobs[idx].clone_from(first_token_logprob);
     }
     Ok((tokens, logprobs))
 }
@@ -1024,8 +1026,7 @@ fn scheduler_loop(
                 let dur_us = step_start.elapsed().as_micros();
                 let epoch_us = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_micros())
-                    .unwrap_or(0);
+                    .map_or(0, |d| d.as_micros());
                 info!(
                     "ITL_STEP mono_us={} epoch_us={} plan={} prefill_tok={} prefill_reqs={} decode_n={} dur_us={}",
                     itl_debug_mono_us(),

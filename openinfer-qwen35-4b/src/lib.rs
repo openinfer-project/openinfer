@@ -38,7 +38,6 @@ pub const MAX_DECODE_BATCH: usize = batch_decode_graph::MAX_BATCH;
 /// This is for model-local tests, debugging, and benchmarks. The root server
 /// should use `start_engine` instead.
 pub mod runtime {
-    pub use crate::batch_decode_graph::MAX_BATCH;
     pub use crate::executor::DecodePlan;
     pub use crate::executor::DecodeRequestResult;
     pub use crate::executor::DecodeResult;

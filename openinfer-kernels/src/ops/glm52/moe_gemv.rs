@@ -194,7 +194,6 @@ pub fn glm52_fp8_weight_only_gemv_launch(
         out,
         None,
     )
-    .map(|_| ())
 }
 
 /// Partials-producing twin of [`glm52_fp8_weight_only_gemv_launch`]: when the

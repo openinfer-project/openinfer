@@ -8,12 +8,12 @@ use cudarc::driver::DevicePtrMut;
 use crate::ffi;
 use crate::tensor::DeviceContext;
 
-pub const GLM52_DEEPGEMM_MQA_HEAD_DIM: usize = 128;
-pub const GLM52_DEEPGEMM_MQA_SPLIT_KV: usize = 256;
-pub const GLM52_DEEPGEMM_MQA_FP8_ELEM_SIZE: usize = 1;
-pub const GLM52_DEEPGEMM_MQA_BF16_ELEM_SIZE: usize = 2;
-pub const GLM52_DEEPGEMM_MQA_F32_ELEM_SIZE: usize = 4;
-pub const GLM52_DEEPGEMM_MQA_SCALE_BYTES_PER_TOKEN: usize = 4;
+const GLM52_DEEPGEMM_MQA_HEAD_DIM: usize = 128;
+const GLM52_DEEPGEMM_MQA_SPLIT_KV: usize = 256;
+const GLM52_DEEPGEMM_MQA_FP8_ELEM_SIZE: usize = 1;
+const GLM52_DEEPGEMM_MQA_BF16_ELEM_SIZE: usize = 2;
+const GLM52_DEEPGEMM_MQA_F32_ELEM_SIZE: usize = 4;
+const GLM52_DEEPGEMM_MQA_SCALE_BYTES_PER_TOKEN: usize = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Glm52DeepGemmMqaLogitsShape {
@@ -32,7 +32,7 @@ pub struct Glm52DeepGemmMqaLogitsShape {
 }
 
 impl Glm52DeepGemmMqaLogitsShape {
-    pub fn validate(self) -> Result<()> {
+    fn validate(self) -> Result<()> {
         ensure!(self.batch_size > 0, "batch_size must be positive");
         ensure!(
             self.next_n == 1 || self.next_n == 2,

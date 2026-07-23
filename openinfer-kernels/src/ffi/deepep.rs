@@ -26,10 +26,10 @@ pub struct DeepEpInfo {
     pub decode_worst_recv_tokens: i32,
     pub decode_worst_expanded_tokens: i32,
     pub prefill_max_tokens_per_rank: i32,
-    pub prefill_worst_recv_tokens: i32,
-    pub prologue_rank_count_len: i32,
-    pub buffer_bytes: i64,
-    pub workspace_bytes: i64,
+    prefill_worst_recv_tokens: i32,
+    pub(crate) prologue_rank_count_len: i32,
+    buffer_bytes: i64,
+    workspace_bytes: i64,
 }
 
 unsafe extern "C" {

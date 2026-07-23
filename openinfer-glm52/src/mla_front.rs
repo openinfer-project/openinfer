@@ -58,7 +58,7 @@ const KV_B_ROWS_PER_HEAD: usize = QK_NOPE + V_HEAD; // 448
 pub(crate) struct Glm52MlaLayerWeights {
     q_a: ProjWeight,
     q_a_ln: DeviceVec,
-    pub(crate) q_b: ProjWeight,
+    q_b: ProjWeight,
     kv_a: ProjWeight,
     pub(crate) kv_a_ln: DeviceVec,
     pub(crate) o_proj: ProjWeight,
@@ -347,7 +347,7 @@ impl Glm52MlaFront {
     }
 
     /// The step row count every front buffer was sized for.
-    pub(crate) fn tokens(&self) -> usize {
+    fn tokens(&self) -> usize {
         self.q_resid.tokens()
     }
 }

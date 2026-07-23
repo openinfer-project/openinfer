@@ -28,13 +28,13 @@ pub const KIMI_K2_MLA_Q_PE_LOCAL_OUT_TP8: usize =
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KimiMlaPagedKvLayout {
-    pub max_pages: usize,
-    pub page_size: usize,
-    pub batch_size: usize,
-    pub ckv_stride_page: usize,
-    pub ckv_stride_n: usize,
-    pub kpe_stride_page: usize,
-    pub kpe_stride_n: usize,
+    max_pages: usize,
+    pub(crate) page_size: usize,
+    pub(crate) batch_size: usize,
+    pub(crate) ckv_stride_page: usize,
+    pub(crate) ckv_stride_n: usize,
+    pub(crate) kpe_stride_page: usize,
+    pub(crate) kpe_stride_n: usize,
 }
 
 impl KimiMlaPagedKvLayout {

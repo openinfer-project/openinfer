@@ -13,7 +13,7 @@ use crate::tensor::DeviceContext;
 
 pub const GLM52_TP_MAX_RANKS: usize = 8;
 pub const GLM52_TP_HIDDEN: usize = 6144;
-pub const GLM52_TP_TOPK: usize = 8;
+const GLM52_TP_TOPK: usize = 8;
 pub const GLM52_TP_BANK_EXPERTS: usize = 257;
 pub const GLM52_TP_TOKENS: usize = 8;
 pub const GLM52_TP_UNION_MAX: usize = GLM52_TP_TOKENS * (GLM52_TP_TOPK + 1);

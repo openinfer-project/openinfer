@@ -6,10 +6,10 @@ use anyhow::bail;
 use anyhow::ensure;
 use serde_json::Value;
 
-pub const GLM52_HIDDEN: usize = 6144;
-pub const GLM52_VOCAB: usize = 154_880;
-pub const GLM52_LAYERS: usize = 78;
-pub const GLM52_DENSE_LAYERS: usize = 3;
+pub(crate) const GLM52_HIDDEN: usize = 6144;
+pub(crate) const GLM52_VOCAB: usize = 154_880;
+pub(crate) const GLM52_LAYERS: usize = 78;
+pub(crate) const GLM52_DENSE_LAYERS: usize = 3;
 /// The checkpoint's `max_position_embeddings` — `probe_config_json` pins the
 /// config to exactly this, so it doubles as the architecture ceiling any
 /// launch-time `max_model_len` must respect.
@@ -38,8 +38,8 @@ pub(crate) const GLM52_SM_SCALE: f32 = 0.0625;
 
 pub(crate) const GLM52_DENSE_INTERMEDIATE: usize = 12_288;
 pub(crate) const GLM52_EXPERT_INTERMEDIATE: usize = 2048;
-pub const GLM52_ROUTED_EXPERTS: usize = 256;
-pub const GLM52_TOPK: usize = 8;
+pub(crate) const GLM52_ROUTED_EXPERTS: usize = 256;
+pub(crate) const GLM52_TOPK: usize = 8;
 const GLM52_SHARED_EXPERTS: usize = 1;
 const GLM52_ROUTED_SCALING_FACTOR: f64 = 2.5;
 const GLM52_RMS_NORM_EPS: f64 = 1.0e-5;
@@ -47,7 +47,7 @@ const GLM52_RMS_NORM_EPS: f64 = 1.0e-5;
 /// the one checkpoint eps that `probe_config_json` validates).
 pub(crate) const GLM52_RMS_EPS: f32 = GLM52_RMS_NORM_EPS as f32;
 
-pub const GLM52_INDEX_TOPK: usize = 2048;
+pub(crate) const GLM52_INDEX_TOPK: usize = 2048;
 const GLM52_INDEX_TOPK_FREQ: usize = 4;
 pub(crate) const GLM52_INDEX_HEAD_DIM: usize = 128;
 pub(crate) const GLM52_INDEX_HEADS: usize = 32;

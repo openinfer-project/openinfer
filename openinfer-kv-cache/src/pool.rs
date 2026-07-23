@@ -47,7 +47,7 @@ impl BlockPool {
     /// hash in each `Remove` back to the router's `sequence_hash`. OFF by
     /// default: plain single-machine serving uses [`new`](Self::new) and pays
     /// neither the per-block event attachment nor the channel.
-    pub fn with_events(
+    pub(crate) fn with_events(
         block_size: usize,
         num_blocks: usize,
     ) -> anyhow::Result<(Self, broadcast::Receiver<KvCacheEvent>)> {
@@ -469,7 +469,7 @@ impl RequestKv {
     /// Physical page IDs assigned to this request, in sequence order.
     /// Includes every block the request currently holds — which can be one
     /// more than the KV tokens need (see `step_page_indices`).
-    pub fn page_indices(&self) -> Vec<i32> {
+    fn page_indices(&self) -> Vec<i32> {
         self.seq
             .inner()
             .assignments()
@@ -502,7 +502,8 @@ impl RequestKv {
     /// They are kvbm's lineage-based [`SequenceHash`], which is exactly that:
     /// position + content + parent fragment, so block `i` of prompt `P` hashes
     /// the same no matter which request computed it.
-    pub fn prompt_block_hashes(&self) -> Vec<[u8; 16]> {
+    #[cfg(test)]
+    fn prompt_block_hashes(&self) -> Vec<[u8; 16]> {
         self.seq
             .inner()
             .sequence()

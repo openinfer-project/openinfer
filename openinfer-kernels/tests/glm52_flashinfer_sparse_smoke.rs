@@ -85,6 +85,13 @@ fn glm52_flashinfer_sparse_fp8_uniform_value() {
 
 #[test]
 fn glm52_flashinfer_sparse_fp8_paged_ramp_value() {
+    // E4M3 encodings for 1, 2, 4, 8 — one value per 64-token page, cycling.
+    const PAGE_VALUES: [u8; 4] = [0x38, 0x40, 0x48, 0x50];
+    const PAGE_TOKENS: usize = 64;
+    // Uniform softmax over pages balanced across the four values:
+    // (1 + 2 + 4 + 8) / 4 = 3.75, exact in bf16.
+    const EXPECTED: f32 = 3.75;
+
     let Ok(ctx) = DeviceContext::new() else {
         eprintln!("skip: no CUDA device");
         return;
@@ -93,13 +100,6 @@ fn glm52_flashinfer_sparse_fp8_paged_ramp_value() {
         eprintln!("skip: GLM5.2 FlashInfer sparse MLA requires SM100/SM103");
         return;
     }
-
-    // E4M3 encodings for 1, 2, 4, 8 — one value per 64-token page, cycling.
-    const PAGE_VALUES: [u8; 4] = [0x38, 0x40, 0x48, 0x50];
-    const PAGE_TOKENS: usize = 64;
-    // Uniform softmax over pages balanced across the four values:
-    // (1 + 2 + 4 + 8) / 4 = 3.75, exact in bf16.
-    const EXPECTED: f32 = 3.75;
 
     for topk_size in [256usize, 2048] {
         for batch_size in [1usize, 2, 4, 8] {

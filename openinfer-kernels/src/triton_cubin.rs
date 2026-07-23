@@ -50,7 +50,7 @@ pub const TRITON_CUBIN_FUNCTIONS: &[TritonCubinFunctionSpec] = &[QWEN35_GDR_CHUN
 
 /// Return a fresh TVM FFI function for a known Triton CUBIN launcher.
 #[must_use]
-pub fn function(name: &str) -> Option<Function> {
+fn function(name: &str) -> Option<Function> {
     if name == QWEN35_GDR_CHUNK_SOLVE.name {
         return Some(Function::from_packed(launch_qwen35_gdr_chunk_solve));
     }

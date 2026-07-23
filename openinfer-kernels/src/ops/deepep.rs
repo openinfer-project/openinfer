@@ -439,11 +439,11 @@ fn deepep_unique_id_for<A: DeepEpAbi>() -> Result<[u8; 128]> {
 /// Dispatch-side scratch, allocated once per rank and reused every layer.
 pub struct DeepEpDispatchScratch {
     /// Deterministic-prologue per-SM rank counters.
-    pub rank_count: CudaSlice<i32>,
+    rank_count: CudaSlice<i32>,
     /// Per-(token, topk) destination slot indices.
-    pub dst_slot: CudaSlice<i32>,
+    dst_slot: CudaSlice<i32>,
     /// Received-token prefix sum per source rank (the combine handle).
-    pub psum_rank: CudaSlice<i32>,
+    psum_rank: CudaSlice<i32>,
     /// Received-token aligned offsets per local expert (exclusive form,
     /// `num_local_experts + 1` entries; the kernel uses the first
     /// `num_local_experts` as atomic counters in expanded mode).
@@ -482,7 +482,7 @@ impl DeepEpDispatchScratch {
     }
 
     /// Prefill-path scratch sized from an explicit shim config.
-    pub fn new_prefill_with(ctx: &DeviceContext, info: &DeepEpInfo) -> Result<Self> {
+    fn new_prefill_with(ctx: &DeviceContext, info: &DeepEpInfo) -> Result<Self> {
         Self::new(ctx, info, info.prefill_max_tokens_per_rank as usize)
     }
 }

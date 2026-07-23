@@ -138,7 +138,7 @@ struct Glm52FlashInferScratch {
 
 impl Glm52MlaAttendScratch {
     #[cfg(test)]
-    pub(crate) fn new(
+    fn new(
         ctx: &DeviceContext,
         contract: &Glm52FlashMlaSparseDecode,
         heads: usize,

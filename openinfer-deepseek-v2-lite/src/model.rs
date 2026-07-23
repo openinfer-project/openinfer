@@ -37,7 +37,7 @@ pub(crate) struct DriverRankModel {
 pub(crate) struct ExpertRankModel {
     pub(crate) ctx: DeviceContext,
     pub(crate) layout: ExpertParallelLayout,
-    pub(crate) gate_devices: Vec<Option<DeviceMatrix>>,
+    gate_devices: Vec<Option<DeviceMatrix>>,
     layers: Vec<Option<Vec<ExpertMlp>>>,
 }
 
@@ -91,11 +91,11 @@ pub(crate) struct MoeMlp {
     // oracle path keeps using `gate_host` for host-side routing.
     pub(crate) gate_device: DeviceMatrix,
     pub(crate) shared: DenseMlp,
-    pub(crate) experts: Vec<ExpertMlp>,
+    experts: Vec<ExpertMlp>,
 }
 
 pub(crate) struct ExpertMlp {
-    pub(crate) global_expert: usize,
+    global_expert: usize,
     pub(crate) dense: DenseMlp,
 }
 

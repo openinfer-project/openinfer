@@ -23,12 +23,12 @@ pub struct DecodeAttributionProfile {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct SectionSample {
-    pub phase: &'static str,
-    pub section: &'static str,
-    pub call_site: String,
-    pub layer: Option<usize>,
-    pub token_index: Option<usize>,
-    pub elapsed_us: u64,
+    phase: &'static str,
+    section: &'static str,
+    call_site: String,
+    layer: Option<usize>,
+    token_index: Option<usize>,
+    elapsed_us: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -58,17 +58,17 @@ pub struct SectionRollup {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct CallSiteRollup {
-    pub call_site: String,
-    pub section: String,
-    pub calls: usize,
-    pub total_us: u64,
-    pub mean_us: f64,
-    pub min_us: u64,
-    pub p50_us: u64,
-    pub p95_us: u64,
-    pub p99_us: u64,
-    pub max_us: u64,
-    pub pct: f64,
+    call_site: String,
+    section: String,
+    calls: usize,
+    total_us: u64,
+    mean_us: f64,
+    min_us: u64,
+    p50_us: u64,
+    p95_us: u64,
+    p99_us: u64,
+    max_us: u64,
+    pct: f64,
 }
 
 impl DecodeAttributionProfile {

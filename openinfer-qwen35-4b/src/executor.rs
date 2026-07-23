@@ -26,7 +26,7 @@ impl RequestId {
         Self(value)
     }
 
-    pub fn get(self) -> u64 {
+    pub(crate) fn get(self) -> u64 {
         self.0
     }
 }
@@ -77,15 +77,15 @@ pub struct DecodePlan<'a> {
 
 #[derive(Clone, Debug)]
 pub struct PrefillRequestResult {
-    pub request_id: RequestId,
-    pub first_token: u32,
+    pub(crate) request_id: RequestId,
+    pub(crate) first_token: u32,
     pub first_token_logprob: Option<TokenLogprob>,
 }
 
 #[derive(Clone, Debug)]
 pub struct DecodeRequestResult {
-    pub request_id: RequestId,
-    pub token: u32,
+    pub(crate) request_id: RequestId,
+    pub(crate) token: u32,
     pub logprob: Option<TokenLogprob>,
 }
 

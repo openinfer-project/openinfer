@@ -28,7 +28,7 @@ pub fn load_tokenizer(model_id: &str) -> Result<DynTokenizer> {
     tokenizer_from_source(&files.tokenizer)
 }
 
-pub fn tokenizer_from_source(source: &TokenizerSource) -> Result<DynTokenizer> {
+fn tokenizer_from_source(source: &TokenizerSource) -> Result<DynTokenizer> {
     match source {
         TokenizerSource::HuggingFace(path) => Ok(Arc::new(HuggingFaceTokenizer::new(path)?)),
         TokenizerSource::Tiktoken(path) => Ok(Arc::new(TiktokenTokenizer::new(path)?)),

@@ -33,7 +33,7 @@ impl PrefillPagedPlan {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn new_with_cta_tile_q(
+    fn new_with_cta_tile_q(
         ctx: &DeviceContext,
         desc: &KvDesc<'_>,
         start_pos: usize,

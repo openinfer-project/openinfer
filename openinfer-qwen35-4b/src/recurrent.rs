@@ -718,7 +718,7 @@ mod tests {
 
         let qkv_host = bf16_vec(
             &(0..batch_size * qkv_dim)
-                .map(|i| ((i % 89) as f32 - 44.0) * 0.0078125)
+                .map(|i| ((i % 89) as f32 - 44.0) * 0.007_812_5)
                 .collect::<Vec<_>>(),
         );
         let b_host = bf16_vec(
@@ -764,7 +764,7 @@ mod tests {
         let mut state_ptrs = Vec::with_capacity(batch_size);
         for state in &mut batch_states {
             let (ptr, _guard) = state.device_ptr_mut(&ctx.stream);
-            state_ptrs.push(ptr as u64);
+            state_ptrs.push(ptr);
         }
         let state_ptrs_d = ctx.stream.clone_htod(&state_ptrs)?;
 

@@ -44,9 +44,9 @@ pub struct Qwen3LoraOptions {
 impl Qwen3LoraOptions {
     pub const DEFAULT_MAX_LORAS: usize = 1;
     pub const DEFAULT_MAX_LORA_RANK: usize = 64;
-    pub const SUPPORTED_MAX_LORA_RANKS: [usize; 9] = [1, 8, 16, 32, 64, 128, 256, 320, 512];
+    const SUPPORTED_MAX_LORA_RANKS: [usize; 9] = [1, 8, 16, 32, 64, 128, 256, 320, 512];
 
-    pub fn validate(self) -> Result<Self> {
+    fn validate(self) -> Result<Self> {
         anyhow::ensure!(self.max_loras > 0, "max_loras must be >= 1");
         anyhow::ensure!(
             Self::is_supported_max_lora_rank(self.max_lora_rank),
@@ -91,19 +91,19 @@ pub use green_ctx::DecodeOverlap;
 /// single-GPU topology is supported (tensor parallel shards KV per rank).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Qwen3OffloadOptions {
-    pub enabled: bool,
+    enabled: bool,
     /// Host pinned-memory pool size (the CPU KV-tier capacity), in bytes.
-    pub pinned_pool_bytes: usize,
+    pinned_pool_bytes: usize,
     /// Back the pool with 2 MiB hugepages (the box must hold a reservation).
     pub use_hugepages: bool,
     /// `Some` joins the cross-instance P2P mesh: block hashes register with a
     /// MetaServer, peers pull missing prefixes over RDMA, and this engine
     /// serves theirs. The P/D disaggregation data plane.
-    pub p2p: Option<Qwen3P2pOptions>,
+    p2p: Option<Qwen3P2pOptions>,
     /// `Some` when the P/D prefill peer is vLLM (pegaflow connector): offload
     /// query keys switch from kvbm lineage hashes to vLLM's prefix-cache hash
     /// scheme so this decode node can find the blocks vLLM registered.
-    pub vllm_compat: Option<Qwen3VllmCompatOptions>,
+    vllm_compat: Option<Qwen3VllmCompatOptions>,
 }
 
 /// Cross-instance P2P KV sharing (see `openinfer_kv_offload::P2pConfig`).

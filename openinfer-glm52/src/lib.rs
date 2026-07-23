@@ -44,13 +44,8 @@ use anyhow::Result;
 use anyhow::bail;
 use anyhow::ensure;
 use bytesize::ByteSize;
-pub use config::GLM52_DENSE_LAYERS;
-pub use config::GLM52_HIDDEN;
-pub use config::GLM52_INDEX_TOPK;
-pub use config::GLM52_LAYERS;
-pub use config::GLM52_ROUTED_EXPERTS;
-pub use config::GLM52_TOPK;
-pub use config::GLM52_VOCAB;
+pub(crate) use config::GLM52_LAYERS;
+pub(crate) use config::GLM52_ROUTED_EXPERTS;
 pub use config::probe_config_json;
 use openinfer_core::engine::EngineHandle;
 use openinfer_core::engine::KvCapacity;
@@ -129,8 +124,8 @@ pub struct Glm52LaunchOptions {
 /// One `--rank-hosts` entry: `host:port=ranks` (e.g. `10.13.84.7:19000=4`).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Glm52RankHostSpec {
-    pub addr: String,
-    pub ranks: usize,
+    addr: String,
+    ranks: usize,
 }
 
 impl std::str::FromStr for Glm52RankHostSpec {
@@ -186,7 +181,7 @@ impl Glm52MoeTopo {
     }
 
     #[must_use]
-    pub fn device_count(self) -> usize {
+    fn device_count(self) -> usize {
         match self {
             Self::Ep8 | Self::Tp8 => GLM52_EP_RANKS,
             Self::Ep4 | Self::Tp4 => 4,
@@ -218,7 +213,7 @@ impl Glm52MoeTopo {
     }
 
     #[must_use]
-    pub(crate) fn expected_ep_size(self) -> usize {
+    fn expected_ep_size(self) -> usize {
         match self {
             Self::Tp8 => GLM52_EP_RANKS,
             Self::Tp4 => 1,
@@ -227,20 +222,20 @@ impl Glm52MoeTopo {
     }
 
     #[must_use]
-    pub(crate) fn uses_ep_expert_bundles(self) -> bool {
+    fn uses_ep_expert_bundles(self) -> bool {
         !self.uses_tensor_replicated_moe()
     }
 
     /// Whole routed experts per rank of an expert-bundle topology (EP8 → 32,
     /// EP4 → 64). Meaningless for the tensor-replicated topologies.
     #[must_use]
-    pub(crate) fn ep_local_experts(self) -> usize {
+    fn ep_local_experts(self) -> usize {
         debug_assert!(self.uses_ep_expert_bundles());
         GLM52_ROUTED_EXPERTS / self.expected_ep_size()
     }
 
     #[must_use]
-    pub(crate) fn uses_tensor_replicated_moe(self) -> bool {
+    fn uses_tensor_replicated_moe(self) -> bool {
         matches!(self, Self::Tp8 | Self::Tp4)
     }
 }

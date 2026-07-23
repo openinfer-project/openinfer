@@ -328,7 +328,7 @@ impl DFlashDraftModel {
         self.config.max_position_embeddings
     }
 
-    pub(crate) fn mask_token_id(&self) -> u32 {
+    fn mask_token_id(&self) -> u32 {
         self.config.mask_token_id
     }
 

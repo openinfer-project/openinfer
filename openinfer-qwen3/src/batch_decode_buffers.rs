@@ -41,7 +41,7 @@ const SPLIT_KV_MAX_CHUNKS_PER_REQUEST: usize = 256; // split-KV workspace/guard 
 const SPLIT_KV_MAX_BATCH_SIZE: usize = 32;
 
 /// The split-KV config for `policy`: 64-token floor + per-policy cap (Tuned 64, Pin/PerToken 256).
-pub(crate) const fn split_kv_config(policy: NumericPolicy) -> SplitKvConfig {
+const fn split_kv_config(policy: NumericPolicy) -> SplitKvConfig {
     let max_chunks = match policy {
         NumericPolicy::Tuned => SPLIT_KV_TUNED_MAX_CHUNKS,
         NumericPolicy::Pin | NumericPolicy::PerToken => SPLIT_KV_MAX_CHUNKS_PER_REQUEST,
@@ -201,7 +201,7 @@ pub(crate) fn bucket_for(bs: usize) -> usize {
 /// Uses `HiddenStates` (2D) instead of `DeviceVec` (1D) — the "seq_len" dimension
 /// is actually the batch dimension (one token per request).
 pub(crate) struct BatchDecodeBuffers {
-    pub(crate) max_batch_size: usize,
+    max_batch_size: usize,
 
     // Per-layer intermediates [dim, max_batch_size]
     pub(crate) normed: HiddenStates,
@@ -211,7 +211,7 @@ pub(crate) struct BatchDecodeBuffers {
     pub(crate) attn_out: HiddenStates,
     pub(crate) attn_proj: HiddenStates,
     /// Fused QKV projection output [q_dim + 2*kv_dim, bs]
-    pub(crate) qkv_out: HiddenStates,
+    qkv_out: HiddenStates,
     /// Split MLP gate projection output [intermediate_size, bs].
     pub(crate) gate_out: HiddenStates,
     /// Split MLP up projection output [intermediate_size, bs].

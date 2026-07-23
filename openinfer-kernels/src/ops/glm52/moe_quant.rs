@@ -9,7 +9,7 @@ use half::bf16;
 use crate::ffi;
 use crate::tensor::DeviceContext;
 
-pub const GLM52_MOE_QUANT_GROUP_SIZE: usize = 128;
+const GLM52_MOE_QUANT_GROUP_SIZE: usize = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Glm52MoeQuantShape {
@@ -19,12 +19,12 @@ pub struct Glm52MoeQuantShape {
 }
 
 impl Glm52MoeQuantShape {
-    pub fn scale_cols(self) -> Result<usize> {
+    fn scale_cols(self) -> Result<usize> {
         self.validate()?;
         Ok(self.width / self.group_size)
     }
 
-    pub fn validate(self) -> Result<()> {
+    fn validate(self) -> Result<()> {
         ensure!(self.rows > 0, "GLM5.2 MoE quant rows must be positive");
         ensure!(self.width > 0, "GLM5.2 MoE quant width must be positive");
         ensure!(

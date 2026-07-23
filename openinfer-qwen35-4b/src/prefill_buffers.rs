@@ -20,35 +20,35 @@ use super::config::Config35;
 /// pipeline rather than one opaque kernel launch.
 pub struct GdrChunkwiseScratch35 {
     /// Chunk-local cumulative gate, fp32: [seq_len, num_value_heads]
-    pub g_cumsum: CudaSlice<f32>,
+    pub(crate) g_cumsum: CudaSlice<f32>,
     /// Beta values, fp32: [seq_len, num_value_heads]
-    pub beta: CudaSlice<f32>,
+    pub(crate) beta: CudaSlice<f32>,
 
     /// Expanded + normalized q in token-major layout: [seq_len, num_value_heads * key_dim]
-    pub q_expanded: HiddenStates,
+    pub(crate) q_expanded: HiddenStates,
     /// Expanded + normalized k in token-major layout: [seq_len, num_value_heads * key_dim]
-    pub k_expanded: HiddenStates,
+    pub(crate) k_expanded: HiddenStates,
     /// Raw v in token-major layout: [seq_len, num_value_heads * value_dim]
-    pub v_raw: HiddenStates,
+    pub(crate) v_raw: HiddenStates,
 
     /// Chunk attention matrix storage, fp32: [seq_len, num_value_heads, chunk_size]
-    pub a_tril: CudaSlice<f32>,
+    pub(crate) a_tril: CudaSlice<f32>,
     /// Inverse (I + A)^-1 in bf16: [seq_len, num_value_heads, chunk_size]
-    pub a_inv: CudaSlice<bf16>,
+    pub(crate) a_inv: CudaSlice<bf16>,
 
     /// Prepared W tensor in token-major layout: [seq_len, num_value_heads * key_dim]
-    pub w: HiddenStates,
+    pub(crate) w: HiddenStates,
     /// Prepared U tensor in token-major layout: [seq_len, num_value_heads * value_dim]
-    pub u: HiddenStates,
+    pub(crate) u: HiddenStates,
     /// New value tensor consumed by chunk output stage: [seq_len, num_value_heads * value_dim]
-    pub v_new: HiddenStates,
+    pub(crate) v_new: HiddenStates,
 
     /// Per-chunk recurrent state snapshots, fp32: [num_chunks, num_value_heads, key_dim, value_dim]
-    pub chunk_state: CudaSlice<f32>,
+    pub(crate) chunk_state: CudaSlice<f32>,
 }
 
 impl GdrChunkwiseScratch35 {
-    pub const CHUNK_SIZE: usize = 64;
+    pub(crate) const CHUNK_SIZE: usize = 64;
 
     pub(crate) fn new(ctx: &DeviceContext, config: &Config35, seq_len: usize) -> Result<Self> {
         Self::from_dims(
@@ -107,7 +107,7 @@ impl GdrChunkwiseScratch35 {
         })
     }
 
-    pub fn num_chunks(seq_len: usize) -> usize {
+    pub(crate) fn num_chunks(seq_len: usize) -> usize {
         seq_len.div_ceil(Self::CHUNK_SIZE)
     }
 

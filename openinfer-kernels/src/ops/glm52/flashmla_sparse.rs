@@ -9,16 +9,16 @@ use half::bf16;
 use crate::ffi;
 use crate::tensor::DeviceContext;
 
-pub const GLM52_FLASHMLA_SPARSE_BATCH_CAPACITY: usize = 128;
+const GLM52_FLASHMLA_SPARSE_BATCH_CAPACITY: usize = 128;
 pub const GLM52_FLASHMLA_SPARSE_HEADS: usize = 64;
 pub const GLM52_FLASHMLA_SPARSE_QK_HEAD_DIM: usize = 576;
 pub const GLM52_FLASHMLA_SPARSE_V_HEAD_DIM: usize = 512;
 pub const GLM52_FLASHMLA_SPARSE_PAGE_SIZE: usize = 64;
 pub const GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN: usize = 656;
 pub const GLM52_FLASHMLA_SPARSE_TOPK: usize = 2048;
-pub const GLM52_FLASHMLA_SPARSE_TOPK_BLOCK: usize = 64;
-pub const GLM52_FLASHMLA_SPARSE_SCHED_META_INTS: usize = 8;
-pub const GLM52_FLASHMLA_SPARSE_MAX_SM_PARTS: usize = 160;
+const GLM52_FLASHMLA_SPARSE_TOPK_BLOCK: usize = 64;
+const GLM52_FLASHMLA_SPARSE_SCHED_META_INTS: usize = 8;
+const GLM52_FLASHMLA_SPARSE_MAX_SM_PARTS: usize = 160;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Glm52FlashMlaSparseDecode {
@@ -30,7 +30,7 @@ pub struct Glm52FlashMlaSparseDecode {
 }
 
 impl Glm52FlashMlaSparseDecode {
-    pub fn validate(self) -> Result<()> {
+    fn validate(self) -> Result<()> {
         ensure!(
             (1..=GLM52_FLASHMLA_SPARSE_BATCH_CAPACITY).contains(&self.batch_size),
             "GLM5.2 FlashMLA sparse decode batch_size {} out of 1..={}",
@@ -63,7 +63,7 @@ impl Glm52FlashMlaSparseDecode {
         Ok(())
     }
 
-    pub fn q_len(self) -> usize {
+    fn q_len(self) -> usize {
         self.batch_size * GLM52_FLASHMLA_SPARSE_HEADS * GLM52_FLASHMLA_SPARSE_QK_HEAD_DIM
     }
 
@@ -71,7 +71,7 @@ impl Glm52FlashMlaSparseDecode {
         self.num_blocks * GLM52_FLASHMLA_SPARSE_PAGE_SIZE * GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN
     }
 
-    pub fn topk_indices_len(self) -> usize {
+    fn topk_indices_len(self) -> usize {
         self.batch_size * self.topk
     }
 
@@ -91,7 +91,7 @@ impl Glm52FlashMlaSparseDecode {
         self.batch_size * GLM52_FLASHMLA_SPARSE_HEADS * GLM52_FLASHMLA_SPARSE_V_HEAD_DIM
     }
 
-    pub fn split_count(self) -> usize {
+    fn split_count(self) -> usize {
         self.batch_size + self.num_sm_parts
     }
 

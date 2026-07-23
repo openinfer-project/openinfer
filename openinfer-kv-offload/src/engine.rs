@@ -78,24 +78,24 @@ pub struct P2pConfig {
 pub struct OffloadConfig {
     /// Stable identifier shared across this engine's lifetime so prefix blocks
     /// saved by one request are query-visible to the next.
-    pub instance_id: String,
+    instance_id: String,
     /// Content-addressing domain shared with P2P peers: two engines see each
     /// other's blocks iff their namespaces match. Callers derive it from
     /// whatever makes KV layouts interchange-safe (model, dtype, block
     /// geometry). Single-node offload can use any constant.
-    pub namespace: String,
+    namespace: String,
     /// CUDA device ordinal whose KV buffer this engine offloads.
-    pub device_id: i32,
+    device_id: i32,
     /// Host pinned-memory pool size in bytes (the CPU KV tier capacity).
-    pub pinned_pool_bytes: usize,
+    pinned_pool_bytes: usize,
     /// Back the pinned pool with hugepages (see [`HostConfig::use_hugepages`]).
     pub use_hugepages: bool,
     /// Worker threads for the embedded runtime that drives pegaflow's async
     /// save/query. Two is plenty: save is fire-and-forget, query is a brief
     /// memory-cache lookup.
-    pub runtime_threads: usize,
+    runtime_threads: usize,
     /// `Some` joins the cross-instance P2P mesh (see [`P2pConfig`]).
-    pub p2p: Option<P2pConfig>,
+    p2p: Option<P2pConfig>,
 }
 
 impl OffloadConfig {

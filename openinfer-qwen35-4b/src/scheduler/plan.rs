@@ -38,7 +38,7 @@ pub(super) struct PrefillQueueState {
 
 const DECODE_FINISH_WINDOW_TOKENS: usize = 4;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SlotCompaction {
     pub(super) moved_from: usize,
     pub(super) moved_to: usize,

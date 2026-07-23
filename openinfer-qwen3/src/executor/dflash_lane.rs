@@ -28,7 +28,7 @@ use crate::speculative::VerifyStepItem;
 
 pub(super) struct DFlashLaneState {
     pub(super) model: DFlashDraftModel,
-    pub(super) requests: HashMap<RequestId, DFlashRequestState>,
+    requests: HashMap<RequestId, DFlashRequestState>,
     /// Lane-level batched draft scratch, allocated once for the whole decode
     /// batch so the dense draft ops run once instead of once per request.
     scratch: DFlashBatchScratch,

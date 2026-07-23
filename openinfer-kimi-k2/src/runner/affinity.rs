@@ -18,7 +18,7 @@ const SCHEDULER_CPU: usize = 1;
 #[derive(Clone, Debug)]
 pub(super) struct KimiRankThreadPlacement {
     pub(super) rank: usize,
-    pub(super) rank_worker_cpu: CpuId,
+    rank_worker_cpu: CpuId,
 }
 
 #[derive(Clone, Debug)]

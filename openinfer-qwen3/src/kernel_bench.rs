@@ -22,7 +22,7 @@ use openinfer_kernels::tensor::HiddenStates;
 use serde::Deserialize;
 use serde::Serialize;
 
-pub const NUM_LAYERS: usize = 1;
+const NUM_LAYERS: usize = 1;
 pub const NUM_QO_HEADS: usize = 32;
 pub const NUM_KV_HEADS: usize = 8;
 pub const HEAD_DIM: usize = 128;
@@ -30,18 +30,18 @@ pub const PAGE_SIZE: usize = 16;
 pub const REPORT_ITERS: u64 = 128;
 // Mirror the default Tuned decode path (SPLIT_KV_TUNED_MAX_CHUNKS), not the opt-in
 // --batch-invariant Pin width (SPLIT_KV_MAX_CHUNKS_PER_REQUEST).
-pub const DEFAULT_SPLIT_KV_CHUNK_TOKENS: usize = crate::batch_decode_buffers::SPLIT_KV_CHUNK_TOKENS;
-pub const DEFAULT_SPLIT_KV_MAX_CHUNKS_PER_REQUEST: usize =
+const DEFAULT_SPLIT_KV_CHUNK_TOKENS: usize = crate::batch_decode_buffers::SPLIT_KV_CHUNK_TOKENS;
+const DEFAULT_SPLIT_KV_MAX_CHUNKS_PER_REQUEST: usize =
     crate::batch_decode_buffers::SPLIT_KV_TUNED_MAX_CHUNKS;
-pub const MEMORY_TRANSFERS_PER_CLOCK: f64 = 2.0;
-pub const CACHE_CLEAR_L2_MULTIPLIER: usize = 2;
-pub const CACHE_CLEAR_MIN_BYTES: usize = 128 * 1024 * 1024;
+const MEMORY_TRANSFERS_PER_CLOCK: f64 = 2.0;
+const CACHE_CLEAR_L2_MULTIPLIER: usize = 2;
+const CACHE_CLEAR_MIN_BYTES: usize = 128 * 1024 * 1024;
 
 pub use crate::batch_decode_buffers::SplitKvCsr;
 pub use crate::batch_decode_buffers::build_split_kv_csr;
 pub use crate::split_kv::SplitKvConfig;
 
-pub const DEFAULT_SPLIT_KV_CONFIG: SplitKvConfig = SplitKvConfig::new(
+const DEFAULT_SPLIT_KV_CONFIG: SplitKvConfig = SplitKvConfig::new(
     DEFAULT_SPLIT_KV_CHUNK_TOKENS,
     DEFAULT_SPLIT_KV_MAX_CHUNKS_PER_REQUEST,
 );
@@ -67,7 +67,7 @@ impl AttentionKernelVariant {
         }
     }
 
-    pub fn split_config(self) -> SplitKvConfig {
+    fn split_config(self) -> SplitKvConfig {
         match self {
             Self::NonPartition => DEFAULT_SPLIT_KV_CONFIG,
             Self::SplitKv(config) => config,
@@ -150,7 +150,7 @@ impl PrefillAttentionVariant {
         }
     }
 
-    pub fn cta_tile_q_override(self) -> i32 {
+    fn cta_tile_q_override(self) -> i32 {
         match self {
             Self::Default => 0,
             Self::CtaTileQ(tile_q) => tile_q as i32,
@@ -190,7 +190,7 @@ impl PrefillStage {
 pub struct DevicePeakBandwidth {
     pub memory_clock_khz: i32,
     pub memory_bus_width_bits: i32,
-    pub peak_bytes_per_sec: f64,
+    peak_bytes_per_sec: f64,
 }
 
 impl DevicePeakBandwidth {
@@ -304,7 +304,7 @@ impl AttentionDecodeCase {
         )
     }
 
-    pub fn new_with_split_config(
+    fn new_with_split_config(
         batch_size: usize,
         kv_len: usize,
         split_config: SplitKvConfig,
@@ -565,11 +565,7 @@ impl AttentionPrefillCase {
         Self::new(spec.shape.batch_size, spec.shape.seq_len, spec.variant)
     }
 
-    pub fn new(
-        batch_size: usize,
-        seq_len: usize,
-        variant: PrefillAttentionVariant,
-    ) -> Result<Self> {
+    fn new(batch_size: usize, seq_len: usize, variant: PrefillAttentionVariant) -> Result<Self> {
         anyhow::ensure!(
             batch_size > 0,
             "prefill batch_size must be greater than zero"
@@ -696,7 +692,7 @@ impl AttentionPrefillCase {
         self.ctx.ctx.cu_ctx().cast::<c_void>()
     }
 
-    pub fn launch_once(&mut self) -> Result<()> {
+    fn launch_once(&mut self) -> Result<()> {
         prefill_attention_paged_into(
             &self.ctx,
             &mut self.q,
@@ -937,7 +933,7 @@ impl SinglePrefillCase {
         Self::new(spec.shape.seq_len)
     }
 
-    pub fn new(seq_len: usize) -> Result<Self> {
+    fn new(seq_len: usize) -> Result<Self> {
         anyhow::ensure!(
             seq_len > 0,
             "single prefill seq_len must be greater than zero"
@@ -1048,15 +1044,15 @@ impl SinglePrefillCase {
 pub const HIDDEN_SIZE: usize = 2560;
 pub const INTERMEDIATE_SIZE: usize = 9728;
 pub const VOCAB_SIZE: usize = 151_936;
-pub const Q_DIM: usize = NUM_QO_HEADS * HEAD_DIM;
-pub const KV_DIM: usize = NUM_KV_HEADS * HEAD_DIM;
+const Q_DIM: usize = NUM_QO_HEADS * HEAD_DIM;
+const KV_DIM: usize = NUM_KV_HEADS * HEAD_DIM;
 /// Position span for the decode qk-norm-rope bench: mid-context decode is the
 /// common case, and the cache read is position-indexed, so the span only has
 /// to be large enough that positions don't all hit one cache line.
-pub const DENSE_ROPE_CACHE_TOKENS: usize = 8192;
+const DENSE_ROPE_CACHE_TOKENS: usize = 8192;
 /// Model fact (config.json `rms_norm_eps`), mirrored here like the head
 /// counts so the weight-free benches launch the production epsilon.
-pub const RMS_NORM_EPS: f32 = 1.0e-6;
+const RMS_NORM_EPS: f32 = 1.0e-6;
 /// Device-memory cap for the `gemm_lt_tune` weight-rotation copies of a
 /// projection-GEMM dense case; the actual copy count is derived from the L2
 /// sweep size so the tuner stays DRAM-cold, and this cap only protects
@@ -1089,7 +1085,7 @@ impl GemmProjection {
         })
     }
 
-    pub fn label(self) -> &'static str {
+    fn label(self) -> &'static str {
         match self {
             Self::QProj => "q_proj",
             Self::KvProj => "kv_proj",

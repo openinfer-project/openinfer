@@ -469,7 +469,7 @@ pub(super) fn build_slot_page_table(
 }
 
 impl KimiWorkerDecodeScratch {
-    pub(super) fn new(
+    fn new(
         ctx: &DeviceContext,
         batch_size: usize,
         dims: &crate::config::KimiLocalDims,

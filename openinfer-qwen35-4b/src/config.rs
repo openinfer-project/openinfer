@@ -336,10 +336,10 @@ mod tp_tests {
             hidden_size: 2560,
             intermediate_size: 9216,
             num_hidden_layers: 32,
-            vocab_size: 248320,
-            selection_vocab: 248320,
+            vocab_size: 248_320,
+            selection_vocab: 248_320,
             rms_norm_eps: 1e-6,
-            eos_token_id: 151645,
+            eos_token_id: 151_645,
             num_attention_heads: 16,
             num_key_value_heads: 4,
             head_dim: 256,
@@ -465,6 +465,8 @@ mod tp_tests {
 /// Schema kept identical to the pinned vLLM frontend; unread fields exist for
 /// payload type-checking.
 #[allow(dead_code)]
+// The tokenizer_config schema is bool-heavy by design.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Deserialize)]
 struct AddedTokenConfig {
     #[serde(default)]

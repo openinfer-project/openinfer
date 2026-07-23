@@ -6,6 +6,7 @@ pub(crate) fn load_tokenizer(model_path: &str) -> DynTokenizer {
         .unwrap_or_else(|err| panic!("Failed to load tokenizer for {model_path}: {err}"))
 }
 
+#[allow(dead_code)]
 pub(crate) fn tp2_device_ordinals() -> Vec<usize> {
     const ENV: &str = "OPENINFER_TEST_TP_DEVICES";
     let value = match std::env::var(ENV) {

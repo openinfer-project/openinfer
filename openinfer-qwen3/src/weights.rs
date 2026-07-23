@@ -41,20 +41,20 @@ pub const DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES: usize = 150 * 1024 * 1024;
 /// Default KV cache page (block) size in tokens.
 pub const DEFAULT_KV_PAGE_SIZE: usize = 16;
 /// Page sizes FlashInfer's paged attention kernels accept (see #545).
-pub(crate) const VALID_KV_PAGE_SIZES: &[usize] = &[16, 64];
+const VALID_KV_PAGE_SIZES: &[usize] = &[16, 64];
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Qwen3MemoryOptions {
     /// Mirrors vLLM's `gpu_memory_utilization`: the KV pool gets what remains
     /// inside this requested budget after weights, profiled non-KV runtime
     /// memory, and a small safety margin are accounted for.
-    pub gpu_memory_utilization: f64,
+    gpu_memory_utilization: f64,
     /// Extra bytes held back after the profile result to cover allocator
     /// fragmentation and small unprofiled runtime drift.
-    pub kv_cache_memory_margin_bytes: usize,
+    pub(crate) kv_cache_memory_margin_bytes: usize,
     /// KV cache page (block) size in tokens (`--kv-page-size`). FlashInfer
     /// constrains this to [`VALID_KV_PAGE_SIZES`]; 16 by default.
-    pub page_size: usize,
+    page_size: usize,
 }
 
 impl Qwen3MemoryOptions {
@@ -163,7 +163,7 @@ pub(crate) struct PackedLoraProjection {
     pub(crate) max_loras: usize,
     pub(crate) max_rank: usize,
     pub(crate) rank: usize,
-    pub(crate) in_dim: usize,
+    in_dim: usize,
     pub(crate) out_dim: usize,
     slot_ranks: Vec<usize>,
 }
@@ -286,7 +286,7 @@ impl PackedLoraProjection {
 }
 
 pub(crate) struct PackedLoraLayer {
-    pub(crate) projections: Vec<Option<PackedLoraProjection>>,
+    projections: Vec<Option<PackedLoraProjection>>,
 }
 
 impl PackedLoraLayer {
@@ -298,7 +298,7 @@ impl PackedLoraLayer {
         }
     }
 
-    pub(crate) fn projection(&self, kind: LoraProjectionKind) -> Option<&PackedLoraProjection> {
+    fn projection(&self, kind: LoraProjectionKind) -> Option<&PackedLoraProjection> {
         self.projections
             .get(kind.index())
             .and_then(Option::as_ref)
@@ -321,11 +321,11 @@ impl PackedLoraRegistry {
         }
     }
 
-    pub(crate) fn slot_for(&self, name: &str) -> Option<usize> {
+    fn slot_for(&self, name: &str) -> Option<usize> {
         self.slots_by_name.get(name).copied()
     }
 
-    pub(crate) fn layer(&self, layer_idx: usize) -> Option<&PackedLoraLayer> {
+    fn layer(&self, layer_idx: usize) -> Option<&PackedLoraLayer> {
         self.packed_layers.get(layer_idx)
     }
 
@@ -362,18 +362,18 @@ pub(crate) struct Qwen3Model {
     pub(super) ctx: DeviceContext,
     pub(super) config: Config,
     pub(super) embed_tokens: DeviceMatrix,
-    pub(super) lm_head: Option<DeviceMatrix>,
+    lm_head: Option<DeviceMatrix>,
     pub(super) layers: Vec<TransformerBlock>,
     pub(super) norm: DeviceVec,
     pub(super) cos_cache: DeviceVec,
     pub(super) sin_cache: DeviceVec,
     pub(super) enable_cuda_graph: bool,
     pub(super) tensor_parallel: TensorParallelConfig,
-    pub(super) tp_comm: Option<Comm>,
-    pub(super) lora_adapters: HashMap<String, DeviceLoraAdapter>,
-    pub(super) packed_lora: PackedLoraRegistry,
-    pub(super) max_loras: usize,
-    pub(super) max_lora_rank: usize,
+    tp_comm: Option<Comm>,
+    lora_adapters: HashMap<String, DeviceLoraAdapter>,
+    packed_lora: PackedLoraRegistry,
+    max_loras: usize,
+    max_lora_rank: usize,
 }
 
 // SAFETY: Each model instance is pinned to a single CUDA device and is only
@@ -757,11 +757,7 @@ impl Qwen3Model {
         Ok(())
     }
 
-    pub(crate) fn lora_layer_for(
-        &self,
-        name: &str,
-        layer_idx: usize,
-    ) -> Option<(&DeviceLoraLayer, f32)> {
+    fn lora_layer_for(&self, name: &str, layer_idx: usize) -> Option<(&DeviceLoraLayer, f32)> {
         self.lora_adapters.get(name).and_then(|adapter| {
             adapter
                 .layers

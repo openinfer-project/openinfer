@@ -64,6 +64,8 @@ struct LayerGraphScratch {
     mlp: LayerMlpGraphScratch,
 }
 
+// Per-layer probe scratch, one at a time; the size asymmetry costs nothing.
+#[allow(clippy::large_enum_variant)]
 enum LayerMlpGraphScratch {
     Dense(DenseMlpForwardScratch),
     Moe(FixedTopologyMoeScratch),

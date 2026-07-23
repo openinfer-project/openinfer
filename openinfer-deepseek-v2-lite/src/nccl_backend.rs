@@ -1472,9 +1472,7 @@ fn validate_nccl_version_for_compute_capabilities(
     version_code: c_int,
     compute_capabilities: &[(i32, i32)],
 ) -> Result<()> {
-    let has_sm120 = compute_capabilities
-        .iter()
-        .any(|compute_capability| *compute_capability == (12, 0));
+    let has_sm120 = compute_capabilities.contains(&(12, 0));
     ensure!(
         !has_sm120 || version_code >= MIN_SM120_NCCL_VERSION,
         "DeepSeek-V2-Lite NCCL EP2 on sm_120 requires NCCL >= {}, loaded {}. Set OPENINFER_NCCL_LIB_DIR to a compatible wheel lib directory or OPENINFER_NCCL_PYTHON to its Python executable",

@@ -21,6 +21,9 @@ const ROWS: usize = 4;
 const SHARD_ROWS: usize = 38_720;
 
 #[test]
+// Golden-value smoke: winning-value comparisons below are meant to be exact,
+// not an epsilon tolerance.
+#[allow(clippy::float_cmp)]
 fn glm52_vocab_parallel_pack_unpack_selects_global_top1() {
     let Ok(ctx) = DeviceContext::new() else {
         eprintln!("skip: no CUDA device");

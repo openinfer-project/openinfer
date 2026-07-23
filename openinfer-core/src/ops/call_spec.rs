@@ -41,7 +41,7 @@ pub enum PagedDecodePath {
 }
 
 impl PagedDecodePath {
-    pub fn label(self) -> String {
+    fn label(self) -> String {
         match self {
             Self::NonPartition => "non_partition".to_string(),
             Self::SplitKv { .. } => "split_kv".to_string(),
@@ -237,50 +237,50 @@ pub fn all_reduce_hidden_call(label: impl Into<String>, hidden: usize, batch: us
         .attr("no_op", true.to_string())
 }
 
-pub fn hidden_batch<A: AxisTag>(dim: usize, batch: usize) -> TensorSpec {
+fn hidden_batch<A: AxisTag>(dim: usize, batch: usize) -> TensorSpec {
     TensorSpec::new::<Bf16, HiddenStatesLayout>([
         AxisSpec::new::<A>(dim),
         AxisSpec::new::<Batch>(batch),
     ])
 }
 
-pub fn weight_matrix(out: usize, in_dim: usize) -> TensorSpec {
+fn weight_matrix(out: usize, in_dim: usize) -> TensorSpec {
     TensorSpec::new::<Bf16, RowMajor2D>([
         AxisSpec::new::<OutDim>(out),
         AxisSpec::new::<InDim>(in_dim),
     ])
 }
 
-pub fn weight_matrix_total(out_total: usize, in_dim: usize) -> TensorSpec {
+fn weight_matrix_total(out_total: usize, in_dim: usize) -> TensorSpec {
     TensorSpec::new::<Bf16, RowMajor2D>([
         AxisSpec::new::<OutTotal>(out_total),
         AxisSpec::new::<InDim>(in_dim),
     ])
 }
 
-pub fn vector<A: AxisTag, D: openinfer_kernels::tensor::DTypeTag>(dim: usize) -> TensorSpec {
+fn vector<A: AxisTag, D: openinfer_kernels::tensor::DTypeTag>(dim: usize) -> TensorSpec {
     TensorSpec::new::<D, Contiguous1D>([AxisSpec::new::<A>(dim)])
 }
 
-pub fn embed_table(vocab: usize, hidden: usize) -> TensorSpec {
+fn embed_table(vocab: usize, hidden: usize) -> TensorSpec {
     TensorSpec::new::<Bf16, RowMajor2D>([
         AxisSpec::new::<Vocab>(vocab),
         AxisSpec::new::<Hidden>(hidden),
     ])
 }
 
-pub fn token_ids(batch: usize) -> TensorSpec {
+fn token_ids(batch: usize) -> TensorSpec {
     TensorSpec::new::<U32, Contiguous1D>([AxisSpec::new::<Token>(batch)])
 }
 
-pub fn rope_cache(seq: usize, head_dim: usize) -> TensorSpec {
+fn rope_cache(seq: usize, head_dim: usize) -> TensorSpec {
     TensorSpec::new::<Bf16, Contiguous1D>([
         AxisSpec::new::<Seq>(seq),
         AxisSpec::new::<RopeDim>(head_dim),
     ])
 }
 
-pub fn paged_kv(spec: PagedDecodeCallSpec) -> TensorSpec {
+fn paged_kv(spec: PagedDecodeCallSpec) -> TensorSpec {
     TensorSpec::new::<Bf16, PagedKvPageFirst>([
         AxisSpec::new::<Page>(spec.total_pages),
         AxisSpec::new::<Layer>(spec.num_layers),
@@ -291,10 +291,10 @@ pub fn paged_kv(spec: PagedDecodeCallSpec) -> TensorSpec {
     ])
 }
 
-pub fn meta_i32<A: AxisTag>(size: usize) -> TensorSpec {
+fn meta_i32<A: AxisTag>(size: usize) -> TensorSpec {
     TensorSpec::new::<I32, Contiguous1D>([AxisSpec::new::<A>(size)])
 }
 
-pub fn meta_u8<A: AxisTag>(size: usize) -> TensorSpec {
+fn meta_u8<A: AxisTag>(size: usize) -> TensorSpec {
     TensorSpec::new::<openinfer_kernels::tensor::U8, Contiguous1D>([AxisSpec::new::<A>(size)])
 }
