@@ -273,6 +273,7 @@ async fn one_http_endpoint_exports_per_engine_scheduler_metrics() -> Result<()> 
             kv_total_blocks: 100,
             num_running_reqs: 1,
             num_waiting_reqs: 0,
+            ..LoadSnapshot::default()
         },
     )?;
     server.publish_load(
@@ -282,6 +283,7 @@ async fn one_http_endpoint_exports_per_engine_scheduler_metrics() -> Result<()> 
             kv_total_blocks: 100,
             num_running_reqs: 0,
             num_waiting_reqs: 2,
+            ..LoadSnapshot::default()
         },
     )?;
     wait_for_metrics(
@@ -304,6 +306,7 @@ async fn one_http_endpoint_exports_per_engine_scheduler_metrics() -> Result<()> 
             kv_total_blocks: 100,
             num_running_reqs: 3,
             num_waiting_reqs: 4,
+            ..LoadSnapshot::default()
         },
     )?;
     server.publish_load(
@@ -313,6 +316,7 @@ async fn one_http_endpoint_exports_per_engine_scheduler_metrics() -> Result<()> 
             kv_total_blocks: 100,
             num_running_reqs: 5,
             num_waiting_reqs: 6,
+            ..LoadSnapshot::default()
         },
     )?;
     wait_for_metrics(

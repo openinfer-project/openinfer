@@ -125,6 +125,7 @@ fn resolve_prefill_outputs(
                 scheduled_at_unix_s,
                 prompt_tokens: prompt_len,
                 cached_tokens: result.cached_tokens,
+                prefix_cache_queried: result.prefix_cache_queried,
             });
         }
 

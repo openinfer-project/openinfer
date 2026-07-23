@@ -95,6 +95,9 @@ pub struct PrefillStepItem {
     /// Set by the executor after matching; the forward pass only computes
     /// the remaining suffix.
     pub(crate) cached_tokens: usize,
+    /// Whether this step performed the request's one local prefix-cache lookup.
+    /// False for later chunks, echo requests, and cache-disabled execution.
+    pub(crate) prefix_cache_queried: bool,
     /// Scheduler-set cap on prompt tokens forwarded this step (chunked
     /// prefill). The executor clamps it to the tokens actually remaining.
     pub(crate) chunk_budget: usize,
@@ -125,6 +128,7 @@ impl PrefillStepItem {
             echo,
             lora_adapter: None,
             cached_tokens: 0,
+            prefix_cache_queried: false,
             chunk_budget: usize::MAX,
             chunk_start: 0,
             chunk_tokens,
@@ -307,6 +311,7 @@ fn build_prefill_request_results(
             first_token_logprob: first_token_logprobs[i].take(),
             prompt_logprobs,
             cached_tokens: req.cached_tokens,
+            prefix_cache_queried: req.prefix_cache_queried,
             completed,
             prefill_pos: req.chunk_start + req.chunk_tokens,
         });
@@ -805,6 +810,10 @@ pub struct PrefillRequestResult {
     pub prompt_logprobs: Option<Vec<Option<TokenLogprob>>>,
     /// Prompt tokens served from the prefix cache (KV reused, not recomputed).
     pub cached_tokens: usize,
+    /// Whether the executor actually queried the local prefix cache for this
+    /// request. The scheduler uses this to exclude echo and cache-disabled
+    /// prefills from the aggregate query denominator.
+    pub prefix_cache_queried: bool,
     /// Whether the prompt is fully prefilled. When false this step ran a
     /// non-final chunk and `first_token` is meaningless.
     pub completed: bool,
@@ -1820,6 +1829,7 @@ impl Qwen3Executor {
             // Echo needs logits for every prompt position; cached positions
             // are never forwarded, so echo requests prefill from scratch.
             if self.prefix_cache_enabled && !req.echo {
+                req.prefix_cache_queried = true;
                 req.cached_tokens = rkv.match_and_add_prefix(self.kv_mgr.pool())?;
             }
             self.request_kvs.insert(req.request_id, rkv);

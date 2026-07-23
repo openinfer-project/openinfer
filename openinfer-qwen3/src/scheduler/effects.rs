@@ -5,6 +5,7 @@ use openinfer_core::engine::TokenSink;
 
 use super::ActiveRequestState;
 use super::PendingRequest;
+use super::PrefixCacheTotals;
 use super::TokenEvent;
 use crate::executor::RequestId;
 
@@ -24,6 +25,7 @@ pub(super) struct ScheduledEffect {
     pub(super) scheduled_at_unix_s: f64,
     pub(super) prompt_tokens: usize,
     pub(super) cached_tokens: usize,
+    pub(super) prefix_cache_queried: bool,
 }
 
 pub(super) enum PendingEffect {
@@ -110,6 +112,7 @@ pub(super) fn apply_effects(
     executor: &mut impl crate::executor::ModelExecutor,
     active: &mut Vec<ActiveRequestState>,
     prefilling: &mut Vec<PendingRequest>,
+    prefix_cache_totals: &mut PrefixCacheTotals,
     effects: StepEffects,
 ) {
     // `Finished` events are not sent inline: they are collected here and
@@ -121,6 +124,9 @@ pub(super) fn apply_effects(
     let mut finishes: Vec<(TokenSink, TokenEvent)> = Vec::new();
 
     for scheduled in effects.scheduled {
+        if scheduled.prefix_cache_queried {
+            prefix_cache_totals.record(scheduled.prompt_tokens, scheduled.cached_tokens);
+        }
         let _ = scheduled.token_tx.send(TokenEvent::Scheduled {
             queued_at_unix_s: scheduled
                 .queued_at_unix_s

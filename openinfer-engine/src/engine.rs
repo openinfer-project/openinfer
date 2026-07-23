@@ -352,6 +352,16 @@ pub struct LoadSnapshot {
     pub num_running_reqs: u64,
     /// Requests admitted but not yet running (KV pressure, prefetch wait).
     pub num_waiting_reqs: u64,
+    /// Prompt tokens queried against the local prefix cache since engine start.
+    ///
+    /// This is a monotonic total because the snapshot rides a coalescing watch
+    /// channel. Consumers that feed delta counters must difference consecutive
+    /// snapshots rather than forwarding this value directly.
+    pub prefix_cache_queries_total: u64,
+    /// Prompt tokens served from the local prefix cache since engine start.
+    /// Monotonic for the same coalescing-safe reason as
+    /// [`Self::prefix_cache_queries_total`].
+    pub prefix_cache_hits_total: u64,
 }
 
 /// One full KV block that just became reusable from this engine's prefix cache.

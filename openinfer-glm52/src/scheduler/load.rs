@@ -36,6 +36,7 @@ pub(super) fn publish_load(
             kv_total_blocks: kv_total_blocks as u64,
             num_running_reqs: slots[rank].iter().flatten().count() as u64,
             num_waiting_reqs: pending[rank].len() as u64,
+            ..LoadSnapshot::default()
         });
     }
 }
