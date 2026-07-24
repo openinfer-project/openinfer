@@ -19,7 +19,7 @@ use openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_PAGE_SIZE;
 use openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_TOPK;
 use openinfer_kernels::ops::Glm52FlashMlaSparseDecode;
 use openinfer_kernels::ops::Glm52IndexerCacheLayout;
-use openinfer_kernels::ops::add_into;
+use openinfer_kernels::ops::add_scaled_bf16_into;
 use openinfer_kernels::ops::glm52_ep_deepep_unique_id;
 use openinfer_kernels::ops::glm52_flashmla_sparse_decode_num_sm_parts;
 use openinfer_kernels::tensor::DeviceContext;
@@ -53,7 +53,7 @@ use crate::model::INDEX_CACHE_BLOCK;
 use crate::model::NUM_SMS;
 use crate::model::rope_tables;
 use crate::moe_decode::HIDDEN;
-use crate::moe_decode::run_router;
+use crate::moe_decode::run_ep_router;
 use crate::moe_ep8::Glm52MoeEp8State;
 use crate::moe_ep8::glm52_moe_ep8_routed_forward;
 use crate::scratch::Glm52DecodeScratch;
@@ -127,7 +127,7 @@ fn layer_moe_ep8_oracle_gate() -> Result<()> {
     let mut ep8 = Glm52MoeEp8State::new(&ctx, &unique_id, EP_RANKS, 0)?;
     // Replay the layer once per global-token bucket, in the same order as the
     // expert threads' collective loops.
-    let outputs: Result<Vec<Vec<f32>>> = GLOBAL_TOKEN_BUCKETS
+    let outputs: Result<Vec<LayerEp8Outputs>> = GLOBAL_TOKEN_BUCKETS
         .into_iter()
         .map(|global_tokens| {
             run_layer_prefill_ep8(
@@ -155,7 +155,7 @@ fn layer_moe_ep8_oracle_gate() -> Result<()> {
     for (outputs, global_tokens) in outputs?.iter().zip(GLOBAL_TOKEN_BUCKETS) {
         assert_layer_probes(
             &format!("layer6/moe/ep8/g{global_tokens}"),
-            outputs,
+            &outputs.hidden,
             MOE_ORACLE_LAYER_PROBES,
             MOE_ORACLE_LAYER_TOL,
             4,
@@ -167,14 +167,52 @@ fn layer_moe_ep8_oracle_gate() -> Result<()> {
 /// The EP8 variant of the gate's prefill-via-decode walk: same decode
 /// environment as `oracle::layer::run_layer_prefill`, with the MLP half
 /// driven through the collective.
-fn run_layer_prefill_ep8(
+pub(super) struct LayerEp8Outputs {
+    pub(super) hidden: Vec<f32>,
+    pub(super) post_attention: Vec<f32>,
+    pub(super) mlp: Vec<f32>,
+}
+
+fn run_moe_ep8_half(
+    ctx: &DeviceContext,
+    moe: &crate::moe_ep8::Glm52MoeEp8LayerWeights,
+    ep8: &mut Glm52MoeEp8State,
+    scratch: &mut Glm52DecodeScratch,
+    global_tokens: usize,
+) -> Result<()> {
+    let route = run_ep_router(ctx, &moe.router, scratch.layer.normed2.data())?;
+    let dispatched = glm52_moe_ep8_routed_forward(
+        ctx,
+        ep8,
+        &moe.bank,
+        Some((scratch.layer.normed2.data(), &route, 1)),
+        global_tokens,
+    )?;
+    ensure!(dispatched, "rank-0 EP8 MoE returned no combined output");
+    moe.shared.forward_into(
+        ctx,
+        scratch.layer.normed2.data(),
+        &mut scratch.shared_mlp,
+        scratch.layer.shared_out.data_mut(),
+    )?;
+    add_scaled_bf16_into(
+        ctx,
+        ep8.combined(),
+        crate::config::GLM52_ROUTED_SCALING_FACTOR as f32,
+        scratch.layer.shared_out.data(),
+        HIDDEN,
+        scratch.layer.mlp_out.data_mut(),
+    )
+}
+
+pub(super) fn run_layer_prefill_ep8(
     ctx: &DeviceContext,
     w: &crate::layer::Glm52DecoderLayerWeights,
     ep8: &mut Glm52MoeEp8State,
     hidden_host: &[bf16],
     oracle_ctx: usize,
     global_tokens: usize,
-) -> Result<Vec<f32>> {
+) -> Result<LayerEp8Outputs> {
     let Glm52LayerMlp::MoeEp8(moe) = &w.mlp else {
         anyhow::bail!("ep8 gate requires the MoeEp8 layer weights");
     };
@@ -221,7 +259,9 @@ fn run_layer_prefill_ep8(
     let mut scratch =
         Glm52DecodeScratch::new(ctx, &contract, mqa_shape, crate::config::GLM52_HEADS, false)?;
 
-    let mut outputs = Vec::with_capacity(oracle_ctx * HIDDEN);
+    let mut hidden_outputs = Vec::with_capacity(oracle_ctx * HIDDEN);
+    let mut post_attention_outputs = Vec::with_capacity(oracle_ctx * HIDDEN);
+    let mut mlp_outputs = Vec::with_capacity(oracle_ctx * HIDDEN);
     for position in 0..oracle_ctx {
         ctx.stream.memcpy_htod(
             &hidden_host[position * HIDDEN..(position + 1) * HIDDEN],
@@ -269,7 +309,117 @@ fn run_layer_prefill_ep8(
             true,
             None,
         )?;
-        let route = run_router(ctx, &moe.router, scratch.layer.normed2.data())?;
+        run_moe_ep8_half(ctx, moe, ep8, &mut scratch, global_tokens)?;
+        let post_attention_host = ctx.stream.clone_dtoh(scratch.layer.attn[0].data())?;
+        post_attention_outputs.extend(post_attention_host.iter().map(|v| v.to_f32()));
+        let mlp_host = ctx.stream.clone_dtoh(scratch.layer.mlp_out.data())?;
+        mlp_outputs.extend(mlp_host.iter().map(|v| v.to_f32()));
+        glm52_layer_finish(ctx, &mut scratch, 0, false)?;
+        let out_host = ctx.stream.clone_dtoh(scratch.hidden.data())?;
+        hidden_outputs.extend(out_host.iter().map(|v| v.to_f32()));
+    }
+    Ok(LayerEp8Outputs {
+        hidden: hidden_outputs,
+        post_attention: post_attention_outputs,
+        mlp: mlp_outputs,
+    })
+}
+
+pub(super) struct MoeEp8RowsOutputs {
+    pub(super) mlp: Vec<f32>,
+    pub(super) normed: Vec<f32>,
+    pub(super) topk_ids: Vec<i32>,
+    pub(super) topk_weights: Vec<f32>,
+    pub(super) routed: Vec<f32>,
+    pub(super) shared_gate_up: Vec<f32>,
+    pub(super) shared_silu: Vec<f32>,
+    pub(super) shared: Vec<f32>,
+}
+
+pub(super) fn run_moe_ep8_rows(
+    ctx: &DeviceContext,
+    w: &crate::layer::Glm52DecoderLayerWeights,
+    ep8: &mut Glm52MoeEp8State,
+    post_attention_host: &[bf16],
+    reference_normed_host: &[bf16],
+    rows: usize,
+    global_tokens: usize,
+) -> Result<MoeEp8RowsOutputs> {
+    ensure!(
+        post_attention_host.len() == rows * HIDDEN,
+        "EP8 MoE oracle input has {} elements, expected {}",
+        post_attention_host.len(),
+        rows * HIDDEN
+    );
+    ensure!(
+        reference_normed_host.len() == rows * HIDDEN,
+        "EP8 MoE oracle reference norm has {} elements, expected {}",
+        reference_normed_host.len(),
+        rows * HIDDEN
+    );
+    let Glm52LayerMlp::MoeEp8(moe) = &w.mlp else {
+        anyhow::bail!("EP8 MoE oracle requires MoeEp8 layer weights");
+    };
+    let contract = Glm52FlashMlaSparseDecode {
+        batch_size: 1,
+        num_blocks: 1,
+        topk: GLM52_FLASHMLA_SPARSE_TOPK,
+        num_sm_parts: glm52_flashmla_sparse_decode_num_sm_parts()?,
+        sm_scale: GLM52_SM_SCALE,
+    };
+    let index_cache_layout = Glm52IndexerCacheLayout {
+        cache_blocks: 1,
+        cache_block_size: INDEX_CACHE_BLOCK,
+        cache_block_stride_bytes: INDEX_CACHE_BLOCK * (GLM52_INDEX_HEAD_DIM + 4),
+    };
+    let mqa_shape =
+        Glm52IndexerScratch::decode_shape(1, index_cache_layout, 1, NUM_SMS, rows.max(1));
+    let mut scratch =
+        Glm52DecodeScratch::new(ctx, &contract, mqa_shape, crate::config::GLM52_HEADS, false)?;
+    let mut outputs = MoeEp8RowsOutputs {
+        mlp: Vec::with_capacity(post_attention_host.len()),
+        normed: Vec::with_capacity(post_attention_host.len()),
+        topk_ids: Vec::with_capacity(rows * crate::config::GLM52_TOPK),
+        topk_weights: Vec::with_capacity(rows * crate::config::GLM52_TOPK),
+        routed: Vec::with_capacity(post_attention_host.len()),
+        shared_gate_up: Vec::with_capacity(
+            rows * 2 * crate::moe_decode::GLM52_SHARED_EXPERT_INTERMEDIATE,
+        ),
+        shared_silu: Vec::with_capacity(rows * crate::moe_decode::GLM52_SHARED_EXPERT_INTERMEDIATE),
+        shared: Vec::with_capacity(post_attention_host.len()),
+    };
+    for (row, reference_normed) in post_attention_host
+        .chunks_exact(HIDDEN)
+        .zip(reference_normed_host.chunks_exact(HIDDEN))
+    {
+        ctx.stream.memcpy_htod(row, scratch.hidden.data_mut())?;
+        openinfer_kernels::ops::rms_norm_rows_into(
+            ctx,
+            scratch.hidden.data(),
+            &w.post_attn_ln,
+            crate::config::GLM52_RMS_EPS,
+            HIDDEN,
+            1,
+            scratch.layer.normed2.data_mut(),
+        )?;
+        let normed = ctx.stream.clone_dtoh(scratch.layer.normed2.data())?;
+        outputs
+            .normed
+            .extend(normed.iter().map(|value| value.to_f32()));
+        // Feed the exact vLLM norm output into all downstream stages. This
+        // keeps the RMSNorm delta from contaminating router and expert-kernel
+        // diagnostics.
+        ctx.stream
+            .memcpy_htod(reference_normed, scratch.layer.normed2.data_mut())?;
+        let route = run_ep_router(ctx, &moe.router, scratch.layer.normed2.data())?;
+        let topk_ids = ctx.stream.clone_dtoh(&route.topk_idx)?;
+        outputs
+            .topk_ids
+            .extend_from_slice(&topk_ids[..crate::config::GLM52_TOPK]);
+        let topk_weights = ctx.stream.clone_dtoh(&route.topk_weight)?;
+        outputs
+            .topk_weights
+            .extend_from_slice(&topk_weights[..crate::config::GLM52_TOPK]);
         let dispatched = glm52_moe_ep8_routed_forward(
             ctx,
             ep8,
@@ -278,22 +428,41 @@ fn run_layer_prefill_ep8(
             global_tokens,
         )?;
         ensure!(dispatched, "rank-0 EP8 MoE returned no combined output");
+        let routed = ctx.stream.clone_dtoh(ep8.combined())?;
+        outputs.routed.extend(routed[..HIDDEN].iter().map(|value| {
+            bf16::from_f32(value.to_f32() * crate::config::GLM52_ROUTED_SCALING_FACTOR as f32)
+                .to_f32()
+        }));
         moe.shared.forward_into(
             ctx,
             scratch.layer.normed2.data(),
             &mut scratch.shared_mlp,
             scratch.layer.shared_out.data_mut(),
         )?;
-        add_into(
+        let shared_gate_up = ctx.stream.clone_dtoh(scratch.shared_mlp.gate_up())?;
+        outputs
+            .shared_gate_up
+            .extend(shared_gate_up.iter().map(|value| value.to_f32()));
+        let shared_silu = ctx.stream.clone_dtoh(scratch.shared_mlp.silu_out())?;
+        outputs
+            .shared_silu
+            .extend(shared_silu.iter().map(|value| value.to_f32()));
+        let shared = ctx.stream.clone_dtoh(scratch.layer.shared_out.data())?;
+        outputs
+            .shared
+            .extend(shared.iter().map(|value| value.to_f32()));
+        add_scaled_bf16_into(
             ctx,
             ep8.combined(),
+            crate::config::GLM52_ROUTED_SCALING_FACTOR as f32,
             scratch.layer.shared_out.data(),
             HIDDEN,
             scratch.layer.mlp_out.data_mut(),
         )?;
-        glm52_layer_finish(ctx, &mut scratch, 0, false)?;
-        let out_host = ctx.stream.clone_dtoh(scratch.hidden.data())?;
-        outputs.extend(out_host.iter().map(|v| v.to_f32()));
+        let output = ctx.stream.clone_dtoh(scratch.layer.mlp_out.data())?;
+        outputs
+            .mlp
+            .extend(output.iter().map(|value| value.to_f32()));
     }
     Ok(outputs)
 }

@@ -119,7 +119,9 @@ unsafe extern "C" {
         masked_out: *const Half,
         masked_m: *const i32,
         expert_offsets: *const i64,
+        row_weights: *const f32,
         aligned_out: *mut Half,
+        aligned_rows: i32,
         n: i32,
         stream: CUstream,
     ) -> CUresult;
@@ -282,9 +284,8 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn glm52_silu_and_mul_weighted_per_token_group_quant_bf16_masked_cuda(
+    pub fn glm52_silu_and_mul_per_token_group_quant_bf16_masked_cuda(
         input: *const Half,
-        topk_weights: *const f32,
         output: *mut u8,
         scales: *mut f32,
         rows: i32,

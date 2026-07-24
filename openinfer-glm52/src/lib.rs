@@ -26,6 +26,8 @@ mod moe_ep8;
 mod moe_ep_wo;
 mod moe_tp;
 #[cfg(test)]
+mod mtp;
+#[cfg(test)]
 mod oracle;
 mod prefill_tp;
 mod remote;

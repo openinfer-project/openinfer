@@ -20,6 +20,24 @@ __global__ void add_kernel(
   }
 }
 
+__global__ void add_scaled_bf16_kernel(
+    const __nv_bfloat16 *__restrict__ routed,
+    float scale,
+    const __nv_bfloat16 *__restrict__ shared,
+    __nv_bfloat16 *__restrict__ out,
+    int n) {
+  for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+       idx < n;
+       idx += gridDim.x * blockDim.x) {
+    // Match vLLM's two BF16 operations: scale the routed output in place,
+    // then add the shared expert.
+    __nv_bfloat16 scaled = __float2bfloat16(
+        __bfloat162float(routed[idx]) * scale);
+    out[idx] = __float2bfloat16(
+        __bfloat162float(shared[idx]) + __bfloat162float(scaled));
+  }
+}
+
 __global__ void scaled_add_rows_kernel(
     const __nv_bfloat16 *__restrict__ delta,
     float scale,
@@ -80,6 +98,21 @@ __global__ void copy_hidden_rows_kernel(
     int row = idx % rows;
     dst[(size_t)token * dst_hidden_dim + row_offset + row] =
         src[(size_t)token * src_hidden_dim + row];
+  }
+}
+
+__global__ void mask_position_zero_rows_kernel(
+    const __nv_bfloat16 *__restrict__ src,
+    const uint32_t *__restrict__ positions,
+    __nv_bfloat16 *__restrict__ dst,
+    int hidden_dim,
+    int rows) {
+  int total = hidden_dim * rows;
+  for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+       idx < total;
+       idx += gridDim.x * blockDim.x) {
+    int row = idx / hidden_dim;
+    dst[idx] = positions[row] == 0 ? __float2bfloat16(0.0f) : src[idx];
   }
 }
 
@@ -355,6 +388,21 @@ CUresult add_cuda(
   return (CUresult)cudaGetLastError();
 }
 
+CUresult add_scaled_bf16_cuda(
+    const __nv_bfloat16 *routed, float scale,
+    const __nv_bfloat16 *shared, __nv_bfloat16 *out,
+    int n, cudaStream_t stream) {
+  if (routed == nullptr || shared == nullptr || out == nullptr ||
+      !isfinite(scale) || n <= 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  int block = 256;
+  int grid = (n + block - 1) / block;
+  add_scaled_bf16_kernel<<<grid, block, 0, stream>>>(
+      routed, scale, shared, out, n);
+  return (CUresult)cudaGetLastError();
+}
+
 CUresult scaled_add_rows_cuda(
     const __nv_bfloat16 *delta,
     float scale,
@@ -419,6 +467,25 @@ CUresult copy_hidden_rows_cuda(
   int grid = (total + block - 1) / block;
   copy_hidden_rows_kernel<<<grid, block, 0, stream>>>(
       src, dst, src_hidden_dim, dst_hidden_dim, row_offset, rows, seq_len);
+  return (CUresult)cudaGetLastError();
+}
+
+CUresult mask_position_zero_rows_cuda(
+    const __nv_bfloat16 *src,
+    const uint32_t *positions,
+    __nv_bfloat16 *dst,
+    int hidden_dim,
+    int rows,
+    cudaStream_t stream) {
+  if (src == nullptr || positions == nullptr || dst == nullptr ||
+      hidden_dim <= 0 || rows <= 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  int total = hidden_dim * rows;
+  int block = 256;
+  int grid = (total + block - 1) / block;
+  mask_position_zero_rows_kernel<<<grid, block, 0, stream>>>(
+      src, positions, dst, hidden_dim, rows);
   return (CUresult)cudaGetLastError();
 }
 

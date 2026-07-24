@@ -110,19 +110,24 @@ __global__ void deepgemm_grouped_fp8_metadata_kernel(
 __global__ void masked_out_to_aligned_kernel(
     const __nv_bfloat16* __restrict__ masked_out,
     const int* __restrict__ masked_m, const int64_t* __restrict__ offsets,
-    __nv_bfloat16* __restrict__ aligned_out, int n) {
+    const float* __restrict__ row_weights,
+    __nv_bfloat16* __restrict__ aligned_out, int aligned_rows, int n) {
   const int g = blockIdx.x;
   const int r = blockIdx.y;
   if (r >= masked_m[g]) {
     return;
   }
-  const uint2* src = reinterpret_cast<const uint2*>(
-      masked_out + ((size_t)g * kMaskedCap + r) * n);
-  uint2* dst = reinterpret_cast<uint2*>(
-      aligned_out + ((size_t)offsets[g] + r) * n);
-  const int words = n / 4;  // n is a multiple of 4 (6144)
-  for (int i = threadIdx.x; i < words; i += blockDim.x) {
-    dst[i] = src[i];
+  const __nv_bfloat16* src =
+      masked_out + ((size_t)g * kMaskedCap + r) * n;
+  const int64_t aligned_row = offsets[g] + r;
+  if (aligned_row < 0 || aligned_row >= aligned_rows) {
+    __trap();
+  }
+  __nv_bfloat16* dst = aligned_out + (size_t)aligned_row * n;
+  const float weight = __ldg(row_weights + aligned_row);
+  for (int i = threadIdx.x; i < n; i += blockDim.x) {
+    dst[i] =
+        __float2bfloat16_rn(__bfloat162float(src[i]) * weight);
   }
 }
 
@@ -164,18 +169,21 @@ CUresult glm52_deepgemm_grouped_fp8_metadata_cuda(
 
 CUresult glm52_deepgemm_masked_out_to_aligned_cuda(
     const __nv_bfloat16* masked_out, const int* masked_m,
-    const int64_t* expert_offsets, __nv_bfloat16* aligned_out, int n,
+    const int64_t* expert_offsets, const float* row_weights,
+    __nv_bfloat16* aligned_out, int aligned_rows, int n,
     cudaStream_t stream) {
   if (masked_out == nullptr || masked_m == nullptr ||
-      expert_offsets == nullptr || aligned_out == nullptr) {
+      expert_offsets == nullptr || row_weights == nullptr ||
+      aligned_out == nullptr) {
     return CUDA_ERROR_INVALID_VALUE;
   }
-  if (n <= 0 || n % 4 != 0) {
+  if (aligned_rows <= 0 || n <= 0 || n % 4 != 0) {
     return CUDA_ERROR_INVALID_VALUE;
   }
   masked_out_to_aligned_kernel<<<dim3(kMaskedGroups, kMaskedCap), 256, 0,
                                  stream>>>(masked_out, masked_m,
-                                           expert_offsets, aligned_out, n);
+                                           expert_offsets, row_weights,
+                                           aligned_out, aligned_rows, n);
   return consume_last_cuda_error();
 }
 

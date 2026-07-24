@@ -83,6 +83,46 @@ pub fn add_into(
     Ok(())
 }
 
+/// `out = bf16(shared + bf16(scale * routed))`.
+///
+/// The intermediate BF16 narrowing matches vLLM's CUDA MoE path, which
+/// scales the reduced routed output in place before adding the shared expert.
+pub fn add_scaled_bf16_into(
+    ctx: &DeviceContext,
+    routed: &CudaSlice<half::bf16>,
+    scale: f32,
+    shared: &CudaSlice<half::bf16>,
+    n: usize,
+    out: &mut CudaSlice<half::bf16>,
+) -> Result<()> {
+    if !scale.is_finite() {
+        return Err(anyhow!("add_scaled_bf16_into scale must be finite"));
+    }
+    if routed.len() < n || shared.len() < n || out.len() < n {
+        return Err(anyhow!(
+            "add_scaled_bf16_into buffers too small for n={n}: routed {}, shared {}, out {}",
+            routed.len(),
+            shared.len(),
+            out.len()
+        ));
+    }
+    let (routed_ptr, _routed_guard) = routed.device_ptr(&ctx.stream);
+    let (shared_ptr, _shared_guard) = shared.device_ptr(&ctx.stream);
+    let (out_ptr, _out_guard) = out.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::add_scaled_bf16_cuda(
+            routed_ptr as *const ffi::Half,
+            scale,
+            shared_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            n as i32,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    result.result()?;
+    Ok(())
+}
+
 /// In-place scaled add into a row range of `out`: out[row_offset..] += scale * delta.
 pub fn scaled_add_rows_into(
     ctx: &DeviceContext,
@@ -277,6 +317,46 @@ pub fn copy_hidden_rows_raw_into(
             row_offset as i32,
             src_dim as i32,
             tokens as i32,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    result.result()?;
+    Ok(())
+}
+
+/// Copy `[rows, hidden_dim]`, replacing every row whose position is zero with
+/// zeros. This is the MTP embedding-mask boundary: position zero has no
+/// previous token and must not contribute its embedding.
+pub fn mask_position_zero_rows_into(
+    ctx: &DeviceContext,
+    src: &CudaSlice<half::bf16>,
+    positions: &CudaSlice<u32>,
+    hidden_dim: usize,
+    rows: usize,
+    dst: &mut CudaSlice<half::bf16>,
+) -> Result<()> {
+    assert!(
+        rows * hidden_dim <= src.len() && rows * hidden_dim <= dst.len(),
+        "mask_position_zero_rows_into rows {rows} x hidden_dim {hidden_dim} exceed src {} / dst {}",
+        src.len(),
+        dst.len()
+    );
+    assert!(
+        rows <= positions.len(),
+        "mask_position_zero_rows_into rows {rows} exceed positions {}",
+        positions.len()
+    );
+
+    let (src_ptr, _gs) = src.device_ptr(&ctx.stream);
+    let (positions_ptr, _gp) = positions.device_ptr(&ctx.stream);
+    let (dst_ptr, _gd) = dst.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::mask_position_zero_rows_cuda(
+            src_ptr as *const ffi::Half,
+            positions_ptr as *const u32,
+            dst_ptr as *mut ffi::Half,
+            hidden_dim as i32,
+            rows as i32,
             crate::tensor::active_cu_stream(ctx),
         )
     };

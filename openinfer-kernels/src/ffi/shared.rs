@@ -32,6 +32,15 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn add_scaled_bf16_cuda(
+        routed: *const Half,
+        scale: f32,
+        shared: *const Half,
+        out: *mut Half,
+        n: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn copy_hidden_rows_cuda(
         src: *const Half,
         dst: *mut Half,
@@ -40,6 +49,15 @@ unsafe extern "C" {
         row_offset: i32,
         rows: i32,
         seq_len: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn mask_position_zero_rows_cuda(
+        src: *const Half,
+        positions: *const u32,
+        dst: *mut Half,
+        hidden_dim: i32,
+        rows: i32,
         stream: CUstream,
     ) -> CUresult;
 

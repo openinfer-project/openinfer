@@ -254,9 +254,9 @@ impl Glm52MoeExpertBank {
     }
 }
 
-/// Router output for one token: the top-8 GLOBAL expert ids and their
-/// normalized, x2.5-scaled weights, both device-resident (never read back to
-/// host).
+/// Router output for one token: the top-8 GLOBAL expert ids and weights, both
+/// device-resident (never read back to host). The caller chooses whether the
+/// model's routed scale is folded into these weights.
 pub(crate) struct RoutedTopk {
     pub(crate) topk_idx: CudaSlice<i32>,
     pub(crate) topk_weight: CudaSlice<f32>,
@@ -297,13 +297,38 @@ pub(crate) fn run_router_into(
     normed_hidden: &CudaSlice<bf16>,
     s: &mut Glm52RouterScratch,
 ) -> Result<()> {
+    run_router_into_with_config(ctx, router, normed_hidden, s, Glm52RouterConfig::glm52())
+}
+
+pub(crate) fn run_ep_router_into(
+    ctx: &DeviceContext,
+    router: &Glm52MoeRouterWeights,
+    normed_hidden: &CudaSlice<bf16>,
+    s: &mut Glm52RouterScratch,
+) -> Result<()> {
+    run_router_into_with_config(
+        ctx,
+        router,
+        normed_hidden,
+        s,
+        Glm52RouterConfig::glm52_unscaled(),
+    )
+}
+
+fn run_router_into_with_config(
+    ctx: &DeviceContext,
+    router: &Glm52MoeRouterWeights,
+    normed_hidden: &CudaSlice<bf16>,
+    s: &mut Glm52RouterScratch,
+    config: Glm52RouterConfig,
+) -> Result<()> {
     let mut router_out = Glm52RouterOutput {
         topk_weight: &mut s.route.topk_weight,
         topk_idx: &mut s.route.topk_idx,
     };
     glm52_router_noaux_tc_launch(
         ctx,
-        Glm52RouterConfig::glm52(),
+        config,
         Glm52RouterBatch {
             active_tokens: s.tokens,
             padded_tokens: s.tokens,
@@ -363,15 +388,14 @@ pub(crate) fn run_router_rows_into(
     )
 }
 
-/// Allocating convenience over [`run_router_into`] for the oracle-gate/test
-/// paths.
+/// Allocating EP/unscaled router for oracle-gate/test paths.
 #[cfg(test)]
-pub(crate) fn run_router(
+pub(crate) fn run_ep_router(
     ctx: &DeviceContext,
     router: &Glm52MoeRouterWeights,
     normed_hidden: &CudaSlice<bf16>,
 ) -> Result<RoutedTopk> {
     let mut s = Glm52RouterScratch::new(ctx, 1)?;
-    run_router_into(ctx, router, normed_hidden, &mut s)?;
+    run_ep_router_into(ctx, router, normed_hidden, &mut s)?;
     Ok(s.route)
 }

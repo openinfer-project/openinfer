@@ -317,9 +317,9 @@ impl Glm52WeightManifest {
         })
     }
 
-    /// Full checkpoint coverage, including the native MTP layer. This is a
-    /// manifest invariant only: resident load plans below deliberately omit
-    /// tensors that the serving model never consumes.
+    /// Full checkpoint coverage, including the MTP accuracy-oracle layer.
+    /// This is a manifest invariant only: resident load plans below
+    /// deliberately omit tensors that the serving model never consumes.
     fn rank_tensor_names(&self, rank: usize) -> Result<Vec<String>> {
         ensure!(
             rank < GLM52_EP_RANKS,
@@ -335,8 +335,8 @@ impl Glm52WeightManifest {
         Ok(names)
     }
 
-    /// Tensors that must become GPU-resident for one serving rank. Native MTP
-    /// layer 78 is validation-only and never enters this list. TP8 gets all
+    /// Tensors that must become GPU-resident for one serving rank. MTP layer
+    /// 78 is accuracy-oracle-only and never enters this list. TP8 gets all
     /// routed + shared experts from `load_tp8_slice_layer`, so its first pass
     /// loads routers but not duplicate full shared-expert projections.
     fn rank_resident_tensor_names(

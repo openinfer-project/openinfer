@@ -161,41 +161,52 @@ pub fn glm52_deepgemm_masked_grouped_fp8_launch(
         .map_err(|err| anyhow!("GLM5.2 DeepGEMM masked grouped FP8 {kind:?} launch failed: {err}"))
 }
 
-/// Masked GEMM output `[32, 64, n]` → the aligned recv slots
-/// `decode_combine` addresses (rows `offsets[g] + r` for `r < masked_m[g]`).
+/// Masked W2 output `[32, 64, n]` → the aligned recv slots
+/// `decode_combine` addresses, applying each aligned row's router weight
+/// after the GEMM (rows `offsets[g] + r` for `r < masked_m[g]`).
 pub fn glm52_deepgemm_masked_out_to_aligned_launch(
     ctx: &DeviceContext,
     n: usize,
     masked_out: &CudaSlice<bf16>,
     masked_m: &CudaSlice<i32>,
     expert_offsets: &CudaSlice<i64>,
+    row_weights: &CudaSlice<f32>,
     aligned_out: &mut CudaSlice<bf16>,
 ) -> Result<()> {
     let groups = GLM52_DEEPGEMM_MASKED_GROUPS;
     let cap = GLM52_DEEPGEMM_MASKED_CAP;
     ensure!(
-        n > 0 && n.is_multiple_of(4),
-        "GLM5.2 masked-out remap needs n % 4 == 0, got {n}"
+        n > 0 && n.is_multiple_of(4) && aligned_out.len().is_multiple_of(n),
+        "GLM5.2 masked-out remap needs n % 4 == 0 and whole output rows, got n {n}, output {}",
+        aligned_out.len()
     );
+    let aligned_rows = i32::try_from(aligned_out.len() / n)
+        .map_err(|_| anyhow!("GLM5.2 masked-out remap output row count exceeds i32"))?;
     ensure!(
         masked_out.len() >= groups * cap * n
             && masked_m.len() >= groups
-            && expert_offsets.len() > groups,
-        "GLM5.2 masked-out remap buffers too small: masked {}, masked_m {}, offsets {}",
+            && expert_offsets.len() > groups
+            && aligned_rows > 0
+            && row_weights.len() >= aligned_rows as usize,
+        "GLM5.2 masked-out remap buffers too small: masked {}, masked_m {}, offsets {}, weights {}, output rows {aligned_rows}",
         masked_out.len(),
         masked_m.len(),
-        expert_offsets.len()
+        expert_offsets.len(),
+        row_weights.len()
     );
     let (src_ptr, _src_guard) = masked_out.device_ptr(&ctx.stream);
     let (masked_ptr, _masked_guard) = masked_m.device_ptr(&ctx.stream);
     let (offsets_ptr, _offsets_guard) = expert_offsets.device_ptr(&ctx.stream);
+    let (weights_ptr, _weights_guard) = row_weights.device_ptr(&ctx.stream);
     let (dst_ptr, _dst_guard) = aligned_out.device_ptr_mut(&ctx.stream);
     let result = unsafe {
         ffi::glm52_deepgemm_masked_out_to_aligned_cuda(
             src_ptr as *const ffi::Half,
             masked_ptr as *const i32,
             offsets_ptr as *const i64,
+            weights_ptr as *const f32,
             dst_ptr as *mut ffi::Half,
+            aligned_rows,
             n as i32,
             ctx.stream.cu_stream(),
         )

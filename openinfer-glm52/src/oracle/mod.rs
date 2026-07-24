@@ -24,5 +24,6 @@ mod layer_ep4;
 mod layer_ep8;
 mod layer_tp8;
 mod mla;
+mod mtp;
 mod sparse_mla_probe;
 mod tp8_ar;

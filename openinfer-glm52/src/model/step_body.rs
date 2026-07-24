@@ -4,7 +4,7 @@ use anyhow::Context as _;
 use anyhow::Result;
 use anyhow::ensure;
 use cudarc::driver::CudaSlice;
-use openinfer_kernels::ops::add_into;
+use openinfer_kernels::ops::add_scaled_bf16_into;
 use openinfer_kernels::ops::argmax_bf16_split_into;
 use openinfer_kernels::ops::copy_hidden_rows_raw_into;
 use openinfer_kernels::ops::glm52_vocab_parallel_pack_launch;
@@ -30,6 +30,7 @@ use crate::layer::Glm52LayerMlp;
 use crate::layer::glm52_layer_attention_half;
 use crate::layer::glm52_layer_finish;
 use crate::layer::glm52_layer_finish_fused;
+use crate::moe_decode::run_ep_router_into;
 use crate::moe_decode::run_router_into;
 use crate::moe_ep_wo::Glm52MoeEpState;
 use crate::moe_ep8::Glm52MoeEp8LayerWeights;
@@ -289,7 +290,7 @@ fn glm52_moe_ep_layer(
     )?;
     let shared_done = aux.stream.record_event(None)?;
 
-    run_router_into(ctx, &moe.router, s.layer.normed2.data(), &mut s.router)?;
+    run_ep_router_into(ctx, &moe.router, s.layer.normed2.data(), &mut s.router)?;
     let dispatched = ep8.routed_forward(
         ctx,
         &moe.bank,
@@ -302,9 +303,10 @@ fn glm52_moe_ep_layer(
     );
     // Join: the closing add consumes both branches.
     ctx.stream.wait(&shared_done)?;
-    add_into(
+    add_scaled_bf16_into(
         ctx,
         ep8.combined(),
+        crate::config::GLM52_ROUTED_SCALING_FACTOR as f32,
         s.layer.shared_out.data(),
         batch * GLM52_HIDDEN,
         s.layer.mlp_out.data_mut(),

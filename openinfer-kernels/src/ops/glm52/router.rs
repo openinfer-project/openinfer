@@ -12,8 +12,9 @@ use crate::tensor::DeviceContext;
 const GLM52_ROUTER_HIDDEN: usize = 6144;
 const GLM52_ROUTER_EXPERTS: usize = 256;
 const GLM52_ROUTER_TOPK: usize = 8;
-/// `routed_scaling_factor` from the GLM5.2 checkpoint config, folded into the
-/// normalized top-k weights (the shared expert is added unscaled).
+/// `routed_scaling_factor` from the GLM5.2 checkpoint config. The default
+/// TP path folds it into top-k weights; the EP path uses normalized weights
+/// and applies the factor after expert reduction, matching vLLM.
 const GLM52_ROUTED_RESIDUAL_SCALE: f32 = 2.5;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -31,6 +32,15 @@ impl Glm52RouterConfig {
             n_experts: GLM52_ROUTER_EXPERTS,
             topk: GLM52_ROUTER_TOPK,
             route_scale: GLM52_ROUTED_RESIDUAL_SCALE,
+        }
+    }
+
+    pub const fn glm52_unscaled() -> Self {
+        Self {
+            hidden_dim: GLM52_ROUTER_HIDDEN,
+            n_experts: GLM52_ROUTER_EXPERTS,
+            topk: GLM52_ROUTER_TOPK,
+            route_scale: 1.0,
         }
     }
 

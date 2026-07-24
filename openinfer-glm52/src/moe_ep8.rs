@@ -10,8 +10,8 @@
 //! dispatch(x bf16, global topk)          # collective; recv = expert-major
 //!   → metadata: psum i32 → offsets i64 + masked_m + row_map
 //!   → re-quant recv rows → masked [32, 64, k] fp8 + mn-major scales
-//!   → DeepGEMM masked W13 (32 groups) → weighted SiLU·quant (recv weights)
-//!   → DeepGEMM masked W2 → remap masked→aligned slots
+//!   → DeepGEMM masked W13 (32 groups) → SiLU·quant
+//!   → DeepGEMM masked W2 → route-weighted remap to aligned slots
 //!   → combine                            # collective; sums slots per token
 //! ```
 //!
@@ -51,7 +51,7 @@ use openinfer_kernels::ops::glm52_deepgemm_grouped_fp8_metadata_launch;
 use openinfer_kernels::ops::glm52_deepgemm_masked_grouped_fp8_launch;
 use openinfer_kernels::ops::glm52_deepgemm_masked_out_to_aligned_launch;
 use openinfer_kernels::ops::glm52_fp8_per_token_group_quant_bf16_masked_launch;
-use openinfer_kernels::ops::glm52_silu_and_mul_weighted_per_token_group_quant_bf16_masked_launch;
+use openinfer_kernels::ops::glm52_silu_and_mul_per_token_group_quant_bf16_masked_launch;
 use openinfer_kernels::tensor::DeviceContext;
 
 use crate::moe_decode::EXPERTS;
@@ -191,8 +191,9 @@ impl Glm52MoeEp8State {
 /// enter simultaneously per layer. A rank with tokens passes its
 /// post-attention normed hidden rows + router output (`[T, HIDDEN]` /
 /// `[T, 8]`) and the row count; on `Ok(true)` the routed output
-/// `[T, HIDDEN]` (route weight and ×2.5 scaling already folded) is in
-/// `state.combined()`. A token-less rank passes `None` and gets `Ok(false)`.
+/// `[T, HIDDEN]` (normalized route weights folded, routed scale not applied)
+/// is in `state.combined()`. A token-less rank passes `None` and gets
+/// `Ok(false)`.
 /// The DP8 production path always passes `Some` (pad rows are dispatched like
 /// real ones); `None` survives for the EP8 layer oracle gate's
 /// single-dispatcher replay.
@@ -314,10 +315,9 @@ pub(crate) fn glm52_moe_ep8_routed_forward(
         &mut state.w13_out_masked,
     )?;
 
-    // Weighted SwiGLU quant: silu(gate)*up*route_weight → fp8 W2 input. The
-    // gate|up rows are already masked (the W13 GEMM wrote them there); the
-    // per-slot weight is exactly what dispatch delivered per expanded row.
-    glm52_silu_and_mul_weighted_per_token_group_quant_bf16_masked_launch(
+    // SwiGLU quant: vLLM quantizes the unweighted activation before W2 and
+    // applies the router weight to W2's BF16 output.
+    glm52_silu_and_mul_per_token_group_quant_bf16_masked_launch(
         ctx,
         Glm52MoeQuantShape {
             rows: bound_rows,
@@ -327,7 +327,6 @@ pub(crate) fn glm52_moe_ep8_routed_forward(
         GLM52_DEEPGEMM_MASKED_GROUPS,
         GLM52_DEEPGEMM_MASKED_CAP,
         &state.w13_out_masked,
-        &state.recv_topk_weight,
         &mut state.w2_act_masked,
         &mut state.w2_act_scale_masked,
         &state.expert_offsets,
@@ -347,13 +346,15 @@ pub(crate) fn glm52_moe_ep8_routed_forward(
         &mut state.expert_out_masked,
     )?;
 
-    // Masked GEMM output → the aligned recv slots decode_combine addresses.
+    // Masked GEMM output × router weight → the aligned recv slots
+    // decode_combine addresses.
     glm52_deepgemm_masked_out_to_aligned_launch(
         ctx,
         W2_N,
         &state.expert_out_masked,
         &state.masked_m,
         &state.expert_offsets,
+        &state.recv_topk_weight,
         &mut state.expert_out,
     )?;
 

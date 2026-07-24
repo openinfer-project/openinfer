@@ -23,7 +23,7 @@ use openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_PAGE_SIZE;
 use openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_TOPK;
 use openinfer_kernels::ops::Glm52FlashMlaSparseDecode;
 use openinfer_kernels::ops::Glm52IndexerCacheLayout;
-use openinfer_kernels::ops::add_into;
+use openinfer_kernels::ops::add_scaled_bf16_into;
 use openinfer_kernels::ops::glm52_ep_deepep_unique_id;
 use openinfer_kernels::ops::glm52_flashmla_sparse_decode_num_sm_parts;
 use openinfer_kernels::tensor::DeviceContext;
@@ -57,7 +57,7 @@ use crate::model::INDEX_CACHE_BLOCK;
 use crate::model::NUM_SMS;
 use crate::model::rope_tables;
 use crate::moe_decode::HIDDEN;
-use crate::moe_decode::run_router;
+use crate::moe_decode::run_ep_router;
 use crate::moe_ep_wo::Glm52MoeEpWoState;
 use crate::moe_ep_wo::glm52_moe_ep_wo_routed_forward;
 use crate::scratch::Glm52DecodeScratch;
@@ -269,7 +269,7 @@ fn run_layer_prefill_ep4(
             true,
             None,
         )?;
-        let route = run_router(ctx, &moe.router, scratch.layer.normed2.data())?;
+        let route = run_ep_router(ctx, &moe.router, scratch.layer.normed2.data())?;
         let dispatched = glm52_moe_ep_wo_routed_forward(
             ctx,
             ep4,
@@ -284,9 +284,10 @@ fn run_layer_prefill_ep4(
             &mut scratch.shared_mlp,
             scratch.layer.shared_out.data_mut(),
         )?;
-        add_into(
+        add_scaled_bf16_into(
             ctx,
             ep4.combined(),
+            crate::config::GLM52_ROUTED_SCALING_FACTOR as f32,
             scratch.layer.shared_out.data(),
             HIDDEN,
             scratch.layer.mlp_out.data_mut(),

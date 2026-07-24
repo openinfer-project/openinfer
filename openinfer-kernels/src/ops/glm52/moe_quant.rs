@@ -188,18 +188,17 @@ pub fn glm52_fp8_per_token_group_quant_bf16_masked_launch(
         .map_err(|err| anyhow!("GLM5.2 FP8 masked group quant launch failed: {err}"))
 }
 
-/// Bounded weighted SwiGLU quant for the masked layout: the gate|up input
-/// rows are already masked (the W13 masked GEMM wrote them), the route
-/// weight stays indexed by the aligned recv row, output/scales land in the
-/// masked layouts (see the quant twin above).
+/// Bounded SwiGLU quant for the masked layout: the gate|up input rows are
+/// already masked (the W13 masked GEMM wrote them), and output/scales land in
+/// the masked layouts (see the quant twin above). Router weights are applied
+/// after W2, matching vLLM's DeepGEMM path.
 #[allow(clippy::too_many_arguments)]
-pub fn glm52_silu_and_mul_weighted_per_token_group_quant_bf16_masked_launch(
+pub fn glm52_silu_and_mul_per_token_group_quant_bf16_masked_launch(
     ctx: &DeviceContext,
     shape: Glm52MoeQuantShape,
     masked_groups: usize,
     masked_cap: usize,
     input: &CudaSlice<bf16>,
-    topk_weights: &CudaSlice<f32>,
     output: &mut CudaSlice<u8>,
     scales: &mut CudaSlice<f32>,
     row_bound: &CudaSlice<i64>,
@@ -210,27 +209,24 @@ pub fn glm52_silu_and_mul_weighted_per_token_group_quant_bf16_masked_launch(
     let masked_rows = masked_groups * masked_cap;
     ensure!(
         input.len() >= masked_rows * shape.width * 2
-            && topk_weights.len() >= shape.rows
             && output.len() >= masked_rows * shape.width
             && scales.len() >= masked_rows * shape.scale_cols()?
             && row_map.len() >= shape.rows,
-        "GLM5.2 weighted SiLU masked quant buffers too small"
+        "GLM5.2 SiLU masked quant buffers too small"
     );
     ensure!(
         row_bound.len() > bound_index,
-        "GLM5.2 weighted SiLU masked quant row_bound index {bound_index} outside buffer of {}",
+        "GLM5.2 SiLU masked quant row_bound index {bound_index} outside buffer of {}",
         row_bound.len()
     );
     let (input_ptr, _g0) = input.device_ptr(&ctx.stream);
-    let (weight_ptr, _g1) = topk_weights.device_ptr(&ctx.stream);
-    let (output_ptr, _g2) = output.device_ptr_mut(&ctx.stream);
-    let (scale_ptr, _g3) = scales.device_ptr_mut(&ctx.stream);
-    let (bound_ptr, _g4) = row_bound.device_ptr(&ctx.stream);
-    let (map_ptr, _g5) = row_map.device_ptr(&ctx.stream);
+    let (output_ptr, _g1) = output.device_ptr_mut(&ctx.stream);
+    let (scale_ptr, _g2) = scales.device_ptr_mut(&ctx.stream);
+    let (bound_ptr, _g3) = row_bound.device_ptr(&ctx.stream);
+    let (map_ptr, _g4) = row_map.device_ptr(&ctx.stream);
     let result = unsafe {
-        ffi::glm52_silu_and_mul_weighted_per_token_group_quant_bf16_masked_cuda(
+        ffi::glm52_silu_and_mul_per_token_group_quant_bf16_masked_cuda(
             input_ptr as *const ffi::Half,
-            weight_ptr as *const f32,
             output_ptr as *mut u8,
             scale_ptr as *mut f32,
             shape.rows as i32,
@@ -244,5 +240,5 @@ pub fn glm52_silu_and_mul_weighted_per_token_group_quant_bf16_masked_launch(
     };
     result
         .result()
-        .map_err(|err| anyhow!("GLM5.2 weighted SiLU masked quant launch failed: {err}"))
+        .map_err(|err| anyhow!("GLM5.2 SiLU masked quant launch failed: {err}"))
 }
