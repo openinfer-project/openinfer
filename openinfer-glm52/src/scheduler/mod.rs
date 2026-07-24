@@ -37,6 +37,7 @@ mod admission;
 mod contract_tests;
 mod graph;
 mod load;
+mod mtp;
 mod offload;
 mod plan;
 mod slot;
@@ -54,6 +55,7 @@ use graph::precapture_step_graphs;
 use load::pending_is_empty;
 use load::publish_load;
 use load::running_counts;
+use mtp::run_mtp_round;
 pub(crate) use offload::REMOTE_FETCH_DEADLINE;
 use offload::VllmPdState;
 use openinfer_core::engine::GenerateRequest;
@@ -81,6 +83,7 @@ use crate::model::Glm52StepKv;
 use crate::model::Glm52StepShape;
 use crate::model::glm52_pool_blocks;
 use crate::model::glm52_table_width;
+use crate::runner::Glm52MtpAppend;
 use crate::runner::Glm52PrefillBatch;
 use crate::runner::Glm52StepFlags;
 use crate::runner::Glm52Worker;
@@ -134,8 +137,8 @@ pub(crate) fn run_dp8_coordinator(
     mut submit_rx: mpsc::UnboundedReceiver<GenerateRequest>,
     workers: Vec<Glm52Worker>,
     eos_token_ids: &[u32],
-    dspark_enabled: bool,
-    prefill_chunk_size: Option<usize>,
+    drafter: crate::Glm52Drafter,
+    prefill_only: bool,
     max_model_len: usize,
     no_prefix_cache: bool,
     offload: Option<Vec<OffloadEngine>>,
@@ -144,7 +147,8 @@ pub(crate) fn run_dp8_coordinator(
     load_txs: Vec<watch::Sender<LoadSnapshot>>,
     graph_dump_request: Option<GraphDumpRequest>,
 ) {
-    let prefill_only = prefill_chunk_size.is_some();
+    let dspark_enabled = drafter.is_dspark();
+    let mtp_enabled = drafter.is_mtp();
     // Tensor-replicated topology: ONE logical rank drives mirrored executors.
     // Every worker receives the identical step (inputs, shape, KV, seed) and
     // must return bit-identical outputs — the scheduler admits, plans, and
@@ -221,9 +225,9 @@ pub(crate) fn run_dp8_coordinator(
     // matching is off while the drafter is on. Speculative decoding and
     // prefix caching are mutually exclusive for now (the qwen3 offload path
     // draws the same line). `--no-prefix-cache` is the explicit kill switch.
-    let prefix_cache_enabled = !dspark_enabled && !no_prefix_cache;
-    if dspark_enabled && !no_prefix_cache {
-        log::info!("GLM5.2 prefix cache disabled: the DSpark drafter is on");
+    let prefix_cache_enabled = !drafter.enabled() && !no_prefix_cache;
+    if drafter.enabled() && !no_prefix_cache {
+        log::info!("GLM5.2 prefix cache disabled: speculative decoding is on");
     }
     let mut slots: Vec<RankSlots> = (0..logical_ranks)
         .map(|_| std::array::from_fn(|_| None))
@@ -330,7 +334,7 @@ pub(crate) fn run_dp8_coordinator(
             &workers,
             mirrored,
             prefix_cache_enabled,
-            dspark_enabled,
+            drafter.enabled(),
             prefill_only,
             &mut pending_resets,
             &mut slots_changed,
@@ -394,7 +398,7 @@ pub(crate) fn run_dp8_coordinator(
                 leased_shapes.as_deref(),
                 slots_changed,
                 pending_is_empty(&pending),
-                dspark_enabled,
+                drafter.enabled(),
                 offload.is_some(),
                 &slots,
                 max_model_len,
@@ -404,7 +408,7 @@ pub(crate) fn run_dp8_coordinator(
         slots_changed = false;
         sample_step += 1;
         // One lock-step step (see [`submit_and_join_step`]).
-        let (outputs, span_kinds) = match submit_and_join_step(
+        let (outputs, span_kinds, step_inputs) = match submit_and_join_step(
             &workers,
             &pools,
             &mut slots,
@@ -420,7 +424,7 @@ pub(crate) fn run_dp8_coordinator(
             }
         };
 
-        let (rank_appends, mut rank_proposals) = match apply_step_outputs(
+        let (rank_appends, mtp_appends, mut rank_proposals) = match apply_step_outputs(
             &mut slots,
             outputs,
             &shapes,
@@ -428,7 +432,8 @@ pub(crate) fn run_dp8_coordinator(
             &pools,
             offload.as_deref(),
             eos_token_ids,
-            dspark_enabled,
+            drafter,
+            &step_inputs,
             &mut pending_resets,
             &mut slots_changed,
         ) {
@@ -463,8 +468,8 @@ pub(crate) fn run_dp8_coordinator(
             }
         }
 
-        if dspark_enabled
-            && let Err(err) = run_draft_round(
+        let draft_result = if dspark_enabled {
+            run_draft_round(
                 &workers,
                 &mut slots,
                 &shapes,
@@ -473,7 +478,19 @@ pub(crate) fn run_dp8_coordinator(
                 rank_proposals,
                 span_drafts,
             )
-        {
+        } else if mtp_enabled {
+            run_mtp_round(
+                &workers,
+                &mut slots,
+                &shapes,
+                &mut pending_resets,
+                mtp_appends,
+                rank_proposals,
+            )
+        } else {
+            Ok(())
+        };
+        if let Err(err) = draft_result {
             fail_step(&mut slots, &err);
             break 'serve;
         }
@@ -529,6 +546,7 @@ fn submit_and_join_step(
 ) -> anyhow::Result<(
     Vec<[u32; GLM52_MAX_BATCH_PER_RANK]>,
     Vec<[Option<SpanKind>; GLM52_MAX_BATCH_PER_RANK]>,
+    Vec<[(u32, usize); GLM52_MAX_BATCH_PER_RANK]>,
 )> {
     // Logical-to-executor mapping: 1:1 under EP8, or the single logical
     // rank's step mirrored onto every worker under the replicated tp8
@@ -540,6 +558,7 @@ fn submit_and_join_step(
         .map(|_| [None; GLM52_MAX_BATCH_PER_RANK])
         .collect();
     let mut responses = Vec::with_capacity(workers.len());
+    let mut step_inputs = Vec::with_capacity(slots.len());
     let mut submit_err: Option<anyhow::Error> = None;
     'submit: for (rank, (rank_slots, shape)) in slots.iter_mut().zip(shapes).enumerate() {
         let pool = &pools[rank];
@@ -630,6 +649,7 @@ fn submit_and_join_step(
             pages: pages.into_boxed_slice(),
             slot_mapping,
         };
+        step_inputs.push(inputs);
         let executors: &[Glm52Worker] = if mirrored {
             workers
         } else {
@@ -685,7 +705,7 @@ fn submit_and_join_step(
         }
         outputs.truncate(1);
     }
-    Ok((outputs, span_kinds))
+    Ok((outputs, span_kinds, step_inputs))
 }
 
 fn submit_join_apply_prefill(
@@ -865,11 +885,17 @@ fn apply_step_outputs(
     pools: &[BlockPool],
     offload: Option<&[offload::RankOffload]>,
     eos_token_ids: &[u32],
-    dspark_enabled: bool,
+    drafter: crate::Glm52Drafter,
+    step_inputs: &[[(u32, usize); GLM52_MAX_BATCH_PER_RANK]],
     pending_resets: &mut [Vec<usize>],
     slots_changed: &mut bool,
-) -> anyhow::Result<(Vec<Vec<(usize, usize)>>, Vec<Vec<(usize, u32, usize)>>)> {
+) -> anyhow::Result<(
+    Vec<Vec<(usize, usize)>>,
+    Vec<Vec<Glm52MtpAppend>>,
+    Vec<Vec<(usize, u32, usize)>>,
+)> {
     let mut rank_appends: Vec<Vec<(usize, usize)>> = slots.iter().map(|_| Vec::new()).collect();
+    let mut mtp_appends: Vec<Vec<Glm52MtpAppend>> = slots.iter().map(|_| Vec::new()).collect();
     let mut rank_proposals: Vec<Vec<(usize, u32, usize)>> =
         slots.iter().map(|_| Vec::new()).collect();
     for (rank, ((rank_slots, rank_outputs), shape)) in
@@ -982,24 +1008,42 @@ fn apply_step_outputs(
                          (blocks return via RAII): {err:#}"
                     );
                 }
-                if dspark_enabled {
+                if drafter.enabled() {
                     pending_resets[rank].push(slot_id);
                 }
                 *slot = None;
                 *slots_changed = true;
-            } else if dspark_enabled {
-                // Committed rows' captured hidden feeds the draft
-                // context; then re-propose from the new anchor.
-                rank_appends[rank].extend(span_rows.take(context_rows).map(|r| (r, slot_id)));
-                if active.state.wants_drafts()
-                    && let Some((anchor, anchor_pos)) = active.state.decode_anchor()
-                {
+            } else if drafter.enabled() {
+                if drafter.is_dspark() {
+                    rank_appends[rank]
+                        .extend(span_rows.clone().take(context_rows).map(|r| (r, slot_id)));
+                } else {
+                    for (offset, source_row) in span_rows.clone().take(context_rows).enumerate() {
+                        let input_token = if offset + 1 < context_rows {
+                            step_inputs[rank][source_row + 1].0
+                        } else {
+                            active.state.next_input_at(0).token
+                        };
+                        mtp_appends[rank].push(Glm52MtpAppend {
+                            source_row,
+                            slot: slot_id,
+                            input_token,
+                            position: step_inputs[rank][source_row].1,
+                        });
+                    }
+                }
+                let wants_drafts = if drafter.is_mtp() {
+                    active.state.wants_full_draft(crate::mtp::GLM52_MTP_DRAFTS)
+                } else {
+                    active.state.wants_drafts()
+                };
+                if wants_drafts && let Some((anchor, anchor_pos)) = active.state.decode_anchor() {
                     rank_proposals[rank].push((slot_id, anchor, anchor_pos));
                 }
             }
         }
     }
-    Ok((rank_appends, rank_proposals))
+    Ok((rank_appends, mtp_appends, rank_proposals))
 }
 
 /// Draft round (rank-local, no collectives): resets, context appends from

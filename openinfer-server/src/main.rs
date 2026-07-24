@@ -180,6 +180,7 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
                     tp_size: args.tp_size,
                     dp_size: args.dp_size.unwrap_or_else(|| moe_topo.default_dp_size()),
                     dspark_draft_model_path: args.dflash_draft_model_path.clone(),
+                    native_mtp: args.glm52_native_mtp,
                     max_model_len: args.max_model_len,
                     prefill_only: args.glm52_prefill_only.then_some(
                         openinfer_glm52::Glm52PrefillOnlyOptions {

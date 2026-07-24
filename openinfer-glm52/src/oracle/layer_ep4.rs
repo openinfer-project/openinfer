@@ -268,6 +268,7 @@ fn run_layer_prefill_ep4(
             0,
             true,
             None,
+            crate::layer::Glm52LayerIndexMode::Normal,
         )?;
         let route = run_ep_router(ctx, &moe.router, scratch.layer.normed2.data())?;
         let dispatched = glm52_moe_ep_wo_routed_forward(

@@ -308,6 +308,7 @@ pub(super) fn run_layer_prefill_ep8(
             0,
             true,
             None,
+            crate::layer::Glm52LayerIndexMode::Normal,
         )?;
         run_moe_ep8_half(ctx, moe, ep8, &mut scratch, global_tokens)?;
         let post_attention_host = ctx.stream.clone_dtoh(scratch.layer.attn[0].data())?;

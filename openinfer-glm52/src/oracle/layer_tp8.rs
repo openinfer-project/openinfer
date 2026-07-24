@@ -290,6 +290,7 @@ fn run_layer_prefill_tp8(
             0,
             true,
             None,
+            crate::layer::Glm52LayerIndexMode::Normal,
         )?;
         // The production TP8 arm verbatim: router on the real path, then the
         // replicated kernel writes routed + shared into all 8 rows.

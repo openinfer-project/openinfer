@@ -113,6 +113,7 @@ fn main() -> Result<()> {
             tp_size,
             dp_size,
             dspark_draft_model_path: None,
+            native_mtp: false,
             max_model_len: cli.max_model_len,
             prefill_only: None,
             no_prefix_cache: false,

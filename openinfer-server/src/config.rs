@@ -179,6 +179,10 @@ pub(crate) struct Args {
     #[arg(long = "dflash-draft-model-path")]
     pub dflash_draft_model_path: Option<PathBuf>,
 
+    /// Use GLM5.2's checkpoint-native MTP layer as the speculative drafter.
+    #[arg(long = "glm52-native-mtp")]
+    pub glm52_native_mtp: bool,
+
     /// Cap on total prompt tokens forwarded in one scheduler step. Qwen3 and
     /// Qwen3.5 only (rejected for other model lines); when omitted, they use
     /// their own crate defaults.
@@ -356,6 +360,7 @@ fn consumed_args(model_type: ModelType) -> &'static [&'static str] {
             "tp_size",
             "dp_size",
             "dflash_draft_model_path",
+            "glm52_native_mtp",
             "max_model_len",
             "glm52_prefill_only",
             "glm52_prefill_chunk_size",
@@ -577,6 +582,9 @@ impl Args {
                 if self.dflash_draft_model_path.is_some() {
                     bail!("--glm52-prefill-only is incompatible with the DSpark drafter");
                 }
+                if self.glm52_native_mtp {
+                    bail!("--glm52-prefill-only is incompatible with native MTP");
+                }
                 if self.kv_offload || self.kv_pd_vllm_seed.is_some() {
                     bail!(
                         "--glm52-prefill-only does not support KV offload or an external P/D peer"
@@ -598,6 +606,12 @@ impl Args {
                     openinfer_glm52::GLM52_PREFILL_CHUNK_ALIGN,
                     self.glm52_prefill_chunk_size
                 );
+            }
+            if self.glm52_native_mtp && self.dflash_draft_model_path.is_some() {
+                bail!("--glm52-native-mtp and --dflash-draft-model-path are mutually exclusive");
+            }
+            if self.glm52_native_mtp && !matches!(moe_topo, openinfer_glm52::Glm52MoeTopo::Ep8) {
+                bail!("--glm52-native-mtp currently requires --moe-topo=ep8");
             }
         }
         Ok(())
@@ -962,6 +976,41 @@ mod tests {
         let (args, provided) = parse_with_provided(&["openinfer"]);
         args.validate(ModelType::Glm52, &provided)
             .expect("GLM5.2 should default to DP8/EP8 when --dp-size is omitted");
+    }
+
+    #[cfg(feature = "glm52")]
+    #[test]
+    fn glm52_accepts_native_mtp_on_ep8() {
+        let (args, provided) = parse_with_provided(&["openinfer", "--glm52-native-mtp"]);
+        assert!(args.glm52_native_mtp);
+        args.validate(ModelType::Glm52, &provided)
+            .expect("native MTP should validate on the default EP8 topology");
+    }
+
+    #[cfg(feature = "glm52")]
+    #[test]
+    fn glm52_native_mtp_rejects_a_second_drafter() {
+        let (args, provided) = parse_with_provided(&[
+            "openinfer",
+            "--glm52-native-mtp",
+            "--dflash-draft-model-path",
+            "/tmp/dspark",
+        ]);
+        let error = args
+            .validate(ModelType::Glm52, &provided)
+            .expect_err("native MTP and DSpark must be mutually exclusive");
+        assert!(error.to_string().contains("mutually exclusive"), "{error}");
+    }
+
+    #[cfg(feature = "glm52")]
+    #[test]
+    fn glm52_native_mtp_rejects_non_ep8_topology() {
+        let (args, provided) =
+            parse_with_provided(&["openinfer", "--glm52-native-mtp", "--moe-topo", "ep4"]);
+        let error = args
+            .validate(ModelType::Glm52, &provided)
+            .expect_err("native MTP currently requires EP8");
+        assert!(error.to_string().contains("--moe-topo=ep8"), "{error}");
     }
 
     #[cfg(feature = "glm52")]

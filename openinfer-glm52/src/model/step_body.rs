@@ -26,6 +26,7 @@ use crate::dense::glm52_dense_mlp_forward_into;
 use crate::layer::Glm52DecodeStep;
 use crate::layer::Glm52DecoderLayerWeights;
 use crate::layer::Glm52LayerCaches;
+use crate::layer::Glm52LayerIndexMode;
 use crate::layer::Glm52LayerMlp;
 use crate::layer::glm52_layer_attention_half;
 use crate::layer::glm52_layer_finish;
@@ -105,6 +106,7 @@ pub(super) fn run_step_body(
             parity,
             layer == 0,
             tp_ar,
+            Glm52LayerIndexMode::Normal,
         )
         .with_context(|| format!("GLM5.2 layer {layer} attention half"))?;
         let mut tp_padded_mlp = false;
@@ -267,7 +269,7 @@ pub(super) fn run_step_body(
 /// DeepEP dispatch/expert-GEMM/combine, joined by the closing add into
 /// `mlp_out`. The events recorded here during capture become graph edges;
 /// replay keeps the parallel branches.
-fn glm52_moe_ep_layer(
+pub(super) fn glm52_moe_ep_layer(
     ctx: &DeviceContext,
     aux: &DeviceContext,
     ep8: &mut Glm52MoeEpState,

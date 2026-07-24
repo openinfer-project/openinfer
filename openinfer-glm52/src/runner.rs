@@ -154,6 +154,27 @@ impl Glm52PrefillBatch {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Glm52MtpAppend {
+    /// Row in the target step's retained raw-hidden buffer.
+    pub(crate) source_row: usize,
+    pub(crate) slot: usize,
+    /// Sequence token shifted one place to the left, matching vLLM's MTP
+    /// first-pass input construction.
+    pub(crate) input_token: u32,
+    pub(crate) position: usize,
+}
+
+/// Fleet-wide work selected by the coordinator for one native-MTP round.
+/// Every EP rank receives the same mode; choosing from rank-local occupancy
+/// would let an empty rank skip collectives that its peers enter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Glm52MtpRoundMode {
+    ResetOnly,
+    ContextOnly,
+    Propose,
+}
+
 enum Glm52RankCommand {
     LoadWeights {
         model_path: PathBuf,
@@ -169,7 +190,7 @@ enum Glm52RankCommand {
     BuildModel {
         max_model_len: usize,
         moe_topo: crate::Glm52MoeTopo,
-        dspark_enabled: bool,
+        drafter: crate::Glm52Drafter,
         prefill_chunk_size: Option<usize>,
         resp: Sender<Result<Vec<KvArena>>>,
     },
@@ -231,6 +252,19 @@ enum Glm52RankCommand {
         appends: Vec<(usize, usize)>,
         proposals: Vec<(usize, u32, usize)>,
         resp: Sender<Result<Vec<[u32; GLM52_DSPARK_DRAFTS]>>>,
+    },
+    /// Collective native-MTP round. Every EP rank receives one command,
+    /// including ranks with no live proposal, and uses the coordinator-agreed
+    /// context/draft buckets for the layer-78 MoE collectives.
+    MtpDraft {
+        mode: Glm52MtpRoundMode,
+        source_bucket: usize,
+        context_bucket: usize,
+        draft_bucket: usize,
+        resets: Vec<usize>,
+        appends: Vec<Glm52MtpAppend>,
+        proposal_slots: Vec<usize>,
+        resp: Sender<Result<Vec<[u32; crate::mtp::GLM52_MTP_DRAFTS]>>>,
     },
     /// Rank-local, vLLM-compat P/D only: deinterleave the RoPE dims of pages
     /// just restored from a vLLM-written namespace (see
@@ -330,7 +364,7 @@ impl Glm52RankWorker {
         &self,
         max_model_len: usize,
         moe_topo: crate::Glm52MoeTopo,
-        dspark_enabled: bool,
+        drafter: crate::Glm52Drafter,
         prefill_chunk_size: Option<usize>,
     ) -> Result<Receiver<Result<Vec<KvArena>>>> {
         let (resp_tx, resp_rx) = bounded(1);
@@ -338,7 +372,7 @@ impl Glm52RankWorker {
             .send(Glm52RankCommand::BuildModel {
                 max_model_len,
                 moe_topo,
-                dspark_enabled,
+                drafter,
                 prefill_chunk_size,
                 resp: resp_tx,
             })
@@ -441,6 +475,32 @@ impl Glm52RankWorker {
         Ok(resp_rx)
     }
 
+    pub(crate) fn mtp_draft_async(
+        &self,
+        mode: Glm52MtpRoundMode,
+        source_bucket: usize,
+        context_bucket: usize,
+        draft_bucket: usize,
+        resets: Vec<usize>,
+        appends: Vec<Glm52MtpAppend>,
+        proposal_slots: Vec<usize>,
+    ) -> Result<Receiver<Result<Vec<[u32; crate::mtp::GLM52_MTP_DRAFTS]>>>> {
+        let (resp_tx, resp_rx) = bounded(1);
+        self.tx
+            .send(Glm52RankCommand::MtpDraft {
+                mode,
+                source_bucket,
+                context_bucket,
+                draft_bucket,
+                resets,
+                appends,
+                proposal_slots,
+                resp: resp_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("GLM5.2 rank worker channel closed"))?;
+        Ok(resp_rx)
+    }
+
     fn dump_decode_graph_async(
         &self,
         bucket: usize,
@@ -514,18 +574,19 @@ impl Glm52Worker {
         &self,
         max_model_len: usize,
         moe_topo: crate::Glm52MoeTopo,
-        dspark_enabled: bool,
+        drafter: crate::Glm52Drafter,
         prefill_chunk_size: Option<usize>,
     ) -> Result<Receiver<Result<Vec<KvArena>>>> {
         match self {
-            Self::Local(worker) => worker.build_model_async(
-                max_model_len,
-                moe_topo,
-                dspark_enabled,
-                prefill_chunk_size,
-            ),
+            Self::Local(worker) => {
+                worker.build_model_async(max_model_len, moe_topo, drafter, prefill_chunk_size)
+            }
             Self::Remote(worker) => {
-                worker.build_model_async(max_model_len, moe_topo, dspark_enabled)
+                ensure!(
+                    prefill_chunk_size.is_none(),
+                    "GLM5.2 TP4 prefill-only execution is single-host"
+                );
+                worker.build_model_async(max_model_len, moe_topo, drafter)
             }
         }
     }
@@ -599,6 +660,32 @@ impl Glm52Worker {
         match self {
             Self::Local(worker) => worker.draft_async(bucket, resets, appends, proposals),
             Self::Remote(worker) => worker.draft_async(bucket, resets, appends, proposals),
+        }
+    }
+
+    pub(crate) fn mtp_draft_async(
+        &self,
+        mode: Glm52MtpRoundMode,
+        source_bucket: usize,
+        context_bucket: usize,
+        draft_bucket: usize,
+        resets: Vec<usize>,
+        appends: Vec<Glm52MtpAppend>,
+        proposal_slots: Vec<usize>,
+    ) -> Result<Receiver<Result<Vec<[u32; crate::mtp::GLM52_MTP_DRAFTS]>>>> {
+        match self {
+            Self::Local(worker) => worker.mtp_draft_async(
+                mode,
+                source_bucket,
+                context_bucket,
+                draft_bucket,
+                resets,
+                appends,
+                proposal_slots,
+            ),
+            Self::Remote(_) => {
+                anyhow::bail!("GLM5.2 native MTP currently requires all EP ranks in one process")
+            }
         }
     }
 
@@ -762,7 +849,7 @@ impl Glm52RankThreadState {
         &mut self,
         max_model_len: usize,
         moe_topo: crate::Glm52MoeTopo,
-        dspark_enabled: bool,
+        drafter: crate::Glm52Drafter,
         prefill_chunk_size: Option<usize>,
     ) -> Result<Vec<KvArena>> {
         let mut weights = self
@@ -778,7 +865,7 @@ impl Glm52RankThreadState {
             moe_topo
                 .uses_tensor_replicated_moe()
                 .then_some(self.placement.rank),
-            dspark_enabled,
+            drafter,
             prefill_chunk_size,
         )?);
         let arenas = model.kv_arenas(&dev_ctx.stream)?;
@@ -886,6 +973,38 @@ impl Glm52RankThreadState {
             &mut states,
             &anchors,
             &mut dspark.scratch,
+        )
+    }
+
+    fn mtp_draft(
+        &mut self,
+        mode: Glm52MtpRoundMode,
+        source_bucket: usize,
+        context_bucket: usize,
+        draft_bucket: usize,
+        resets: &[usize],
+        appends: &[Glm52MtpAppend],
+        proposal_slots: &[usize],
+    ) -> Result<Vec<[u32; crate::mtp::GLM52_MTP_DRAFTS]>> {
+        let dev_ctx = self.ctx.device_context()?;
+        let runtime = self
+            .runtime
+            .as_mut()
+            .context("GLM5.2 native MTP draft before build_model")?;
+        runtime.model.mtp_propose(
+            &dev_ctx,
+            &runtime.aux_ctx,
+            runtime
+                .ep8
+                .as_mut()
+                .context("GLM5.2 native MTP requires the EP8 collective state")?,
+            mode,
+            source_bucket,
+            context_bucket,
+            draft_bucket,
+            resets,
+            appends,
+            proposal_slots,
         )
     }
 
@@ -1079,16 +1198,12 @@ fn rank_worker_loop(rx: &Receiver<Glm52RankCommand>, mut state: Glm52RankThreadS
             Glm52RankCommand::BuildModel {
                 max_model_len,
                 moe_topo,
-                dspark_enabled,
+                drafter,
                 prefill_chunk_size,
                 resp,
             } => {
-                let _ = resp.send(state.build_model(
-                    max_model_len,
-                    moe_topo,
-                    dspark_enabled,
-                    prefill_chunk_size,
-                ));
+                let _ =
+                    resp.send(state.build_model(max_model_len, moe_topo, drafter, prefill_chunk_size));
             }
             Glm52RankCommand::SetupComm {
                 unique_id,
@@ -1137,6 +1252,26 @@ fn rank_worker_loop(rx: &Receiver<Glm52RankCommand>, mut state: Glm52RankThreadS
                 resp,
             } => {
                 let _ = resp.send(state.draft(bucket, &resets, &appends, &proposals));
+            }
+            Glm52RankCommand::MtpDraft {
+                mode,
+                source_bucket,
+                context_bucket,
+                draft_bucket,
+                resets,
+                appends,
+                proposal_slots,
+                resp,
+            } => {
+                let _ = resp.send(state.mtp_draft(
+                    mode,
+                    source_bucket,
+                    context_bucket,
+                    draft_bucket,
+                    &resets,
+                    &appends,
+                    &proposal_slots,
+                ));
             }
             Glm52RankCommand::Shutdown => break,
         }

@@ -77,8 +77,10 @@ use crate::weights::retype_owned;
 
 mod build;
 mod launch_ahead;
+mod mtp;
 mod step_body;
 use launch_ahead::Glm52SpeculatedStep;
+use mtp::Glm52NativeMtp;
 use step_body::run_step_body;
 
 /// The per-rank slot count and the largest decode bucket. A slot is a batch
@@ -285,6 +287,7 @@ pub(crate) fn rope_tables(position: usize) -> (Vec<bf16>, Vec<bf16>) {
 pub(crate) struct Glm52RankModel {
     layers: Vec<Glm52DecoderLayerWeights>,
     caches: Vec<Glm52LayerCaches>,
+    mtp: Option<Glm52NativeMtp>,
     embed: DeviceMatrix,
     final_norm: DeviceVec,
     /// Full vocabulary head retained for DSpark and non-greedy sampling.
@@ -527,7 +530,7 @@ impl Glm52RankModel {
         max_model_len: usize,
         moe_topo: crate::Glm52MoeTopo,
         attn_shard: Option<usize>,
-        dspark_enabled: bool,
+        drafter: crate::Glm52Drafter,
         prefill_chunk_size: Option<usize>,
     ) -> Result<Self> {
         ensure!(
@@ -596,6 +599,10 @@ impl Glm52RankModel {
                     .transpose()?,
             });
         }
+        let mtp = drafter
+            .is_mtp()
+            .then(|| Glm52NativeMtp::build(ctx, w, max_model_len))
+            .transpose()?;
 
         let embed_raw = w.take_tensor("model.embed_tokens.weight")?;
         let lm_head_raw = w.take_tensor("lm_head.weight")?;
@@ -703,7 +710,7 @@ impl Glm52RankModel {
                     mqa_shape,
                     mla_heads,
                     mla_backend,
-                    dspark_enabled,
+                    drafter.is_dspark(),
                 )?,
                 graph: CudaGraphState::new(),
                 block_table: bucket_table,
@@ -790,6 +797,7 @@ impl Glm52RankModel {
         Ok(Self {
             layers,
             caches,
+            mtp,
             embed,
             final_norm,
             lm_head,
@@ -859,6 +867,53 @@ impl Glm52RankModel {
                 vocab_start: self.decode_vocab_start,
                 sampling_scratch,
             },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn mtp_propose(
+        &mut self,
+        ctx: &DeviceContext,
+        aux: &DeviceContext,
+        ep: &mut Glm52MoeEpState,
+        mode: crate::runner::Glm52MtpRoundMode,
+        source_bucket: usize,
+        context_bucket: usize,
+        draft_bucket: usize,
+        resets: &[usize],
+        appends: &[crate::runner::Glm52MtpAppend],
+        proposal_slots: &[usize],
+    ) -> Result<Vec<[u32; crate::mtp::GLM52_MTP_DRAFTS]>> {
+        let source_index = self
+            .buckets
+            .iter()
+            .position(|bucket| bucket.rows == source_bucket)
+            .with_context(|| {
+                format!(
+                    "GLM5.2 MTP source bucket {source_bucket} is not in \
+                     {GLM52_DECODE_BUCKETS:?}"
+                )
+            })?;
+        let source_hidden = &self.buckets[source_index].scratch.hidden;
+        let mtp = self
+            .mtp
+            .as_mut()
+            .context("GLM5.2 native MTP command reached a model without MTP weights")?;
+        mtp.propose(
+            ctx,
+            aux,
+            ep,
+            &self.embed,
+            &self.lm_head,
+            &self.cos_table,
+            &self.sin_table,
+            source_hidden,
+            mode,
+            context_bucket,
+            draft_bucket,
+            resets,
+            appends,
+            proposal_slots,
         )
     }
 

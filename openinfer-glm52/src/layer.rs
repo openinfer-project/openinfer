@@ -91,6 +91,16 @@ pub(crate) struct Glm52LayerCaches {
     pub(crate) index_k_cache: Option<CudaSlice<u8>>,
 }
 
+/// Sparse-index policy for one decoder-layer forward. Target layers compute
+/// or inherit indices according to their checkpoint role. Native MTP computes
+/// layer 78's indices on its first pass, then reuses the selected rows for
+/// the remaining four proposal iterations (`index_share_for_mtp_iteration`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Glm52LayerIndexMode {
+    Normal,
+    Reuse,
+}
+
 /// Everything one decode step shares across layers: the token position, the two
 /// rotary tables (MLA interleaved; indexer half-split — different conventions,
 /// same `[32]` cos/sin extent), and the paging plumbing common to every layer's
@@ -168,6 +178,7 @@ pub(crate) fn glm52_layer_attention_half(
     parity: usize,
     first_layer: bool,
     tp_ar: Option<(&mut crate::moe_tp::Glm52MoeTpState, usize)>,
+    index_mode: Glm52LayerIndexMode,
 ) -> Result<()> {
     // Attention-TP: a head-sharded layer (8 of 64 heads) produces an o_proj
     // PARTIAL that must cross the AR brick before the residual add; holding
@@ -195,8 +206,15 @@ pub(crate) fn glm52_layer_attention_half(
     let tokens = step.mla_sched.batch();
     glm52_mla_front_q_into(ctx, &w.mla, &s.layer.normed, &mut s.mla_front)?;
     let mut topk_ready = None;
-    match &w.indexer {
-        Glm52LayerIndexer::Full(indexer) => {
+    match (&w.indexer, index_mode) {
+        (Glm52LayerIndexer::Full(_), Glm52LayerIndexMode::Reuse) => {
+            ensure!(
+                caches.index_k_cache.is_some(),
+                "GLM5.2 reused full-indexer layer is missing its index-K cache"
+            );
+            *carry_ready = true;
+        }
+        (Glm52LayerIndexer::Full(indexer), Glm52LayerIndexMode::Normal) => {
             let index_k_cache = caches
                 .index_k_cache
                 .as_mut()
@@ -227,11 +245,14 @@ pub(crate) fn glm52_layer_attention_half(
             }
             *carry_ready = true;
         }
-        Glm52LayerIndexer::Shared => {
+        (Glm52LayerIndexer::Shared, Glm52LayerIndexMode::Normal) => {
             ensure!(
                 caches.index_k_cache.is_none(),
                 "GLM5.2 shared-indexer layer unexpectedly owns an index-K cache"
             );
+        }
+        (Glm52LayerIndexer::Shared, Glm52LayerIndexMode::Reuse) => {
+            anyhow::bail!("GLM5.2 cannot request explicit top-k reuse on a shared-indexer layer")
         }
     }
     ensure!(
@@ -396,7 +417,19 @@ pub(crate) fn glm52_decoder_layer_forward(
         tokens,
         s.layer.normed.data_mut(),
     )?;
-    glm52_layer_attention_half(ctx, None, w, caches, step, s, carry_ready, 0, true, None)?;
+    glm52_layer_attention_half(
+        ctx,
+        None,
+        w,
+        caches,
+        step,
+        s,
+        carry_ready,
+        0,
+        true,
+        None,
+        Glm52LayerIndexMode::Normal,
+    )?;
     match &w.mlp {
         Glm52LayerMlp::Dense(dense) => glm52_dense_mlp_forward_into(
             ctx,

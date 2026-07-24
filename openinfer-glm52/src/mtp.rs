@@ -16,12 +16,14 @@
 //! value is recycled into the next draft iteration; normalizing in place
 //! would apply the shared norm twice on the logits path.
 //!
-//! This module is test-only. Production weight residency, scheduler state,
-//! and speculative serving are deliberately outside this accuracy bring-up.
+//! Production serving owns residency and state in `model::mtp`; the oracle
+//! tests call these same bookend operations directly.
 
+use anyhow::Context as _;
 use anyhow::Result;
 use anyhow::ensure;
 use cudarc::driver::CudaSlice;
+use half::bf16;
 use openinfer_kernels::ops::copy_hidden_rows_raw_into;
 use openinfer_kernels::ops::gemm_strided_batched_bf16;
 use openinfer_kernels::ops::mask_position_zero_rows_into;
@@ -32,10 +34,45 @@ use openinfer_kernels::tensor::DeviceVec;
 use openinfer_kernels::tensor::HiddenStates;
 
 use crate::config::GLM52_HIDDEN;
+use crate::config::GLM52_INDEX_HEAD_DIM;
 use crate::config::GLM52_RMS_EPS;
+use crate::model::GLM52_DECODE_BUCKETS;
+use crate::model::GLM52_MODEL_LEN_ALIGN;
+use crate::model::glm52_pool_blocks;
 use crate::rows::Rows;
 
 const MTP_FUSED_INPUT: usize = 2 * GLM52_HIDDEN;
+pub(crate) const GLM52_MTP_DRAFTS: usize = 5;
+
+/// Context-scaled device memory owned by the native MTP lane: one layer of
+/// MLA + index-K cache and one set of per-bucket indexer logits/block tables.
+/// Fixed-size weights and scratch are accounted by the post-build headroom
+/// probe; this function is the exact monotone term used to derive the context
+/// cap before those arenas are allocated.
+pub(crate) fn glm52_mtp_arena_bytes(max_model_len: usize) -> Result<usize> {
+    let blocks = glm52_pool_blocks(max_model_len);
+    let mla = blocks
+        .checked_mul(GLM52_MODEL_LEN_ALIGN)
+        .and_then(|v| v.checked_mul(openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN))
+        .context("GLM5.2 MTP MLA arena byte count overflow")?;
+    let index_k = blocks
+        .checked_mul(GLM52_MODEL_LEN_ALIGN)
+        .and_then(|v| v.checked_mul(GLM52_INDEX_HEAD_DIM + size_of::<f32>()))
+        .context("GLM5.2 MTP index-K arena byte count overflow")?;
+    let rows: usize = GLM52_DECODE_BUCKETS.iter().sum();
+    let indexer_logits = rows
+        .checked_mul(max_model_len.next_multiple_of(256))
+        .and_then(|v| v.checked_mul(size_of::<bf16>() + size_of::<f32>()))
+        .context("GLM5.2 MTP indexer scratch byte count overflow")?;
+    let block_tables = rows
+        .checked_mul(max_model_len.div_ceil(GLM52_MODEL_LEN_ALIGN))
+        .and_then(|v| v.checked_mul(size_of::<i32>()))
+        .context("GLM5.2 MTP block-table byte count overflow")?;
+    mla.checked_add(index_k)
+        .and_then(|v| v.checked_add(indexer_logits))
+        .and_then(|v| v.checked_add(block_tables))
+        .context("GLM5.2 MTP arena byte count overflow")
+}
 
 /// The four BF16 weights around the ordinary layer-78 decoder block.
 pub(crate) struct Glm52MtpHeadWeights {

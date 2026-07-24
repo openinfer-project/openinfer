@@ -206,6 +206,14 @@ impl Glm52SlotState {
         !self.mid_prefill() && self.completion + 1 < self.max_tokens
     }
 
+    /// Native MTP always executes its fixed five-token proposal chain. Do not
+    /// start that chain in a shorter request tail: the verifier would discard
+    /// most of it, and the unused speculative KV positions could cross the
+    /// request's launch-time model-length cap.
+    pub(super) fn wants_full_draft(&self, draft_tokens: usize) -> bool {
+        !self.mid_prefill() && self.max_tokens - self.completion >= draft_tokens
+    }
+
     /// Install the draft lane's proposal for the next verify span, truncated
     /// to the topology's span cap ([`GLM52_DSPARK_EP8_SPAN_DRAFTS`] under EP8,
     /// all of [`GLM52_DSPARK_DRAFTS`] under TP8's span shape).
@@ -293,7 +301,7 @@ impl Glm52SlotState {
         }
         let mean_accepted = stats.accepted_sum as f64 / stats.rounds as f64;
         log::info!(
-            "GLM5.2 dspark: rank={rank} slot={slot} rounds={} mean_accepted_drafts={mean_accepted:.3} \
+            "GLM5.2 speculative: rank={rank} slot={slot} rounds={} mean_accepted_drafts={mean_accepted:.3} \
              mean_accepted_incl_bonus={:.3} hist={:?}",
             stats.rounds,
             mean_accepted + 1.0,
@@ -595,6 +603,19 @@ mod tests {
         assert!(state.wants_drafts());
         assert_eq!(state.advance_span(&[21], EOS), commit(&[21], 1, None, 1));
         assert!(!state.wants_drafts(), "one-token tail is a plain row");
+    }
+
+    #[test]
+    fn fixed_mtp_chain_stops_before_a_short_tail() {
+        let mut state = state(vec![10], 6, false);
+        assert!(!state.wants_full_draft(5), "mid-prefill never drafts");
+        assert_eq!(state.advance_span(&[20], EOS), commit(&[20], 1, None, 1));
+        assert!(state.wants_full_draft(5));
+        assert_eq!(state.advance_span(&[21], EOS), commit(&[21], 1, None, 1));
+        assert!(
+            !state.wants_full_draft(5),
+            "four-token tail must not launch a five-token MTP chain"
+        );
     }
 
     #[test]

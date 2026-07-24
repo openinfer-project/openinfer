@@ -260,9 +260,10 @@ impl Glm52WeightManifest {
     pub(crate) fn all_rank_load_bundles(
         &self,
         moe_topo: crate::Glm52MoeTopo,
+        native_mtp: bool,
     ) -> Result<Vec<Glm52RankLoadBundle>> {
         (0..moe_topo.device_count())
-            .map(|rank| self.rank_load_bundle(rank, moe_topo))
+            .map(|rank| self.rank_load_bundle(rank, moe_topo, native_mtp))
             .collect()
     }
 
@@ -279,8 +280,9 @@ impl Glm52WeightManifest {
         &self,
         rank: usize,
         moe_topo: crate::Glm52MoeTopo,
+        native_mtp: bool,
     ) -> Result<Glm52RankLoadBundle> {
-        let names = self.rank_resident_tensor_names(rank, moe_topo)?;
+        let names = self.rank_resident_tensor_names(rank, moe_topo, native_mtp)?;
         let mut by_shard: BTreeMap<String, Vec<Glm52TensorLoadSpec>> = BTreeMap::new();
         for name in names {
             let shard = self
@@ -336,13 +338,14 @@ impl Glm52WeightManifest {
     }
 
     /// Tensors that must become GPU-resident for one serving rank. MTP layer
-    /// 78 is accuracy-oracle-only and never enters this list. TP8 gets all
+    /// 78 enters the EP plan only when native MTP is enabled. TP8 gets all
     /// routed + shared experts from `load_tp8_slice_layer`, so its first pass
     /// loads routers but not duplicate full shared-expert projections.
     fn rank_resident_tensor_names(
         &self,
         rank: usize,
         moe_topo: crate::Glm52MoeTopo,
+        native_mtp: bool,
     ) -> Result<Vec<String>> {
         ensure!(
             rank < moe_topo.device_count(),
@@ -357,6 +360,15 @@ impl Glm52WeightManifest {
             for layer_idx in GLM52_DENSE_LAYERS..GLM52_LAYERS {
                 push_routed_experts(&mut names, layer_idx, expert_range.clone());
             }
+            if native_mtp {
+                self.push_mtp_non_expert_names(&mut names, true);
+                push_routed_experts(&mut names, GLM52_MTP_LAYER, expert_range);
+            }
+        } else {
+            ensure!(
+                !native_mtp,
+                "GLM5.2 native MTP resident loading currently requires an EP topology"
+            );
         }
         Ok(names)
     }
@@ -382,6 +394,10 @@ impl Glm52WeightManifest {
 
     fn push_checkpoint_non_expert_names(&self, names: &mut Vec<String>) {
         self.push_resident_non_expert_names(names, true);
+        self.push_mtp_non_expert_names(names, true);
+    }
+
+    fn push_mtp_non_expert_names(&self, names: &mut Vec<String>, include_shared_experts: bool) {
         names.push(format!("model.layers.{GLM52_MTP_LAYER}.enorm.weight"));
         names.push(format!("model.layers.{GLM52_MTP_LAYER}.hnorm.weight"));
         names.push(format!("model.layers.{GLM52_MTP_LAYER}.eh_proj.weight"));
@@ -389,7 +405,7 @@ impl Glm52WeightManifest {
             "model.layers.{GLM52_MTP_LAYER}.shared_head.norm.weight"
         ));
         self.push_attention_names(names, GLM52_MTP_LAYER);
-        push_moe_non_expert(names, GLM52_MTP_LAYER, true);
+        push_moe_non_expert(names, GLM52_MTP_LAYER, include_shared_experts);
     }
 
     fn push_attention_names(&self, names: &mut Vec<String>, layer_idx: usize) {
@@ -740,10 +756,10 @@ mod tests {
             weight_map: BTreeMap::new(),
         };
         let ep8 = manifest
-            .rank_resident_tensor_names(0, crate::Glm52MoeTopo::Ep8)
+            .rank_resident_tensor_names(0, crate::Glm52MoeTopo::Ep8, false)
             .unwrap();
         let tp8 = manifest
-            .rank_resident_tensor_names(0, crate::Glm52MoeTopo::Tp8)
+            .rank_resident_tensor_names(0, crate::Glm52MoeTopo::Tp8, false)
             .unwrap();
 
         let mtp_prefix = format!("model.layers.{GLM52_MTP_LAYER}.");
@@ -762,13 +778,64 @@ mod tests {
     }
 
     #[test]
+    fn native_mtp_ep8_plan_adds_the_local_layer_78_partition() {
+        let manifest = Glm52WeightManifest {
+            weight_map: BTreeMap::new(),
+        };
+        let plain = manifest
+            .rank_resident_tensor_names(3, crate::Glm52MoeTopo::Ep8, false)
+            .unwrap();
+        let native_mtp = manifest
+            .rank_resident_tensor_names(3, crate::Glm52MoeTopo::Ep8, true)
+            .unwrap();
+        let mtp_prefix = format!("model.layers.{GLM52_MTP_LAYER}.");
+
+        assert!(plain.iter().all(|name| !name.starts_with(&mtp_prefix)));
+        assert!(
+            native_mtp
+                .iter()
+                .any(|name| name == &format!("{mtp_prefix}eh_proj.weight"))
+        );
+        assert!(
+            native_mtp
+                .iter()
+                .any(|name| name == &format!("{mtp_prefix}mlp.experts.96.gate_proj.weight"))
+        );
+        assert!(
+            native_mtp
+                .iter()
+                .any(|name| name == &format!("{mtp_prefix}mlp.experts.127.down_proj.weight"))
+        );
+        assert!(native_mtp.iter().all(|name| {
+            if !name.starts_with(&format!("{mtp_prefix}mlp.experts.")) {
+                return true;
+            }
+            name.split(".mlp.experts.")
+                .nth(1)
+                .and_then(|rest| rest.split('.').next())
+                .and_then(|expert| expert.parse::<usize>().ok())
+                .is_some_and(|expert| (96..128).contains(&expert))
+        }));
+    }
+
+    #[test]
+    fn native_mtp_resident_plan_rejects_non_ep_topologies() {
+        let manifest = Glm52WeightManifest {
+            weight_map: BTreeMap::new(),
+        };
+        manifest
+            .rank_resident_tensor_names(0, crate::Glm52MoeTopo::Tp8, true)
+            .expect_err("native MTP must not construct a TP resident plan");
+    }
+
+    #[test]
     fn ep4_resident_plan_carries_64_expert_bundles() {
         let manifest = Glm52WeightManifest {
             weight_map: BTreeMap::new(),
         };
         // Rank 1 of EP4 owns whole experts 64..128 on every MoE layer.
         let ep4 = manifest
-            .rank_resident_tensor_names(1, crate::Glm52MoeTopo::Ep4)
+            .rank_resident_tensor_names(1, crate::Glm52MoeTopo::Ep4, false)
             .unwrap();
         assert!(
             ep4.iter()
@@ -789,7 +856,7 @@ mod tests {
         // Four EP4 ranks cover the full routed set.
         assert!(
             manifest
-                .rank_resident_tensor_names(4, crate::Glm52MoeTopo::Ep4)
+                .rank_resident_tensor_names(4, crate::Glm52MoeTopo::Ep4, false)
                 .is_err()
         );
     }

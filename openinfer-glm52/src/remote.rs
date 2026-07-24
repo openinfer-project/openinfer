@@ -130,7 +130,7 @@ enum WireRequest {
     BuildModel {
         max_model_len: usize,
         moe_topo: Glm52MoeTopo,
-        dspark_enabled: bool,
+        drafter: crate::Glm52Drafter,
     },
     SetupComm {
         unique_id: Vec<u8>,
@@ -476,7 +476,7 @@ impl Glm52RemoteRankWorker {
         &self,
         max_model_len: usize,
         moe_topo: Glm52MoeTopo,
-        dspark_enabled: bool,
+        drafter: crate::Glm52Drafter,
     ) -> Result<Receiver<Result<Vec<KvArena>>>> {
         let (tx, rx) = bounded(1);
         self.node.shared.submit(
@@ -484,7 +484,7 @@ impl Glm52RemoteRankWorker {
             WireRequest::BuildModel {
                 max_model_len,
                 moe_topo,
-                dspark_enabled,
+                drafter,
             },
             PendingResp::BuildModel(tx),
         )?;
@@ -776,7 +776,7 @@ fn serve_connection(stream: TcpStream) -> Result<()> {
 
 fn spawn_hosted_workers(hello: &WireHello) -> Result<Vec<Glm52RankWorker>> {
     let manifest = Glm52WeightManifest::from_model_dir(&hello.model_path)?;
-    let bundles = manifest.all_rank_load_bundles(hello.moe_topo)?;
+    let bundles = manifest.all_rank_load_bundles(hello.moe_topo, false)?;
     ensure!(
         hello.first_rank + hello.rank_count <= bundles.len(),
         "GLM5.2 rank-host asked for ranks {}..{} but {:?} has {} ranks",
@@ -834,12 +834,11 @@ fn host_demux_loop(
             WireRequest::BuildModel {
                 max_model_len,
                 moe_topo,
-                dspark_enabled,
+                drafter,
             } => HostPending::BuildModel(worker.build_model_async(
                 max_model_len,
                 moe_topo,
-                dspark_enabled,
-                None,
+                drafter,
             )?),
             WireRequest::SetupComm {
                 unique_id,
