@@ -154,7 +154,7 @@ __global__ void indexer_weights_fold_kernel(
     float softmax_scale, float n_heads_scale,
     float* __restrict__ out,                    // [heads]
     int heads) {
-  const int h = threadIdx.x;
+  const int h = blockIdx.x * blockDim.x + threadIdx.x;
   if (h < heads) {
     out[h] = __bfloat162float(weights[h]) * q_scale[h] * softmax_scale *
              n_heads_scale;
@@ -257,10 +257,12 @@ CUresult glm52_indexer_weights_fold_cuda(const __nv_bfloat16* weights,
                                           float n_heads_scale, float* out,
                                           int heads, cudaStream_t stream) {
   if (weights == nullptr || q_scale == nullptr || out == nullptr ||
-      heads <= 0 || heads > 1024) {
+      heads <= 0) {
     return CUDA_ERROR_INVALID_VALUE;
   }
-  indexer_weights_fold_kernel<<<1, heads, 0, stream>>>(
+  constexpr int kThreads = 256;
+  indexer_weights_fold_kernel<<<(heads + kThreads - 1) / kThreads, kThreads, 0,
+                                stream>>>(
       weights, q_scale, softmax_scale, n_heads_scale, out, heads);
   return consume_last_cuda_error();
 }

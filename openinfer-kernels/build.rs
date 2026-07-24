@@ -433,6 +433,23 @@ fn nvcc_accepts_gencode(nvcc: &str, compute: &str, sm: &str) -> bool {
     }
 }
 
+fn glm52_fp8_gemm_arch_args(normalized_sms: &[String], nvcc: &str) -> Option<Vec<String>> {
+    let mut args = Vec::new();
+    for sm in normalized_sms {
+        let numeric = sm_numeric_prefix(sm)?;
+        if !(100..120).contains(&numeric) {
+            continue;
+        }
+        let accelerated = format!("{numeric}a");
+        if !nvcc_accepts_gencode(nvcc, &accelerated, &accelerated) {
+            continue;
+        }
+        args.push("-gencode".to_string());
+        args.push(format!("arch=compute_{accelerated},code=sm_{accelerated}"));
+    }
+    (!args.is_empty()).then_some(args)
+}
+
 fn glm52_flashmla_sparse_arch_args(normalized_sms: &[String], nvcc: &str) -> Vec<String> {
     let sm90a_supported = normalized_sms.iter().any(|sm| sm == "90" || sm == "90a")
         && nvcc_accepts_gencode(nvcc, "90a", "90a");
@@ -1530,7 +1547,14 @@ fn main() {
             "-I".to_string(),
             csrc_dir.to_string_lossy().to_string(),
         ];
-        if stem == "glm52_flashmla_sparse" {
+        if stem == "glm52_fp8_gemm" {
+            if let Some(args) = glm52_fp8_gemm_arch_args(&nvcc_sm_targets, &nvcc) {
+                nvcc_args.extend(args);
+                nvcc_args.push("-DGLM52_FP8_GEMM_SM100A".to_string());
+            } else {
+                nvcc_args.extend(arch_args.clone());
+            }
+        } else if stem == "glm52_flashmla_sparse" {
             nvcc_args.extend(glm52_flashmla_sparse_arch_args(&nvcc_sm_targets, &nvcc));
         } else if stem == "glm52_deepgemm_mqa" {
             if let Some((mqa_args, mqa_define)) =
@@ -1665,6 +1689,21 @@ fn main() {
                     .join("kerutils/include")
                     .to_string_lossy()
                     .to_string(),
+                "-I".to_string(),
+                flashinfer.cutlass.to_string_lossy().to_string(),
+                "-I".to_string(),
+                flashinfer.cutlass_util.to_string_lossy().to_string(),
+            ]);
+        } else if stem == "glm52_fp8_gemm" {
+            for dir in &flashinfer.cccl {
+                nvcc_args.extend(["-I".to_string(), dir.to_string_lossy().to_string()]);
+            }
+            nvcc_args.extend([
+                "--std=c++17".to_string(),
+                "--expt-relaxed-constexpr".to_string(),
+                "--expt-extended-lambda".to_string(),
+                "-I".to_string(),
+                flashinfer.include.to_string_lossy().to_string(),
                 "-I".to_string(),
                 flashinfer.cutlass.to_string_lossy().to_string(),
                 "-I".to_string(),

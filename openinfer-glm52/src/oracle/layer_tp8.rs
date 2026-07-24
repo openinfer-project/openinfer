@@ -226,8 +226,13 @@ fn run_layer_prefill_tp8(
     let mut sin = ctx.stream.alloc_zeros::<bf16>(GLM52_ROPE_HALF)?;
     let mla_sched = Glm52MlaSchedMetadata::new(ctx, contract, w.mla.heads)?;
 
-    let mqa_shape =
-        Glm52IndexerScratch::decode_shape(1, index_cache_layout, index_blocks, NUM_SMS, oracle_ctx);
+    let mqa_shape = Glm52IndexerScratch::paged_mqa_shape(
+        1,
+        index_cache_layout,
+        index_blocks,
+        NUM_SMS,
+        oracle_ctx,
+    );
     let mut scratch =
         Glm52DecodeScratch::new(ctx, &contract, mqa_shape, crate::config::GLM52_HEADS, false)?;
     let mut router_scratch = Glm52RouterScratch::new(ctx, 1)?;

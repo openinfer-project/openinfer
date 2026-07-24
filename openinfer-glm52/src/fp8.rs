@@ -14,6 +14,10 @@ use anyhow::ensure;
 use cudarc::driver::CudaSlice;
 use half::bf16;
 use openinfer_kernels::ops::GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW;
+use openinfer_kernels::ops::Glm52MoeQuantShape;
+use openinfer_kernels::ops::glm52_fp8_groupwise_gemm_sm100_bank_launch;
+use openinfer_kernels::ops::glm52_fp8_groupwise_gemm_sm100_launch;
+use openinfer_kernels::ops::glm52_fp8_per_token_group_quant_bf16_launch;
 use openinfer_kernels::ops::glm52_fp8_weight_only_gemv_launch;
 use openinfer_kernels::ops::glm52_fp8_weight_only_gemv_pair_launch;
 use openinfer_kernels::ops::glm52_fp8_weight_only_gemv_partials_launch;
@@ -22,6 +26,127 @@ use openinfer_kernels::ops::glm52_silu_and_mul_bf16_launch;
 use openinfer_kernels::tensor::DeviceContext;
 
 pub(crate) const FP8_BLOCK: usize = 128;
+const FP8_GEMM_WORKSPACE_BYTES: usize = 32 << 20;
+
+pub(crate) struct Glm52Fp8GemmScratch {
+    rows: usize,
+    width: usize,
+    activation: CudaSlice<u8>,
+    activation_scale: CudaSlice<f32>,
+    workspace: CudaSlice<u8>,
+}
+
+impl Glm52Fp8GemmScratch {
+    pub(crate) fn new(ctx: &DeviceContext, rows: usize, width: usize) -> Result<Self> {
+        ensure!(
+            rows > 0 && rows.is_multiple_of(4) && width.is_multiple_of(FP8_BLOCK),
+            "GLM5.2 FP8 GEMM scratch requires rows%4=0 and width%128=0"
+        );
+        Ok(Self {
+            rows,
+            width,
+            activation: ctx.stream.alloc_zeros::<u8>(rows * width)?,
+            activation_scale: ctx
+                .stream
+                .alloc_zeros::<f32>(rows * width.div_ceil(FP8_BLOCK))?,
+            workspace: ctx.stream.alloc_zeros::<u8>(FP8_GEMM_WORKSPACE_BYTES)?,
+        })
+    }
+}
+
+pub(crate) fn fp8_linear_large_m_into(
+    ctx: &DeviceContext,
+    w: &ProjWeight,
+    rows: usize,
+    input: &CudaSlice<bf16>,
+    scratch: &mut Glm52Fp8GemmScratch,
+    out: &mut CudaSlice<bf16>,
+) -> Result<()> {
+    ensure!(
+        rows > 0
+            && rows.is_multiple_of(4)
+            && rows <= scratch.rows
+            && w.k <= scratch.width
+            && input.len() >= rows * w.k
+            && out.len() >= rows * w.n,
+        "GLM5.2 large-M FP8 projection buffers do not fit [{rows}, {}, {}]",
+        w.n,
+        w.k
+    );
+    glm52_fp8_per_token_group_quant_bf16_launch(
+        ctx,
+        Glm52MoeQuantShape {
+            rows,
+            width: w.k,
+            group_size: FP8_BLOCK,
+        },
+        input,
+        &mut scratch.activation,
+        &mut scratch.activation_scale,
+    )?;
+    glm52_fp8_groupwise_gemm_sm100_launch(
+        ctx,
+        rows,
+        w.n,
+        w.k,
+        &scratch.activation,
+        &scratch.activation_scale,
+        &w.weight,
+        &w.scale,
+        out,
+        &mut scratch.workspace,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fp8_linear_large_m_bank_into(
+    ctx: &DeviceContext,
+    rows: usize,
+    n: usize,
+    k: usize,
+    input: &CudaSlice<bf16>,
+    weight: &CudaSlice<u8>,
+    weight_offset: usize,
+    scale: &CudaSlice<f32>,
+    scale_offset: usize,
+    scratch: &mut Glm52Fp8GemmScratch,
+    out: &mut CudaSlice<bf16>,
+) -> Result<()> {
+    ensure!(
+        rows > 0
+            && rows.is_multiple_of(4)
+            && rows <= scratch.rows
+            && k <= scratch.width
+            && input.len() >= rows * k
+            && out.len() >= rows * n,
+        "GLM5.2 bank FP8 projection buffers do not fit [{rows}, {n}, {k}]"
+    );
+    glm52_fp8_per_token_group_quant_bf16_launch(
+        ctx,
+        Glm52MoeQuantShape {
+            rows,
+            width: k,
+            group_size: FP8_BLOCK,
+        },
+        input,
+        &mut scratch.activation,
+        &mut scratch.activation_scale,
+    )?;
+    glm52_fp8_groupwise_gemm_sm100_bank_launch(
+        ctx,
+        rows,
+        n,
+        k,
+        &scratch.activation,
+        &scratch.activation_scale,
+        weight,
+        weight_offset,
+        scale,
+        scale_offset,
+        out,
+        &mut scratch.workspace,
+    )
+}
 
 /// OCP `float8_e4m3fn` decode (bias 7, no inf; subnormals supported). Used by the
 /// host-side dequant paths (kv_b absorb factors), not the GPU kernels.

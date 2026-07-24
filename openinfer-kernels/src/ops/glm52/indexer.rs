@@ -296,10 +296,7 @@ pub fn glm52_indexer_weights_fold_launch(
     out: &mut CudaSlice<f32>,
 ) -> Result<()> {
     let heads = out.len();
-    ensure!(
-        heads > 0 && heads <= 1024,
-        "GLM5.2 indexer weights fold heads {heads} outside 1..=1024"
-    );
+    ensure!(heads > 0, "GLM5.2 indexer weights fold is empty");
     ensure!(
         weights.len() >= heads && q_scale.len() >= heads,
         "GLM5.2 indexer weights fold inputs too small: weights {}, q_scale {} (need {heads})",

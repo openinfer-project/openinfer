@@ -74,35 +74,7 @@ pub(super) fn plan_step_shapes(
     wants
         .iter()
         .map(|row| {
-            // Every active slot gets one row, then leftover capacity extends
-            // spans one row per slot per round (round-robin), so two
-            // mid-prefill slots on one rank drain in parallel instead of the
-            // lowest slot starving the later one down to a liveness row for
-            // its whole prefill.
-            let mut spans = [0usize; GLM52_MAX_BATCH_PER_RANK];
-            let mut used = 0usize;
-            for (slot, &want) in row.iter().enumerate() {
-                if want > 0 {
-                    // bucket >= this rank's capped demand >= its active count
-                    // by construction; a dropped active would stall forever.
-                    assert!(used < bucket, "bucket {bucket} smaller than active count");
-                    spans[slot] = 1;
-                    used += 1;
-                }
-            }
-            loop {
-                let mut gave = false;
-                for (slot, &want) in row.iter().enumerate() {
-                    if used < bucket && spans[slot] > 0 && spans[slot] < want {
-                        spans[slot] += 1;
-                        used += 1;
-                        gave = true;
-                    }
-                }
-                if !gave || used == bucket {
-                    break;
-                }
-            }
+            let spans = plan_prefill_spans(row, bucket);
             let mut slots: [u8; GLM52_MAX_BATCH_PER_RANK] = std::array::from_fn(|slot| slot as u8);
             let mut dst = 0usize;
             for (slot, &span) in spans.iter().enumerate() {
@@ -185,7 +157,7 @@ pub(super) fn launch_ahead_flags(
 /// bf16-tied maxima stochastic, diverging from `select_batch`'s semantics).
 /// The SAME predicate gates lease-granting and sampling-row collection, which
 /// is what keeps "sampled row never rides a launch-ahead step" structural.
-fn takes_argmax(params: &SamplingParams) -> bool {
+pub(super) fn takes_argmax(params: &SamplingParams) -> bool {
     openinfer_sample::effectively_greedy(params, GLM52_VOCAB)
 }
 
@@ -243,6 +215,41 @@ pub(super) fn feed_wants(slots: &[RankSlots]) -> Vec<[usize; GLM52_MAX_BATCH_PER
             })
         })
         .collect()
+}
+
+/// Split one prefill launch across active requests without exceeding the
+/// large-M row budget. Every active request gets one row before remaining
+/// rows are distributed round-robin.
+pub(super) fn plan_prefill_spans(
+    wants: &[usize; GLM52_MAX_BATCH_PER_RANK],
+    max_rows: usize,
+) -> [usize; GLM52_MAX_BATCH_PER_RANK] {
+    assert!(max_rows > 0, "prefill row budget must be positive");
+    let mut spans = [0; GLM52_MAX_BATCH_PER_RANK];
+    let mut used = 0;
+    for (slot, &want) in wants.iter().enumerate() {
+        if want > 0 && used < max_rows {
+            spans[slot] = 1;
+            used += 1;
+        }
+    }
+    while used < max_rows {
+        let mut advanced = false;
+        for (slot, &want) in wants.iter().enumerate() {
+            if used == max_rows {
+                break;
+            }
+            if spans[slot] > 0 && spans[slot] < want {
+                spans[slot] += 1;
+                used += 1;
+                advanced = true;
+            }
+        }
+        if !advanced {
+            break;
+        }
+    }
+    spans
 }
 
 #[cfg(test)]
@@ -639,5 +646,21 @@ mod tests {
             forwarded(&plan_step_shapes(&wants, false))[0],
             (8, vec![0, 3, 3, 3, 3, 6, 6, 6])
         );
+    }
+
+    #[test]
+    fn large_m_prefill_budget_is_shared_across_requests() {
+        let mut wants = [0; GLM52_MAX_BATCH_PER_RANK];
+        wants[0] = 20_000;
+        wants[3] = 20_000;
+        wants[6] = 4;
+        let spans = plan_prefill_spans(&wants, 16_384);
+        assert_eq!(spans.iter().sum::<usize>(), 16_384);
+        assert_eq!(spans[6], 4);
+        assert!(
+            spans[0].abs_diff(spans[3]) <= 1,
+            "long requests must share the remaining rows: {spans:?}"
+        );
+        assert_eq!(plan_prefill_spans(&wants, 2), [1, 0, 0, 1, 0, 0, 0, 0]);
     }
 }

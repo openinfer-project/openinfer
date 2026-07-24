@@ -216,6 +216,21 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> i32;
 
+    pub fn gemm_bf16_f32_cuda(
+        op_a: i32,
+        op_b: i32,
+        m: i32,
+        n: i32,
+        k: i32,
+        a: *const Half,
+        lda: i32,
+        b: *const Half,
+        ldb: i32,
+        c: *mut f32,
+        ldc: i32,
+        stream: CUstream,
+    ) -> i32;
+
     pub fn gemm_lt_tune_cuda(
         Ws: *const *const Half,
         num_ws: i32,

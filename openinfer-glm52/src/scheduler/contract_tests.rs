@@ -119,7 +119,7 @@ fn admission_never_moves_a_rank_bound_request() {
 }
 
 #[test]
-fn prefill_only_admits_one_request_per_tp_group() {
+fn prefill_only_admits_multiple_requests_within_pool_capacity() {
     let pools = vec![BlockPool::new(PAGE, 16).expect("pool")];
     let mut slots: Vec<RankSlots> = vec![std::array::from_fn(|_| None)];
     let mut pending: Vec<VecDeque<GenerateRequest>> = vec![VecDeque::new()];
@@ -151,8 +151,8 @@ fn prefill_only_admits_one_request_per_tp_group() {
     )
     .expect("prefill-only admission");
 
-    assert_eq!(slots[0].iter().flatten().count(), 1);
-    assert_eq!(pending[0].len(), 1);
+    assert_eq!(slots[0].iter().flatten().count(), 2);
+    assert!(pending[0].is_empty());
 }
 
 /// Drive one request end to end through the coordinator's exact

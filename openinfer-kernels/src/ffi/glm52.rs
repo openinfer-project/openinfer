@@ -19,6 +19,61 @@ mod deepgemm_mqa;
 pub use deepgemm_mqa::*;
 
 unsafe extern "C" {
+    pub fn glm52_router_select_cuda(
+        logits: *const f32,
+        e_score_correction_bias: *const f32,
+        topk_weight: *mut f32,
+        topk_idx: *mut i32,
+        active_tokens: i32,
+        padded_tokens: i32,
+        n_experts: i32,
+        topk: i32,
+        route_scale: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn glm52_fp8_groupwise_gemm_sm100_cuda(
+        activation: *const u8,
+        activation_scale: *const f32,
+        weight: *const u8,
+        weight_scale: *const f32,
+        output: *mut Half,
+        workspace: *mut u8,
+        workspace_bytes: usize,
+        m: i32,
+        n: i32,
+        k: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn glm52_prefill_ar_cuda(
+        partial: *const Half,
+        output: *mut Half,
+        local_buffer: *mut std::ffi::c_void,
+        peer_buffers: *const *const std::ffi::c_void,
+        epoch: *const u64,
+        rows: i32,
+        ranks: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn glm52_prefill_moe_gather_cuda(
+        input: *const Half,
+        rows: *const i32,
+        output: *mut Half,
+        count: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn glm52_prefill_moe_scatter_cuda(
+        input: *const Half,
+        rows: *const i32,
+        weights: *const f32,
+        output: *mut Half,
+        count: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn glm52_vocab_parallel_pack_cuda(
         local_values: *const Half,
         local_indices: *const i32,
@@ -305,6 +360,16 @@ unsafe extern "C" {
         k: i32,
         stream: CUstream,
         ksplit_out: *mut i32,
+    ) -> CUresult;
+
+    pub fn glm52_prefill_unpack_pages_cuda(
+        packed: *const u8,
+        block_ids: *const i32,
+        blocks: i32,
+        packed_bytes: i32,
+        max_slots: i64,
+        unpacked: *mut Half,
+        stream: CUstream,
     ) -> CUresult;
 
     pub fn glm52_gemv_reduce_silu_mul_cuda(

@@ -96,6 +96,48 @@ pub fn gemm_strided_batched_bf16(
     Ok(())
 }
 
+#[allow(clippy::many_single_char_names, clippy::too_many_arguments)]
+pub fn gemm_bf16_f32(
+    ctx: &DeviceContext,
+    transpose_a: bool,
+    transpose_b: bool,
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &cudarc::driver::CudaSlice<bf16>,
+    lda: usize,
+    b: &cudarc::driver::CudaSlice<bf16>,
+    ldb: usize,
+    c: &mut cudarc::driver::CudaSlice<f32>,
+    ldc: usize,
+) -> Result<()> {
+    ensure!(
+        m > 0 && n > 0 && k > 0 && a.len() >= m * k && b.len() >= n * k && c.len() >= m * n,
+        "gemm_bf16_f32 buffers do not fit [{m},{n},{k}]"
+    );
+    let (a_ptr, _ga) = a.device_ptr(&ctx.stream);
+    let (b_ptr, _gb) = b.device_ptr(&ctx.stream);
+    let (c_ptr, _gc) = c.device_ptr_mut(&ctx.stream);
+    let status = unsafe {
+        ffi::gemm_bf16_f32_cuda(
+            i32::from(transpose_a),
+            i32::from(transpose_b),
+            m as i32,
+            n as i32,
+            k as i32,
+            a_ptr as *const ffi::Half,
+            lda as i32,
+            b_ptr as *const ffi::Half,
+            ldb as i32,
+            c_ptr as *mut f32,
+            ldc as i32,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    ensure!(status == 0, "gemm_bf16_f32 failed: status={status}");
+    Ok(())
+}
+
 /// GEMMs at or below this N consult the cublasLt plan cache. 32 covers the
 /// decode buckets where cuBLAS's GemmEx heuristic picks badly (worst at
 /// N in [8, 16], where it skips split-K entirely); above that the GEMMs are

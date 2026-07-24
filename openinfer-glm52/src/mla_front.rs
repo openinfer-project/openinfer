@@ -27,11 +27,13 @@ use crate::config::GLM52_QK_ROPE_HEAD_DIM;
 use crate::config::GLM52_RMS_EPS as RMS_EPS;
 use crate::config::GLM52_V_HEAD_DIM;
 use crate::fp8::FP8_BLOCK;
+use crate::fp8::Glm52Fp8GemmScratch;
 use crate::fp8::Glm52ProjBytes;
 use crate::fp8::ProjWeight;
 use crate::fp8::bytes_to_f32;
 use crate::fp8::e4m3_to_f32;
 use crate::fp8::fp8_linear_into;
+use crate::fp8::fp8_linear_large_m_into;
 use crate::fp8::fp8_linear_pair_into;
 use crate::fp8::fp8_linear_partials_into;
 use crate::fp8::pack_proj_pair;
@@ -324,6 +326,19 @@ pub(crate) struct Glm52MlaFront {
 
 impl Glm52MlaFront {
     pub(crate) fn new(ctx: &DeviceContext, tokens: usize, heads: usize) -> Result<Self> {
+        Self::with_decode_scratch(ctx, tokens, heads, true)
+    }
+
+    pub(crate) fn new_prefill(ctx: &DeviceContext, tokens: usize, heads: usize) -> Result<Self> {
+        Self::with_decode_scratch(ctx, tokens, heads, false)
+    }
+
+    fn with_decode_scratch(
+        ctx: &DeviceContext,
+        tokens: usize,
+        heads: usize,
+        decode_scratch: bool,
+    ) -> Result<Self> {
         ensure!(
             (1..=HEADS).contains(&heads),
             "GLM5.2 MLA front heads {heads} out of 1..={HEADS}"
@@ -337,12 +352,16 @@ impl Glm52MlaFront {
             kv_c: ctx.stream.alloc_zeros::<bf16>(tokens * KV_LORA)?,
             k_pe: ctx.stream.alloc_zeros::<bf16>(tokens * ROPE_DIM)?,
             heads,
-            gemv_partial: ctx
-                .stream
-                .alloc_zeros::<f32>(tokens * GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW)?,
-            qa_kva_out: ctx
-                .stream
-                .alloc_zeros::<bf16>(tokens * (Q_LORA + KV_A_OUT))?,
+            gemv_partial: ctx.stream.alloc_zeros::<f32>(if decode_scratch {
+                tokens * GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW
+            } else {
+                1
+            })?,
+            qa_kva_out: ctx.stream.alloc_zeros::<bf16>(if decode_scratch {
+                tokens * (Q_LORA + KV_A_OUT)
+            } else {
+                1
+            })?,
         })
     }
 
@@ -350,6 +369,52 @@ impl Glm52MlaFront {
     fn tokens(&self) -> usize {
         self.q_resid.tokens()
     }
+}
+
+pub(crate) fn glm52_mla_prefill_front_into(
+    ctx: &DeviceContext,
+    weights: &Glm52MlaLayerWeights,
+    rows: usize,
+    hidden: &CudaSlice<bf16>,
+    scratch: &mut Glm52Fp8GemmScratch,
+    front: &mut Glm52MlaFront,
+) -> Result<()> {
+    ensure!(
+        rows > 0
+            && rows.is_multiple_of(4)
+            && rows <= front.tokens()
+            && weights.heads == front.heads,
+        "GLM5.2 prefill MLA front shape mismatch"
+    );
+    fp8_linear_large_m_into(ctx, &weights.q_a, rows, hidden, scratch, &mut front.q_a)?;
+    rms_norm_rows_into(
+        ctx,
+        &front.q_a,
+        &weights.q_a_ln,
+        RMS_EPS,
+        Q_LORA,
+        rows,
+        front.q_resid.data_mut(),
+    )?;
+    fp8_linear_large_m_into(
+        ctx,
+        &weights.q_b,
+        rows,
+        front.q_resid.data(),
+        scratch,
+        &mut front.q_full,
+    )?;
+    fp8_linear_large_m_into(ctx, &weights.kv_a, rows, hidden, scratch, &mut front.ckv)?;
+    glm52_mla_ckv_split_launch(ctx, rows, &front.ckv, &mut front.kv_c_raw, &mut front.k_pe)?;
+    rms_norm_rows_into(
+        ctx,
+        &front.kv_c_raw,
+        &weights.kv_a_ln,
+        RMS_EPS,
+        KV_LORA,
+        rows,
+        &mut front.kv_c,
+    )
 }
 
 /// The q-phase of the MLA front: `q_a` projection + q_a_layernorm over the

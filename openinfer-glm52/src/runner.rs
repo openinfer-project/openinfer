@@ -98,6 +98,62 @@ pub(crate) struct Glm52RowSample {
     pub(crate) step: u64,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct Glm52PrefillBatch {
+    pub(crate) token_ids: Vec<u32>,
+    pub(crate) positions: Vec<u32>,
+    pub(crate) request_indptr: Vec<u32>,
+    pub(crate) block_indptr: Vec<u32>,
+    pub(crate) block_ids: Vec<i32>,
+    pub(crate) padding_block: i32,
+    pub(crate) slot_mapping: Vec<i64>,
+    pub(crate) output_rows: Vec<u32>,
+    pub(crate) sampling: Vec<Glm52RowSample>,
+    pub(crate) seed: u64,
+}
+
+impl Glm52PrefillBatch {
+    pub(crate) fn validate(&self) -> Result<()> {
+        let rows = self.token_ids.len();
+        ensure!(
+            rows > 0 && self.positions.len() == rows && self.slot_mapping.len() == rows,
+            "GLM5.2 prefill batch row buffers disagree"
+        );
+        ensure!(
+            self.request_indptr.first() == Some(&0)
+                && self.request_indptr.last().copied() == Some(rows as u32)
+                && self.request_indptr.windows(2).all(|w| w[0] < w[1]),
+            "GLM5.2 prefill request row ranges are invalid"
+        );
+        let requests = self.request_indptr.len() - 1;
+        ensure!(
+            self.block_indptr.len() == requests + 1
+                && self.block_indptr.first() == Some(&0)
+                && self.block_indptr.last().copied() == Some(self.block_ids.len() as u32)
+                && self.block_indptr.windows(2).all(|w| w[0] <= w[1]),
+            "GLM5.2 prefill block ranges are invalid"
+        );
+        ensure!(
+            self.padding_block >= 0,
+            "GLM5.2 prefill padding block is invalid"
+        );
+        ensure!(
+            self.output_rows.windows(2).all(|w| w[0] < w[1])
+                && self.output_rows.iter().all(|&row| (row as usize) < rows),
+            "GLM5.2 prefill output rows are invalid"
+        );
+        ensure!(
+            self.sampling.windows(2).all(|w| w[0].row < w[1].row)
+                && self
+                    .sampling
+                    .iter()
+                    .all(|sample| sample.row < self.output_rows.len()),
+            "GLM5.2 prefill sampling rows are invalid"
+        );
+        Ok(())
+    }
+}
+
 enum Glm52RankCommand {
     LoadWeights {
         model_path: PathBuf,
@@ -114,6 +170,7 @@ enum Glm52RankCommand {
         max_model_len: usize,
         moe_topo: crate::Glm52MoeTopo,
         dspark_enabled: bool,
+        prefill_chunk_size: Option<usize>,
         resp: Sender<Result<Vec<KvArena>>>,
     },
     /// Collective: create the DeepEP context (barriers across ranks). Issued
@@ -145,6 +202,10 @@ enum Glm52RankCommand {
         sampling: Vec<Glm52RowSample>,
         seed: u64,
         resp: Sender<Result<[u32; GLM52_MAX_BATCH_PER_RANK]>>,
+    },
+    PrefillChunk {
+        batch: Glm52PrefillBatch,
+        resp: Sender<Result<Vec<u32>>>,
     },
     /// Non-collective: load the DSpark draft model onto this rank. Issued to
     /// every rank after BuildModel (the draft reuses the target's
@@ -270,6 +331,7 @@ impl Glm52RankWorker {
         max_model_len: usize,
         moe_topo: crate::Glm52MoeTopo,
         dspark_enabled: bool,
+        prefill_chunk_size: Option<usize>,
     ) -> Result<Receiver<Result<Vec<KvArena>>>> {
         let (resp_tx, resp_rx) = bounded(1);
         self.tx
@@ -277,6 +339,7 @@ impl Glm52RankWorker {
                 max_model_len,
                 moe_topo,
                 dspark_enabled,
+                prefill_chunk_size,
                 resp: resp_tx,
             })
             .map_err(|_| anyhow::anyhow!("GLM5.2 rank worker channel closed"))?;
@@ -319,6 +382,20 @@ impl Glm52RankWorker {
                 flags,
                 sampling,
                 seed,
+                resp: resp_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("GLM5.2 rank worker channel closed"))?;
+        Ok(resp_rx)
+    }
+
+    pub(crate) fn prefill_chunk_async(
+        &self,
+        batch: Glm52PrefillBatch,
+    ) -> Result<Receiver<Result<Vec<u32>>>> {
+        let (resp_tx, resp_rx) = bounded(1);
+        self.tx
+            .send(Glm52RankCommand::PrefillChunk {
+                batch,
                 resp: resp_tx,
             })
             .map_err(|_| anyhow::anyhow!("GLM5.2 rank worker channel closed"))?;
@@ -438,11 +515,15 @@ impl Glm52Worker {
         max_model_len: usize,
         moe_topo: crate::Glm52MoeTopo,
         dspark_enabled: bool,
+        prefill_chunk_size: Option<usize>,
     ) -> Result<Receiver<Result<Vec<KvArena>>>> {
         match self {
-            Self::Local(worker) => {
-                worker.build_model_async(max_model_len, moe_topo, dspark_enabled)
-            }
+            Self::Local(worker) => worker.build_model_async(
+                max_model_len,
+                moe_topo,
+                dspark_enabled,
+                prefill_chunk_size,
+            ),
             Self::Remote(worker) => {
                 worker.build_model_async(max_model_len, moe_topo, dspark_enabled)
             }
@@ -479,6 +560,18 @@ impl Glm52Worker {
         match self {
             Self::Local(worker) => worker.step_async(inputs, shape, kv, flags, sampling, seed),
             Self::Remote(worker) => worker.step_async(inputs, shape, kv, flags, sampling, seed),
+        }
+    }
+
+    pub(crate) fn prefill_chunk_async(
+        &self,
+        batch: Glm52PrefillBatch,
+    ) -> Result<Receiver<Result<Vec<u32>>>> {
+        match self {
+            Self::Local(worker) => worker.prefill_chunk_async(batch),
+            Self::Remote(_) => {
+                anyhow::bail!("GLM5.2 TP4 prefill-only execution is single-host")
+            }
         }
     }
 
@@ -670,6 +763,7 @@ impl Glm52RankThreadState {
         max_model_len: usize,
         moe_topo: crate::Glm52MoeTopo,
         dspark_enabled: bool,
+        prefill_chunk_size: Option<usize>,
     ) -> Result<Vec<KvArena>> {
         let mut weights = self
             .loaded
@@ -685,6 +779,7 @@ impl Glm52RankThreadState {
                 .uses_tensor_replicated_moe()
                 .then_some(self.placement.rank),
             dspark_enabled,
+            prefill_chunk_size,
         )?);
         let arenas = model.kv_arenas(&dev_ctx.stream)?;
         let aux_ctx = self.ctx.auxiliary_device_context("decode aux")?;
@@ -935,6 +1030,18 @@ impl Glm52RankThreadState {
         )
     }
 
+    fn prefill_chunk(&mut self, batch: &Glm52PrefillBatch) -> Result<Vec<u32>> {
+        batch.validate()?;
+        let dev_ctx = self.ctx.device_context()?;
+        let runtime = self
+            .runtime
+            .as_mut()
+            .context("GLM5.2 prefill chunk before build_model")?;
+        runtime
+            .model
+            .prefill_chunk(&dev_ctx, batch, runtime.tp.as_mut())
+    }
+
     fn vllm_rope_fixup(&mut self, pages: &[i32]) -> Result<()> {
         let dev_ctx = self.ctx.device_context()?;
         let runtime = self
@@ -973,9 +1080,15 @@ fn rank_worker_loop(rx: &Receiver<Glm52RankCommand>, mut state: Glm52RankThreadS
                 max_model_len,
                 moe_topo,
                 dspark_enabled,
+                prefill_chunk_size,
                 resp,
             } => {
-                let _ = resp.send(state.build_model(max_model_len, moe_topo, dspark_enabled));
+                let _ = resp.send(state.build_model(
+                    max_model_len,
+                    moe_topo,
+                    dspark_enabled,
+                    prefill_chunk_size,
+                ));
             }
             Glm52RankCommand::SetupComm {
                 unique_id,
@@ -995,6 +1108,9 @@ fn rank_worker_loop(rx: &Receiver<Glm52RankCommand>, mut state: Glm52RankThreadS
                 resp,
             } => {
                 let _ = resp.send(state.step(&inputs, shape, &kv, flags, &sampling, seed));
+            }
+            Glm52RankCommand::PrefillChunk { batch, resp } => {
+                let _ = resp.send(state.prefill_chunk(&batch));
             }
             Glm52RankCommand::VllmRopeFixup { pages, resp } => {
                 let _ = resp.send(state.vllm_rope_fixup(&pages));
