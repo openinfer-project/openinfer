@@ -52,10 +52,28 @@ async fn validate_prefill_only_inner(
     let value: serde_json::Value =
         serde_json::from_slice(&body).context("failed to parse OpenAI request JSON")?;
     let max_tokens = value.get("max_tokens").and_then(serde_json::Value::as_u64);
+    let max_completion_tokens = value
+        .get("max_completion_tokens")
+        .and_then(serde_json::Value::as_u64);
+    let is_chat = parts.uri.path() == "/v1/chat/completions";
+    if is_chat
+        && let (Some(max_tokens), Some(max_completion_tokens)) = (max_tokens, max_completion_tokens)
+    {
+        anyhow::ensure!(
+            max_tokens == max_completion_tokens,
+            "max_tokens ({max_tokens}) conflicts with max_completion_tokens \
+             ({max_completion_tokens})"
+        );
+    }
+    let effective_max_tokens = if is_chat {
+        max_completion_tokens.or(max_tokens)
+    } else {
+        max_tokens
+    };
     anyhow::ensure!(
-        max_tokens == Some(1),
+        effective_max_tokens == Some(1),
         "GLM5.2 prefill-only mode requires max_tokens=1, got {}",
-        max_tokens.map_or_else(|| "omitted".to_owned(), |value| value.to_string())
+        effective_max_tokens.map_or_else(|| "omitted".to_owned(), |value| value.to_string())
     );
     parts.headers.insert(
         axum::http::header::CONTENT_LENGTH,
@@ -72,19 +90,48 @@ async fn validate_prefill_only_inner(
 mod tests {
     use super::*;
 
+    fn request(path: &str, body: &'static str) -> Request {
+        Request::post(path)
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .expect("request")
+    }
+
     #[tokio::test]
-    async fn prefill_only_contract_returns_400_before_engine_submission() {
+    async fn prefill_only_contract_accepts_chat_token_aliases() {
         let downstream =
             Router::new().route("/v1/chat/completions", post(|| async { StatusCode::OK }));
-        let response = prefill_only_routes(downstream)
-            .oneshot(
-                Request::post("/v1/chat/completions")
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"max_tokens":2}"#))
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        for body in [
+            r#"{"max_tokens":1}"#,
+            r#"{"max_completion_tokens":1}"#,
+            r#"{"max_tokens":1,"max_completion_tokens":1}"#,
+        ] {
+            let response = prefill_only_routes(downstream.clone())
+                .oneshot(request("/v1/chat/completions", body))
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::OK, "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn prefill_only_contract_rejects_invalid_or_conflicting_limits() {
+        let downstream = Router::new()
+            .route("/v1/chat/completions", post(|| async { StatusCode::OK }))
+            .route("/v1/completions", post(|| async { StatusCode::OK }));
+        for (path, body) in [
+            ("/v1/chat/completions", r#"{"max_tokens":2}"#),
+            (
+                "/v1/chat/completions",
+                r#"{"max_tokens":1,"max_completion_tokens":2}"#,
+            ),
+            ("/v1/completions", r#"{"max_completion_tokens":1}"#),
+        ] {
+            let response = prefill_only_routes(downstream.clone())
+                .oneshot(request(path, body))
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+        }
     }
 }
