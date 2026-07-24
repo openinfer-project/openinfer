@@ -551,7 +551,12 @@ impl Qwen3Model {
             t_gpu.elapsed().as_secs_f64() * 1e3
         );
         drop(shards);
-        drop(mmaps);
+        // Page-table teardown of the multi-GB mapping is not worth blocking
+        // startup on; nothing references the mmaps once every weight is uploaded.
+        std::thread::Builder::new()
+            .name("qwen3-weights-unmap".into())
+            .spawn(move || drop(mmaps))
+            .map_err(|e| anyhow::anyhow!("weight unmap thread spawn failed: {e}"))?;
 
         let num_hidden_layers = config.num_hidden_layers;
         let model = Self {
