@@ -839,6 +839,7 @@ fn host_demux_loop(
                 max_model_len,
                 moe_topo,
                 dspark_enabled,
+                None,
             )?),
             WireRequest::SetupComm {
                 unique_id,

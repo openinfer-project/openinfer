@@ -95,7 +95,7 @@ fn validate_glm52_router_shapes(
     config: Glm52RouterConfig,
     batch: Glm52RouterBatch,
     hidden: &CudaSlice<bf16>,
-    gate_weight: &CudaSlice<u8>,
+    gate_weight: &CudaSlice<bf16>,
     e_score_correction_bias: &CudaSlice<u8>,
     logits: &CudaSlice<f32>,
     output: &Glm52RouterOutput<'_>,
@@ -109,10 +109,10 @@ fn validate_glm52_router_shapes(
         hidden.len(),
         hidden_elems
     );
-    let gate_bytes = config.n_experts * config.hidden_dim * std::mem::size_of::<bf16>();
+    let gate_elems = config.n_experts * config.hidden_dim;
     ensure!(
-        gate_weight.len() >= gate_bytes,
-        "GLM5.2 router gate_weight too small: have {} bytes, need {gate_bytes}",
+        gate_weight.len() >= gate_elems,
+        "GLM5.2 router gate_weight too small: have {}, need {gate_elems}",
         gate_weight.len()
     );
     let bias_bytes = config.n_experts * std::mem::size_of::<f32>();
@@ -146,7 +146,7 @@ pub fn glm52_router_noaux_tc_launch(
     config: Glm52RouterConfig,
     batch: Glm52RouterBatch,
     hidden: &CudaSlice<bf16>,
-    gate_weight: &CudaSlice<u8>,
+    gate_weight: &CudaSlice<bf16>,
     e_score_correction_bias: &CudaSlice<u8>,
     logits: &mut CudaSlice<f32>,
     output: &mut Glm52RouterOutput<'_>,
@@ -188,4 +188,43 @@ pub fn glm52_router_noaux_tc_launch(
     result
         .result()
         .map_err(|err| anyhow!("GLM5.2 router CUDA launch failed: {err}"))
+}
+
+pub fn glm52_router_select_launch(
+    ctx: &DeviceContext,
+    config: Glm52RouterConfig,
+    batch: Glm52RouterBatch,
+    logits: &CudaSlice<f32>,
+    e_score_correction_bias: &CudaSlice<u8>,
+    output: &mut Glm52RouterOutput<'_>,
+) -> Result<()> {
+    config.validate()?;
+    batch.validate()?;
+    ensure!(
+        logits.len() >= batch.padded_tokens * config.n_experts
+            && e_score_correction_bias.len() >= config.n_experts * std::mem::size_of::<f32>()
+            && output.topk_weight.len() >= batch.active_tokens * config.topk
+            && output.topk_idx.len() >= batch.active_tokens * config.topk,
+        "GLM5.2 router selection buffers are too small"
+    );
+    let (logits_ptr, _gl) = logits.device_ptr(&ctx.stream);
+    let (bias_ptr, _gb) = e_score_correction_bias.device_ptr(&ctx.stream);
+    let (weight_ptr, _gw) = output.topk_weight.device_ptr_mut(&ctx.stream);
+    let (idx_ptr, _gi) = output.topk_idx.device_ptr_mut(&ctx.stream);
+    unsafe {
+        ffi::glm52_router_select_cuda(
+            logits_ptr as *const f32,
+            bias_ptr as *const f32,
+            weight_ptr as *mut f32,
+            idx_ptr as *mut i32,
+            batch.active_tokens as i32,
+            batch.padded_tokens as i32,
+            config.n_experts as i32,
+            config.topk as i32,
+            config.route_scale,
+            ctx.stream.cu_stream(),
+        )
+    }
+    .result()
+    .map_err(|err| anyhow!("GLM5.2 router selection failed: {err}"))
 }

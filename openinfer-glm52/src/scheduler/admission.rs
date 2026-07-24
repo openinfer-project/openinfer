@@ -172,7 +172,7 @@ pub(super) fn admit_from_queue(
     mirrored: bool,
     prefix_cache_enabled: bool,
     dspark_enabled: bool,
-    prefill_only: bool,
+    _prefill_only: bool,
     pending_resets: &mut [Vec<usize>],
     slots_changed: &mut bool,
 ) -> anyhow::Result<()> {
@@ -203,9 +203,6 @@ pub(super) fn admit_from_queue(
     };
 
     for rank in 0..slots.len() {
-        if prefill_only && slots[rank].iter().any(Option::is_some) {
-            continue;
-        }
         while let Some(slot) = slots[rank].iter().position(Option::is_none) {
             let Some(front) = pending[rank].front() else {
                 break;
@@ -330,9 +327,6 @@ pub(super) fn admit_from_queue(
             slots[rank][slot] = Some(ActiveRequest { req, state, kv });
             committed[rank] += need_blocks;
             *slots_changed = true;
-            if prefill_only {
-                break;
-            }
         }
     }
     Ok(())

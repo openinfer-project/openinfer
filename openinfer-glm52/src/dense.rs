@@ -8,13 +8,16 @@
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
 use half::bf16;
+use openinfer_kernels::ops::glm52_silu_and_mul_bf16_launch;
 use openinfer_kernels::tensor::DeviceContext;
 
 use crate::config::GLM52_HIDDEN;
+use crate::fp8::Glm52Fp8GemmScratch;
 use crate::fp8::Glm52MlpScratch;
 #[cfg(test)]
 use crate::fp8::Glm52ProjBytes;
 use crate::fp8::ProjWeight;
+use crate::fp8::fp8_linear_large_m_into;
 use crate::fp8::fp8_mlp_into;
 use crate::fp8::pack_proj_pair;
 
@@ -106,4 +109,19 @@ pub(crate) fn glm52_dense_mlp_forward_into(
         mlp,
         out,
     )
+}
+
+pub(crate) fn glm52_dense_mlp_prefill_into(
+    ctx: &DeviceContext,
+    weights: &Glm52DenseMlpWeights,
+    rows: usize,
+    normed_hidden: &CudaSlice<bf16>,
+    gemm: &mut Glm52Fp8GemmScratch,
+    gate_up: &mut CudaSlice<bf16>,
+    silu: &mut CudaSlice<bf16>,
+    out: &mut CudaSlice<bf16>,
+) -> Result<()> {
+    fp8_linear_large_m_into(ctx, &weights.gate_up, rows, normed_hidden, gemm, gate_up)?;
+    glm52_silu_and_mul_bf16_launch(ctx, rows, INTERMEDIATE, gate_up, silu)?;
+    fp8_linear_large_m_into(ctx, &weights.down, rows, silu, gemm, out)
 }

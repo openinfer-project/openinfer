@@ -143,4 +143,24 @@ CUresult glm52_router_noaux_tc_cuda(
   return CUDA_SUCCESS;
 }
 
+CUresult glm52_router_select_cuda(
+    const float* logits, const float* e_score_correction_bias,
+    float* topk_weight, int* topk_idx, int active_tokens, int padded_tokens,
+    int n_experts, int topk, float route_scale, cudaStream_t stream) {
+  if (!logits || !e_score_correction_bias || !topk_weight || !topk_idx ||
+      active_tokens <= 0 || active_tokens > padded_tokens ||
+      n_experts != kGlm52Experts || topk != kGlm52Topk ||
+      !(route_scale > 0.0f)) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  const size_t smem =
+      static_cast<size_t>(kRouterSelectThreads) * (2 * sizeof(float)) +
+      static_cast<size_t>(topk) * sizeof(float);
+  router_scores_topk_normalize_kernel<<<padded_tokens, kRouterSelectThreads,
+                                        smem, stream>>>(
+      logits, e_score_correction_bias, topk_weight, topk_idx, active_tokens,
+      padded_tokens, n_experts, topk, route_scale);
+  return consume_last_cuda_error();
+}
+
 }  // extern "C"

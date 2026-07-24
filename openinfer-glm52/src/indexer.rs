@@ -43,6 +43,7 @@ use openinfer_kernels::ops::Glm52IndexerLocalTopKToSlots;
 use openinfer_kernels::ops::Glm52IndexerTopK;
 use openinfer_kernels::ops::Glm52MoeQuantShape;
 use openinfer_kernels::ops::bf16_bytes_to_f32_into;
+use openinfer_kernels::ops::gemm_strided_batched_bf16;
 use openinfer_kernels::ops::glm52_deepgemm_paged_mqa_logits_launch;
 use openinfer_kernels::ops::glm52_deepgemm_paged_mqa_metadata_launch;
 use openinfer_kernels::ops::glm52_flashinfer_topk_2048_launch;
@@ -60,12 +61,14 @@ use crate::config::GLM52_INDEX_HEAD_DIM;
 use crate::config::GLM52_INDEX_HEADS;
 use crate::config::GLM52_Q_LORA_RANK;
 use crate::fp8::FP8_BLOCK;
+use crate::fp8::Glm52Fp8GemmScratch;
 #[cfg(test)]
 use crate::fp8::Glm52ProjBytes;
 use crate::fp8::ProjWeight;
 #[cfg(test)]
 use crate::fp8::fp8_linear;
 use crate::fp8::fp8_linear_into;
+use crate::fp8::fp8_linear_large_m_into;
 use crate::rows::Rows;
 
 const HIDDEN: usize = GLM52_HIDDEN;
@@ -285,15 +288,31 @@ pub(crate) struct Glm52IndexerScratch {
     topk_offsets: CudaSlice<i32>,
     topk_values: CudaSlice<f32>,
     pub(crate) global_slots: CudaSlice<i32>,
-    topk_lens: CudaSlice<i32>,
+    pub(crate) topk_lens: CudaSlice<i32>,
     // Owned mma partial buffer (wq_b/wk). The indexer chain runs on the AUX
     // stream concurrently with the ctx-side MLA front — this buffer being
     // owned here (not shared per device) is what makes that overlap safe.
     gemv_partial: CudaSlice<f32>,
+    large_gemm: Option<Glm52Fp8GemmScratch>,
 }
 
 impl Glm52IndexerScratch {
     pub(crate) fn new(ctx: &DeviceContext, shape: Glm52DeepGemmMqaLogitsShape) -> Result<Self> {
+        Self::with_large_gemm(ctx, shape, false)
+    }
+
+    pub(crate) fn new_prefill(
+        ctx: &DeviceContext,
+        shape: Glm52DeepGemmMqaLogitsShape,
+    ) -> Result<Self> {
+        Self::with_large_gemm(ctx, shape, true)
+    }
+
+    fn with_large_gemm(
+        ctx: &DeviceContext,
+        shape: Glm52DeepGemmMqaLogitsShape,
+        large_gemm: bool,
+    ) -> Result<Self> {
         let t = shape.batch_size;
         let logits_elems = t * shape.next_n * shape.logits_stride;
         Ok(Self {
@@ -318,16 +337,20 @@ impl Glm52IndexerScratch {
             topk_values: ctx.stream.alloc_zeros::<f32>(t * GLM52_INDEXER_TOPK)?,
             global_slots: ctx.stream.alloc_zeros::<i32>(t * GLM52_INDEXER_TOPK)?,
             topk_lens: ctx.stream.alloc_zeros::<i32>(t)?,
-            gemv_partial: ctx
-                .stream
-                .alloc_zeros::<f32>(t * GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW)?,
+            gemv_partial: ctx.stream.alloc_zeros::<f32>(if large_gemm {
+                1
+            } else {
+                t * GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW
+            })?,
+            large_gemm: large_gemm
+                .then(|| Glm52Fp8GemmScratch::new(ctx, t, HIDDEN))
+                .transpose()?,
             shape,
         })
     }
 
-    /// The build-time MQA logits shape for a decode step: the decode batch,
-    /// next_n=1, the paged index-K cache layout, and the fixed logits stride.
-    pub(crate) fn decode_shape(
+    /// Build the paged MQA shape for one query token per batch row.
+    pub(crate) fn paged_mqa_shape(
         batch: usize,
         cache_layout: Glm52IndexerCacheLayout,
         block_table_stride: usize,
@@ -388,7 +411,7 @@ pub(crate) fn glm52_indexer_forward_into(
     let shape = s.shape;
     let t = shape.batch_size;
     // The paged cache layout the scratch shape was built from
-    // (`Glm52IndexerScratch::decode_shape` copies these three fields in).
+    // (`Glm52IndexerScratch::paged_mqa_shape` copies these three fields in).
     let cache_layout = Glm52IndexerCacheLayout {
         cache_blocks: shape.num_kv_blocks,
         cache_block_size: shape.block_kv,
@@ -399,34 +422,60 @@ pub(crate) fn glm52_indexer_forward_into(
     // asserts).
 
     // ---- projections ----
-    fp8_linear_into(
-        ctx,
-        &w.wq_b,
-        t,
-        q_resid.data(),
-        Some(&mut s.gemv_partial),
-        &mut s.q,
-    )?; // [T, 32*128]
-    fp8_linear_into(
-        ctx,
-        &w.wk,
-        t,
-        hidden.data(),
-        Some(&mut s.gemv_partial),
-        &mut s.k_raw,
-    )?; // [T, 128]
+    if let Some(gemm) = &mut s.large_gemm {
+        fp8_linear_large_m_into(ctx, &w.wq_b, t, q_resid.data(), gemm, &mut s.q)?;
+        fp8_linear_large_m_into(ctx, &w.wk, t, hidden.data(), gemm, &mut s.k_raw)?;
+    } else {
+        fp8_linear_into(
+            ctx,
+            &w.wq_b,
+            t,
+            q_resid.data(),
+            Some(&mut s.gemv_partial),
+            &mut s.q,
+        )?;
+        fp8_linear_into(
+            ctx,
+            &w.wk,
+            t,
+            hidden.data(),
+            Some(&mut s.gemv_partial),
+            &mut s.k_raw,
+        )?;
+    }
     // weights_proj: bf16 in/out (transformers keeps it fp32 via
     // _keep_in_fp32_modules; the checkpoint stores bf16). Min-latency GEMV,
     // [T, 32] row-major out — the layout the fold consumes.
-    glm52_indexer_weights_proj_launch(
-        ctx,
-        hidden.data(),
-        &w.weights_proj,
-        t,
-        INDEX_HEADS,
-        HIDDEN,
-        &mut s.weights_bf16,
-    )?;
+    if s.large_gemm.is_some() {
+        gemm_strided_batched_bf16(
+            ctx,
+            true,
+            false,
+            INDEX_HEADS,
+            t,
+            HIDDEN,
+            &w.weights_proj,
+            HIDDEN,
+            0,
+            hidden.data(),
+            HIDDEN,
+            0,
+            &mut s.weights_bf16,
+            INDEX_HEADS,
+            0,
+            1,
+        )?;
+    } else {
+        glm52_indexer_weights_proj_launch(
+            ctx,
+            hidden.data(),
+            &w.weights_proj,
+            t,
+            INDEX_HEADS,
+            HIDDEN,
+            &mut s.weights_bf16,
+        )?;
+    }
     // ---- k LayerNorm (eps=1e-6, with bias), one CTA per row ----
     layer_norm_into(
         ctx,
@@ -570,7 +619,7 @@ pub(crate) fn glm52_indexer_forward(
     num_sms: usize,
     max_model_len: usize,
 ) -> Result<CudaSlice<i32>> {
-    let shape = Glm52IndexerScratch::decode_shape(
+    let shape = Glm52IndexerScratch::paged_mqa_shape(
         1,
         cache_layout,
         block_table.len(),

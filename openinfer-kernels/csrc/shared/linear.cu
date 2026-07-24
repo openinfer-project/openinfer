@@ -384,6 +384,29 @@ int gemm_strided_batched_bf16_cuda(int op_a, int op_b, int m, int n, int k,
   return static_cast<int>(cudaPeekAtLastError());
 }
 
+int gemm_bf16_f32_cuda(int op_a, int op_b, int m, int n, int k,
+                       const __nv_bfloat16 *A, int lda,
+                       const __nv_bfloat16 *B, int ldb, float *C, int ldc,
+                       cudaStream_t stream) {
+  if (g_cublas_handle == nullptr || m <= 0 || n <= 0 || k <= 0) {
+    return static_cast<int>(cudaErrorInvalidValue);
+  }
+  const cublasOperation_t ta = op_a != 0 ? CUBLAS_OP_T : CUBLAS_OP_N;
+  const cublasOperation_t tb = op_b != 0 ? CUBLAS_OP_T : CUBLAS_OP_N;
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+  cublasStatus_t status = cublasSetStream(g_cublas_handle, stream);
+  if (status == CUBLAS_STATUS_SUCCESS) {
+    status = cublasGemmEx(g_cublas_handle, ta, tb, m, n, k, &alpha, A,
+                          CUDA_R_16BF, lda, B, CUDA_R_16BF, ldb, &beta, C,
+                          CUDA_R_32F, ldc, CUBLAS_COMPUTE_32F,
+                          CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+  }
+  return status == CUBLAS_STATUS_SUCCESS
+             ? static_cast<int>(cudaPeekAtLastError())
+             : cublas_status_to_error(status);
+}
+
 // Decode GEMM through the cublasLt plan tuned by gemm_lt_tune_cuda. Returns
 // GEMM_LT_UNTUNED when this thread holds no plan for (M, N, K) — the tuned
 // kernel was already executed during tuning, so replaying it inside a CUDA

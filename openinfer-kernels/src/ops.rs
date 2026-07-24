@@ -100,6 +100,7 @@ pub use linear::NumericPolicy;
 pub use linear::PinAlgoConfig;
 pub(crate) use linear::ensure_tuned_policy;
 pub use linear::gemm;
+pub use linear::gemm_bf16_f32;
 pub use linear::gemm_graphsafe_into_checked;
 pub use linear::gemm_graphsafe_ref_into_checked;
 pub use linear::gemm_into;

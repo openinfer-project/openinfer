@@ -149,12 +149,14 @@ pub(super) fn build_decoder_layer(
         // Tensor-replicated topology keeps routed and shared experts in the
         // rank slice bank; the resident first pass carries only the router.
         Glm52LayerMlp::MoeTp(Box::new(Glm52MoeRouterWeights::new(
+            ctx,
             w.take_tensor(&format!("{mp}.gate.weight"))?,
             w.take_tensor(&format!("{mp}.gate.e_score_correction_bias"))?,
         )?))
     } else {
         Glm52LayerMlp::MoeEp8(Box::new(Glm52MoeEp8LayerWeights {
             router: Glm52MoeRouterWeights::new(
+                ctx,
                 w.take_tensor(&format!("{mp}.gate.weight"))?,
                 w.take_tensor(&format!("{mp}.gate.e_score_correction_bias"))?,
             )?,

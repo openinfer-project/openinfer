@@ -20,6 +20,76 @@ const GLM52_FLASHMLA_SPARSE_TOPK_BLOCK: usize = 64;
 const GLM52_FLASHMLA_SPARSE_SCHED_META_INTS: usize = 8;
 const GLM52_FLASHMLA_SPARSE_MAX_SM_PARTS: usize = 160;
 
+#[allow(clippy::too_many_arguments)]
+pub fn glm52_flashmla_sparse_prefill_launch(
+    ctx: &DeviceContext,
+    query_rows: usize,
+    kv_rows: usize,
+    topk: usize,
+    sm_scale: f32,
+    q: &CudaSlice<bf16>,
+    kv: &CudaSlice<bf16>,
+    topk_indices: &CudaSlice<i32>,
+    topk_length: Option<&CudaSlice<i32>>,
+    out: &mut CudaSlice<bf16>,
+    max_logits: &mut CudaSlice<f32>,
+    lse: &mut CudaSlice<f32>,
+) -> Result<()> {
+    ensure!(
+        query_rows > 0
+            && kv_rows > 0
+            && topk > 0
+            && topk <= GLM52_FLASHMLA_SPARSE_TOPK
+            && topk.is_multiple_of(GLM52_FLASHMLA_SPARSE_TOPK_BLOCK)
+            && sm_scale.is_finite()
+            && sm_scale > 0.0,
+        "GLM5.2 FlashMLA sparse prefill shape is invalid"
+    );
+    ensure!(
+        q.len() >= query_rows * GLM52_FLASHMLA_SPARSE_HEADS * GLM52_FLASHMLA_SPARSE_QK_HEAD_DIM
+            && kv.len() >= kv_rows * GLM52_FLASHMLA_SPARSE_QK_HEAD_DIM
+            && topk_indices.len() >= query_rows * topk
+            && topk_length.is_none_or(|length| length.len() >= query_rows)
+            && out.len()
+                >= query_rows * GLM52_FLASHMLA_SPARSE_HEADS * GLM52_FLASHMLA_SPARSE_V_HEAD_DIM
+            && max_logits.len() >= query_rows * GLM52_FLASHMLA_SPARSE_HEADS
+            && lse.len() >= query_rows * GLM52_FLASHMLA_SPARSE_HEADS,
+        "GLM5.2 FlashMLA sparse prefill buffers are too small"
+    );
+    let (q_ptr, _q_guard) = q.device_ptr(&ctx.stream);
+    let (kv_ptr, _kv_guard) = kv.device_ptr(&ctx.stream);
+    let (indices_ptr, _indices_guard) = topk_indices.device_ptr(&ctx.stream);
+    let (length_ptr, _length_guard) = match topk_length {
+        Some(length) => {
+            let (ptr, guard) = length.device_ptr(&ctx.stream);
+            (ptr as *const i32, Some(guard))
+        }
+        None => (std::ptr::null(), None),
+    };
+    let (out_ptr, _out_guard) = out.device_ptr_mut(&ctx.stream);
+    let (max_ptr, _max_guard) = max_logits.device_ptr_mut(&ctx.stream);
+    let (lse_ptr, _lse_guard) = lse.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::glm52_flashmla_sparse_prefill_launch_cuda(
+            q_ptr as *const ffi::Half,
+            kv_ptr as *const ffi::Half,
+            indices_ptr as *const i32,
+            length_ptr,
+            out_ptr as *mut ffi::Half,
+            max_ptr as *mut f32,
+            lse_ptr as *mut f32,
+            query_rows as i32,
+            kv_rows as i32,
+            topk as i32,
+            sm_scale,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result
+        .result()
+        .map_err(|err| anyhow!("GLM5.2 FlashMLA sparse prefill launch failed: {err}"))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Glm52FlashMlaSparseDecode {
     pub batch_size: usize,
@@ -292,4 +362,56 @@ fn validate_decode_buffers(
         contract.o_accum_len()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod prefill_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires an SM100/103 CUDA device"]
+    fn sparse_prefill_uniform_attention() -> Result<()> {
+        const ROWS: usize = 64;
+        const TOPK: usize = 64;
+        let ctx = DeviceContext::new()?;
+        let q = ctx
+            .stream
+            .alloc_zeros::<bf16>(GLM52_FLASHMLA_SPARSE_HEADS * GLM52_FLASHMLA_SPARSE_QK_HEAD_DIM)?;
+        let mut kv_host = vec![bf16::ZERO; ROWS * GLM52_FLASHMLA_SPARSE_QK_HEAD_DIM];
+        for row in 0..ROWS {
+            let value = bf16::from_f32((row % 4) as f32);
+            kv_host[row * GLM52_FLASHMLA_SPARSE_QK_HEAD_DIM
+                ..row * GLM52_FLASHMLA_SPARSE_QK_HEAD_DIM + GLM52_FLASHMLA_SPARSE_V_HEAD_DIM]
+                .fill(value);
+        }
+        let kv = ctx.stream.clone_htod(&kv_host)?;
+        let indices = ctx
+            .stream
+            .clone_htod(&(0..TOPK as i32).collect::<Vec<_>>())?;
+        let mut out = ctx
+            .stream
+            .alloc_zeros::<bf16>(GLM52_FLASHMLA_SPARSE_HEADS * GLM52_FLASHMLA_SPARSE_V_HEAD_DIM)?;
+        let mut max_logits = ctx.stream.alloc_zeros::<f32>(GLM52_FLASHMLA_SPARSE_HEADS)?;
+        let mut lse = ctx.stream.alloc_zeros::<f32>(GLM52_FLASHMLA_SPARSE_HEADS)?;
+        glm52_flashmla_sparse_prefill_launch(
+            &ctx,
+            1,
+            ROWS,
+            TOPK,
+            1.0,
+            &q,
+            &kv,
+            &indices,
+            None,
+            &mut out,
+            &mut max_logits,
+            &mut lse,
+        )?;
+        let out = ctx.stream.clone_dtoh(&out)?;
+        ensure!(
+            out.iter().all(|value| (value.to_f32() - 1.5).abs() <= 0.01),
+            "uniform sparse prefill did not average the selected values"
+        );
+        Ok(())
+    }
 }

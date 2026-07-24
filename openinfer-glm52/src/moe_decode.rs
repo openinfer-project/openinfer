@@ -9,7 +9,9 @@ use openinfer_kernels::ops::GLM52_TP_TOKENS;
 use openinfer_kernels::ops::Glm52RouterBatch;
 use openinfer_kernels::ops::Glm52RouterConfig;
 use openinfer_kernels::ops::Glm52RouterOutput;
+use openinfer_kernels::ops::gemm_bf16_f32;
 use openinfer_kernels::ops::glm52_router_noaux_tc_launch;
+use openinfer_kernels::ops::glm52_router_select_launch;
 use openinfer_kernels::tensor::DeviceContext;
 
 use crate::fp8::Glm52MlpScratch;
@@ -20,6 +22,7 @@ use crate::fp8::ProjWeight;
 use crate::fp8::bytes_to_f32;
 use crate::fp8::fp8_mlp_into;
 use crate::fp8::pack_proj_pair;
+use crate::weights::retype_owned;
 
 pub(crate) const HIDDEN: usize = crate::config::GLM52_HIDDEN;
 pub(crate) const EXPERTS: usize = crate::config::GLM52_ROUTED_EXPERTS;
@@ -47,12 +50,16 @@ pub(crate) struct Glm52MoeRoutedExpertBytes<'a> {
 
 /// Router weights: the bf16 gate GEMM and the f32 selection-bias.
 pub(crate) struct Glm52MoeRouterWeights {
-    gate_weight: CudaSlice<u8>,  // bf16 [EXPERTS, HIDDEN]
-    e_score_bias: CudaSlice<u8>, // f32  [EXPERTS]
+    gate_weight: CudaSlice<bf16>, // bf16 [EXPERTS, HIDDEN]
+    e_score_bias: CudaSlice<u8>,  // f32  [EXPERTS]
 }
 
 impl Glm52MoeRouterWeights {
-    pub(crate) fn new(gate_weight: CudaSlice<u8>, e_score_bias: CudaSlice<u8>) -> Result<Self> {
+    pub(crate) fn new(
+        ctx: &DeviceContext,
+        gate_weight: CudaSlice<u8>,
+        e_score_bias: CudaSlice<u8>,
+    ) -> Result<Self> {
         ensure!(
             gate_weight.len() == EXPERTS * HIDDEN * 2 && e_score_bias.len() == EXPERTS * 4,
             "GLM5.2 MoE router weight bytes unexpected: gate {}, bias {}",
@@ -60,7 +67,7 @@ impl Glm52MoeRouterWeights {
             e_score_bias.len()
         );
         Ok(Self {
-            gate_weight,
+            gate_weight: retype_owned(&ctx.stream, gate_weight)?,
             e_score_bias,
         })
     }
@@ -308,6 +315,52 @@ pub(crate) fn run_router_into(
         &mut router_out,
     )?;
     Ok(())
+}
+
+pub(crate) fn run_router_rows_into(
+    ctx: &DeviceContext,
+    router: &Glm52MoeRouterWeights,
+    normed_hidden: &CudaSlice<bf16>,
+    active_tokens: usize,
+    padded_tokens: usize,
+    s: &mut Glm52RouterScratch,
+) -> Result<()> {
+    ensure!(
+        active_tokens > 0
+            && active_tokens <= padded_tokens
+            && padded_tokens <= s.tokens
+            && normed_hidden.len() >= padded_tokens * HIDDEN,
+        "GLM5.2 router prefill shape is invalid"
+    );
+    gemm_bf16_f32(
+        ctx,
+        true,
+        false,
+        EXPERTS,
+        padded_tokens,
+        HIDDEN,
+        &router.gate_weight,
+        HIDDEN,
+        normed_hidden,
+        HIDDEN,
+        &mut s.logits,
+        EXPERTS,
+    )?;
+    let mut router_out = Glm52RouterOutput {
+        topk_weight: &mut s.route.topk_weight,
+        topk_idx: &mut s.route.topk_idx,
+    };
+    glm52_router_select_launch(
+        ctx,
+        Glm52RouterConfig::glm52(),
+        Glm52RouterBatch {
+            active_tokens,
+            padded_tokens,
+        },
+        &s.logits,
+        &router.e_score_bias,
+        &mut router_out,
+    )
 }
 
 /// Allocating convenience over [`run_router_into`] for the oracle-gate/test

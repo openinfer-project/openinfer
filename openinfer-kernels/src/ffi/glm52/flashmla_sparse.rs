@@ -4,6 +4,21 @@ use cudarc::driver::sys::CUstream;
 use crate::ffi::Half;
 
 unsafe extern "C" {
+    pub fn glm52_flashmla_sparse_prefill_launch_cuda(
+        q: *const Half,
+        kv: *const Half,
+        topk_indices: *const i32,
+        topk_length: *const i32,
+        out: *mut Half,
+        max_logits: *mut f32,
+        lse: *mut f32,
+        query_rows: i32,
+        kv_rows: i32,
+        topk: i32,
+        sm_scale: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn glm52_flashmla_sparse_decode_num_sm_parts_cuda(num_sm_parts: *mut i32) -> CUresult;
 
     pub fn glm52_flashmla_sparse_decode_metadata_cuda(

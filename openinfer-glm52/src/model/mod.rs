@@ -26,6 +26,7 @@ use cudarc::driver::PinnedHostSlice;
 use half::bf16;
 use openinfer_core::cuda_graph::CudaGraphDumpSummary;
 use openinfer_core::cuda_graph::CudaGraphState;
+use openinfer_kernels::ops::GLM52_FLASHINFER_SPARSE_BYTES_PER_TOKEN;
 use openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN;
 use openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_PAGE_SIZE;
 use openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_TOPK;
@@ -67,6 +68,9 @@ use crate::mla_decode::glm52_mla_backend_preflight;
 use crate::mla_decode::glm52_select_mla_backend;
 use crate::moe_ep_wo::Glm52MoeEpState;
 use crate::moe_tp::Glm52MoeTpRank;
+use crate::prefill_tp::Glm52TpPrefillExecutor;
+use crate::prefill_tp::Glm52TpPrefillModelView;
+use crate::prefill_tp::PREFILL_TILE_ROWS;
 use crate::scratch::Glm52DecodeScratch;
 use crate::weights::Glm52RankGpuWeights;
 use crate::weights::retype_owned;
@@ -95,12 +99,11 @@ pub(crate) const GLM52_MODEL_LEN_ALIGN: usize = GLM52_FLASHMLA_SPARSE_PAGE_SIZE;
 /// with `prompt + max_tokens <= cap + 1` (`validate_request`) — one page
 /// more than its KV ever writes, because kvbm appends the final generated
 /// token and eagerly provisions its page (the dangling-token contract). The
-/// `cap + 1` here keeps 8 concurrent max-shape requests admissible, exactly
-/// like the pre-pool per-slot layout. The coordinator's `BlockPool` and the
-/// rank arenas ([`Glm52RankModel::build`]) MUST agree on this count: pool
-/// block ids index the arenas directly.
-pub(crate) fn glm52_pool_blocks(max_model_len: usize) -> usize {
-    GLM52_MAX_BATCH_PER_RANK * (max_model_len + 1).div_ceil(GLM52_FLASHMLA_SPARSE_PAGE_SIZE) + 1
+/// coordinator's `BlockPool` and the rank arenas
+/// ([`Glm52RankModel::build`]) MUST agree on this count: pool block ids index
+/// the arenas directly.
+pub(crate) fn glm52_pool_blocks(max_model_len: usize, pool_slots: usize) -> usize {
+    pool_slots * (max_model_len + 1).div_ceil(GLM52_FLASHMLA_SPARSE_PAGE_SIZE) + 1
 }
 
 /// Page-table width: the pages a single request at the full cap addresses.
@@ -118,33 +121,55 @@ pub(crate) fn glm52_table_width(max_model_len: usize) -> usize {
 /// launch-time VRAM probe sizes `max_model_len` against this, so a new
 /// len-scaled allocation in `build` MUST be added here or the probe
 /// under-charges.
-pub(crate) fn glm52_arena_bytes(max_model_len: usize) -> Result<usize> {
-    let num_blocks = glm52_pool_blocks(max_model_len);
-    let mla = GLM52_LAYERS
-        * num_blocks
-        * GLM52_FLASHMLA_SPARSE_PAGE_SIZE
-        * GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN;
-    let (table_width, index_layout) = glm52_index_cache_layout(max_model_len);
+pub(crate) fn glm52_arena_bytes(
+    max_model_len: usize,
+    pool_slots: usize,
+    prefill_only: bool,
+) -> Result<usize> {
+    let num_blocks = glm52_pool_blocks(max_model_len, pool_slots);
+    let cache_bytes_per_token = if prefill_only {
+        GLM52_FLASHINFER_SPARSE_BYTES_PER_TOKEN
+    } else {
+        GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN
+    };
+    let mla = GLM52_LAYERS * num_blocks * GLM52_FLASHMLA_SPARSE_PAGE_SIZE * cache_bytes_per_token;
+    let (table_width, index_layout) = glm52_index_cache_layout(max_model_len, pool_slots);
     let index_k = (0..GLM52_LAYERS)
         .filter(|&layer| glm52_layer_has_full_indexer(layer))
         .count()
         * index_layout.min_cache_bytes()?;
     let rope_tables = 2 * max_model_len * GLM52_ROPE_HALF * size_of::<bf16>();
-    let bucket_rows: usize = GLM52_DECODE_BUCKETS.iter().sum();
+    let bucket_rows: usize = if prefill_only {
+        0
+    } else {
+        GLM52_DECODE_BUCKETS.iter().sum()
+    };
     let indexer_logits =
         bucket_rows * max_model_len.next_multiple_of(256) * (size_of::<bf16>() + size_of::<f32>());
     let block_tables = bucket_rows * table_width * size_of::<i32>();
-    Ok(mla + index_k + rope_tables + indexer_logits + block_tables)
+    let prefill_unpacked = if prefill_only {
+        num_blocks
+            * GLM52_FLASHMLA_SPARSE_PAGE_SIZE
+            * crate::config::GLM52_KV_A_OUT
+            * size_of::<bf16>()
+            + num_blocks * size_of::<i32>()
+    } else {
+        0
+    };
+    Ok(mla + index_k + rope_tables + indexer_logits + block_tables + prefill_unpacked)
 }
 
 /// The page-table width and index-K cache layout for a given cap — the ONE
 /// construction shared by [`Glm52RankModel::build`] and the arena ledger
 /// ([`glm52_arena_bytes`]), so a layout change cannot drift between them.
-fn glm52_index_cache_layout(max_model_len: usize) -> (usize, Glm52IndexerCacheLayout) {
+fn glm52_index_cache_layout(
+    max_model_len: usize,
+    pool_slots: usize,
+) -> (usize, Glm52IndexerCacheLayout) {
     // The index-K cache is indexed by the same pool block ids as the MLA
     // cache, so it holds the same block count.
     let layout = Glm52IndexerCacheLayout {
-        cache_blocks: glm52_pool_blocks(max_model_len),
+        cache_blocks: glm52_pool_blocks(max_model_len, pool_slots),
         cache_block_size: INDEX_CACHE_BLOCK,
         cache_block_stride_bytes: INDEX_CACHE_BLOCK * (GLM52_INDEX_HEAD_DIM + 4),
     };
@@ -272,7 +297,7 @@ pub(crate) struct Glm52RankModel {
     /// [`GLM52_DECODE_BUCKETS`]. Selecting one `Glm52BucketState` selects the
     /// plans, scratch, graphs, and block table together — a graph can never
     /// be taken from one shape and restored into another.
-    buckets: [Glm52BucketState; GLM52_DECODE_BUCKETS.len()],
+    buckets: Vec<Glm52BucketState>,
     /// Width of every per-row page-table row ([`glm52_table_width`]): the
     /// pages one request at the full cap addresses.
     table_width: usize,
@@ -281,6 +306,7 @@ pub(crate) struct Glm52RankModel {
     /// rank-wide per-layer MLA and index-K page pools at build time
     /// ([`glm52_pool_blocks`]).
     max_model_len: usize,
+    pool_blocks: usize,
     /// Token stride of this rank's MLA arena. FlashMLA fp8_ds_mla uses 656
     /// bytes; TP4 FlashInfer uses the standard 576-byte E4M3 layout.
     mla_cache_bytes_per_token: usize,
@@ -307,7 +333,10 @@ pub(crate) struct Glm52RankModel {
     /// runs outside the captured graphs, so pointer stability per bucket is
     /// not required). Allocated at build — a mid-serving step must never hit
     /// the allocator.
-    sampling_scratch: BatchSamplingScratch,
+    sampling_scratch: Option<BatchSamplingScratch>,
+    /// TP4 eager-prefill executor and reusable 32-row workspace. Persistent
+    /// KV lives in `caches`.
+    prefill: Option<Glm52TpPrefillExecutor>,
     /// In-flight speculative next-step replay, if any (see `decode_step`).
     speculated: Option<Glm52SpeculatedStep>,
     /// What the per-row `positions` device buffer currently holds (padding
@@ -410,7 +439,7 @@ impl Glm52RankModel {
     /// without its index-K would be silent corruption. The arenas are
     /// contiguous, so a block's stride equals its copy size.
     pub(crate) fn kv_arenas(&self, stream: &CudaStream) -> Result<Vec<KvArena>> {
-        let num_blocks = glm52_pool_blocks(self.max_model_len);
+        let num_blocks = self.pool_blocks;
         let mla_block_bytes = GLM52_FLASHMLA_SPARSE_PAGE_SIZE * self.mla_cache_bytes_per_token;
         let idxk_block_bytes = INDEX_CACHE_BLOCK * (GLM52_INDEX_HEAD_DIM + 4);
         let mut arenas = Vec::with_capacity(self.caches.len() * 2);
@@ -499,6 +528,7 @@ impl Glm52RankModel {
         moe_topo: crate::Glm52MoeTopo,
         attn_shard: Option<usize>,
         dspark_enabled: bool,
+        prefill_chunk_size: Option<usize>,
     ) -> Result<Self> {
         ensure!(
             moe_topo.uses_tensor_replicated_moe() == attn_shard.is_some(),
@@ -529,14 +559,20 @@ impl Glm52RankModel {
         } else {
             glm52_flashmla_sparse_decode_num_sm_parts()?
         };
+        let pool_slots = if prefill_chunk_size.is_some() {
+            1
+        } else {
+            GLM52_MAX_BATCH_PER_RANK
+        };
+        let pool_blocks = glm52_pool_blocks(max_model_len, pool_slots);
         let contract = Glm52FlashMlaSparseDecode {
             batch_size: batch,
-            num_blocks: glm52_pool_blocks(max_model_len),
+            num_blocks: pool_blocks,
             topk: GLM52_FLASHMLA_SPARSE_TOPK,
             num_sm_parts,
             sm_scale: GLM52_SM_SCALE,
         };
-        let (table_width, index_cache_layout) = glm52_index_cache_layout(max_model_len);
+        let (table_width, index_cache_layout) = glm52_index_cache_layout(max_model_len, pool_slots);
 
         let mut layers = Vec::with_capacity(GLM52_LAYERS);
         let mut caches = Vec::with_capacity(GLM52_LAYERS);
@@ -630,13 +666,22 @@ impl Glm52RankModel {
         // first step prologue uploads the coordinator's page rows).
         // Attention-TP scratch follows the head shard and selected MLA cache
         // layout; both were fixed before the per-layer arenas were allocated.
-        let mut buckets = Vec::with_capacity(GLM52_DECODE_BUCKETS.len());
-        for rows in GLM52_DECODE_BUCKETS {
+        let mut buckets = Vec::with_capacity(if prefill_chunk_size.is_some() {
+            0
+        } else {
+            GLM52_DECODE_BUCKETS.len()
+        });
+        for rows in prefill_chunk_size
+            .is_none()
+            .then_some(GLM52_DECODE_BUCKETS)
+            .into_iter()
+            .flatten()
+        {
             let contract_rows = Glm52FlashMlaSparseDecode {
                 batch_size: rows,
                 ..contract
             };
-            let mqa_shape = Glm52IndexerScratch::decode_shape(
+            let mqa_shape = Glm52IndexerScratch::paged_mqa_shape(
                 rows,
                 index_cache_layout,
                 table_width,
@@ -668,11 +713,6 @@ impl Glm52RankModel {
                 argmax_indices_host: unsafe { ctx.ctx.alloc_pinned::<i32>(rows)? },
             });
         }
-        let buckets: [Glm52BucketState; GLM52_DECODE_BUCKETS.len()] = buckets
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("GLM5.2 bucket state count drifted from the const"))?;
-        let mut buckets = buckets;
-
         if mla_backend == crate::mla_decode::Glm52MlaBackend::FlashInferFp8 {
             for bucket in &mut buckets {
                 glm52_mla_backend_preflight(
@@ -692,7 +732,7 @@ impl Glm52RankModel {
         // that bucket (graphs are lazily captured; nothing else exercises a
         // bucket before real traffic does). Zeroed dummy operands in the
         // smallest whitelisted linear shape (indexer wk, n=128 k=6144).
-        {
+        if prefill_chunk_size.is_none() {
             let (n, k) = (128usize, 6144usize);
             let weight = ctx.stream.alloc_zeros::<u8>(n * k)?;
             let scale = ctx
@@ -728,6 +768,25 @@ impl Glm52RankModel {
             }
         }
 
+        let prefill = prefill_chunk_size
+            .is_some()
+            .then(|| {
+                let indexer_shape = Glm52IndexerScratch::paged_mqa_shape(
+                    PREFILL_TILE_ROWS,
+                    index_cache_layout,
+                    table_width,
+                    NUM_SMS,
+                    max_model_len,
+                );
+                Glm52TpPrefillExecutor::new(
+                    ctx,
+                    pool_blocks * GLM52_FLASHMLA_SPARSE_PAGE_SIZE,
+                    table_width,
+                    indexer_shape,
+                )
+            })
+            .transpose()?;
+
         Ok(Self {
             layers,
             caches,
@@ -739,6 +798,7 @@ impl Glm52RankModel {
             buckets,
             table_width,
             max_model_len,
+            pool_blocks,
             mla_cache_bytes_per_token,
             ep_ranks: moe_topo.expected_ep_size(),
             slot_mapping: ctx.stream.alloc_zeros::<i64>(batch)?,
@@ -757,10 +817,49 @@ impl Glm52RankModel {
             cos: ctx.stream.alloc_zeros::<bf16>(batch * GLM52_ROPE_HALF)?,
             sin: ctx.stream.alloc_zeros::<bf16>(batch * GLM52_ROPE_HALF)?,
             token_ids: ctx.stream.alloc_zeros::<u32>(batch)?,
-            sampling_scratch: BatchSamplingScratch::new(ctx, batch, GLM52_VOCAB)?,
+            sampling_scratch: Some(BatchSamplingScratch::new(ctx, batch, GLM52_VOCAB)?),
+            prefill,
             speculated: None,
             device_positions: [0; GLM52_MAX_BATCH_PER_RANK],
         })
+    }
+
+    pub(crate) fn prefill_chunk(
+        &mut self,
+        ctx: &DeviceContext,
+        batch: &crate::runner::Glm52PrefillBatch,
+        tp: Option<&mut Glm52MoeTpRank>,
+    ) -> Result<Vec<u32>> {
+        let executor = self
+            .prefill
+            .as_mut()
+            .context("GLM5.2 rank was not built for prefill-only execution")?;
+        let tp = tp.context("GLM5.2 TP4 prefill is missing its TP runtime")?;
+        let sampling_scratch = self
+            .sampling_scratch
+            .as_mut()
+            .context("GLM5.2 prefill sampling scratch is missing")?;
+        let lm_head = self
+            .decode_lm_head
+            .as_ref()
+            .context("GLM5.2 TP4 prefill is missing its vocabulary shard")?;
+        executor.forward(
+            ctx,
+            batch,
+            tp,
+            Glm52TpPrefillModelView {
+                layers: &self.layers,
+                caches: &mut self.caches,
+                embed: &self.embed,
+                cos_table: &self.cos_table,
+                sin_table: &self.sin_table,
+                final_norm: &self.final_norm,
+                shard_lm_head: lm_head,
+                full_lm_head: &self.lm_head,
+                vocab_start: self.decode_vocab_start,
+                sampling_scratch,
+            },
+        )
     }
 
     /// One lock-step step: feed `inputs[row]` = the `(token, position)` each
@@ -803,6 +902,10 @@ impl Glm52RankModel {
         sampling: &[crate::runner::Glm52RowSample],
         seed: u64,
     ) -> Result<[u32; GLM52_MAX_BATCH_PER_RANK]> {
+        assert!(
+            self.prefill.is_none(),
+            "GLM5.2 prefill-only execution entered decode_step"
+        );
         // A launch-ahead speculation feeds this step's ARGMAX token to the
         // next step, so it can never coexist with a sampled row — the
         // coordinator withholds the lease while any non-greedy request is
@@ -876,6 +979,10 @@ impl Glm52RankModel {
         if sampling.is_empty() {
             return Ok(());
         }
+        let sampling_scratch = self
+            .sampling_scratch
+            .as_mut()
+            .context("GLM5.2 sampling is unavailable in prefill-only mode")?;
         for pair in sampling.windows(2) {
             ensure!(
                 pair[0].row < pair[1].row,
@@ -929,8 +1036,7 @@ impl Glm52RankModel {
             .map(as_row)
             .collect();
         if !unseeded.is_empty() {
-            let tokens =
-                gpu_sample_batch_into(ctx, logits, &unseeded, seed, &mut self.sampling_scratch)?;
+            let tokens = gpu_sample_batch_into(ctx, logits, &unseeded, seed, sampling_scratch)?;
             for (row, token) in unseeded.iter().zip(tokens) {
                 outputs[row.row] = token;
             }
@@ -944,7 +1050,7 @@ impl Glm52RankModel {
                 logits,
                 &[as_row(s)],
                 mix_seed(request_seed, s.step),
-                &mut self.sampling_scratch,
+                sampling_scratch,
             )?;
             outputs[s.row] = tokens[0];
         }

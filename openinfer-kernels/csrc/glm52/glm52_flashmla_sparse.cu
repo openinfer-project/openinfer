@@ -7,6 +7,7 @@
 
 #include "params.h"
 #include "sm100/decode/head64/kernel.cuh"
+#include "sm100/prefill/sparse/fwd/head64/phase1.cuh"
 #include "sm90/decode/sparse_fp8/splitkv_mla.cuh"
 #include "smxx/decode/combine/combine.cu"
 #include "smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu"
@@ -109,6 +110,54 @@ bool valid_common_shape(int batch_size, int num_blocks, int topk,
 extern "C" CUresult glm52_flashmla_sparse_decode_num_sm_parts_cuda(
     int* num_sm_parts) {
   return current_flashmla_num_sm_parts(num_sm_parts);
+}
+
+extern "C" CUresult glm52_flashmla_sparse_prefill_launch_cuda(
+    const void* q, const void* kv, const int* topk_indices,
+    const int* topk_length, void* out, float* max_logits, float* lse,
+    int query_rows, int kv_rows, int topk, float sm_scale,
+    cudaStream_t stream) {
+  if (q == nullptr || kv == nullptr || topk_indices == nullptr ||
+      out == nullptr || max_logits == nullptr || lse == nullptr ||
+      query_rows <= 0 || kv_rows <= 0 || topk <= 0 || topk > kTopk ||
+      topk % 64 != 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  cudaDeviceProp prop{};
+  FlashMlaArch arch{};
+  CUresult result = current_flashmla_arch(&prop, &arch);
+  if (result != CUDA_SUCCESS) return result;
+  if (arch != FlashMlaArch::Sm100) return CUDA_ERROR_NOT_SUPPORTED;
+
+  SparseAttnFwdParams params{
+      query_rows,
+      kv_rows,
+      kHeads,
+      kKvHeads,
+      kQkDim,
+      kVDim,
+      topk,
+      sm_scale,
+      sm_scale * kLog2E,
+      reinterpret_cast<cutlass::bfloat16_t*>(const_cast<void*>(q)),
+      reinterpret_cast<cutlass::bfloat16_t*>(const_cast<void*>(kv)),
+      const_cast<int*>(topk_indices),
+      nullptr,
+      const_cast<int*>(topk_length),
+      kHeads * kQkDim,
+      kQkDim,
+      kQkDim,
+      kQkDim,
+      topk,
+      topk,
+      reinterpret_cast<cutlass::bfloat16_t*>(out),
+      max_logits,
+      lse,
+      prop.multiProcessorCount,
+      stream,
+  };
+  return run_flashmla_host(
+      [&] { sm100::fwd::head64::run_fwd_phase1_kernel<kQkDim>(params); });
 }
 
 extern "C" CUresult glm52_flashmla_sparse_decode_metadata_cuda(
