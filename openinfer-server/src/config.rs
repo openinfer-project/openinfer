@@ -201,16 +201,11 @@ pub(crate) struct Args {
     #[arg(long)]
     pub max_model_len: Option<usize>,
 
-    /// Run GLM5.2 TP4 as a prefill-only engine. Requests must ask for exactly
-    /// one output token; the token produced by the prompt tail is returned and
-    /// the request is never admitted to decode. Prefix caching stays enabled.
+    /// Run GLM5.2 TP4 with prefix caching and no decode.
     #[arg(long, default_value_t = false)]
     pub glm52_prefill_only: bool,
 
-    /// Maximum token rows in one future native GLM5.2 prefill launch. PR1 uses
-    /// this value to reserve VRAM and lock the public contract while the
-    /// compatibility executor still feeds prompt spans through the existing
-    /// small-row path. Must be a multiple of the 64-token KV page size.
+    /// Token rows per prefill chunk. Must be a multiple of 64.
     #[arg(long, default_value_t = 16_384)]
     pub glm52_prefill_chunk_size: usize,
 

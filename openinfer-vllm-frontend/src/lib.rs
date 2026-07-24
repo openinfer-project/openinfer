@@ -103,9 +103,7 @@ pub async fn serve_with_engine_count(
     .await
 }
 
-/// Serve a prefill-only endpoint whose request contract is enforced at the
-/// HTTP boundary, before vLLM creates an engine stream. The scheduler repeats
-/// the check as a fail-closed backstop for non-HTTP callers.
+/// Serve an endpoint that requires `max_tokens=1`.
 #[allow(clippy::too_many_arguments)]
 pub async fn serve_prefill_only_with_engine_count(
     engine: impl Future<Output = Result<EngineHandle>> + Send + 'static,

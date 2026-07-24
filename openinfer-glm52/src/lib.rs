@@ -73,10 +73,7 @@ use crate::model::glm52_pool_blocks;
 pub const GLM52_PREFILL_CHUNK_ALIGN: usize = GLM52_MODEL_LEN_ALIGN;
 pub const GLM52_DEFAULT_PREFILL_CHUNK_SIZE: usize = 16_384;
 
-/// Contract for the first native TP4 prefill milestone. PR1 deliberately
-/// keeps the compatibility executor (prompt spans ride the existing small-row
-/// forward) while reserving the future large-M scratch and enforcing the
-/// externally visible prefill-only request semantics.
+/// TP4 prefill-only configuration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Glm52PrefillOnlyOptions {
     pub chunk_size: usize,
@@ -99,9 +96,7 @@ pub struct Glm52LaunchOptions {
     /// an explicit value is still validated against that budget so an
     /// impossible cap fails at launch, not at the first long request.
     pub max_model_len: Option<usize>,
-    /// `Some` makes this TP4 group a prefill-only endpoint: prefix caching is
-    /// mandatory, each request returns the prompt tail's first predicted
-    /// token, and no request may enter decode.
+    /// Enables TP4 prefill-only serving.
     pub prefill_only: Option<Glm52PrefillOnlyOptions>,
     /// vLLM-style kill switch: disable prefix matching outright (every
     /// prefill recomputes the full prompt). Prefix caching is also forced
@@ -576,17 +571,10 @@ const GLM52_VRAM_RESERVE_BYTES: usize = 5 << 30;
 /// (`glm52_dspark_arena_bytes`), not here.
 const GLM52_DSPARK_VRAM_RESERVE_BYTES: usize = 5 << 30;
 
-/// Fixed bookkeeping/workspace allowance for the future large-M prefill
-/// executor. The per-token ledger below covers activation-sized buffers; this
-/// fixed part covers collective, allocator, and tiled top-k workspaces whose
-/// size is not linear in the active chunk rows.
+/// Fixed prefill workspace reserve.
 const GLM52_PREFILL_FIXED_SCRATCH_BYTES: usize = 256 << 20;
 
-/// Conservative large-M scratch ledger per token row: hidden ping/pong +
-/// normalized input, TP4-local projection/MoE intermediates, and streaming
-/// DSA top-k metadata. PR1 reserves this capacity without allocating it; the
-/// native executor must fit inside this envelope or revise the ledger in the
-/// PR that introduces the allocation.
+/// Estimated scratch bytes per token row.
 const GLM52_PREFILL_SCRATCH_BYTES_PER_TOKEN: usize = 72 << 10;
 
 /// The smallest cap worth serving with (the pre-refactor bring-up value);

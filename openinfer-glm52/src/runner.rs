@@ -69,8 +69,7 @@ pub(crate) struct Glm52StepFlags {
     /// advanced by its own argmax — every rank MUST enqueue that next
     /// replay launch-ahead (see `Glm52RankModel::decode_step`).
     pub(crate) lease: bool,
-    /// Execute the whole step eagerly. Prefill-only mode sets this on every
-    /// compatibility step so it neither captures nor replays decode graphs.
+    /// Bypass CUDA graph capture and replay.
     pub(crate) eager: bool,
 }
 
