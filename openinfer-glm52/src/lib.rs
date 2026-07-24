@@ -577,8 +577,8 @@ const GLM52_VRAM_RESERVE_BYTES: usize = 5 << 30;
 /// (`glm52_dspark_arena_bytes`), not here.
 const GLM52_DSPARK_VRAM_RESERVE_BYTES: usize = 5 << 30;
 
-/// Fixed prefill workspace reserve.
-const GLM52_PREFILL_FIXED_SCRATCH_BYTES: usize = 256 << 20;
+/// Fixed workspace for the largest TP prefill tile.
+const GLM52_PREFILL_FIXED_SCRATCH_BYTES: usize = 2 << 30;
 
 /// Estimated scratch bytes per token row.
 const GLM52_PREFILL_SCRATCH_BYTES_PER_TOKEN: usize = 160 << 10;
@@ -971,18 +971,20 @@ fn start_engine(
 }
 
 fn preflight_prefill_kernels(workers: &[Glm52Worker]) -> Result<()> {
+    const PREFLIGHT_ROWS: usize = crate::prefill_tp::PREFILL_TILE_ROWS;
+    let block_count = PREFLIGHT_ROWS.div_ceil(GLM52_MODEL_LEN_ALIGN);
     let started = Instant::now();
     let responses = workers
         .iter()
         .map(|worker| {
             worker.prefill_chunk_async(Glm52PrefillBatch {
-                token_ids: vec![0],
-                positions: vec![0],
-                request_indptr: vec![0, 1],
-                block_indptr: vec![0, 1],
-                block_ids: vec![0],
-                padding_block: 1,
-                slot_mapping: vec![0],
+                token_ids: vec![0; PREFLIGHT_ROWS],
+                positions: (0..PREFLIGHT_ROWS as u32).collect(),
+                request_indptr: vec![0, PREFLIGHT_ROWS as u32],
+                block_indptr: vec![0, block_count as u32],
+                block_ids: (0..block_count as i32).collect(),
+                padding_block: block_count as i32,
+                slot_mapping: (0..PREFLIGHT_ROWS as i64).collect(),
                 output_rows: Vec::new(),
                 sampling: Vec::new(),
                 seed: 0,
@@ -995,7 +997,7 @@ fn preflight_prefill_kernels(workers: &[Glm52Worker]) -> Result<()> {
         })??;
     }
     log::info!(
-        "GLM5.2 TP4 prefill kernel preflight completed on all ranks in {:.3}s",
+        "GLM5.2 TP4 prefill {PREFLIGHT_ROWS}-row kernel preflight completed on all ranks in {:.3}s",
         started.elapsed().as_secs_f64()
     );
     Ok(())
@@ -1092,9 +1094,14 @@ fn build_rank_models(
     let tp_exchange = moe_topo
         .uses_tensor_replicated_moe()
         .then(|| std::sync::Arc::new(crate::moe_tp::Glm52TpExchange::new(moe_topo.device_count())));
+    let prefill_nccl_id = prefill_chunk_size
+        .map(|_| openinfer_kernels::ops::Glm52PrefillNcclComm::unique_id())
+        .transpose()?;
     let responses = workers
         .iter()
-        .map(|worker| worker.setup_comm_async(unique_id, moe_topo, tp_exchange.clone()))
+        .map(|worker| {
+            worker.setup_comm_async(unique_id, prefill_nccl_id, moe_topo, tp_exchange.clone())
+        })
         .collect::<Result<Vec<_>>>()?;
     for (rank, response) in responses.into_iter().enumerate() {
         response
@@ -1534,6 +1541,6 @@ mod max_model_len_tests {
             chunk_size: GLM52_DEFAULT_PREFILL_CHUNK_SIZE,
         }))
         .expect("prefill reservation");
-        assert_eq!(bytes, 2_952_790_016);
+        assert_eq!(bytes, 4_831_838_208);
     }
 }

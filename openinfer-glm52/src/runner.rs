@@ -179,6 +179,7 @@ enum Glm52RankCommand {
     /// pointers through `tp_exchange`.
     SetupComm {
         unique_id: Box<[u8; 128]>,
+        prefill_nccl_id: Option<[u8; 128]>,
         moe_topo: crate::Glm52MoeTopo,
         tp_exchange: Option<Arc<Glm52TpExchange>>,
         resp: Sender<Result<()>>,
@@ -349,6 +350,7 @@ impl Glm52RankWorker {
     pub(crate) fn setup_comm_async(
         &self,
         unique_id: [u8; 128],
+        prefill_nccl_id: Option<[u8; 128]>,
         moe_topo: crate::Glm52MoeTopo,
         tp_exchange: Option<Arc<Glm52TpExchange>>,
     ) -> Result<Receiver<Result<()>>> {
@@ -356,6 +358,7 @@ impl Glm52RankWorker {
         self.tx
             .send(Glm52RankCommand::SetupComm {
                 unique_id: Box::new(unique_id),
+                prefill_nccl_id,
                 moe_topo,
                 tp_exchange,
                 resp: resp_tx,
@@ -533,14 +536,17 @@ impl Glm52Worker {
     pub(crate) fn setup_comm_async(
         &self,
         unique_id: [u8; 128],
+        prefill_nccl_id: Option<[u8; 128]>,
         moe_topo: crate::Glm52MoeTopo,
         tp_exchange: Option<Arc<Glm52TpExchange>>,
     ) -> Result<Receiver<Result<()>>> {
         match self {
-            Self::Local(worker) => worker.setup_comm_async(unique_id, moe_topo, tp_exchange),
+            Self::Local(worker) => {
+                worker.setup_comm_async(unique_id, prefill_nccl_id, moe_topo, tp_exchange)
+            }
             Self::Remote(worker) => {
                 ensure!(
-                    tp_exchange.is_none(),
+                    tp_exchange.is_none() && prefill_nccl_id.is_none(),
                     "GLM5.2 tensor-replicated topologies are single-node"
                 );
                 worker.setup_comm_async(unique_id, moe_topo)
@@ -892,9 +898,11 @@ impl Glm52RankThreadState {
     fn setup_comm(
         &mut self,
         unique_id: &[u8; 128],
+        prefill_nccl_id: Option<[u8; 128]>,
         moe_topo: crate::Glm52MoeTopo,
         tp_exchange: Option<&Arc<Glm52TpExchange>>,
     ) -> Result<()> {
+        self.ctx.set_current()?;
         let dev_ctx = self.ctx.device_context()?;
         let runtime = self
             .runtime
@@ -954,17 +962,34 @@ impl Glm52RankThreadState {
                 crate::Glm52MoeTopo::Tp4 => openinfer_kernels::ops::Glm52TpTopology::Tp4,
                 _ => anyhow::bail!("GLM5.2 {moe_topo:?} setup received a TP exchange"),
             };
-            let state = Glm52MoeTpState::new(
-                &dev_ctx,
-                topology,
-                self.placement.rank,
-                self.placement.device_ordinal,
-                exchange,
-                self.tp_slices.len(),
-                // One tail slot gathers rank-local vocabulary argmax
-                // candidates after the 78 attention slots.
-                crate::config::GLM52_LAYERS + 1,
-            )?;
+            let state = if let Some(id) = prefill_nccl_id {
+                let comm = openinfer_kernels::ops::Glm52PrefillNcclComm::new(
+                    &id,
+                    self.placement.rank,
+                    topology.ranks(),
+                )
+                .context("GLM5.2 prefill NCCL init")?;
+                Glm52MoeTpState::new_prefill(
+                    &dev_ctx,
+                    topology,
+                    self.placement.rank,
+                    self.tp_slices.len(),
+                    crate::config::GLM52_LAYERS + 1,
+                    comm,
+                )?
+            } else {
+                Glm52MoeTpState::new(
+                    &dev_ctx,
+                    topology,
+                    self.placement.rank,
+                    self.placement.device_ordinal,
+                    exchange,
+                    self.tp_slices.len(),
+                    // One tail slot gathers rank-local vocabulary argmax
+                    // candidates after the 78 attention slots.
+                    crate::config::GLM52_LAYERS + 1,
+                )?
+            };
             runtime.tp = Some(Glm52MoeTpRank {
                 state,
                 slices: std::mem::take(&mut self.tp_slices),
@@ -1092,11 +1117,17 @@ fn rank_worker_loop(rx: &Receiver<Glm52RankCommand>, mut state: Glm52RankThreadS
             }
             Glm52RankCommand::SetupComm {
                 unique_id,
+                prefill_nccl_id,
                 moe_topo,
                 tp_exchange,
                 resp,
             } => {
-                let _ = resp.send(state.setup_comm(&unique_id, moe_topo, tp_exchange.as_ref()));
+                let _ = resp.send(state.setup_comm(
+                    &unique_id,
+                    prefill_nccl_id,
+                    moe_topo,
+                    tp_exchange.as_ref(),
+                ));
             }
             Glm52RankCommand::Step {
                 inputs,

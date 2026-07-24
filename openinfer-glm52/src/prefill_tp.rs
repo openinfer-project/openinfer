@@ -60,8 +60,9 @@ use crate::moe_tp::Glm52MoeTpState;
 use crate::rows::Rows;
 use crate::runner::Glm52PrefillBatch;
 
-pub(crate) const PREFILL_TILE_ROWS: usize = 32;
-const INDEXER_TILE: usize = PREFILL_TILE_ROWS;
+pub(crate) const PREFILL_TILE_ROWS: usize = 512;
+pub(crate) const PREFILL_INDEXER_TILE_ROWS: usize = 32;
+const INDEXER_TILE: usize = PREFILL_INDEXER_TILE_ROWS;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Glm52TpPrefillLayout {
@@ -106,6 +107,11 @@ pub(crate) struct Glm52TpPrefillExecutor {
     tile_slots: CudaSlice<i64>,
     tile_table: CudaSlice<i32>,
     tile_lens: CudaSlice<i32>,
+    indexer_carry_slots: CudaSlice<i32>,
+    indexer_carry_lens: CudaSlice<i32>,
+    tile_query_bf16: CudaSlice<bf16>,
+    tile_normed: Rows<GLM52_HIDDEN>,
+    tile_attention_reduced: Rows<GLM52_HIDDEN>,
     attention_out: CudaSlice<bf16>,
     attention_max: CudaSlice<f32>,
     attention_lse: CudaSlice<f32>,
@@ -152,7 +158,7 @@ impl Glm52TpPrefillExecutor {
                 && indexer_shape.block_table_stride == layout.table_width,
             "prefill indexer scratch/layout mismatch"
         );
-        let work_rows = INDEXER_TILE;
+        let work_rows = PREFILL_TILE_ROWS;
         Ok(Self {
             layout,
             token_ids: ctx.stream.alloc_zeros::<u32>(work_rows)?,
@@ -201,6 +207,13 @@ impl Glm52TpPrefillExecutor {
                 .stream
                 .alloc_zeros::<i32>(INDEXER_TILE * layout.table_width)?,
             tile_lens: ctx.stream.alloc_zeros::<i32>(INDEXER_TILE)?,
+            indexer_carry_slots: ctx.stream.alloc_zeros::<i32>(PREFILL_TILE_ROWS * 2048)?,
+            indexer_carry_lens: ctx.stream.alloc_zeros::<i32>(PREFILL_TILE_ROWS)?,
+            tile_query_bf16: ctx
+                .stream
+                .alloc_zeros::<bf16>(INDEXER_TILE * 64 * GLM52_KV_A_OUT)?,
+            tile_normed: Rows::zeros(ctx, INDEXER_TILE)?,
+            tile_attention_reduced: Rows::zeros(ctx, INDEXER_TILE)?,
             attention_out: ctx
                 .stream
                 .alloc_zeros::<bf16>(INDEXER_TILE * 64 * GLM52_KV_LORA_RANK)?,
@@ -210,19 +223,15 @@ impl Glm52TpPrefillExecutor {
             attention_partial: ctx
                 .stream
                 .alloc_zeros::<bf16>(INDEXER_TILE * GLM52_HIDDEN)?,
-            attention_reduced: ctx
-                .stream
-                .alloc_zeros::<bf16>(INDEXER_TILE * GLM52_HIDDEN)?,
+            attention_reduced: ctx.stream.alloc_zeros::<bf16>(work_rows * GLM52_HIDDEN)?,
             dense_gate_up: ctx
                 .stream
-                .alloc_zeros::<bf16>(INDEXER_TILE * 2 * crate::config::GLM52_DENSE_INTERMEDIATE)?,
+                .alloc_zeros::<bf16>(work_rows * 2 * crate::config::GLM52_DENSE_INTERMEDIATE)?,
             dense_silu: ctx
                 .stream
-                .alloc_zeros::<bf16>(INDEXER_TILE * crate::config::GLM52_DENSE_INTERMEDIATE)?,
-            dense_out: ctx
-                .stream
-                .alloc_zeros::<bf16>(INDEXER_TILE * GLM52_HIDDEN)?,
-            moe: Glm52MoeTpPrefillScratch::new(ctx)?,
+                .alloc_zeros::<bf16>(work_rows * crate::config::GLM52_DENSE_INTERMEDIATE)?,
+            dense_out: ctx.stream.alloc_zeros::<bf16>(work_rows * GLM52_HIDDEN)?,
+            moe: Glm52MoeTpPrefillScratch::new(ctx, work_rows)?,
             output_rows: ctx.stream.alloc_zeros(32)?,
             final_hidden: Rows::zeros(ctx, 32)?,
             final_normed: Rows::zeros(ctx, 32)?,
@@ -280,24 +289,43 @@ impl Glm52TpPrefillExecutor {
                 if !batch.block_ids.is_empty() {
                     self.unpack_kv_pages(ctx, &cache.mla_cache, &batch.block_ids)?;
                 }
-                match &weights.indexer {
-                    Glm52LayerIndexer::Full(indexer) => {
-                        let index_k_cache = cache
-                            .index_k_cache
-                            .as_mut()
-                            .context("GLM5.2 full prefill indexer is missing its cache")?;
-                        self.run_indexer(ctx, indexer, index_k_cache, batch, start, active)?;
-                        carry_ready = true;
+                for local in (0..active).step_by(INDEXER_TILE) {
+                    let tile_active = (active - local).min(INDEXER_TILE);
+                    match &weights.indexer {
+                        Glm52LayerIndexer::Full(indexer) => {
+                            let index_k_cache = cache
+                                .index_k_cache
+                                .as_mut()
+                                .context("GLM5.2 full prefill indexer is missing its cache")?;
+                            self.run_indexer(
+                                ctx,
+                                indexer,
+                                index_k_cache,
+                                batch,
+                                start + local,
+                                local,
+                                tile_active,
+                            )?;
+                            self.store_indexer_carry(ctx, local)?;
+                            carry_ready = true;
+                        }
+                        Glm52LayerIndexer::Shared => {
+                            ensure!(
+                                carry_ready,
+                                "GLM5.2 shared prefill indexer has no top-k carry"
+                            );
+                            self.load_indexer_carry(ctx, local)?;
+                        }
                     }
-                    Glm52LayerIndexer::Shared => {
-                        ensure!(
-                            carry_ready,
-                            "GLM5.2 shared prefill indexer has no top-k carry"
-                        );
-                    }
+                    self.attend_partial(ctx, &weights.mla, local, tile_active)?;
+                    self.reduce_and_norm_attention(
+                        ctx,
+                        &mut tp.state,
+                        &weights.post_attn_ln,
+                        local,
+                        tile_active,
+                    )?;
                 }
-                self.attend_partial(ctx, &weights.mla, active)?;
-                self.reduce_and_norm_attention(ctx, &mut tp.state, &weights.post_attn_ln, active)?;
                 match &weights.mlp {
                     Glm52LayerMlp::Dense(dense) => {
                         self.dense_mlp(ctx, dense, active.next_multiple_of(4))?;
@@ -386,7 +414,7 @@ impl Glm52TpPrefillExecutor {
     ) -> Result<()> {
         let rows = token_ids.len();
         ensure!(
-            rows > 0 && rows <= INDEXER_TILE && positions.len() == rows,
+            rows > 0 && rows <= PREFILL_TILE_ROWS && positions.len() == rows,
             "prefill chunk rows/positions mismatch"
         );
         ctx.stream
@@ -410,8 +438,8 @@ impl Glm52TpPrefillExecutor {
     fn norm_chunk(&mut self, ctx: &DeviceContext, weight: &DeviceVec, rows: usize) -> Result<()> {
         let rows = rows.next_multiple_of(4);
         ensure!(
-            rows > 0 && rows <= INDEXER_TILE,
-            "prefill norm rows {rows} exceed tile capacity {INDEXER_TILE}"
+            rows > 0 && rows <= PREFILL_TILE_ROWS,
+            "prefill norm rows {rows} exceed tile capacity {PREFILL_TILE_ROWS}"
         );
         rms_norm_rows_into(
             ctx,
@@ -450,7 +478,7 @@ impl Glm52TpPrefillExecutor {
     ) -> Result<()> {
         let rows = slot_mapping.len();
         ensure!(
-            rows > 0 && rows <= INDEXER_TILE,
+            rows > 0 && rows <= PREFILL_TILE_ROWS,
             "prefill MLA rows exceed scratch capacity"
         );
         ctx.stream.memcpy_htod(
@@ -513,18 +541,42 @@ impl Glm52TpPrefillExecutor {
         index_k_cache: &mut CudaSlice<u8>,
         batch: &Glm52PrefillBatch,
         start: usize,
+        local_offset: usize,
         active: usize,
     ) -> Result<()> {
         ensure!(
             active > 0 && active <= INDEXER_TILE && start + active <= batch.token_ids.len(),
             "prefill indexer tile range is invalid"
         );
-        ctx.stream
-            .memcpy_dtod(&self.normed, self.tile_hidden.data_mut())?;
-        ctx.stream
-            .memcpy_dtod(self.mla_front.q_resid.data(), self.tile_q_resid.data_mut())?;
-        ctx.stream.memcpy_dtod(&self.cos, &mut self.tile_cos)?;
-        ctx.stream.memcpy_dtod(&self.sin, &mut self.tile_sin)?;
+        let hidden_offset = local_offset * GLM52_HIDDEN;
+        ctx.stream.memcpy_dtod(
+            &self
+                .normed
+                .slice(hidden_offset..hidden_offset + INDEXER_TILE * GLM52_HIDDEN),
+            self.tile_hidden.data_mut(),
+        )?;
+        let q_offset = local_offset * GLM52_Q_LORA_RANK;
+        ctx.stream.memcpy_dtod(
+            &self
+                .mla_front
+                .q_resid
+                .data()
+                .slice(q_offset..q_offset + INDEXER_TILE * GLM52_Q_LORA_RANK),
+            self.tile_q_resid.data_mut(),
+        )?;
+        let rope_offset = local_offset * GLM52_ROPE_HALF;
+        ctx.stream.memcpy_dtod(
+            &self
+                .cos
+                .slice(rope_offset..rope_offset + INDEXER_TILE * GLM52_ROPE_HALF),
+            &mut self.tile_cos,
+        )?;
+        ctx.stream.memcpy_dtod(
+            &self
+                .sin
+                .slice(rope_offset..rope_offset + INDEXER_TILE * GLM52_ROPE_HALF),
+            &mut self.tile_sin,
+        )?;
 
         let padding_page = batch.padding_block;
         let mut slots = vec![padding_page as i64 * 64; INDEXER_TILE];
@@ -563,23 +615,63 @@ impl Glm52TpPrefillExecutor {
         )
     }
 
+    fn store_indexer_carry(&mut self, ctx: &DeviceContext, offset: usize) -> Result<()> {
+        let slot_start = offset * 2048;
+        ctx.stream.memcpy_dtod(
+            &self.indexer.global_slots,
+            &mut self
+                .indexer_carry_slots
+                .slice_mut(slot_start..slot_start + INDEXER_TILE * 2048),
+        )?;
+        ctx.stream.memcpy_dtod(
+            &self.indexer.topk_lens,
+            &mut self
+                .indexer_carry_lens
+                .slice_mut(offset..offset + INDEXER_TILE),
+        )?;
+        Ok(())
+    }
+
+    fn load_indexer_carry(&mut self, ctx: &DeviceContext, offset: usize) -> Result<()> {
+        let slot_start = offset * 2048;
+        ctx.stream.memcpy_dtod(
+            &self
+                .indexer_carry_slots
+                .slice(slot_start..slot_start + INDEXER_TILE * 2048),
+            &mut self.indexer.global_slots,
+        )?;
+        ctx.stream.memcpy_dtod(
+            &self.indexer_carry_lens.slice(offset..offset + INDEXER_TILE),
+            &mut self.indexer.topk_lens,
+        )?;
+        Ok(())
+    }
+
     fn attend_partial(
         &mut self,
         ctx: &DeviceContext,
         weights: &Glm52MlaLayerWeights,
+        offset: usize,
         active: usize,
     ) -> Result<()> {
         ensure!(
             active > 0 && active <= INDEXER_TILE,
             "prefill attention tile is invalid"
         );
+        let query_offset = offset * 64 * GLM52_KV_A_OUT;
+        ctx.stream.memcpy_dtod(
+            &self
+                .query_bf16
+                .slice(query_offset..query_offset + INDEXER_TILE * 64 * GLM52_KV_A_OUT),
+            &mut self.tile_query_bf16,
+        )?;
         glm52_flashmla_sparse_prefill_launch(
             ctx,
             active,
             self.layout.kv_slots,
             2048,
             0.0625,
-            &self.query_bf16,
+            &self.tile_query_bf16,
             &self.unpacked_kv,
             &self.indexer.global_slots,
             Some(&self.indexer.topk_lens),
@@ -669,30 +761,50 @@ impl Glm52TpPrefillExecutor {
         ctx: &DeviceContext,
         tp: &mut Glm52MoeTpState,
         post_attn_ln: &DeviceVec,
+        offset: usize,
         active: usize,
     ) -> Result<()> {
         tp.prefill_ar_launch(
             ctx,
             active,
             &self.attention_partial,
-            &mut self.attention_reduced,
+            self.tile_attention_reduced.data_mut(),
+        )?;
+        let hidden_start = offset * GLM52_HIDDEN;
+        ctx.stream.memcpy_dtod(
+            &self
+                .hidden
+                .slice(hidden_start..hidden_start + INDEXER_TILE * GLM52_HIDDEN),
+            self.tile_hidden.data_mut(),
         )?;
         fused_add_rms_norm_round_into(
             ctx,
-            &mut self.attention_reduced,
-            &self.hidden,
+            self.tile_attention_reduced.data_mut(),
+            self.tile_hidden.data(),
             post_attn_ln,
             GLM52_RMS_EPS,
             GLM52_HIDDEN,
             active,
-            &mut self.normed,
+            self.tile_normed.data_mut(),
+        )?;
+        ctx.stream.memcpy_dtod(
+            self.tile_attention_reduced.data(),
+            &mut self
+                .attention_reduced
+                .slice_mut(hidden_start..hidden_start + INDEXER_TILE * GLM52_HIDDEN),
+        )?;
+        ctx.stream.memcpy_dtod(
+            self.tile_normed.data(),
+            &mut self
+                .normed
+                .slice_mut(hidden_start..hidden_start + INDEXER_TILE * GLM52_HIDDEN),
         )?;
         let rows = active.next_multiple_of(4);
         if rows > active {
             ctx.stream.memset_zeros(
                 &mut self
                     .normed
-                    .slice_mut(active * GLM52_HIDDEN..rows * GLM52_HIDDEN),
+                    .slice_mut((offset + active) * GLM52_HIDDEN..(offset + rows) * GLM52_HIDDEN),
             )?;
         }
         Ok(())
