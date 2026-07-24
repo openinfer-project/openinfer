@@ -98,6 +98,7 @@ enum Glm52RankCommand {
     LoadWeights {
         model_path: PathBuf,
         moe_topo: crate::Glm52MoeTopo,
+        weight_staging: bool,
         resp: Sender<Result<Glm52RankWeightLoadReport>>,
     },
     /// Non-collective: adopt the resident weights into the rank's model.
@@ -246,12 +247,14 @@ impl Glm52RankWorker {
         &self,
         model_path: &Path,
         moe_topo: crate::Glm52MoeTopo,
+        weight_staging: bool,
     ) -> Result<Receiver<Result<Glm52RankWeightLoadReport>>> {
         let (resp_tx, resp_rx) = bounded(1);
         self.tx
             .send(Glm52RankCommand::LoadWeights {
                 model_path: model_path.to_path_buf(),
                 moe_topo,
+                weight_staging,
                 resp: resp_tx,
             })
             .map_err(|_| anyhow::anyhow!("GLM5.2 rank worker channel closed"))?;
@@ -418,10 +421,11 @@ impl Glm52Worker {
         &self,
         model_path: &Path,
         moe_topo: crate::Glm52MoeTopo,
+        weight_staging: bool,
     ) -> Result<Receiver<Result<Glm52RankWeightLoadReport>>> {
         match self {
-            Self::Local(worker) => worker.load_weights_async(model_path, moe_topo),
-            Self::Remote(worker) => worker.load_weights_async(model_path, moe_topo),
+            Self::Local(worker) => worker.load_weights_async(model_path, moe_topo, weight_staging),
+            Self::Remote(worker) => worker.load_weights_async(model_path, moe_topo, weight_staging),
         }
     }
 
@@ -587,8 +591,9 @@ impl Glm52RankThreadState {
         &mut self,
         model_path: &Path,
         moe_topo: crate::Glm52MoeTopo,
+        weight_staging: bool,
     ) -> Result<Glm52RankWeightLoadReport> {
-        let loaded = load_rank_weights_to_gpu(&self.ctx, model_path, &self.bundle)?;
+        let loaded = load_rank_weights_to_gpu(&self.ctx, model_path, &self.bundle, weight_staging)?;
         if moe_topo.uses_tensor_replicated_moe() {
             // Tensor-replicated topology: the bundle carried no routed experts;
             // gather this rank's 1/TP intermediate slice of ALL experts for
@@ -926,9 +931,10 @@ fn rank_worker_loop(rx: &Receiver<Glm52RankCommand>, mut state: Glm52RankThreadS
             Glm52RankCommand::LoadWeights {
                 model_path,
                 moe_topo,
+                weight_staging,
                 resp,
             } => {
-                let _ = resp.send(state.load_weights(&model_path, moe_topo));
+                let _ = resp.send(state.load_weights(&model_path, moe_topo, weight_staging));
             }
             Glm52RankCommand::BuildModel {
                 max_model_len,

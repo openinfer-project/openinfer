@@ -109,6 +109,9 @@ pub struct Glm52LaunchOptions {
     /// four-GPU bring-up target using 16 attention heads per rank and 1/4
     /// intermediate MoE slices.
     pub moe_topo: Glm52MoeTopo,
+    /// Stage checkpoint bytes through pinned double buffers. Intended for
+    /// warm page-cache starts; cold network filesystems should leave it off.
+    pub weight_staging: bool,
     /// Export rank 0's already pre-captured whole-step decode graph during
     /// startup. EP8 and TP4 export bucket 1; TP8 exports its fixed bucket 8.
     /// The requested PNG gets a complete sibling `.dot` for machine
@@ -402,6 +405,7 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
         no_prefix_cache,
         kv_offload,
         moe_topo,
+        weight_staging,
         dump_graph_png,
         rank_hosts,
     } = options;
@@ -503,6 +507,7 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
         no_prefix_cache,
         kv_offload,
         moe_topo,
+        weight_staging,
         dump_graph_png,
     )
 }
@@ -677,11 +682,12 @@ fn start_engine(
     no_prefix_cache: bool,
     kv_offload: Option<Glm52KvOffloadOptions>,
     moe_topo: Glm52MoeTopo,
+    weight_staging: bool,
     dump_graph_png: Option<PathBuf>,
 ) -> Result<EngineHandle> {
     let dspark_enabled = dspark_path.is_some();
     let startup = validate_startup(model_path, options, moe_topo)?;
-    let loaded = load_rank_weights_to_gpu(model_path, &startup, moe_topo)?;
+    let loaded = load_rank_weights_to_gpu(model_path, &startup, moe_topo, weight_staging)?;
     log::info!(
         "GLM5.2 load-weight startup complete: ranks={}, rank_plan_tensors={:?}, rank_gpu_tensors={:?}, rank_gpu_bytes={:?}",
         startup.device_ordinals.len(),
@@ -1175,6 +1181,7 @@ fn load_rank_weights_to_gpu(
     model_path: &Path,
     startup: &StartupValidation,
     moe_topo: Glm52MoeTopo,
+    weight_staging: bool,
 ) -> Result<LoadedGlm52Runtime> {
     let spawn_started = Instant::now();
     log::info!(
@@ -1215,7 +1222,7 @@ fn load_rank_weights_to_gpu(
     );
     let load_results = workers
         .iter()
-        .map(|worker| worker.load_weights_async(model_path, moe_topo))
+        .map(|worker| worker.load_weights_async(model_path, moe_topo, weight_staging))
         .collect::<Result<Vec<_>>>()?;
     let mut reports = Vec::with_capacity(load_results.len());
     for (rank, rx) in load_results.into_iter().enumerate() {

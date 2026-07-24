@@ -117,6 +117,7 @@ fn main() -> Result<()> {
             no_prefix_cache: false,
             kv_offload: None,
             moe_topo,
+            weight_staging: false,
             dump_graph_png: None,
             rank_hosts: cli
                 .rank_hosts

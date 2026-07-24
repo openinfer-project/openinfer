@@ -21,11 +21,60 @@ use super::Glm52RankLoadBundle;
 use super::expected_tensor_contract;
 use super::expert_placement;
 use super::mmap_file;
+use super::staging::Glm52WeightStager;
 
 // One mmap per event keeps source lifetimes explicit without the large-tail
 // regression observed when many shard mappings stay live together.
 const MMAP_EVENT_GROUP: usize = 1;
 const LIVE_MMAP_GROUPS: usize = 16;
+enum WeightUploader {
+    Pageable,
+    Staged(Glm52WeightStager),
+}
+
+impl WeightUploader {
+    fn new(ctx: &Glm52RankGpuContext, rank: usize, weight_staging: bool) -> Result<Self> {
+        if weight_staging {
+            Ok(Self::Staged(Glm52WeightStager::new(ctx, rank)?))
+        } else {
+            Ok(Self::Pageable)
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Pageable => "pageable",
+            Self::Staged(_) => "pinned",
+        }
+    }
+
+    fn upload(
+        &mut self,
+        ctx: &Glm52RankGpuContext,
+        src: &[u8],
+        dst: &mut CudaSlice<u8>,
+        dst_offset: usize,
+    ) -> Result<usize> {
+        match self {
+            Self::Pageable => {
+                let end = dst_offset.checked_add(src.len()).ok_or_else(|| {
+                    anyhow::anyhow!("GLM5.2 pageable upload destination range overflow")
+                })?;
+                ensure!(
+                    end <= dst.len(),
+                    "GLM5.2 pageable upload [{dst_offset}..{end}) exceeds destination of {} bytes",
+                    dst.len()
+                );
+                let mut view = dst.slice_mut(dst_offset..end);
+                ctx.stream()
+                    .memcpy_htod(src, &mut view)
+                    .context("GLM5.2 pageable H2D copy")?;
+                Ok(1)
+            }
+            Self::Staged(stager) => stager.upload(src, dst, dst_offset),
+        }
+    }
+}
 
 /// One layer's rank-local routed experts, packed expert-major at H2D time
 /// (per expert: [gate; up] fp8 rows / f32 scales; down alone) — the exact
@@ -120,6 +169,7 @@ pub(crate) fn load_rank_weights_to_gpu(
     ctx: &Glm52RankGpuContext,
     model_path: &Path,
     bundle: &Glm52RankLoadBundle,
+    weight_staging: bool,
 ) -> Result<Glm52RankLoadOutput> {
     ctx.set_current()?;
     let load_started = Instant::now();
@@ -140,13 +190,15 @@ pub(crate) fn load_rank_weights_to_gpu(
     let mut h2d_copies = 0usize;
     let mut mmap_guard = MmapH2dLifetimeGuard::new(ctx, bundle.plan.rank);
     let mut sync_secs = 0.0f64;
+    let mut uploader = WeightUploader::new(ctx, bundle.plan.rank, weight_staging)?;
     debug!(
-        "GLM5.2 rank {} start weight load: tensors={}, shards={}, bytes={}, experts={:?}",
+        "GLM5.2 rank {} start weight load: tensors={}, shards={}, bytes={}, experts={:?}, uploader={}",
         bundle.plan.rank,
         bundle.plan.tensor_count,
         bundle.shards.len(),
         ByteSize(planned_total_bytes as u64),
-        bundle.plan.expert_range
+        bundle.plan.expert_range,
+        uploader.label(),
     );
 
     for shard in &bundle.shards {
@@ -200,10 +252,9 @@ pub(crate) fn load_rank_weights_to_gpu(
                     placement.region,
                     region.len()
                 );
-                let mut dst = region.slice_mut(placement.offset..placement.offset + bytes);
                 mmap.mark_stream_work();
-                ctx.stream()
-                    .memcpy_htod(view.data(), &mut dst)
+                h2d_copies += uploader
+                    .upload(ctx, view.data(), region, placement.offset)
                     .with_context(|| {
                         format!("failed to copy GLM5.2 expert tensor {} to GPU", spec.name)
                     })?;
@@ -216,8 +267,8 @@ pub(crate) fn load_rank_weights_to_gpu(
                 let mut dst = unsafe { ctx.stream().alloc::<u8>(bytes) }
                     .with_context(|| format!("alloc GLM5.2 tensor {}", spec.name))?;
                 mmap.mark_stream_work();
-                ctx.stream()
-                    .memcpy_htod(view.data(), &mut dst)
+                h2d_copies += uploader
+                    .upload(ctx, view.data(), &mut dst, 0)
                     .with_context(|| {
                         format!("failed to copy GLM5.2 tensor {} to GPU", spec.name)
                     })?;
@@ -231,7 +282,6 @@ pub(crate) fn load_rank_weights_to_gpu(
             weights.total_bytes += bytes;
             loaded_total_bytes += bytes;
             loaded_tensor_count += 1;
-            h2d_copies += 1;
         }
         drop(safetensors);
         sync_secs += mmap_guard.push_completed_shard(mmap.into_mmap())?;
@@ -269,6 +319,10 @@ pub(crate) fn load_rank_weights_to_gpu(
         }
     }
     sync_secs += mmap_guard.drain()?;
+    let uploader_label = uploader.label();
+    let uploader_drop_started = Instant::now();
+    drop(uploader);
+    sync_secs += uploader_drop_started.elapsed().as_secs_f64();
     let copy_secs = (copy_started.elapsed().as_secs_f64() - sync_secs).max(0.0);
     let sync_started = Instant::now();
     ctx.sync().with_context(|| {
@@ -281,11 +335,12 @@ pub(crate) fn load_rank_weights_to_gpu(
 
     let (slowest_shard, slowest_secs) = slowest_shard.unwrap_or_else(|| ("none".to_owned(), 0.0));
     info!(
-        "GLM5.2 rank {} weight load profile: total={:.2}s, mmap_deser_copy={:.2}s, sync={:.2}s, tensors={}, h2d_copies={}, bytes={}, expert_layers={}, slowest_shard={} {:.2}s",
+        "GLM5.2 rank {} weight load profile: total={:.2}s, mmap_deser_copy={:.2}s, sync={:.2}s, uploader={}, tensors={}, h2d_copies={}, bytes={}, expert_layers={}, slowest_shard={} {:.2}s",
         bundle.plan.rank,
         load_started.elapsed().as_secs_f64(),
         copy_secs,
         sync_secs,
+        uploader_label,
         loaded_tensor_count,
         h2d_copies,
         ByteSize(loaded_total_bytes as u64),

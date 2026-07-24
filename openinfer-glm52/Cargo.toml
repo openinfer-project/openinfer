@@ -19,6 +19,7 @@ openinfer-kernels = { workspace = true, features = ["glm52"] }
 openinfer-kv-cache = { workspace = true }
 openinfer-kv-offload = { workspace = true }
 openinfer-sample = { workspace = true }
+rayon = { workspace = true }
 safetensors = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

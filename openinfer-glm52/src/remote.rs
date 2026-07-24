@@ -125,6 +125,7 @@ enum WireRequest {
     LoadWeights {
         model_path: PathBuf,
         moe_topo: Glm52MoeTopo,
+        weight_staging: bool,
     },
     BuildModel {
         max_model_len: usize,
@@ -456,6 +457,7 @@ impl Glm52RemoteRankWorker {
         &self,
         model_path: &Path,
         moe_topo: Glm52MoeTopo,
+        weight_staging: bool,
     ) -> Result<Receiver<Result<Glm52RankWeightLoadReport>>> {
         let (tx, rx) = bounded(1);
         self.node.shared.submit(
@@ -463,6 +465,7 @@ impl Glm52RemoteRankWorker {
             WireRequest::LoadWeights {
                 model_path: model_path.to_path_buf(),
                 moe_topo,
+                weight_staging,
             },
             PendingResp::LoadWeights(tx),
         )?;
@@ -822,7 +825,12 @@ fn host_demux_loop(
             WireRequest::LoadWeights {
                 model_path,
                 moe_topo,
-            } => HostPending::LoadWeights(worker.load_weights_async(&model_path, moe_topo)?),
+                weight_staging,
+            } => HostPending::LoadWeights(worker.load_weights_async(
+                &model_path,
+                moe_topo,
+                weight_staging,
+            )?),
             WireRequest::BuildModel {
                 max_model_len,
                 moe_topo,
