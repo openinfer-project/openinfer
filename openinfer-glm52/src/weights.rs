@@ -27,6 +27,7 @@ use crate::config::GLM52_VOCAB;
 
 mod context;
 mod load;
+mod staging;
 
 pub(crate) use context::Glm52RankGpuContext;
 pub(crate) use load::Glm52ExpertLayerRegions;
@@ -673,6 +674,7 @@ pub(crate) fn mmap_file(path: &Path) -> Result<Mmap> {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     #[test]

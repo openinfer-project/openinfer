@@ -192,6 +192,7 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
                             }),
                         }),
                     moe_topo,
+                    weight_staging: args.glm52_weight_staging,
                     dump_graph_png: args.dump_graph_png.clone(),
                     rank_hosts: args
                         .rank_hosts

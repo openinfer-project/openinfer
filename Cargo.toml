@@ -69,6 +69,7 @@ colored = "3"
 comfy-table = "7.2"
 criterion = { version = "0.8", features = ["html_reports"] }
 crossbeam-channel = "0.5"
+rayon = "1"
 # Floor 0.19.3 (caret), the lowest that satisfies dynamo's `=0.19.3` pin in the
 # openinfer-dynamo-backend sub-workspace. The MAIN openinfer workspace stays
 # locked at 0.19.7 (caret-satisfied, no re-resolve), so the standalone engine

@@ -68,6 +68,10 @@ impl Glm52RankGpuContext {
         &self.stream
     }
 
+    pub(crate) fn cuda_context(&self) -> &Arc<CudaContext> {
+        &self.ctx
+    }
+
     /// The kernels-crate view of this rank's context/stream pair (shared
     /// Arcs, not a new context) — what the forward bricks take. Also performs
     /// the kernels-crate per-thread setup that `DeviceContext::new` would do:

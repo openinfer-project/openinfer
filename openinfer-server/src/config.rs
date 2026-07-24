@@ -212,6 +212,12 @@ pub(crate) struct Args {
     #[arg(long, default_value = "ep8")]
     pub moe_topo: String,
 
+    /// Stage GLM5.2 checkpoint bytes through pinned double buffers. This can
+    /// substantially accelerate warm-page-cache loads; leave off for cold
+    /// network-filesystem starts.
+    #[arg(long)]
+    pub glm52_weight_staging: bool,
+
     /// GLM5.2 remote rank-host nodes for cross-node EP, comma-separated
     /// `host:port=ranks` (e.g. `10.13.84.7:19000=4`). Each node contributes
     /// its ranks AFTER this process's local ranks, in list order; the total
@@ -355,6 +361,7 @@ fn consumed_args(model_type: ModelType) -> &'static [&'static str] {
             "kv_pd_miss_wait_ms",
             "kv_pd_allow_local_prefill",
             "moe_topo",
+            "glm52_weight_staging",
             "dump_graph_png",
             "rank_hosts",
         ],
