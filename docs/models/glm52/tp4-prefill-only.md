@@ -28,9 +28,9 @@ predicted token is returned but never fed back, so it has no KV entry.
 
 PR1 does not claim a native prefill kernel or prefill throughput. Its
 compatibility executor still advances prompt spans through the existing
-small-row whole-step implementation. The native large-M executor replaces
-that implementation later and remains eager; this PR introduces no prefill
-CUDA graph.
+small-row whole-step implementation, but executes those steps eagerly:
+prefill-only startup neither captures nor replays the decode graphs. The
+native large-M executor replaces that implementation later and remains eager.
 
 ## Capacity contract
 
@@ -61,7 +61,8 @@ the capacity gates.
 
 - CLI accepts only the TP4/prefix-cache-compatible combination.
 - Non-page-aligned chunks and inert chunk flags are rejected.
-- Request intake rejects any `max_tokens != 1`.
+- The HTTP boundary returns `400 invalid_request_error` for any
+  `max_tokens != 1`; scheduler intake repeats the check for non-HTTP callers.
 - The slot state finishes with `Length` on the prompt-tail output.
 - Prefill-only admission keeps at most one active request in the TP group.
 - The coordinator fails closed if an active prefill-only request ever reaches

@@ -172,7 +172,11 @@ pub(super) fn launch_ahead_flags(
             .all(|active| {
                 takes_argmax(&active.req.params) && lease_ok(&active.state, max_model_len)
             });
-    Glm52StepFlags { consume, lease }
+    Glm52StepFlags {
+        consume,
+        lease,
+        eager: false,
+    }
 }
 
 /// Whether a request's committed rows take the fused argmax — the shared

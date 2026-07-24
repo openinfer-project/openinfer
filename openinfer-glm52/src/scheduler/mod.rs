@@ -228,7 +228,10 @@ pub(crate) fn run_dp8_coordinator(
     // contexts already exist: on failure broadcast Shutdown before the
     // workers' sequential Drop joins them (the same collective-teardown
     // contract as the exit path).
-    if let Err(err) = precapture_step_graphs(&workers, &pools, table_width, mirrored, full_bucket) {
+    if !prefill_only
+        && let Err(err) =
+            precapture_step_graphs(&workers, &pools, table_width, mirrored, full_bucket)
+    {
         if let Some((_, response)) = graph_dump_request {
             let _ = response.send(Err(anyhow::anyhow!("{err:#}")));
         }
@@ -346,16 +349,23 @@ pub(crate) fn run_dp8_coordinator(
         // free slots — and all responses are joined before any output is
         // interpreted.
         let shapes = plan_step_shapes(&feed_wants(&slots), full_bucket);
-        let flags = launch_ahead_flags(
-            &shapes,
-            leased_shapes.as_deref(),
-            slots_changed,
-            pending_is_empty(&pending),
-            dspark_enabled,
-            offload.is_some(),
-            &slots,
-            max_model_len,
-        );
+        let flags = if prefill_only {
+            Glm52StepFlags {
+                eager: true,
+                ..Glm52StepFlags::plain()
+            }
+        } else {
+            launch_ahead_flags(
+                &shapes,
+                leased_shapes.as_deref(),
+                slots_changed,
+                pending_is_empty(&pending),
+                dspark_enabled,
+                offload.is_some(),
+                &slots,
+                max_model_len,
+            )
+        };
         leased_shapes = flags.lease.then(|| shapes.clone());
         slots_changed = false;
         sample_step += 1;

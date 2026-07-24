@@ -843,7 +843,16 @@ impl Glm52RankModel {
             // a global grant), so the stale replay's collectives pair up and
             // it degrades to a harmless recompute the prologue overwrites.
             self.speculated = None;
-            self.decode_step_prologue_and_replay(ctx, aux, ep8, tp, inputs, shape, kv)?;
+            self.decode_step_prologue_and_replay(
+                ctx,
+                aux,
+                ep8,
+                tp,
+                inputs,
+                shape,
+                kv,
+                flags.eager,
+            )?;
         }
         let mut outputs = self.decode_step_harvest(ctx, inputs, shape, flags.lease)?;
         self.sample_rows_into(ctx, shape, sampling, seed, &mut outputs)?;
@@ -955,6 +964,7 @@ impl Glm52RankModel {
         inputs: &[(u32, usize); GLM52_MAX_BATCH_PER_RANK],
         shape: Glm52StepShape,
         kv: &Glm52StepKv,
+        eager: bool,
     ) -> Result<()> {
         // The bucket state's `rows` is the lookup key — an unknown bucket is
         // a coordinator bug and fails the step before touching the GPU.
@@ -1080,6 +1090,24 @@ impl Glm52RankModel {
 
         let s = &mut bucket.scratch;
         let decode_lm_head = self.decode_lm_head.as_ref().unwrap_or(&self.lm_head);
+        if eager {
+            return run_step_body(
+                ctx,
+                aux,
+                ep8,
+                tp,
+                &self.layers,
+                &mut self.caches,
+                &self.embed,
+                &self.final_norm,
+                decode_lm_head,
+                self.decode_vocab_start,
+                &self.token_ids,
+                &step,
+                s,
+                global_tokens,
+            );
+        }
         let mut graph = std::mem::take(&mut bucket.graph);
         let result = graph.run_or_capture(ctx, || {
             run_step_body(

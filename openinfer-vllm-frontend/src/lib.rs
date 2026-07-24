@@ -25,6 +25,7 @@ use vllm_server::RendererSelection;
 
 mod bridge;
 mod lora;
+mod request_contract;
 mod wire;
 
 use bridge::LocalEngineBridge;
@@ -98,6 +99,33 @@ pub async fn serve_with_engine_count(
         resolve_max_model_len(model_path, max_model_len),
         engine_count,
         shutdown,
+    )
+    .await
+}
+
+/// Serve a prefill-only endpoint whose request contract is enforced at the
+/// HTTP boundary, before vLLM creates an engine stream. The scheduler repeats
+/// the check as a fail-closed backstop for non-HTTP callers.
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_prefill_only_with_engine_count(
+    engine: impl Future<Output = Result<EngineHandle>> + Send + 'static,
+    model_path: &Path,
+    served_model_name: Vec<String>,
+    port: u16,
+    max_model_len: Option<u32>,
+    engine_count: usize,
+    shutdown: CancellationToken,
+) -> Result<()> {
+    serve_model_on_host_with_router_extension(
+        engine,
+        model_path.to_string_lossy().into_owned(),
+        served_model_name,
+        "0.0.0.0".to_string(),
+        port,
+        resolve_max_model_len(model_path, max_model_len),
+        engine_count,
+        shutdown,
+        request_contract::prefill_only_routes,
     )
     .await
 }

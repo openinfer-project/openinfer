@@ -3,6 +3,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
+use std::time::Instant;
 
 use anyhow::Context as _;
 use anyhow::Result;
@@ -68,6 +69,9 @@ pub(crate) struct Glm52StepFlags {
     /// advanced by its own argmax — every rank MUST enqueue that next
     /// replay launch-ahead (see `Glm52RankModel::decode_step`).
     pub(crate) lease: bool,
+    /// Execute the whole step eagerly. Prefill-only mode sets this on every
+    /// compatibility step so it neither captures nor replays decode graphs.
+    pub(crate) eager: bool,
 }
 
 impl Glm52StepFlags {
@@ -76,6 +80,7 @@ impl Glm52StepFlags {
         Self {
             consume: false,
             lease: false,
+            eager: false,
         }
     }
 }
@@ -593,14 +598,19 @@ impl Glm52RankThreadState {
         moe_topo: crate::Glm52MoeTopo,
         weight_staging: bool,
     ) -> Result<Glm52RankWeightLoadReport> {
+        let rank_load_started = Instant::now();
         let loaded = load_rank_weights_to_gpu(&self.ctx, model_path, &self.bundle, weight_staging)?;
+        let resident_load_secs = rank_load_started.elapsed().as_secs_f64();
         if moe_topo.uses_tensor_replicated_moe() {
             // Tensor-replicated topology: the bundle carried no routed experts;
             // gather this rank's 1/TP intermediate slice of ALL experts for
             // every MoE layer instead.
             let manifest = Glm52WeightManifest::from_model_dir(model_path)?;
             let dev_ctx = self.ctx.device_context()?;
+            let tp_slices_started = Instant::now();
+            let mut slowest_layer = None::<(usize, f64)>;
             for layer in crate::config::GLM52_DENSE_LAYERS..crate::config::GLM52_LAYERS {
+                let layer_started = Instant::now();
                 let bank = load_tp_slice_layer(
                     &dev_ctx,
                     model_path,
@@ -610,7 +620,24 @@ impl Glm52RankThreadState {
                     layer,
                 )?;
                 self.tp_slices.insert(layer, bank);
+                let elapsed = layer_started.elapsed().as_secs_f64();
+                if slowest_layer.is_none_or(|(_, slowest)| elapsed > slowest) {
+                    slowest_layer = Some((layer, elapsed));
+                }
             }
+            let (slowest_layer, slowest_secs) =
+                slowest_layer.expect("tensor-replicated topology has MoE layers");
+            log::info!(
+                "GLM5.2 rank {} TP slice-bank load profile: layers={}, total={:.2}s, \
+                 mean={:.2}s/layer, slowest_layer={} {:.2}s; this second pass re-reads and \
+                 host-gathers every routed expert independently on each TP rank",
+                self.placement.rank,
+                self.tp_slices.len(),
+                tp_slices_started.elapsed().as_secs_f64(),
+                tp_slices_started.elapsed().as_secs_f64() / self.tp_slices.len() as f64,
+                slowest_layer,
+                slowest_secs,
+            );
         }
         ensure!(
             loaded.loaded_total_bytes == loaded.weights.total_bytes,
@@ -629,6 +656,13 @@ impl Glm52RankThreadState {
             free_vram_bytes,
         };
         self.loaded = Some(loaded.weights);
+        log::info!(
+            "GLM5.2 rank {} complete weight residency: base_plan={resident_load_secs:.2}s, \
+             tp_slice_second_pass={:.2}s, total={:.2}s",
+            self.placement.rank,
+            (rank_load_started.elapsed().as_secs_f64() - resident_load_secs).max(0.0),
+            rank_load_started.elapsed().as_secs_f64(),
+        );
         Ok(report)
     }
 
