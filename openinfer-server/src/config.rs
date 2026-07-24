@@ -201,6 +201,19 @@ pub(crate) struct Args {
     #[arg(long)]
     pub max_model_len: Option<usize>,
 
+    /// Run GLM5.2 TP4 as a prefill-only engine. Requests must ask for exactly
+    /// one output token; the token produced by the prompt tail is returned and
+    /// the request is never admitted to decode. Prefix caching stays enabled.
+    #[arg(long, default_value_t = false)]
+    pub glm52_prefill_only: bool,
+
+    /// Maximum token rows in one future native GLM5.2 prefill launch. PR1 uses
+    /// this value to reserve VRAM and lock the public contract while the
+    /// compatibility executor still feeds prompt spans through the existing
+    /// small-row path. Must be a multiple of the 64-token KV page size.
+    #[arg(long, default_value_t = 16_384)]
+    pub glm52_prefill_chunk_size: usize,
+
     /// GLM5.2 launch-time MoE sharding topology: `ep8` (default) is the
     /// high-throughput configuration (32 whole experts per rank, DeepEP
     /// dispatch/combine, buckets 1-8); `ep4` is its four-GPU counterpart
@@ -349,6 +362,8 @@ fn consumed_args(model_type: ModelType) -> &'static [&'static str] {
             "dp_size",
             "dflash_draft_model_path",
             "max_model_len",
+            "glm52_prefill_only",
+            "glm52_prefill_chunk_size",
             "no_prefix_cache",
             "kv_offload",
             "kv_offload_host_gib",
@@ -555,6 +570,38 @@ impl Args {
                     "GLM5.2 --moe-topo={} requires --tp-size={expected_tp_size}, got {}",
                     self.moe_topo,
                     self.tp_size
+                );
+            }
+            if self.glm52_prefill_only {
+                if !matches!(moe_topo, openinfer_glm52::Glm52MoeTopo::Tp4) {
+                    bail!("--glm52-prefill-only requires --moe-topo=tp4");
+                }
+                if self.no_prefix_cache {
+                    bail!("--glm52-prefill-only requires prefix caching; drop --no-prefix-cache");
+                }
+                if self.dflash_draft_model_path.is_some() {
+                    bail!("--glm52-prefill-only is incompatible with the DSpark drafter");
+                }
+                if self.kv_offload || self.kv_pd_vllm_seed.is_some() {
+                    bail!(
+                        "--glm52-prefill-only does not support KV offload or an external P/D peer"
+                    );
+                }
+                if self.dump_graph_png.is_some() {
+                    bail!("--glm52-prefill-only does not expose a decode CUDA graph");
+                }
+            } else if provided.contains("glm52_prefill_chunk_size") {
+                bail!("--glm52-prefill-chunk-size requires --glm52-prefill-only");
+            }
+            if self.glm52_prefill_chunk_size == 0
+                || !self
+                    .glm52_prefill_chunk_size
+                    .is_multiple_of(openinfer_glm52::GLM52_PREFILL_CHUNK_ALIGN)
+            {
+                bail!(
+                    "--glm52-prefill-chunk-size must be a positive multiple of {}, got {}",
+                    openinfer_glm52::GLM52_PREFILL_CHUNK_ALIGN,
+                    self.glm52_prefill_chunk_size
                 );
             }
         }
@@ -1006,5 +1053,73 @@ mod tests {
             .validate(ModelType::Glm52, &provided)
             .expect_err("GLM5.2 EP4 should reject explicit non-DP4");
         assert!(error.to_string().contains("--dp-size=4"));
+    }
+
+    #[cfg(feature = "glm52")]
+    #[test]
+    fn glm52_prefill_only_accepts_tp4_defaults() {
+        let (args, provided) = parse_with_provided(&[
+            "openinfer",
+            "--moe-topo",
+            "tp4",
+            "--tp-size",
+            "4",
+            "--glm52-prefill-only",
+        ]);
+        args.validate(ModelType::Glm52, &provided)
+            .expect("TP4 prefill-only defaults should validate");
+        assert_eq!(
+            args.glm52_prefill_chunk_size,
+            openinfer_glm52::GLM52_DEFAULT_PREFILL_CHUNK_SIZE
+        );
+    }
+
+    #[cfg(feature = "glm52")]
+    #[test]
+    fn glm52_prefill_only_rejects_decode_features() {
+        for extra in [
+            vec!["--no-prefix-cache"],
+            vec!["--dflash-draft-model-path", "/tmp/dspark"],
+            vec!["--dump-graph-png", "/tmp/decode.png"],
+        ] {
+            let mut argv = vec![
+                "openinfer",
+                "--moe-topo",
+                "tp4",
+                "--tp-size",
+                "4",
+                "--glm52-prefill-only",
+            ];
+            argv.extend(extra);
+            let (args, provided) = parse_with_provided(&argv);
+            args.validate(ModelType::Glm52, &provided)
+                .expect_err("prefill-only must reject decode-only features");
+        }
+    }
+
+    #[cfg(feature = "glm52")]
+    #[test]
+    fn glm52_prefill_chunk_requires_mode_and_page_alignment() {
+        let (args, provided) =
+            parse_with_provided(&["openinfer", "--glm52-prefill-chunk-size", "16384"]);
+        let error = args
+            .validate(ModelType::Glm52, &provided)
+            .expect_err("an inert chunk size must be rejected");
+        assert!(error.to_string().contains("requires --glm52-prefill-only"));
+
+        let (args, provided) = parse_with_provided(&[
+            "openinfer",
+            "--moe-topo",
+            "tp4",
+            "--tp-size",
+            "4",
+            "--glm52-prefill-only",
+            "--glm52-prefill-chunk-size",
+            "16001",
+        ]);
+        let error = args
+            .validate(ModelType::Glm52, &provided)
+            .expect_err("unaligned chunk must be rejected");
+        assert!(error.to_string().contains("positive multiple of 64"));
     }
 }

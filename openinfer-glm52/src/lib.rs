@@ -70,6 +70,18 @@ use crate::model::GLM52_MODEL_LEN_ALIGN;
 use crate::model::glm52_arena_bytes;
 use crate::model::glm52_pool_blocks;
 
+pub const GLM52_PREFILL_CHUNK_ALIGN: usize = GLM52_MODEL_LEN_ALIGN;
+pub const GLM52_DEFAULT_PREFILL_CHUNK_SIZE: usize = 16_384;
+
+/// Contract for the first native TP4 prefill milestone. PR1 deliberately
+/// keeps the compatibility executor (prompt spans ride the existing small-row
+/// forward) while reserving the future large-M scratch and enforcing the
+/// externally visible prefill-only request semantics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Glm52PrefillOnlyOptions {
+    pub chunk_size: usize,
+}
+
 /// GLM5.2 parallel shape. EP8 is the production layout today; TP4 is the
 /// GB300 bring-up target.
 #[derive(Clone, Debug)]
@@ -87,6 +99,10 @@ pub struct Glm52LaunchOptions {
     /// an explicit value is still validated against that budget so an
     /// impossible cap fails at launch, not at the first long request.
     pub max_model_len: Option<usize>,
+    /// `Some` makes this TP4 group a prefill-only endpoint: prefix caching is
+    /// mandatory, each request returns the prompt tail's first predicted
+    /// token, and no request may enter decode.
+    pub prefill_only: Option<Glm52PrefillOnlyOptions>,
     /// vLLM-style kill switch: disable prefix matching outright (every
     /// prefill recomputes the full prompt). Prefix caching is also forced
     /// off while the DSpark drafter is on — the draft lane needs the
@@ -402,6 +418,7 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
         dp_size,
         dspark_draft_model_path,
         max_model_len,
+        prefill_only,
         no_prefix_cache,
         kv_offload,
         moe_topo,
@@ -434,6 +451,34 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
                 "GLM5.2 {moe_topo:?} requires --dp-size={expected_dp} (or omitted), got {dp_size}"
             );
         }
+    }
+    if let Some(prefill) = prefill_only {
+        ensure!(
+            moe_topo == Glm52MoeTopo::Tp4,
+            "GLM5.2 prefill-only mode requires the TP4 topology"
+        );
+        ensure!(
+            prefill.chunk_size > 0 && prefill.chunk_size.is_multiple_of(GLM52_PREFILL_CHUNK_ALIGN),
+            "GLM5.2 prefill chunk size {} must be a positive multiple of {}",
+            prefill.chunk_size,
+            GLM52_PREFILL_CHUNK_ALIGN,
+        );
+        ensure!(
+            dspark_draft_model_path.is_none(),
+            "GLM5.2 prefill-only mode is incompatible with the DSpark drafter"
+        );
+        ensure!(
+            !no_prefix_cache,
+            "GLM5.2 prefill-only mode requires prefix caching"
+        );
+        ensure!(
+            kv_offload.is_none(),
+            "GLM5.2 prefill-only mode does not support KV offload or an external P/D peer"
+        );
+        ensure!(
+            dump_graph_png.is_none(),
+            "GLM5.2 prefill-only mode does not expose a decode CUDA graph"
+        );
     }
     // The offload tier extends the prefix cache (restored blocks surface as
     // matched prefix), so a config that disables prefix matching while asking
@@ -504,6 +549,7 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
         },
         dspark_draft_model_path.as_deref(),
         max_model_len,
+        prefill_only,
         no_prefix_cache,
         kv_offload,
         moe_topo,
@@ -529,6 +575,19 @@ const GLM52_VRAM_RESERVE_BYTES: usize = 5 << 30;
 /// the probe. The drafter's cap-scaled buffers are in the exact ledger
 /// (`glm52_dspark_arena_bytes`), not here.
 const GLM52_DSPARK_VRAM_RESERVE_BYTES: usize = 5 << 30;
+
+/// Fixed bookkeeping/workspace allowance for the future large-M prefill
+/// executor. The per-token ledger below covers activation-sized buffers; this
+/// fixed part covers collective, allocator, and tiled top-k workspaces whose
+/// size is not linear in the active chunk rows.
+const GLM52_PREFILL_FIXED_SCRATCH_BYTES: usize = 256 << 20;
+
+/// Conservative large-M scratch ledger per token row: hidden ping/pong +
+/// normalized input, TP4-local projection/MoE intermediates, and streaming
+/// DSA top-k metadata. PR1 reserves this capacity without allocating it; the
+/// native executor must fit inside this envelope or revise the ledger in the
+/// PR that introduces the allocation.
+const GLM52_PREFILL_SCRATCH_BYTES_PER_TOKEN: usize = 72 << 10;
 
 /// The smallest cap worth serving with (the pre-refactor bring-up value);
 /// a budget below this is a misconfiguration, not a working engine.
@@ -564,6 +623,19 @@ fn glm52_cap_bytes(max_model_len: usize, dspark_enabled: bool) -> Result<usize> 
         })
 }
 
+fn glm52_prefill_scratch_reservation(
+    prefill_only: Option<Glm52PrefillOnlyOptions>,
+) -> Result<usize> {
+    let Some(prefill) = prefill_only else {
+        return Ok(0);
+    };
+    prefill
+        .chunk_size
+        .checked_mul(GLM52_PREFILL_SCRATCH_BYTES_PER_TOKEN)
+        .and_then(|bytes| bytes.checked_add(GLM52_PREFILL_FIXED_SCRATCH_BYTES))
+        .context("GLM5.2 prefill scratch reservation overflow")
+}
+
 /// Decide the per-request context cap from the post-weight-load VRAM budget.
 /// Every slot's cache region is sized `max_model_len` tokens at build, so a
 /// candidate cap's cost is exact arithmetic ([`glm52_cap_bytes`]) over the
@@ -574,13 +646,15 @@ fn derive_max_model_len(
     requested: Option<usize>,
     min_free_vram_bytes: usize,
     dspark_enabled: bool,
+    prefill_scratch_bytes: usize,
 ) -> Result<Glm52ContextBudget> {
     let reserve_bytes = GLM52_VRAM_RESERVE_BYTES
         + if dspark_enabled {
             GLM52_DSPARK_VRAM_RESERVE_BYTES
         } else {
             0
-        };
+        }
+        + prefill_scratch_bytes;
     let budget_bytes = min_free_vram_bytes.saturating_sub(reserve_bytes);
     let max_model_len = if let Some(requested) = requested {
         ensure!(
@@ -679,6 +753,7 @@ fn start_engine(
     options: &Glm52LoadOptions,
     dspark_path: Option<&Path>,
     requested_max_model_len: Option<usize>,
+    prefill_only: Option<Glm52PrefillOnlyOptions>,
     no_prefix_cache: bool,
     kv_offload: Option<Glm52KvOffloadOptions>,
     moe_topo: Glm52MoeTopo,
@@ -711,12 +786,22 @@ fn start_engine(
         requested_max_model_len,
         min_free_vram_bytes.saturating_sub(qa_kva_twin_bytes),
         dspark_enabled,
+        glm52_prefill_scratch_reservation(prefill_only)?,
     )?;
+    if let Some(prefill) = prefill_only {
+        ensure!(
+            prefill.chunk_size <= budget.max_model_len,
+            "GLM5.2 prefill chunk size {} exceeds max_model_len {}; lower \
+             --glm52-prefill-chunk-size or raise --max-model-len",
+            prefill.chunk_size,
+            budget.max_model_len,
+        );
+    }
     let max_model_len = budget.max_model_len;
     log::info!(
         "GLM5.2 max_model_len={max_model_len} ({}): min rank free VRAM {} after weights \
          (qa|kv_a twins {} charged), cap-scaled arenas {} across {} slots{}, reserve {}, \
-         budget {}",
+         budget {}{}",
         if requested_max_model_len.is_some() {
             "--max-model-len"
         } else {
@@ -733,6 +818,14 @@ fn start_engine(
         },
         ByteSize(budget.reserve_bytes as u64),
         ByteSize(budget.budget_bytes as u64),
+        prefill_only.map_or_else(String::new, |prefill| format!(
+            ", prefill-only chunk {} (scratch reservation {})",
+            prefill.chunk_size,
+            ByteSize(
+                glm52_prefill_scratch_reservation(Some(prefill))
+                    .expect("validated prefill scratch reservation") as u64
+            ),
+        )),
     );
 
     let eos_token_ids = read_eos_token_ids(model_path)?;
@@ -803,6 +896,7 @@ fn start_engine(
                 loaded.workers,
                 &eos_token_ids,
                 dspark_enabled,
+                prefill_only.is_some(),
                 max_model_len,
                 no_prefix_cache,
                 offload,
@@ -1280,24 +1374,25 @@ mod max_model_len_tests {
     /// Free VRAM that budgets exactly a `cap`-token context (exact ledger +
     /// reserve) — inverted through the same `glm52_cap_bytes` the derivation
     /// uses, so the tests exercise the policy, not a parallel formula.
-    fn free_for(cap: usize, dspark: bool) -> usize {
+    fn free_for(cap: usize, dspark: bool, prefill_scratch_bytes: usize) -> usize {
         let reserve = GLM52_VRAM_RESERVE_BYTES
             + if dspark {
                 GLM52_DSPARK_VRAM_RESERVE_BYTES
             } else {
                 0
-            };
+            }
+            + prefill_scratch_bytes;
         reserve + glm52_cap_bytes(cap, dspark).expect("cap bytes")
     }
 
     #[test]
     fn derived_cap_is_aligned_and_scales_with_free_vram() {
-        let cap = derive_max_model_len(None, free_for(10_048, false), false)
+        let cap = derive_max_model_len(None, free_for(10_048, false, 0), false, 0)
             .expect("derive")
             .max_model_len;
         assert_eq!(cap, 10_048, "exact budget for an aligned cap derives it");
         assert!(cap.is_multiple_of(GLM52_MODEL_LEN_ALIGN));
-        let larger = derive_max_model_len(None, free_for(50_048, false), false)
+        let larger = derive_max_model_len(None, free_for(50_048, false, 0), false, 0)
             .expect("derive")
             .max_model_len;
         assert!(larger > cap);
@@ -1305,9 +1400,9 @@ mod max_model_len_tests {
 
     #[test]
     fn dspark_lane_shrinks_the_derived_cap() {
-        let free = free_for(50_048, false);
-        let plain = derive_max_model_len(None, free, false).expect("derive");
-        let dspark = derive_max_model_len(None, free, true).expect("derive");
+        let free = free_for(50_048, false, 0);
+        let plain = derive_max_model_len(None, free, false, 0).expect("derive");
+        let dspark = derive_max_model_len(None, free, true, 0).expect("derive");
         assert!(
             dspark.max_model_len < plain.max_model_len,
             "dspark cap-scaled cost must shrink the cap"
@@ -1316,20 +1411,20 @@ mod max_model_len_tests {
 
     #[test]
     fn derived_cap_never_exceeds_the_checkpoint_ceiling() {
-        let budget = derive_max_model_len(None, usize::MAX / 2, false).expect("derive");
+        let budget = derive_max_model_len(None, usize::MAX / 2, false, 0).expect("derive");
         assert_eq!(budget.max_model_len, GLM52_MAX_CONTEXT);
     }
 
     #[test]
     fn too_little_vram_fails_instead_of_serving_a_toy_cap() {
-        let err = derive_max_model_len(None, free_for(1024, false), false)
+        let err = derive_max_model_len(None, free_for(1024, false, 0), false, 0)
             .expect_err("sub-minimum cap must fail");
         assert!(err.to_string().contains("context cap"), "{err}");
     }
 
     #[test]
     fn unaligned_requested_cap_is_rejected_with_the_nearest_valid_values() {
-        let err = derive_max_model_len(Some(5000), free_for(100_032, false), false)
+        let err = derive_max_model_len(Some(5000), free_for(100_032, false, 0), false, 0)
             .expect_err("unaligned cap must fail, not silently round");
         let message = err.to_string();
         assert!(
@@ -1340,14 +1435,37 @@ mod max_model_len_tests {
 
     #[test]
     fn requested_cap_beyond_the_budget_fails_at_launch() {
-        let err = derive_max_model_len(Some(99_968), free_for(10_048, false), false)
+        let err = derive_max_model_len(Some(99_968), free_for(10_048, false, 0), false, 0)
             .expect_err("over-budget cap must fail");
         assert!(err.to_string().contains("--max-model-len"), "{err}");
     }
 
     #[test]
     fn requested_cap_below_the_minimum_fails() {
-        derive_max_model_len(Some(1024), free_for(100_032, false), false)
+        derive_max_model_len(Some(1024), free_for(100_032, false, 0), false, 0)
             .expect_err("sub-minimum cap must fail");
+    }
+
+    #[test]
+    fn prefill_scratch_reservation_shrinks_auto_capacity() {
+        let prefill = Glm52PrefillOnlyOptions {
+            chunk_size: GLM52_DEFAULT_PREFILL_CHUNK_SIZE,
+        };
+        let scratch =
+            glm52_prefill_scratch_reservation(Some(prefill)).expect("prefill reservation");
+        let free = free_for(100_032, false, 0);
+        let plain = derive_max_model_len(None, free, false, 0).expect("plain budget");
+        let reserved = derive_max_model_len(None, free, false, scratch).expect("prefill budget");
+        assert!(reserved.max_model_len < plain.max_model_len);
+        assert_eq!(reserved.reserve_bytes, GLM52_VRAM_RESERVE_BYTES + scratch);
+    }
+
+    #[test]
+    fn default_prefill_chunk_reservation_is_stable() {
+        let bytes = glm52_prefill_scratch_reservation(Some(Glm52PrefillOnlyOptions {
+            chunk_size: GLM52_DEFAULT_PREFILL_CHUNK_SIZE,
+        }))
+        .expect("prefill reservation");
+        assert_eq!(bytes, 1_476_395_008);
     }
 }

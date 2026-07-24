@@ -164,6 +164,11 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
                     dp_size: args.dp_size.unwrap_or_else(|| moe_topo.default_dp_size()),
                     dspark_draft_model_path: args.dflash_draft_model_path.clone(),
                     max_model_len: args.max_model_len,
+                    prefill_only: args.glm52_prefill_only.then_some(
+                        openinfer_glm52::Glm52PrefillOnlyOptions {
+                            chunk_size: args.glm52_prefill_chunk_size,
+                        },
+                    ),
                     no_prefix_cache: args.no_prefix_cache,
                     kv_offload: args
                         .kv_offload

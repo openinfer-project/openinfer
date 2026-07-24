@@ -131,6 +131,7 @@ pub(crate) fn run_dp8_coordinator(
     workers: Vec<Glm52Worker>,
     eos_token_ids: &[u32],
     dspark_enabled: bool,
+    prefill_only: bool,
     max_model_len: usize,
     no_prefix_cache: bool,
     offload: Option<Vec<OffloadEngine>>,
@@ -269,13 +270,25 @@ pub(crate) fn run_dp8_coordinator(
         if channel_open && all_idle(&slots) && pending_is_empty(&pending) {
             publish_load(&load_txs, &pools, &slots, &pending);
             match submit_rx.blocking_recv() {
-                Some(req) => intake(req, &mut pending, &running_counts(&slots), max_model_len),
+                Some(req) => intake(
+                    req,
+                    &mut pending,
+                    &running_counts(&slots),
+                    max_model_len,
+                    prefill_only,
+                ),
                 None => channel_open = false,
             }
         }
         while channel_open {
             match submit_rx.try_recv() {
-                Ok(req) => intake(req, &mut pending, &running_counts(&slots), max_model_len),
+                Ok(req) => intake(
+                    req,
+                    &mut pending,
+                    &running_counts(&slots),
+                    max_model_len,
+                    prefill_only,
+                ),
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => channel_open = false,
             }
@@ -298,6 +311,7 @@ pub(crate) fn run_dp8_coordinator(
             mirrored,
             prefix_cache_enabled,
             dspark_enabled,
+            prefill_only,
             &mut pending_resets,
             &mut slots_changed,
         ) {
@@ -313,6 +327,18 @@ pub(crate) fn run_dp8_coordinator(
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
             continue;
+        }
+        if prefill_only
+            && slots
+                .iter()
+                .flat_map(|rank| rank.iter().flatten())
+                .any(|active| !active.state.mid_prefill())
+        {
+            fail_step(
+                &mut slots,
+                &anyhow::anyhow!("GLM5.2 prefill-only invariant failed: a request reached decode"),
+            );
+            break 'serve;
         }
 
         // One lock-step step: every rank forwards the SAME bucket — each

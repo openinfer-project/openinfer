@@ -22,12 +22,22 @@ use super::offload::{self};
 use super::slot::Glm52SlotState;
 use crate::runner::Glm52Worker;
 
-fn validate_request(req: &GenerateRequest, max_model_len: usize) -> Result<(), String> {
+fn validate_request(
+    req: &GenerateRequest,
+    max_model_len: usize,
+    prefill_only: bool,
+) -> Result<(), String> {
     if req.prompt_tokens.is_empty() {
         return Err("GLM5.2 requires a non-empty prompt".to_owned());
     }
     if req.max_tokens == 0 {
         return Err("GLM5.2 requires max_tokens > 0".to_owned());
+    }
+    if prefill_only && req.max_tokens != 1 {
+        return Err(format!(
+            "GLM5.2 prefill-only mode requires max_tokens=1, got {}",
+            req.max_tokens
+        ));
     }
     // Highest position any forward step can touch: the (max_tokens-1)-th
     // generated token is fed at position prompt+max_tokens-2, so requiring
@@ -121,8 +131,9 @@ pub(super) fn intake(
     pending: &mut [VecDeque<GenerateRequest>],
     running: &[usize],
     max_model_len: usize,
+    prefill_only: bool,
 ) {
-    if let Err(message) = validate_request(&req, max_model_len) {
+    if let Err(message) = validate_request(&req, max_model_len, prefill_only) {
         reject(&req, message);
         return;
     }
@@ -161,6 +172,7 @@ pub(super) fn admit_from_queue(
     mirrored: bool,
     prefix_cache_enabled: bool,
     dspark_enabled: bool,
+    prefill_only: bool,
     pending_resets: &mut [Vec<usize>],
     slots_changed: &mut bool,
 ) -> anyhow::Result<()> {
@@ -191,6 +203,9 @@ pub(super) fn admit_from_queue(
     };
 
     for rank in 0..slots.len() {
+        if prefill_only && slots[rank].iter().any(Option::is_some) {
+            continue;
+        }
         while let Some(slot) = slots[rank].iter().position(Option::is_none) {
             let Some(front) = pending[rank].front() else {
                 break;
@@ -315,6 +330,9 @@ pub(super) fn admit_from_queue(
             slots[rank][slot] = Some(ActiveRequest { req, state, kv });
             committed[rank] += need_blocks;
             *slots_changed = true;
+            if prefill_only {
+                break;
+            }
         }
     }
     Ok(())
@@ -359,7 +377,7 @@ mod tests {
         for params in cases {
             let req = request(vec![10], params, 4);
             assert!(
-                validate_request(&req, 4096).is_err(),
+                validate_request(&req, 4096, false).is_err(),
                 "params must be rejected at intake: {params:?}"
             );
         }
@@ -373,7 +391,7 @@ mod tests {
             },
             4,
         );
-        assert!(validate_request(&req, 4096).is_ok());
+        assert!(validate_request(&req, 4096, false).is_ok());
     }
 
     #[test]
@@ -382,7 +400,7 @@ mod tests {
 
         let mut bound = request(vec![10], SamplingParams::default(), 4);
         bound.data_parallel_rank = Some(2);
-        intake(bound, &mut pending, &[0, 0, 0], 4096);
+        intake(bound, &mut pending, &[0, 0, 0], 4096, false);
         assert_eq!(
             pending.iter().map(VecDeque::len).collect::<Vec<_>>(),
             [0, 0, 1]
@@ -393,6 +411,7 @@ mod tests {
             &mut pending,
             &[2, 1, 2],
             4096,
+            false,
         );
         assert_eq!(
             pending.iter().map(VecDeque::len).collect::<Vec<_>>(),
@@ -406,6 +425,7 @@ mod tests {
             &mut pending,
             &[2, 1, 2],
             4096,
+            false,
         );
         assert_eq!(
             pending.iter().map(VecDeque::len).collect::<Vec<_>>(),
@@ -422,5 +442,15 @@ mod tests {
         assert_eq!(lifetime_blocks(63, 1), 1);
         assert_eq!(lifetime_blocks(64, 64), 2);
         assert_eq!(lifetime_blocks(64, 65), 3);
+    }
+
+    #[test]
+    fn prefill_only_accepts_exactly_one_output_token() {
+        let one = request(vec![10, 11], SamplingParams::default(), 1);
+        assert!(validate_request(&one, 4096, true).is_ok());
+
+        let many = request(vec![10, 11], SamplingParams::default(), 2);
+        let error = validate_request(&many, 4096, true).expect_err("decode must be rejected");
+        assert!(error.contains("requires max_tokens=1"), "{error}");
     }
 }

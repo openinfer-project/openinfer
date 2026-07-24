@@ -362,6 +362,17 @@ mod tests {
     }
 
     #[test]
+    fn one_token_contract_finishes_on_the_prompt_tail() {
+        let mut state = state(vec![10, 11, 12], 1, false);
+        assert_eq!(
+            state.advance_span(&[90, 91, 42], EOS),
+            commit(&[42], 1, Some(FinishReason::Length), 3)
+        );
+        assert_eq!(state.completion_tokens(), 1);
+        assert!(!state.mid_prefill());
+    }
+
+    #[test]
     fn prompt_span_feeds_consecutive_positions_and_keeps_only_the_last_output() {
         let mut state = state(vec![10, 11, 12, 13], 4, false);
 

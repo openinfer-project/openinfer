@@ -114,6 +114,7 @@ fn main() -> Result<()> {
             dp_size,
             dspark_draft_model_path: None,
             max_model_len: cli.max_model_len,
+            prefill_only: None,
             no_prefix_cache: false,
             kv_offload: None,
             moe_topo,
