@@ -136,21 +136,23 @@ Stable test knobs:
 - `OPENINFER_TEST_TP_DEVICES`: comma-separated TP2 CUDA ordinals. Defaults to `0,1`; examples: `1,2`, `2,3`. TP2 tests require exactly two distinct ordinals.
 - `OPENINFER_TEST_FRONTEND_MODEL_PATH`: optional tokenizer/config metadata path for HTTP serving tests. Defaults to `OPENINFER_TEST_MODEL_PATH` when unset.
 
-## Follow-Up Work
+## Phase 2 Follow-Up
 
-The exact Phase 2 split is not decided yet. The items below are retained as follow-up work that should be scoped in the design branch before implementation.
+Phase 2 is locked in `docs/models/qwen35/tp-design.md` as two separate implementation series: P2a is eager mixed unified execution on the replicated Phase 1 GDR path; P2b shards the head-indexed linear-attention/GDR weight and state surface. P2a protocol/lifecycle gates must complete before P2b changes loader, kernel, or state shapes.
 
-### TP mixed-step unified execution
+### P2a: TP mixed-step unified execution
 
-Implement `RunUnifiedStep` under TP while keeping Phase 1's replicated linear-attention/GDR state unless the design branch decides otherwise.
+Implement eager `RunUnifiedStep` under TP while retaining Phase 1's replicated linear-attention/GDR weights, kernels, conv state, recurrent state, and scratch shapes.
 
 Goals:
 
 - Support mixed prefill+decode scheduler steps under TP.
 - Preserve deterministic collective ordering across ranks.
 - Return mixed prefill/decode artifacts from the primary rank.
+- Use the `RequestId`-keyed `UnifiedPlan` and artifact contract in `tp-design.md`; P2a does not introduce CUDA Graph padded-slot or compaction semantics.
 - Validate finish/drop/client-disconnect cleanup under mixed-step execution.
 - Keep TP CUDA Graph disabled unless a separate graph design is completed.
+- Keep the fixed 16-device Triton AOT handle table and add startup-time validation for unsupported logical CUDA ordinals.
 
 Why this should be separated from GDR sharding:
 
@@ -158,9 +160,9 @@ Why this should be separated from GDR sharding:
 - Sharded linear-attention/GDR is a model-state-shape problem.
 - Combining them would make failures hard to attribute.
 
-### Sharded linear-attention/GDR state
+### P2b: sharded linear-attention/GDR state
 
-Shard the Qwen3.5 linear-attention/GDR path after the mixed-step and state-lifecycle contract is clear.
+Shard the Qwen3.5 linear-attention/GDR path after P2a establishes the mixed-step and state-lifecycle contract.
 
 Expected work:
 
@@ -169,6 +171,7 @@ Expected work:
 - adapt or regenerate GDR kernels for local state shapes
 - keep recurrent/conv state rank-local and request-local
 - all-reduce only after local linear-attention `out_proj`
+- report matched Phase 1 TP2 versus P2b TP2 HBM/latency/throughput data before making a performance claim
 
 Non-negotiable invariant:
 
