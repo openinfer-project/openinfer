@@ -198,6 +198,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | `benchmarks/mixed-load-itl.md` | Qwen3-4B + Qwen3.5 mixed-load ITL (#244, #375): chunking-off sweeps via `bench_serving mixed`. Both freeze active decode for the full prefill. Qwen3 p99 blows up with prompt/QPS; the old Qwen3.5 “p99-immune” table is a **measurement artifact** (primary: hardcoded `max_batch=4` slot starvation — see #470 / `models/qwen35/mixed-load-itl-470.md`; secondary: short `bg_output_len`). Prefix reuse defeats it on Qwen3. |
 | `benchmarks/accuracy-eval-results.md` | Phase 1 GSM8K: Qwen3-4B PASS (openinfer 85.37% vs HF 85.82%, delta -0.45 pp). Qwen3.5-4B historical FAIL recovered by #250 (strict 79.38%, flexible 79.30% vs HF 79.45%). |
 | `benchmarks/qwen3-8b-pd-vs-mix-h200.md` | Qwen3-8B 多轮负载三方 A/B（2×H200）：P/D 1P+1D vs mixed×2（会话亲和 LB）vs mixed×1。吞吐持平（47.8k vs 47.0k tok/s），P/D 赢在 decode 稳定性（TPOT p99 10.08 vs 12.77ms，turn2+ TTFT 恒定 ~107ms vs 爬升 71→132ms），冷 turn1 多付 ~200ms（M3 目标）。含 vllm-bench 命令与 `max_completion_tokens` 坑。 |
+| `benchmarks/qwen3-14b-pd-vs-mix-h200.md` | Qwen3-14B 多轮长输入（8k+2k/轮）P/D 战役（8×H200）：等卡 P/D 吞吐反超 mixed +17% 且 ITL p99 23.5 vs 105ms；vLLM 0.25.1 吞吐/内核更快但 ITL p99 141ms；重负载下 200GiB hugepage host 池 vs 16GiB 决定 decode 纯净性（84.6→23.6ms）；2P+2D 弹性对比证明 router 前缀亲和是必要条件（round-robin ITL p99 86 → 亲和 22.8ms，pegaflow #405）；restore 冻结 decode 的机制与修复（openinfer #705）；同栈固定 seed 复跑的 warm 污染坑。 |
 
 ## conventions
 
