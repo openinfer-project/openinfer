@@ -852,7 +852,7 @@ fn host_demux_loop(
                 let id: [u8; 128] = unique_id
                     .try_into()
                     .map_err(|_| anyhow!("GLM5.2 rank-host: unique_id must be 128 bytes"))?;
-                HostPending::SetupComm(worker.setup_comm_async(id, moe_topo, None)?)
+                HostPending::SetupComm(worker.setup_comm_async(id, None, moe_topo, None)?)
             }
             WireRequest::Step {
                 inputs,

@@ -154,6 +154,61 @@ pub fn glm52_fp8_groupwise_gemm_sm100_bank_launch(
         .map_err(|err| anyhow!("GLM5.2 bank FP8 GEMM launch failed: {err}"))
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn glm52_fp8_groupwise_batched_gemm_sm100_launch(
+    ctx: &DeviceContext,
+    batch: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    activation: &CudaSlice<u8>,
+    activation_scale: &CudaSlice<f32>,
+    weight: &CudaSlice<u8>,
+    weight_scale: &CudaSlice<f32>,
+    output: &mut CudaSlice<bf16>,
+    workspace: &mut CudaSlice<u8>,
+) -> Result<()> {
+    ensure!(
+        batch > 0 && m > 0 && m.is_multiple_of(4) && n > 0 && k.is_multiple_of(128),
+        "GLM5.2 batched FP8 GEMM shape [{batch}, {m}, {n}, {k}] is invalid"
+    );
+    ensure!(
+        activation.len() >= batch * m * k
+            && activation_scale.len() >= batch * m * k.div_ceil(128)
+            && weight.len() >= batch * n * k
+            && weight_scale.len() >= batch * n.div_ceil(128) * k.div_ceil(128)
+            && output.len() >= batch * m * n
+            && !workspace.is_empty(),
+        "GLM5.2 batched FP8 GEMM buffers are too small"
+    );
+    let (activation_ptr, _activation_guard) = activation.device_ptr(&ctx.stream);
+    let (activation_scale_ptr, _activation_scale_guard) = activation_scale.device_ptr(&ctx.stream);
+    let (weight_ptr, _weight_guard) = weight.device_ptr(&ctx.stream);
+    let (weight_scale_ptr, _weight_scale_guard) = weight_scale.device_ptr(&ctx.stream);
+    let (output_ptr, _output_guard) = output.device_ptr_mut(&ctx.stream);
+    let workspace_bytes = workspace.len();
+    let (workspace_ptr, _workspace_guard) = workspace.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::glm52_fp8_groupwise_batched_gemm_sm100_cuda(
+            activation_ptr as *const u8,
+            activation_scale_ptr as *const f32,
+            weight_ptr as *const u8,
+            weight_scale_ptr as *const f32,
+            output_ptr as *mut ffi::Half,
+            workspace_ptr as *mut u8,
+            workspace_bytes,
+            m as i32,
+            n as i32,
+            k as i32,
+            batch as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result
+        .result()
+        .map_err(|err| anyhow!("GLM5.2 batched FP8 groupwise GEMM launch failed: {err}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

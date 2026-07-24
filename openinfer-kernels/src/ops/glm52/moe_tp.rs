@@ -16,10 +16,73 @@ pub const GLM52_TP_HIDDEN: usize = 6144;
 const GLM52_TP_TOPK: usize = 8;
 pub const GLM52_TP_BANK_EXPERTS: usize = 257;
 pub const GLM52_TP_TOKENS: usize = 8;
-pub const GLM52_PREFILL_AR_ROWS: usize = 128;
+pub const GLM52_PREFILL_AR_ROWS: usize = 512;
 pub const GLM52_PREFILL_AR_BUFFER_BYTES: usize =
     GLM52_PREFILL_AR_ROWS * GLM52_TP_HIDDEN * size_of::<bf16>() + 2 * size_of::<u64>();
 pub const GLM52_TP_UNION_MAX: usize = GLM52_TP_TOKENS * (GLM52_TP_TOPK + 1);
+
+pub struct Glm52PrefillNcclComm {
+    raw: *mut std::ffi::c_void,
+}
+
+unsafe impl Send for Glm52PrefillNcclComm {}
+
+impl Glm52PrefillNcclComm {
+    pub fn unique_id() -> Result<[u8; 128]> {
+        let mut id = [0u8; 128];
+        let status = unsafe { ffi::glm52_prefill_nccl_unique_id(id.as_mut_ptr()) };
+        ensure!(status == 0, "GLM5.2 NCCL unique id failed: {status}");
+        Ok(id)
+    }
+
+    pub fn new(id: &[u8; 128], rank: usize, ranks: usize) -> Result<Self> {
+        let rank_i32 = i32::try_from(rank).map_err(|_| anyhow!("GLM5.2 NCCL rank overflow"))?;
+        let ranks_i32 =
+            i32::try_from(ranks).map_err(|_| anyhow!("GLM5.2 NCCL rank count overflow"))?;
+        ensure!(
+            ranks_i32 > 0 && rank_i32 < ranks_i32,
+            "GLM5.2 NCCL rank {rank} is invalid for {ranks} ranks"
+        );
+        let mut raw = std::ptr::null_mut();
+        let status = unsafe {
+            ffi::glm52_prefill_nccl_comm_create(id.as_ptr(), rank_i32, ranks_i32, &raw mut raw)
+        };
+        ensure!(status == 0, "GLM5.2 NCCL init failed: {status}");
+        Ok(Self { raw })
+    }
+
+    pub fn all_reduce_bf16<S: DevicePtr<bf16>, R: DevicePtrMut<bf16>>(
+        &self,
+        ctx: &DeviceContext,
+        count: usize,
+        input: &S,
+        output: &mut R,
+    ) -> Result<()> {
+        ensure!(
+            count > 0 && input.len() >= count && output.len() >= count,
+            "GLM5.2 NCCL all-reduce buffers are invalid"
+        );
+        let (input_ptr, _input_guard) = input.device_ptr(&ctx.stream);
+        let (output_ptr, _output_guard) = output.device_ptr_mut(&ctx.stream);
+        let status = unsafe {
+            ffi::glm52_prefill_nccl_all_reduce_bf16(
+                self.raw,
+                input_ptr as *const ffi::Half,
+                output_ptr as *mut ffi::Half,
+                count,
+                ctx.stream.cu_stream(),
+            )
+        };
+        ensure!(status == 0, "GLM5.2 NCCL all-reduce failed: {status}");
+        Ok(())
+    }
+}
+
+impl Drop for Glm52PrefillNcclComm {
+    fn drop(&mut self) {
+        let _ = unsafe { ffi::glm52_prefill_nccl_comm_destroy(self.raw) };
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Glm52TpTopology {
@@ -198,7 +261,6 @@ pub fn glm52_prefill_moe_gather_launch(
 ) -> Result<()> {
     ensure!(
         rows > 0
-            && rows <= GLM52_PREFILL_AR_ROWS
             && row_indices.len() >= rows
             && input.len() >= GLM52_TP_HIDDEN
             && output.len() >= rows * GLM52_TP_HIDDEN,
@@ -218,6 +280,44 @@ pub fn glm52_prefill_moe_gather_launch(
     }
     .result()
     .map_err(|err| anyhow!("GLM5.2 prefill MoE gather failed: {err}"))
+}
+
+pub fn glm52_prefill_moe_reduce_launch(
+    ctx: &DeviceContext,
+    rows: usize,
+    routes_per_row: usize,
+    input: &CudaSlice<bf16>,
+    route_slots: &CudaSlice<i32>,
+    weights: &CudaSlice<f32>,
+    output: &mut CudaSlice<bf16>,
+) -> Result<()> {
+    ensure!(
+        rows > 0
+            && rows <= GLM52_PREFILL_AR_ROWS
+            && routes_per_row > 0
+            && route_slots.len() >= rows * routes_per_row
+            && weights.len() >= routes_per_row
+            && input.len() >= weights.len() * GLM52_TP_HIDDEN
+            && output.len() >= rows * GLM52_TP_HIDDEN,
+        "GLM5.2 prefill MoE reduction buffers are invalid"
+    );
+    let (input_ptr, _input_guard) = input.device_ptr(&ctx.stream);
+    let (slots_ptr, _slots_guard) = route_slots.device_ptr(&ctx.stream);
+    let (weights_ptr, _weights_guard) = weights.device_ptr(&ctx.stream);
+    let (output_ptr, _output_guard) = output.device_ptr_mut(&ctx.stream);
+    unsafe {
+        ffi::glm52_prefill_moe_reduce_cuda(
+            input_ptr as *const ffi::Half,
+            slots_ptr as *const i32,
+            weights_ptr as *const f32,
+            output_ptr as *mut ffi::Half,
+            rows as i32,
+            routes_per_row as i32,
+            ctx.stream.cu_stream(),
+        )
+    }
+    .result()
+    .map_err(|err| anyhow!("GLM5.2 prefill MoE reduction failed: {err}"))
 }
 
 pub fn glm52_prefill_moe_scatter_launch(

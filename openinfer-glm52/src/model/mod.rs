@@ -70,7 +70,7 @@ use crate::moe_ep_wo::Glm52MoeEpState;
 use crate::moe_tp::Glm52MoeTpRank;
 use crate::prefill_tp::Glm52TpPrefillExecutor;
 use crate::prefill_tp::Glm52TpPrefillModelView;
-use crate::prefill_tp::PREFILL_TILE_ROWS;
+use crate::prefill_tp::PREFILL_INDEXER_TILE_ROWS;
 use crate::scratch::Glm52DecodeScratch;
 use crate::weights::Glm52RankGpuWeights;
 use crate::weights::retype_owned;
@@ -772,7 +772,7 @@ impl Glm52RankModel {
             .is_some()
             .then(|| {
                 let indexer_shape = Glm52IndexerScratch::paged_mqa_shape(
-                    PREFILL_TILE_ROWS,
+                    PREFILL_INDEXER_TILE_ROWS,
                     index_cache_layout,
                     table_width,
                     NUM_SMS,

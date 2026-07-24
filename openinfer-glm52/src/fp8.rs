@@ -9,12 +9,14 @@
 //! shared expert all share these helpers; only the EP8 routed-expert chain
 //! (multi-row) stays on the grouped CUTLASS path.
 
+use anyhow::Context;
 use anyhow::Result;
 use anyhow::ensure;
 use cudarc::driver::CudaSlice;
 use half::bf16;
 use openinfer_kernels::ops::GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW;
 use openinfer_kernels::ops::Glm52MoeQuantShape;
+use openinfer_kernels::ops::glm52_fp8_groupwise_batched_gemm_sm100_launch;
 use openinfer_kernels::ops::glm52_fp8_groupwise_gemm_sm100_bank_launch;
 use openinfer_kernels::ops::glm52_fp8_groupwise_gemm_sm100_launch;
 use openinfer_kernels::ops::glm52_fp8_per_token_group_quant_bf16_launch;
@@ -143,6 +145,59 @@ pub(crate) fn fp8_linear_large_m_bank_into(
         weight_offset,
         scale,
         scale_offset,
+        out,
+        &mut scratch.workspace,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fp8_linear_large_m_batched_into(
+    ctx: &DeviceContext,
+    batch: usize,
+    rows: usize,
+    n: usize,
+    k: usize,
+    input: &CudaSlice<bf16>,
+    weight: &CudaSlice<u8>,
+    scale: &CudaSlice<f32>,
+    scratch: &mut Glm52Fp8GemmScratch,
+    out: &mut CudaSlice<bf16>,
+) -> Result<()> {
+    let total_rows = batch
+        .checked_mul(rows)
+        .context("GLM5.2 batched FP8 row count overflow")?;
+    ensure!(
+        rows > 0
+            && rows.is_multiple_of(4)
+            && total_rows <= scratch.rows
+            && k <= scratch.width
+            && input.len() >= total_rows * k
+            && weight.len() >= batch * n * k
+            && scale.len() >= batch * n.div_ceil(FP8_BLOCK) * k.div_ceil(FP8_BLOCK)
+            && out.len() >= total_rows * n,
+        "GLM5.2 batched FP8 projection buffers do not fit [{batch}, {rows}, {n}, {k}]"
+    );
+    glm52_fp8_per_token_group_quant_bf16_launch(
+        ctx,
+        Glm52MoeQuantShape {
+            rows: total_rows,
+            width: k,
+            group_size: FP8_BLOCK,
+        },
+        input,
+        &mut scratch.activation,
+        &mut scratch.activation_scale,
+    )?;
+    glm52_fp8_groupwise_batched_gemm_sm100_launch(
+        ctx,
+        batch,
+        rows,
+        n,
+        k,
+        &scratch.activation,
+        &scratch.activation_scale,
+        weight,
+        scale,
         out,
         &mut scratch.workspace,
     )
