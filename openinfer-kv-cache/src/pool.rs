@@ -451,6 +451,17 @@ impl RequestKv {
             .map_err(|e| anyhow::anyhow!("release: {e}"))
     }
 
+    /// Mark every assigned block's canonical primary to reset on release.
+    ///
+    /// A duplicate resets itself but keeps its primary alive; marking the
+    /// primary prevents that hidden block from entering the inactive cache on
+    /// final drop.
+    pub fn mark_blocks_reset_on_release(&self) {
+        for (_, block) in self.seq.inner().assignments().assigned_iter() {
+            block.set_primary_reset_on_release(true);
+        }
+    }
+
     // ── Queries ────────────────────────────────────────────────────────
 
     /// Tokens with KV already computed.
@@ -636,6 +647,70 @@ mod tests {
             ha[0],
             "salt (lora) must scope the prefix cache"
         );
+    }
+
+    fn complete_non_retained_speculative_request(
+        pool: &BlockPool,
+        prompt: &[u32],
+        max_output_tokens: usize,
+    ) {
+        const MAX_PREFILL_CHUNK: usize = 1024;
+        const MAX_VERIFY_SPAN: usize = 17;
+
+        let mut request = pool.new_request(prompt.to_vec(), max_output_tokens, None);
+        let mut prefilled = 0;
+        while prompt.len() - prefilled > MAX_PREFILL_CHUNK {
+            request
+                .schedule_prefill(MAX_PREFILL_CHUNK, pool)
+                .expect("schedule prefill chunk");
+            request
+                .apply_prefill_chunk(pool)
+                .expect("apply prefill chunk");
+            prefilled += MAX_PREFILL_CHUNK;
+        }
+        request
+            .schedule_prefill(prompt.len() - prefilled, pool)
+            .expect("schedule final prefill chunk");
+        request
+            .apply_prefill(70_000, pool)
+            .expect("apply final prefill chunk");
+
+        while !request.is_complete() {
+            let span = (max_output_tokens - request.generated_tokens()).min(MAX_VERIFY_SPAN);
+            request
+                .schedule_speculative(span, pool)
+                .expect("schedule speculative verify");
+            let accepted = (0..span)
+                .map(|offset| 80_000 + offset as u32)
+                .collect::<Vec<_>>();
+            request
+                .apply_speculative(&accepted, pool)
+                .expect("apply speculative verify");
+        }
+
+        request.mark_blocks_reset_on_release();
+    }
+
+    /// CPU-only shape of issue #681: 160 request pages, a 1643-token prompt
+    /// split into 1024 + 619 prefill chunks, 512 output tokens, and 17-token
+    /// speculative verify spans. A completed request must leave enough clean
+    /// pages for the identical request to finish again.
+    #[test]
+    fn issue_681_profiled_capacity_reuses_blocks_across_requests() {
+        // BlockPool reserves one additional CUDA-graph padding page.
+        let pool = BlockPool::new(16, 161).unwrap();
+        assert_eq!(pool.max_request_blocks(), 160);
+        let baseline = pool.available_blocks();
+        let prompt = (0..1643).map(|i| 30_000 + i).collect::<Vec<_>>();
+
+        for round in 0..2 {
+            complete_non_retained_speculative_request(&pool, &prompt, 512);
+            assert_eq!(
+                pool.available_blocks(),
+                baseline,
+                "issue #681 request {round} did not release its KV pages"
+            );
+        }
     }
 
     /// kvbm's `schedule_decode` allocates the next generation block when the

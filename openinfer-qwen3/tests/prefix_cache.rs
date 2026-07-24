@@ -177,8 +177,9 @@ fn prefix_cache_behavior() {
     let c = prompt(3, 64); // exactly 4 blocks — the cap edge
     let d = prompt(4, 40); // never seen before the mixed batch
 
-    // ── Phase 1: matching disabled — true cold baselines. apply_prefill /
-    // apply_decode still register completed blocks, so phase 2 finds them.
+    // ── Phase 1: matching and completed-block retention disabled — true cold
+    // baselines. Dropping each request resets its registered KV, so enabling
+    // the cache later must start cold rather than resurrecting these blocks.
     ex.set_prefix_cache_enabled(false);
     let (cached, a_cold) = run_one(&mut ex, 1, &a);
     assert_eq!(
@@ -188,8 +189,16 @@ fn prefix_cache_behavior() {
     let (_, b_cold) = run_one(&mut ex, 2, &b);
     let (_, c_cold) = run_one(&mut ex, 3, &c);
 
-    // ── Phase 2: warm replays.
+    // ── Phase 2: enable retention and seed the cache explicitly. The first A
+    // run must be cold: phase 1's disabled-mode request may not survive.
     ex.set_prefix_cache_enabled(true);
+    let (cached, _) = run_one(&mut ex, 4, &a);
+    assert_eq!(
+        cached, 0,
+        "cache-disabled requests must not seed a later enabled cache"
+    );
+    let _ = run_one(&mut ex, 5, &b);
+    let _ = run_one(&mut ex, 6, &c);
 
     let (cached, a_warm) = run_one(&mut ex, 11, &a);
     assert_eq!(
@@ -244,6 +253,14 @@ fn prefix_cache_behavior() {
     ex.drop_request(RequestId::new(31)).expect("drop");
     assert_close("D cold in mixed batch", &d_solo, &d_mixed);
     ex.set_prefix_cache_enabled(true);
+
+    // Disabling the cache above drained the earlier A/B/C primaries. Seed B
+    // again so the unified-path assertions below exercise warm page reuse.
+    let (cached, _) = run_one(&mut ex, 32, &b);
+    assert_eq!(
+        cached, 0,
+        "re-enabled cache starts cold after transition drain"
+    );
 
     // ── Unified path: warm prefill of A while another request decodes.
     let pr = ex

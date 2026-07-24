@@ -580,12 +580,13 @@ fn run_eager_suite(golden: &Golden, model_path: &str, devices: &[usize], label: 
     let (batched, _) = run(golden, &mut ex, &all[..n], true);
     report_and_assert(&format!("{label}batched eager ({n}, no pad)"), &batched);
 
-    // Prefix-cached replay. Every block is already registered (the runs
-    // above register blocks even with matching disabled), so these rerun
-    // with warm caches: prefill skips the cached prefix and attention spans
-    // cached KV + recomputed suffix (kv_len > q_len). Same HF tolerances —
-    // a wrong RoPE offset, mask, or stale page would blow far past them.
+    // Prefix-cached replay. Matching-disabled requests intentionally reset
+    // their completed blocks, so first seed under enabled retention and then
+    // rerun warm: prefill skips the cached prefix and attention spans cached
+    // KV + recomputed suffix (kv_len > q_len). Same HF tolerances — a wrong
+    // RoPE offset, mask, or stale page would blow far past them.
     ex.set_prefix_cache_enabled(true);
+    let _ = run(golden, &mut ex, &all, false);
     let (cached, _) = run(golden, &mut ex, &all, false);
     assert!(
         cached.cached_tokens > 0,
@@ -648,6 +649,7 @@ fn pega_logprobs_match_hf_golden_within_bf16_tolerance() {
         // tables that now point at blocks written by earlier requests.
         ex.set_prefix_cache_enabled(true);
         let n = BUCKET_STRADDLES[1];
+        let _ = run(&golden, &mut ex, &all[..n], true);
         let (cached, _) = run(&golden, &mut ex, &all[..n], true);
         assert!(
             cached.cached_tokens > 0,

@@ -1605,9 +1605,28 @@ impl Qwen3Executor {
 
     /// Prefix caching is on by default; tests that assert bit-identical
     /// replay disable it (a cache hit changes prefill GEMM shapes, which
-    /// drifts logits by bf16 ULPs).
+    /// drifts logits by bf16 ULPs). Disabling it also disables retention of
+    /// completed request blocks: retaining blocks that can never be matched
+    /// creates duplicate primaries outside request-level capacity accounting.
     pub fn set_prefix_cache_enabled(&mut self, enabled: bool) {
+        let retained_before = self.retains_completed_kv_blocks();
         self.prefix_cache_enabled = enabled;
+        self.finish_retention_transition(retained_before);
+    }
+
+    /// Whether a completed request should leave its registered GPU blocks in
+    /// the inactive L1 cache for a later prefix match.
+    fn retains_completed_kv_blocks(&self) -> bool {
+        self.prefix_cache_enabled && !self.l1_retention_disabled
+    }
+
+    /// Drain blocks retained under the old policy once when L1 retention is
+    /// disabled. Active blocks are untouched; `drop_request` marks them for
+    /// reset when their final owners finish.
+    fn finish_retention_transition(&mut self, retained_before: bool) {
+        if retained_before && !self.retains_completed_kv_blocks() {
+            self.kv_mgr.pool().evict_inactive();
+        }
     }
 
     /// Configure two-stream prefill/decode overlap (see [`crate::DecodeOverlap`]).
@@ -1658,9 +1677,11 @@ impl Qwen3Executor {
     /// way to force the bytes from L2 is to not keep the HBM copy around.
     pub(crate) fn set_no_prefix_cache(&mut self, on: bool) {
         if self.offload.is_some() {
+            let retained_before = self.retains_completed_kv_blocks();
             self.l1_retention_disabled = on;
+            self.finish_retention_transition(retained_before);
         } else {
-            self.prefix_cache_enabled = !on;
+            self.set_prefix_cache_enabled(!on);
         }
     }
 
@@ -1686,7 +1707,7 @@ impl Qwen3Executor {
             "Qwen3 DFlash speculative decoding enabled: draft block size {}",
             meta.block_size
         );
-        self.prefix_cache_enabled = false;
+        self.set_prefix_cache_enabled(false);
         self.speculative = Some(meta);
         Ok(())
     }
@@ -2271,16 +2292,23 @@ impl ModelExecutor for Qwen3Executor {
         // Remove and drop — RAII on SchedulableSequence's block guards
         // returns all allocated blocks regardless of lifecycle state. The same
         // RAII frees any parked prefetch's reserved/held blocks.
-        let removed = self.request_kvs.remove(&request_id);
+        let retain_completed_kv = self.retains_completed_kv_blocks();
+        let mut removed = self.request_kvs.remove(&request_id);
         // With the event feed on, capture this request's still-unflushed store
         // run before its cursor is gone: a request can register its last full
         // block in the very step it finishes (see `ExecutorKvEvents`).
-        if let (Some(mut rkv), Some(events)) = (removed, self.kv_events.as_mut()) {
-            let run = rkv.take_newly_registered_blocks();
-            if !run.is_empty() {
-                events.pending_dropped.push(run);
+        if let Some(rkv) = removed.as_mut() {
+            if let Some(events) = self.kv_events.as_mut() {
+                let run = rkv.take_newly_registered_blocks();
+                if !run.is_empty() {
+                    events.pending_dropped.push(run);
+                }
+            }
+            if !retain_completed_kv {
+                rkv.mark_blocks_reset_on_release();
             }
         }
+        drop(removed);
         // A parked prefetch may still have a load in flight: pegaflow's worker
         // is writing the reserved GPU blocks (H2D). Dropping the reservation now
         // frees those physical pages for immediate reuse while the DMA keeps
