@@ -97,7 +97,7 @@ fn native_mtp_uses_final_normalized_target_hidden() -> Result<()> {
     // across mixed prefill, proposal, and idle rank states without paying for
     // a second model load.
     let prompt_lengths = [PATHOLOGICAL_PROMPT.len(), 112, 96, 80, 64, 48, 32, 16];
-    let output_lengths = [32, 28, 24, 20, 16, 12, 8, 6];
+    let output_lengths = [256, 28, 24, 20, 16, 12, 8, 6];
     let mut receivers = Vec::with_capacity(8);
     for rank in 0..8 {
         let (token_tx, token_rx) = TokenSink::standalone();
@@ -167,8 +167,8 @@ fn native_mtp_uses_final_normalized_target_hidden() -> Result<()> {
         .context("reused native MTP slot did not produce a proposal")?;
     assert_eq!(reuse_first_proposal.first(), Some(&98825));
     assert!(
-        stats.reuse_rounds > 0,
-        "reused native MTP slot did not verify a proposal"
+        stats.reuse_rounds >= 32,
+        "reused native MTP slot produced too few rounds for a stable acceptance gate: {stats:?}"
     );
     let reuse_mean_accepted_length =
         1.0 + stats.reuse_accepted_drafts as f64 / stats.reuse_rounds as f64;

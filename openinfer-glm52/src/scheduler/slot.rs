@@ -126,7 +126,7 @@ pub(super) struct Glm52SlotState {
 }
 
 /// Drafts fed per verify span under EP8: 3 drafts + anchor = a bucket-4
-/// verify step. A/B-measured on jz-38 (2026-07-04,
+/// verify step. A/B-measured on 8×H200 (2026-07-04,
 /// docs/models/glm52/dspark-mtp.md): the bucket-4 step costs ~32 ms vs
 /// bucket-8's ~46, and that cheaper round beats span 8's extra accepted tail
 /// on EVERY tested prompt class. The drafter still proposes 7; the tail is
