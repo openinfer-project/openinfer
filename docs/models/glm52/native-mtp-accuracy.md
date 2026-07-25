@@ -110,13 +110,50 @@
 
 ### Native MTP forward and serving integration
 
-- Added the native layer-78 MTP head, its separate one-layer KV state, proposal/recycle loop, and
+- Added the native layer-78 MTP decoder, its separate one-layer KV state, proposal/recycle loop, and
   scheduler-wide collective modes for reset-only, context-only, and proposal rounds.
 - Verified release build, library and CLI tests, an 8-rank end-to-end run, and an official-vLLM
   fixture gate.
 - Result: functional. The official-vLLM fixture comparison measured MLP RMS `8.62e-3`
   (`p99 2.54e-2`), chained hidden RMS `1.87e-2` (`p99 5.86e-2`), exact top-1, top-8 overlap `8/8`,
   and top-32 overlap `30/32`.
+
+### PR hardening
+
+- Replaced the public `dspark path + native_mtp bool` pair with one
+  `None / Dspark(path) / NativeMtp` launch type, so callers cannot enable two drafters.
+- Bumped the rank-host wire version and added a `BuildModel` round-trip test covering the drafter
+  payload. Mixed coordinator/rank-host binaries now reject at the handshake.
+- Replaced the seven-argument MTP round command with `Reset / Context / Propose` variants. The
+  runner/model boundary can no longer carry a context-only mode with proposal data.
+- Removed the per-round global test lock. The production gate records its first proposal once and
+  copies the request-local acceptance counters when the slot is released.
+- Extended that gate, without another model load, to reuse rank 0's released slot and issue eight
+  concurrent rank-pinned requests with different prompt and output lengths. The reused slot has
+  its own first-proposal and request-level acceptance assertions; the other ranks provide the
+  mixed-state collective liveness coverage.
+- Removed unrelated GSM8K evaluator changes from this branch. The evaluator results below remain
+  evidence gathered during bring-up, not part of the native-MTP serving change.
+
+### EP8 MoE correctness prerequisite and scope
+
+- This PR also corrects the shared EP8 routed-expert pipeline used by every target MoE layer, not
+  only native MTP's layer 78. The previous path multiplied route weights into the SwiGLU
+  activation before FP8 quantization and folded the routed scaling factor into router weights.
+  Official vLLM quantizes the unweighted activation before W2, applies each route weight to W2's
+  BF16 output, combines experts, and then applies the `2.5` routed scaling factor before adding the
+  unscaled shared-expert output.
+- The correction is a prerequisite for the MTP oracle because the target and layer-78 decoder
+  share `glm52_moe_ep8_routed_forward`; retaining the old target semantics only for layers 0–77
+  would create two numerically different implementations of the same checkpoint MoE.
+- The official-vLLM layer-78 golden gate exercises the corrected EP8 kernel and reports MLP RMS
+  `8.62e-3`, chained hidden RMS `1.87e-2`, exact top-1, top-8 overlap `8/8`, and top-32 overlap
+  `30/32`. The existing layer-6 EP8 oracle exercises the same kernel in a plain target layer and is
+  part of the 8×H200 validation set.
+- The post-change plain serving result is GSM8K `195/200`; native MTP is `196/200`. No retained
+  pre-change plain GSM8K run used the identical harness, so this document does not claim a
+  before/after task-accuracy improvement from the MoE correction. The direct evidence is the
+  official tensor oracle plus the post-change plain-path regression gate.
 
 ### End-task accuracy
 
@@ -219,12 +256,15 @@
 - The corrected selected-request response and acceptance log have SHA-256
   `8f5a6663d6ddb10c59458a1f6849fff468150265443398da63aa492d0b3ca3f3` and
   `5807097280c2edf83a60b4f1841760ca60e7061dddad6916edb49a5835093d94`.
-- Release validation passes `83` library tests with `19` GPU/model gates ignored, followed by the
-  two explicitly enabled official-vLLM MTP front and EP8 layer-78 golden gates. A new ignored
+- Release validation passes `84` library tests with `19` GPU/model gates ignored, followed by the
+  two explicitly enabled official-vLLM MTP front and EP8 layer-78 golden gates. An ignored
   production-path gate loads the full checkpoint on 8×H200, submits the selected 256-token request
   through the real scheduler/executor, and asserts target trajectory, first draft `98825`, and mean
-  accepted length at least `5.0`; it passes in `210.37 s`. The clean c8 replay completes `64/64`
-  requests with the exact retained input/output totals.
+  accepted length at least `5.0`; the original gate passes in `210.37 s`. PR hardening extends the
+  same model-loaded gate with a released-slot reuse request plus eight concurrent rank-pinned
+  requests of different lengths. The reused slot must again draft `98825` first and retain mean
+  accepted length at least `5.0`; the other requests exercise mixed-state collective liveness. The
+  clean c8 replay completes `64/64` requests with the exact retained input/output totals.
 
 ### Matched c1 after the hidden-boundary fix
 
@@ -261,8 +301,8 @@
   delta comes from OpenInfer accepting `0.390` more tokens per speculative round on this engine's
   target trajectories. This does not imply identical target text or identical MTP numerics across
   the two topologies.
-- The benchmarked OpenInfer source stack is the feature branch ending at `2dd5237e` (native-MTP
-  commits `f35292c1`, `fd6bd6e0`, `83389e75`, and `2dd5237e` over base `272c2f94`), built in the
+- The benchmarked OpenInfer binary was built from `2dd5237e` (native-MTP commits `f35292c1`,
+  `fd6bd6e0`, `83389e75`, and `2dd5237e` over base `272c2f94`) in the
   release profile. The runtime binary SHA-256 is
   `1a803c63c64377a82d611a1713cbf769b6bee1440c14902561922974c3691f62`. The official-vLLM
   image digest is `sha256:79460a12901891f5e74d7a6ee1259f8aad9aa3b405cc0753534ee4ff6124fd3b`.

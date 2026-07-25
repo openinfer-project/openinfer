@@ -87,7 +87,7 @@ pub(crate) struct Args {
     /// Sealed KV blocks are saved to host pinned memory and restored into
     /// HBM before prefill when a prompt's prefix has fallen out of the GPU
     /// cache. GLM5.2 requires the prefix cache: incompatible with
-    /// --no-prefix-cache and the DSpark drafter.
+    /// --no-prefix-cache and speculative decoding.
     #[arg(long, default_value_t = false)]
     pub kv_offload: bool,
 

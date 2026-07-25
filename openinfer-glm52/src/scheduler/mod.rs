@@ -77,6 +77,8 @@ use slot::Glm52StepOutcome;
 #[cfg(test)]
 pub(crate) use slot::MTP_PRODUCTION_GATE_REQUEST_ID;
 #[cfg(test)]
+pub(crate) use slot::MTP_SLOT_REUSE_GATE_REQUEST_ID;
+#[cfg(test)]
 pub(crate) use slot::mtp_production_stats;
 #[cfg(test)]
 pub(crate) use slot::reset_mtp_production_stats;
@@ -225,12 +227,11 @@ pub(crate) fn run_dp8_coordinator(
     // Pool pages available to requests per rank (total minus the padding
     // page) — constant for the engine's lifetime.
     let usable_blocks: Vec<usize> = pools.iter().map(|pool| pool.total_blocks() - 1).collect();
-    // The DSpark draft lane asserts every anchor position equals its
-    // committed + pending context rows — a skipped (cache-hit) prefix never
-    // produces the aux-hidden captures the draft consumes, so prefix
-    // matching is off while the drafter is on. Speculative decoding and
-    // prefix caching are mutually exclusive for now (the qwen3 offload path
-    // draws the same line). `--no-prefix-cache` is the explicit kill switch.
+    // A cache-hit prefix skips state required by either speculative lane:
+    // DSpark loses the aux-hidden captures it consumes, while native MTP
+    // loses target hidden rows and continuity in its separate KV cache.
+    // Prefix matching therefore stays off while any drafter is active.
+    // `--no-prefix-cache` remains the explicit kill switch.
     let prefix_cache_enabled = !drafter.enabled() && !no_prefix_cache;
     if drafter.enabled() && !no_prefix_cache {
         log::info!("GLM5.2 prefix cache disabled: speculative decoding is on");
@@ -438,7 +439,7 @@ pub(crate) fn run_dp8_coordinator(
             &pools,
             offload.as_deref(),
             eos_token_ids,
-            drafter,
+            &drafter,
             &step_inputs,
             &mut pending_resets,
             &mut slots_changed,
@@ -891,7 +892,7 @@ fn apply_step_outputs(
     pools: &[BlockPool],
     offload: Option<&[offload::RankOffload]>,
     eos_token_ids: &[u32],
-    drafter: crate::Glm52Drafter,
+    drafter: &crate::Glm52Drafter,
     step_inputs: &[[(u32, usize); GLM52_MAX_BATCH_PER_RANK]],
     pending_resets: &mut [Vec<usize>],
     slots_changed: &mut bool,
@@ -997,6 +998,10 @@ fn apply_step_outputs(
                 }
             };
             if freed {
+                #[cfg(test)]
+                active
+                    .state
+                    .record_mtp_production_gate(active.req.request_id.as_deref());
                 active.state.log_spec_stats(rank, slot_id);
                 // Offload the freshly-sealed blocks BEFORE release: the
                 // hashes and guards come off the still-assigned request
@@ -1024,17 +1029,17 @@ fn apply_step_outputs(
                     rank_appends[rank]
                         .extend(span_rows.clone().take(context_rows).map(|r| (r, slot_id)));
                 } else {
-                    for (offset, source_row) in span_rows.clone().take(context_rows).enumerate() {
+                    for (offset, target_row) in span_rows.clone().take(context_rows).enumerate() {
                         let input_token = if offset + 1 < context_rows {
-                            step_inputs[rank][source_row + 1].0
+                            step_inputs[rank][target_row + 1].0
                         } else {
                             active.state.next_input_at(0).token
                         };
                         mtp_appends[rank].push(Glm52MtpAppend {
-                            source_row,
+                            target_row,
                             slot: slot_id,
                             input_token,
-                            position: step_inputs[rank][source_row].1,
+                            position: step_inputs[rank][target_row].1,
                         });
                     }
                 }

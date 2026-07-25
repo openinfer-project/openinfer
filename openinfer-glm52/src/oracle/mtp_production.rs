@@ -37,8 +37,7 @@ fn native_mtp_uses_final_normalized_target_hidden() -> Result<()> {
         Glm52LaunchOptions {
             tp_size: 1,
             dp_size: 8,
-            dspark_draft_model_path: None,
-            native_mtp: true,
+            drafter: crate::Glm52Drafter::NativeMtp,
             max_model_len: Some(4096),
             prefill_only: None,
             no_prefix_cache: true,
@@ -86,14 +85,70 @@ fn native_mtp_uses_final_normalized_target_hidden() -> Result<()> {
             TokenEvent::Scheduled { .. } | TokenEvent::PromptTokens { .. } => {}
         }
     }
-    drop(engine);
-
     assert_eq!(completion.len(), 256);
     assert!(
         completion.iter().all(|&token| token == 98824),
         "selected target trajectory changed: {:?}",
         &completion[..completion.len().min(16)]
     );
+
+    // Reuse rank 0's released slot while all eight ranks process different
+    // prompt/output lengths. This keeps the native-MTP collectives live
+    // across mixed prefill, proposal, and idle rank states without paying for
+    // a second model load.
+    let prompt_lengths = [PATHOLOGICAL_PROMPT.len(), 112, 96, 80, 64, 48, 32, 16];
+    let output_lengths = [32, 28, 24, 20, 16, 12, 8, 6];
+    let mut receivers = Vec::with_capacity(8);
+    for rank in 0..8 {
+        let (token_tx, token_rx) = TokenSink::standalone();
+        engine.submit(GenerateRequest {
+            request_id: Some(if rank == 0 {
+                crate::scheduler::MTP_SLOT_REUSE_GATE_REQUEST_ID.into()
+            } else {
+                format!("native-mtp-multirank-{rank}")
+            }),
+            queued_at_unix_s: None,
+            trace_parent: None,
+            data_parallel_rank: Some(rank),
+            prompt_tokens: PATHOLOGICAL_PROMPT[..prompt_lengths[rank]].to_vec(),
+            params: SamplingParams {
+                ignore_eos: true,
+                ..SamplingParams::default()
+            },
+            max_tokens: output_lengths[rank],
+            lora_adapter: None,
+            token_tx,
+            logprobs: 0,
+            echo: false,
+        })?;
+        receivers.push(token_rx);
+    }
+    for (rank, mut receiver) in receivers.into_iter().enumerate() {
+        let mut tokens = 0;
+        loop {
+            let (_, event) = receiver
+                .blocking_recv()
+                .with_context(|| format!("rank {rank} closed its MTP gate token stream"))?;
+            match event {
+                TokenEvent::Token { .. } => tokens += 1,
+                TokenEvent::Finished {
+                    completion_tokens, ..
+                } => {
+                    assert_eq!(completion_tokens, output_lengths[rank]);
+                    assert_eq!(tokens, output_lengths[rank]);
+                    break;
+                }
+                TokenEvent::Error { message, .. } | TokenEvent::Rejected { message, .. } => {
+                    anyhow::bail!(
+                        "GLM5.2 multi-rank production gate failed on rank {rank}: {message}"
+                    )
+                }
+                TokenEvent::Scheduled { .. } | TokenEvent::PromptTokens { .. } => {}
+            }
+        }
+    }
+    drop(engine);
+
     let stats = crate::scheduler::mtp_production_stats();
     let first_proposal = stats
         .first_proposal
@@ -105,6 +160,22 @@ fn native_mtp_uses_final_normalized_target_hidden() -> Result<()> {
     assert!(
         mean_accepted_length >= 5.0,
         "native MTP mean accepted length regressed to {mean_accepted_length:.3}: {stats:?}"
+    );
+    let reuse_first_proposal = stats
+        .reuse_first_proposal
+        .as_deref()
+        .context("reused native MTP slot did not produce a proposal")?;
+    assert_eq!(reuse_first_proposal.first(), Some(&98825));
+    assert!(
+        stats.reuse_rounds > 0,
+        "reused native MTP slot did not verify a proposal"
+    );
+    let reuse_mean_accepted_length =
+        1.0 + stats.reuse_accepted_drafts as f64 / stats.reuse_rounds as f64;
+    assert!(
+        reuse_mean_accepted_length >= 5.0,
+        "reused native MTP slot mean accepted length regressed to \
+         {reuse_mean_accepted_length:.3}: {stats:?}"
     );
     Ok(())
 }

@@ -174,13 +174,19 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
         ModelType::Glm52 => {
             let moe_topo: openinfer_glm52::Glm52MoeTopo =
                 args.moe_topo.parse().context("--moe-topo")?;
+            let drafter = if args.glm52_native_mtp {
+                openinfer_glm52::Glm52Drafter::NativeMtp
+            } else if let Some(path) = &args.dflash_draft_model_path {
+                openinfer_glm52::Glm52Drafter::Dspark(path.clone())
+            } else {
+                openinfer_glm52::Glm52Drafter::None
+            };
             openinfer_glm52::launch(
                 &args.model_path,
                 openinfer_glm52::Glm52LaunchOptions {
                     tp_size: args.tp_size,
                     dp_size: args.dp_size.unwrap_or_else(|| moe_topo.default_dp_size()),
-                    dspark_draft_model_path: args.dflash_draft_model_path.clone(),
-                    native_mtp: args.glm52_native_mtp,
+                    drafter,
                     max_model_len: args.max_model_len,
                     prefill_only: args.glm52_prefill_only.then_some(
                         openinfer_glm52::Glm52PrefillOnlyOptions {

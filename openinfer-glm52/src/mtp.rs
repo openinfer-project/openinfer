@@ -75,14 +75,14 @@ pub(crate) fn glm52_mtp_arena_bytes(max_model_len: usize) -> Result<usize> {
 }
 
 /// The four BF16 weights around the ordinary layer-78 decoder block.
-pub(crate) struct Glm52MtpHeadWeights {
+pub(crate) struct Glm52MtpBookendWeights {
     enorm: DeviceVec,
     hnorm: DeviceVec,
     eh_proj: DeviceMatrix,
     shared_norm: DeviceVec,
 }
 
-impl Glm52MtpHeadWeights {
+impl Glm52MtpBookendWeights {
     pub(crate) fn new(
         enorm: DeviceVec,
         hnorm: DeviceVec,
@@ -169,7 +169,7 @@ impl Glm52MtpScratch {
 /// `nn.Linear(torch.cat(...))`.
 pub(crate) fn glm52_mtp_prepare_into(
     ctx: &DeviceContext,
-    w: &Glm52MtpHeadWeights,
+    w: &Glm52MtpBookendWeights,
     positions: &CudaSlice<u32>,
     inputs_embeds: &Rows<GLM52_HIDDEN>,
     previous_hidden: &Rows<GLM52_HIDDEN>,
@@ -251,7 +251,7 @@ pub(crate) fn glm52_mtp_prepare_into(
 /// Callers retain `raw_hidden` unchanged for the shared target lm_head path.
 pub(crate) fn glm52_mtp_recycle_into(
     ctx: &DeviceContext,
-    w: &Glm52MtpHeadWeights,
+    w: &Glm52MtpBookendWeights,
     raw_hidden: &Rows<GLM52_HIDDEN>,
     recycle_hidden: &mut Rows<GLM52_HIDDEN>,
 ) -> Result<()> {

@@ -37,6 +37,7 @@ use crate::bookend::glm52_embed_into;
 use crate::bookend::glm52_lm_head_into;
 use crate::config::GLM52_HIDDEN;
 use crate::config::GLM52_INDEX_HEAD_DIM;
+use crate::config::GLM52_MTP_LAYER;
 use crate::config::GLM52_RMS_EPS;
 use crate::config::GLM52_SM_SCALE;
 use crate::config::GLM52_VOCAB;
@@ -52,24 +53,21 @@ use crate::mla_decode::Glm52MlaSchedMetadata;
 use crate::mla_decode::glm52_select_mla_backend;
 use crate::moe_ep_wo::Glm52MoeEpState;
 use crate::mtp::GLM52_MTP_DRAFTS;
-use crate::mtp::Glm52MtpHeadWeights;
+use crate::mtp::Glm52MtpBookendWeights;
 use crate::mtp::Glm52MtpScratch;
 use crate::mtp::glm52_mtp_prepare_into;
 use crate::mtp::glm52_mtp_recycle_into;
 use crate::rows::Rows;
-use crate::runner::Glm52MtpAppend;
-use crate::runner::Glm52MtpRoundMode;
+use crate::runner::Glm52MtpRound;
 use crate::scratch::Glm52DecodeScratch;
 use crate::weights::Glm52RankGpuWeights;
 use crate::weights::retype_owned;
-
-const MTP_LAYER: usize = crate::config::GLM52_LAYERS;
 
 struct Glm52MtpBucket {
     rows: usize,
     sched: Glm52MlaSchedMetadata,
     scratch: Glm52DecodeScratch,
-    head_scratch: Glm52MtpScratch,
+    bookend_scratch: Glm52MtpScratch,
     embeds: Rows<GLM52_HIDDEN>,
     previous: Rows<GLM52_HIDDEN>,
     decoder_input: Rows<GLM52_HIDDEN>,
@@ -79,7 +77,7 @@ struct Glm52MtpBucket {
 }
 
 pub(super) struct Glm52NativeMtp {
-    head: Glm52MtpHeadWeights,
+    bookend: Glm52MtpBookendWeights,
     layer: Glm52DecoderLayerWeights,
     cache: Glm52LayerCaches,
     buckets: [Glm52MtpBucket; GLM52_DECODE_BUCKETS.len()],
@@ -102,7 +100,7 @@ impl Glm52NativeMtp {
         weights: &mut Glm52RankGpuWeights,
         max_model_len: usize,
     ) -> Result<Self> {
-        let prefix = format!("model.layers.{MTP_LAYER}");
+        let prefix = format!("model.layers.{GLM52_MTP_LAYER}");
         let enorm = build::take_bf16_vec(
             ctx,
             weights,
@@ -131,9 +129,14 @@ impl Glm52NativeMtp {
             &format!("{prefix}.shared_head.norm.weight"),
             GLM52_HIDDEN,
         )?;
-        let head = Glm52MtpHeadWeights::new(enorm, hnorm, eh_proj, shared_norm)?;
-        let layer =
-            build::build_decoder_layer(ctx, weights, MTP_LAYER, crate::Glm52MoeTopo::Ep8, None)?;
+        let bookend = Glm52MtpBookendWeights::new(enorm, hnorm, eh_proj, shared_norm)?;
+        let layer = build::build_decoder_layer(
+            ctx,
+            weights,
+            GLM52_MTP_LAYER,
+            crate::Glm52MoeTopo::Ep8,
+            None,
+        )?;
 
         let num_blocks = glm52_pool_blocks(max_model_len);
         let table_width = glm52_table_width(max_model_len);
@@ -191,7 +194,7 @@ impl Glm52NativeMtp {
                     backend,
                     false,
                 )?,
-                head_scratch: Glm52MtpScratch::new(ctx, rows)?,
+                bookend_scratch: Glm52MtpScratch::new(ctx, rows)?,
                 embeds: Rows::zeros(ctx, rows)?,
                 previous: Rows::zeros(ctx, rows)?,
                 decoder_input: Rows::zeros(ctx, rows)?,
@@ -201,7 +204,7 @@ impl Glm52NativeMtp {
             });
         }
         Ok(Self {
-            head,
+            bookend,
             layer,
             cache,
             buckets: buckets
@@ -227,6 +230,18 @@ impl Glm52NativeMtp {
         })
     }
 
+    pub(super) fn reset_slots(&mut self, resets: &[usize]) -> Result<()> {
+        for &slot in resets {
+            ensure!(
+                slot < GLM52_MAX_BATCH_PER_RANK,
+                "GLM5.2 MTP reset slot {slot} is outside \
+                 0..{GLM52_MAX_BATCH_PER_RANK}"
+            );
+            self.committed_lens[slot] = 0;
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn propose(
         &mut self,
@@ -237,46 +252,51 @@ impl Glm52NativeMtp {
         lm_head: &DeviceMatrix,
         cos_table: &DeviceMatrix,
         sin_table: &DeviceMatrix,
-        source_hidden: &Rows<GLM52_HIDDEN>,
-        mode: Glm52MtpRoundMode,
-        context_bucket: usize,
-        draft_bucket: usize,
-        resets: &[usize],
-        appends: &[Glm52MtpAppend],
-        proposal_slots: &[usize],
+        target_final_normed: &Rows<GLM52_HIDDEN>,
+        round: &Glm52MtpRound,
     ) -> Result<Vec<[u32; GLM52_MTP_DRAFTS]>> {
-        for &slot in resets {
-            ensure!(slot < GLM52_MAX_BATCH_PER_RANK, "MTP reset slot {slot}");
-            self.committed_lens[slot] = 0;
-        }
+        let (context_bucket, appends, proposal) = match round {
+            Glm52MtpRound::Context {
+                context_bucket,
+                appends,
+                ..
+            } => (*context_bucket, appends.as_slice(), None),
+            Glm52MtpRound::Propose {
+                context_bucket,
+                draft_bucket,
+                appends,
+                proposal_slots,
+                ..
+            } => (
+                *context_bucket,
+                appends.as_slice(),
+                Some((*draft_bucket, proposal_slots.as_slice())),
+            ),
+            Glm52MtpRound::Reset { .. } => {
+                unreachable!("reset-only MTP rounds return before target hidden is selected")
+            }
+        };
+        let proposal_slots = proposal.map_or(&[][..], |(_, slots)| slots);
         ensure!(
-            appends.len() <= context_bucket && proposal_slots.len() <= draft_bucket,
-            "GLM5.2 MTP packed rows exceed their collective buckets"
+            appends.len() <= context_bucket,
+            "GLM5.2 MTP context rows {} exceed collective bucket {context_bucket}",
+            appends.len(),
         );
         ensure!(
             proposal_slots.windows(2).all(|pair| pair[0] < pair[1]),
             "GLM5.2 MTP proposal slots must be strictly ascending"
         );
-        match mode {
-            Glm52MtpRoundMode::ResetOnly => {
-                ensure!(
-                    appends.is_empty() && proposal_slots.is_empty(),
-                    "GLM5.2 MTP reset-only round carried context or proposals"
-                );
-                return Ok(Vec::new());
-            }
-            Glm52MtpRoundMode::ContextOnly => ensure!(
-                proposal_slots.is_empty(),
-                "GLM5.2 MTP context-only round carried proposals"
-            ),
-            Glm52MtpRoundMode::Propose => {}
-        }
         let context_index = self.bucket_index(context_bucket)?;
         for (packed, append) in appends.iter().enumerate() {
             ensure!(
                 append.slot < GLM52_MAX_BATCH_PER_RANK
-                    && append.source_row < source_hidden.tokens(),
-                "GLM5.2 MTP append is outside source/slot bounds: {append:?}"
+                    && append.target_row < target_final_normed.tokens(),
+                "GLM5.2 MTP append target row {} or slot {} is out of bounds \
+                 (target rows {}, slots {})",
+                append.target_row,
+                append.slot,
+                target_final_normed.tokens(),
+                GLM52_MAX_BATCH_PER_RANK,
             );
             ensure!(
                 append.position == self.committed_lens[append.slot],
@@ -285,9 +305,9 @@ impl Glm52NativeMtp {
                 append.position,
                 self.committed_lens[append.slot]
             );
-            let src = source_hidden
+            let src = target_final_normed
                 .data()
-                .slice(append.source_row * GLM52_HIDDEN..(append.source_row + 1) * GLM52_HIDDEN);
+                .slice(append.target_row * GLM52_HIDDEN..(append.target_row + 1) * GLM52_HIDDEN);
             let mut dst = self.buckets[context_index]
                 .previous
                 .data_mut()
@@ -311,9 +331,14 @@ impl Glm52NativeMtp {
             &context_inputs,
             Glm52LayerIndexMode::Normal,
         )?;
-        if mode == Glm52MtpRoundMode::ContextOnly {
+        let Some((draft_bucket, proposal_slots)) = proposal else {
             return Ok(Vec::new());
-        }
+        };
+        ensure!(
+            proposal_slots.len() <= draft_bucket,
+            "GLM5.2 MTP proposal rows {} exceed collective bucket {draft_bucket}",
+            proposal_slots.len(),
+        );
         let mut last_rows = Vec::with_capacity(proposal_slots.len());
         for &slot in proposal_slots {
             let row = appends
@@ -324,10 +349,10 @@ impl Glm52NativeMtp {
         }
         let context_tokens = self.argmax_host(ctx, context_index)?;
         let draft_index = self.bucket_index(draft_bucket)?;
-        for (packed, (&slot, &source_row)) in proposal_slots.iter().zip(&last_rows).enumerate() {
+        for (packed, (&slot, &context_row)) in proposal_slots.iter().zip(&last_rows).enumerate() {
             let src_topk = self.buckets[context_index].scratch.idx.global_slots.slice(
-                source_row * GLM52_FLASHMLA_SPARSE_TOPK
-                    ..(source_row + 1) * GLM52_FLASHMLA_SPARSE_TOPK,
+                context_row * GLM52_FLASHMLA_SPARSE_TOPK
+                    ..(context_row + 1) * GLM52_FLASHMLA_SPARSE_TOPK,
             );
             let mut dst_topk = self.shared_topk.slice_mut(
                 packed * GLM52_FLASHMLA_SPARSE_TOPK..(packed + 1) * GLM52_FLASHMLA_SPARSE_TOPK,
@@ -337,7 +362,7 @@ impl Glm52NativeMtp {
                 .scratch
                 .final_normed
                 .data()
-                .slice(source_row * GLM52_HIDDEN..(source_row + 1) * GLM52_HIDDEN);
+                .slice(context_row * GLM52_HIDDEN..(context_row + 1) * GLM52_HIDDEN);
             let mut dst_hidden = self.buckets[draft_index]
                 .previous
                 .data_mut()
@@ -437,7 +462,10 @@ impl Glm52NativeMtp {
         for (row, &(slot, token, position)) in inputs.iter().enumerate() {
             ensure!(
                 row < rows && slot < GLM52_MAX_BATCH_PER_RANK && position < self.max_model_len,
-                "GLM5.2 MTP input row/slot/position outside its launch cap"
+                "GLM5.2 MTP input row {row}/{rows}, slot \
+                 {slot}/{GLM52_MAX_BATCH_PER_RANK}, or position \
+                 {position}/{} is out of bounds",
+                self.max_model_len,
             );
             tokens[row] = token;
             positions[row] = position as u32;
@@ -466,7 +494,7 @@ impl Glm52NativeMtp {
         let Glm52MtpBucket {
             sched,
             scratch,
-            head_scratch,
+            bookend_scratch,
             embeds,
             previous,
             decoder_input,
@@ -493,11 +521,11 @@ impl Glm52NativeMtp {
             glm52_embed_into(ctx, embed, &self.token_ids, embeds)?;
             glm52_mtp_prepare_into(
                 ctx,
-                &self.head,
+                &self.bookend,
                 &self.positions,
                 embeds,
                 previous,
-                head_scratch,
+                bookend_scratch,
                 decoder_input,
             )?;
             ctx.stream
@@ -538,7 +566,12 @@ impl Glm52NativeMtp {
                 crate::weights::GLM52_EP_RANKS * rows,
             )?;
             glm52_layer_finish(ctx, scratch, 0, false)?;
-            glm52_mtp_recycle_into(ctx, &self.head, &scratch.hidden, &mut scratch.final_normed)?;
+            glm52_mtp_recycle_into(
+                ctx,
+                &self.bookend,
+                &scratch.hidden,
+                &mut scratch.final_normed,
+            )?;
             glm52_lm_head_into(ctx, &scratch.final_normed, lm_head, &mut scratch.logits)?;
             argmax_bf16_split_into(
                 ctx,
@@ -560,10 +593,12 @@ impl Glm52NativeMtp {
         values
             .iter()
             .zip(indices)
-            .map(|(value, index)| {
+            .enumerate()
+            .map(|(row, (value, index))| {
                 ensure!(
                     value.to_f32().is_finite() && index >= 0,
-                    "GLM5.2 MTP produced a non-finite/negative argmax"
+                    "GLM5.2 MTP row {row} produced invalid argmax value {} at index {index}",
+                    value.to_f32(),
                 );
                 u32::try_from(index).context("GLM5.2 MTP argmax does not fit u32")
             })

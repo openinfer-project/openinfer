@@ -156,8 +156,8 @@ impl Glm52PrefillBatch {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Glm52MtpAppend {
-    /// Row in the target step's retained raw-hidden buffer.
-    pub(crate) source_row: usize,
+    /// Row in the target step's retained final-normalized hidden buffer.
+    pub(crate) target_row: usize,
     pub(crate) slot: usize,
     /// Sequence token shifted one place to the left, matching vLLM's MTP
     /// first-pass input construction.
@@ -165,14 +165,47 @@ pub(crate) struct Glm52MtpAppend {
     pub(crate) position: usize,
 }
 
-/// Fleet-wide work selected by the coordinator for one native-MTP round.
-/// Every EP rank receives the same mode; choosing from rank-local occupancy
-/// would let an empty rank skip collectives that its peers enter.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Glm52MtpRoundMode {
-    ResetOnly,
-    ContextOnly,
-    Propose,
+/// One rank's work in a fleet-wide native-MTP round. The coordinator selects
+/// the same variant for every EP rank, including empty ranks, so no worker can
+/// skip a collective entered by its peers.
+#[derive(Debug)]
+pub(crate) enum Glm52MtpRound {
+    Reset {
+        resets: Vec<usize>,
+    },
+    Context {
+        source_bucket: usize,
+        context_bucket: usize,
+        resets: Vec<usize>,
+        appends: Vec<Glm52MtpAppend>,
+    },
+    Propose {
+        source_bucket: usize,
+        context_bucket: usize,
+        draft_bucket: usize,
+        resets: Vec<usize>,
+        appends: Vec<Glm52MtpAppend>,
+        proposal_slots: Vec<usize>,
+    },
+}
+
+impl Glm52MtpRound {
+    pub(crate) fn resets(&self) -> &[usize] {
+        match self {
+            Self::Reset { resets }
+            | Self::Context { resets, .. }
+            | Self::Propose { resets, .. } => resets,
+        }
+    }
+
+    pub(crate) fn source_bucket(&self) -> Option<usize> {
+        match self {
+            Self::Reset { .. } => None,
+            Self::Context { source_bucket, .. } | Self::Propose { source_bucket, .. } => {
+                Some(*source_bucket)
+            }
+        }
+    }
 }
 
 enum Glm52RankCommand {
@@ -257,13 +290,7 @@ enum Glm52RankCommand {
     /// including ranks with no live proposal, and uses the coordinator-agreed
     /// context/draft buckets for the layer-78 MoE collectives.
     MtpDraft {
-        mode: Glm52MtpRoundMode,
-        source_bucket: usize,
-        context_bucket: usize,
-        draft_bucket: usize,
-        resets: Vec<usize>,
-        appends: Vec<Glm52MtpAppend>,
-        proposal_slots: Vec<usize>,
+        round: Glm52MtpRound,
         resp: Sender<Result<Vec<[u32; crate::mtp::GLM52_MTP_DRAFTS]>>>,
     },
     /// Rank-local, vLLM-compat P/D only: deinterleave the RoPE dims of pages
@@ -477,24 +504,12 @@ impl Glm52RankWorker {
 
     pub(crate) fn mtp_draft_async(
         &self,
-        mode: Glm52MtpRoundMode,
-        source_bucket: usize,
-        context_bucket: usize,
-        draft_bucket: usize,
-        resets: Vec<usize>,
-        appends: Vec<Glm52MtpAppend>,
-        proposal_slots: Vec<usize>,
+        round: Glm52MtpRound,
     ) -> Result<Receiver<Result<Vec<[u32; crate::mtp::GLM52_MTP_DRAFTS]>>>> {
         let (resp_tx, resp_rx) = bounded(1);
         self.tx
             .send(Glm52RankCommand::MtpDraft {
-                mode,
-                source_bucket,
-                context_bucket,
-                draft_bucket,
-                resets,
-                appends,
-                proposal_slots,
+                round,
                 resp: resp_tx,
             })
             .map_err(|_| anyhow::anyhow!("GLM5.2 rank worker channel closed"))?;
@@ -665,24 +680,10 @@ impl Glm52Worker {
 
     pub(crate) fn mtp_draft_async(
         &self,
-        mode: Glm52MtpRoundMode,
-        source_bucket: usize,
-        context_bucket: usize,
-        draft_bucket: usize,
-        resets: Vec<usize>,
-        appends: Vec<Glm52MtpAppend>,
-        proposal_slots: Vec<usize>,
+        round: Glm52MtpRound,
     ) -> Result<Receiver<Result<Vec<[u32; crate::mtp::GLM52_MTP_DRAFTS]>>>> {
         match self {
-            Self::Local(worker) => worker.mtp_draft_async(
-                mode,
-                source_bucket,
-                context_bucket,
-                draft_bucket,
-                resets,
-                appends,
-                proposal_slots,
-            ),
+            Self::Local(worker) => worker.mtp_draft_async(round),
             Self::Remote(_) => {
                 anyhow::bail!("GLM5.2 native MTP currently requires all EP ranks in one process")
             }
@@ -978,13 +979,7 @@ impl Glm52RankThreadState {
 
     fn mtp_draft(
         &mut self,
-        mode: Glm52MtpRoundMode,
-        source_bucket: usize,
-        context_bucket: usize,
-        draft_bucket: usize,
-        resets: &[usize],
-        appends: &[Glm52MtpAppend],
-        proposal_slots: &[usize],
+        round: &Glm52MtpRound,
     ) -> Result<Vec<[u32; crate::mtp::GLM52_MTP_DRAFTS]>> {
         let dev_ctx = self.ctx.device_context()?;
         let runtime = self
@@ -998,13 +993,7 @@ impl Glm52RankThreadState {
                 .ep8
                 .as_mut()
                 .context("GLM5.2 native MTP requires the EP8 collective state")?,
-            mode,
-            source_bucket,
-            context_bucket,
-            draft_bucket,
-            resets,
-            appends,
-            proposal_slots,
+            round,
         )
     }
 
@@ -1253,25 +1242,8 @@ fn rank_worker_loop(rx: &Receiver<Glm52RankCommand>, mut state: Glm52RankThreadS
             } => {
                 let _ = resp.send(state.draft(bucket, &resets, &appends, &proposals));
             }
-            Glm52RankCommand::MtpDraft {
-                mode,
-                source_bucket,
-                context_bucket,
-                draft_bucket,
-                resets,
-                appends,
-                proposal_slots,
-                resp,
-            } => {
-                let _ = resp.send(state.mtp_draft(
-                    mode,
-                    source_bucket,
-                    context_bucket,
-                    draft_bucket,
-                    &resets,
-                    &appends,
-                    &proposal_slots,
-                ));
+            Glm52RankCommand::MtpDraft { round, resp } => {
+                let _ = resp.send(state.mtp_draft(&round));
             }
             Glm52RankCommand::Shutdown => break,
         }

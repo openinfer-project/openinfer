@@ -876,14 +876,15 @@ impl Glm52RankModel {
         ctx: &DeviceContext,
         aux: &DeviceContext,
         ep: &mut Glm52MoeEpState,
-        mode: crate::runner::Glm52MtpRoundMode,
-        source_bucket: usize,
-        context_bucket: usize,
-        draft_bucket: usize,
-        resets: &[usize],
-        appends: &[crate::runner::Glm52MtpAppend],
-        proposal_slots: &[usize],
+        round: &crate::runner::Glm52MtpRound,
     ) -> Result<Vec<[u32; crate::mtp::GLM52_MTP_DRAFTS]>> {
+        let Some(source_bucket) = round.source_bucket() else {
+            self.mtp
+                .as_mut()
+                .context("GLM5.2 native MTP command reached a model without MTP weights")?
+                .reset_slots(round.resets())?;
+            return Ok(Vec::new());
+        };
         let source_index = self
             .buckets
             .iter()
@@ -896,12 +897,13 @@ impl Glm52RankModel {
             })?;
         // Official vLLM feeds MTP the target model return, which is after
         // final RMSNorm for GLM5.2. The pre-norm residual is not an
-        // interchangeable EAGLE feature even when target top-1 is unchanged.
-        let source_hidden = &self.buckets[source_index].scratch.final_normed;
+        // interchangeable MTP input even when target top-1 is unchanged.
+        let target_final_normed = &self.buckets[source_index].scratch.final_normed;
         let mtp = self
             .mtp
             .as_mut()
             .context("GLM5.2 native MTP command reached a model without MTP weights")?;
+        mtp.reset_slots(round.resets())?;
         mtp.propose(
             ctx,
             aux,
@@ -910,13 +912,8 @@ impl Glm52RankModel {
             &self.lm_head,
             &self.cos_table,
             &self.sin_table,
-            source_hidden,
-            mode,
-            context_bucket,
-            draft_bucket,
-            resets,
-            appends,
-            proposal_slots,
+            target_final_normed,
+            round,
         )
     }
 

@@ -76,24 +76,34 @@ use crate::model::glm52_pool_blocks;
 pub const GLM52_PREFILL_CHUNK_ALIGN: usize = GLM52_MODEL_LEN_ALIGN;
 pub const GLM52_DEFAULT_PREFILL_CHUNK_SIZE: usize = 16_384;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
-pub(crate) enum Glm52Drafter {
+/// Optional speculative decoder used by the GLM5.2 engine.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub enum Glm52Drafter {
     None,
-    Dspark,
-    Mtp,
+    /// External DSpark checkpoint.
+    Dspark(PathBuf),
+    /// Checkpoint-native layer-78 multi-token prediction decoder.
+    NativeMtp,
 }
 
 impl Glm52Drafter {
-    fn enabled(self) -> bool {
-        self != Self::None
+    fn enabled(&self) -> bool {
+        !matches!(self, Self::None)
     }
 
-    fn is_dspark(self) -> bool {
-        self == Self::Dspark
+    fn is_dspark(&self) -> bool {
+        matches!(self, Self::Dspark(_))
     }
 
-    fn is_mtp(self) -> bool {
-        self == Self::Mtp
+    fn is_mtp(&self) -> bool {
+        matches!(self, Self::NativeMtp)
+    }
+
+    fn dspark_path(&self) -> Option<&Path> {
+        match self {
+            Self::Dspark(path) => Some(path),
+            Self::None | Self::NativeMtp => None,
+        }
     }
 }
 
@@ -109,17 +119,10 @@ pub struct Glm52PrefillOnlyOptions {
 pub struct Glm52LaunchOptions {
     pub tp_size: usize,
     pub dp_size: usize,
-    /// DSpark drafter checkpoint dir (`RedHatAI/GLM-5.2-speculator.dspark`).
-    /// Enables speculative decoding for greedy AND sampled requests (the
-    /// verify span prefix-matches per-row sampled tokens — lossless): verify
-    /// spans ride the decode buckets, accepted tokens commit in batches,
-    /// per-request accept stats are logged on release.
-    pub dspark_draft_model_path: Option<std::path::PathBuf>,
-    /// Use the checkpoint's native layer-78 MTP head and propose five tokens
-    /// per speculative round. The first production lane is single-node EP8:
-    /// the MTP MoE layer is itself an EP collective and all ranks must enter
-    /// its five forwards in lock-step.
-    pub native_mtp: bool,
+    /// Optional speculative decoder. DSpark enables lossless speculative
+    /// sampling from an external checkpoint; native MTP uses the checkpoint's
+    /// layer-78 decoder and currently requires single-node EP8.
+    pub drafter: Glm52Drafter,
     /// Per-request context cap (`prompt + max_tokens - 1 <= max_model_len`).
     /// `None` sizes it from the post-weight-load free VRAM (fleet minimum);
     /// an explicit value is still validated against that budget so an
@@ -129,14 +132,15 @@ pub struct Glm52LaunchOptions {
     pub prefill_only: Option<Glm52PrefillOnlyOptions>,
     /// vLLM-style kill switch: disable prefix matching outright (every
     /// prefill recomputes the full prompt). Prefix caching is also forced
-    /// off while the DSpark drafter is on — the draft lane needs the
-    /// aux-hidden captures a skipped prefix never produces.
+    /// off while a speculative decoder is on: DSpark needs aux-hidden
+    /// captures for every prefix row, while native MTP needs target hidden
+    /// states and uninterrupted MTP KV continuity.
     pub no_prefix_cache: bool,
     /// `Some` adds the pegaflow host tier under the prefix cache: sealed KV
     /// blocks flow to one shared pinned pool on request release, and a
     /// prompt whose prefix fell out of HBM restores from it at admission.
-    /// Requires the prefix cache (rejected at launch alongside the DSpark
-    /// drafter or `no_prefix_cache`).
+    /// Requires the prefix cache (rejected at launch alongside any
+    /// speculative decoder or `no_prefix_cache`).
     pub kv_offload: Option<Glm52KvOffloadOptions>,
     /// Launch-time MoE sharding topology. `Ep8` (default) is the
     /// high-throughput configuration: 32 whole experts per rank, DeepEP
@@ -440,8 +444,7 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
     let Glm52LaunchOptions {
         tp_size,
         dp_size,
-        dspark_draft_model_path,
-        native_mtp,
+        drafter,
         max_model_len,
         prefill_only,
         no_prefix_cache,
@@ -451,12 +454,7 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
         dump_graph_png,
         rank_hosts,
     } = options;
-    ensure!(
-        dspark_draft_model_path.is_none() || !native_mtp,
-        "GLM5.2 accepts exactly one drafter: drop either --dflash-draft-model-path or \
-         --glm52-native-mtp"
-    );
-    if native_mtp {
+    if drafter.is_mtp() {
         ensure!(
             moe_topo == Glm52MoeTopo::Ep8,
             "GLM5.2 native MTP currently requires the single-node EP8 topology"
@@ -466,13 +464,6 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
             "GLM5.2 native MTP currently requires all eight EP ranks in one process"
         );
     }
-    let drafter = if native_mtp {
-        Glm52Drafter::Mtp
-    } else if dspark_draft_model_path.is_some() {
-        Glm52Drafter::Dspark
-    } else {
-        Glm52Drafter::None
-    };
     if let Some(path) = &dump_graph_png {
         openinfer_core::cuda_graph::validate_graph_dump_request(path)?;
     }
@@ -598,7 +589,6 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
             ep_size: moe_topo.expected_ep_size(),
             rank_hosts,
         },
-        dspark_draft_model_path.as_deref(),
         drafter,
         max_model_len,
         prefill_only,
@@ -661,7 +651,7 @@ struct Glm52ContextBudget {
 /// arenas plus the selected speculative lane.
 fn glm52_cap_bytes(
     max_model_len: usize,
-    drafter: Glm52Drafter,
+    drafter: &Glm52Drafter,
     prefill_only: bool,
 ) -> Result<usize> {
     let pool_slots = if prefill_only {
@@ -701,7 +691,7 @@ fn glm52_prefill_scratch_reservation(
 fn derive_max_model_len(
     requested: Option<usize>,
     min_free_vram_bytes: usize,
-    drafter: Glm52Drafter,
+    drafter: &Glm52Drafter,
     prefill_scratch_bytes: usize,
     prefill_only: bool,
 ) -> Result<Glm52ContextBudget> {
@@ -810,7 +800,6 @@ struct LoadedGlm52Runtime {
 fn start_engine(
     model_path: &Path,
     options: &Glm52LoadOptions,
-    dspark_path: Option<&Path>,
     drafter: Glm52Drafter,
     requested_max_model_len: Option<usize>,
     prefill_only: Option<Glm52PrefillOnlyOptions>,
@@ -820,10 +809,6 @@ fn start_engine(
     weight_staging: bool,
     dump_graph_png: Option<PathBuf>,
 ) -> Result<EngineHandle> {
-    ensure!(
-        drafter.is_dspark() == dspark_path.is_some(),
-        "GLM5.2 drafter/path startup contract drifted"
-    );
     let startup = validate_startup(model_path, options, moe_topo, drafter.is_mtp())?;
     let loaded = load_rank_weights_to_gpu(model_path, &startup, moe_topo, weight_staging)?;
     log::info!(
@@ -848,7 +833,7 @@ fn start_engine(
     let budget = derive_max_model_len(
         requested_max_model_len,
         min_free_vram_bytes.saturating_sub(qa_kva_twin_bytes),
-        drafter,
+        &drafter,
         glm52_prefill_scratch_reservation(prefill_only)?,
         prefill_only.is_some(),
     )?;
@@ -906,7 +891,7 @@ fn start_engine(
         &loaded.workers,
         max_model_len,
         moe_topo,
-        drafter,
+        &drafter,
         prefill_only.map(|options| options.chunk_size),
     ) {
         Ok(rank_arenas) => rank_arenas,
@@ -924,7 +909,7 @@ fn start_engine(
         if prefill_only.is_some() {
             preflight_prefill_kernels(&loaded.workers)?;
         }
-        if let Some(dspark_path) = dspark_path {
+        if let Some(dspark_path) = drafter.dspark_path() {
             load_dspark_drafters(&loaded.workers, dspark_path)?;
         }
         ensure_post_build_headroom(&loaded.workers)?;
@@ -1121,14 +1106,19 @@ fn build_rank_models(
     workers: &[Glm52Worker],
     max_model_len: usize,
     moe_topo: Glm52MoeTopo,
-    drafter: Glm52Drafter,
+    drafter: &Glm52Drafter,
     prefill_chunk_size: Option<usize>,
 ) -> Result<Vec<Vec<KvArena>>> {
     let build_started = Instant::now();
     let responses = workers
         .iter()
         .map(|worker| {
-            worker.build_model_async(max_model_len, moe_topo, drafter, prefill_chunk_size)
+            worker.build_model_async(
+                max_model_len,
+                moe_topo,
+                drafter.clone(),
+                prefill_chunk_size,
+            )
         })
         .collect::<Result<Vec<_>>>()?;
     let mut rank_arenas = Vec::with_capacity(responses.len());
@@ -1486,7 +1476,7 @@ mod max_model_len_tests {
     /// Free VRAM that budgets exactly a `cap`-token context (exact ledger +
     /// reserve) — inverted through the same `glm52_cap_bytes` the derivation
     /// uses, so the tests exercise the policy, not a parallel formula.
-    fn free_for(cap: usize, drafter: Glm52Drafter, prefill_scratch_bytes: usize) -> usize {
+    fn free_for(cap: usize, drafter: &Glm52Drafter, prefill_scratch_bytes: usize) -> usize {
         let reserve = GLM52_VRAM_RESERVE_BYTES
             + if drafter.is_dspark() {
                 GLM52_DSPARK_VRAM_RESERVE_BYTES
@@ -1501,8 +1491,8 @@ mod max_model_len_tests {
     fn derived_cap_is_aligned_and_scales_with_free_vram() {
         let cap = derive_max_model_len(
             None,
-            free_for(10_048, Glm52Drafter::None, 0),
-            Glm52Drafter::None,
+            free_for(10_048, &Glm52Drafter::None, 0),
+            &Glm52Drafter::None,
             0,
             false,
         )
@@ -1512,8 +1502,8 @@ mod max_model_len_tests {
         assert!(cap.is_multiple_of(GLM52_MODEL_LEN_ALIGN));
         let larger = derive_max_model_len(
             None,
-            free_for(50_048, Glm52Drafter::None, 0),
-            Glm52Drafter::None,
+            free_for(50_048, &Glm52Drafter::None, 0),
+            &Glm52Drafter::None,
             0,
             false,
         )
@@ -1524,11 +1514,12 @@ mod max_model_len_tests {
 
     #[test]
     fn dspark_lane_shrinks_the_derived_cap() {
-        let free = free_for(50_048, Glm52Drafter::None, 0);
-        let plain =
-            derive_max_model_len(None, free, Glm52Drafter::None, 0, false).expect("derive");
+        let free = free_for(50_048, &Glm52Drafter::None, 0);
+        let plain = derive_max_model_len(None, free, &Glm52Drafter::None, 0, false)
+            .expect("derive");
+        let dspark_drafter = Glm52Drafter::Dspark(PathBuf::from("draft"));
         let dspark =
-            derive_max_model_len(None, free, Glm52Drafter::Dspark, 0, false).expect("derive");
+            derive_max_model_len(None, free, &dspark_drafter, 0, false).expect("derive");
         assert!(
             dspark.max_model_len < plain.max_model_len,
             "dspark cap-scaled cost must shrink the cap"
@@ -1537,18 +1528,26 @@ mod max_model_len_tests {
 
     #[test]
     fn native_mtp_lane_shrinks_the_derived_cap() {
-        let free = free_for(50_048, Glm52Drafter::None, 0);
-        let plain =
-            derive_max_model_len(None, free, Glm52Drafter::None, 0, false).expect("derive");
-        let native_mtp =
-            derive_max_model_len(None, free, Glm52Drafter::Mtp, 0, false).expect("derive");
+        let free = free_for(50_048, &Glm52Drafter::None, 0);
+        let plain = derive_max_model_len(None, free, &Glm52Drafter::None, 0, false)
+            .expect("derive");
+        let native_mtp = derive_max_model_len(
+            None,
+            free,
+            &Glm52Drafter::NativeMtp,
+            0,
+            false,
+        )
+        .expect("derive");
         assert!(
             native_mtp.max_model_len < plain.max_model_len,
             "native MTP cap-scaled KV must shrink the target context cap"
         );
         assert!(
-            glm52_cap_bytes(50_048, Glm52Drafter::Mtp, false).expect("MTP cap bytes")
-                > glm52_cap_bytes(50_048, Glm52Drafter::None, false).expect("plain cap bytes"),
+            glm52_cap_bytes(50_048, &Glm52Drafter::NativeMtp, false)
+                .expect("MTP cap bytes")
+                > glm52_cap_bytes(50_048, &Glm52Drafter::None, false)
+                    .expect("plain cap bytes"),
             "native MTP must be represented in the exact memory ledger"
         );
     }
@@ -1558,7 +1557,7 @@ mod max_model_len_tests {
         let budget = derive_max_model_len(
             None,
             usize::MAX / 2,
-            Glm52Drafter::None,
+            &Glm52Drafter::None,
             0,
             false,
         )
@@ -1570,8 +1569,8 @@ mod max_model_len_tests {
     fn too_little_vram_fails_instead_of_serving_a_toy_cap() {
         let err = derive_max_model_len(
             None,
-            free_for(1024, Glm52Drafter::None, 0),
-            Glm52Drafter::None,
+            free_for(1024, &Glm52Drafter::None, 0),
+            &Glm52Drafter::None,
             0,
             false,
         )
@@ -1583,8 +1582,8 @@ mod max_model_len_tests {
     fn unaligned_requested_cap_is_rejected_with_the_nearest_valid_values() {
         let err = derive_max_model_len(
             Some(5000),
-            free_for(100_032, Glm52Drafter::None, 0),
-            Glm52Drafter::None,
+            free_for(100_032, &Glm52Drafter::None, 0),
+            &Glm52Drafter::None,
             0,
             false,
         )
@@ -1600,8 +1599,8 @@ mod max_model_len_tests {
     fn requested_cap_beyond_the_budget_fails_at_launch() {
         let err = derive_max_model_len(
             Some(99_968),
-            free_for(10_048, Glm52Drafter::None, 0),
-            Glm52Drafter::None,
+            free_for(10_048, &Glm52Drafter::None, 0),
+            &Glm52Drafter::None,
             0,
             false,
         )
@@ -1613,8 +1612,8 @@ mod max_model_len_tests {
     fn requested_cap_below_the_minimum_fails() {
         derive_max_model_len(
             Some(1024),
-            free_for(100_032, Glm52Drafter::None, 0),
-            Glm52Drafter::None,
+            free_for(100_032, &Glm52Drafter::None, 0),
+            &Glm52Drafter::None,
             0,
             false,
         )
@@ -1628,10 +1627,10 @@ mod max_model_len_tests {
         };
         let scratch =
             glm52_prefill_scratch_reservation(Some(prefill)).expect("prefill reservation");
-        let free = free_for(100_032, Glm52Drafter::None, 0);
-        let decode = derive_max_model_len(None, free, Glm52Drafter::None, 0, false)
+        let free = free_for(100_032, &Glm52Drafter::None, 0);
+        let decode = derive_max_model_len(None, free, &Glm52Drafter::None, 0, false)
             .expect("decode budget");
-        let prefill = derive_max_model_len(None, free, Glm52Drafter::None, scratch, true)
+        let prefill = derive_max_model_len(None, free, &Glm52Drafter::None, scratch, true)
             .expect("prefill budget");
         assert!(
             prefill.max_model_len > decode.max_model_len,

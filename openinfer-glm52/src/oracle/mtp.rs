@@ -36,10 +36,11 @@ use super::layer_ep8::run_layer_prefill_ep8;
 use super::layer_ep8::run_moe_ep8_rows;
 use crate::bookend::glm52_lm_head_into;
 use crate::config::GLM52_HIDDEN;
+use crate::config::GLM52_MTP_LAYER;
 use crate::config::GLM52_VOCAB;
 use crate::moe_ep8::Glm52MoeEp8State;
 use crate::moe_ep8::glm52_moe_ep8_routed_forward;
-use crate::mtp::Glm52MtpHeadWeights;
+use crate::mtp::Glm52MtpBookendWeights;
 use crate::mtp::Glm52MtpScratch;
 use crate::mtp::glm52_mtp_prepare_into;
 use crate::mtp::glm52_mtp_recycle_into;
@@ -48,7 +49,6 @@ use crate::weights::Glm52WeightManifest;
 use crate::weights::mmap_file;
 
 const ROWS: usize = 5;
-const MTP_LAYER: usize = 78;
 const EP_RANKS: usize = 8;
 const VLLM_COMMIT: &str = "dcfebf93f4eccf30f71872283331eee757915daf";
 const MODEL_CONFIG_SHA256: &str =
@@ -169,9 +169,9 @@ fn load_mtp_head_weights(
     ctx: &DeviceContext,
     manifest: &Glm52WeightManifest,
     model_path: &Path,
-) -> Result<Glm52MtpHeadWeights> {
+) -> Result<Glm52MtpBookendWeights> {
     let prefix = "model.layers.78";
-    Glm52MtpHeadWeights::from_host(
+    Glm52MtpBookendWeights::from_host(
         ctx,
         &checkpoint_tensor(manifest, model_path, &format!("{prefix}.enorm.weight"))?,
         &checkpoint_tensor(manifest, model_path, &format!("{prefix}.hnorm.weight"))?,
@@ -436,7 +436,7 @@ fn mtp_layer78_vllm_ep8_golden_gate() -> Result<()> {
     let expected = bf16_tensor(&fixture, "raw_hidden", &[ROWS, GLM52_HIDDEN])?;
     let model_path = model_path();
     let unique_id = glm52_ep_deepep_unique_id(EP_RANKS)?;
-    let tensors = Arc::new(LayerTensors::load(&model_path, MTP_LAYER)?);
+    let tensors = Arc::new(LayerTensors::load(&model_path, GLM52_MTP_LAYER)?);
 
     let handles: Vec<_> = (1..EP_RANKS)
         .map(|rank| {
@@ -445,7 +445,8 @@ fn mtp_layer78_vllm_ep8_golden_gate() -> Result<()> {
                 .name(format!("mtp-ep8-gate-rank-{rank}"))
                 .spawn(move || -> Result<()> {
                     let ctx = DeviceContext::new_with_device(rank)?;
-                    let bank = load_rank_expert_bank(&ctx, &tensors, MTP_LAYER, rank, EP_RANKS)?;
+                    let bank =
+                        load_rank_expert_bank(&ctx, &tensors, GLM52_MTP_LAYER, rank, EP_RANKS)?;
                     let mut ep8 = Glm52MoeEp8State::new(&ctx, &unique_id, EP_RANKS, rank)?;
                     for _ in 0..2 * ROWS {
                         let dispatched =
@@ -482,7 +483,12 @@ fn mtp_layer78_vllm_ep8_golden_gate() -> Result<()> {
         &mut prepared_decoder_input,
     )?;
     let prepared_decoder_input = ctx.stream.clone_dtoh(prepared_decoder_input.data())?;
-    let weights = load_decoder_layer(&ctx, &model_path, MTP_LAYER, GateLayerMlp::MoeEp8Rank0)?;
+    let weights = load_decoder_layer(
+        &ctx,
+        &model_path,
+        GLM52_MTP_LAYER,
+        GateLayerMlp::MoeEp8Rank0,
+    )?;
     let mut ep8 = Glm52MoeEp8State::new(&ctx, &unique_id, EP_RANKS, 0)?;
     let actual = run_layer_prefill_ep8(
         &ctx,

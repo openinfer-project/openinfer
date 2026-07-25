@@ -23,7 +23,6 @@ import argparse
 import json
 import re
 import sys
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import requests
@@ -90,12 +89,9 @@ def main():
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--tokenizer", default=None, help="HF tokenizer path (for reference only)")
-    parser.add_argument("--train-file", help="Local GSM8K train JSONL")
-    parser.add_argument("--test-file", help="Local GSM8K test JSONL")
     parser.add_argument("--num-fewshot", type=int, default=8)
     parser.add_argument("--max-tokens", type=int, default=4096)
     parser.add_argument("--limit", type=int, default=0, help="0 = all samples")
-    parser.add_argument("--parallel", type=int, default=1)
     parser.add_argument("--seed", type=int, default=1234, help="per-request seed; -1 omits it (engine RNG)")
     parser.add_argument(
         "--temperature",
@@ -103,27 +99,10 @@ def main():
         default=0.0,
         help="sampling temperature (0 = greedy; >0 for sampled-score parity runs)",
     )
-    parser.add_argument(
-        "--stop-at-next-question",
-        action="store_true",
-        help="Stop non-thinking models when they begin another few-shot question",
-    )
     parser.add_argument("--output", default=None, help="Output JSON path")
     args = parser.parse_args()
 
-    if bool(args.train_file) != bool(args.test_file):
-        parser.error("--train-file and --test-file must be provided together")
-    if args.train_file:
-        train_suffix = Path(args.train_file).suffix.lstrip(".")
-        if Path(args.test_file).suffix.lstrip(".") != train_suffix:
-            parser.error("--train-file and --test-file must use the same format")
-        file_format = "json" if train_suffix == "jsonl" else train_suffix
-        ds = load_dataset(
-            file_format,
-            data_files={"train": args.train_file, "test": args.test_file},
-        )
-    else:
-        ds = load_dataset("openai/gsm8k", "main")
+    ds = load_dataset("openai/gsm8k", "main")
     train = ds["train"]
     test = ds["test"]
 
@@ -133,19 +112,19 @@ def main():
     if args.limit > 0:
         samples = samples[: args.limit]
 
+    strict_correct = 0
+    flex_correct = 0
     total = len(samples)
+    results = []
 
-    def evaluate(ex):
+    for ex in tqdm(samples, desc="Evaluating"):
         prompt = prefix + "\n\n" + f"Question: {ex['question']}\nAnswer:"
-        stop = ["<|im_end|>"]
-        if args.stop_at_next_question:
-            stop.append("\n\nQuestion:")
         payload = {
             "prompt": prompt,
             "model": args.model,
             "max_tokens": args.max_tokens,
             "temperature": args.temperature,
-            "stop": stop,
+            "stop": ["<|im_end|>"],
         }
         # seed < 0 omits the per-request seed: sampled-parity runs want the
         # engine RNG (three independent runs per arm), not a fixed replay.
@@ -166,7 +145,12 @@ def main():
         strict_match = strict is not None and normalize(strict) == normalize(gold)
         flex_match = flex is not None and normalize(flex) == normalize(gold)
 
-        return {
+        if strict_match:
+            strict_correct += 1
+        if flex_match:
+            flex_correct += 1
+
+        results.append({
             "question": ex["question"],
             "gold": gold,
             "raw_len": len(raw_text),
@@ -176,20 +160,8 @@ def main():
             "flex_pred": flex,
             "strict_match": strict_match,
             "flex_match": flex_match,
-        }
+        })
 
-    if args.parallel < 1:
-        parser.error("--parallel must be at least 1")
-    if args.parallel == 1:
-        results = list(tqdm(map(evaluate, samples), total=total, desc="Evaluating"))
-    else:
-        with ThreadPoolExecutor(max_workers=args.parallel) as executor:
-            results = list(
-                tqdm(executor.map(evaluate, samples), total=total, desc="Evaluating")
-            )
-
-    strict_correct = sum(result["strict_match"] for result in results)
-    flex_correct = sum(result["flex_match"] for result in results)
     strict_acc = strict_correct / total
     flex_acc = flex_correct / total
 
@@ -204,8 +176,6 @@ def main():
         "flex_correct": flex_correct,
         "max_tokens": args.max_tokens,
         "seed": args.seed,
-        "parallel": args.parallel,
-        "stop_at_next_question": args.stop_at_next_question,
     }
 
     print(f"\n{'='*50}")

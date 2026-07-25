@@ -9,6 +9,8 @@ use serde_json::Value;
 pub(crate) const GLM52_HIDDEN: usize = 6144;
 pub(crate) const GLM52_VOCAB: usize = 154_880;
 pub(crate) const GLM52_LAYERS: usize = 78;
+/// Checkpoint layer containing the native multi-token prediction decoder.
+pub(crate) const GLM52_MTP_LAYER: usize = GLM52_LAYERS;
 pub(crate) const GLM52_DENSE_LAYERS: usize = 3;
 /// The checkpoint's `max_position_embeddings` — `probe_config_json` pins the
 /// config to exactly this, so it doubles as the architecture ceiling any

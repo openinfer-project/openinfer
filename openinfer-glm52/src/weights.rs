@@ -19,6 +19,7 @@ use crate::config::GLM52_KV_A_OUT;
 use crate::config::GLM52_KV_B_OUT;
 use crate::config::GLM52_KV_LORA_RANK;
 use crate::config::GLM52_LAYERS;
+use crate::config::GLM52_MTP_LAYER;
 use crate::config::GLM52_O_PROJ_IN;
 use crate::config::GLM52_Q_B_OUT;
 use crate::config::GLM52_Q_LORA_RANK;
@@ -35,7 +36,6 @@ pub(crate) use load::Glm52RankGpuWeights;
 pub(crate) use load::load_rank_weights_to_gpu;
 
 const GLM52_WEIGHT_INDEX: &str = "model.safetensors.index.json";
-const GLM52_MTP_LAYER: usize = GLM52_LAYERS;
 /// The EP8 production partition (8 ranks × 32 experts). Serving-path code
 /// derives rank/expert counts from the launch topology
 /// (`Glm52MoeTopo::ep_local_experts`); these constants remain the manifest

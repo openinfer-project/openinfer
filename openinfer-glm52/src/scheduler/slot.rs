@@ -10,41 +10,55 @@ use crate::dspark::accept_prefix_match;
 
 #[cfg(test)]
 pub(crate) const MTP_PRODUCTION_GATE_REQUEST_ID: &str = "native-mtp-hidden-boundary-gate";
+#[cfg(test)]
+pub(crate) const MTP_SLOT_REUSE_GATE_REQUEST_ID: &str = "native-mtp-slot-reuse-gate";
 
 #[cfg(test)]
 #[derive(Clone, Debug, Default)]
-pub(crate) struct MtpProductionStats {
+pub(crate) struct MtpProductionGateStats {
     pub(crate) first_proposal: Option<Vec<u32>>,
     pub(crate) rounds: u64,
     pub(crate) accepted_drafts: u64,
+    pub(crate) reuse_first_proposal: Option<Vec<u32>>,
+    pub(crate) reuse_rounds: u64,
+    pub(crate) reuse_accepted_drafts: u64,
 }
 
 #[cfg(test)]
-static MTP_PRODUCTION_STATS: std::sync::LazyLock<std::sync::Mutex<MtpProductionStats>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(MtpProductionStats::default()));
+static MTP_PRODUCTION_STATS: std::sync::LazyLock<std::sync::Mutex<MtpProductionGateStats>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(MtpProductionGateStats::default()));
 
 #[cfg(test)]
 pub(crate) fn reset_mtp_production_stats() {
     *MTP_PRODUCTION_STATS
         .lock()
-        .expect("MTP production stats lock poisoned") = MtpProductionStats::default();
+        .expect("MTP production stats lock poisoned") = MtpProductionGateStats::default();
 }
 
 #[cfg(test)]
 pub(super) fn record_mtp_proposal(request_id: Option<&str>, drafts: &[u32]) {
-    if request_id != Some(MTP_PRODUCTION_GATE_REQUEST_ID) {
+    if !matches!(
+        request_id,
+        Some(MTP_PRODUCTION_GATE_REQUEST_ID | MTP_SLOT_REUSE_GATE_REQUEST_ID)
+    ) {
         return;
     }
     let mut stats = MTP_PRODUCTION_STATS
         .lock()
         .expect("MTP production stats lock poisoned");
-    if stats.first_proposal.is_none() {
-        stats.first_proposal = Some(drafts.to_vec());
+    match request_id {
+        Some(MTP_PRODUCTION_GATE_REQUEST_ID) if stats.first_proposal.is_none() => {
+            stats.first_proposal = Some(drafts.to_vec());
+        }
+        Some(MTP_SLOT_REUSE_GATE_REQUEST_ID) if stats.reuse_first_proposal.is_none() => {
+            stats.reuse_first_proposal = Some(drafts.to_vec());
+        }
+        _ => {}
     }
 }
 
 #[cfg(test)]
-pub(crate) fn mtp_production_stats() -> MtpProductionStats {
+pub(crate) fn mtp_production_stats() -> MtpProductionGateStats {
     MTP_PRODUCTION_STATS
         .lock()
         .expect("MTP production stats lock poisoned")
@@ -109,8 +123,6 @@ pub(super) struct Glm52SlotState {
     drafts: Vec<u32>,
     /// Accept telemetry across the request's verify rounds.
     spec: SpecStats,
-    #[cfg(test)]
-    mtp_production_gate: bool,
 }
 
 /// Drafts fed per verify span under EP8: 3 drafts + anchor = a bucket-4
@@ -153,14 +165,31 @@ impl Glm52SlotState {
             last_token: 0,
             drafts: Vec::new(),
             spec: SpecStats::default(),
-            #[cfg(test)]
-            mtp_production_gate: false,
         }
     }
 
     #[cfg(test)]
-    pub(super) fn enable_mtp_production_gate(&mut self) {
-        self.mtp_production_gate = true;
+    pub(super) fn record_mtp_production_gate(&self, request_id: Option<&str>) {
+        if !matches!(
+            request_id,
+            Some(MTP_PRODUCTION_GATE_REQUEST_ID | MTP_SLOT_REUSE_GATE_REQUEST_ID)
+        ) {
+            return;
+        }
+        let mut stats = MTP_PRODUCTION_STATS
+            .lock()
+            .expect("MTP production stats lock poisoned");
+        match request_id {
+            Some(MTP_PRODUCTION_GATE_REQUEST_ID) => {
+                stats.rounds = self.spec.rounds;
+                stats.accepted_drafts = self.spec.accepted_sum;
+            }
+            Some(MTP_SLOT_REUSE_GATE_REQUEST_ID) => {
+                stats.reuse_rounds = self.spec.rounds;
+                stats.reuse_accepted_drafts = self.spec.accepted_sum;
+            }
+            _ => {}
+        }
     }
 
     pub(super) fn completion_tokens(&self) -> usize {
@@ -310,14 +339,6 @@ impl Glm52SlotState {
             if drafts_fed > 0 {
                 let accepted_drafts = committed.len() - 1;
                 self.spec.record(accepted_drafts);
-                #[cfg(test)]
-                if self.mtp_production_gate {
-                    let mut stats = MTP_PRODUCTION_STATS
-                        .lock()
-                        .expect("MTP production stats lock poisoned");
-                    stats.rounds += 1;
-                    stats.accepted_drafts += accepted_drafts as u64;
-                }
             }
             let context_rows = committed.len();
             (committed, context_rows)

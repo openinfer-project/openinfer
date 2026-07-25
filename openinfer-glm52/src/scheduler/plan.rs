@@ -129,14 +129,14 @@ pub(super) fn launch_ahead_flags(
     leased_shapes: Option<&[Glm52StepShape]>,
     slots_changed: bool,
     pending_empty: bool,
-    dspark_enabled: bool,
+    drafter_enabled: bool,
     offload_enabled: bool,
     slots: &[RankSlots],
     max_model_len: usize,
 ) -> Glm52StepFlags {
     let consume = !slots_changed && leased_shapes == Some(shapes);
     let lease = pending_empty
-        && !dspark_enabled
+        && !drafter_enabled
         && !offload_enabled
         && slots
             .iter()

@@ -6,19 +6,26 @@ use super::RankSlots;
 use crate::model::GLM52_DECODE_BUCKETS;
 use crate::model::Glm52StepShape;
 use crate::runner::Glm52MtpAppend;
-use crate::runner::Glm52MtpRoundMode;
+use crate::runner::Glm52MtpRound;
 use crate::runner::Glm52Worker;
 
-fn select_round_mode(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RoundKind {
+    Reset,
+    Context,
+    Propose,
+}
+
+fn select_round_kind(
     rank_appends: &[Vec<Glm52MtpAppend>],
     rank_proposals: &[Vec<(usize, u32, usize)>],
-) -> Glm52MtpRoundMode {
+) -> RoundKind {
     if rank_proposals.iter().any(|proposals| !proposals.is_empty()) {
-        Glm52MtpRoundMode::Propose
+        RoundKind::Propose
     } else if rank_appends.iter().any(|appends| !appends.is_empty()) {
-        Glm52MtpRoundMode::ContextOnly
+        RoundKind::Context
     } else {
-        Glm52MtpRoundMode::ResetOnly
+        RoundKind::Reset
     }
 }
 
@@ -58,10 +65,11 @@ pub(super) fn run_mtp_round(
     };
     let context_bucket = pick_bucket(rank_appends.iter().map(Vec::len).max().unwrap_or(0))?;
     let draft_bucket = pick_bucket(rank_proposals.iter().map(Vec::len).max().unwrap_or(0))?;
-    let mode = select_round_mode(&rank_appends, &rank_proposals);
+    let kind = select_round_kind(&rank_appends, &rank_proposals);
 
     let mut joins = Vec::with_capacity(workers.len());
     let mut proposal_slots = Vec::with_capacity(workers.len());
+    let mut rank_errors: Vec<Option<anyhow::Error>> = (0..workers.len()).map(|_| None).collect();
     for (rank, ((worker, appends), proposals)) in workers
         .iter()
         .zip(rank_appends)
@@ -72,28 +80,75 @@ pub(super) fn run_mtp_round(
             .iter()
             .map(|&(slot, _, _)| slot)
             .collect::<Vec<_>>();
-        joins.push(worker.mtp_draft_async(
-            mode,
-            source_bucket,
-            context_bucket,
-            draft_bucket,
-            std::mem::take(&mut pending_resets[rank]),
-            appends,
-            slots_for_rank.clone(),
-        )?);
+        let resets = std::mem::take(&mut pending_resets[rank]);
+        let round = match kind {
+            RoundKind::Reset => Glm52MtpRound::Reset { resets },
+            RoundKind::Context => Glm52MtpRound::Context {
+                source_bucket,
+                context_bucket,
+                resets,
+                appends,
+            },
+            RoundKind::Propose => Glm52MtpRound::Propose {
+                source_bucket,
+                context_bucket,
+                draft_bucket,
+                resets,
+                appends,
+                proposal_slots: slots_for_rank.clone(),
+            },
+        };
+        let response = match worker.mtp_draft_async(round) {
+            Ok(response) => Some(response),
+            Err(err) => {
+                let err = err.context(format!("GLM5.2 rank {rank} MTP draft submission"));
+                log::error!("GLM5.2 rank {rank} MTP draft submission failed: {err:#}");
+                rank_errors[rank] = Some(err);
+                None
+            }
+        };
+        joins.push(response);
         proposal_slots.push(slots_for_rank);
     }
 
-    for (rank, (rx, proposal_slots)) in joins.into_iter().zip(proposal_slots).enumerate() {
-        let spans = rx
+    // Join every rank before returning an error. The first rank received can
+    // be blocked inside DeepEP and report only its device timeout; a later
+    // response may contain the pre-collective invariant failure that caused
+    // it. Preserve every error in the log and return the first in rank order.
+    let mut rank_spans = Vec::with_capacity(joins.len());
+    for (rank, (rx, expected_slots)) in joins.iter().zip(&proposal_slots).enumerate() {
+        let Some(rx) = rx else {
+            rank_spans.push(Vec::new());
+            continue;
+        };
+        let result = rx
             .recv()
-            .map_err(|_| anyhow::anyhow!("GLM5.2 rank {rank} dropped its MTP response"))??;
-        anyhow::ensure!(
-            spans.len() == proposal_slots.len(),
-            "GLM5.2 rank {rank} MTP returned {} spans for {} proposals",
-            spans.len(),
-            proposal_slots.len()
-        );
+            .map_err(|_| anyhow::anyhow!("dropped its response"))
+            .and_then(|result| result)
+            .and_then(|spans| {
+                anyhow::ensure!(
+                    spans.len() == expected_slots.len(),
+                    "returned {} spans for {} proposals",
+                    spans.len(),
+                    expected_slots.len()
+                );
+                Ok(spans)
+            });
+        match result {
+            Ok(spans) => rank_spans.push(spans),
+            Err(err) => {
+                let err = err.context(format!("GLM5.2 rank {rank} MTP draft"));
+                log::error!("GLM5.2 rank {rank} MTP draft failed: {err:#}");
+                rank_errors[rank] = Some(err);
+                rank_spans.push(Vec::new());
+            }
+        }
+    }
+    if let Some(err) = rank_errors.into_iter().flatten().next() {
+        return Err(err);
+    }
+
+    for (rank, (spans, proposal_slots)) in rank_spans.into_iter().zip(proposal_slots).enumerate() {
         for (slot_id, span) in proposal_slots.into_iter().zip(spans) {
             if let Some(active) = slots[rank][slot_id].as_mut() {
                 #[cfg(test)]
@@ -113,7 +168,7 @@ mod tests {
 
     fn append() -> Glm52MtpAppend {
         Glm52MtpAppend {
-            source_row: 0,
+            target_row: 0,
             slot: 0,
             input_token: 1,
             position: 0,
@@ -124,29 +179,20 @@ mod tests {
     fn any_rank_proposal_keeps_every_rank_in_the_collective_chain() {
         let appends = vec![vec![append()], Vec::new()];
         let proposals = vec![vec![(0, 1, 0)], Vec::new()];
-        assert_eq!(
-            select_round_mode(&appends, &proposals),
-            Glm52MtpRoundMode::Propose
-        );
+        assert_eq!(select_round_kind(&appends, &proposals), RoundKind::Propose);
     }
 
     #[test]
     fn committed_context_without_proposals_runs_only_the_first_pass() {
         let appends = vec![Vec::new(), vec![append()]];
         let proposals = vec![Vec::new(), Vec::new()];
-        assert_eq!(
-            select_round_mode(&appends, &proposals),
-            Glm52MtpRoundMode::ContextOnly
-        );
+        assert_eq!(select_round_kind(&appends, &proposals), RoundKind::Context);
     }
 
     #[test]
     fn an_empty_round_only_resets_host_state() {
         let appends = vec![Vec::new(), Vec::new()];
         let proposals = vec![Vec::new(), Vec::new()];
-        assert_eq!(
-            select_round_mode(&appends, &proposals),
-            Glm52MtpRoundMode::ResetOnly
-        );
+        assert_eq!(select_round_kind(&appends, &proposals), RoundKind::Reset);
     }
 }
