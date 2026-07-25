@@ -4,8 +4,10 @@
 > OpenInfer passed the target's pre-final-norm residual to MTP, while official vLLM passes the
 > model-returned final-normalized hidden. Using `scratch.final_normed` raises the matched c8 mean
 > accepted length from `1.753` to `3.725` versus official vLLM's `3.786`, and reduces TPOT from
-> `23.44 ms` to `11.31 ms`. On the selected 251-token target trajectory, mean accepted length
-> changes from `1.000` to `5.795`. The remaining c8 acceptance delta is `0.061` (`1.6%`).
+> `23.44 ms` to `11.31 ms`. A subsequent three-run matched c1 measures OpenInfer at `7.749 ms`
+> versus official vLLM at `8.814 ms`; their proxy round costs are `30.04` and `30.72 ms`, so there
+> is no remaining c1 TPOT deficit. On the selected 251-token target trajectory, mean accepted
+> length changes from `1.000` to `5.795`.
 >
 > **Last touched:** 2026-07
 
@@ -84,6 +86,25 @@
     the stratified subset should be retained; aggregate runs keep tokens, counters, and margins.
   - TP8+EP8 versus TP1/DP8+EP8 may prevent bit parity even on a teacher-forced path. Conclusions
     must distinguish harmless numeric drift from changes to selected tokens or accepted prefixes.
+
+### Matched c1 performance follow-up
+
+- **Question**: Does corrected OpenInfer still trail official vLLM by about `2 ms` at concurrency
+  one, or did the earlier comparison mix OpenInfer c8 (`11.31 ms`) with vLLM c1 (`9.10 ms`)?
+- **Plan**:
+  1. Reuse the retained 64-request random corpus, greedy sampling, 256 output tokens, disabled
+     prefix cache, and identical client/version flags. Validate the live model id and benchmark
+     client flags before collecting results.
+  2. Run OpenInfer and official vLLM sequentially on the same 8×H200 node at concurrency one,
+     saving benchmark JSON and speculative-acceptance counters for every measured run.
+  3. Compare TPOT, accepted length, and `TPOT × accepted length`; only attribute a compute-side
+     difference when the matched c1 round costs disagree beyond run-to-run noise.
+  4. Restore the corrected OpenInfer service and health-check it after the official-vLLM run.
+- **Risks / open questions**:
+  - The official vLLM and OpenInfer topologies differ, so accepted length remains
+    content-dependent; round cost is required alongside TPOT.
+  - A single c1 run can be distorted by startup and host noise. Use warmup plus repeated measured
+    runs and report their spread rather than selecting the best number.
 
 ## Execution Log
 
@@ -205,6 +226,59 @@
   accepted length at least `5.0`; it passes in `210.37 s`. The clean c8 replay completes `64/64`
   requests with the exact retained input/output totals.
 
+### Matched c1 after the hidden-boundary fix
+
+- Reused the exact c8 random workload at concurrency one: seed `0`, `64` prompts, temperature `0`,
+  ignore EOS, prefix cache disabled, nominal input length `128`, and output length `256`. Every
+  measured run completed `64/64` requests with `8152` input and `16384` output tokens. One
+  readiness probe and two warmup requests preceded each measured run and are excluded from the
+  counters below.
+- Both engines ran sequentially on the same 8×H200 node. OpenInfer used TP1/DP8+EP8; official vLLM
+  commit `dcfebf93` used TP8+EP8 from its upstream nightly image, with five native-MTP draft tokens.
+  Three measured runs per engine give:
+
+  | Engine | Mean TPOT | Run-to-run σ | Mean accepted length | TPOT × accepted length | Mean TTFT | Output throughput |
+  | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+  | OpenInfer native MTP | `7.749 ms` | `0.003 ms` | `3.8762` | `30.04 ms` | `432.50 ms` | `106.29 tok/s` |
+  | official vLLM native MTP | `8.814 ms` | `0.001 ms` | `3.4858` | `30.72 ms` | `232.57 ms` | `103.22 tok/s` |
+
+- Per-run OpenInfer TPOT is `[7.753, 7.746, 7.749] ms`; official vLLM is
+  `[8.815, 8.814, 8.813] ms`. OpenInfer is therefore `1.065 ms` (`12.1%`) lower on matched c1,
+  rather than approximately `2 ms` higher. OpenInfer output throughput is `3.0%` higher, while its
+  TTFT is about `200 ms` higher; the result is decode-specific, not an end-to-end latency win.
+- OpenInfer reproduces the same aggregate accepted-draft histogram in all three runs:
+  `[815, 644, 443, 346, 212, 1723, 0, 0]`, or `4183` rounds and `12031` accepted drafts.
+  Official vLLM likewise reproduces `4714` rounds and `11718` accepted drafts in each run.
+- The official acceptance counters are retained inside each enhanced benchmark JSON, not in a
+  separate log. This benchmark-client build fetches vLLM's cumulative `vllm:spec_decode*`
+  Prometheus counters after the readiness probe and warmups but immediately before the measured
+  requests, fetches them again after the measured requests, and writes their delta as
+  `spec_decode_num_drafts`, `spec_decode_draft_tokens`, `spec_decode_accepted_tokens`,
+  `spec_decode_acceptance_length`, and per-position rates. Thus `3.485787` is directly auditable as
+  `1 + 11718 / 4714` from every retained official JSON; readiness and warmup traffic are outside
+  the snapshot window.
+- The proxy round costs differ by only `0.69 ms` (`2.2%`) and favor OpenInfer. Most of the TPOT
+  delta comes from OpenInfer accepting `0.390` more tokens per speculative round on this engine's
+  target trajectories. This does not imply identical target text or identical MTP numerics across
+  the two topologies.
+- The benchmarked OpenInfer source stack is the feature branch ending at `2dd5237e` (native-MTP
+  commits `f35292c1`, `fd6bd6e0`, `83389e75`, and `2dd5237e` over base `272c2f94`), built in the
+  release profile. The runtime binary SHA-256 is
+  `1a803c63c64377a82d611a1713cbf769b6bee1440c14902561922974c3691f62`. The official-vLLM
+  image digest is `sha256:79460a12901891f5e74d7a6ee1259f8aad9aa3b405cc0753534ee4ff6124fd3b`.
+- The ordered checksum-list SHA-256 for the three OpenInfer benchmark JSON files, three OpenInfer
+  acceptance logs, and three official-vLLM benchmark JSON files is
+  `a0dbc587ec16816dfae134a0f3f629745d8a6db5375bc09fb306fa4d82f165e9`.
+  The benchmark-client binary SHA-256 is
+  `953dab27d67e370645e8f78163bbd7e9cb423539f1290233988ab90ad617ed8c`; the corpus SHA-256
+  remains `59516edc33d2a7a36b63628db7cd4eb0888f3aec7f9ac97b49039920743928d3`.
+- The checkout-local benchmark binary terminated with `Illegal instruction` only after entering
+  the request path. No measured request reached the server in that attempt. The run switched to a
+  previously validated upstream-client build, repeated the exact dry-run token totals, passed a
+  one-request smoke test on both engines, and then collected the six retained runs above.
+- After measurement, the official-vLLM container was stopped and the corrected OpenInfer service
+  was restored and health-checked.
+
 ### Pre-fix fixed-prompt comparison
 
 - Used the deterministic prompt `The capital of France is` with greedy decoding. The official
@@ -282,7 +356,8 @@
 
 - **Outcome**: Native MTP now consumes the same target-hidden boundary as official vLLM. Matched c8
   acceptance is `3.725` versus `3.786`, and the formerly pathological shared trajectory aligns.
-  Task-level quality remains healthy on the measured GSM8K slice.
+  Matched c1 TPOT is `7.749 ms` versus official vLLM's `8.814 ms`, with near-equal proxy round
+  cost. Task-level quality remains healthy on the measured GSM8K slice.
 - **Pitfalls encountered**:
   - A small offline layer-78 match cannot certify online accepted length because it bypasses the
     production target hidden-state source and long-lived MTP KV.
@@ -295,9 +370,13 @@
     proposer while retaining raw hidden only for logits.
   - A top-1 mismatch after an earlier rejected draft is diagnostically useful but irrelevant to
     accepted length. First-diff analysis must stop at the effective accepted prefix.
+  - A benchmark client's dry-run can succeed while its request path contains CPU instructions
+    unsupported by the current host. Require a real one-request smoke before a long measurement.
 - **Lessons learned**:
   - Native-MTP acceptance is itself an accuracy metric even when target-generated answers remain
     correct.
+  - Compare c1 with c1. The earlier apparent `11.31` versus `9.10 ms` gap mixed OpenInfer c8 with
+    an exploratory official-vLLM c1 snapshot; matched repeated c1 reverses that conclusion.
   - Cross-engine aggregate acceptance is meaningful only when both engines follow the same target
     token trajectory; identical prompt lengths and sampling flags are insufficient.
   - For distributed BF16/FP8 paths, classify top-1 differences with logit margin and whether the
