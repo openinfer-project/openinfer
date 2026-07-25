@@ -74,6 +74,12 @@ use plan::takes_argmax;
 use slot::GLM52_PADDING_STEP;
 use slot::Glm52SlotState;
 use slot::Glm52StepOutcome;
+#[cfg(test)]
+pub(crate) use slot::MTP_PRODUCTION_GATE_REQUEST_ID;
+#[cfg(test)]
+pub(crate) use slot::mtp_production_stats;
+#[cfg(test)]
+pub(crate) use slot::reset_mtp_production_stats;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
 

@@ -96,6 +96,8 @@ pub(super) fn run_mtp_round(
         );
         for (slot_id, span) in proposal_slots.into_iter().zip(spans) {
             if let Some(active) = slots[rank][slot_id].as_mut() {
+                #[cfg(test)]
+                super::slot::record_mtp_proposal(active.req.request_id.as_deref(), &span);
                 active
                     .state
                     .set_drafts(span.to_vec(), crate::mtp::GLM52_MTP_DRAFTS);

@@ -8,6 +8,49 @@ use openinfer_core::engine::FinishReason;
 use crate::dspark::GLM52_DSPARK_DRAFTS;
 use crate::dspark::accept_prefix_match;
 
+#[cfg(test)]
+pub(crate) const MTP_PRODUCTION_GATE_REQUEST_ID: &str = "native-mtp-hidden-boundary-gate";
+
+#[cfg(test)]
+#[derive(Clone, Debug, Default)]
+pub(crate) struct MtpProductionStats {
+    pub(crate) first_proposal: Option<Vec<u32>>,
+    pub(crate) rounds: u64,
+    pub(crate) accepted_drafts: u64,
+}
+
+#[cfg(test)]
+static MTP_PRODUCTION_STATS: std::sync::LazyLock<std::sync::Mutex<MtpProductionStats>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(MtpProductionStats::default()));
+
+#[cfg(test)]
+pub(crate) fn reset_mtp_production_stats() {
+    *MTP_PRODUCTION_STATS
+        .lock()
+        .expect("MTP production stats lock poisoned") = MtpProductionStats::default();
+}
+
+#[cfg(test)]
+pub(super) fn record_mtp_proposal(request_id: Option<&str>, drafts: &[u32]) {
+    if request_id != Some(MTP_PRODUCTION_GATE_REQUEST_ID) {
+        return;
+    }
+    let mut stats = MTP_PRODUCTION_STATS
+        .lock()
+        .expect("MTP production stats lock poisoned");
+    if stats.first_proposal.is_none() {
+        stats.first_proposal = Some(drafts.to_vec());
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn mtp_production_stats() -> MtpProductionStats {
+    MTP_PRODUCTION_STATS
+        .lock()
+        .expect("MTP production stats lock poisoned")
+        .clone()
+}
+
 /// What a rank forwards this step. Idle rows feed the padding input; their
 /// KV/index-cache writes land in the pool's reserved padding page, which no
 /// request is ever assigned.
@@ -66,6 +109,8 @@ pub(super) struct Glm52SlotState {
     drafts: Vec<u32>,
     /// Accept telemetry across the request's verify rounds.
     spec: SpecStats,
+    #[cfg(test)]
+    mtp_production_gate: bool,
 }
 
 /// Drafts fed per verify span under EP8: 3 drafts + anchor = a bucket-4
@@ -108,7 +153,14 @@ impl Glm52SlotState {
             last_token: 0,
             drafts: Vec::new(),
             spec: SpecStats::default(),
+            #[cfg(test)]
+            mtp_production_gate: false,
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn enable_mtp_production_gate(&mut self) {
+        self.mtp_production_gate = true;
     }
 
     pub(super) fn completion_tokens(&self) -> usize {
@@ -256,7 +308,16 @@ impl Glm52SlotState {
             debug_assert!(drafts_fed <= self.drafts.len());
             let committed = accept_prefix_match(&self.drafts[..drafts_fed], outputs);
             if drafts_fed > 0 {
-                self.spec.record(committed.len() - 1);
+                let accepted_drafts = committed.len() - 1;
+                self.spec.record(accepted_drafts);
+                #[cfg(test)]
+                if self.mtp_production_gate {
+                    let mut stats = MTP_PRODUCTION_STATS
+                        .lock()
+                        .expect("MTP production stats lock poisoned");
+                    stats.rounds += 1;
+                    stats.accepted_drafts += accepted_drafts as u64;
+                }
             }
             let context_rows = committed.len();
             (committed, context_rows)

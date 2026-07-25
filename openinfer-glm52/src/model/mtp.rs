@@ -1,6 +1,6 @@
 //! Checkpoint-native GLM5.2 MTP serving lane.
 //!
-//! The target step keeps its raw final hidden rows resident. A draft round
+//! The target step keeps its final-normalized hidden rows resident. A draft round
 //! packs only committed rows, shifts each sequence token one place left, and
 //! runs checkpoint layer 78 once to synchronize MTP KV and produce draft 1.
 //! Four single-token iterations then recycle the layer's shared-head-normalized

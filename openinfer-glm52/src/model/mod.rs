@@ -894,7 +894,10 @@ impl Glm52RankModel {
                      {GLM52_DECODE_BUCKETS:?}"
                 )
             })?;
-        let source_hidden = &self.buckets[source_index].scratch.hidden;
+        // Official vLLM feeds MTP the target model return, which is after
+        // final RMSNorm for GLM5.2. The pre-norm residual is not an
+        // interchangeable EAGLE feature even when target top-1 is unchanged.
+        let source_hidden = &self.buckets[source_index].scratch.final_normed;
         let mtp = self
             .mtp
             .as_mut()

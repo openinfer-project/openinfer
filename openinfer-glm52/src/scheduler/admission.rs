@@ -321,6 +321,14 @@ pub(super) fn admit_from_queue(
                 req.params.ignore_eos,
                 cached_tokens,
             );
+            #[cfg(test)]
+            let state = {
+                let mut state = state;
+                if req.request_id.as_deref() == Some(super::slot::MTP_PRODUCTION_GATE_REQUEST_ID) {
+                    state.enable_mtp_production_gate();
+                }
+                state
+            };
             if dspark_enabled {
                 pending_resets[rank].push(slot);
             }
