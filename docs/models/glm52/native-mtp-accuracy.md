@@ -149,7 +149,9 @@
 - The official-vLLM layer-78 golden gate exercises the corrected EP8 kernel and reports MLP RMS
   `8.62e-3`, chained hidden RMS `1.87e-2`, exact top-1, top-8 overlap `8/8`, and top-32 overlap
   `30/32`. The existing layer-6 EP8 oracle exercises the same kernel in a plain target layer and is
-  part of the 8×H200 validation set.
+  part of the 8×H200 validation set. A fresh run passes all four `g64/g32/g16/g8` groupings with
+  `62/64` probes inside tolerance for each grouping and the two permitted near-tie outliers, in
+  `27.84 s`.
 - The post-change plain serving result is GSM8K `195/200`; native MTP is `196/200`. No retained
   pre-change plain GSM8K run used the identical harness, so this document does not claim a
   before/after task-accuracy improvement from the MoE correction. The direct evidence is the
@@ -260,11 +262,13 @@
   two explicitly enabled official-vLLM MTP front and EP8 layer-78 golden gates. An ignored
   production-path gate loads the full checkpoint on 8×H200, submits the selected 256-token request
   through the real scheduler/executor, and asserts target trajectory, first draft `98825`, and mean
-  accepted length at least `5.0`; the original gate passes in `210.37 s`. PR hardening extends the
-  same model-loaded gate with a released-slot reuse request plus eight concurrent rank-pinned
-  requests of different lengths. The reused slot must again draft `98825` first and retain mean
-  accepted length at least `5.0`; the other requests exercise mixed-state collective liveness. The
-  clean c8 replay completes `64/64` requests with the exact retained input/output totals.
+  accepted length at least `5.0`; the original single-request form passes in `210.37 s`. PR
+  hardening extends the same model-loaded gate with a released-slot reuse request plus eight
+  concurrent rank-pinned requests of different lengths. The reused slot must again draft `98825`
+  first, complete at least 32 speculative rounds, and retain mean accepted length at least `5.0`;
+  the other requests exercise mixed-state collective liveness. The hardened gate passes in
+  `220.70 s`. The clean c8 replay completes `64/64` requests with the exact retained input/output
+  totals.
 
 ### Matched c1 after the hidden-boundary fix
 
