@@ -530,7 +530,7 @@ impl Glm52RankModel {
         max_model_len: usize,
         moe_topo: crate::Glm52MoeTopo,
         attn_shard: Option<usize>,
-        drafter: crate::Glm52Drafter,
+        drafter: &crate::Glm52Drafter,
         prefill_chunk_size: Option<usize>,
     ) -> Result<Self> {
         ensure!(

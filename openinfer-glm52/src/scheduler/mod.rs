@@ -146,7 +146,7 @@ pub(crate) fn run_dp8_coordinator(
     workers: Vec<Glm52Worker>,
     eos_token_ids: &[u32],
     drafter: crate::Glm52Drafter,
-    prefill_only: bool,
+    prefill_chunk_size: Option<usize>,
     max_model_len: usize,
     no_prefix_cache: bool,
     offload: Option<Vec<OffloadEngine>>,
@@ -155,6 +155,7 @@ pub(crate) fn run_dp8_coordinator(
     load_txs: Vec<watch::Sender<LoadSnapshot>>,
     graph_dump_request: Option<GraphDumpRequest>,
 ) {
+    let prefill_only = prefill_chunk_size.is_some();
     let dspark_enabled = drafter.is_dspark();
     let mtp_enabled = drafter.is_mtp();
     // Tensor-replicated topology: ONE logical rank drives mirrored executors.

@@ -383,6 +383,18 @@
   accepted drafts `[1,1,1,2]`. OpenInfer's four rounds are reproduced directly from the table and
   the shared target trajectory as `[1,1,1,1]`.
 
+### Latest-main integration
+
+- Rebased the native-MTP series onto the TP4 prefill execution change. The semantic conflict was
+  larger than the textual conflict: the coordinator must retain `prefill_chunk_size: Option<usize>`
+  rather than reduce it to a boolean, while the speculative drafter remains a separate launch
+  choice.
+- Updated the native-MTP KV arena and its byte ledger to use the same eight-slot pool geometry,
+  adopted the renamed paged-MQA indexer shape constructor, and kept remote rank hosts on the
+  decode-only build contract.
+- Local validation passes the GLM5.2 release server check and `86` library tests, with `20`
+  hardware/model gates ignored.
+
 ### How to use aggregate accepted length
 
 - The matched random benchmark uses identical input/output lengths, but official vLLM runs a

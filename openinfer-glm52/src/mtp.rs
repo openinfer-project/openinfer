@@ -37,6 +37,7 @@ use crate::config::GLM52_HIDDEN;
 use crate::config::GLM52_INDEX_HEAD_DIM;
 use crate::config::GLM52_RMS_EPS;
 use crate::model::GLM52_DECODE_BUCKETS;
+use crate::model::GLM52_MAX_BATCH_PER_RANK;
 use crate::model::GLM52_MODEL_LEN_ALIGN;
 use crate::model::glm52_pool_blocks;
 use crate::rows::Rows;
@@ -50,7 +51,7 @@ pub(crate) const GLM52_MTP_DRAFTS: usize = 5;
 /// probe; this function is the exact monotone term used to derive the context
 /// cap before those arenas are allocated.
 pub(crate) fn glm52_mtp_arena_bytes(max_model_len: usize) -> Result<usize> {
-    let blocks = glm52_pool_blocks(max_model_len);
+    let blocks = glm52_pool_blocks(max_model_len, GLM52_MAX_BATCH_PER_RANK);
     let mla = blocks
         .checked_mul(GLM52_MODEL_LEN_ALIGN)
         .and_then(|v| v.checked_mul(openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN))

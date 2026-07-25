@@ -138,7 +138,7 @@ impl Glm52NativeMtp {
             None,
         )?;
 
-        let num_blocks = glm52_pool_blocks(max_model_len);
+        let num_blocks = glm52_pool_blocks(max_model_len, GLM52_MAX_BATCH_PER_RANK);
         let table_width = glm52_table_width(max_model_len);
         let index_layout = Glm52IndexerCacheLayout {
             cache_blocks: num_blocks,
@@ -171,7 +171,7 @@ impl Glm52NativeMtp {
                 batch_size: rows,
                 ..contract
             };
-            let mqa_shape = Glm52IndexerScratch::decode_shape(
+            let mqa_shape = Glm52IndexerScratch::paged_mqa_shape(
                 rows,
                 index_layout,
                 table_width,

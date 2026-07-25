@@ -374,7 +374,7 @@ pub(super) fn run_moe_ep8_rows(
         cache_block_stride_bytes: INDEX_CACHE_BLOCK * (GLM52_INDEX_HEAD_DIM + 4),
     };
     let mqa_shape =
-        Glm52IndexerScratch::decode_shape(1, index_cache_layout, 1, NUM_SMS, rows.max(1));
+        Glm52IndexerScratch::paged_mqa_shape(1, index_cache_layout, 1, NUM_SMS, rows.max(1));
     let mut scratch =
         Glm52DecodeScratch::new(ctx, &contract, mqa_shape, crate::config::GLM52_HEADS, false)?;
     let mut outputs = MoeEp8RowsOutputs {

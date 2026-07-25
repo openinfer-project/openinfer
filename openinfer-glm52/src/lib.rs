@@ -737,8 +737,7 @@ fn derive_max_model_len(
         let (mut lo, mut hi) = (0, GLM52_MAX_CONTEXT / GLM52_MODEL_LEN_ALIGN);
         while lo < hi {
             let mid = (lo + hi).div_ceil(2);
-            if glm52_cap_bytes(mid * GLM52_MODEL_LEN_ALIGN, drafter, prefill_only)?
-                <= budget_bytes
+            if glm52_cap_bytes(mid * GLM52_MODEL_LEN_ALIGN, drafter, prefill_only)? <= budget_bytes
             {
                 lo = mid;
             } else {
@@ -958,7 +957,7 @@ fn start_engine(
                 loaded.workers,
                 &eos_token_ids,
                 drafter,
-                prefill_only.is_some(),
+                prefill_only.map(|prefill| prefill.chunk_size),
                 max_model_len,
                 no_prefix_cache,
                 offload,
@@ -1113,12 +1112,7 @@ fn build_rank_models(
     let responses = workers
         .iter()
         .map(|worker| {
-            worker.build_model_async(
-                max_model_len,
-                moe_topo,
-                drafter.clone(),
-                prefill_chunk_size,
-            )
+            worker.build_model_async(max_model_len, moe_topo, drafter.clone(), prefill_chunk_size)
         })
         .collect::<Result<Vec<_>>>()?;
     let mut rank_arenas = Vec::with_capacity(responses.len());
@@ -1515,11 +1509,10 @@ mod max_model_len_tests {
     #[test]
     fn dspark_lane_shrinks_the_derived_cap() {
         let free = free_for(50_048, &Glm52Drafter::None, 0);
-        let plain = derive_max_model_len(None, free, &Glm52Drafter::None, 0, false)
-            .expect("derive");
+        let plain =
+            derive_max_model_len(None, free, &Glm52Drafter::None, 0, false).expect("derive");
         let dspark_drafter = Glm52Drafter::Dspark(PathBuf::from("draft"));
-        let dspark =
-            derive_max_model_len(None, free, &dspark_drafter, 0, false).expect("derive");
+        let dspark = derive_max_model_len(None, free, &dspark_drafter, 0, false).expect("derive");
         assert!(
             dspark.max_model_len < plain.max_model_len,
             "dspark cap-scaled cost must shrink the cap"
@@ -1529,39 +1522,25 @@ mod max_model_len_tests {
     #[test]
     fn native_mtp_lane_shrinks_the_derived_cap() {
         let free = free_for(50_048, &Glm52Drafter::None, 0);
-        let plain = derive_max_model_len(None, free, &Glm52Drafter::None, 0, false)
-            .expect("derive");
-        let native_mtp = derive_max_model_len(
-            None,
-            free,
-            &Glm52Drafter::NativeMtp,
-            0,
-            false,
-        )
-        .expect("derive");
+        let plain =
+            derive_max_model_len(None, free, &Glm52Drafter::None, 0, false).expect("derive");
+        let native_mtp =
+            derive_max_model_len(None, free, &Glm52Drafter::NativeMtp, 0, false).expect("derive");
         assert!(
             native_mtp.max_model_len < plain.max_model_len,
             "native MTP cap-scaled KV must shrink the target context cap"
         );
         assert!(
-            glm52_cap_bytes(50_048, &Glm52Drafter::NativeMtp, false)
-                .expect("MTP cap bytes")
-                > glm52_cap_bytes(50_048, &Glm52Drafter::None, false)
-                    .expect("plain cap bytes"),
+            glm52_cap_bytes(50_048, &Glm52Drafter::NativeMtp, false).expect("MTP cap bytes")
+                > glm52_cap_bytes(50_048, &Glm52Drafter::None, false).expect("plain cap bytes"),
             "native MTP must be represented in the exact memory ledger"
         );
     }
 
     #[test]
     fn derived_cap_never_exceeds_the_checkpoint_ceiling() {
-        let budget = derive_max_model_len(
-            None,
-            usize::MAX / 2,
-            &Glm52Drafter::None,
-            0,
-            false,
-        )
-        .expect("derive");
+        let budget = derive_max_model_len(None, usize::MAX / 2, &Glm52Drafter::None, 0, false)
+            .expect("derive");
         assert_eq!(budget.max_model_len, GLM52_MAX_CONTEXT);
     }
 
@@ -1628,8 +1607,8 @@ mod max_model_len_tests {
         let scratch =
             glm52_prefill_scratch_reservation(Some(prefill)).expect("prefill reservation");
         let free = free_for(100_032, &Glm52Drafter::None, 0);
-        let decode = derive_max_model_len(None, free, &Glm52Drafter::None, 0, false)
-            .expect("decode budget");
+        let decode =
+            derive_max_model_len(None, free, &Glm52Drafter::None, 0, false).expect("decode budget");
         let prefill = derive_max_model_len(None, free, &Glm52Drafter::None, scratch, true)
             .expect("prefill budget");
         assert!(

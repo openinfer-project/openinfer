@@ -866,7 +866,7 @@ impl Glm52RankThreadState {
             moe_topo
                 .uses_tensor_replicated_moe()
                 .then_some(self.placement.rank),
-            drafter,
+            &drafter,
             prefill_chunk_size,
         )?);
         let arenas = model.kv_arenas(&dev_ctx.stream)?;
@@ -1191,8 +1191,12 @@ fn rank_worker_loop(rx: &Receiver<Glm52RankCommand>, mut state: Glm52RankThreadS
                 prefill_chunk_size,
                 resp,
             } => {
-                let _ =
-                    resp.send(state.build_model(max_model_len, moe_topo, drafter, prefill_chunk_size));
+                let _ = resp.send(state.build_model(
+                    max_model_len,
+                    moe_topo,
+                    drafter,
+                    prefill_chunk_size,
+                ));
             }
             Glm52RankCommand::SetupComm {
                 unique_id,
