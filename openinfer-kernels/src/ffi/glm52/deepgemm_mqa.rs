@@ -42,4 +42,18 @@ unsafe extern "C" {
         kv_scales_elem_size: i32,
         stream: CUstream,
     ) -> CUresult;
+
+    pub fn glm52_deepgemm_mqa_logits_cuda(
+        q: *const std::ffi::c_void,
+        kv: *const std::ffi::c_void,
+        kv_scales: *const f32,
+        weights: *const f32,
+        row_starts: *const i32,
+        row_ends: *const i32,
+        logits: *mut std::ffi::c_void,
+        num_q_tokens: i32,
+        num_kv_tokens: i32,
+        logits_stride: i32,
+        stream: CUstream,
+    ) -> CUresult;
 }

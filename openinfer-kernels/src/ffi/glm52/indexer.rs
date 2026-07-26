@@ -16,6 +16,20 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn glm52_indexer_gather_cache_cuda(
+        indexer_cache: *const u8,
+        gathered_k: *mut u8,
+        gathered_scales: *mut f32,
+        block_table: *const i32,
+        cu_seq_lens: *const i32,
+        requests: i32,
+        tokens: i32,
+        block_table_stride: i32,
+        cache_block_size: i32,
+        cache_block_stride_bytes: i64,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn glm52_indexer_weights_proj_cuda(
         hidden: *const Half,
         weights_proj: *const Half,
@@ -33,6 +47,7 @@ unsafe extern "C" {
         local_topk_stride: i32,
         seq_lens: *const i32,
         block_table: *const i32,
+        row_table_ids: *const i32,
         block_table_stride: i32,
         block_table_cols: i32,
         block_size: i32,

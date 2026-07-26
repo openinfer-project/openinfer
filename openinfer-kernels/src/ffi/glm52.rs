@@ -34,6 +34,25 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> i32;
     pub fn glm52_prefill_nccl_comm_destroy(comm: *mut std::ffi::c_void) -> i32;
+    pub fn glm52_trtllm_moe_create(
+        max_tokens: i32,
+        device: i32,
+        out: *mut *mut std::ffi::c_void,
+    ) -> CUresult;
+    pub fn glm52_trtllm_moe_destroy(handle: *mut std::ffi::c_void) -> CUresult;
+    pub fn glm52_trtllm_moe_launch(
+        handle: *mut std::ffi::c_void,
+        hidden: *const Half,
+        routing_logits: *const f32,
+        routing_bias: *const f32,
+        w13: *const u8,
+        w13_scale: *const f32,
+        w2: *const u8,
+        w2_scale: *const f32,
+        output: *mut Half,
+        tokens: i32,
+        stream: CUstream,
+    ) -> CUresult;
 
     pub fn glm52_router_select_cuda(
         logits: *const f32,
@@ -74,17 +93,6 @@ unsafe extern "C" {
         n: i32,
         k: i32,
         batch: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn glm52_prefill_ar_cuda(
-        partial: *const Half,
-        output: *mut Half,
-        local_buffer: *mut std::ffi::c_void,
-        peer_buffers: *const *const std::ffi::c_void,
-        epoch: *const u64,
-        rows: i32,
-        ranks: i32,
         stream: CUstream,
     ) -> CUresult;
 

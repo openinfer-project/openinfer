@@ -44,10 +44,12 @@ use openinfer_kernels::ops::Glm52IndexerTopK;
 use openinfer_kernels::ops::Glm52MoeQuantShape;
 use openinfer_kernels::ops::bf16_bytes_to_f32_into;
 use openinfer_kernels::ops::gemm_strided_batched_bf16;
+use openinfer_kernels::ops::glm52_deepgemm_mqa_logits_launch;
 use openinfer_kernels::ops::glm52_deepgemm_paged_mqa_logits_launch;
 use openinfer_kernels::ops::glm52_deepgemm_paged_mqa_metadata_launch;
 use openinfer_kernels::ops::glm52_flashinfer_topk_2048_launch;
 use openinfer_kernels::ops::glm52_fp8_per_token_group_quant_bf16_launch;
+use openinfer_kernels::ops::glm52_indexer_gather_cache_launch;
 use openinfer_kernels::ops::glm52_indexer_k_quant_and_cache_launch;
 use openinfer_kernels::ops::glm52_indexer_local_topk_to_slots_launch;
 use openinfer_kernels::ops::glm52_indexer_rope_launch;
@@ -296,6 +298,18 @@ pub(crate) struct Glm52IndexerScratch {
     large_gemm: Option<Glm52Fp8GemmScratch>,
 }
 
+pub(crate) struct Glm52IndexerPrefill<'a> {
+    pub(crate) requests: usize,
+    pub(crate) num_kv_tokens: usize,
+    pub(crate) gather_table: &'a CudaSlice<i32>,
+    pub(crate) gather_cu_lens: &'a CudaSlice<i32>,
+    pub(crate) row_starts: &'a CudaSlice<i32>,
+    pub(crate) row_ends: &'a CudaSlice<i32>,
+    pub(crate) row_table_ids: &'a CudaSlice<i32>,
+    pub(crate) gathered_k: &'a mut CudaSlice<u8>,
+    pub(crate) gathered_scales: &'a mut CudaSlice<f32>,
+}
+
 impl Glm52IndexerScratch {
     pub(crate) fn new(ctx: &DeviceContext, shape: Glm52DeepGemmMqaLogitsShape) -> Result<Self> {
         Self::with_large_gemm(ctx, shape, false)
@@ -331,7 +345,11 @@ impl Glm52IndexerScratch {
                 .stream
                 .alloc_zeros::<i32>(shape.schedule_metadata_len())?,
             context_lens: ctx.stream.alloc_zeros::<i32>(t)?,
-            logits: ctx.stream.alloc_zeros::<u8>(logits_elems * 2)?, // bf16
+            // Prefill writes f32 logits directly; keep only the decode path's
+            // bf16 staging allocation.
+            logits: ctx
+                .stream
+                .alloc_zeros::<u8>(if large_gemm { 1 } else { logits_elems * 2 })?,
             logits_f32: ctx.stream.alloc_zeros::<f32>(logits_elems)?,
             topk_offsets: ctx.stream.alloc_zeros::<i32>(t * GLM52_INDEXER_TOPK)?,
             topk_values: ctx.stream.alloc_zeros::<f32>(t * GLM52_INDEXER_TOPK)?,
@@ -374,9 +392,9 @@ impl Glm52IndexerScratch {
     }
 }
 
-/// DSA indexer decode forward over the scratch's `shape.batch_size` rows:
-/// computes each row's sparse top-k slot indices for the FlashMLA sparse
-/// decode into `s.global_slots` (`[T, topk]`).
+/// Run the DSA indexer over `shape.batch_size` rows and write sparse KV slots
+/// to `s.global_slots`. Prefill gathers paged keys once per request before
+/// MQA; decode reads the paged cache directly.
 ///
 /// - `q_resid` is the MLA layer's q_a_layernorm output (`[T, 2048]`).
 /// - `hidden` is the step's hidden states (`[T, 6144]`).
@@ -406,6 +424,7 @@ pub(crate) fn glm52_indexer_forward_into(
     block_table: &CudaSlice<i32>,
     seq_lens: &CudaSlice<i32>,
     topk: usize,
+    mut prefill: Option<Glm52IndexerPrefill<'_>>,
     s: &mut Glm52IndexerScratch,
 ) -> Result<()> {
     let shape = s.shape;
@@ -539,34 +558,58 @@ pub(crate) fn glm52_indexer_forward_into(
     // (Matches vllm's decode-path API — no separate scales buffer needed.)
     ctx.stream
         .memcpy_dtod(&seq_lens.slice(0..t), &mut s.context_lens)?;
-    glm52_deepgemm_paged_mqa_metadata_launch(
-        ctx,
-        shape,
-        &mut s.context_lens,
-        &mut s.schedule_meta,
-        None,
-    )?;
-
-    // kv_cache_scales are embedded in the interleaved cache buffer — the CUDA
-    // wrapper computes the scales pointer internally from kv_cache + offset.
-    // No separate scales allocation needed.
-    glm52_deepgemm_paged_mqa_logits_launch(
-        ctx,
-        shape,
-        &s.q_fp8,
-        index_k_cache,
-        &s.weights_folded,
-        &s.context_lens,
-        &mut s.logits,
-        block_table,
-        None,
-        &mut s.schedule_meta,
-    )?;
-
-    // DeepGEMM outputs bf16 logits; FlashInfer top-k expects f32.
-    // The sm90 kernel already fuses per-head ReLU (fmaxf(score, 0) * weight)
-    // matching transformers' F.relu(scores) — no extra ReLU needed here.
-    bf16_bytes_to_f32_into(ctx, &s.logits, &mut s.logits_f32)?;
+    if let Some(prefill) = prefill.as_mut() {
+        glm52_indexer_gather_cache_launch(
+            ctx,
+            cache_layout,
+            prefill.requests,
+            prefill.num_kv_tokens,
+            shape.block_table_stride,
+            index_k_cache,
+            prefill.gather_table,
+            prefill.gather_cu_lens,
+            prefill.gathered_k,
+            prefill.gathered_scales,
+        )?;
+        glm52_deepgemm_mqa_logits_launch(
+            ctx,
+            t,
+            prefill.num_kv_tokens,
+            shape.logits_stride,
+            &s.q_fp8,
+            prefill.gathered_k,
+            prefill.gathered_scales,
+            &s.weights_folded,
+            prefill.row_starts,
+            prefill.row_ends,
+            &mut s.logits_f32,
+        )?;
+    } else {
+        ensure!(
+            s.large_gemm.is_none(),
+            "GLM5.2 prefill indexer requires compact gather metadata"
+        );
+        glm52_deepgemm_paged_mqa_metadata_launch(
+            ctx,
+            shape,
+            &mut s.context_lens,
+            &mut s.schedule_meta,
+            None,
+        )?;
+        glm52_deepgemm_paged_mqa_logits_launch(
+            ctx,
+            shape,
+            &s.q_fp8,
+            index_k_cache,
+            &s.weights_folded,
+            &s.context_lens,
+            &mut s.logits,
+            block_table,
+            None,
+            &mut s.schedule_meta,
+        )?;
+        bf16_bytes_to_f32_into(ctx, &s.logits, &mut s.logits_f32)?;
+    }
 
     glm52_flashinfer_topk_2048_launch(
         ctx,
@@ -582,17 +625,28 @@ pub(crate) fn glm52_indexer_forward_into(
     )?;
 
     // ---- local top-k offsets -> global KV slots (per row) ----
+    let (slot_table, row_table_ids, table_rows) = if let Some(prefill) = prefill.as_ref() {
+        (
+            prefill.gather_table,
+            Some(prefill.row_table_ids),
+            prefill.requests,
+        )
+    } else {
+        (block_table, None, t)
+    };
     glm52_indexer_local_topk_to_slots_launch(
         ctx,
         Glm52IndexerLocalTopKToSlots {
             num_tokens: t,
+            table_rows,
             topk,
             block_size: cache_layout.cache_block_size,
             block_table_cols: shape.block_table_stride,
         },
         &s.topk_offsets,
         &s.context_lens,
-        block_table,
+        slot_table,
+        row_table_ids,
         &mut s.global_slots,
         &mut s.topk_lens,
     )?;
@@ -639,6 +693,7 @@ pub(crate) fn glm52_indexer_forward(
         block_table,
         seq_lens,
         GLM52_INDEXER_TOPK,
+        None,
         &mut s,
     )?;
     Ok(s.global_slots)

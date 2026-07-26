@@ -94,9 +94,10 @@ pub fn glm52_fp8_groupwise_gemm_sm100_offset_launch(
             ctx.stream.cu_stream(),
         )
     };
+    let detail = crate::ops::ffi_exception_message(result as i32);
     result
         .result()
-        .map_err(|err| anyhow!("GLM5.2 FP8 groupwise GEMM launch failed: {err}"))
+        .map_err(|err| anyhow!("GLM5.2 FP8 groupwise GEMM launch failed: {err}{detail}"))
 }
 
 #[allow(clippy::too_many_arguments)]

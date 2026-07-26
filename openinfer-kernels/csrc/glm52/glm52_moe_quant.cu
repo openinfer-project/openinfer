@@ -43,7 +43,7 @@ __device__ __forceinline__ unsigned char quantize_e4m3(float value,
 // scale is silently truncated — up to 2x too small — on Blackwell, while
 // sm90 reads the f32 scale exactly. Power-of-two scales make both archs read
 // the identical value.
-template <bool kMasked, bool kUe8m0 = false>
+template <bool kMasked, bool kUe8m0 = false, bool kTransposeScale = false>
 __global__ void fp8_per_token_group_quant_bf16_k128_kernel(
     const __nv_bfloat16* __restrict__ input,
     unsigned char* __restrict__ output, float* __restrict__ scales, int rows,
@@ -95,6 +95,8 @@ __global__ void fp8_per_token_group_quant_bf16_k128_kernel(
         const int r_local = out_row % masked_cap;
         scales[((size_t)g * scale_cols + group) * masked_cap + r_local] =
             shared[0];
+      } else if constexpr (kTransposeScale) {
+        scales[(size_t)group * rows + row] = shared[0];
       } else {
         scales[(size_t)row * scale_cols + group] = shared[0];
       }
@@ -210,6 +212,20 @@ CUresult glm52_fp8_per_token_group_quant_bf16_cuda(
 
   dim3 grid(row_grid(rows), hidden_dim / kGroupSize, 1);
   fp8_per_token_group_quant_bf16_k128_kernel<false>
+      <<<grid, kGroupSize, 0, stream>>>(input, output, scales, rows,
+                                        hidden_dim, nullptr, nullptr, 0);
+  return consume_last_cuda_error();
+}
+
+CUresult glm52_fp8_per_token_group_quant_bf16_trtllm_cuda(
+    const __nv_bfloat16* input, unsigned char* output, float* scales, int rows,
+    int hidden_dim, int group_size, cudaStream_t stream) {
+  if (input == nullptr || output == nullptr || scales == nullptr ||
+      !valid_quant_shape(rows, hidden_dim, group_size)) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  dim3 grid(row_grid(rows), hidden_dim / kGroupSize, 1);
+  fp8_per_token_group_quant_bf16_k128_kernel<false, false, true>
       <<<grid, kGroupSize, 0, stream>>>(input, output, scales, rows,
                                         hidden_dim, nullptr, nullptr, 0);
   return consume_last_cuda_error();

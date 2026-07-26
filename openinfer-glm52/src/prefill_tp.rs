@@ -43,6 +43,7 @@ use crate::dense::glm52_dense_mlp_prefill_into;
 use crate::fp8::Glm52Fp8GemmScratch;
 use crate::fp8::fp8_linear_large_m_into;
 use crate::indexer::Glm52IndexerLayerWeights;
+use crate::indexer::Glm52IndexerPrefill;
 use crate::indexer::Glm52IndexerScratch;
 use crate::indexer::glm52_indexer_forward_into;
 use crate::layer::Glm52DecoderLayerWeights;
@@ -60,8 +61,8 @@ use crate::moe_tp::Glm52MoeTpState;
 use crate::rows::Rows;
 use crate::runner::Glm52PrefillBatch;
 
-pub(crate) const PREFILL_TILE_ROWS: usize = 512;
-pub(crate) const PREFILL_INDEXER_TILE_ROWS: usize = 32;
+pub(crate) const PREFILL_TILE_ROWS: usize = 16_384;
+pub(crate) const PREFILL_INDEXER_TILE_ROWS: usize = 512;
 const INDEXER_TILE: usize = PREFILL_INDEXER_TILE_ROWS;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -105,16 +106,21 @@ pub(crate) struct Glm52TpPrefillExecutor {
     tile_cos: CudaSlice<bf16>,
     tile_sin: CudaSlice<bf16>,
     tile_slots: CudaSlice<i64>,
-    tile_table: CudaSlice<i32>,
     tile_lens: CudaSlice<i32>,
+    gather_table: CudaSlice<i32>,
+    gather_cu_lens: CudaSlice<i32>,
+    gather_row_starts: CudaSlice<i32>,
+    gather_row_ends: CudaSlice<i32>,
+    gather_row_table_ids: CudaSlice<i32>,
+    gathered_index_k: CudaSlice<u8>,
+    gathered_index_scales: CudaSlice<f32>,
     indexer_carry_slots: CudaSlice<i32>,
     indexer_carry_lens: CudaSlice<i32>,
     tile_query_bf16: CudaSlice<bf16>,
-    tile_normed: Rows<GLM52_HIDDEN>,
-    tile_attention_reduced: Rows<GLM52_HIDDEN>,
     attention_out: CudaSlice<bf16>,
     attention_max: CudaSlice<f32>,
     attention_lse: CudaSlice<f32>,
+    tile_attention_v: CudaSlice<bf16>,
     attention_v: CudaSlice<bf16>,
     attention_partial: CudaSlice<bf16>,
     attention_reduced: CudaSlice<bf16>,
@@ -203,26 +209,29 @@ impl Glm52TpPrefillExecutor {
                 .stream
                 .alloc_zeros::<bf16>(INDEXER_TILE * GLM52_ROPE_HALF)?,
             tile_slots: ctx.stream.alloc_zeros::<i64>(INDEXER_TILE)?,
-            tile_table: ctx
+            tile_lens: ctx.stream.alloc_zeros::<i32>(INDEXER_TILE)?,
+            gather_table: ctx
                 .stream
                 .alloc_zeros::<i32>(INDEXER_TILE * layout.table_width)?,
-            tile_lens: ctx.stream.alloc_zeros::<i32>(INDEXER_TILE)?,
+            gather_cu_lens: ctx.stream.alloc_zeros::<i32>(INDEXER_TILE + 1)?,
+            gather_row_starts: ctx.stream.alloc_zeros::<i32>(INDEXER_TILE)?,
+            gather_row_ends: ctx.stream.alloc_zeros::<i32>(INDEXER_TILE)?,
+            gather_row_table_ids: ctx.stream.alloc_zeros::<i32>(INDEXER_TILE)?,
+            gathered_index_k: ctx.stream.alloc_zeros::<u8>(layout.kv_slots * 128)?,
+            gathered_index_scales: ctx.stream.alloc_zeros::<f32>(layout.kv_slots)?,
             indexer_carry_slots: ctx.stream.alloc_zeros::<i32>(PREFILL_TILE_ROWS * 2048)?,
             indexer_carry_lens: ctx.stream.alloc_zeros::<i32>(PREFILL_TILE_ROWS)?,
             tile_query_bf16: ctx
                 .stream
                 .alloc_zeros::<bf16>(INDEXER_TILE * 64 * GLM52_KV_A_OUT)?,
-            tile_normed: Rows::zeros(ctx, INDEXER_TILE)?,
-            tile_attention_reduced: Rows::zeros(ctx, INDEXER_TILE)?,
             attention_out: ctx
                 .stream
                 .alloc_zeros::<bf16>(INDEXER_TILE * 64 * GLM52_KV_LORA_RANK)?,
             attention_max: ctx.stream.alloc_zeros::<f32>(INDEXER_TILE * 64)?,
             attention_lse: ctx.stream.alloc_zeros::<f32>(INDEXER_TILE * 64)?,
-            attention_v: ctx.stream.alloc_zeros::<bf16>(INDEXER_TILE * 16 * 256)?,
-            attention_partial: ctx
-                .stream
-                .alloc_zeros::<bf16>(INDEXER_TILE * GLM52_HIDDEN)?,
+            tile_attention_v: ctx.stream.alloc_zeros::<bf16>(INDEXER_TILE * 16 * 256)?,
+            attention_v: ctx.stream.alloc_zeros::<bf16>(work_rows * 16 * 256)?,
+            attention_partial: ctx.stream.alloc_zeros::<bf16>(work_rows * GLM52_HIDDEN)?,
             attention_reduced: ctx.stream.alloc_zeros::<bf16>(work_rows * GLM52_HIDDEN)?,
             dense_gate_up: ctx
                 .stream
@@ -257,7 +266,7 @@ impl Glm52TpPrefillExecutor {
         ctx: &DeviceContext,
         batch: &Glm52PrefillBatch,
         tp: &mut Glm52MoeTpRank,
-        model: Glm52TpPrefillModelView<'_>,
+        model: &mut Glm52TpPrefillModelView<'_>,
     ) -> Result<Vec<u32>> {
         ensure!(
             model.layers.len() == model.caches.len() && !model.layers.is_empty(),
@@ -317,15 +326,15 @@ impl Glm52TpPrefillExecutor {
                             self.load_indexer_carry(ctx, local)?;
                         }
                     }
-                    self.attend_partial(ctx, &weights.mla, local, tile_active)?;
-                    self.reduce_and_norm_attention(
-                        ctx,
-                        &mut tp.state,
-                        &weights.post_attn_ln,
-                        local,
-                        tile_active,
-                    )?;
+                    self.attend_values(ctx, &weights.mla, local, tile_active)?;
                 }
+                self.project_reduce_norm_attention(
+                    ctx,
+                    &mut tp.state,
+                    &weights.mla,
+                    &weights.post_attn_ln,
+                    active,
+                )?;
                 match &weights.mlp {
                     Glm52LayerMlp::Dense(dense) => {
                         self.dense_mlp(ctx, dense, active.next_multiple_of(4))?;
@@ -581,24 +590,74 @@ impl Glm52TpPrefillExecutor {
         let padding_page = batch.padding_block;
         let mut slots = vec![padding_page as i64 * 64; INDEXER_TILE];
         let mut lens = vec![1i32; INDEXER_TILE];
-        let mut table = vec![padding_page; INDEXER_TILE * self.layout.table_width];
+        let mut row_requests = Vec::with_capacity(active);
         let mut request = batch.request_indptr[1..].partition_point(|&end| end as usize <= start);
         for local in 0..active {
             let row = start + local;
             while row >= batch.request_indptr[request + 1] as usize {
                 request += 1;
             }
+            slots[local] = batch.slot_mapping[row];
+            lens[local] = batch.positions[row] as i32 + 1;
+            row_requests.push(request);
+        }
+
+        let mut requests = Vec::<(usize, usize)>::new();
+        for (local, &request) in row_requests.iter().enumerate() {
+            let seq_len = lens[local] as usize;
+            if let Some((last_request, last_len)) = requests.last_mut()
+                && *last_request == request
+            {
+                *last_len = (*last_len).max(seq_len);
+            } else {
+                requests.push((request, seq_len));
+            }
+        }
+        let mut gather_table = vec![padding_page; requests.len() * self.layout.table_width];
+        let mut gather_cu_lens = vec![0i32; INDEXER_TILE + 1];
+        let mut row_starts = vec![0i32; INDEXER_TILE];
+        let mut row_ends = vec![1i32; INDEXER_TILE];
+        let mut row_table_ids = vec![0i32; INDEXER_TILE];
+        let mut gathered_tokens = 0usize;
+        for (gather_row, &(request, seq_len)) in requests.iter().enumerate() {
+            gather_cu_lens[gather_row] = gathered_tokens as i32;
             let block_start = batch.block_indptr[request] as usize;
             let block_end = batch.block_indptr[request + 1] as usize;
             let blocks = &batch.block_ids[block_start..block_end];
-            table[local * self.layout.table_width..local * self.layout.table_width + blocks.len()]
+            gather_table[gather_row * self.layout.table_width
+                ..gather_row * self.layout.table_width + blocks.len()]
                 .copy_from_slice(blocks);
-            slots[local] = batch.slot_mapping[row];
-            lens[local] = batch.positions[row] as i32 + 1;
+            for (local, &row_request) in row_requests.iter().enumerate() {
+                if row_request == request {
+                    row_starts[local] = gathered_tokens as i32;
+                    row_ends[local] = (gathered_tokens + lens[local] as usize) as i32;
+                    row_table_ids[local] = gather_row as i32;
+                }
+            }
+            gathered_tokens += seq_len;
         }
+        gather_cu_lens[requests.len()] = gathered_tokens as i32;
+        ensure!(
+            gathered_tokens > 0 && gathered_tokens <= self.layout.kv_slots,
+            "prefill indexer gather needs {gathered_tokens} tokens, capacity is {}",
+            self.layout.kv_slots
+        );
         ctx.stream.memcpy_htod(&slots, &mut self.tile_slots)?;
         ctx.stream.memcpy_htod(&lens, &mut self.tile_lens)?;
-        ctx.stream.memcpy_htod(&table, &mut self.tile_table)?;
+        ctx.stream.memcpy_htod(
+            &gather_table,
+            &mut self
+                .gather_table
+                .slice_mut(..requests.len() * self.layout.table_width),
+        )?;
+        ctx.stream
+            .memcpy_htod(&gather_cu_lens, &mut self.gather_cu_lens)?;
+        ctx.stream
+            .memcpy_htod(&row_starts, &mut self.gather_row_starts)?;
+        ctx.stream
+            .memcpy_htod(&row_ends, &mut self.gather_row_ends)?;
+        ctx.stream
+            .memcpy_htod(&row_table_ids, &mut self.gather_row_table_ids)?;
         glm52_indexer_forward_into(
             ctx,
             weights,
@@ -608,9 +667,20 @@ impl Glm52TpPrefillExecutor {
             &self.tile_sin,
             index_k_cache,
             &self.tile_slots,
-            &self.tile_table,
+            &self.gather_table,
             &self.tile_lens,
             2048,
+            Some(Glm52IndexerPrefill {
+                requests: requests.len(),
+                num_kv_tokens: gathered_tokens,
+                gather_table: &self.gather_table,
+                gather_cu_lens: &self.gather_cu_lens,
+                row_starts: &self.gather_row_starts,
+                row_ends: &self.gather_row_ends,
+                row_table_ids: &self.gather_row_table_ids,
+                gathered_k: &mut self.gathered_index_k,
+                gathered_scales: &mut self.gathered_index_scales,
+            }),
             &mut self.indexer,
         )
     }
@@ -647,7 +717,7 @@ impl Glm52TpPrefillExecutor {
         Ok(())
     }
 
-    fn attend_partial(
+    fn attend_values(
         &mut self,
         ctx: &DeviceContext,
         weights: &Glm52MlaLayerWeights,
@@ -696,27 +766,18 @@ impl Glm52TpPrefillExecutor {
             &self.attention_out,
             64 * GLM52_KV_LORA_RANK,
             GLM52_KV_LORA_RANK,
-            &mut self.attention_v,
+            &mut self.tile_attention_v,
             16 * 256,
             256,
             16,
         )?;
-        let rows = active.next_multiple_of(4);
-        if rows > active {
-            ctx.stream.memset_zeros(
-                &mut self
-                    .attention_v
-                    .slice_mut(active * 16 * 256..rows * 16 * 256),
-            )?;
-        }
-        fp8_linear_large_m_into(
-            ctx,
-            &weights.o_proj,
-            rows,
-            &self.attention_v,
-            &mut self.fp8_gemm,
-            &mut self.attention_partial,
-        )
+        let elems = active * 16 * 256;
+        let dst_start = offset * 16 * 256;
+        ctx.stream.memcpy_dtod(
+            &self.tile_attention_v.slice(..elems),
+            &mut self.attention_v.slice_mut(dst_start..dst_start + elems),
+        )?;
+        Ok(())
     }
 
     fn dense_mlp(
@@ -756,55 +817,51 @@ impl Glm52TpPrefillExecutor {
         )
     }
 
-    fn reduce_and_norm_attention(
+    fn project_reduce_norm_attention(
         &mut self,
         ctx: &DeviceContext,
         tp: &mut Glm52MoeTpState,
+        weights: &Glm52MlaLayerWeights,
         post_attn_ln: &DeviceVec,
-        offset: usize,
         active: usize,
     ) -> Result<()> {
-        tp.prefill_ar_launch(
-            ctx,
-            active,
-            &self.attention_partial,
-            self.tile_attention_reduced.data_mut(),
-        )?;
-        let hidden_start = offset * GLM52_HIDDEN;
-        ctx.stream.memcpy_dtod(
-            &self
-                .hidden
-                .slice(hidden_start..hidden_start + INDEXER_TILE * GLM52_HIDDEN),
-            self.tile_hidden.data_mut(),
-        )?;
-        fused_add_rms_norm_round_into(
-            ctx,
-            self.tile_attention_reduced.data_mut(),
-            self.tile_hidden.data(),
-            post_attn_ln,
-            GLM52_RMS_EPS,
-            GLM52_HIDDEN,
-            active,
-            self.tile_normed.data_mut(),
-        )?;
-        ctx.stream.memcpy_dtod(
-            self.tile_attention_reduced.data(),
-            &mut self
-                .attention_reduced
-                .slice_mut(hidden_start..hidden_start + INDEXER_TILE * GLM52_HIDDEN),
-        )?;
-        ctx.stream.memcpy_dtod(
-            self.tile_normed.data(),
-            &mut self
-                .normed
-                .slice_mut(hidden_start..hidden_start + INDEXER_TILE * GLM52_HIDDEN),
-        )?;
         let rows = active.next_multiple_of(4);
         if rows > active {
             ctx.stream.memset_zeros(
                 &mut self
+                    .attention_v
+                    .slice_mut(active * 16 * 256..rows * 16 * 256),
+            )?;
+        }
+        fp8_linear_large_m_into(
+            ctx,
+            &weights.o_proj,
+            rows,
+            &self.attention_v,
+            &mut self.fp8_gemm,
+            &mut self.attention_partial,
+        )?;
+        tp.prefill_ar_launch(
+            ctx,
+            active,
+            &self.attention_partial,
+            &mut self.attention_reduced,
+        )?;
+        fused_add_rms_norm_round_into(
+            ctx,
+            &mut self.attention_reduced,
+            &self.hidden,
+            post_attn_ln,
+            GLM52_RMS_EPS,
+            GLM52_HIDDEN,
+            active,
+            &mut self.normed,
+        )?;
+        if rows > active {
+            ctx.stream.memset_zeros(
+                &mut self
                     .normed
-                    .slice_mut((offset + active) * GLM52_HIDDEN..(offset + rows) * GLM52_HIDDEN),
+                    .slice_mut(active * GLM52_HIDDEN..rows * GLM52_HIDDEN),
             )?;
         }
         Ok(())

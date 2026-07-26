@@ -153,10 +153,10 @@ pub use sampling::markov_step_argmax_into;
 pub use sampling::markov_step_argmax_partials_len;
 
 /// Calling thread's last FFI exception message, ready to append to an error;
-/// empty unless `result` is the -1 sentinel set by the C++ guard. Public for
+/// empty unless a guarded C++ call failed with an exception. Public for
 /// crates that call guarded FFI entries directly instead of through a wrapper.
 pub fn ffi_exception_message(result: i32) -> String {
-    if result != -1 {
+    if result == 0 {
         return String::new();
     }
     let ptr = unsafe { crate::ffi::openinfer_kernels_last_error() };

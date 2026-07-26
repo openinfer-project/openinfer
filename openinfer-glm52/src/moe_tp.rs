@@ -17,7 +17,6 @@ use anyhow::bail;
 use anyhow::ensure;
 use cudarc::driver::CudaSlice;
 use half::bf16;
-use openinfer_kernels::ops::GLM52_PREFILL_AR_BUFFER_BYTES;
 use openinfer_kernels::ops::GLM52_TP_BANK_EXPERTS;
 use openinfer_kernels::ops::GLM52_TP_HIDDEN;
 use openinfer_kernels::ops::GLM52_TP_MAX_RANKS;
@@ -30,9 +29,6 @@ use openinfer_kernels::ops::Glm52TpTopology;
 use openinfer_kernels::ops::glm52_moe_tp_epoch_advance;
 use openinfer_kernels::ops::glm52_moe_tp_layer_launch;
 use openinfer_kernels::ops::glm52_moe_tp_max_blocks;
-use openinfer_kernels::ops::glm52_prefill_ar_launch;
-use openinfer_kernels::ops::glm52_prefill_moe_gather_launch;
-use openinfer_kernels::ops::glm52_prefill_moe_reduce_launch;
 use openinfer_kernels::ops::glm52_silu_and_mul_bf16_launch;
 use openinfer_kernels::ops::glm52_tp_ar_buffer_bytes;
 use openinfer_kernels::ops::glm52_tp_ar_chunk_packets;
@@ -43,17 +39,14 @@ use crate::config::GLM52_EXPERT_INTERMEDIATE as INTERMEDIATE;
 use crate::config::GLM52_HIDDEN;
 use crate::fp8::Glm52Fp8GemmScratch;
 use crate::fp8::fp8_linear_large_m_bank_into;
-use crate::fp8::fp8_linear_large_m_batched_into;
 use crate::moe_decode::EXPERTS;
 use crate::moe_decode::Glm52MoeRouterWeights;
 use crate::moe_decode::Glm52RouterScratch;
 use crate::moe_decode::QUANT_GROUP;
-use crate::moe_decode::TOPK;
 use crate::moe_decode::W2_K;
 use crate::moe_decode::W2_N;
 use crate::moe_decode::W2_SCALE_COLS;
 use crate::moe_decode::W2_SCALE_ROWS;
-use crate::moe_decode::run_router_rows_into;
 use crate::weights::Glm52WeightManifest;
 use crate::weights::expected_tensor_contract;
 use crate::weights::mmap_file;
@@ -332,7 +325,6 @@ pub(crate) fn load_tp_slice_layer(
 struct Glm52TpLlVas {
     rs: [u64; RANKS],
     ar: [u64; RANKS],
-    prefill_ar: [u64; RANKS],
 }
 
 /// Cross-rank rendezvous for LL buffer mappings: every rank publishes its
@@ -424,7 +416,6 @@ impl Glm52TpExchange {
                 Glm52TpLlVas {
                     rs: [0; RANKS],
                     ar: [0; RANKS],
-                    prefill_ar: [0; RANKS],
                 }
             }
         }))
@@ -482,49 +473,29 @@ impl Glm52MoeTpRank {
 
 pub(crate) struct Glm52MoeTpPrefillScratch {
     router: Glm52RouterScratch,
-    row_indices: CudaSlice<i32>,
-    output_route_slots: CudaSlice<i32>,
-    route_weights: CudaSlice<f32>,
-    expert_input: CudaSlice<bf16>,
-    gate_up: CudaSlice<bf16>,
-    silu: CudaSlice<bf16>,
-    expert_output: CudaSlice<bf16>,
-    shared_input: CudaSlice<bf16>,
+    fused: Option<openinfer_kernels::ops::Glm52TrtllmMoe>,
+    rows: usize,
+    routed_output: CudaSlice<bf16>,
     shared_gate_up: CudaSlice<bf16>,
     shared_silu: CudaSlice<bf16>,
     shared_output: CudaSlice<bf16>,
     partial: CudaSlice<bf16>,
     gemm: Glm52Fp8GemmScratch,
-    host_indices: Vec<i32>,
-    host_weights: Vec<f32>,
 }
 
 impl Glm52MoeTpPrefillScratch {
     pub(crate) fn new(ctx: &DeviceContext, rows: usize) -> Result<Self> {
-        ensure!(
-            rows > 0 && rows <= openinfer_kernels::ops::GLM52_PREFILL_AR_ROWS,
-            "GLM5.2 TP prefill scratch rows are invalid"
-        );
-        let packed_rows = BANK * rows;
+        ensure!(rows > 0, "GLM5.2 TP prefill scratch rows are invalid");
         Ok(Self {
             router: Glm52RouterScratch::new(ctx, rows)?,
-            row_indices: ctx.stream.alloc_zeros(packed_rows)?,
-            output_route_slots: ctx.stream.alloc_zeros(rows * (TOPK + 1))?,
-            route_weights: ctx.stream.alloc_zeros(packed_rows)?,
-            expert_input: ctx.stream.alloc_zeros(packed_rows * H)?,
-            gate_up: ctx
-                .stream
-                .alloc_zeros(packed_rows * 2 * (INTERMEDIATE / 4))?,
-            silu: ctx.stream.alloc_zeros(packed_rows * (INTERMEDIATE / 4))?,
-            expert_output: ctx.stream.alloc_zeros(packed_rows * H)?,
-            shared_input: ctx.stream.alloc_zeros(rows * H)?,
+            fused: None,
+            rows,
+            routed_output: ctx.stream.alloc_zeros(rows * H)?,
             shared_gate_up: ctx.stream.alloc_zeros(rows * 2 * (INTERMEDIATE / 4))?,
             shared_silu: ctx.stream.alloc_zeros(rows * (INTERMEDIATE / 4))?,
             shared_output: ctx.stream.alloc_zeros(rows * H)?,
             partial: ctx.stream.alloc_zeros(rows * H)?,
-            gemm: Glm52Fp8GemmScratch::new(ctx, packed_rows, H)?,
-            host_indices: vec![0; rows * TOPK],
-            host_weights: vec![0.0; rows * TOPK],
+            gemm: Glm52Fp8GemmScratch::new(ctx, rows, H)?,
         })
     }
 
@@ -538,144 +509,63 @@ impl Glm52MoeTpPrefillScratch {
         active: usize,
         output: &mut CudaSlice<bf16>,
     ) -> Result<()> {
-        let rows = active.next_multiple_of(4);
+        let shared_rows = active.next_multiple_of(4);
         ensure!(
             active > 0
-                && rows <= openinfer_kernels::ops::GLM52_PREFILL_AR_ROWS
-                && bank.tp_ranks == state.ranks()
-                && bank.slice_i == INTERMEDIATE / state.ranks(),
+                && shared_rows <= self.rows
+                && state.ranks() == 4
+                && bank.tp_ranks == 4
+                && bank.slice_i == INTERMEDIATE / 4,
             "GLM5.2 TP prefill MoE shape is invalid"
         );
-        run_router_rows_into(ctx, router, normed, active, rows, &mut self.router)?;
-        let routes = active * TOPK;
-        ctx.stream.memcpy_dtoh(
-            &self.router.route.topk_idx.slice(..routes),
-            &mut self.host_indices[..routes],
-        )?;
-        ctx.stream.memcpy_dtoh(
-            &self.router.route.topk_weight.slice(..routes),
-            &mut self.host_weights[..routes],
-        )?;
-        ctx.stream.synchronize()?;
-
-        let mut grouped = vec![Vec::<(i32, f32, usize)>::new(); BANK];
-        for row in 0..active {
-            for route in 0..TOPK {
-                let offset = row * TOPK + route;
-                let expert = usize::try_from(self.host_indices[offset])
-                    .context("GLM5.2 router returned a negative expert")?;
-                ensure!(expert < EXPERTS, "GLM5.2 router expert {expert} is invalid");
-                grouped[expert].push((row as i32, self.host_weights[offset], route));
-            }
-            grouped[BANK - 1].push((row as i32, 1.0, TOPK));
-        }
-
-        let expert_rows = grouped[..EXPERTS]
-            .iter()
-            .map(Vec::len)
-            .max()
-            .unwrap_or_default()
-            .next_multiple_of(4);
-        ensure!(
-            expert_rows > 0 && expert_rows <= openinfer_kernels::ops::GLM52_PREFILL_AR_ROWS,
-            "GLM5.2 TP prefill expert batch width {expert_rows} is invalid"
-        );
-        let routed_rows = EXPERTS * expert_rows;
-        let shared_rows = rows;
-        let packed_rows = routed_rows + shared_rows;
-        let mut indices = vec![0i32; packed_rows];
-        let mut weights = vec![0.0f32; packed_rows];
-        let mut output_route_slots = vec![0i32; active * (TOPK + 1)];
-        for (expert, routes) in grouped[..EXPERTS].iter().enumerate() {
-            let base = expert * expert_rows;
-            for (slot, &(row, weight, route)) in routes.iter().enumerate() {
-                indices[base + slot] = row;
-                weights[base + slot] = weight;
-                output_route_slots[row as usize * (TOPK + 1) + route] =
-                    i32::try_from(base + slot).context("GLM5.2 packed route index overflow")?;
-            }
-        }
-        for (slot, &(row, weight, route)) in grouped[BANK - 1].iter().enumerate() {
-            indices[routed_rows + slot] = row;
-            weights[routed_rows + slot] = weight;
-            output_route_slots[row as usize * (TOPK + 1) + route] =
-                i32::try_from(routed_rows + slot).context("GLM5.2 shared route index overflow")?;
-        }
-        ctx.stream
-            .memcpy_htod(&indices, &mut self.row_indices.slice_mut(..packed_rows))?;
-        ctx.stream
-            .memcpy_htod(&weights, &mut self.route_weights.slice_mut(..packed_rows))?;
-        ctx.stream.memcpy_htod(
-            &output_route_slots,
-            &mut self
-                .output_route_slots
-                .slice_mut(..output_route_slots.len()),
-        )?;
-        glm52_prefill_moe_gather_launch(
+        crate::moe_decode::run_router_logits_rows_into(
             ctx,
-            packed_rows,
+            router,
             normed,
-            &self.row_indices,
-            &mut self.expert_input,
+            active,
+            &mut self.router,
         )?;
-        fp8_linear_large_m_batched_into(
-            ctx,
-            EXPERTS,
-            expert_rows,
-            bank.slice_rows,
-            H,
-            &self.expert_input,
-            &bank.w13,
-            &bank.w13_scale,
-            &mut self.gemm,
-            &mut self.gate_up,
-        )?;
-        glm52_silu_and_mul_bf16_launch(
-            ctx,
-            routed_rows,
-            bank.slice_i,
-            &self.gate_up,
-            &mut self.silu,
-        )?;
-        fp8_linear_large_m_batched_into(
-            ctx,
-            EXPERTS,
-            expert_rows,
-            H,
-            bank.slice_i,
-            &self.silu,
-            &bank.w2,
-            &bank.w2_scale,
-            &mut self.gemm,
-            &mut self.expert_output,
-        )?;
-        ctx.stream.memcpy_dtod(
-            &self
-                .expert_input
-                .slice(routed_rows * H..(routed_rows + shared_rows) * H),
-            &mut self.shared_input,
-        )?;
+        if self.fused.is_none() {
+            self.fused = Some(openinfer_kernels::ops::Glm52TrtllmMoe::new(ctx, self.rows)?);
+        }
+        let fused = self.fused.as_ref().expect("fused MoE initialized above");
+        fused
+            .launch(
+                ctx,
+                active,
+                normed,
+                self.router.logits(),
+                router.selection_bias(),
+                &bank.w13,
+                &bank.w13_scale,
+                &bank.w2,
+                &bank.w2_scale,
+                &mut self.routed_output,
+            )
+            .context("GLM5.2 TP prefill routed fused MoE")?;
         let shared = BANK - 1;
         fp8_linear_large_m_bank_into(
             ctx,
             shared_rows,
             bank.slice_rows,
             H,
-            &self.shared_input,
+            normed,
             &bank.w13,
             shared * bank.slice_rows * H,
             &bank.w13_scale,
             shared * bank.slice_rows.div_ceil(128) * H.div_ceil(128),
             &mut self.gemm,
             &mut self.shared_gate_up,
-        )?;
+        )
+        .context("GLM5.2 TP prefill shared gate/up projection")?;
         glm52_silu_and_mul_bf16_launch(
             ctx,
             shared_rows,
             bank.slice_i,
             &self.shared_gate_up,
             &mut self.shared_silu,
-        )?;
+        )
+        .context("GLM5.2 TP prefill shared activation")?;
         fp8_linear_large_m_bank_into(
             ctx,
             shared_rows,
@@ -688,20 +578,13 @@ impl Glm52MoeTpPrefillScratch {
             shared * H.div_ceil(128) * bank.slice_i.div_ceil(128),
             &mut self.gemm,
             &mut self.shared_output,
-        )?;
-        ctx.stream.memcpy_dtod(
-            &self.shared_output.slice(..shared_rows * H),
-            &mut self
-                .expert_output
-                .slice_mut(routed_rows * H..(routed_rows + shared_rows) * H),
-        )?;
-        glm52_prefill_moe_reduce_launch(
+        )
+        .context("GLM5.2 TP prefill shared down projection")?;
+        openinfer_kernels::ops::add_into(
             ctx,
-            active,
-            TOPK + 1,
-            &self.expert_output,
-            &self.output_route_slots,
-            &self.route_weights,
+            &self.routed_output,
+            &self.shared_output,
+            active * H,
             &mut self.partial,
         )?;
         state.prefill_ar_launch(ctx, active, &self.partial, output)
@@ -717,13 +600,10 @@ pub(crate) struct Glm52MoeTpState {
     grid_blocks: usize,
     _rs: Option<Glm52TpLlBuffer>,
     _ar: Option<Glm52TpLlBuffer>,
-    _prefill_ar: Option<Glm52TpLlBuffer>,
     rs_local: u64,
     ar_local: u64,
     peer_rs: [u64; RANKS],
     peer_ar: [u64; RANKS],
-    prefill_ar_local: u64,
-    peer_prefill_ar: [u64; RANKS],
     epoch_dev: CudaSlice<u64>,
     active_rows_dev: CudaSlice<i32>,
     guidx: CudaSlice<i32>,
@@ -745,7 +625,7 @@ impl Glm52MoeTpState {
         ar_slots: usize,
     ) -> Result<Self> {
         let ranks = topology.ranks();
-        let prep = (|| -> Result<(Glm52TpLlBuffer, Glm52TpLlBuffer, Glm52TpLlBuffer)> {
+        let prep = (|| -> Result<(Glm52TpLlBuffer, Glm52TpLlBuffer)> {
             ensure!(rank < ranks, "{topology:?} rank {rank} out of range");
             ensure!(
                 slots > 0 && ar_slots > 0,
@@ -768,13 +648,11 @@ impl Glm52MoeTpState {
                 glm52_tp_ar_buffer_bytes(topology, ar_slots),
                 &fleet,
             )?;
-            let prefill_ar =
-                Glm52TpLlBuffer::alloc(topology, GLM52_PREFILL_AR_BUFFER_BYTES, &fleet)?;
-            Ok((rs, ar, prefill_ar))
+            Ok((rs, ar))
         })();
         let vas = prep
             .as_ref()
-            .map(|(rs, ar, prefill_ar)| Glm52TpLlVas {
+            .map(|(rs, ar)| Glm52TpLlVas {
                 rs: std::array::from_fn(|accessor| {
                     if accessor < ranks {
                         rs.addr_for(accessor)
@@ -789,18 +667,10 @@ impl Glm52MoeTpState {
                         0
                     }
                 }),
-                prefill_ar: std::array::from_fn(|accessor| {
-                    if accessor < ranks {
-                        prefill_ar.addr_for(accessor)
-                    } else {
-                        0
-                    }
-                }),
             })
             .map_err(|err| format!("{err:#}"));
         let table = exchange.publish_and_wait(rank, vas)?;
-        let (rs, ar, prefill_ar) =
-            prep.expect("own failure would have surfaced via publish_and_wait");
+        let (rs, ar) = prep.expect("own failure would have surfaced via publish_and_wait");
         let rs_slot = GLM52_TP_HIDDEN * 16;
         let ar_slot = glm52_tp_ar_chunk_packets(topology) * 16;
         let peer_rs = std::array::from_fn(|peer| {
@@ -813,13 +683,6 @@ impl Glm52MoeTpState {
         let peer_ar = std::array::from_fn(|peer| {
             if peer < ranks {
                 table[peer].ar[device_ordinal] + (rank * ar_slot) as u64
-            } else {
-                0
-            }
-        });
-        let peer_prefill_ar = std::array::from_fn(|peer| {
-            if peer < ranks {
-                table[peer].prefill_ar[device_ordinal]
             } else {
                 0
             }
@@ -840,11 +703,8 @@ impl Glm52MoeTpState {
             ar_local: ar.addr_for(device_ordinal),
             _rs: Some(rs),
             _ar: Some(ar),
-            _prefill_ar: Some(prefill_ar),
             peer_rs,
             peer_ar,
-            prefill_ar_local: peer_prefill_ar[rank],
-            peer_prefill_ar,
             epoch_dev,
             active_rows_dev,
             guidx: ctx.stream.alloc_zeros(GLM52_TP_UNION_MAX)?,
@@ -881,13 +741,10 @@ impl Glm52MoeTpState {
             grid_blocks: glm52_moe_tp_max_blocks(topology)?,
             _rs: None,
             _ar: None,
-            _prefill_ar: None,
             rs_local: 0,
             ar_local: 0,
             peer_rs: [0; RANKS],
             peer_ar: [0; RANKS],
-            prefill_ar_local: 0,
-            peer_prefill_ar: [0; RANKS],
             epoch_dev,
             active_rows_dev,
             guidx: ctx.stream.alloc_zeros(GLM52_TP_UNION_MAX)?,
@@ -958,24 +815,14 @@ impl Glm52MoeTpState {
         partial: &CudaSlice<bf16>,
         out: &mut CudaSlice<bf16>,
     ) -> Result<()> {
-        if let Some(comm) = &self.prefill_comm {
-            let len = rows * GLM52_HIDDEN;
-            let send = partial.slice(..len);
-            let mut recv = out.slice_mut(..len);
-            comm.all_reduce_bf16(ctx, len, &send, &mut recv)?;
-            return Ok(());
-        }
-        self.advance_epoch(ctx)?;
-        glm52_prefill_ar_launch(
-            ctx,
-            rows,
-            partial,
-            out,
-            self.prefill_ar_local,
-            self.peer_prefill_ar,
-            &self.epoch_dev,
-            self.topology.ranks(),
-        )
+        let comm = self
+            .prefill_comm
+            .as_ref()
+            .expect("prefill execution requires the NCCL TP state");
+        let len = rows * GLM52_HIDDEN;
+        let send = partial.slice(..len);
+        let mut recv = out.slice_mut(..len);
+        comm.all_reduce_bf16(ctx, len, &send, &mut recv)
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -263,11 +263,8 @@ const _: () = assert!(GLM52_FLASHMLA_SPARSE_TOPK <= GLM52_INDEX_TOPK);
 /// DeepGEMM paged MQA requires BLOCK_KV=64 — a kernel constraint, not a
 /// model property (kept here, not in config.rs).
 pub(crate) const INDEX_CACHE_BLOCK: usize = 64;
-/// The DeepGEMM MQA indexer's persistent-grid size. 132 is the H200 SM count
-/// and is baked into the AOT instantiation (`kAotNumSms` in
-/// glm52_deepgemm_mqa.cu, enforced by its `num_sms == kAotNumSms` gate), so
-/// it deliberately stays 132 on 152-SM GB300 — the schedule metadata drives
-/// correctness; "fixing" this to the live SM count breaks the AOT gate.
+/// The DeepGEMM MQA indexer's persistent-grid size. 132 is baked into the
+/// AOT schedule metadata instantiation.
 pub(crate) const NUM_SMS: usize = 132;
 
 pub(crate) fn rope_tables(position: usize) -> (Vec<bf16>, Vec<bf16>) {
@@ -540,6 +537,15 @@ impl Glm52RankModel {
             "GLM5.2 max_model_len {max_model_len} must be a positive multiple of \
              {GLM52_MODEL_LEN_ALIGN} (the FlashMLA page / index-K block size)"
         );
+        if prefill_chunk_size.is_some() {
+            let (major, _) = ctx.ctx.compute_capability()?;
+            ensure!(
+                major == 10,
+                "GLM5.2 native TP prefill requires an SM100-class GPU; \
+                 device {} reports compute capability {major}.x",
+                ctx.device_ordinal
+            );
+        }
         let batch = GLM52_MAX_BATCH_PER_RANK;
         let mla_heads = if attn_shard.is_some() {
             crate::config::GLM52_HEADS / moe_topo.device_count()
@@ -843,23 +849,19 @@ impl Glm52RankModel {
             .decode_lm_head
             .as_ref()
             .context("GLM5.2 TP4 prefill is missing its vocabulary shard")?;
-        executor.forward(
-            ctx,
-            batch,
-            tp,
-            Glm52TpPrefillModelView {
-                layers: &self.layers,
-                caches: &mut self.caches,
-                embed: &self.embed,
-                cos_table: &self.cos_table,
-                sin_table: &self.sin_table,
-                final_norm: &self.final_norm,
-                shard_lm_head: lm_head,
-                full_lm_head: &self.lm_head,
-                vocab_start: self.decode_vocab_start,
-                sampling_scratch,
-            },
-        )
+        let mut model = Glm52TpPrefillModelView {
+            layers: &self.layers,
+            caches: &mut self.caches,
+            embed: &self.embed,
+            cos_table: &self.cos_table,
+            sin_table: &self.sin_table,
+            final_norm: &self.final_norm,
+            shard_lm_head: lm_head,
+            full_lm_head: &self.lm_head,
+            vocab_start: self.decode_vocab_start,
+            sampling_scratch,
+        };
+        executor.forward(ctx, batch, tp, &mut model)
     }
 
     /// One lock-step step: feed `inputs[row]` = the `(token, position)` each

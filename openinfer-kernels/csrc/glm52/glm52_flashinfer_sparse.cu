@@ -13,6 +13,7 @@
 #include <string>
 
 #include "glm52_trtllm_fmha_cubins.inc"
+#include "glm52_trtllm_moe_cubins.inc"
 #include <flashinfer/trtllm/fmha/fmhaRunner.cuh>
 
 namespace {
@@ -36,6 +37,20 @@ CUresult consume_last_cuda_error() {
 namespace flashinfer::trtllm_cubin_loader {
 
 std::string getCubin(const std::string& kernel_name, const std::string& sha256) {
+#define GLM52_RETURN_MOE_CUBIN(symbol)                                       \
+  if (kernel_name.size() >= std::char_traits<char>::length(symbol##Name) &&  \
+      kernel_name.compare(                                                   \
+          kernel_name.size() - std::char_traits<char>::length(symbol##Name), \
+          std::char_traits<char>::length(symbol##Name), symbol##Name) == 0 && \
+      sha256 == symbol##Sha256) {                                            \
+    return std::string(reinterpret_cast<const char*>(symbol), symbol##Size); \
+  }
+  GLM52_RETURN_MOE_CUBIN(kGlm52MoeFc1Tile8)
+  GLM52_RETURN_MOE_CUBIN(kGlm52MoeFc2Tile8)
+  GLM52_RETURN_MOE_CUBIN(kGlm52MoeFc1Tile64)
+  GLM52_RETURN_MOE_CUBIN(kGlm52MoeFc2Tile64)
+#undef GLM52_RETURN_MOE_CUBIN
+
   auto load = [&](const char* name, const char* expected_sha, const unsigned char* data,
                   unsigned int size) -> std::string {
     if (kernel_name.find(name) == std::string::npos) return {};

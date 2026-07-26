@@ -249,3 +249,58 @@ pub fn glm52_deepgemm_paged_mqa_logits_launch(
         .result()
         .map_err(|err| anyhow!("GLM5.2 DeepGEMM MQA logits launch failed: {err}"))
 }
+
+#[allow(clippy::too_many_arguments)]
+pub fn glm52_deepgemm_mqa_logits_launch(
+    ctx: &DeviceContext,
+    num_q_tokens: usize,
+    num_kv_tokens: usize,
+    logits_stride: usize,
+    q: &CudaSlice<u8>,
+    kv: &CudaSlice<u8>,
+    kv_scales: &CudaSlice<f32>,
+    weights: &CudaSlice<f32>,
+    row_starts: &CudaSlice<i32>,
+    row_ends: &CudaSlice<i32>,
+    logits: &mut CudaSlice<f32>,
+) -> Result<()> {
+    ensure!(
+        num_q_tokens > 0 && num_kv_tokens > 0 && logits_stride >= num_kv_tokens,
+        "GLM5.2 unpaged MQA shape is invalid"
+    );
+    ensure!(
+        q.len() >= num_q_tokens * 32 * GLM52_DEEPGEMM_MQA_HEAD_DIM
+            && kv.len() >= num_kv_tokens * GLM52_DEEPGEMM_MQA_HEAD_DIM
+            && kv_scales.len() >= num_kv_tokens
+            && weights.len() >= num_q_tokens * 32
+            && row_starts.len() >= num_q_tokens
+            && row_ends.len() >= num_q_tokens
+            && logits.len() >= num_q_tokens * logits_stride,
+        "GLM5.2 unpaged MQA buffer is too small"
+    );
+    let (q_ptr, _q_guard) = q.device_ptr(&ctx.stream);
+    let (kv_ptr, _kv_guard) = kv.device_ptr(&ctx.stream);
+    let (scale_ptr, _scale_guard) = kv_scales.device_ptr(&ctx.stream);
+    let (weight_ptr, _weight_guard) = weights.device_ptr(&ctx.stream);
+    let (start_ptr, _start_guard) = row_starts.device_ptr(&ctx.stream);
+    let (end_ptr, _end_guard) = row_ends.device_ptr(&ctx.stream);
+    let (logits_ptr, _logits_guard) = logits.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::glm52_deepgemm_mqa_logits_cuda(
+            q_ptr as *const std::ffi::c_void,
+            kv_ptr as *const std::ffi::c_void,
+            scale_ptr as *const f32,
+            weight_ptr as *const f32,
+            start_ptr as *const i32,
+            end_ptr as *const i32,
+            logits_ptr as *mut std::ffi::c_void,
+            num_q_tokens as i32,
+            num_kv_tokens as i32,
+            logits_stride as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result
+        .result()
+        .map_err(|err| anyhow!("GLM5.2 DeepGEMM unpaged MQA launch failed: {err}"))
+}

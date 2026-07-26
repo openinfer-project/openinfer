@@ -17,8 +17,6 @@ const GLM52_TP_TOPK: usize = 8;
 pub const GLM52_TP_BANK_EXPERTS: usize = 257;
 pub const GLM52_TP_TOKENS: usize = 8;
 pub const GLM52_PREFILL_AR_ROWS: usize = 512;
-pub const GLM52_PREFILL_AR_BUFFER_BYTES: usize =
-    GLM52_PREFILL_AR_ROWS * GLM52_TP_HIDDEN * size_of::<bf16>() + 2 * size_of::<u64>();
 pub const GLM52_TP_UNION_MAX: usize = GLM52_TP_TOKENS * (GLM52_TP_TOPK + 1);
 
 pub struct Glm52PrefillNcclComm {
@@ -81,6 +79,96 @@ impl Glm52PrefillNcclComm {
 impl Drop for Glm52PrefillNcclComm {
     fn drop(&mut self) {
         let _ = unsafe { ffi::glm52_prefill_nccl_comm_destroy(self.raw) };
+    }
+}
+
+pub struct Glm52TrtllmMoe {
+    raw: *mut std::ffi::c_void,
+    capacity: usize,
+}
+
+unsafe impl Send for Glm52TrtllmMoe {}
+
+impl Glm52TrtllmMoe {
+    pub fn new(ctx: &DeviceContext, capacity: usize) -> Result<Self> {
+        let capacity_i32 =
+            i32::try_from(capacity).map_err(|_| anyhow!("GLM5.2 fused MoE capacity overflow"))?;
+        ensure!(capacity_i32 > 0, "GLM5.2 fused MoE capacity is zero");
+        let mut raw = std::ptr::null_mut();
+        unsafe {
+            ffi::glm52_trtllm_moe_create(capacity_i32, ctx.device_ordinal as i32, &raw mut raw)
+        }
+        .result()
+        .map_err(|err| anyhow!("GLM5.2 fused MoE initialization failed: {err}"))?;
+        ensure!(!raw.is_null(), "GLM5.2 fused MoE returned a null handle");
+        Ok(Self { raw, capacity })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch<
+        H: DevicePtr<bf16>,
+        L: DevicePtr<f32>,
+        B: DevicePtr<u8>,
+        W13: DevicePtr<u8>,
+        S13: DevicePtr<f32>,
+        W2: DevicePtr<u8>,
+        S2: DevicePtr<f32>,
+        O: DevicePtrMut<bf16>,
+    >(
+        &self,
+        ctx: &DeviceContext,
+        rows: usize,
+        hidden: &H,
+        routing_logits: &L,
+        routing_bias: &B,
+        w13: &W13,
+        w13_scale: &S13,
+        w2: &W2,
+        w2_scale: &S2,
+        output: &mut O,
+    ) -> Result<()> {
+        ensure!(
+            rows > 0
+                && rows <= self.capacity
+                && hidden.len() >= rows * GLM52_TP_HIDDEN
+                && routing_logits.len() >= rows * 256
+                && routing_bias.len() >= 256
+                && output.len() >= rows * GLM52_TP_HIDDEN,
+            "GLM5.2 fused MoE buffers do not fit {rows} rows"
+        );
+        let (hidden_ptr, _hidden_guard) = hidden.device_ptr(&ctx.stream);
+        let (logits_ptr, _logits_guard) = routing_logits.device_ptr(&ctx.stream);
+        let (bias_ptr, _bias_guard) = routing_bias.device_ptr(&ctx.stream);
+        let (w13_ptr, _w13_guard) = w13.device_ptr(&ctx.stream);
+        let (s13_ptr, _s13_guard) = w13_scale.device_ptr(&ctx.stream);
+        let (w2_ptr, _w2_guard) = w2.device_ptr(&ctx.stream);
+        let (s2_ptr, _s2_guard) = w2_scale.device_ptr(&ctx.stream);
+        let (output_ptr, _output_guard) = output.device_ptr_mut(&ctx.stream);
+        let status = unsafe {
+            ffi::glm52_trtllm_moe_launch(
+                self.raw,
+                hidden_ptr as *const ffi::Half,
+                logits_ptr as *const f32,
+                bias_ptr as *const f32,
+                w13_ptr as *const u8,
+                s13_ptr as *const f32,
+                w2_ptr as *const u8,
+                s2_ptr as *const f32,
+                output_ptr as *mut ffi::Half,
+                rows as i32,
+                ctx.stream.cu_stream(),
+            )
+        };
+        let detail = crate::ops::ffi_exception_message(status as i32);
+        status
+            .result()
+            .map_err(|err| anyhow!("GLM5.2 fused MoE launch failed: {err}{detail}"))
+    }
+}
+
+impl Drop for Glm52TrtllmMoe {
+    fn drop(&mut self) {
+        let _ = unsafe { ffi::glm52_trtllm_moe_destroy(self.raw) };
     }
 }
 
@@ -207,49 +295,6 @@ pub fn glm52_moe_tp_epoch_advance(
     result
         .result()
         .map_err(|err| anyhow!("{topology:?} epoch advance failed: {err}"))
-}
-
-pub fn glm52_prefill_ar_launch(
-    ctx: &DeviceContext,
-    rows: usize,
-    partial: &CudaSlice<bf16>,
-    output: &mut CudaSlice<bf16>,
-    local_buffer: u64,
-    peer_buffers: [u64; GLM52_TP_MAX_RANKS],
-    epoch: &CudaSlice<u64>,
-    ranks: usize,
-) -> Result<()> {
-    ensure!(
-        rows > 0
-            && rows <= GLM52_PREFILL_AR_ROWS
-            && ranks > 1
-            && ranks <= GLM52_TP_MAX_RANKS
-            && partial.len() >= rows * GLM52_TP_HIDDEN
-            && output.len() >= rows * GLM52_TP_HIDDEN
-            && local_buffer != 0
-            && peer_buffers[..ranks].iter().all(|&ptr| ptr != 0)
-            && !epoch.is_empty(),
-        "GLM5.2 prefill all-reduce buffers are invalid"
-    );
-    let (partial_ptr, _partial_guard) = partial.device_ptr(&ctx.stream);
-    let (output_ptr, _output_guard) = output.device_ptr_mut(&ctx.stream);
-    let (epoch_ptr, _epoch_guard) = epoch.device_ptr(&ctx.stream);
-    let peers = peer_buffers.map(|ptr| ptr as *const std::ffi::c_void);
-    let result = unsafe {
-        ffi::glm52_prefill_ar_cuda(
-            partial_ptr as *const ffi::Half,
-            output_ptr as *mut ffi::Half,
-            local_buffer as *mut std::ffi::c_void,
-            peers.as_ptr(),
-            epoch_ptr as *const u64,
-            rows as i32,
-            ranks as i32,
-            ctx.stream.cu_stream(),
-        )
-    };
-    result
-        .result()
-        .map_err(|err| anyhow!("GLM5.2 prefill all-reduce launch failed: {err}"))
 }
 
 pub fn glm52_prefill_moe_gather_launch(
@@ -495,76 +540,4 @@ pub fn glm52_moe_tp_layer_launch(
     result
         .result()
         .map_err(|err| anyhow!("{topology:?} MoE launch failed: {err}"))
-}
-
-#[cfg(test)]
-mod prefill_ar_tests {
-    use std::sync::Arc;
-    use std::sync::Barrier;
-    use std::sync::Mutex;
-
-    use super::*;
-
-    #[test]
-    #[ignore = "requires 4 peer-accessible CUDA devices"]
-    fn tp4_prefill_ar_sums_rows() -> Result<()> {
-        const RANKS: usize = 4;
-        const ROWS: usize = 7;
-        let vas = Arc::new(Mutex::new(vec![Vec::<u64>::new(); RANKS]));
-        let barrier = Arc::new(Barrier::new(RANKS));
-        let handles: Vec<_> = (0..RANKS)
-            .map(|rank| {
-                let vas = Arc::clone(&vas);
-                let barrier = Arc::clone(&barrier);
-                std::thread::spawn(move || -> Result<()> {
-                    let ctx = DeviceContext::new_with_device(rank)?;
-                    let buffer = Glm52TpLlBuffer::alloc(
-                        Glm52TpTopology::Tp4,
-                        GLM52_PREFILL_AR_BUFFER_BYTES,
-                        &(0..RANKS).collect::<Vec<_>>(),
-                    )?;
-                    vas.lock().unwrap()[rank] =
-                        (0..RANKS).map(|device| buffer.addr_for(device)).collect();
-                    barrier.wait();
-                    let peer: [u64; GLM52_TP_MAX_RANKS] = {
-                        let vas = vas.lock().unwrap();
-                        std::array::from_fn(
-                            |owner| {
-                                if owner < RANKS { vas[owner][rank] } else { 0 }
-                            },
-                        )
-                    };
-                    let partial_host =
-                        vec![bf16::from_f32((rank + 1) as f32); ROWS * GLM52_TP_HIDDEN];
-                    let partial = ctx.stream.clone_htod(&partial_host)?;
-                    let mut output = ctx.stream.alloc_zeros::<bf16>(ROWS * GLM52_TP_HIDDEN)?;
-                    let mut epoch = ctx.stream.alloc_zeros::<u64>(1)?;
-                    for _ in 0..3 {
-                        glm52_moe_tp_epoch_advance(&ctx, Glm52TpTopology::Tp4, &mut epoch)?;
-                        glm52_prefill_ar_launch(
-                            &ctx,
-                            ROWS,
-                            &partial,
-                            &mut output,
-                            buffer.addr_for(rank),
-                            peer,
-                            &epoch,
-                            RANKS,
-                        )?;
-                        let host = ctx.stream.clone_dtoh(&output)?;
-                        ensure!(
-                            host.iter().all(|value| value.to_f32() == 10.0),
-                            "TP4 prefill all-reduce produced an unexpected sum"
-                        );
-                    }
-                    barrier.wait();
-                    Ok(())
-                })
-            })
-            .collect();
-        for handle in handles {
-            handle.join().expect("prefill AR rank panicked")?;
-        }
-        Ok(())
-    }
 }
