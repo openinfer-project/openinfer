@@ -4,8 +4,8 @@
 //! to pegaflow's host tier, evicts the GPU-side data implicitly by loading into
 //! a *different* set of blocks, and checks the bytes match. This exercises the
 //! whole connector — strided per-layer registration (`block_stride` ≠ copy
-//! size), the K/V split, the async save, the prefix query, and the in-process
-//! oneshot load — on actual device memory. If the layout math were wrong the
+//! size), the K/V split, the async save, the prefix query, and the cross-process
+//! load state — on actual device memory. If the layout math were wrong the
 //! loaded bytes would land in the wrong layer/segment/block and the compare
 //! would fail.
 //!
@@ -14,7 +14,9 @@
 use cudarc::driver::CudaContext;
 use cudarc::driver::result;
 use half::bf16;
+use openinfer_kernels::imported::ImportedKvArena;
 use openinfer_kv_cache::KvBuffer;
+use openinfer_kv_cache::KvLayout;
 use openinfer_kv_offload::OffloadConfig;
 use openinfer_kv_offload::OffloadEngine;
 use openinfer_kv_offload::QueryOutcome;
@@ -58,19 +60,32 @@ fn block_hash(logical: usize) -> Vec<u8> {
 
 #[test]
 fn gpu_cpu_gpu_roundtrip_preserves_kv_bytes() {
+    let Ok(server_addr) = std::env::var("OPENINFER_PEGAFLOW_SERVER") else {
+        eprintln!("skipping cpu_roundtrip: set OPENINFER_PEGAFLOW_SERVER to run it");
+        return;
+    };
     let ctx = CudaContext::new(0).expect("cuda device 0");
     ctx.bind_to_thread().expect("bind ctx to test thread");
     let stream = ctx.default_stream();
 
-    let buffer = KvBuffer::new(
+    // ── Register first: the server allocates the arena and returns its
+    // CUDA IPC handle; the buffer is a view over the imported mapping. ──
+    let layout = KvLayout::new(NUM_LAYERS, NUM_KV_HEADS, HEAD_DIM, PAGE_SIZE);
+    let config = OffloadConfig::new("roundtrip-test", 0, server_addr);
+    let (mut engine, handle) =
+        OffloadEngine::new(&config, &layout, NUM_BLOCKS).expect("build OffloadEngine");
+    let arena_bytes = NUM_BLOCKS * PAGE_STRIDE * std::mem::size_of::<bf16>();
+    let arena = ImportedKvArena::open(&stream, &handle, arena_bytes).expect("import arena");
+    let buffer = KvBuffer::new_imported(
         &stream,
         NUM_LAYERS,
         NUM_KV_HEADS,
         HEAD_DIM,
         PAGE_SIZE,
         NUM_BLOCKS,
+        &arena,
     )
-    .expect("alloc KvBuffer");
+    .expect("wrap imported arena");
     // Sanity: our test-local geometry constants match the buffer's layout.
     assert_eq!(buffer.layout().page_stride, PAGE_STRIDE);
     assert_eq!(buffer.layout().kv_block_len, SEGMENT_LEN);
@@ -95,14 +110,6 @@ fn gpu_cpu_gpu_roundtrip_preserves_kv_bytes() {
     }
     stream.synchronize().expect("sync after fill");
 
-    // ── Build the offload engine (registers the fused buffer) ──
-    let engine = OffloadEngine::new(
-        OffloadConfig::new("roundtrip-test", 0, 64 * 1024 * 1024),
-        &buffer,
-        &stream,
-    )
-    .expect("build OffloadEngine");
-
     let hashes: Vec<Vec<u8>> = (0..src_blocks.len()).map(block_hash).collect();
     let src_ids: Vec<i32> = src_blocks.iter().map(|&b| b as i32).collect();
 
@@ -124,7 +131,7 @@ fn gpu_cpu_gpu_roundtrip_preserves_kv_bytes() {
     // ── Load CPU→GPU into a *different* set of blocks ──
     let dst_ids: Vec<i32> = dst_blocks.iter().map(|&b| b as i32).collect();
     engine
-        .load(lease, dst_ids)
+        .load(&lease, dst_ids)
         .expect("submit load")
         .wait()
         .expect("load completes");
@@ -158,4 +165,10 @@ fn gpu_cpu_gpu_roundtrip_preserves_kv_bytes() {
         zero.iter().all(|v| v.to_bits() == 0),
         "an unloaded block must remain zeroed — load must not scribble outside its destinations"
     );
+
+    // ── Teardown order mirrors the executor: close the mapping, then let
+    // unregister free the server-side arena. ──
+    drop(buffer);
+    drop(arena);
+    engine.shutdown();
 }

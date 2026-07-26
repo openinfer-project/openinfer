@@ -51,7 +51,6 @@ pub use config::probe_config_json;
 use openinfer_core::engine::EngineHandle;
 use openinfer_core::engine::KvCapacity;
 use openinfer_core::engine::LoadSnapshot;
-use openinfer_kv_offload::HostConfig;
 use openinfer_kv_offload::KvArena;
 use openinfer_kv_offload::OffloadEngine;
 use openinfer_kv_offload::OffloadHost;
@@ -343,8 +342,8 @@ mod topology_tests {
     }
 }
 
-/// Host-tier KV offload knobs. One `PegaEngine` (one pinned pool) backs all
-/// 8 DP ranks under a single namespace: the MLA latent has no TP sharding
+/// External PegaFlow KV offload for all 8 DP ranks under one namespace. The
+/// MLA latent has no TP sharding
 /// and the non-expert weights are replicated, so any rank's KV for a token
 /// prefix is as good as any other's — the same tolerance as reusing a
 /// rank's own prefix cache (FP reduction order may differ across the batch
@@ -352,33 +351,14 @@ mod topology_tests {
 /// any rank saved.
 #[derive(Clone, Debug)]
 pub struct Glm52KvOffloadOptions {
-    /// Host pinned-memory pool size in bytes, shared by all ranks.
-    pub pinned_pool_bytes: usize,
-    /// Back the pool with hugepages (the box must hold a reservation —
-    /// check `HugePages_Total`).
-    pub use_hugepages: bool,
-    /// `Some` joins the cross-instance P2P mesh: saved block hashes register
-    /// with the MetaServer and missing prefixes are pulled from peer
-    /// instances over RDMA — the P/D disaggregation data plane.
-    pub p2p: Option<Glm52P2pOptions>,
+    /// Out-of-process PegaFlow gRPC endpoint.
+    pub server_addr: String,
+    /// Stable deployment/checkpoint identity for native OpenInfer peers.
+    pub namespace: Option<String>,
     /// `Some` when the P/D prefill peer is vLLM (pegaflow connector): offload
     /// query keys switch from kvbm lineage hashes to vLLM's prefix-cache hash
     /// scheme so this decode node can find the blocks vLLM registered.
-    /// Requires `p2p` (the peer's KV lives in its pegaflow-server's pool,
-    /// even on the same host).
     pub vllm_compat: Option<Glm52VllmCompatOptions>,
-}
-
-/// Cross-instance P2P KV sharing (see `openinfer_kv_offload::P2pConfig`).
-#[derive(Clone, Debug)]
-pub struct Glm52P2pOptions {
-    /// MetaServer gRPC address, e.g. `http://10.0.0.100:50056`.
-    pub metaserver_addr: String,
-    /// This engine's routable `IP:port` (doubles as the embedded transfer
-    /// service's bind address). Must be reachable by every peer.
-    pub advertise_addr: String,
-    /// RDMA NIC device names to register the pinned pool on.
-    pub rdma_nics: Vec<String>,
 }
 
 /// Decode-node settings for a P/D deployment whose prefill node is vLLM with
@@ -497,16 +477,14 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
         "GLM5.2 --kv-offload requires the EP8 topology (tp8 replicates KV on all ranks; \
          a host-tier restore would land on one)"
     );
-    // The vLLM prefill peer's KV lives in its pegaflow-server's pool (a
-    // separate process even on the same host); without the P2P mesh the
-    // compat keys would query an empty local tier and every request would
-    // wait out the full miss window.
+    // The native-arena server allocates exactly one fused arena per instance;
+    // GLM5.2's rank-local MLA/index-K arenas need multi-arena registration,
+    // which the v1 contract does not cover. Refuse here, before the multi-GPU
+    // weight load — `with_arenas_on` would only fail after it.
     ensure!(
-        kv_offload
-            .as_ref()
-            .is_none_or(|kv| kv.vllm_compat.is_none() || kv.p2p.is_some()),
-        "GLM5.2 --kv-pd-vllm-seed requires the KV P2P mesh (--kv-p2p-metaserver-addr, \
-         --kv-p2p-advertise-addr, --kv-p2p-nics)"
+        kv_offload.is_none(),
+        "GLM5.2 KV offload is not supported by the native-arena PegaFlow contract \
+         (one server-allocated arena per instance); drop --kv-offload-server"
     );
     // The miss window must sit inside the in-flight-fetch ceiling, or the
     // registration phase could never hand over to the fetch phase.
@@ -1135,20 +1113,8 @@ fn build_offload_engines(
             .all(|arena| arena.bytes_per_block == mla_page_size * mla_bytes_per_token)),
         "GLM5.2 KV offload ranks disagree on MLA cache layout"
     );
-    let host = OffloadHost::new(HostConfig {
-        pinned_pool_bytes: opts.pinned_pool_bytes,
-        use_hugepages: opts.use_hugepages,
-        runtime_threads: 2,
-        p2p: opts
-            .p2p
-            .as_ref()
-            .map(|p2p| openinfer_kv_offload::P2pConfig {
-                metaserver_addr: p2p.metaserver_addr.clone(),
-                advertise_addr: p2p.advertise_addr.clone(),
-                rdma_nics: p2p.rdma_nics.clone(),
-            }),
-    })
-    .map_err(|err| anyhow::anyhow!("GLM5.2 KV offload host: {err}"))?;
+    let host = OffloadHost::connect(&opts.server_addr, 2)
+        .map_err(|err| anyhow::anyhow!("GLM5.2 KV offload host: {err}"))?;
     // vLLM-compat mode joins the *P side's* content domain: the pegaflow
     // connector derives an 8-hex namespace from vLLM config (and logs it at
     // startup); reproducing that derivation would mean chasing Python repr
@@ -1156,7 +1122,10 @@ fn build_offload_engines(
     let namespace = match &opts.vllm_compat {
         Some(compat) => compat.namespace.clone(),
         None => format!(
-            "openinfer-glm52-l{GLM52_LAYERS}-p{}-mla{}-idxk{}",
+            "openinfer-glm52-{}-l{GLM52_LAYERS}-p{}-mla{}-idxk{}",
+            opts.namespace
+                .as_deref()
+                .context("GLM5.2 native KV offload requires a checkpoint namespace")?,
             mla_page_size,
             mla_bytes_per_token,
             config::GLM52_INDEX_HEAD_DIM + 4,
@@ -1194,10 +1163,9 @@ fn build_offload_engines(
             .filter(|&layer| config::glm52_layer_has_full_indexer(layer))
             .count();
     log::info!(
-        "GLM5.2 KV offload up: {} pinned host pool (hugepages: {}), namespace {namespace}, \
+        "GLM5.2 KV offload up: server={}, namespace {namespace}, \
          {} rank instances x {arenas_per_rank} arenas",
-        ByteSize(opts.pinned_pool_bytes as u64),
-        opts.use_hugepages,
+        opts.server_addr,
         engines.len(),
     );
     Ok(engines)

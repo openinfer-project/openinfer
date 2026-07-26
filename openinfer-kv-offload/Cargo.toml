@@ -5,29 +5,22 @@ name = "openinfer-kv-offload"
 version = "0.1.0"
 
 [dependencies]
-# Embedded in-process: pegaflow-core is the host/SSD/RDMA KV offload tier.
-# Pinned to the upstream master rev that landed PR #395 (P-side partial-tail
-# save + first-token router forwarding), including PR #381's metaserver flush
-# barrier and embeddable P2pTransferService. The supported producer versions
-# and default layouts are pinned in the P/D deployment docs; they register the
-# same block-local bytes OpenInfer restores, so no cross-layout conversion is
-# required.
-# per the workflow in docs/subsystems/runtime/pegaflow-offload-integration.md
-# §5.2. default-features=false drops its `cuda-12` (which would pull a
-# clashing cudarc/cuda-12080 selector); the workspace cudarc already provides
-# cuda-12090 + nvrtc + runtime, which covers pegaflow-core and
-# pegaflow-transfer. `rdma` enables pegaflow-transfer: cross-node block fetch
-# (RDMA READ) + MetaServer discovery — the P/D disaggregation data plane.
+# The client shares PegaFlow's wire-compatible error/save types but does not
+# embed its storage engine or RDMA stack. Pinned to the native-arena server:
+# registration returns a CUDA IPC handle for the server-allocated KV arena.
+pegaflow-core = { git = "https://github.com/novitalabs/pegaflow.git", rev = "6043c290000a1cc5a384cff59bda6ecaaf868027", default-features = false }
+pegaflow-proto = { git = "https://github.com/novitalabs/pegaflow.git", rev = "6043c290000a1cc5a384cff59bda6ecaaf868027" }
 cudarc = { workspace = true }
 half = { workspace = true }
 log = { workspace = true }
 openinfer-kv-cache = { workspace = true }
-pegaflow-core = { git = "https://github.com/novitalabs/pegaflow.git", rev = "1473c5355d879b4fea23101760cb2a0074642ada", default-features = false, features = [
-  "rdma",
-] }
 tokio = { workspace = true }
-tokio-stream = { workspace = true, features = ["net"] }
+tonic = { workspace = true }
+uuid = { workspace = true }
 xxhash-rust = { workspace = true }
+
+[dev-dependencies]
+openinfer-kernels = { workspace = true }
 
 [lints]
 workspace = true

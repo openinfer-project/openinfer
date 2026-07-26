@@ -171,6 +171,7 @@ tempfile = "3"
 tmq = "0.5.0"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
+tonic = "0.14"
 tokio-util = "0.7"
 toml = "1.1"
 tower = "0.5"
