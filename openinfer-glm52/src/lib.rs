@@ -477,6 +477,15 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
         "GLM5.2 --kv-offload requires the EP8 topology (tp8 replicates KV on all ranks; \
          a host-tier restore would land on one)"
     );
+    // The native-arena server allocates exactly one fused arena per instance;
+    // GLM5.2's rank-local MLA/index-K arenas need multi-arena registration,
+    // which the v1 contract does not cover. Refuse here, before the multi-GPU
+    // weight load — `with_arenas_on` would only fail after it.
+    ensure!(
+        kv_offload.is_none(),
+        "GLM5.2 KV offload is not supported by the native-arena PegaFlow contract \
+         (one server-allocated arena per instance); drop --kv-offload-server"
+    );
     // The miss window must sit inside the in-flight-fetch ceiling, or the
     // registration phase could never hand over to the fetch phase.
     ensure!(
