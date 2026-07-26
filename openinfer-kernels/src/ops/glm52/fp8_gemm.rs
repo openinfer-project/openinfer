@@ -154,6 +154,77 @@ pub fn glm52_fp8_groupwise_gemm_sm100_bank_launch(
         .map_err(|err| anyhow!("GLM5.2 bank FP8 GEMM launch failed: {err}"))
 }
 
+/// Minimum workspace for the grouped GEMM: per-group pointer/stride/layout
+/// arrays plus the CUTLASS grouped-kernel workspace.
+pub const GLM52_FP8_GROUPED_GEMM_WORKSPACE_BYTES: usize = 16 << 20;
+
+/// Grouped fp8 blockwise GEMM over `num_groups` expert slices (FlashInfer
+/// `CutlassFP8GroupwiseScaledGroupGEMMSM100`, compiled from source — no
+/// cubins): group `g` computes `out[m_indptr[g]..m_indptr[g+1], :n] =
+/// deq(act rows) @ deq(weight[g])^T`. Activation rows are pre-gathered in
+/// `m_indptr` order; `weight` is the routed slice bank base `[num_groups, n,
+/// k]` fp8 with `weight_scale` `[num_groups, n/128, k/128]` f32 (checkpoint
+/// layout as-is, same contract as the dense launch above). `m_indptr` is
+/// device-resident — per-group row counts never touch the host.
+#[allow(clippy::too_many_arguments)]
+pub fn glm52_fp8_grouped_gemm_sm100_launch(
+    ctx: &DeviceContext,
+    max_m: usize,
+    n: usize,
+    k: usize,
+    num_groups: usize,
+    activation: &CudaSlice<u8>,
+    activation_scale: &CudaSlice<f32>,
+    weight: &CudaSlice<u8>,
+    weight_scale: &CudaSlice<f32>,
+    m_indptr: &CudaSlice<i32>,
+    output: &mut CudaSlice<bf16>,
+    workspace: &mut CudaSlice<u8>,
+) -> Result<()> {
+    ensure!(
+        max_m > 0 && n > 0 && n.is_multiple_of(64) && k.is_multiple_of(128) && num_groups > 0,
+        "GLM5.2 grouped FP8 GEMM shape [{max_m}, {n}, {k}] x {num_groups} is invalid"
+    );
+    ensure!(
+        activation.len() >= max_m * k
+            && activation_scale.len() >= max_m * k.div_ceil(128)
+            && weight.len() >= num_groups * n * k
+            && weight_scale.len() >= num_groups * n.div_ceil(128) * k.div_ceil(128)
+            && m_indptr.len() > num_groups
+            && output.len() >= max_m * n
+            && workspace.len() >= GLM52_FP8_GROUPED_GEMM_WORKSPACE_BYTES,
+        "GLM5.2 grouped FP8 GEMM buffers are too small for [{max_m}, {n}, {k}] x {num_groups}"
+    );
+    let (activation_ptr, _activation_guard) = activation.device_ptr(&ctx.stream);
+    let (activation_scale_ptr, _activation_scale_guard) = activation_scale.device_ptr(&ctx.stream);
+    let (weight_ptr, _weight_guard) = weight.device_ptr(&ctx.stream);
+    let (weight_scale_ptr, _weight_scale_guard) = weight_scale.device_ptr(&ctx.stream);
+    let (indptr_ptr, _indptr_guard) = m_indptr.device_ptr(&ctx.stream);
+    let (output_ptr, _output_guard) = output.device_ptr_mut(&ctx.stream);
+    let workspace_bytes = workspace.len();
+    let (workspace_ptr, _workspace_guard) = workspace.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::glm52_fp8_grouped_gemm_sm100_cuda(
+            activation_ptr as *const u8,
+            activation_scale_ptr as *const f32,
+            weight_ptr as *const u8,
+            weight_scale_ptr as *const f32,
+            output_ptr as *mut ffi::Half,
+            indptr_ptr as *const i32,
+            max_m as i32,
+            n as i32,
+            k as i32,
+            num_groups as i32,
+            workspace_ptr as *mut u8,
+            workspace_bytes,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result
+        .result()
+        .map_err(|err| anyhow!("GLM5.2 grouped FP8 GEMM launch failed: {err}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,6 +289,87 @@ mod tests {
                     "output[{row}, {col}]={} != {want}",
                     output[row * N + col].to_f32()
                 );
+            }
+        }
+        Ok(())
+    }
+
+    /// Grouped GEMM vs an exact hand-computed reference: 4 expert groups
+    /// (one empty), one-hot ±1 weights, unit scales — every output element
+    /// is an exact copy/negation of one activation value.
+    #[test]
+    #[ignore = "requires an SM100/103 CUDA device"]
+    fn fp8_grouped_gemm_matches_reference() -> Result<()> {
+        const GROUPS: usize = 4;
+        const N: usize = 128;
+        const K: usize = 256;
+        const TOTAL_M: usize = 16;
+        const INDPTR: [i32; GROUPS + 1] = [0, 3, 3, 8, 16];
+        const VALUES: [(u8, f32); 5] = [
+            (0xc0, -2.0),
+            (0xb8, -1.0),
+            (0x00, 0.0),
+            (0x38, 1.0),
+            (0x40, 2.0),
+        ];
+
+        let ctx = DeviceContext::new()?;
+        let mut activation_host = vec![0u8; TOTAL_M * K];
+        for row in 0..TOTAL_M {
+            for col in 0..K {
+                activation_host[row * K + col] = VALUES[(row * 3 + col) % VALUES.len()].0;
+            }
+        }
+        let mut weight_host = vec![0u8; GROUPS * N * K];
+        for group in 0..GROUPS {
+            for row in 0..N {
+                weight_host[group * N * K + row * K + (row * 7 + group * 3 + 3) % K] =
+                    if row.is_multiple_of(2) { 0x38 } else { 0xb8 };
+            }
+        }
+        let activation = ctx.stream.clone_htod(&activation_host)?;
+        let activation_scale = ctx.stream.clone_htod(&vec![1.0f32; TOTAL_M * (K / 128)])?;
+        let weight = ctx.stream.clone_htod(&weight_host)?;
+        let weight_scale = ctx
+            .stream
+            .clone_htod(&vec![1.0f32; GROUPS * (N / 128) * (K / 128)])?;
+        let m_indptr = ctx.stream.clone_htod(&INDPTR)?;
+        let mut output = ctx.stream.alloc_zeros::<bf16>(TOTAL_M * N)?;
+        let mut workspace = ctx
+            .stream
+            .alloc_zeros::<u8>(GLM52_FP8_GROUPED_GEMM_WORKSPACE_BYTES)?;
+
+        glm52_fp8_grouped_gemm_sm100_launch(
+            &ctx,
+            TOTAL_M,
+            N,
+            K,
+            GROUPS,
+            &activation,
+            &activation_scale,
+            &weight,
+            &weight_scale,
+            &m_indptr,
+            &mut output,
+            &mut workspace,
+        )?;
+        let output = ctx.stream.clone_dtoh(&output)?;
+        for group in 0..GROUPS {
+            for row in INDPTR[group] as usize..INDPTR[group + 1] as usize {
+                for col in 0..N {
+                    let source_col = (col * 7 + group * 3 + 3) % K;
+                    let source = VALUES[(row * 3 + source_col) % VALUES.len()].1;
+                    let want = if col.is_multiple_of(2) {
+                        source
+                    } else {
+                        -source
+                    };
+                    ensure!(
+                        output[row * N + col].to_f32() == want,
+                        "group {group} output[{row}, {col}]={} != {want}",
+                        output[row * N + col].to_f32()
+                    );
+                }
             }
         }
         Ok(())

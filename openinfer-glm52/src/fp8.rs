@@ -58,7 +58,7 @@ pub(crate) fn fp8_linear_large_m_into(
     ctx: &DeviceContext,
     w: &ProjWeight,
     rows: usize,
-    input: &CudaSlice<bf16>,
+    input: &impl cudarc::driver::DevicePtr<bf16>,
     scratch: &mut Glm52Fp8GemmScratch,
     out: &mut CudaSlice<bf16>,
 ) -> Result<()> {
@@ -104,7 +104,7 @@ pub(crate) fn fp8_linear_large_m_bank_into(
     rows: usize,
     n: usize,
     k: usize,
-    input: &CudaSlice<bf16>,
+    input: &impl cudarc::driver::DevicePtr<bf16>,
     weight: &CudaSlice<u8>,
     weight_offset: usize,
     scale: &CudaSlice<f32>,

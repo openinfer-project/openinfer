@@ -70,7 +70,6 @@ use crate::moe_ep_wo::Glm52MoeEpState;
 use crate::moe_tp::Glm52MoeTpRank;
 use crate::prefill_tp::Glm52TpPrefillExecutor;
 use crate::prefill_tp::Glm52TpPrefillModelView;
-use crate::prefill_tp::PREFILL_TILE_ROWS;
 use crate::scratch::Glm52DecodeScratch;
 use crate::weights::Glm52RankGpuWeights;
 use crate::weights::retype_owned;
@@ -776,20 +775,21 @@ impl Glm52RankModel {
         }
 
         let prefill = prefill_chunk_size
-            .is_some()
-            .then(|| {
-                let indexer_shape = Glm52IndexerScratch::paged_mqa_shape(
-                    PREFILL_TILE_ROWS,
-                    index_cache_layout,
-                    table_width,
-                    NUM_SMS,
-                    max_model_len,
-                );
+            .map(|chunk_rows| {
+                let topology = match moe_topo {
+                    crate::Glm52MoeTopo::Tp4 => openinfer_kernels::ops::Glm52TpTopology::Tp4,
+                    crate::Glm52MoeTopo::Tp8 => openinfer_kernels::ops::Glm52TpTopology::Tp8,
+                    other => anyhow::bail!(
+                        "GLM5.2 prefill-only execution requires a TP topology, got {other:?}"
+                    ),
+                };
                 Glm52TpPrefillExecutor::new(
                     ctx,
                     pool_blocks * GLM52_FLASHMLA_SPARSE_PAGE_SIZE,
                     table_width,
-                    indexer_shape,
+                    index_cache_layout,
+                    chunk_rows,
+                    topology,
                 )
             })
             .transpose()?;
@@ -830,6 +830,12 @@ impl Glm52RankModel {
             speculated: None,
             device_positions: [0; GLM52_MAX_BATCH_PER_RANK],
         })
+    }
+
+    /// Whether this rank was built for prefill-only execution (drives the
+    /// prefill NCCL all-reduce bring-up in SetupComm).
+    pub(crate) fn is_prefill_only(&self) -> bool {
+        self.prefill.is_some()
     }
 
     pub(crate) fn prefill_chunk(

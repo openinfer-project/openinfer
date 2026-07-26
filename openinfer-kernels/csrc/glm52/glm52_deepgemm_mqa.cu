@@ -324,6 +324,14 @@ CUresult glm52_deepgemm_paged_mqa_logits_cuda(
                       smem_size, stream, args);
 }
 
+// The unpaged prefill MQA logits kernel is SM100-only (tcgen05); Hopper
+// keeps the paged decode path and reports NOT_SUPPORTED here.
+CUresult glm52_deepgemm_mqa_logits_unpaged_cuda(
+    const unsigned char*, const unsigned char*, const float*, const float*,
+    const int*, const int*, void*, int, int, int, CUstream) {
+    return CUDA_ERROR_NOT_SUPPORTED;
+}
+
 } // extern "C"
 
 #elif defined(GLM52_DEEPGEMM_MQA_SM100F)
@@ -362,6 +370,28 @@ const auto kLogitsKernel = &deep_gemm::sm100_paged_mqa_logits<
     kNumQStages, kNumKVStages, kSplitKv, kSplitsPerChunk,
     kNumSpecializedThreads, kNumMathThreads, cutlass::bfloat16_t, float>;
 
+// Unpaged (contiguous-KV) prefill instantiation: DeepGEMM's `fp8_mqa_logits`
+// path (the kernel vLLM uses for the DeepSeek-V3.2 indexer prefill).
+//  - kIsCompressedLogits=false: logits column n is the ABSOLUTE kv token
+//    index (not relative to `cu_seqlen_ks`). Columns inside a scheduled
+//    256-wide split but outside a row's [ks, ke) range receive unmasked
+//    garbage scores; the consumer must mask by [ks, ke) (DeepGEMM's own API
+//    runs `smxx_clean_logits` for this).
+//  - logits dtype float (fp32), matching DeepGEMM's `fp8_mqa_logits`
+//    (`logits_dtype = torch::kFloat`).
+//  - kNumSMs is a template constant consumed by the grid-stride scheduler;
+//    the grid MUST be exactly kAotNumSms blocks.
+//  - No schedule-metadata kernel: the contiguous-KV scheduler derives its
+//    work list on the fly from `cu_seqlen_ks/ke` inside the kernel.
+const auto kUnpagedLogitsKernel = &deep_gemm::sm100_mqa_logits<
+    /*kIsFP4=*/false, kAotNumHeads, kAotHeadDim,
+    /*kIsCompressedLogits=*/false,
+    /*BLOCK_Q=*/kAotBlockQ, kSplitKv,
+    kNumQStages, kNumKVStages,
+    /*kNumSMs=*/kAotNumSms,
+    kNumSpecializedThreads, kNumMathThreads,
+    /*logits_dtype_t=*/float, /*reduce_dtype_t=*/float>;
+
 CUresult launch_aot(const void* func, dim3 grid_dim, dim3 block_dim, int smem_size,
                     cudaStream_t stream, void** args) {
     if (smem_size > 0) {
@@ -386,6 +416,34 @@ CUresult launch_aot(const void* func, dim3 grid_dim, dim3 block_dim, int smem_si
     config.attrs = attrs;
     config.numAttrs = 1;
 
+    const cudaError_t err = cudaLaunchKernelExC(&config, func, args);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "glm52_deepgemm_mqa: launch failed: %s\n", cudaGetErrorString(err));
+        return CUDA_ERROR_LAUNCH_FAILED;
+    }
+    return CUDA_SUCCESS;
+}
+
+// Plain-stream-order launch (no programmatic stream serialization): the
+// prefill-side unpaged logits launch takes normal stream semantics so it can
+// never begin before its predecessors (K gather, ke upload) fully complete.
+// The decode-side paged chain keeps the PDL attribute above.
+CUresult launch_aot_plain(const void* func, dim3 grid_dim, dim3 block_dim, int smem_size,
+                          cudaStream_t stream, void** args) {
+    if (smem_size > 0) {
+        const cudaError_t attr_err = cudaFuncSetAttribute(
+            func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+        if (attr_err != cudaSuccess) {
+            fprintf(stderr, "glm52_deepgemm_mqa: cudaFuncSetAttribute failed: %s\n",
+                    cudaGetErrorString(attr_err));
+            return CUDA_ERROR_LAUNCH_FAILED;
+        }
+    }
+    cudaLaunchConfig_t config = {};
+    config.gridDim = grid_dim;
+    config.blockDim = block_dim;
+    config.dynamicSmemBytes = static_cast<size_t>(smem_size);
+    config.stream = stream;
     const cudaError_t err = cudaLaunchKernelExC(&config, func, args);
     if (err != cudaSuccess) {
         fprintf(stderr, "glm52_deepgemm_mqa: launch failed: %s\n", cudaGetErrorString(err));
@@ -557,6 +615,134 @@ CUresult glm52_deepgemm_paged_mqa_logits_cuda(
                       smem_size, stream, args);
 }
 
+// DSA indexer prefill: unpaged (contiguous-KV) FP8 MQA logits.
+//
+// Contract (from sm100_mqa_logits.cuh + DeepGEMM's fp8_mqa_logits host code):
+//  - q_fp8:    [seq_q, 32, 128] fp8 e4m3, contiguous.
+//  - k_fp8:    [seq_kv, 128] fp8 e4m3, contiguous (compact, pre-gathered from
+//              the paged indexer cache by glm52_indexer_k_gather_cuda).
+//  - k_scale:  [seq_kv] f32 per-token scales. The TMA descriptor rounds the
+//              inner dim up to align(seq_kv, 4); allocate the buffer padded
+//              to a multiple of 4 floats (16 bytes).
+//  - weights:  [seq_q, 32] f32, per-token per-head factors with q_scale
+//              folded in. Applied in-kernel fused with ReLU:
+//              logit = (sum_h max(q_h . k, 0) * w_h) * k_scale[n].
+//  - cu_seqlen_ks/ke: [seq_q] i32 ABSOLUTE kv range [ks, ke) per query token
+//              (kernel clamps both to seq_kv).
+//  - logits:   f32, row stride `logits_stride` elements. Row stride must be
+//              1024-byte aligned (logits_stride % 256 == 0) and cover the
+//              trailing split overshoot (>= seq_kv + 256). The buffer must
+//              have align(seq_q, 4) rows: the tail Q-block pads rows past
+//              seq_q by re-processing the last query token and writes them.
+//              Column n is the ABSOLUTE kv index; columns inside a scheduled
+//              split but outside [ks, ke) hold garbage the caller must mask.
+//  - No seq_q/seq_kv multiple-of alignment is required; the scheduler aligns
+//    each Q-block's kv base down to 4 tokens internally (16B TMA alignment
+//    for the f32 scale loads).
+//  - No schedule-metadata pre-pass exists for this kernel (unlike the paged
+//    variant); this is a single launch.
+CUresult glm52_deepgemm_mqa_logits_unpaged_cuda(
+    const unsigned char* q_fp8,
+    const unsigned char* k_fp8,
+    const float* k_scale,
+    const float* weights,
+    const int* cu_seqlen_ks,
+    const int* cu_seqlen_ke,
+    void* logits,
+    int seq_q,
+    int seq_kv,
+    int logits_stride,
+    CUstream stream
+) {
+    if (!q_fp8 || !k_fp8 || !k_scale || !weights ||
+        !cu_seqlen_ks || !cu_seqlen_ke || !logits) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if (seq_q <= 0 || seq_kv <= 0) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    // fp32 rows must be 1024-byte aligned (DeepGEMM's stride contract) and
+    // long enough for the last 256-wide split to overshoot seq_kv.
+    constexpr int kLogitsStrideAlignment = 1024 / static_cast<int>(sizeof(float));
+    if (logits_stride % kLogitsStrideAlignment != 0 ||
+        logits_stride < seq_kv + kSplitKv) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+
+    // TMA descriptor for q: [seq_q * 32, 128] fp8 rows, 128B swizzle; the
+    // smem box covers one Q-block ([BLOCK_Q * 32, 128]).
+    const auto tensor_map_q = deep_gemm::make_tma_2d_desc_raw(
+        const_cast<unsigned char*>(q_fp8), 1, deep_gemm::DgDtype::Float8_e4m3,
+        kAotHeadDim, seq_q * kAotNumHeads,
+        kAotHeadDim, kAotBlockQ * kAotNumHeads,
+        kAotHeadDim,
+        kAotHeadDim);
+
+    // TMA descriptor for the compact kv: [seq_kv, 128] fp8 rows, box is one
+    // 256-token split. Out-of-bounds rows of a trailing split are zero-filled
+    // by TMA.
+    const auto tensor_map_kv = deep_gemm::make_tma_2d_desc_raw(
+        const_cast<unsigned char*>(k_fp8), 1, deep_gemm::DgDtype::Float8_e4m3,
+        kAotHeadDim, seq_kv,
+        kAotHeadDim, kSplitKv,
+        kAotHeadDim,
+        kAotHeadDim);
+
+    // TMA descriptor for kv scales: 1D-as-2D [align(seq_kv, 4)] f32, box of
+    // one 256-token split, no swizzle (mirrors DeepGEMM's fp8 branch).
+    const auto tensor_map_kv_scales = deep_gemm::make_tma_2d_desc_raw(
+        const_cast<float*>(k_scale), static_cast<int>(sizeof(float)),
+        deep_gemm::DgDtype::Float,
+        deep_gemm::get_tma_aligned_size(seq_kv, static_cast<int>(sizeof(float))), 1,
+        kSplitKv, 1,
+        0,
+        0);
+
+    // TMA descriptor for weights: [seq_q, 32] f32, box is one Q-block.
+    const auto tensor_map_weights = deep_gemm::make_tma_2d_desc_raw(
+        const_cast<float*>(weights), static_cast<int>(sizeof(float)),
+        deep_gemm::DgDtype::Float,
+        kAotNumHeads, seq_q,
+        kAotNumHeads, kAotBlockQ,
+        kAotNumHeads,
+        0);
+
+    // Same shared-storage shape as the paged instantiation (identical
+    // H/D/BLOCK_Q/SPLIT_KV/stage template arguments).
+    constexpr int smem_size = static_cast<int>(sizeof(
+        deep_gemm::layout::MQALogitsSharedStorage<
+            false, kAotNumHeads, kAotHeadDim, kAotBlockQ, kSplitKv,
+            kNumQStages, kNumKVStages, 3, float>));
+    static_assert(smem_size <= kSM100SmemCapacity);
+
+    const uint32_t arg_num_q_tokens = static_cast<uint32_t>(seq_q);
+    const uint32_t arg_num_kv_tokens = static_cast<uint32_t>(seq_kv);
+    const uint32_t arg_logits_stride = static_cast<uint32_t>(logits_stride);
+    const uint32_t* arg_ks = reinterpret_cast<const uint32_t*>(cu_seqlen_ks);
+    const uint32_t* arg_ke = reinterpret_cast<const uint32_t*>(cu_seqlen_ke);
+    float* arg_logits = static_cast<float*>(logits);
+    void* args[] = {
+        const_cast<uint32_t*>(&arg_num_q_tokens),
+        const_cast<uint32_t*>(&arg_num_kv_tokens),
+        const_cast<uint32_t*>(&arg_logits_stride),
+        &arg_ks,
+        &arg_ke,
+        &arg_logits,
+        const_cast<CUtensorMap*>(&tensor_map_q),
+        // FP8 leaves the sf_q descriptor slot unused; fill it with the kv
+        // scales descriptor exactly like DeepGEMM's host wrapper does.
+        const_cast<CUtensorMap*>(&tensor_map_kv_scales),
+        const_cast<CUtensorMap*>(&tensor_map_kv),
+        const_cast<CUtensorMap*>(&tensor_map_kv_scales),
+        const_cast<CUtensorMap*>(&tensor_map_weights),
+    };
+    // Grid MUST equal the kNumSMs template constant (scheduler grid stride).
+    return launch_aot_plain(reinterpret_cast<const void*>(kUnpagedLogitsKernel),
+                      dim3(static_cast<unsigned>(kAotNumSms), 1, 1),
+                      dim3(static_cast<unsigned>(kNumSpecializedThreads + kNumMathThreads), 1, 1),
+                      smem_size, stream, args);
+}
+
 } // extern "C"
 
 #else // !GLM52_DEEPGEMM_MQA_SM90A && !GLM52_DEEPGEMM_MQA_SM100F
@@ -572,6 +758,12 @@ CUresult glm52_deepgemm_paged_mqa_logits_cuda(
     const void*, const void*, int64_t, const void*, const int*, void*,
     const int*, const int*, int*, int, int, int, int, int, int, bool, bool,
     int, int, int, int, int, int, int, cudaStream_t) {
+    return CUDA_ERROR_NOT_SUPPORTED;
+}
+
+CUresult glm52_deepgemm_mqa_logits_unpaged_cuda(
+    const unsigned char*, const unsigned char*, const float*, const float*,
+    const int*, const int*, void*, int, int, int, CUstream) {
     return CUDA_ERROR_NOT_SUPPORTED;
 }
 

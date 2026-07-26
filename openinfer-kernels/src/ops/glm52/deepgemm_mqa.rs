@@ -249,3 +249,80 @@ pub fn glm52_deepgemm_paged_mqa_logits_launch(
         .result()
         .map_err(|err| anyhow!("GLM5.2 DeepGEMM MQA logits launch failed: {err}"))
 }
+
+/// Unpaged DeepGEMM SM100 MQA logits (the vLLM DSv3.2 indexer PREFILL
+/// kernel, `fp8_mqa_logits`), AOT-instantiated like the paged twin: one
+/// launch computes fp32 logits for `seq_q` queries against a compact
+/// gathered K `[seq_kv, 128]` fp8 + per-token f32 scales, with the per-head
+/// ReLU * weight fold fused in-kernel.
+///
+/// Contract (from the sm100 kernel):
+/// - `logits` is fp32 `[seq_q.next_multiple_of(4), logits_stride]`; the tail
+///   Q-block writes rows past `seq_q` up to that alignment.
+/// - `logits_stride % 256 == 0` and `logits_stride >= seq_kv + 256` (the
+///   last 256-wide KV split writes unconditionally past `ke`).
+/// - Logits columns are ABSOLUTE kv indices; columns outside a query's
+///   `[ks, ke)` hold garbage — the top-k consumer masks by context length.
+/// - `k_scale` must be allocated to `seq_kv.next_multiple_of(4)` floats and
+///   its base pointer 16-byte aligned (pass 4-row-aligned segment bases).
+#[allow(clippy::too_many_arguments)]
+pub fn glm52_deepgemm_mqa_logits_unpaged_launch(
+    ctx: &DeviceContext,
+    seq_q: usize,
+    seq_kv: usize,
+    logits_stride: usize,
+    q_fp8: &impl DevicePtr<u8>,
+    k_fp8: &impl DevicePtr<u8>,
+    k_scale: &impl DevicePtr<f32>,
+    weights: &impl DevicePtr<f32>,
+    cu_seqlen_ks: &impl DevicePtr<i32>,
+    cu_seqlen_ke: &impl DevicePtr<i32>,
+    logits: &mut CudaSlice<f32>,
+) -> Result<()> {
+    // Baked into the AOT instantiation alongside head_dim.
+    let heads = 32usize;
+    let head_dim = GLM52_DEEPGEMM_MQA_HEAD_DIM;
+    let padded_q = seq_q.next_multiple_of(4);
+    ensure!(
+        seq_q > 0
+            && seq_kv > 0
+            && logits_stride.is_multiple_of(256)
+            && logits_stride >= seq_kv + 256,
+        "GLM5.2 unpaged MQA logits shape is invalid: seq_q={seq_q}, seq_kv={seq_kv}, stride={logits_stride}"
+    );
+    ensure!(
+        q_fp8.len() >= seq_q * heads * head_dim
+            && k_fp8.len() >= seq_kv * head_dim
+            && k_scale.len() >= seq_kv.next_multiple_of(4)
+            && weights.len() >= seq_q * heads
+            && cu_seqlen_ks.len() >= seq_q
+            && cu_seqlen_ke.len() >= seq_q
+            && logits.len() >= padded_q * logits_stride,
+        "GLM5.2 unpaged MQA logits buffers are too small for seq_q={seq_q}, seq_kv={seq_kv}"
+    );
+    let (q_ptr, _q_guard) = q_fp8.device_ptr(&ctx.stream);
+    let (k_ptr, _k_guard) = k_fp8.device_ptr(&ctx.stream);
+    let (scale_ptr, _scale_guard) = k_scale.device_ptr(&ctx.stream);
+    let (weights_ptr, _weights_guard) = weights.device_ptr(&ctx.stream);
+    let (ks_ptr, _ks_guard) = cu_seqlen_ks.device_ptr(&ctx.stream);
+    let (ke_ptr, _ke_guard) = cu_seqlen_ke.device_ptr(&ctx.stream);
+    let (logits_ptr, _logits_guard) = logits.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::glm52_deepgemm_mqa_logits_unpaged_cuda(
+            q_ptr as *const u8,
+            k_ptr as *const u8,
+            scale_ptr as *const f32,
+            weights_ptr as *const f32,
+            ks_ptr as *const i32,
+            ke_ptr as *const i32,
+            logits_ptr as *mut std::ffi::c_void,
+            seq_q as i32,
+            seq_kv as i32,
+            logits_stride as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result
+        .result()
+        .map_err(|err| anyhow!("GLM5.2 unpaged MQA logits launch failed: {err}"))
+}

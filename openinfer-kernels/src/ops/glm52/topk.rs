@@ -50,8 +50,8 @@ impl Glm52IndexerTopK {
 pub fn glm52_flashinfer_topk_2048_launch(
     ctx: &DeviceContext,
     contract: Glm52IndexerTopK,
-    logits: &CudaSlice<f32>,
-    lengths: &CudaSlice<i32>,
+    logits: &impl DevicePtr<f32>,
+    lengths: &impl DevicePtr<i32>,
     output_indices: &mut CudaSlice<i32>,
     output_values: &mut CudaSlice<f32>,
 ) -> Result<()> {

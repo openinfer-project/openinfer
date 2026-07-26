@@ -15,6 +15,20 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn glm52_deepgemm_mqa_logits_unpaged_cuda(
+        q_fp8: *const u8,
+        k_fp8: *const u8,
+        k_scale: *const f32,
+        weights: *const f32,
+        cu_seqlen_ks: *const i32,
+        cu_seqlen_ke: *const i32,
+        logits: *mut std::ffi::c_void,
+        seq_q: i32,
+        seq_kv: i32,
+        logits_stride: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn glm52_deepgemm_paged_mqa_logits_cuda(
         q: *const std::ffi::c_void,
         kv_cache: *const std::ffi::c_void,

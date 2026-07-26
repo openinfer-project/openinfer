@@ -45,7 +45,7 @@ impl Glm52MoeQuantShape {
 pub fn glm52_fp8_per_token_group_quant_bf16_launch(
     ctx: &DeviceContext,
     shape: Glm52MoeQuantShape,
-    input: &CudaSlice<bf16>,
+    input: &impl DevicePtr<bf16>,
     output: &mut CudaSlice<u8>,
     scales: &mut CudaSlice<f32>,
 ) -> Result<()> {
@@ -105,7 +105,7 @@ pub fn glm52_fp8_per_token_group_quant_bf16_ue8m0_launch(
 
 fn validate_quant_buffers(
     shape: Glm52MoeQuantShape,
-    input: &CudaSlice<bf16>,
+    input: &impl DevicePtr<bf16>,
     output: &CudaSlice<u8>,
     scales: &CudaSlice<f32>,
 ) -> Result<()> {

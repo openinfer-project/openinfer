@@ -1062,7 +1062,7 @@ impl Glm52RankThreadState {
                 crate::Glm52MoeTopo::Tp4 => openinfer_kernels::ops::Glm52TpTopology::Tp4,
                 _ => anyhow::bail!("GLM5.2 {moe_topo:?} setup received a TP exchange"),
             };
-            let state = Glm52MoeTpState::new(
+            let mut state = Glm52MoeTpState::new(
                 &dev_ctx,
                 topology,
                 self.placement.rank,
@@ -1073,6 +1073,11 @@ impl Glm52RankThreadState {
                 // candidates after the 78 attention slots.
                 crate::config::GLM52_LAYERS + 1,
             )?;
+            if runtime.model.is_prefill_only() {
+                // Collective like the LL rendezvous above: every TP rank
+                // reaches this concurrently in its own SetupComm.
+                state.init_prefill_nccl(&dev_ctx, exchange)?;
+            }
             runtime.tp = Some(Glm52MoeTpRank {
                 state,
                 slices: std::mem::take(&mut self.tp_slices),

@@ -44,13 +44,16 @@ use openinfer_kernels::ops::Glm52IndexerTopK;
 use openinfer_kernels::ops::Glm52MoeQuantShape;
 use openinfer_kernels::ops::bf16_bytes_to_f32_into;
 use openinfer_kernels::ops::gemm_strided_batched_bf16;
+use openinfer_kernels::ops::glm52_deepgemm_mqa_logits_unpaged_launch;
 use openinfer_kernels::ops::glm52_deepgemm_paged_mqa_logits_launch;
 use openinfer_kernels::ops::glm52_deepgemm_paged_mqa_metadata_launch;
 use openinfer_kernels::ops::glm52_flashinfer_topk_2048_launch;
 use openinfer_kernels::ops::glm52_fp8_per_token_group_quant_bf16_launch;
+use openinfer_kernels::ops::glm52_indexer_k_gather_launch;
 use openinfer_kernels::ops::glm52_indexer_k_quant_and_cache_launch;
 use openinfer_kernels::ops::glm52_indexer_local_topk_to_slots_launch;
 use openinfer_kernels::ops::glm52_indexer_rope_launch;
+use openinfer_kernels::ops::glm52_indexer_topk_to_slots_lut_launch;
 use openinfer_kernels::ops::glm52_indexer_weights_fold_launch;
 use openinfer_kernels::ops::glm52_indexer_weights_proj_launch;
 use openinfer_kernels::ops::layer_norm_into;
@@ -299,13 +302,6 @@ pub(crate) struct Glm52IndexerScratch {
 impl Glm52IndexerScratch {
     pub(crate) fn new(ctx: &DeviceContext, shape: Glm52DeepGemmMqaLogitsShape) -> Result<Self> {
         Self::with_large_gemm(ctx, shape, false)
-    }
-
-    pub(crate) fn new_prefill(
-        ctx: &DeviceContext,
-        shape: Glm52DeepGemmMqaLogitsShape,
-    ) -> Result<Self> {
-        Self::with_large_gemm(ctx, shape, true)
     }
 
     fn with_large_gemm(
@@ -642,4 +638,341 @@ pub(crate) fn glm52_indexer_forward(
         &mut s,
     )?;
     Ok(s.global_slots)
+}
+
+/// Upper bound on requests sharing one prefill coordinator chunk (sizes the
+/// per-request gather tables; exceeding it fails the chunk explicitly).
+pub(crate) const GLM52_INDEXER_PREFILL_MAX_REQUESTS: usize = 128;
+
+/// One request's segment inside the current prefill chunk.
+#[derive(Clone, Copy, Debug)]
+struct Glm52IndexerPrefillSegment {
+    q_start: usize,
+    q_end: usize,
+    kv_len: usize,
+}
+
+/// Chunk-scale DSA indexer scratch for the TP prefill path: projections run
+/// once per layer at chunk M, the paged index-K cache is gathered into the
+/// compact unpaged layout, and the DeepGEMM SM100 unpaged MQA logits kernel
+/// (vLLM's DSv3.2 indexer prefill kernel) runs per request segment in
+/// attention-tile slices. Replaces the 32-row paged-MQA sub-tiling that cost
+/// ~1.76 s per 16K chunk.
+pub(crate) struct Glm52IndexerPrefillScratch {
+    chunk_rows: usize,
+    attn_tile: usize,
+    kv_cap: usize,
+    logits_stride: usize,
+    table_width: usize,
+    cache_layout: Glm52IndexerCacheLayout,
+    // chunk-scale projection intermediates
+    q: CudaSlice<bf16>,
+    k_raw: CudaSlice<bf16>,
+    k: CudaSlice<bf16>,
+    weights_bf16: CudaSlice<bf16>,
+    q_fp8: CudaSlice<u8>,
+    q_scale: CudaSlice<f32>,
+    weights_folded: CudaSlice<f32>,
+    // gathered compact K + slot LUT (per layer)
+    k_compact: CudaSlice<u8>,
+    k_scale_compact: CudaSlice<f32>,
+    slot_lut: CudaSlice<i32>,
+    // per-subtile logits/top-k
+    logits: CudaSlice<f32>,
+    topk_offsets: CudaSlice<i32>,
+    topk_values: CudaSlice<f32>,
+    // per-chunk plan (staged once per forward)
+    ks_zero: CudaSlice<i32>,
+    ke_dev: CudaSlice<i32>,
+    gather_table: CudaSlice<i32>,
+    gather_lens: CudaSlice<i32>,
+    segments: Vec<Glm52IndexerPrefillSegment>,
+    host_ke: Vec<i32>,
+    host_table: Vec<i32>,
+    host_lens: Vec<i32>,
+}
+
+impl Glm52IndexerPrefillScratch {
+    pub(crate) fn new(
+        ctx: &DeviceContext,
+        chunk_rows: usize,
+        attn_tile: usize,
+        kv_slots: usize,
+        table_width: usize,
+        cache_layout: Glm52IndexerCacheLayout,
+    ) -> Result<Self> {
+        ensure!(
+            chunk_rows > 0 && attn_tile > 0 && kv_slots > 0 && table_width > 0,
+            "GLM5.2 indexer prefill scratch shapes must be positive"
+        );
+        let chunk = chunk_rows.next_multiple_of(4);
+        // The compact K buffer holds ONE request's logical context at a time
+        // (the gather runs per segment), so it is sized by the per-request
+        // context cap — NOT the physical pool. Requests sharing cached
+        // prefix pages therefore cannot overflow it: the physical pool
+        // admits shared pages once, while each segment re-gathers its own
+        // logical view into the same buffer.
+        let _ = kv_slots;
+        let kv_cap = (table_width * 64).next_multiple_of(4);
+        let logits_stride = kv_cap.next_multiple_of(256) + 256;
+        let tile = attn_tile.next_multiple_of(4);
+        Ok(Self {
+            chunk_rows: chunk,
+            attn_tile,
+            kv_cap,
+            logits_stride,
+            table_width,
+            cache_layout,
+            q: ctx
+                .stream
+                .alloc_zeros::<bf16>(chunk * INDEX_HEADS * INDEX_HEAD_DIM)?,
+            k_raw: ctx.stream.alloc_zeros::<bf16>(chunk * INDEX_HEAD_DIM)?,
+            k: ctx.stream.alloc_zeros::<bf16>(chunk * INDEX_HEAD_DIM)?,
+            weights_bf16: ctx.stream.alloc_zeros::<bf16>(chunk * INDEX_HEADS)?,
+            q_fp8: ctx
+                .stream
+                .alloc_zeros::<u8>(chunk * INDEX_HEADS * INDEX_HEAD_DIM)?,
+            q_scale: ctx.stream.alloc_zeros::<f32>(chunk * INDEX_HEADS)?,
+            weights_folded: ctx.stream.alloc_zeros::<f32>(chunk * INDEX_HEADS)?,
+            k_compact: ctx.stream.alloc_zeros::<u8>(kv_cap * INDEX_HEAD_DIM)?,
+            k_scale_compact: ctx.stream.alloc_zeros::<f32>(kv_cap.next_multiple_of(4))?,
+            slot_lut: ctx.stream.alloc_zeros::<i32>(kv_cap)?,
+            logits: ctx.stream.alloc_zeros::<f32>(tile * logits_stride)?,
+            topk_offsets: ctx.stream.alloc_zeros::<i32>(tile * GLM52_INDEXER_TOPK)?,
+            topk_values: ctx.stream.alloc_zeros::<f32>(tile * GLM52_INDEXER_TOPK)?,
+            ks_zero: ctx.stream.alloc_zeros::<i32>(chunk)?,
+            ke_dev: ctx.stream.alloc_zeros::<i32>(chunk)?,
+            gather_table: ctx
+                .stream
+                .alloc_zeros::<i32>(GLM52_INDEXER_PREFILL_MAX_REQUESTS * table_width)?,
+            gather_lens: ctx
+                .stream
+                .alloc_zeros::<i32>(GLM52_INDEXER_PREFILL_MAX_REQUESTS)?,
+            segments: Vec::new(),
+            host_ke: vec![0; chunk],
+            host_table: vec![0; GLM52_INDEXER_PREFILL_MAX_REQUESTS * table_width],
+            host_lens: vec![0; GLM52_INDEXER_PREFILL_MAX_REQUESTS],
+        })
+    }
+
+    /// Stage the per-chunk request plan: segment ranges, per-query kv ends,
+    /// per-query LUT bases, and the per-request gather tables. Called once
+    /// per coordinator batch, before the layer loop.
+    pub(crate) fn stage_chunk(
+        &mut self,
+        ctx: &DeviceContext,
+        batch: &crate::runner::Glm52PrefillBatch,
+    ) -> Result<()> {
+        let rows = batch.token_ids.len();
+        ensure!(
+            rows > 0 && rows <= self.chunk_rows,
+            "GLM5.2 indexer prefill chunk of {rows} rows exceeds capacity {}",
+            self.chunk_rows
+        );
+        self.segments.clear();
+        let width = self.table_width;
+        let mut request = 0usize;
+        let mut row = 0usize;
+        while row < rows {
+            while row >= batch.request_indptr[request + 1] as usize {
+                request += 1;
+            }
+            let q_start = row;
+            let q_end = (batch.request_indptr[request + 1] as usize).min(rows);
+            let kv_len = batch.positions[q_end - 1] as usize + 1;
+            let seg_index = self.segments.len();
+            ensure!(
+                seg_index < GLM52_INDEXER_PREFILL_MAX_REQUESTS,
+                "GLM5.2 prefill chunk spans more than {GLM52_INDEXER_PREFILL_MAX_REQUESTS} requests"
+            );
+            ensure!(
+                kv_len <= self.kv_cap,
+                "GLM5.2 prefill request context {kv_len} exceeds the compact index-K cap {}",
+                self.kv_cap
+            );
+            let block_start = batch.block_indptr[request] as usize;
+            let block_end = batch.block_indptr[request + 1] as usize;
+            let blocks = &batch.block_ids[block_start..block_end];
+            ensure!(
+                blocks.len() <= width && blocks.len() * 64 >= kv_len,
+                "GLM5.2 prefill request block table does not cover its context"
+            );
+            self.host_table[seg_index * width..seg_index * width + blocks.len()]
+                .copy_from_slice(blocks);
+            self.host_lens[seg_index] = kv_len as i32;
+            for r in q_start..q_end {
+                self.host_ke[r] = batch.positions[r] as i32 + 1;
+            }
+            self.segments.push(Glm52IndexerPrefillSegment {
+                q_start,
+                q_end,
+                kv_len,
+            });
+            row = q_end;
+        }
+        let segs = self.segments.len();
+        ctx.stream
+            .memcpy_htod(&self.host_ke[..rows], &mut self.ke_dev.slice_mut(..rows))?;
+        ctx.stream.memcpy_htod(
+            &self.host_table[..segs * width],
+            &mut self.gather_table.slice_mut(..segs * width),
+        )?;
+        ctx.stream.memcpy_htod(
+            &self.host_lens[..segs],
+            &mut self.gather_lens.slice_mut(..segs),
+        )?;
+        Ok(())
+    }
+
+    /// One full-indexer layer over the whole staged chunk: chunk-M
+    /// projections, K quant + cache write, paged->compact K gather, then per
+    /// request segment the unpaged MQA logits + top-k + LUT slot conversion,
+    /// writing straight into the executor's chunk-scale carry.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn run_layer(
+        &mut self,
+        ctx: &DeviceContext,
+        w: &Glm52IndexerLayerWeights,
+        hidden: &CudaSlice<bf16>,
+        q_resid: &CudaSlice<bf16>,
+        cos: &CudaSlice<bf16>,
+        sin: &CudaSlice<bf16>,
+        index_k_cache: &mut CudaSlice<u8>,
+        slot_mapping: &CudaSlice<i64>,
+        rows: usize,
+        gemm: &mut Glm52Fp8GemmScratch,
+        carry_slots: &mut CudaSlice<i32>,
+        carry_lens: &mut CudaSlice<i32>,
+    ) -> Result<()> {
+        ensure!(
+            rows > 0 && rows <= self.chunk_rows && !self.segments.is_empty(),
+            "GLM5.2 indexer prefill layer before stage_chunk"
+        );
+        let rows4 = rows.next_multiple_of(4);
+        fp8_linear_large_m_into(ctx, &w.wq_b, rows4, q_resid, gemm, &mut self.q)?;
+        fp8_linear_large_m_into(ctx, &w.wk, rows4, hidden, gemm, &mut self.k_raw)?;
+        gemm_strided_batched_bf16(
+            ctx,
+            true,
+            false,
+            INDEX_HEADS,
+            rows,
+            HIDDEN,
+            &w.weights_proj,
+            HIDDEN,
+            0,
+            hidden,
+            HIDDEN,
+            0,
+            &mut self.weights_bf16,
+            INDEX_HEADS,
+            0,
+            1,
+        )?;
+        layer_norm_into(
+            ctx,
+            &self.k_raw,
+            &w.k_norm_w,
+            &w.k_norm_b,
+            K_NORM_EPS,
+            INDEX_HEAD_DIM,
+            rows,
+            &mut self.k,
+        )?;
+        glm52_indexer_rope_launch(ctx, &mut self.q, &mut self.k, INDEX_HEADS, rows, cos, sin)?;
+        glm52_fp8_per_token_group_quant_bf16_launch(
+            ctx,
+            Glm52MoeQuantShape {
+                rows: rows * INDEX_HEADS,
+                width: INDEX_HEAD_DIM,
+                group_size: FP8_BLOCK,
+            },
+            &self.q,
+            &mut self.q_fp8,
+            &mut self.q_scale,
+        )?;
+        glm52_indexer_weights_fold_launch(
+            ctx,
+            &self.weights_bf16,
+            &self.q_scale,
+            SOFTMAX_SCALE,
+            N_HEADS_SCALE,
+            &mut self.weights_folded,
+        )?;
+        glm52_indexer_k_quant_and_cache_launch(
+            ctx,
+            Glm52IndexerCacheInsert {
+                tokens: rows,
+                layout: self.cache_layout,
+            },
+            &self.k,
+            index_k_cache,
+            slot_mapping,
+        )?;
+        let segments = self.segments.clone();
+        for (seg_index, seg) in segments.iter().enumerate() {
+            // Per-segment gather into the shared compact buffer (base 0):
+            // requests sharing cached prefix pages each re-gather their own
+            // logical context, so the buffer is bounded by one request's cap
+            // regardless of how the physical pool deduplicates pages.
+            glm52_indexer_k_gather_launch(
+                ctx,
+                1,
+                self.table_width,
+                self.cache_layout.cache_block_size,
+                self.cache_layout.cache_block_stride_bytes,
+                index_k_cache,
+                &self.gather_table.slice(seg_index * self.table_width..),
+                &self.gather_lens.slice(seg_index..),
+                &self.ks_zero.slice(..1),
+                &mut self.k_compact,
+                &mut self.k_scale_compact,
+                &mut self.slot_lut,
+            )?;
+            let mut sub = seg.q_start;
+            while sub < seg.q_end {
+                let t = (seg.q_end - sub).min(self.attn_tile);
+                glm52_deepgemm_mqa_logits_unpaged_launch(
+                    ctx,
+                    t,
+                    seg.kv_len,
+                    self.logits_stride,
+                    &self.q_fp8.slice(sub * INDEX_HEADS * INDEX_HEAD_DIM..),
+                    &self.k_compact,
+                    &self.k_scale_compact,
+                    &self.weights_folded.slice(sub * INDEX_HEADS..),
+                    &self.ks_zero.slice(..t),
+                    &self.ke_dev.slice(sub..sub + t),
+                    &mut self.logits,
+                )?;
+                glm52_flashinfer_topk_2048_launch(
+                    ctx,
+                    Glm52IndexerTopK {
+                        num_rows: t,
+                        top_k: GLM52_INDEXER_TOPK,
+                        max_len: self.logits_stride,
+                    },
+                    &self.logits,
+                    &self.ke_dev.slice(sub..sub + t),
+                    &mut self.topk_offsets,
+                    &mut self.topk_values,
+                )?;
+                let mut slots_out = carry_slots.slice_mut(sub * GLM52_INDEXER_TOPK..);
+                let mut lens_out = carry_lens.slice_mut(sub..);
+                glm52_indexer_topk_to_slots_lut_launch(
+                    ctx,
+                    t,
+                    GLM52_INDEXER_TOPK,
+                    &self.topk_offsets,
+                    &self.ke_dev.slice(sub..sub + t),
+                    &self.ks_zero.slice(..t),
+                    &self.slot_lut,
+                    &mut slots_out,
+                    &mut lens_out,
+                )?;
+                sub += t;
+            }
+        }
+        Ok(())
+    }
 }

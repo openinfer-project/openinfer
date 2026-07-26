@@ -115,7 +115,7 @@ pub(crate) fn glm52_dense_mlp_prefill_into(
     ctx: &DeviceContext,
     weights: &Glm52DenseMlpWeights,
     rows: usize,
-    normed_hidden: &CudaSlice<bf16>,
+    normed_hidden: &impl cudarc::driver::DevicePtr<bf16>,
     gemm: &mut Glm52Fp8GemmScratch,
     gate_up: &mut CudaSlice<bf16>,
     silu: &mut CudaSlice<bf16>,

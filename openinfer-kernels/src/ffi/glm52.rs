@@ -46,31 +46,63 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn glm52_prefill_ar_cuda(
-        partial: *const Half,
+    pub fn glm52_fp8_grouped_gemm_sm100_cuda(
+        activation: *const u8,
+        activation_scale: *const f32,
+        weight: *const u8,
+        weight_scale: *const f32,
         output: *mut Half,
-        local_buffer: *mut std::ffi::c_void,
-        peer_buffers: *const *const std::ffi::c_void,
-        epoch: *const u64,
+        m_indptr: *const i32,
+        max_m: i32,
+        n: i32,
+        k: i32,
+        num_groups: i32,
+        workspace: *mut u8,
+        workspace_bytes: usize,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn glm52_prefill_moe_route_cuda(
+        topk_idx: *const i32,
         rows: i32,
-        ranks: i32,
+        topk: i32,
+        num_experts: i32,
+        expert_counts: *mut i32,
+        m_indptr: *mut i32,
+        gather_rows: *mut i32,
+        route_slot: *mut i32,
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn glm52_prefill_moe_gather_cuda(
+    pub fn glm52_prefill_moe_gather_rows_cuda(
         input: *const Half,
-        rows: *const i32,
+        gather_rows: *const i32,
         output: *mut Half,
-        count: i32,
+        total: i32,
+        hidden: i32,
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn glm52_prefill_moe_scatter_cuda(
-        input: *const Half,
-        rows: *const i32,
-        weights: *const f32,
+    pub fn glm52_prefill_moe_gather_fp8_cuda(
+        input: *const u8,
+        input_scale: *const f32,
+        gather_rows: *const i32,
+        output: *mut u8,
+        output_scale: *mut f32,
+        total: i32,
+        k: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn glm52_prefill_moe_combine_cuda(
+        w2_out: *const Half,
+        route_slot: *const i32,
+        topk_weight: *const f32,
+        shared_out: *const Half,
         output: *mut Half,
-        count: i32,
+        rows: i32,
+        topk: i32,
+        hidden: i32,
         stream: CUstream,
     ) -> CUresult;
 

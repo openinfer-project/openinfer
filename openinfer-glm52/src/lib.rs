@@ -618,10 +618,13 @@ const GLM52_VRAM_RESERVE_BYTES: usize = 5 << 30;
 /// (`glm52_dspark_arena_bytes`), not here.
 const GLM52_DSPARK_VRAM_RESERVE_BYTES: usize = 5 << 30;
 
-/// Fixed prefill workspace reserve.
-const GLM52_PREFILL_FIXED_SCRATCH_BYTES: usize = 256 << 20;
+/// Fixed prefill workspace reserve: the row-block-bounded MoE scratch
+/// (gathered fp8 routes + grouped W2 output), the attention/dense sub-tile
+/// buffers, the unpacked bf16 KV pool, and the GEMM workspaces.
+const GLM52_PREFILL_FIXED_SCRATCH_BYTES: usize = 3 << 30;
 
-/// Estimated scratch bytes per token row.
+/// Estimated scratch bytes per token row (chunk-scale activations, MLA
+/// front/query buffers, indexer carry, router logits).
 const GLM52_PREFILL_SCRATCH_BYTES_PER_TOKEN: usize = 160 << 10;
 
 /// The smallest cap worth serving with (the pre-refactor bring-up value);
@@ -1133,6 +1136,19 @@ fn build_rank_models(
     let tp_exchange = moe_topo
         .uses_tensor_replicated_moe()
         .then(|| std::sync::Arc::new(crate::moe_tp::Glm52TpExchange::new(moe_topo.device_count())));
+    if tp_exchange.is_some() {
+        // The prefill-only NCCL all-reduce moves ~200 MB per layer; NCCL's
+        // default channel count on this single-host NVLink topology comes up
+        // as 2 and caps the ring at ~46 GB/s (measured 8.7 ms per 16K-row
+        // all-reduce). 16..32 channels restores ~5x (measured 1.6 ms).
+        // Set BEFORE any worker thread initializes its communicator; user
+        // overrides win. Single-threaded here, so set_var is race-free.
+        for (key, value) in [("NCCL_MIN_NCHANNELS", "16"), ("NCCL_MAX_NCHANNELS", "32")] {
+            if std::env::var_os(key).is_none() {
+                unsafe { std::env::set_var(key, value) };
+            }
+        }
+    }
     let responses = workers
         .iter()
         .map(|worker| worker.setup_comm_async(unique_id, moe_topo, tp_exchange.clone()))
@@ -1634,6 +1650,8 @@ mod max_model_len_tests {
             chunk_size: GLM52_DEFAULT_PREFILL_CHUNK_SIZE,
         }))
         .expect("prefill reservation");
-        assert_eq!(bytes, 2_952_790_016);
+        // 3 GiB fixed (row-block MoE scratch + sub-tile buffers) plus
+        // 160 KiB x 16384 chunk rows of chunk-scale activations.
+        assert_eq!(bytes, 5_905_580_032);
     }
 }

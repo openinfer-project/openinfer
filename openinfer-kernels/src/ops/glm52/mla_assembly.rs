@@ -38,12 +38,12 @@ pub fn glm52_mla_query_assemble_launch(
     ctx: &DeviceContext,
     tokens: usize,
     num_q_heads: usize,
-    ql_nope: &CudaSlice<bf16>,
-    q_pe_base: &CudaSlice<bf16>,
+    ql_nope: &impl DevicePtr<bf16>,
+    q_pe_base: &impl DevicePtr<bf16>,
     q_pe_offset: usize,
     q_pe_head_stride: usize,
-    cos: &CudaSlice<bf16>,
-    sin: &CudaSlice<bf16>,
+    cos: &impl DevicePtr<bf16>,
+    sin: &impl DevicePtr<bf16>,
     query: &mut CudaSlice<bf16>,
 ) -> Result<()> {
     ensure!(tokens > 0, "GLM5.2 MLA assemble tokens must be positive");
