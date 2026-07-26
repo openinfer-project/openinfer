@@ -8,8 +8,8 @@ version = "0.1.0"
 # The client shares PegaFlow's wire-compatible error/save types but does not
 # embed its storage engine or RDMA stack. Pinned to the native-arena server:
 # registration returns a CUDA IPC handle for the server-allocated KV arena.
-pegaflow-core = { git = "https://github.com/novitalabs/pegaflow.git", rev = "641a4023e9b0c72ce3ecb3a5f60230b7333578e3", default-features = false }
-pegaflow-proto = { git = "https://github.com/novitalabs/pegaflow.git", rev = "641a4023e9b0c72ce3ecb3a5f60230b7333578e3" }
+pegaflow-core = { git = "https://github.com/novitalabs/pegaflow.git", rev = "6043c290000a1cc5a384cff59bda6ecaaf868027", default-features = false }
+pegaflow-proto = { git = "https://github.com/novitalabs/pegaflow.git", rev = "6043c290000a1cc5a384cff59bda6ecaaf868027" }
 cudarc = { workspace = true }
 half = { workspace = true }
 log = { workspace = true }

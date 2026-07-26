@@ -31,8 +31,9 @@ pub struct ImportedKvArena {
 impl ImportedKvArena {
     /// Import `ipc_handle` (the 64-byte `CUipcMemHandle` from PegaFlow's
     /// registration response) on `stream`'s device. `size_bytes` is the arena
-    /// size this side expects; it is recorded for bounds checks only — the
-    /// mapping spans whatever the server allocated.
+    /// size this side needs; the actual allocation is queried from the driver
+    /// and must cover it — trusting the client's own number would let a
+    /// server-side under-allocation turn into silent out-of-bounds writes.
     pub fn open(
         stream: &Arc<CudaStream>,
         ipc_handle: &[u8],
@@ -58,6 +59,27 @@ impl ImportedKvArena {
                 sys::CUipcMem_flags_enum::CU_IPC_MEM_LAZY_ENABLE_PEER_ACCESS as u32,
             )
             .result()?;
+        }
+
+        let mut range_base: sys::CUdeviceptr = 0;
+        let mut range_size: usize = 0;
+        // SAFETY: ptr is a live imported mapping; the driver reports the
+        // allocation it belongs to.
+        let range = unsafe {
+            sys::cuMemGetAddressRange_v2(&raw mut range_base, &raw mut range_size, ptr).result()
+        };
+        let actual = match range {
+            Ok(()) => range_size - (ptr - range_base) as usize,
+            Err(err) => {
+                // SAFETY: close the mapping we just opened before bailing.
+                unsafe { sys::cuIpcCloseMemHandle(ptr).result().ok() };
+                return Err(err);
+            }
+        };
+        if actual < size_bytes {
+            // SAFETY: as above.
+            unsafe { sys::cuIpcCloseMemHandle(ptr).result().ok() };
+            return Err(DriverError(CUresult::CUDA_ERROR_INVALID_VALUE));
         }
 
         Ok(Self {

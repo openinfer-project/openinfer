@@ -3459,7 +3459,7 @@ dependencies = [
 [[package]]
 name = "pegaflow-common"
 version = "0.23.5"
-source = "git+https://github.com/novitalabs/pegaflow.git?rev=641a4023e9b0c72ce3ecb3a5f60230b7333578e3#641a4023e9b0c72ce3ecb3a5f60230b7333578e3"
+source = "git+https://github.com/novitalabs/pegaflow.git?rev=6043c290000a1cc5a384cff59bda6ecaaf868027#6043c290000a1cc5a384cff59bda6ecaaf868027"
 dependencies = [
  "colored",
  "libc",
@@ -3470,7 +3470,7 @@ dependencies = [
 [[package]]
 name = "pegaflow-core"
 version = "0.23.5"
-source = "git+https://github.com/novitalabs/pegaflow.git?rev=641a4023e9b0c72ce3ecb3a5f60230b7333578e3#641a4023e9b0c72ce3ecb3a5f60230b7333578e3"
+source = "git+https://github.com/novitalabs/pegaflow.git?rev=6043c290000a1cc5a384cff59bda6ecaaf868027#6043c290000a1cc5a384cff59bda6ecaaf868027"
 dependencies = [
  "ahash",
  "bytesize",
@@ -3499,7 +3499,7 @@ dependencies = [
 [[package]]
 name = "pegaflow-proto"
 version = "0.23.5"
-source = "git+https://github.com/novitalabs/pegaflow.git?rev=641a4023e9b0c72ce3ecb3a5f60230b7333578e3#641a4023e9b0c72ce3ecb3a5f60230b7333578e3"
+source = "git+https://github.com/novitalabs/pegaflow.git?rev=6043c290000a1cc5a384cff59bda6ecaaf868027#6043c290000a1cc5a384cff59bda6ecaaf868027"
 dependencies = [
  "prost",
  "tonic",

@@ -1149,6 +1149,17 @@ impl Qwen3Executor {
             dflash_kv_bytes_per_token,
             memory_options,
         )?;
+        // Pure config validation goes before registration: past this point a
+        // failure means unwinding a server-side arena allocation.
+        if let Some(c) = offload_opts.vllm_compat.as_ref() {
+            ensure!(
+                c.miss_wait < REMOTE_FETCH_DEADLINE,
+                "kv-pd miss wait ({:?}) must stay below the {:?} remote-fetch \
+                 deadline, which would otherwise silently cap it",
+                c.miss_wait,
+                REMOTE_FETCH_DEADLINE,
+            );
+        }
         // With offload on, register with PegaFlow before any KV allocation:
         // the server owns the arena and hands back its CUDA IPC handle.
         let mut offload_setup = None;
@@ -1182,7 +1193,7 @@ impl Qwen3Executor {
         };
         let kv_buffer = kv_mgr.buffer().clone();
         let (offload, kv_arena) = match offload_setup {
-            Some((engine, arena)) => (Some(engine), Some(arena)),
+            Some((arena, engine)) => (Some(engine), Some(arena)),
             None => (None, None),
         };
         let total_blocks = kv_mgr.pool().total_blocks();
@@ -1190,13 +1201,6 @@ impl Qwen3Executor {
         let vllm_compat = match offload_opts.vllm_compat.as_ref() {
             None => None,
             Some(c) => {
-                ensure!(
-                    c.miss_wait < REMOTE_FETCH_DEADLINE,
-                    "kv-pd miss wait ({:?}) must stay below the {:?} remote-fetch \
-                     deadline, which would otherwise silently cap it",
-                    c.miss_wait,
-                    REMOTE_FETCH_DEADLINE,
-                );
                 let hasher = openinfer_kv_offload::VllmBlockHasher::new(
                     &c.python_hash_seed,
                     budget.block_size,
@@ -2165,7 +2169,10 @@ impl Qwen3Executor {
         model: &Qwen3Model,
         budget: &crate::weights::KvBudget,
         offload_opts: &Qwen3OffloadOptions,
-        offload_setup: &mut Option<(OffloadEngine, ImportedKvArena)>,
+        // Arena before engine: if construction bails after this is populated,
+        // the tuple's field-order drop closes the IPC mapping before the
+        // engine's Drop unregisters and the server frees the allocation.
+        offload_setup: &mut Option<(ImportedKvArena, OffloadEngine)>,
     ) -> Result<KvCacheManager> {
         if !offload_opts.is_enabled() {
             return KvCacheManager::new(
@@ -2192,7 +2199,7 @@ impl Qwen3Executor {
             budget.head_dim,
             budget.block_size,
             budget.num_blocks,
-            &setup.1,
+            &setup.0,
         )?;
         *offload_setup = Some(setup);
         Ok(kv_mgr)
@@ -2204,7 +2211,7 @@ fn build_offload(
     layout: &openinfer_kv_cache::KvLayout,
     num_blocks: usize,
     ctx: &DeviceContext,
-) -> Result<Option<(OffloadEngine, ImportedKvArena)>> {
+) -> Result<Option<(ImportedKvArena, OffloadEngine)>> {
     let Some(server_addr) = &opts.server_addr else {
         return Ok(None);
     };
@@ -2240,7 +2247,7 @@ fn build_offload(
     let arena = ImportedKvArena::open(&ctx.stream, &arena_ipc_handle, arena_bytes)
         .map_err(|e| anyhow::anyhow!("import PegaFlow KV arena: {e}"))?;
     log::info!("KV offload enabled on device {device_id}: server={server_addr}");
-    Ok(Some((engine, arena)))
+    Ok(Some((arena, engine)))
 }
 
 fn ensure_lora_capacity(
@@ -3155,12 +3162,22 @@ mod tests {
 
 impl Drop for Qwen3Executor {
     fn drop(&mut self) {
-        // Ordering: stop every kernel producer first, then close our mapping
-        // of the server-owned arena, and only then unregister — which lets
-        // the server free the allocation.
+        // Ordering: stop every kernel producer first, wait out in-flight
+        // host→GPU loads (their DMA targets the arena), then close our
+        // mapping of the server-owned arena, and only then unregister —
+        // which lets the server free the allocation.
         self.primary.shutdown();
         for worker in &mut self.workers {
             worker.shutdown();
+        }
+        if self.offload.is_some() {
+            for (_, state) in self.prefetch.drain() {
+                if let PrefetchPhase::Loading { handle, .. } = state.phase {
+                    if let Err(err) = handle.wait() {
+                        log::warn!("KV offload load abandoned during shutdown: {err}");
+                    }
+                }
+            }
         }
         self.kv_arena.take();
         if let Some(mut offload) = self.offload.take() {

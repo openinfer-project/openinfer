@@ -24,6 +24,10 @@ use tonic::transport::Endpoint;
 const MAX_GRPC_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
 const CONNECT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 const RPC_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+/// Save/load move data through the server's GPU/host pipelines; under load they
+/// legitimately take much longer than control RPCs, and hitting this deadline
+/// is fatal (see `abort_server_timeout`). Keep it far above worst-case D2H/H2D.
+const DATA_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
 /// Byte length of a serialized `CUipcMemHandle`.
 const IPC_HANDLE_BYTES: usize = 64;
 
@@ -216,7 +220,7 @@ impl ExternalClient {
             .collect::<Result<_, EngineError>>()?;
         let mut client = self.client.clone();
         let response = match tokio::time::timeout(
-            RPC_DEADLINE,
+            DATA_DEADLINE,
             client.save(Request::new(SaveRequest {
                 instance_id: instance_id.to_string(),
                 tp_rank: as_u32(tp_rank, "tp_rank")?,
@@ -294,7 +298,7 @@ impl ExternalClient {
     ) -> Result<(), EngineError> {
         let mut client = self.client.clone();
         let response = match tokio::time::timeout(
-            RPC_DEADLINE,
+            DATA_DEADLINE,
             client.load(Request::new(LoadRequest {
                 instance_id: instance_id.to_string(),
                 tp_rank: as_u32(tp_rank, "tp_rank")?,
@@ -329,6 +333,8 @@ impl ExternalClient {
         Ok(())
     }
 
+    /// Server-wide durability barrier: `Flush` has no instance scope, so on a
+    /// shared server this also waits out other instances' save tails.
     pub(super) async fn flush(&self) -> Result<(), EngineError> {
         let mut client = self.client.clone();
         let response = client
@@ -339,6 +345,9 @@ impl ExternalClient {
         require_ok("flush", response.status)
     }
 
+    /// Ensure the instance is gone server-side. "Not found" counts as
+    /// success: dropping the liveness stream just before this call may have
+    /// already triggered the server's session cleanup for the same instance.
     pub(super) async fn unregister(&self, instance_id: &str) -> Result<(), EngineError> {
         let mut client = self.client.clone();
         let response = match tokio::time::timeout(
@@ -350,6 +359,17 @@ impl ExternalClient {
         .await
         {
             Ok(Ok(response)) => response.into_inner(),
+            Ok(Err(err))
+                if matches!(
+                    err.code(),
+                    tonic::Code::FailedPrecondition | tonic::Code::NotFound
+                ) =>
+            {
+                log::debug!(
+                    "unregister_context: instance {instance_id} already cleaned up ({err})"
+                );
+                return Ok(());
+            }
             Ok(Err(err)) => return Err(rpc_error("unregister_context", &err)),
             Err(_) => abort_server_timeout("unregister_context"),
         };
@@ -399,8 +419,8 @@ fn abort_lost_server(operation: &str, err: &tonic::Status) -> ! {
 
 fn abort_server_timeout(operation: &str) -> ! {
     log::error!(
-        "external PegaFlow {operation} did not respond within {RPC_DEADLINE:?}; the server owns \
-         the KV arena this process has mapped, exiting"
+        "external PegaFlow {operation} did not respond in time; the server owns this process's \
+         KV arena, so its state is unknowable — exiting"
     );
     std::process::abort();
 }

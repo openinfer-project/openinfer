@@ -505,6 +505,12 @@ impl OffloadEngine {
         }
         assert_outside_runtime("shutdown");
         self.flush_saves();
+        // Retire the dead-server watchdog BEFORE unregister: the server may
+        // close the session stream while (or right after) it handles the
+        // unregister, and the watchdog aborts the process on stream loss —
+        // it cannot tell a clean teardown from a crash. From here on,
+        // unregister's own error handling is the only liveness check needed.
+        self.session.take();
         if let Err(err) = self
             .host
             .runtime
@@ -519,9 +525,6 @@ impl OffloadEngine {
             );
             std::process::abort();
         }
-        // The explicit unregister owns cleanup. Aborting the liveness stream
-        // afterwards only removes its now-empty session entry.
-        self.session.take();
     }
 }
 
