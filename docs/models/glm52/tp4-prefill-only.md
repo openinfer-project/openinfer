@@ -4,9 +4,48 @@
 > 4-GPU TP4 host with a cubin-free kernel stack (FlashInfer CUTLASS grouped
 > MoE GEMM, DeepGEMM unpaged MQA indexer, NCCL bf16 all-reduces). 4×GB300
 > 16K TTFT 409 s → 1.36 s vs the 32-row bring-up path; leads a same-day
-> vLLM 0.25 rerun at every length except 4K.
+> vLLM 0.25 rerun at every length except 4K. TP4 now persists the canonical
+> 656-byte `fp8_ds_mla` row used by EP consumers.
 
 **Last touched:** 2026-07
+
+## Preparation: canonical P/D KV layout
+
+- **Read**:
+  - `docs/index.md` — routed the work to the GLM5.2 model line.
+  - `docs/models/glm52/tp4-prefill-only.md` — TP4 prefill currently persists a 576-byte cache row and rejects external P/D.
+  - `docs/models/glm52/pd-m2-execution.md` — the established P/D wire contract is the 656-byte `fp8_ds_mla` row plus the 132-byte index-K sidecar.
+- **Relevant history**:
+  - Existing P/D support validates TP8 vLLM → EP8 OpenInfer, but no TP4 → EP16 path exists.
+- **Plan**:
+  1. Create a non-`main` feature branch and make TP4 prefill persist the canonical 656-byte MLA row while retaining its BF16 sparse-prefill execution.
+  2. Add one startup `info` record that states topology, MLA backend/layout, page size, bytes per token/page, and MLA/index-K arena counts.
+  3. Add focused CPU/unit coverage for TP4-producer versus EP16-consumer cache geometry and run release library tests.
+  4. On the local 4×GB300 host, run the smallest TP4 prefill correctness/prefix-cache smoke available, then assess whether a true EP16 consumer run is possible with the available 4 GPUs.
+- **Risks / open questions**:
+  - This host has four GPUs and cannot perform a real 16-rank EP16 decode run; format/geometry can be gated locally, while end-to-end EP16 needs a 16-GPU environment.
+  - The 656-byte row increases TP4 target-cache capacity by 13.9%; the launch-time VRAM ledger must remain exact.
+
+### Execution result
+
+- TP4 prefill keeps `FlashInferFp8` as its 16-head/rank execution backend,
+  but persists the EP-consumer `fp8_ds_mla` row:
+  `512B fp8 cKV + 16B UE8M0/f32 scales + 128B bf16 RoPE = 656B/token`.
+- Startup logs the complete per-rank geometry: 78 MLA arenas at
+  `41,984B/page`, plus 21 index-K arenas at `8,448B/page`.
+- Release build and focused cache-layout unit test passed.
+- A 4×GB300 smoke using the full 141-shard checkpoint reached HTTP-ready.
+  A 401-token prompt completed successfully; two repeats both reported
+  `cached_tokens=384` (six complete 64-token pages) and returned the same
+  token.
+- The matching EP4 consumer topology also reached HTTP-ready and reported
+  the same 656-byte MLA / 132-byte index-K geometry. A 401-token prompt
+  decoded 16 coherent tokens; its repeat reported `cached_tokens=384` and
+  returned byte-identical output.
+- Container prerequisite: keep the NCCL runtime and development library on
+  one version. Mixing system NCCL 2.28.9 with a pip NCCL 2.30.7 produced
+  `corrupted comm object detected`/`ncclInvalidArgument`; upgrading both
+  system packages to 2.30.7 fixed the prefill all-reduce preflight.
 
 ## Contract
 

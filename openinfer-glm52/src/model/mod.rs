@@ -26,7 +26,6 @@ use cudarc::driver::PinnedHostSlice;
 use half::bf16;
 use openinfer_core::cuda_graph::CudaGraphDumpSummary;
 use openinfer_core::cuda_graph::CudaGraphState;
-use openinfer_kernels::ops::GLM52_FLASHINFER_SPARSE_BYTES_PER_TOKEN;
 use openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN;
 use openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_PAGE_SIZE;
 use openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_TOPK;
@@ -128,11 +127,10 @@ pub(crate) fn glm52_arena_bytes(
     prefill_only: bool,
 ) -> Result<usize> {
     let num_blocks = glm52_pool_blocks(max_model_len, pool_slots);
-    let cache_bytes_per_token = if prefill_only {
-        GLM52_FLASHINFER_SPARSE_BYTES_PER_TOKEN
-    } else {
-        GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN
-    };
+    // Prefill-only is a P/D producer: persist the same fp8_ds_mla row the EP
+    // decode consumer reads, even though TP4's local attention execution uses
+    // a different backend.
+    let cache_bytes_per_token = GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN;
     let mla = GLM52_LAYERS * num_blocks * GLM52_FLASHMLA_SPARSE_PAGE_SIZE * cache_bytes_per_token;
     let (table_width, index_layout) = glm52_index_cache_layout(max_model_len, pool_slots);
     let index_k = (0..GLM52_LAYERS)
@@ -175,6 +173,19 @@ fn glm52_index_cache_layout(
         cache_block_stride_bytes: INDEX_CACHE_BLOCK * (GLM52_INDEX_HEAD_DIM + 4),
     };
     (glm52_table_width(max_model_len), layout)
+}
+
+fn glm52_persistent_mla_bytes_per_token(
+    prefill_only: bool,
+    backend: crate::mla_decode::Glm52MlaBackend,
+) -> usize {
+    if prefill_only {
+        // P/D producer wire/storage format, independent of TP4's local
+        // attention execution backend.
+        GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN
+    } else {
+        backend.cache_bytes_per_token()
+    }
 }
 
 /// The decode batch buckets, ascending. Each bucket has its own captured
@@ -549,9 +560,30 @@ impl Glm52RankModel {
             crate::config::GLM52_HEADS
         };
         let mla_backend = glm52_select_mla_backend(mla_heads)?;
-        let mla_cache_bytes_per_token = mla_backend.cache_bytes_per_token();
+        let mla_cache_bytes_per_token =
+            glm52_persistent_mla_bytes_per_token(prefill_chunk_size.is_some(), mla_backend);
+        let indexer_arenas = (0..GLM52_LAYERS)
+            .filter(|&layer| glm52_layer_has_full_indexer(layer))
+            .count();
         log::info!(
-            "GLM5.2 MLA backend: {:?} ({} heads/rank, {} bytes/cache token)",
+            "GLM5.2 KV cache: topology={moe_topo:?} backend={mla_backend:?} \
+             page_tokens={} mla_layout={} mla_bytes/token={} mla_bytes/page={} \
+             mla_arenas={} index_k_layout=fp8[64,128]+f32[64] \
+             index_k_bytes/token={} index_k_bytes/page={} index_k_arenas={indexer_arenas}",
+            GLM52_FLASHMLA_SPARSE_PAGE_SIZE,
+            if mla_cache_bytes_per_token == GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN {
+                "fp8_ds_mla"
+            } else {
+                "flashinfer_fp8"
+            },
+            mla_cache_bytes_per_token,
+            GLM52_FLASHMLA_SPARSE_PAGE_SIZE * mla_cache_bytes_per_token,
+            GLM52_LAYERS,
+            GLM52_INDEX_HEAD_DIM + 4,
+            INDEX_CACHE_BLOCK * (GLM52_INDEX_HEAD_DIM + 4),
+        );
+        log::info!(
+            "GLM5.2 MLA execution: backend={:?} ({} heads/rank, persistent {} bytes/cache token)",
             mla_backend,
             mla_heads,
             mla_cache_bytes_per_token
@@ -719,7 +751,9 @@ impl Glm52RankModel {
                 argmax_indices_host: unsafe { ctx.ctx.alloc_pinned::<i32>(rows)? },
             });
         }
-        if mla_backend == crate::mla_decode::Glm52MlaBackend::FlashInferFp8 {
+        if prefill_chunk_size.is_none()
+            && mla_backend == crate::mla_decode::Glm52MlaBackend::FlashInferFp8
+        {
             for bucket in &mut buckets {
                 glm52_mla_backend_preflight(
                     ctx,
@@ -1296,5 +1330,23 @@ impl Glm52RankModel {
         });
         bucket.graph = graph;
         result
+    }
+}
+
+#[cfg(test)]
+mod cache_layout_tests {
+    use super::*;
+    use crate::mla_decode::Glm52MlaBackend;
+
+    #[test]
+    fn tp4_prefill_matches_ep_decode_persistent_mla_layout() {
+        let tp4_prefill =
+            glm52_persistent_mla_bytes_per_token(true, Glm52MlaBackend::FlashInferFp8);
+        let ep_decode = glm52_persistent_mla_bytes_per_token(false, Glm52MlaBackend::FlashMlaFp8Ds);
+
+        assert_eq!(tp4_prefill, 656);
+        assert_eq!(tp4_prefill, ep_decode);
+        assert_eq!(GLM52_FLASHMLA_SPARSE_PAGE_SIZE * tp4_prefill, 41_984);
+        assert_eq!(INDEX_CACHE_BLOCK * (GLM52_INDEX_HEAD_DIM + 4), 8_448);
     }
 }

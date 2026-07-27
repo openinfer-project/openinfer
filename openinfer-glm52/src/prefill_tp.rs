@@ -17,6 +17,7 @@ use cudarc::driver::CudaEvent;
 use cudarc::driver::CudaSlice;
 use half::bf16;
 use openinfer_kernels::ops::Glm52IndexerCacheLayout;
+use openinfer_kernels::ops::Glm52MoeQuantShape;
 use openinfer_kernels::ops::add_into;
 use openinfer_kernels::ops::argmax_batch_bf16_split_partials_len;
 use openinfer_kernels::ops::argmax_bf16_split_into;
@@ -24,7 +25,8 @@ use openinfer_kernels::ops::embedding_rows_into;
 use openinfer_kernels::ops::fused_add_rms_norm_round_into;
 use openinfer_kernels::ops::gemm_strided_batched_bf16;
 use openinfer_kernels::ops::glm52_flashmla_sparse_prefill_launch;
-use openinfer_kernels::ops::glm52_mla_front_pack_fp8_launch;
+use openinfer_kernels::ops::glm52_fp8_per_token_group_quant_bf16_ue8m0_launch;
+use openinfer_kernels::ops::glm52_mla_cache_pack_launch;
 use openinfer_kernels::ops::glm52_mla_query_assemble_launch;
 use openinfer_kernels::ops::glm52_prefill_moe_gather_rows_launch;
 use openinfer_kernels::ops::glm52_prefill_unpack_pages_launch;
@@ -183,7 +185,8 @@ pub(crate) struct Glm52TpPrefillExecutor {
     sin: CudaSlice<bf16>,
     mla_front: Glm52MlaFront,
     ql_nope: CudaSlice<bf16>,
-    query_fp8: CudaSlice<u8>,
+    ckv_fp8: CudaSlice<u8>,
+    ckv_scales: CudaSlice<f32>,
     slot_mapping: CudaSlice<i64>,
     block_ids: CudaSlice<i32>,
     unpacked_kv: CudaSlice<bf16>,
@@ -260,7 +263,8 @@ impl Glm52TpPrefillExecutor {
             ql_nope: ctx
                 .stream
                 .alloc_zeros::<bf16>(chunk * 16 * GLM52_KV_LORA_RANK)?,
-            query_fp8: ctx.stream.alloc_zeros::<u8>(chunk * 16 * GLM52_KV_A_OUT)?,
+            ckv_fp8: ctx.stream.alloc_zeros::<u8>(chunk * GLM52_KV_LORA_RANK)?,
+            ckv_scales: ctx.stream.alloc_zeros::<f32>(chunk * 4)?,
             slot_mapping: ctx.stream.alloc_zeros::<i64>(chunk)?,
             block_ids: ctx
                 .stream
@@ -563,9 +567,9 @@ impl Glm52TpPrefillExecutor {
     }
 
     /// Per-layer chunk-scale MLA pack: the w_uk absorb bmm plus the fused
-    /// front-pack kernel that writes both the fp8 query and this layer's
-    /// packed KV pages at `slot_mapping`. The bf16 attention query is
-    /// assembled later, per attention sub-tile.
+    /// canonical fp8_ds_mla pack that writes this layer's 656-byte KV rows at
+    /// `slot_mapping`. The bf16 attention query is assembled later, per
+    /// attention sub-tile.
     fn pack_mla_cache(
         &mut self,
         ctx: &DeviceContext,
@@ -591,20 +595,25 @@ impl Glm52TpPrefillExecutor {
             GLM52_KV_LORA_RANK,
             16,
         )?;
-        glm52_mla_front_pack_fp8_launch(
+        glm52_fp8_per_token_group_quant_bf16_ue8m0_launch(
+            ctx,
+            Glm52MoeQuantShape {
+                rows,
+                width: GLM52_KV_LORA_RANK,
+                group_size: 128,
+            },
+            &self.mla_front.kv_c,
+            &mut self.ckv_fp8,
+            &mut self.ckv_scales,
+        )?;
+        glm52_mla_cache_pack_launch(
             ctx,
             rows,
-            16,
-            &self.ql_nope,
-            &self.mla_front.q_full,
-            GLM52_QK_NOPE_HEAD_DIM,
-            GLM52_QK_HEAD_DIM,
-            &self.mla_front.ckv,
-            &weights.kv_a_ln.data,
-            GLM52_RMS_EPS,
+            &self.ckv_fp8,
+            &self.ckv_scales,
+            &self.mla_front.k_pe,
             &self.cos,
             &self.sin,
-            &mut self.query_fp8,
             packed_cache,
             &self.slot_mapping,
         )
