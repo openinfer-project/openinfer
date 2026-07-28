@@ -41,7 +41,7 @@ The bridge to FlashInfer's `paged_kv_t` (which expects separate `k_data`/`v_data
 ## Scheduling policy
 
 - **FCFS prefill-priority.** Pending prefill always preempts continued decode at step boundaries.
-- **Bucket CUDA Graphs.** Batch buckets `[1, 2, 4, 8, 16, 32, 64]`, padded up at runtime. One captured graph per bucket, capture-on-first-use, replay afterward.
+- **Bucket CUDA Graphs.** Batch buckets 1–256 (36 sizes), padded up at runtime. One graph per `(bucket, attention path)`, all pre-captured at startup (single GPU and TP alike), replay afterward.
 - **Padding page.** `KvPool` reserves one page at construction. Padding batch slots point at it with `seq_len=1, last_page_len=1` — KV append writes harmless garbage, attention output is discarded.
 - **Unified forward.** When both pending prefill and active decode exist, one forward pass handles all tokens. Decode rows ride free inside the compute-bound prefill GEMM (<2% FLOPs added). Pure decode (the common case) still uses CUDA Graph.
 - **Admission.** Reject when `KvPool` full. No queue behind memory pressure.

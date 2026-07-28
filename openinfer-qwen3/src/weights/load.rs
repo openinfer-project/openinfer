@@ -271,7 +271,7 @@ impl Qwen3Model {
 
         if model.enable_cuda_graph {
             debug!(
-                "Decode path CUDA Graph is enabled (single GPU captures on first decode step; TP pre-captures every bucket at startup)"
+                "Decode path CUDA Graph is enabled (every bucket's decode graph is pre-captured at startup)"
             );
         } else {
             debug!("Decode path CUDA Graph is disabled");

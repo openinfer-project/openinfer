@@ -36,4 +36,6 @@ The 2026-06 rejection reasoned from the numbers above: upload ran at ~7GB/s page
 
 ## Next
 
-The warm HTTP-ready floor is now the engine's own post-load startup work (profile, warmup, graph capture — ~3.7s of the ~4.7s), no longer the frontend path; that is where the next startup-time win lives. Cold-start stays bandwidth-bound (per roadmap out of scope).
+The warm HTTP-ready floor is now the engine's own post-load startup work (profile, warmup, graph capture — ~3.7s of the ~4.7s), no longer the frontend path; that is where the next startup-time win lives.
+
+2026-07-28: single-GPU decode graphs are now pre-captured at startup too (same sweep as TP), so the per-bucket first-hit capture stall is gone from serving. Measured on RTX 5070 Ti (Qwen3-4B, default Tuned policy): the 36-bucket sweep costs **0.91s** of engine startup (`Engine loaded: elapsed_ms=5620` end-to-end) and memory plateaus at 14.1/16.3GB — Tuned/Pin graph execs are ~2MB/bucket. `--batch-invariant=per-token` is the exception: its per-row GemmEx loop bakes N nodes per (projection, layer) into a bucket-N graph, so the sweep retains ~1.8GB total — on 16GB cards it needs KV-budget headroom (see `models/qwen3/single-gpu-graph-precapture.md`). Cold-start stays bandwidth-bound (per roadmap out of scope).

@@ -227,7 +227,7 @@ pub struct Qwen3LaunchOptions {
     /// Tensor-parallel world size; `> 1` uses devices `0..tp_size`.
     pub tp_size: usize,
     /// Whether the user requested CUDA Graph. LoRA serving forces it off;
-    /// under tensor parallelism every decode graph is pre-captured at startup.
+    /// every decode graph is pre-captured at startup (single GPU and TP alike).
     pub cuda_graph: bool,
     /// Export the live rank-0, batch-1 SplitKv decode graph during startup.
     /// The requested PNG gets a detailed sibling `.dot` for LLM inspection.

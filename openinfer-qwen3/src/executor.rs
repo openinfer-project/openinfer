@@ -1041,6 +1041,10 @@ pub struct Qwen3Executor {
     /// [`enable_decode_overlap`] to create overlap streams on the correct
     /// device (the model, KV cache, and compute stream all live here).
     device_ordinal: usize,
+    /// Whether CUDA Graph decode was requested at construction. Drives the
+    /// startup pre-capture sweeps: main-stream graphs at construction, the
+    /// green-ctx split cache when decode-overlap is enabled.
+    enable_cuda_graph: bool,
 }
 
 /// Executor-side state for the opt-in KV block-event feed.
@@ -1220,20 +1224,48 @@ impl Qwen3Executor {
                 })
             }
         };
+        let enable_cuda_graph = model.enable_cuda_graph;
+        let primary = RankWorker::spawn(
+            0,
+            LocalQwen3Lane::new(
+                model,
+                kv_buffer,
+                total_blocks,
+                padding_block_id,
+                max_prefill_tokens,
+            )?,
+        )?;
+        // Pre-capture every reachable decode graph now — the same sweep the TP
+        // path runs, with a single rank (no collectives, so no watchdog).
+        // Serving must never hit a lazy mid-request capture: that is the #481
+        // capture window on one GPU. Uncompiled GQA groups reroute decode to
+        // the eager unified path and skip it.
+        if enable_cuda_graph && metadata.config.decode_group_is_compiled() {
+            let started = std::time::Instant::now();
+            let run_phase = |phase: PrecapturePhase| -> Result<()> {
+                primary.precapture(phase, None)?.recv().map_err(|_| {
+                    anyhow::anyhow!(
+                        "rank-0 worker dropped during decode graph pre-capture {phase:?}"
+                    )
+                })?
+            };
+            run_phase(PrecapturePhase::Warmup)?;
+            for bucket_idx in 0..BATCH_BUCKETS.len() {
+                run_phase(PrecapturePhase::Capture { bucket_idx })?;
+                run_phase(PrecapturePhase::Launch { bucket_idx })?;
+            }
+            run_phase(PrecapturePhase::Finalize)?;
+            log::info!(
+                "Single-GPU decode graph pre-capture: {} buckets captured in {:.2}s",
+                BATCH_BUCKETS.len(),
+                started.elapsed().as_secs_f64()
+            );
+        }
         Ok(Self {
             metadata,
             kv_mgr,
             request_kvs: HashMap::new(),
-            primary: RankWorker::spawn(
-                0,
-                LocalQwen3Lane::new(
-                    model,
-                    kv_buffer,
-                    total_blocks,
-                    padding_block_id,
-                    max_prefill_tokens,
-                )?,
-            )?,
+            primary,
             workers: Vec::new(),
             loaded_lora_adapters: HashSet::new(),
             prefix_cache_enabled: true,
@@ -1255,6 +1287,7 @@ impl Qwen3Executor {
             dflash_ready_requests: HashSet::new(),
             kv_events,
             device_ordinal,
+            enable_cuda_graph,
         })
     }
 
@@ -1516,7 +1549,7 @@ impl Qwen3Executor {
             let run_phase = |phase: PrecapturePhase| -> Result<()> {
                 let pending = std::iter::once(&primary)
                     .chain(workers.iter())
-                    .map(|worker| worker.precapture(phase))
+                    .map(|worker| worker.precapture(phase, None))
                     .collect::<Result<Vec<_>>>()?;
                 let ranks = pending.len();
                 for (rank, recv) in pending.into_iter().enumerate() {
@@ -1580,6 +1613,7 @@ impl Qwen3Executor {
             // KV events are single-GPU only (asserted above); never wired here.
             kv_events: None,
             device_ordinal: device_ordinals[0],
+            enable_cuda_graph,
         })
     }
 
@@ -1659,6 +1693,35 @@ impl Qwen3Executor {
         );
         let device_ordinal = self.device_ordinal;
         self.overlap = crate::green_ctx::OverlapStreams::create(device_ordinal, overlap)?;
+        // SplitConcurrent decode replays the split cache (`graphs_split`), whose
+        // graphs are pinned to the decode-partition stream — pre-capture them on
+        // that stream now so the first mixed step never captures mid-serving.
+        if let Some(ref overlap_streams) = self.overlap {
+            if self.enable_cuda_graph && self.metadata.config.decode_group_is_compiled() {
+                let started = std::time::Instant::now();
+                let decode_stream = overlap_streams.decode_stream;
+                let run_phase = |phase: PrecapturePhase| -> Result<()> {
+                    self.primary
+                        .precapture(phase, Some(decode_stream))?
+                        .recv()
+                        .map_err(|_| {
+                            anyhow::anyhow!(
+                                "rank-0 worker dropped during split-stream graph pre-capture {phase:?}"
+                            )
+                        })?
+                };
+                for bucket_idx in 0..BATCH_BUCKETS.len() {
+                    run_phase(PrecapturePhase::Capture { bucket_idx })?;
+                    run_phase(PrecapturePhase::Launch { bucket_idx })?;
+                }
+                run_phase(PrecapturePhase::Finalize)?;
+                log::info!(
+                    "Split-stream decode graph pre-capture (--decode-overlap): {} buckets captured in {:.2}s",
+                    BATCH_BUCKETS.len(),
+                    started.elapsed().as_secs_f64()
+                );
+            }
+        }
         Ok(())
     }
 
@@ -3264,18 +3327,29 @@ impl LocalQwen3Lane {
         })
     }
 
-    /// One phase of the TP startup sweep ([`PrecapturePhase`]). Synthetic rows
+    /// One phase of the startup sweep ([`PrecapturePhase`]). Synthetic rows
     /// are token 0 at position 0 over the shared padding page; outputs unused.
-    fn precapture_phase(&mut self, phase: PrecapturePhase) -> Result<()> {
+    /// `split_stream` targets the green-ctx decode-partition cache
+    /// (`graphs_split`) instead of the full-SM `graphs` cache.
+    fn precapture_phase(
+        &mut self,
+        phase: PrecapturePhase,
+        split_stream: Option<crate::green_ctx::SendStream>,
+    ) -> Result<()> {
         match phase {
             PrecapturePhase::Warmup => self.model.warmup_tp_collective(),
             PrecapturePhase::Capture { bucket_idx } => {
-                self.precapture_decode(bucket_idx, DecodeGraphUse::CaptureOnly)
+                self.precapture_decode(bucket_idx, DecodeGraphUse::CaptureOnly, split_stream)
             }
             PrecapturePhase::Launch { bucket_idx } => {
-                self.precapture_decode(bucket_idx, DecodeGraphUse::Replay)
+                self.precapture_decode(bucket_idx, DecodeGraphUse::Replay, split_stream)
             }
             PrecapturePhase::Finalize => {
+                let graphs = if split_stream.is_some() {
+                    &self.bufs.graphs_split
+                } else {
+                    &self.bufs.graphs
+                };
                 for (bucket_idx, &bucket) in BATCH_BUCKETS.iter().enumerate() {
                     let path = BatchDecodeBuffers::attention_path(
                         bucket,
@@ -3283,8 +3357,8 @@ impl LocalQwen3Lane {
                     );
                     let graph_idx = BatchDecodeBuffers::graph_index(bucket_idx, path);
                     anyhow::ensure!(
-                        self.bufs.graphs[graph_idx].is_captured(),
-                        "TP decode graph pre-capture left bucket {bucket} ({path:?}) uncaptured"
+                        graphs[graph_idx].is_captured(),
+                        "decode graph pre-capture left bucket {bucket} ({path:?}) uncaptured"
                     );
                 }
                 self.precapture_complete = true;
@@ -3293,13 +3367,24 @@ impl LocalQwen3Lane {
         }
     }
 
-    fn precapture_decode(&mut self, bucket_idx: usize, graph_use: DecodeGraphUse) -> Result<()> {
+    fn precapture_decode(
+        &mut self,
+        bucket_idx: usize,
+        graph_use: DecodeGraphUse,
+        split_stream: Option<crate::green_ctx::SendStream>,
+    ) -> Result<()> {
         let bucket = BATCH_BUCKETS[bucket_idx];
         let token_ids = vec![0u32; bucket];
         let kv_views: Vec<KvView> = (0..bucket)
             .map(|_| KvView::new(vec![self.padding_block_id], 1, self.layout.page_size))
             .collect();
         let lora_adapters: Vec<Option<&str>> = vec![None; bucket];
+        // Split sweep (--decode-overlap): run under the decode-partition stream
+        // override so `batch_decode` routes into `graphs_split` and the captured
+        // nodes pin to the partition — the same setup SplitConcurrent serves with.
+        let _override_guard = split_stream.map(|stream| unsafe {
+            openinfer_kernels::tensor::StreamOverrideGuard::activate(stream.0)
+        });
         self.model.batch_decode(
             &token_ids,
             &kv_views,
@@ -3310,8 +3395,18 @@ impl LocalQwen3Lane {
             graph_use,
         )?;
         // Capture acks only after the async cuGraphUpload lands; Launch acks
-        // only after the collectives drained.
-        self.model.device_ctx().stream.synchronize()?;
+        // only after the collectives drained. Under the override the work sits
+        // on the split stream, which `ctx.stream` says nothing about.
+        match split_stream {
+            Some(stream) => {
+                let r = unsafe { cudarc::driver::sys::cuStreamSynchronize(stream.0) };
+                anyhow::ensure!(
+                    r == cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+                    "cuStreamSynchronize(split decode) failed during graph pre-capture: {r:?}"
+                );
+            }
+            None => self.model.device_ctx().stream.synchronize()?,
+        }
         Ok(())
     }
 
@@ -3326,7 +3421,7 @@ impl LocalQwen3Lane {
                 !self.model.tp_graph_enabled(),
                 "Qwen3 TP batch-1 graph was not captured by the startup sweep"
             );
-            self.precapture_decode(bucket_idx, DecodeGraphUse::CaptureOnly)?;
+            self.precapture_decode(bucket_idx, DecodeGraphUse::CaptureOnly, None)?;
         }
         let title = format!("Qwen3 decode CUDA Graph · bs={bucket} · {attention_path:?}");
         self.bufs.graphs[graph_idx]
@@ -3676,10 +3771,12 @@ enum WorkerCommand {
         request_id: RequestId,
         resp: channel::Sender<Result<()>>,
     },
-    /// Startup-only (TP + CUDA Graph): one phase of the decode-graph
-    /// pre-capture sweep. See [`LocalQwen3Lane::precapture_phase`].
+    /// Startup-only (CUDA Graph): one phase of the decode-graph pre-capture
+    /// sweep. See [`LocalQwen3Lane::precapture_phase`]. `split_stream` targets
+    /// the green-ctx decode-partition cache instead of the full-SM one.
     Precapture {
         phase: PrecapturePhase,
+        split_stream: Option<crate::green_ctx::SendStream>,
         resp: channel::Sender<Result<()>>,
     },
     DumpDecodeGraph {
@@ -3689,13 +3786,14 @@ enum WorkerCommand {
     Shutdown,
 }
 
-/// One controller-barriered phase of the TP decode-graph pre-capture sweep.
+/// One controller-barriered phase of the decode-graph pre-capture sweep.
 ///
 /// Capture and launch are separate phases because a captured collective's first
 /// launch blocks on its peers: overlapping that with a peer still in capture/
 /// instantiate/upload (which contend driver locks and allocate device memory)
 /// deadlocks the driver. So every rank finishes capturing a bucket before any
-/// rank launches it.
+/// rank launches it. Single GPU runs the same sequence with one rank — the
+/// separation is harmless and keeps one sweep implementation.
 #[derive(Clone, Copy, Debug)]
 enum PrecapturePhase {
     /// One eager all-reduce per bucket message size, so the size-selected NCCL
@@ -3798,8 +3896,12 @@ impl RankWorker {
                                     lane.drop_dflash_request(request_id);
                                     let _ = resp.send(Ok(()));
                                 }
-                                WorkerCommand::Precapture { phase, resp } => {
-                                    let result = lane.precapture_phase(phase);
+                                WorkerCommand::Precapture {
+                                    phase,
+                                    split_stream,
+                                    resp,
+                                } => {
+                                    let result = lane.precapture_phase(phase, split_stream);
                                     let _ = resp.send(result);
                                 }
                                 WorkerCommand::DumpDecodeGraph { png_path, resp } => {
@@ -3848,11 +3950,17 @@ impl RankWorker {
 
     /// Start one sweep phase; returns the ack receiver. The controller fans a
     /// phase out to all ranks before collecting acks so their collectives pair.
-    fn precapture(&self, phase: PrecapturePhase) -> Result<channel::Receiver<Result<()>>> {
+    /// `split_stream` selects the green-ctx decode-partition graph cache.
+    fn precapture(
+        &self,
+        phase: PrecapturePhase,
+        split_stream: Option<crate::green_ctx::SendStream>,
+    ) -> Result<channel::Receiver<Result<()>>> {
         let (resp_tx, resp_rx) = channel::bounded(1);
         self.tx
             .send(WorkerCommand::Precapture {
                 phase,
+                split_stream,
                 resp: resp_tx,
             })
             .map_err(|_| anyhow::anyhow!("worker channel closed on precapture {phase:?}"))?;

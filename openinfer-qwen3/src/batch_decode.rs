@@ -48,7 +48,9 @@ macro_rules! trace_decode_kv_len {
 /// How a `batch_decode` call interacts with the per-bucket CUDA graphs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DecodeGraphUse {
-    /// Replay if captured, lazily capture otherwise (single-GPU serving).
+    /// Replay if captured, capture otherwise (serving). After the startup
+    /// pre-capture sweep this is always a replay; the capture fallback only
+    /// covers construction paths that skipped the sweep.
     Serve,
     /// Eager kernels even with graphs enabled; the TP memory profile uses it to
     /// avoid an uncoordinated capture (see [`PrecapturePhase`]).

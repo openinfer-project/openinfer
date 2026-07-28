@@ -13,6 +13,12 @@ use openinfer_kernels::ops::NumericPolicy;
 use openinfer_kernels::ops::pin_served;
 use openinfer_kernels::ops::reset_numeric_policy_counters;
 use openinfer_kernels::ops::set_numeric_policy;
+use openinfer_qwen3::DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES;
+use openinfer_qwen3::DEFAULT_KV_PAGE_SIZE;
+use openinfer_qwen3::DEFAULT_MAX_PREFILL_TOKENS;
+use openinfer_qwen3::Qwen3LoraOptions;
+use openinfer_qwen3::Qwen3MemoryOptions;
+use openinfer_qwen3::Qwen3OffloadOptions;
 use openinfer_qwen3::runtime::DecodePlan;
 use openinfer_qwen3::runtime::DecodeStepItem;
 use openinfer_qwen3::runtime::PrefillPlan;
@@ -104,24 +110,42 @@ fn a_first_and_decode(ex: &mut Qwen3Executor, n_requests: usize) -> (u32, Vec<(u
     (a_first, topk)
 }
 
-/// One fresh executor with `policy` active before first decode (graph captured under it).
-fn run_policy(policy: NumericPolicy, model_path: &str) -> Vec<(bool, bool, u64)> {
+/// One fresh executor with `policy` active before construction — decode graphs are
+/// pre-captured at startup under it. Returns the pin-GEMM count from that sweep plus
+/// per-pair `(first_token_eq, topk_eq)` results. Replay skips the kernel closure, so no
+/// later decode step can add to the pin count (Tuned/PerToken are structurally 0 = N/A).
+fn run_policy(policy: NumericPolicy, model_path: &str) -> (u64, Vec<(bool, bool)>) {
     set_numeric_policy(policy);
-    let mut ex = Qwen3Executor::from_runtime(model_path, true, &[0]).expect("build executor");
+    reset_numeric_policy_counters();
+    // PerToken graphs bake one N=1 GemmEx node per (row, projection, layer), so graph
+    // exec memory grows with the bucket (~1.8GB across all 36 startup-captured buckets;
+    // Tuned/Pin stay flat ~2MB/bucket). Shrink the KV pool so the three policy executors
+    // fit on consumer GPUs — the assertions are numerics-only, pool size is irrelevant.
+    let mut ex = Qwen3Executor::from_runtime_with_lora_options(
+        model_path,
+        true,
+        &[0],
+        Qwen3LoraOptions::default(),
+        Qwen3OffloadOptions::disabled(),
+        DEFAULT_MAX_PREFILL_TOKENS,
+        None,
+        Qwen3MemoryOptions::new(
+            0.75,
+            DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES,
+            DEFAULT_KV_PAGE_SIZE,
+        ),
+        false,
+    )
+    .expect("build executor");
+    let capture_served = pin_served();
     ex.set_prefix_cache_enabled(false);
     let mut out = Vec::new();
     for (_, small, large) in PAIRS {
-        reset_numeric_policy_counters();
         let (ft_s, tk_s) = a_first_and_decode(&mut ex, small);
         let (ft_l, tk_l) = a_first_and_decode(&mut ex, large);
-        let served = pin_served();
-        let ft_eq = ft_s == ft_l;
-        let tk_eq = tk_s == tk_l;
-        // served counts the CAPTURE step only (replay skips the closure). Under baseline/per_token,
-        // launch_gemm_pin is never called → served is structurally 0 (N/A).
-        out.push((ft_eq, tk_eq, served));
+        out.push((ft_s == ft_l, tk_s == tk_l));
     }
-    out
+    (capture_served, out)
 }
 
 #[test]
@@ -129,9 +153,9 @@ fn batch_invariance_decode_gemm_graph() {
     let Some(model_path) = model_path_or_skip() else {
         return;
     };
-    let baseline = run_policy(NumericPolicy::Tuned, &model_path);
-    let pin = run_policy(NumericPolicy::Pin, &model_path);
-    let pertoken = run_policy(NumericPolicy::PerToken, &model_path);
+    let (_, baseline) = run_policy(NumericPolicy::Tuned, &model_path);
+    let (pin_served_at_capture, pin) = run_policy(NumericPolicy::Pin, &model_path);
+    let (_, pertoken) = run_policy(NumericPolicy::PerToken, &model_path);
 
     // Prefill must be identical for A in every batch/policy, else the decode comparison is
     // prefill-contaminated.
@@ -140,7 +164,7 @@ fn batch_invariance_decode_gemm_graph() {
         ("pin", &pin),
         ("per_token", &pertoken),
     ] {
-        for (i, (ft_eq, _, _)) in rows.iter().enumerate() {
+        for (i, (ft_eq, _)) in rows.iter().enumerate() {
             assert!(
                 *ft_eq,
                 "{name}: A's prefill first_token differs across batch on pair {} — decode \
@@ -151,28 +175,27 @@ fn batch_invariance_decode_gemm_graph() {
     }
 
     // Control: baseline must drift on at least one pair (else not reproduced here).
-    let baseline_drifted = baseline.iter().any(|(_, tk_eq, _)| !tk_eq);
+    let baseline_drifted = baseline.iter().any(|(_, tk_eq)| !tk_eq);
     assert!(
         baseline_drifted,
         "baseline did NOT drift on any pair — decode-GEMM coupling not reproduced; \
          the pin proof would be vacuous"
     );
 
-    // Pin: every pair invariant, served>0 (pin ran at capture).
-    for (i, (_, tk_eq, served)) in pin.iter().enumerate() {
+    // Pin: every pair invariant, and pin actually ran during the startup capture sweep.
+    assert!(
+        pin_served_at_capture > 0,
+        "PIN: pin did not run during the startup pre-capture sweep (served=0) — vacuous"
+    );
+    for (i, (_, tk_eq)) in pin.iter().enumerate() {
         assert!(
             *tk_eq,
             "PIN: A's graph decode top-K changed on pair {} — pin did NOT make graph decode \
-             batch-invariant (graph captured under Pin)",
-            PAIRS[i].0.trim()
-        );
-        assert!(
-            *served > 0,
-            "PIN: pin did not run on pair {} (served=0) — vacuous",
+             batch-invariant (graphs captured under Pin)",
             PAIRS[i].0.trim()
         );
     }
-    for (i, (_, tk_eq, _)) in pertoken.iter().enumerate() {
+    for (i, (_, tk_eq)) in pertoken.iter().enumerate() {
         assert!(
             *tk_eq,
             "PER_TOKEN: A's graph decode top-K changed on pair {} — harness bug",

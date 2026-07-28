@@ -60,7 +60,7 @@ The transition lands exactly where CTA count crosses SM count: bs≤8 (≤64 CTA
 
 The grid must be fixed for graph replay, but SplitKv's chunk count varies with context. Resolved by **fixed-upper-bound grid + out-of-graph metadata**:
 
-- One captured graph per `(batch bucket, attention_path)` — `graph_index = bucket_idx × 2 + path.graph_slot()`. bs=1 has a `NonPartition` slot and a `SplitKv` slot; first use of a combination captures, later steps replay.
+- One captured graph per `(batch bucket, attention_path)` — `graph_index = bucket_idx × 2 + path.graph_slot()`. bs=1 has a `NonPartition` slot and a `SplitKv` slot; every `(bucket, path)` combination is pre-captured at startup, so serving steps are pure replay.
 - SplitKv workspace is pre-allocated to the active policy's grid (`bs × max_split_chunks()`: default `Tuned` `bs × 64` = `SPLIT_KV_TUNED_MAX_CHUNKS`, `Pin`/`PerToken` `bs × 256`), so buffer pointers stay stable across replay — the policy is fixed before construction, so the size never shifts under a live executor. The grid is fixed per `(bucket, policy)` (see *Chunk size and batch-invariance*).
 - Per-step context differences go through `memcpy_htod` in `sync_split_kv_meta` **before** `run_or_capture` (outside the graph): chunk_size, valid-chunk count, `valid_mask`, `o_indptr`. Chunks beyond the real count are masked off (`valid_mask = 0`, those CTAs early-exit).
 

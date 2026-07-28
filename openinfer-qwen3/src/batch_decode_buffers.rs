@@ -14,9 +14,9 @@ use openinfer_kv_cache::KvView;
 use crate::split_kv::SplitKvConfig;
 
 /// Bucket sizes for CUDA Graph capture. Actual batch is padded to the nearest bucket.
-/// Based on vLLM's cudagraph capture list up to 256; graphs are captured lazily per
-/// bucket, and activation buffers are shared (sized once at the largest bucket), so
-/// extra buckets cost capture time on first hit, not memory.
+/// Based on vLLM's cudagraph capture list up to 256; every bucket's graph is
+/// pre-captured at startup, and activation buffers are shared (sized once at the
+/// largest bucket), so extra buckets cost startup capture time, not memory.
 ///
 /// Buckets 8/16 are viable only because decode GEMMs at N <= GEMM_LT_MAX_N run
 /// tuned cublasLt algos: cuBLAS's GemmEx heuristic skips split-K for batch in
