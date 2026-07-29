@@ -63,12 +63,10 @@ fn tp_scheduler_uses_eager_only_plan() {
 
 #[test]
 fn inflight_prefill_waits_instead_of_parking_after_last_decode_retires() {
-    assert_eq!(overlap_action(true, false), Some(OverlapAction::Wait));
     assert!(
         !should_block_on_submit(true, true, true, true),
         "an in-flight prefill must keep the scheduler off submit_rx.blocking_recv()"
     );
-    assert_eq!(overlap_action(true, true), Some(OverlapAction::Decode));
 }
 
 #[test]

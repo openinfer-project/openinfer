@@ -1005,20 +1005,6 @@ fn publish_load(
     });
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum OverlapAction {
-    Decode,
-    Wait,
-}
-
-fn overlap_action(inflight_prefill: bool, have_active: bool) -> Option<OverlapAction> {
-    inflight_prefill.then_some(if have_active {
-        OverlapAction::Decode
-    } else {
-        OverlapAction::Wait
-    })
-}
-
 fn should_block_on_submit(
     active_empty: bool,
     prefilling_empty: bool,
@@ -1119,7 +1105,7 @@ fn scheduler_loop(
         // One async prefill owns its scheduled request state. Do not admit or
         // launch a second chunk until it resolves. Active decode keeps moving;
         // if it retires first, wait on the event instead of blocking on submit.
-        if let Some(action) = overlap_action(inflight_prefill.is_some(), !active.is_empty()) {
+        if inflight_prefill.is_some() {
             deferred = pending;
             let itl_step_start = itl_debug_enabled().then(Instant::now);
             let (itl_prefill_tokens, itl_prefill_reqs) =
@@ -1130,22 +1116,19 @@ fn scheduler_loop(
                     )
                 });
             let itl_decode_n = active.len();
-            let itl_plan_kind = match action {
-                OverlapAction::Decode => {
-                    decode_step(&mut backend, &mut active, &mut rng);
-                    "overlap_decode"
-                }
-                OverlapAction::Wait => {
-                    finish_async_prefill(
-                        &mut backend,
-                        &mut active,
-                        &mut prefilling,
-                        inflight_prefill
-                            .take()
-                            .expect("async prefill must be present before blocking wait"),
-                    );
-                    "overlap_wait"
-                }
+            let itl_plan_kind = if active.is_empty() {
+                finish_async_prefill(
+                    &mut backend,
+                    &mut active,
+                    &mut prefilling,
+                    inflight_prefill
+                        .take()
+                        .expect("async prefill must be present before blocking wait"),
+                );
+                "overlap_wait"
+            } else {
+                decode_step(&mut backend, &mut active, &mut rng);
+                "overlap_decode"
             };
             log_itl_step(
                 itl_step_start,
