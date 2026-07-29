@@ -20,4 +20,4 @@ notes = "grid (64, rows) x 192 线程，rows 无上界 → rows 16/32/64（MTP s
 mode = "torch_tolerance"
 [reference.tolerance]
 rel_l2 = 1e-09
-note = "构造上 bit-exact：bf16 x bf16 乘积在 f32 精确（8 位尾数）、单次舍入加减与 FMA 等值、两侧 RNE bf16 store（论证见 kernel_lab.refs.mla_attention）；任何 rel_l2 > 0 即 bug。UNMEASURED——GB300 首测在此确认 0.0 并回填机器名"
+note = "构造上 bit-exact：bf16 x bf16 乘积在 f32 精确（8 位尾数）、单次舍入加减与 FMA 等值、两侧 RNE bf16 store（论证见 kernel_lab.refs.mla_attention）；任何 rel_l2 > 0 即 bug。MEASURED rel_l2 = 0.0 全 rows（GB300 sm_103 tray03，2026-07-29）——bit-exact 论证成立"

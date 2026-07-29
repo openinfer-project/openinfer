@@ -21,4 +21,4 @@ notes = "grid rows x 128 线程，rows 无上界 → rows 16/32/64 原生支持�
 mode = "torch_tolerance"
 [reference.tolerance]
 rel_l2 = 1e-09
-note = "字节级对拍：拷贝段 bit-exact，rope 段同 mla.query_assemble 的 bit-exact 论证；scale 区 pow2 由 harness 断言兜底（非 pow2 直接 AssertionError，非容差事件）。UNMEASURED——GB300 首测确认 0.0 并回填机器名"
+note = "字节级对拍：拷贝段 bit-exact，rope 段同 mla.query_assemble 的 bit-exact 论证；scale 区 pow2 由 harness 断言兜底（非 pow2 直接 AssertionError，非容差事件）。MEASURED rel_l2 = 0.0 全 rows × ctx 三档（GB300 sm_103 tray03，2026-07-29）；scale 区 pow2 读回断言通过"

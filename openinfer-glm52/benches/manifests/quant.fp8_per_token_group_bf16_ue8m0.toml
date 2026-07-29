@@ -21,4 +21,4 @@ notes = "UE8M0 = FlashMLA V3.2 fp8 sparse KV-cache 合同：sm100 decode 内核�
 mode = "torch_tolerance"
 [reference.tolerance]
 rel_l2 = 1e-6
-note = "bit-exact 目标（UNMEASURED — 待 GB300 首测回填实测值与机器名）：舍入论证同 quant.fp8_per_token_group_bf16（kernel cvt.rn.satfinite.e4m3 = torch float8_e4m3fn cast，双侧 RNE）；ue8m0 向上取整为整数位操作，双侧逐位一致。推导：任一字节/scale-bit 差异 ⇒ rel_l2 ≥ ~7e-4（最小面 rows=1：528 B，norm≈RMS(byte)*23）≫ 1e-6，故等价 bit-exact 门。若首测非零：先查 scale 是否 2 幂（硬断言应已拦下），再查 cvt/torch 编码差异，按 1 e4m3 encode step（每元素相对 ≤2^-3）推导新界并记录于此"
+note = "bit-exact 门，MEASURED rel_l2=0.0（GB300 首测全绿；sm_120 RTX 5070 Ti 2026-07-29 全 rows 复测 0.0）。舍入论证同 quant.fp8_per_token_group_bf16（kernel cvt.rn.satfinite.e4m3 = torch float8_e4m3fn cast，双侧 RNE）；ue8m0 向上取整为整数位操作，双侧逐位一致。参考实现与 base 共享同一 scale 计算：torch tensor÷CPU标量 的倒数乘法陷阱（rn(1/448) 不精确 → +1 ulp）已修为 device 张量除数（真 div.rn）；本变体首测未暴露是因为 pow2 bump 吸收 sub-ulp 差异且精确商舍回原值。1e-6 门槛推导不变：任一字节/scale-bit 差异 ⇒ rel_l2 ≥ ~7e-4（最小面 rows=1）≫ 1e-6。若未来复现非零：先查 scale 是否 2 幂（硬断言应已拦下），再查 cvt/torch 编码差异，按 1 e4m3 encode step（每元素相对 ≤2^-3）推导新界并记录于此"

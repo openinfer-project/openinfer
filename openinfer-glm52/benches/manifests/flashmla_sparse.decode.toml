@@ -21,4 +21,4 @@ notes = "topk = 2048 固定；num_sm_parts 运行时查询 glm52_flashmla_sparse
 mode = "torch_tolerance"
 [reference.tolerance]
 rel_l2 = 0.02
-note = "bf16 store floor（2^-8 相对量级）+ f32 split 累加重排 vs f64 naive 参考（移植自 glm52_sparse_mla.cu reference kernel；与 Rust 门 2e-2 mean-norm 同量级）。UNMEASURED——GB300 首测回填 measured 值与机器名"
+note = "bf16 store floor（2^-8 相对量级）+ f32 split 累加重排 vs f64 naive 参考（移植自 glm52_sparse_mla.cu reference kernel；与 Rust 门 2e-2 mean-norm 同量级）。MEASURED rel_l2 ≤ 2.04e-3（rows{1,8,64}×ctx{16384,65536,262144} 全组合，GB300 sm_103 tray03，2026-07-29）；headroom ~10×"

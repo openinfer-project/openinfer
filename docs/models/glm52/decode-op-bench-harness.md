@@ -94,6 +94,98 @@
     （`--rows` 可重复）；pytest 9/9 绿（新增 16/32/64 推导断言）。
   - **未做**：GB300 上 rows 16/32/64 的 check+bench 首测与 (ksplit,ntiles) 实测替换。
 
+- 2026-07-29 tray03 环境（容器镜像 = `openinfer-susundev:glm52-kv-layout`，用户指定）:
+  - 运行中的 `susundev` 容器是另一会话的（只挂 repo、无 cargo、torch cuda False），不动它；
+    新建 `kernel-lab` 容器：同镜像 + `/mnt/shared/home/susun→/work`（cargo 1.97、.venv NCCL
+    2.30.7、torch 2.11.0+cu130 4×GB300 可见）+ `--gpus all --ipc=host --network=host`
+    + `git config --global safe.directory "*"`。
+  - 不碰共享仓另一会话的 `feat/glm52-pd-mtp-arenas` checkout：独立 worktree
+    `/mnt/shared/home/susun/openinfer-kernel-lab`（track origin/feat/glm52-kernel-lab）。
+  - **坑**：worktree 里 build.rs 自动 submodule init 以容器 root 身份跑失败（ceph 上 .git
+    属 susun + 网络 flake）；改在 host 以 susun 跑 `git submodule update --init --recursive`。
+  - **坑**：本地 pre-commit `clippy-kernels-kimi`（`^openinfer-kernels/` 触发）需要
+    `OPENINFER_NCCL_ROOT` ≥2.30.4——本机 `.venv` 装 `nvidia-nccl-cu13==2.30.7` 解决；
+    该钩子每次全量 nvcc 编译，kernels 改动的提交需 15-25 min。
+
+- 2026-07-29 swarm 7 组 → 23 个一期单元（92 pytest 绿 / 1 skipped）:
+  - 7 个 coder agent 并行交付：proj-gemv（o_proj 全轴 + qa_kva_pair rows=1）、attention
+    （query_assemble/cache_pack/flashmla_sparse.decode，rows×ctx{16k,64k,256k}）、norm 三单元
+    （fused 带生产未融合链 byte-compare）、quant 两单元（bit-exact 门 + ue8m0 pow2 硬断言；
+    torch RNE 侧已在 CPU 对全部 65282 个 bf16 位型交叉验证 0 差异）、indexer 六单元、
+    router 两单元、bookends 三单元 + shared_expert.swiglu。
+  - 合并验证：92 passed、`kernel_lab list` 23 单元、合并后 .cu nvcc 单 TU 编译绿。
+    3 个 agent 并发改 `glm52_moe_gemv.cu` 的 mma_config Blackwell 16/32/64 块（o_proj、
+    shared gate|up、shared down 各补 {4,1} UNMEASURED 占位），纯增量合并干净。
+  - **协调约定（agent 自发）**：`test_registry.py::EXPECTED_PHASE1_UNITS` 全量断言与并行
+    落地冲突 → "一行一单元追加"约定，编排方统一收口。
+  - **BLOCKED（manifest notes 已记）**：`router.noaux_tc` rows>8（min_gemv kMaxTokens=8
+    编译期上限 + acc 寄存器墙）；`indexer.weights_proj` rows>8（multi-mma 表无该 shape，
+    不写无消费者表项）；`indexer.mqa_logits` rows=64（AOT kAotAlignedBatchSize=32 硬顶）。
+  - **事实修正**：`norm.q_a_layernorm` 实为 RMSNorm(2048)（HF `GlmMoeDsaRMSNorm`，无 bias）；
+    LayerNorm-with-bias 是 indexer k_norm（indexer 组已覆盖）。**doc 分歧**：
+    `indexer-forward.md` 写 rope interleave，落地 `glm52_indexer_rope.cu` 是 half-split
+    （NeoX）——torch 参考按 .cu 实际语义，该 doc 建议后续修正。
+  - **共享层缺口（agent 提请，暂不阻塞）**：CLI 无 `--ctx` 轴（attention/indexer 组在 refs
+    里自写 sweep driver）；`derive_shapes` GEMV 口径（非 GEMV 单元 list 输出有误导数字）；
+    `loader.resolve` 固定 c_int restype 不适配 void ABI（norm 组自写 resolve_void）；
+    check 门是单 tensor rel_l2（多输出精确门放 adapter 内硬断言）。
+  - GB300 构建在 `kernel-lab` 容器后台运行（日志 `/work/kernel-lab-build.log`）。
+
+- 2026-07-29 GB300 首测：20/23 一次通过 → 修复后 23/23 全绿（sm_103 tray03）:
+  - 构建 47s（144 nvcc jobs，单 target sm_103；FlashMLA 走 sm_100f，DeepGEMM grouped /
+    TileLang 按设计 stub）。示范单元 `mla_front.q_b_gemv` rel_l2=1.66e-3，正中 bf16 floor 推导。
+  - 首测 4 个参考端 bug + 1 个容差 FAIL，根因全部查明、kernel 无一有问题：
+    1. `flashmla.decode`/`mqa_logits`/`cache_pack`：torch 参考 shape bug（fp8 编码输出
+       `[T,4,128]` 未 reshape `[T,512]`；cos/sin 广播把 rows 错位到 head 轴——rows=1
+       恰好合法漏网）。两组独立犯同款 expand/reshape 错误——盲写参考（本地无 torch）
+       的必然成本，GB300 迭代一轮即修完。
+    2. `quant.fp8_per_token_group_bf16` FAIL（rel_l2=4.19e-4，max_abs=1 code step）：
+       **torch 把 `tensor ÷ CPU标量` 降级为倒数乘法**（BinaryDivTrueKernel is_cpu_scalar
+       快路径），`amax / 448.0` 变 `amax * rn(1/448)`（448 含 1/7 因子，倒数不精确），
+       参考 scale 在 57% group 偏 +1 ulp（295 字节差 = 220 scale + 75 连带 value）。
+       除数改 device 张量后与 kernel `div.rn` 逐位一致，全 rows rel_l2=0.0。
+       **教训（广播全组）**：torch 参考里任何 `tensor / python标量` 都中此陷阱；
+       除数是 2 的幂不受影响（mla_attention 的 `/2.0` 安全）。ue8m0 变体因 pow2 bump
+       吸收 sub-ulp 差异而天然免疫。
+  - 修复后复测：23/23 PASS；实测值已回填 manifest（flashmla ≤2.04e-3、mqa ≤1.67e-3、
+    query_assemble/cache_pack/quant = 0.0，均 GB300 sm_103 tray03 2026-07-29）。
+  - 迭代通道：本地改文件 → `rsync -e 'ssh -J gb300-login'` 单文件到 tray03 worktree →
+    `docker exec -i kernel-lab` 重跑，绕过 git 往返，修复周期 <10 min/组。
+
+- 2026-07-29 GB300 bench：23/23 单元首批基线落账（`baselines/<unit>.json`）:
+  - 全 rows 轴（各单元支持范围内）× 默认 ctx；30 rounds × 10 inner，clocks.sm=2070 MHz，
+    git_rev=da68d4f9。示例：q_b_gemv rows=64 median 46.07µs、o_proj rows=64 134.36µs、
+    swiglu rows=64 58.92µs、quant/norm/router 4.7–9.0µs 量级。
+  - 账本已回拉本地入库（git 追踪，键 (shape, arch) 分桶——H200 数字永不混入）。
+
 ## Debrief
 
-（待执行后填写）
+- **Outcome**: 一期 harness 全量落地并验收——build.rs 双产物（默认构建零变化由两次无 env
+  的 pre-commit clippy 编译实证）、kernel_lab Python 包（list/check/bench/compare）、
+  23 个一期单元（7 组）配齐 manifest + torch 参考；CPU pytest 92 绿；GB300 sm_103 上
+  check 23/23 PASS（融合单元带生产未融合链 byte-compare：norm.fused_add_rmsnorm_round）、
+  bench 23/23 基线入 `baselines/`；Execution Log 全程记录。分支 feat/glm52-kernel-lab
+  已推送，tray03 worktree 同步。
+- **Pitfalls encountered**:
+  - torch `tensor ÷ CPU标量` 倒数乘法降级：除数含 1/7 类因子时参考系统性偏 1 ulp——
+    除数改 device 张量。写 torch 参考的通用陷阱，已记入 quant manifest note。
+  - 盲写 torch 参考（本地无 torch）必有 shape bug：首测 4 个失败全是参考端，kernel
+    零问题；修复通道 = rsync 单文件 + 容器重跑（<10 min/组）。
+  - rows>8 不是配置问题：BATCH=16 直接实例化会静默算错（mma N=8 维是 batch 维），
+    需要 multi-subtile mma 新内核（纯增量，rows 1–8 bit-identical）。
+  - worktree 里 build.rs 以容器 root 跑 submodule init 失败（ceph 权限）→ host 以属主跑。
+  - pre-commit clippy-kernels-kimi 钩子需要 OPENINFER_NCCL_ROOT + 全量 nvcc（15-25 min/提交）。
+- **Lessons learned**:
+  - swarm 铺单元组的前提 = 先有一个端到端验证过的示范单元（模式锚点）；并行落地 vs
+    全量断言（EXPECTED_PHASE1_UNITS）冲突用"一行一单元追加"约定解决。
+  - 容差推导（bf16 binade / fp8 量子 / bit-exact 论证）首测全部成立：6 个 bit-exact 门
+    实测 0.0，其余在 bf16 floor 量级，无一个需要放宽。
+- **Follow-ups**:
+  - 共享层缺口（agent 提请）：CLI `--ctx` 轴、per-group derive_shapes 钩子、loader
+    void-restype、多输出 gate 钩子——二期前值得补。
+  - BLOCKED 项：router.noaux_tc rows>8（kMaxTokens=8）、mqa_logits rows=64（AOT 32）——
+    需要生产侧决策（是否扩 min_gemv 实例 / AOT 重建）。
+  - {4,1} mma 表项是 UNMEASURED 占位：首轮调优任务就是扫描替换（q_b/o_proj/shared
+    rows 16/32/64）。
+  - 二期：MoE EP weight-only 链 × {EP4,8,16}（#668 优先）+ DeepEP 多卡测量设计。
+  - `indexer-forward.md` 的 rope interleave 描述与 .cu 实际（half-split）不符，建议修正。

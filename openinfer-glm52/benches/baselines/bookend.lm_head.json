@@ -1,0 +1,117 @@
+{
+  "unit": "bookend.lm_head",
+  "entries": [
+    {
+      "unit": "bookend.lm_head",
+      "shape": {
+        "rows": 16,
+        "n": 154880,
+        "k": 6144
+      },
+      "arch": "sm_103",
+      "gpu": "NVIDIA GB300",
+      "clocks_sm_mhz": 2070,
+      "median_us": 315.059,
+      "p50_us": 315.059,
+      "p99_us": 315.507,
+      "git_rev": "da68d4f9",
+      "timestamp": "2026-07-29T13:42:49+00:00"
+    },
+    {
+      "unit": "bookend.lm_head",
+      "shape": {
+        "rows": 1,
+        "n": 154880,
+        "k": 6144
+      },
+      "arch": "sm_103",
+      "gpu": "NVIDIA GB300",
+      "clocks_sm_mhz": 2070,
+      "median_us": 311.678,
+      "p50_us": 311.638,
+      "p99_us": 312.899,
+      "git_rev": "da68d4f9",
+      "timestamp": "2026-07-29T13:42:48+00:00"
+    },
+    {
+      "unit": "bookend.lm_head",
+      "shape": {
+        "rows": 2,
+        "n": 154880,
+        "k": 6144
+      },
+      "arch": "sm_103",
+      "gpu": "NVIDIA GB300",
+      "clocks_sm_mhz": 2070,
+      "median_us": 311.918,
+      "p50_us": 311.904,
+      "p99_us": 313.245,
+      "git_rev": "da68d4f9",
+      "timestamp": "2026-07-29T13:42:48+00:00"
+    },
+    {
+      "unit": "bookend.lm_head",
+      "shape": {
+        "rows": 32,
+        "n": 154880,
+        "k": 6144
+      },
+      "arch": "sm_103",
+      "gpu": "NVIDIA GB300",
+      "clocks_sm_mhz": 2070,
+      "median_us": 316.872,
+      "p50_us": 316.838,
+      "p99_us": 317.651,
+      "git_rev": "da68d4f9",
+      "timestamp": "2026-07-29T13:42:49+00:00"
+    },
+    {
+      "unit": "bookend.lm_head",
+      "shape": {
+        "rows": 4,
+        "n": 154880,
+        "k": 6144
+      },
+      "arch": "sm_103",
+      "gpu": "NVIDIA GB300",
+      "clocks_sm_mhz": 2070,
+      "median_us": 312.509,
+      "p50_us": 312.499,
+      "p99_us": 313.251,
+      "git_rev": "da68d4f9",
+      "timestamp": "2026-07-29T13:42:48+00:00"
+    },
+    {
+      "unit": "bookend.lm_head",
+      "shape": {
+        "rows": 64,
+        "n": 154880,
+        "k": 6144
+      },
+      "arch": "sm_103",
+      "gpu": "NVIDIA GB300",
+      "clocks_sm_mhz": 2070,
+      "median_us": 320.549,
+      "p50_us": 320.538,
+      "p99_us": 321.642,
+      "git_rev": "da68d4f9",
+      "timestamp": "2026-07-29T13:42:49+00:00"
+    },
+    {
+      "unit": "bookend.lm_head",
+      "shape": {
+        "rows": 8,
+        "n": 154880,
+        "k": 6144
+      },
+      "arch": "sm_103",
+      "gpu": "NVIDIA GB300",
+      "clocks_sm_mhz": 2070,
+      "median_us": 313.282,
+      "p50_us": 313.206,
+      "p99_us": 314.406,
+      "git_rev": "da68d4f9",
+      "timestamp": "2026-07-29T13:42:48+00:00"
+    }
+  ]
+}

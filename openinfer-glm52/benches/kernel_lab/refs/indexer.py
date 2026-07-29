@@ -7,13 +7,34 @@ fp8 projections (wq_b / wk) -> k LayerNorm -> half-split RoPE -> q group-quant
 the six harness units drawn on those kernel boundaries (the norms/quant/fold
 glue is not a unit).
 
+rows x ctx sweep: the shared CLI iterates only the rows axis
+(`kernel_lab/__main__._shapes`); until it grows a --ctx selector, this module
+provides the group sweep (same pattern as refs/mla_attention.py):
+
+    PYTHONPATH=openinfer-glm52/benches \
+        python3 -m kernel_lab.refs.indexer check indexer.mqa_logits --rows 8 --ctx 65536
+    PYTHONPATH=openinfer-glm52/benches \
+        python3 -m kernel_lab.refs.indexer bench indexer.topk_2048 --rows 8
+
 Module level is stdlib-only (CPU-test safe); every reference imports torch
 lazily inside the function. Shape helpers stay torch-free so
 tests/test_indexer.py can validate derivations without a GPU.
 """
 from __future__ import annotations
 
+import argparse
+import sys
+
 from kernel_lab.data import derive_seed
+
+GROUP_UNITS = (
+    "indexer.weights_proj",
+    "indexer.rope",
+    "indexer.k_quant_cache",
+    "indexer.mqa_logits",
+    "indexer.topk_2048",
+    "indexer.local_topk_to_slots",
+)
 
 # --- model constants (openinfer-glm52/src/config.rs) -------------------------
 INDEX_HEADS = 32          # GLM52_INDEX_HEADS
@@ -96,13 +117,18 @@ def quantize_e4m3_rows(x_bf16):
     amax over the group -> scale = max(amax, 1e-4)/448 -> value/scale clamped to
     +-448 -> RNE cast (`torch.float8_e4m3fn` conversion is round-to-nearest-even,
     same as `__nv_cvt_float_to_fp8(..., __NV_SATFINITE, __NV_E4M3)` on finite
-    in-range input). Returns (q uint8 [t, 128], scale f32 [t])."""
+    in-range input). Returns (q uint8 [t, 128], scale f32 [t]).
+
+    NOTE: the scale division MUST be tensor/tensor — torch lowers
+    `tensor / python_scalar` on CUDA to a reciprocal multiply, which is not the
+    IEEE-correctly-rounded f32 division the kernel emits (observed on GB300 as
+    a single 1-ulp scale byte over 2M written bytes)."""
     from kernel_lab.loader import require_torch
 
     torch = require_torch()
     xf = x_bf16.to(torch.float32)
     amax = xf.abs().amax(dim=1)
-    scale = amax.clamp_min(FP8_SCALE_EPS) / FP8_SCALE_DIVISOR
+    scale = amax.clamp_min(FP8_SCALE_EPS) / torch.full_like(amax, FP8_SCALE_DIVISOR)
     q = (xf / scale[:, None]).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
     return q.view(torch.uint8), scale
 
@@ -141,7 +167,7 @@ def build_paged_cache(rows: int, ctx: int, seed: int, device: str = "cuda"):
         ).to(device)
         q, scale = quantize_e4m3_rows(k)
         region = cache[r * cols * stride : (r + 1) * cols * stride].view(cols, stride)
-        region[:, : BLOCK_KV * HEAD_DIM] = q.view(cols, BLOCK_KV, HEAD_DIM)
+        region[:, : BLOCK_KV * HEAD_DIM] = q.view(cols, BLOCK_KV * HEAD_DIM)
         region[:, BLOCK_KV * HEAD_DIM :] = scale.contiguous().view(torch.uint8).view(
             cols, BLOCK_KV * SCALE_BYTES_PER_TOKEN
         )
@@ -346,3 +372,82 @@ def local_topk_to_slots_ref(offsets, seq_lens, block_table, block_size: int = BL
     slots = torch.where(valid, pages * block_size + within, torch.full_like(pages, -1))
     lens = valid.sum(dim=1).to(torch.int32)
     return slots.to(torch.int32), lens
+
+
+# ---------------------------------------------------------------------------
+# rows x ctx sweep driver (shared CLI has no --ctx selector yet)
+# ---------------------------------------------------------------------------
+
+def iter_shape_points(manifest_shape: dict, rows_axes, ctx_axes):
+    """rows x ctx grid as CLI-style shape dicts (adapters read `ctx` via
+    shape.get("ctx", DEFAULT_CTX); the shared CLI never injects it)."""
+    for r in rows_axes:
+        for c in ctx_axes:
+            yield {"rows": r, "n": manifest_shape["n"], "k": manifest_shape["k"], "ctx": c}
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="python3 -m kernel_lab.refs.indexer",
+        description="indexer-group rows x ctx sweep (check vs reference / bench)",
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    for name in ("check", "bench"):
+        p = sub.add_parser(name)
+        p.add_argument("unit", choices=GROUP_UNITS)
+        p.add_argument("--rows", type=int, action="append", default=None)
+        p.add_argument("--ctx", type=int, action="append", default=None)
+        p.add_argument("--so", default=None)
+        p.add_argument("--seed", type=int, default=0x5EED)
+        if name == "bench":
+            p.add_argument("--warmup", type=int, default=20)
+            p.add_argument("--rounds", type=int, default=30)
+            p.add_argument("--inner", type=int, default=10)
+    args = parser.parse_args(argv)
+
+    from kernel_lab import loader, registry, timing
+    from kernel_lab.refs import compute_metrics
+
+    units = registry.discover()
+    if args.unit not in units:
+        raise SystemExit(f"{args.unit}: not registered; available: {', '.join(units)}")
+    u = units[args.unit]
+    torch = loader.require_torch()
+    if not torch.cuda.is_available():
+        raise SystemExit("kernel_lab: no CUDA device visible")
+    major, minor = torch.cuda.get_device_capability()
+    arch = f"sm_{major}{minor}"
+    if u.manifest.capability.get("blackwell_only") and major < 10:
+        raise SystemExit(f"{u.name}: Blackwell-only unit (fail-closed); device capability major={major}")
+    lib = loader.load_library(args.so)
+    stream = loader.current_stream_ptr()
+
+    rows_axes = args.rows or list(u.manifest.axes.get("rows", ()))
+    ctx_axes = args.ctx or list(u.manifest.axes.get("ctx", (DEFAULT_CTX,)))
+    ok = True
+    for shape in iter_shape_points(u.manifest.shape, rows_axes, ctx_axes):
+        tensors = u.adapter.make_inputs(shape, args.seed)
+        if args.cmd == "check":
+            u.adapter.run(lib, tensors, shape, stream)
+            torch.cuda.synchronize()
+            want = u.adapter.reference(tensors, shape)
+            metrics = compute_metrics(tensors["out"], want)
+            limit = u.manifest.tolerance.get("rel_l2")
+            passed = limit is None or metrics["rel_l2"] <= limit
+            ok &= passed
+            print(f"[{'PASS' if passed else 'FAIL'}] {u.name} rows={shape['rows']} ctx={shape['ctx']} ({arch})")
+            print(f"       rel_l2={metrics['rel_l2']:.4e} (tol {limit})  cosine={metrics['cosine']:.6f}  "
+                  f"max_abs={metrics['max_abs']:.4e}  mean_abs={metrics['mean_abs']:.4e}")
+        else:
+            stats = timing.bench(
+                lambda: u.adapter.run(lib, tensors, shape, stream),
+                args.warmup, args.rounds, args.inner,
+            )
+            print(f"bench {u.name} rows={shape['rows']} ctx={shape['ctx']}: "
+                  f"median={stats.median_us:.2f} us  p50={stats.p50_us:.2f}  p99={stats.p99_us:.2f}  "
+                  f"mean={stats.mean_us:.2f}  rounds={len(stats.samples_us)}  ({arch})")
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

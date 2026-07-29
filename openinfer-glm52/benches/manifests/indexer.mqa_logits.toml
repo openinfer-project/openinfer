@@ -22,4 +22,4 @@ notes = "每次 run = 生产同款双发射：metadata（schedule）+ logits（o
 mode = "torch_tolerance"
 [reference.tolerance]
 rel_l2 = 0.02
-note = "bf16 store floor（2^-8 相对量级）+ fp8-mma f32 结合序重排；UNMEASURED——首次 GB300 实测后回填 measured 值与机器"
+note = "bf16 store floor（2^-8 相对量级）+ fp8-mma f32 结合序重排；MEASURED rel_l2 ≤ 1.67e-3（rows{1,8,32}×ctx{16384,65536,262144}，GB300 sm_103 tray03，2026-07-29）；headroom ~12×"

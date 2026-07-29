@@ -1,0 +1,117 @@
+{
+  "unit": "router.select",
+  "entries": [
+    {
+      "unit": "router.select",
+      "shape": {
+        "rows": 16,
+        "n": 256,
+        "k": 6144
+      },
+      "arch": "sm_103",
+      "gpu": "NVIDIA GB300",
+      "clocks_sm_mhz": 2070,
+      "median_us": 5.264,
+      "p50_us": 5.261,
+      "p99_us": 11.824,
+      "git_rev": "da68d4f9",
+      "timestamp": "2026-07-29T13:44:03+00:00"
+    },
+    {
+      "unit": "router.select",
+      "shape": {
+        "rows": 1,
+        "n": 256,
+        "k": 6144
+      },
+      "arch": "sm_103",
+      "gpu": "NVIDIA GB300",
+      "clocks_sm_mhz": 2070,
+      "median_us": 5.178,
+      "p50_us": 5.174,
+      "p99_us": 10.054,
+      "git_rev": "da68d4f9",
+      "timestamp": "2026-07-29T13:44:03+00:00"
+    },
+    {
+      "unit": "router.select",
+      "shape": {
+        "rows": 2,
+        "n": 256,
+        "k": 6144
+      },
+      "arch": "sm_103",
+      "gpu": "NVIDIA GB300",
+      "clocks_sm_mhz": 2070,
+      "median_us": 5.272,
+      "p50_us": 5.27,
+      "p99_us": 6.451,
+      "git_rev": "da68d4f9",
+      "timestamp": "2026-07-29T13:44:03+00:00"
+    },
+    {
+      "unit": "router.select",
+      "shape": {
+        "rows": 32,
+        "n": 256,
+        "k": 6144
+      },
+      "arch": "sm_103",
+      "gpu": "NVIDIA GB300",
+      "clocks_sm_mhz": 2070,
+      "median_us": 5.312,
+      "p50_us": 5.306,
+      "p99_us": 6.637,
+      "git_rev": "da68d4f9",
+      "timestamp": "2026-07-29T13:44:03+00:00"
+    },
+    {
+      "unit": "router.select",
+      "shape": {
+        "rows": 4,
+        "n": 256,
+        "k": 6144
+      },
+      "arch": "sm_103",
+      "gpu": "NVIDIA GB300",
+      "clocks_sm_mhz": 2070,
+      "median_us": 5.336,
+      "p50_us": 5.334,
+      "p99_us": 8.221,
+      "git_rev": "da68d4f9",
+      "timestamp": "2026-07-29T13:44:03+00:00"
+    },
+    {
+      "unit": "router.select",
+      "shape": {
+        "rows": 64,
+        "n": 256,
+        "k": 6144
+      },
+      "arch": "sm_103",
+      "gpu": "NVIDIA GB300",
+      "clocks_sm_mhz": 2070,
+      "median_us": 5.325,
+      "p50_us": 5.325,
+      "p99_us": 6.352,
+      "git_rev": "da68d4f9",
+      "timestamp": "2026-07-29T13:44:03+00:00"
+    },
+    {
+      "unit": "router.select",
+      "shape": {
+        "rows": 8,
+        "n": 256,
+        "k": 6144
+      },
+      "arch": "sm_103",
+      "gpu": "NVIDIA GB300",
+      "clocks_sm_mhz": 2070,
+      "median_us": 5.12,
+      "p50_us": 5.12,
+      "p99_us": 7.773,
+      "git_rev": "da68d4f9",
+      "timestamp": "2026-07-29T13:44:03+00:00"
+    }
+  ]
+}

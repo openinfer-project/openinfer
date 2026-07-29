@@ -22,6 +22,12 @@ Bit-exactness argument (target: byte-identical out + identical scale bits):
   and torch's amax agree exactly.
 - scale: one f32 clamp + one f32 IEEE division (div.rn on both sides); the
   1e-10 / 448.0 literals parse to identical f32 constants on both sides.
+  PITFALL (GB300 FAIL 2026-07-29, reproduced on sm_120): torch lowers
+  tensor / CPU-scalar to multiply-by-reciprocal (BinaryDivTrueKernel.cu
+  is_cpu_scalar fast path), and rn(1/448) is inexact — the reference must
+  divide by a DEVICE tensor of 448.0 to get the kernel's true div.rn. The
+  ue8m0 twin is immune (the pow2 bump absorbs a sub-ulp difference, and
+  exactly-representable quotients round back exactly); the plain path is not.
 - encode: the kernel's `__nv_cvt_float_to_fp8(__NV_SATFINITE, __NV_E4M3)`
   lowers to PTX `cvt.rn.satfinite.e4m3x2.f32` — round-to-nearest-EVEN with
   saturation to finite. torch's f32 -> `torch.float8_e4m3fn` cast is RNE as
@@ -153,7 +159,14 @@ def fp8_per_token_group_quant_ref(act_bf16, ue8m0: bool = False):
         raise ValueError(f"hidden {hidden} not divisible by group {GROUP_SIZE}")
     x = act_bf16.to(torch.float32).view(rows, hidden // GROUP_SIZE, GROUP_SIZE)
     amax = x.abs().amax(dim=-1)  # exact f32 max, order-independent
-    scale = torch.clamp(amax, min=QUANT_EPS) / E4M3_MAX  # f32 div.rn
+    # True f32 div.rn, matching the kernel: the divisor must be a DEVICE
+    # tensor. torch lowers tensor / CPU-scalar to multiply-by-reciprocal
+    # (BinaryDivTrueKernel.cu is_cpu_scalar fast path) and rn(1/448) is
+    # inexact, which put the reference scale a systematic +1 ulp above the
+    # kernel's div.rn(amax, 448) on ~57% of groups (GB300 FAIL rel_l2=4.19e-4,
+    # reproduced on sm_120, 2026-07-29). The ue8m0 twin only survived because
+    # the pow2 bump absorbs a sub-ulp difference.
+    scale = torch.clamp(amax, min=QUANT_EPS) / torch.full_like(amax, E4M3_MAX)
     if ue8m0:
         scale = ue8m0_ceil_pow2_f32(scale)
     q = torch.clamp(x / scale.unsqueeze(-1), -E4M3_MAX, E4M3_MAX)

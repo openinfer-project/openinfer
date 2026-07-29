@@ -50,7 +50,8 @@ def test_quant_manifests_parse():
         assert m.reference["mode"] == "torch_tolerance"
         # bit-exactness gate: any single byte/scale-bit diff is >= ~1e-4 rel_l2
         assert 0 < m.tolerance["rel_l2"] <= 1e-6
-        assert "UNMEASURED" in m.tolerance["note"]
+        # measured bit-identity (rel_l2 = 0.0) is recorded with machine + date
+        assert "MEASURED" in m.tolerance["note"] and "rel_l2=0.0" in m.tolerance["note"]
 
 
 def test_shape_derivation_matches_quant_buffers():

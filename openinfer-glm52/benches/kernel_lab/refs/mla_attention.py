@@ -210,7 +210,13 @@ def rope_block_ref(x, cos, sin):
     p = r % 32; r < 32 -> even*c - odd*s, r >= 32 -> odd*c + even*s. f32 math
     + bf16 RNE store — bit-identical to `rope_block()` in
     csrc/glm52/glm52_mla_assembly.cu (products of bf16 values are exact in
-    f32, so FMA contraction cannot change the single-rounded result)."""
+    f32, so FMA contraction cannot change the single-rounded result).
+
+    Broadcast contract: x is [..., 64] and cos/sin [..., 32] must carry the
+    SAME leading dims — when x has a head dim that the per-token table does
+    not (query assemble: x [rows, heads, 64], table [rows, 32]), the caller
+    passes cos/sin.unsqueeze(-2); a bare [rows, 32] table against a
+    [rows, heads, 64] x misaligns rows onto the head axis (rows>1 crash)."""
     torch = require_torch()
     r = torch.arange(ROPE_DIM, device=x.device)
     pair = r % ROPE_HALF
@@ -273,8 +279,13 @@ def normal_quantized_ckv(tokens: int, seed: int, device="cuda"):
     amax = g.abs().amax(dim=-1).clamp_min(1e-12)
     scales = _ue8m0_round_up_tensor(amax / data.E4M3_MAX)  # [T,4], pow2 by construction
     assert_ue8m0_scales(scales, "normal_quantized_ckv")
-    q = g / scales.view(tokens, SCALE_GROUPS, 1)  # |q| <= 448 by construction
-    return _e4m3_encode(q).to(device), scales.contiguous().to(device)
+    q = (g / scales.view(tokens, SCALE_GROUPS, 1)).reshape(tokens, KV_LORA)  # |q| <= 448
+    fp8 = _e4m3_encode(q)
+    if fp8.shape != (tokens, KV_LORA) or scales.shape != (tokens, SCALE_GROUPS):
+        raise AssertionError(
+            f"normal_quantized_ckv: bad factory shapes fp8={tuple(fp8.shape)} scales={tuple(scales.shape)}"
+        )
+    return fp8.to(device), scales.contiguous().to(device)
 
 
 _PACKED_CACHE_MEMO: dict = {}
@@ -291,6 +302,8 @@ def packed_cache(num_tokens: int, seed: int, device="cuda"):
     if master is None:
         fp8, scales = normal_quantized_ckv(num_tokens, data.derive_seed(seed, "cache-ckv"), device="cpu")
         kpe = data.normal_bf16((num_tokens, ROPE_DIM), seed=data.derive_seed(seed, "cache-kpe"), device="cpu")
+        if fp8.shape != (num_tokens, KV_LORA):
+            raise AssertionError(f"packed_cache: fp8 shape {tuple(fp8.shape)} != ({num_tokens}, {KV_LORA})")
         master = torch.zeros((num_tokens, CACHE_BYTES), dtype=torch.uint8)
         master[:, :SCALE_OFFSET] = fp8
         master[:, SCALE_OFFSET:KPE_OFFSET] = scales.view(torch.uint8)
@@ -309,10 +322,13 @@ def query_assemble_ref(ql_nope, q_full, cos, sin):
     half is a copy, the rope half is `rope_block_ref`."""
     torch = require_torch()
     rows = ql_nope.shape[0]
-    q_pe = q_full[..., Q_PE_OFFSET:Q_PE_OFFSET + ROPE_DIM]
+    q_pe = q_full[..., Q_PE_OFFSET:Q_PE_OFFSET + ROPE_DIM]  # [rows, 64, 64]
     out = torch.empty((rows, HEADS, QUERY_DIM), dtype=torch.bfloat16, device=ql_nope.device)
     out[..., :QK_NOPE] = ql_nope
-    out[..., QK_NOPE:] = rope_block_ref(q_pe, cos, sin)
+    # cos/sin are per-token [rows, 32] tables shared across the 64 heads:
+    # unsqueeze the head axis so the table broadcasts over heads instead of
+    # misaligning rows onto it (rows=1 silently worked, rows>1 crashed).
+    out[..., QK_NOPE:] = rope_block_ref(q_pe, cos.unsqueeze(-2), sin.unsqueeze(-2))
     return out.to(torch.float32)
 
 
