@@ -1036,11 +1036,9 @@ pub struct Qwen3Executor {
     /// DFlash draft metadata; `Some` once a draft model is loaded into the
     /// primary lane. Speculative decoding is enabled iff this is set.
     speculative: Option<DFlashMeta>,
-    /// Cumulative acceptance counters for the DFlash path; `Some` exactly while
-    /// `speculative` is. Written in `execute_speculative_verify_impl`, read by
-    /// `publish_load`. Held on the executor rather than read back from the worker
-    /// lane, so the publish path never round-trips the worker. See
-    /// [`SpecDecodeCounters`] for why these are cumulative rather than per-step.
+    /// Cumulative acceptance counters for the DFlash path, set and cleared
+    /// together with `speculative` above. Written in
+    /// `execute_speculative_verify_impl`, read by `publish_load`.
     spec_decode_counters: Option<SpecDecodeCounters>,
     /// Requests whose DFlash context is captured and ready to draft. A request
     /// enters this set when its prompt finishes prefilling with captured target
@@ -3163,9 +3161,9 @@ impl Drop for Qwen3Executor {
 #[derive(Clone, Debug)]
 struct DFlashMeta {
     block_size: usize,
-    /// Max drafts proposed per verify step (`verify_span - 1`, the anchor
-    /// aside). This is the configured `K` the spec-decode metrics report as
-    /// `num_spec_tokens` and the length of their per-position acceptance vector.
+    /// Max drafts proposed per verify step (`K`). The span leads with the anchor
+    /// (`[anchor, draft_1, …]`), so this is `verify_span - 1` under either block
+    /// layout — anchor-first vs anchor-drop is already folded into `verify_span()`.
     num_spec_tokens: usize,
     /// Draft's max cacheable position; with the `block_size` in-fill headroom
     /// this caps the DFlash-effective context to `max_position_embeddings - block_size`.
@@ -3377,7 +3375,6 @@ impl LocalQwen3Lane {
         model.tune_gemm_algos(&self.model)?;
         let meta = DFlashMeta {
             block_size: model.block_size(),
-            // Anchor position aside, the verify span carries K proposed drafts.
             num_spec_tokens: model.verify_span().saturating_sub(1),
             max_position_embeddings: model.max_position_embeddings(),
             target_layer_ids: model.target_layer_ids().to_vec(),

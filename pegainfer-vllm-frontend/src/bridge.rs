@@ -666,12 +666,6 @@ fn stop_sentinel_id(eos_token_id: Option<u32>, stop_token_ids: &[u32]) -> Option
 /// shape the frontend increments its `vllm:spec_decode_*_total` counters by (see
 /// [`SpecDecodeCounters`] for why the transport carries totals and the wire
 /// carries deltas).
-///
-/// `num_spec_tokens` is the drafter's `K`, not a counter, so it passes through
-/// undiffed; it also bounds the per-position slice, keeping the emitted vector —
-/// and therefore the frontend's `position` label set — stable across publishes.
-/// Saturating subtraction is defensive: the scheduler's totals only ever grow,
-/// so a non-monotone diff would be a bug, not an underflow to wrap.
 fn spec_decode_delta(last: &SpecDecodeCounters, cur: &SpecDecodeCounters) -> SpecDecodingStats {
     let width = (cur.num_spec_tokens as usize).min(MAX_SPEC_TOKENS);
     let num_accepted_tokens_per_pos = cur.num_accepted_tokens_per_pos[..width]
@@ -702,20 +696,19 @@ async fn publish_scheduler_stats(
     output_tx: mpsc::UnboundedSender<EngineCoreOutputs>,
     shutdown: CancellationToken,
 ) -> Result<()> {
-    // Totals we last turned into a wire delta. Persists across the loop so no
-    // accepted token is dropped or double-counted when the watch coalesces
-    // several scheduler steps into one wake.
     let mut last_spec = SpecDecodeCounters::default();
     loop {
         let snapshot = *load_rx.borrow_and_update();
         let spec_decoding_stats = if let Some(cur) = &snapshot.spec_decode {
             let delta = spec_decode_delta(&last_spec, cur);
             last_spec = *cur;
-            // Attach only on intervals that actually drafted, matching vLLM's own
-            // scheduler (which leaves the field `None` on plain steps); an
-            // all-zero delta would spam NaN acceptance-rate logs. Dropping it
-            // loses nothing: every counter moves only inside `observe_draft`, so
-            // a zero `num_drafts` delta means nothing else moved either.
+            // Intervals with no verify step are the common case — prefill,
+            // idle, and plain decode all publish without drafting. Reporting
+            // one would divide by a zero `num_drafts` in the frontend's
+            // acceptance-rate log, so leave the field `None` there, as vLLM's
+            // own scheduler does. Nothing is lost by dropping it: every counter
+            // moves only inside `observe_draft`, so a zero `num_drafts` delta
+            // means nothing else moved either.
             (delta.num_drafts > 0).then_some(delta)
         } else {
             // No drafter (or one that just went away): forget the totals so a

@@ -439,16 +439,21 @@ impl KvCapacity {
 /// Upper bound on a drafter's `K`, fixing the width of
 /// [`SpecDecodeCounters::num_accepted_tokens_per_pos`].
 ///
-/// `K = verify_span - 1`, and `verify_span` is the checkpoint's `block_size`
-/// (anchor-drop layout) or `block_size + 1` (anchor-first). The widest shipping
-/// drafter is `Qwen3-4B-DFlash-b16`, so an anchor-first b16 checkpoint needs
-/// exactly 16 positions; `dspark_qwen3_4b_block7` needs 7. A drafter past this
-/// is clamped rather than rejected — the totals stay exact, only the
-/// per-position curve truncates.
+/// `K` is checkpoint data, not a compile-time property: `K = verify_span - 1`,
+/// so it is `block_size - 1` on an anchor-drop checkpoint and `block_size` on an
+/// anchor-first one. Nothing validates an upper bound at load, so this is a
+/// headroom cap rather than an exact fit — the drafters we ship today need 15
+/// (`Qwen3-4B-DFlash-b16`, anchor-drop) and 7 (`dspark_qwen3_4b_block7`,
+/// anchor-first). A wider drafter is clamped, not rejected: every
+/// total stays exact and only the per-position curve truncates, and
+/// `load_speculative` warns so the truncation is never silent.
 ///
-/// Keeping the array fixed is what lets [`LoadSnapshot`] stay `Copy`, so
-/// publishing a snapshot on the scheduler's hot loop never allocates.
-pub const MAX_SPEC_TOKENS: usize = 16;
+/// Fixed width is what lets [`LoadSnapshot`] stay `Copy`. That keeps the
+/// scheduler's top-of-loop publish a bitwise copy, and it keeps the `*guard`
+/// watch reads in `openinfer-dynamo-backend` (its own workspace) and the glm52
+/// scheduler contract tests compiling — neither is covered by CI's package
+/// matrix.
+pub const MAX_SPEC_TOKENS: usize = 32;
 
 /// Cumulative speculative-decode acceptance counters, monotone since the draft
 /// model was loaded.
@@ -465,17 +470,6 @@ pub const MAX_SPEC_TOKENS: usize = 16;
 ///
 /// The bridge is the only place that knows both sides, so it does the
 /// conversion: it diffs each snapshot against the totals it last forwarded.
-///
-/// Invariants worth relying on:
-///
-/// * acceptance is prefix-shaped (the target commits the accepted draft prefix,
-///   then its own token at the first mismatch), so
-///   `num_accepted_tokens_per_pos` is a survival curve: `[0] >= [1] >= ...`.
-/// * `num_accepted_tokens_per_pos[..num_spec_tokens]` sums to
-///   `num_accepted_tokens`.
-/// * every draft also commits one bonus token, so tokens actually emitted are
-///   `num_accepted_tokens + num_drafts` — which is why mean acceptance length is
-///   `1 + num_accepted_tokens / num_drafts`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SpecDecodeCounters {
     /// Configured max draft tokens proposed per verify step (`K`), and the
@@ -495,23 +489,22 @@ pub struct SpecDecodeCounters {
 }
 
 impl SpecDecodeCounters {
-    /// Zeroed counters for a drafter proposing at most `num_spec_tokens` tokens
-    /// per step, clamped to [`MAX_SPEC_TOKENS`].
     pub fn new(num_spec_tokens: usize) -> Self {
+        if num_spec_tokens > MAX_SPEC_TOKENS {
+            log::warn!(
+                "drafter proposes K={num_spec_tokens} per step, above \
+                 MAX_SPEC_TOKENS={MAX_SPEC_TOKENS}: per-position acceptance is \
+                 reported for the first {MAX_SPEC_TOKENS} positions only \
+                 (draft/accept totals are unaffected)"
+            );
+        }
         Self {
             num_spec_tokens: num_spec_tokens.min(MAX_SPEC_TOKENS) as u64,
             ..Self::default()
         }
     }
 
-    /// Fold one request's verify outcome into the totals: `num_draft_tokens`
-    /// drafts proposed, of which the first `num_accepted` were accepted (see the
-    /// prefix-shape invariant on the struct). Mirrors the Python
-    /// [`SpecDecodingStats.observe_draft`]. Positions past `num_spec_tokens` are
-    /// dropped rather than panicking, so a drafter that ever over-reports
-    /// degrades the per-position curve instead of taking down the scheduler.
-    ///
-    /// [`SpecDecodingStats.observe_draft`]: https://github.com/vllm-project/vllm/blob/bc2c0c86efb28e77677a3cfb8687e976914a313a/vllm/v1/spec_decode/metrics.py#L16-L44
+    /// Fold one request's verify outcome into the totals
     pub fn observe_draft(&mut self, num_draft_tokens: usize, num_accepted: usize) {
         self.num_drafts += 1;
         self.num_draft_tokens += num_draft_tokens as u64;
@@ -539,8 +532,7 @@ pub struct LoadSnapshot {
     pub num_running_reqs: u64,
     /// Requests admitted but not yet running (KV pressure, prefetch wait).
     pub num_waiting_reqs: u64,
-    /// Cumulative spec-decode counters, or `None` when no draft model is
-    /// loaded. See [`SpecDecodeCounters`] for why these are totals, not deltas.
+    /// Cumulative spec-decode counters, or `None` when no draft model is loaded.
     pub spec_decode: Option<SpecDecodeCounters>,
 }
 
@@ -1123,21 +1115,18 @@ mod tests {
     }
 
     #[test]
-    fn spec_counters_clamp_overflow_positions() {
-        // A drafter that (mis)reports more accepts than its configured K must
-        // not panic in release: extra positions are dropped, totals still add.
-        let mut counters = SpecDecodeCounters::new(0); // zero-K drafter
-        counters.observe_draft(4, 4);
-        assert_eq!(counters.num_drafts, 1);
-        assert_eq!(counters.num_accepted_tokens, 4);
-        assert!(counters.num_accepted_tokens_per_pos.iter().all(|&n| n == 0));
+    fn spec_counters_clamp_oversized_k() {
+        // A drafter wider than the array is clamped at construction (and warns), so
+        // the bridge's `[..num_spec_tokens]` slice stays in bounds. The contract the
+        // warning promises: totals stay exact, only the per-position curve truncates.
+        let mut counters = SpecDecodeCounters::new(MAX_SPEC_TOKENS + 8);
+        assert_eq!(counters.num_spec_tokens, MAX_SPEC_TOKENS as u64);
 
-        // A K past the array width is clamped at construction, and accepts past
-        // the clamp are dropped rather than writing out of bounds.
-        let mut wide = SpecDecodeCounters::new(MAX_SPEC_TOKENS + 8);
-        assert_eq!(wide.num_spec_tokens, MAX_SPEC_TOKENS as u64);
-        wide.observe_draft(MAX_SPEC_TOKENS + 8, MAX_SPEC_TOKENS + 8);
-        assert!(wide.num_accepted_tokens_per_pos.iter().all(|&n| n == 1));
+        counters.observe_draft(MAX_SPEC_TOKENS + 8, MAX_SPEC_TOKENS + 8);
+        assert_eq!(counters.num_drafts, 1);
+        assert_eq!(counters.num_draft_tokens, (MAX_SPEC_TOKENS + 8) as u64);
+        assert_eq!(counters.num_accepted_tokens, (MAX_SPEC_TOKENS + 8) as u64);
+        assert!(counters.num_accepted_tokens_per_pos.iter().all(|&n| n == 1));
     }
 
     #[test]
