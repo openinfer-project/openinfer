@@ -3031,24 +3031,29 @@ impl ModelExecutor for Qwen3Executor {
                 prefill_event,
             } => {
                 // SM-partition path: decode done, prefill still in-flight.
-                // `prefill_event` remains armed across every fallible decode
-                // update. An early return synchronizes it before the scheduler
-                // can recycle any request KV pages.
-                for req_result in &decode_result.requests {
-                    let rkv = self
-                        .request_kvs
-                        .get_mut(&req_result.request_id)
-                        .expect("request must exist after split decode");
-                    rkv.apply_decode(req_result.token, self.kv_mgr.pool())?;
+                // Establish executor ownership before any fallible decode
+                // update. If an update fails, resolve_async_prefill_after_error
+                // synchronizes the event and clears the worker-side state before
+                // the scheduler recycles the touched requests.
+                self.async_prefill = Some(AsyncPrefillState {
+                    event: prefill_event,
+                });
+                let apply_result = (|| -> Result<()> {
+                    for req_result in &decode_result.requests {
+                        let rkv = self
+                            .request_kvs
+                            .get_mut(&req_result.request_id)
+                            .expect("request must exist after split decode");
+                        rkv.apply_decode(req_result.token, self.kv_mgr.pool())?;
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = apply_result {
+                    return Err(self.resolve_async_prefill_after_error(error));
                 }
                 for req_result in &decode_result.requests {
                     self.save_sealed_blocks(req_result.request_id);
                 }
-                // This is the durable executor-side handoff. From here on the
-                // scheduler's poll/wait path owns completion and cleanup.
-                self.async_prefill = Some(AsyncPrefillState {
-                    event: prefill_event,
-                });
                 // Return a UnifiedResult with empty prefill — scheduler will
                 // get prefill results via poll_async_prefill.
                 Ok(UnifiedResult {
@@ -3316,6 +3321,21 @@ impl ModelExecutor for Qwen3Executor {
         // result resolution after the event is known to be complete.
         self.poll_async_prefill()
             .ok_or_else(|| anyhow::anyhow!("async prefill completed without a result"))
+    }
+
+    /// Resolve a prefill after a fallible decode-side handoff step failed.
+    ///
+    /// The scheduler will drop the requests touched by the failed step, but the
+    /// worker still owns the prefill buffers until its stream is synchronized
+    /// and its in-flight state is consumed. Preserve the original execution
+    /// error while making cleanup failure visible as additional context.
+    fn resolve_async_prefill_after_error(&mut self, error: anyhow::Error) -> anyhow::Error {
+        match self.wait_async_prefill() {
+            Ok(_) => error,
+            Err(cleanup_error) => error.context(format!(
+                "failed to clean up async prefill after execution error: {cleanup_error:#}"
+            )),
+        }
     }
 }
 
