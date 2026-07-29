@@ -62,6 +62,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 
 | Path | TL;DR |
 | --- | --- |
+| `models/glm52/decode-op-bench-harness.md` | Agent 调优流水线：`openinfer-glm52/benches/` Python harness（torch 参考 + 一键 check/bench/compare）调用 build.rs 生产 flags 编出的 kernel_lab .so；一期 = EP 无关 per-rank 内核（bucket/ctx 轴），二期 = MoE 专家链 EP4/8/16；顶门 `glm52_step_bench` 同会话 A/B。 |
 | `models/glm52/cuda-graph-png.md` | `--dump-graph-png PATH` exports GLM5.2 rank 0's live EP8 bucket-1 or TP8 bucket-8 whole-step graph as a complete DOT and readable folded PNG, preserving PDL metadata and omitting DSpark work when the drafter is off. |
 | `models/glm52/dp-scheduler-metrics.md` | GLM5.2 maps logical scheduler partitions onto vLLM EngineCore identities: 8 rank-local running/waiting/KV series for EP8/DP8, 1 for TP8; 8x H200 endpoint gates and matched serving A/B passed without an upstream vLLM change. |
 | `models/glm52/moe-tp8-low-latency.md` | `--moe-topo tp8`: bucket-1 decode MoE runs TP8-sharded phase-split kernels + LL packet AG/RS instead of the EP8 DeepEP chain — measured solo ITL 19.23 → 15.27 ms (1.26×), 8-concurrent 1.17×, on 8×H200. TP8+MTP span mapping on top: solo DSpark span-8 rides the bucket-8 shape — code 186 tok/s (2.5–2.9× over both baselines), prose 106, ~25 ms rounds; solo prefill 8 tok/step. Launch-time config; EP8 stays the high-throughput default. |

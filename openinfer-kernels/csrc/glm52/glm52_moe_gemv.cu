@@ -424,6 +424,169 @@ __global__ void glm52_gemv_batched_mma_reduce_kernel(
   out[i] = __float2bfloat16(v);
 }
 
+// ---------------------------------------------------------------------------
+// Multi-batch-tile mma (batches 16/32/64): BTILES = batch/8 column subtiles
+// of the same m16n8k16 chain. MTP verify presents span x bucket rows per step
+// (span-8 x bucket-8 = 64), and per-rank batch may grow past the decode
+// buckets; the single-tile mma above is hardware-capped at 8 batch columns
+// (N=8 of the mma), and the register tile's per-thread acc[ROWS][BATCH] does
+// not scale. Here the 16-row weight tile (A fragments) is read once per k64
+// and retired against every 8-row activation subtile, so weight HBM traffic
+// per output row is unchanged from batch 8 while the tensor-core work scales
+// linearly with batch. Per-row numerics are the mma's fixed hardware
+// accumulation order with the same k-slice/reduce structure as the batch-4/8
+// path — a row carries bit-identical results whether launched inside a
+// batch-8 or a batch-64 grid (same ksplit), but NOT vs the m=1 kernel.
+template <int BTILES, int KSPLIT, int NTILES>
+__global__ __launch_bounds__(kMmaWarps * kWarpSize) void
+glm52_gemv_batched_mma_multi_kernel(
+    const __nv_bfloat16* __restrict__ activation,  // [BTILES*8, k]
+    const unsigned char* __restrict__ weight,      // [n, k] e4m3, original layout
+    const float* __restrict__ weight_scale,        // [n/128, k/128]
+    float* __restrict__ partial,                   // [KSPLIT, BTILES*8, n] f32
+    int n, int k) {
+  constexpr int BATCH = BTILES * 8;
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int tile0 = (blockIdx.y * kMmaWarps + warp) * NTILES;  // 16-row tiles
+  if (tile0 * 16 >= n) return;
+  const int gid = lane >> 2, tid = lane & 3;
+  const int kslice = k / KSPLIT;  // multiple of 128
+  const int k_begin = blockIdx.x * kslice;
+  const int scale_cols = k >> 7;
+
+  float macc[BTILES][NTILES][4], cacc[BTILES][NTILES][4];
+#pragma unroll
+  for (int bt = 0; bt < BTILES; ++bt)
+#pragma unroll
+    for (int t = 0; t < NTILES; ++t)
+#pragma unroll
+      for (int i = 0; i < 4; ++i) { macc[bt][t][i] = 0.f; cacc[bt][t][i] = 0.f; }
+
+  // Per chain: rows (gid, gid+8) of its tile; one 16B packet per row per k64.
+  const unsigned char* w0[NTILES];
+  const unsigned char* w1[NTILES];
+#pragma unroll
+  for (int t = 0; t < NTILES; ++t) {
+    const int n0 = (tile0 + t) * 16;
+    w0[t] = weight + (size_t)(n0 + gid) * k + k_begin + tid * 16;
+    w1[t] = weight + (size_t)(n0 + gid + 8) * k + k_begin + tid * 16;
+  }
+
+  // Same 2-deep weight-packet pipeline per chain as the single-tile kernel.
+  uint4 wp0[NTILES], wp1[NTILES];
+#pragma unroll
+  for (int t = 0; t < NTILES; ++t) {
+    wp0[t] = __ldcs(reinterpret_cast<const uint4*>(w0[t]));
+    wp1[t] = __ldcs(reinterpret_cast<const uint4*>(w1[t]));
+  }
+  for (int kk = k_begin; kk < k_begin + kslice; kk += 64) {
+    uint4 c0[NTILES], c1[NTILES];
+#pragma unroll
+    for (int t = 0; t < NTILES; ++t) {
+      c0[t] = wp0[t]; c1[t] = wp1[t];
+      w0[t] += 64; w1[t] += 64;
+    }
+    if (kk + 64 < k_begin + kslice) {
+#pragma unroll
+      for (int t = 0; t < NTILES; ++t) {
+        wp0[t] = __ldcs(reinterpret_cast<const uint4*>(w0[t]));
+        wp1[t] = __ldcs(reinterpret_cast<const uint4*>(w1[t]));
+      }
+    }
+#pragma unroll
+    for (int s = 0; s < 4; ++s) {  // four k16 mma steps per k64 super-chunk
+      // B fragments for every 8-row subtile: batch row bt*8 + gid. All 8 gids
+      // always load — BATCH is a whole multiple of 8 by construction.
+      unsigned b01[BTILES], b23[BTILES];
+#pragma unroll
+      for (int bt = 0; bt < BTILES; ++bt) {
+        const __nv_bfloat16* xrow =
+            activation + (size_t)(bt * 8 + gid) * k + kk + tid * 16 + 4 * s;
+        const uint2 bv = *reinterpret_cast<const uint2*>(xrow);
+        b01[bt] = bv.x; b23[bt] = bv.y;
+      }
+#pragma unroll
+      for (int t = 0; t < NTILES; ++t) {
+        const unsigned char* p0 = reinterpret_cast<const unsigned char*>(&c0[t]) + 4 * s;
+        const unsigned char* p1 = reinterpret_cast<const unsigned char*>(&c1[t]) + 4 * s;
+        // The weight decode is shared across all subtiles — this is the
+        // register-side reuse that keeps weight traffic at the batch-8 level.
+        unsigned a0 = mma_cvt_pair(p0[0], p0[1]);  // row gid,   slots tid*2/+1
+        unsigned a1 = mma_cvt_pair(p1[0], p1[1]);  // row gid+8, slots tid*2/+1
+        unsigned a2 = mma_cvt_pair(p0[2], p0[3]);  // row gid,   slots tid*2+8/+9
+        unsigned a3 = mma_cvt_pair(p1[2], p1[3]);  // row gid+8, slots tid*2+8/+9
+#pragma unroll
+        for (int bt = 0; bt < BTILES; ++bt) {
+          asm volatile(
+              "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+              "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+              : "+f"(cacc[bt][t][0]), "+f"(cacc[bt][t][1]),
+                "+f"(cacc[bt][t][2]), "+f"(cacc[bt][t][3])
+              : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
+                "r"(b01[bt]), "r"(b23[bt]));
+        }
+      }
+    }
+    if (((kk + 64) & 127) == 0) {  // end of a 128-col scale group
+#pragma unroll
+      for (int bt = 0; bt < BTILES; ++bt)
+#pragma unroll
+        for (int t = 0; t < NTILES; ++t) {
+          // A 16-row tile never straddles a /128 scale-row boundary (16 | 128).
+          const float scale =
+              weight_scale[(size_t)(((tile0 + t) * 16) >> 7) * scale_cols + (kk >> 7)];
+#pragma unroll
+          for (int i = 0; i < 4; ++i) { macc[bt][t][i] += scale * cacc[bt][t][i]; cacc[bt][t][i] = 0.f; }
+        }
+    }
+  }
+  // C fragment: c0=(row gid, col tid*2) c1=(gid, +1) c2=(gid+8, tid*2)
+  // c3=(gid+8, +1); subtile bt shifts the column (batch row) by bt*8. Every
+  // column is a real batch row (BATCH % 8 == 0), so no col < BATCH guards.
+  float* out_slice = partial + (size_t)blockIdx.x * BATCH * n;
+  const int col0 = tid * 2;
+#pragma unroll
+  for (int bt = 0; bt < BTILES; ++bt) {
+    const int b0 = bt * 8 + col0;
+#pragma unroll
+    for (int t = 0; t < NTILES; ++t) {
+      const int n0 = (tile0 + t) * 16;
+      out_slice[(size_t)b0 * n + n0 + gid] = macc[bt][t][0];
+      out_slice[(size_t)(b0 + 1) * n + n0 + gid] = macc[bt][t][1];
+      out_slice[(size_t)b0 * n + n0 + gid + 8] = macc[bt][t][2];
+      out_slice[(size_t)(b0 + 1) * n + n0 + gid + 8] = macc[bt][t][3];
+    }
+  }
+}
+
+template <int BTILES, int KSPLIT, int NTILES>
+CUresult launch_gemv_batched_mma_multi(const __nv_bfloat16* activation,
+                                       const unsigned char* weight,
+                                       const float* weight_scale,
+                                       __nv_bfloat16* out, float* scratch,
+                                       size_t scratch_floats, int n, int k,
+                                       cudaStream_t stream,
+                                       bool skip_reduce = false) {
+  constexpr int BATCH = BTILES * 8;
+  if (n % 16 != 0 || k % (128 * KSPLIT) != 0 || (n / 16) % NTILES != 0 ||
+      scratch == nullptr || (size_t)KSPLIT * BATCH * n > scratch_floats) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  const int tiles = n / 16;
+  const dim3 grid(KSPLIT, (tiles / NTILES + kMmaWarps - 1) / kMmaWarps, 1);
+  glm52_gemv_batched_mma_multi_kernel<BTILES, KSPLIT, NTILES>
+      <<<grid, kMmaWarps * kWarpSize, 0, stream>>>(activation, weight,
+                                                   weight_scale, scratch, n, k);
+  if (!skip_reduce) {
+    const int rthreads = 256;
+    glm52_gemv_batched_mma_reduce_kernel<BATCH, KSPLIT>
+        <<<(BATCH * n + rthreads - 1) / rthreads, rthreads, 0, stream>>>(
+            scratch, out, n);
+  }
+  return consume_last_cuda_error();
+}
+
 // (ksplit, ntiles) per (arch, batch, whitelisted shape); ksplit == 0 keeps the
 // register tile. Measured winners ONLY — Hopper table from an 8xH200
 // locked-clock sweep 2026-07-05, Blackwell batch-8 table from a GB300 sm_103
@@ -481,6 +644,14 @@ MmaConfig mma_config(int batch, int n, int k) {
     if (n == 24576 && k == 6144) return {16, 2};  // dense gate|up
     if (n == 4096  && k == 6144) return {16, 2};  // shared gate|up
     if (n == 128   && k == 6144) return {16, 2};  // indexer wk
+  }
+  // MTP verify / large-batch rows (16/32/64 = BTILES 2/4/8 of the
+  // multi-subtile mma). Blackwell-only initial picks mirroring the batch-8
+  // winners — UNMEASURED placeholders: the first kernel_lab GB300 sweep owns
+  // replacing them (docs/models/glm52/decode-op-bench-harness.md). No Hopper
+  // entries: off-Blackwell these batches get {0,0} and fail closed.
+  if (arch_is_blackwell() && (batch == 16 || batch == 32 || batch == 64)) {
+    if (n == 16384 && k == 2048) return {4, 1};   // q_b
   }
   return {0, 0};
 }
@@ -613,6 +784,14 @@ CUresult plain_rows_per_warp(int k, int* rows) {
 constexpr int kBatchedGemvBatch2 = 2;
 constexpr int kBatchedGemvBatch4 = 4;
 constexpr int kBatchedGemvBatchFull = 8;
+// MTP span-mapped verify rows and future large per-rank batches (span-8 x
+// bucket-8 = 64 rows). Batches past 8 run only the multi-subtile mma path
+// (BTILES = batch/8) — no register-tile fallback exists there. These are NOT
+// decode buckets: production GLM52_DECODE_BUCKETS stays {1,2,4,8} and never
+// routes here; only kernel_lab (and future MTP-span call sites) launch them.
+constexpr int kBatchedGemvBatch16 = 16;
+constexpr int kBatchedGemvBatch32 = 32;
+constexpr int kBatchedGemvBatch64 = 64;
 // Per-batch (ROWS, WARPS) tile — measured, see the kernel comment.
 constexpr int kBatchedRows  = 4;
 constexpr int kBatchedWarps = 4;
@@ -696,7 +875,9 @@ CUresult glm52_fp8_weight_only_gemv_pair_cuda(
 // batch == 1 routes to the m=1 kernel; batch 2 keeps the bit-parity register
 // tile; batches 4/8 dispatch per shape between the tensor-core mma path and
 // the register tile (mma_config — deterministic per bucket, not bit-identical
-// to m=1; see the mma block comment for the numerics contract).
+// to m=1; see the mma block comment for the numerics contract). Batches
+// 16/32/64 (MTP span-mapped verify rows, not decode buckets) take only the
+// multi-subtile mma and fail closed off-table — no register tile past batch 8.
 // `scratch`/`scratch_floats` = caller-owned f32 partial buffer for the
 // tensor-core path (see the mma block comment for the ownership contract:
 // one buffer per stream, never shared across the ctx/aux overlap). Batches
@@ -726,6 +907,13 @@ static CUresult gemv_batched_dispatch(
   if (cfg.ksplit == (KS_) && cfg.ntiles == (NT_)) {                         \
     if (partials_only && ksplit_out != nullptr) *ksplit_out = (KS_);        \
     return launch_gemv_batched_mma<BATCH_, KS_, NT_>(                       \
+        activation, weight, weight_scale, out, scratch, scratch_floats, n,  \
+        k, stream, partials_only);                                          \
+  }
+#define GLM52_MMA_MULTI_CASE(BT_, KS_, NT_)                                  \
+  if (btiles == (BT_) && cfg.ksplit == (KS_) && cfg.ntiles == (NT_)) {      \
+    if (partials_only && ksplit_out != nullptr) *ksplit_out = (KS_);        \
+    return launch_gemv_batched_mma_multi<BT_, KS_, NT_>(                    \
         activation, weight, weight_scale, out, scratch, scratch_floats, n,  \
         k, stream, partials_only);                                          \
   }
@@ -778,11 +966,28 @@ static CUresult gemv_batched_dispatch(
               activation, weight, weight_scale, out, n, k);
       break;
     }
+    case kBatchedGemvBatch16:
+    case kBatchedGemvBatch32:
+    case kBatchedGemvBatch64: {
+      // MTP verify / large batches: multi-subtile mma ONLY (BTILES = batch/8
+      // column subtiles) — the register tile's per-thread acc[ROWS][BATCH]
+      // does not scale past batch 8, so there is no fallback arm here and
+      // off-table shapes fail closed. An uninstantiated table entry crashes
+      // on the cfg.ksplit guard, same contract as the batch-4/8 arms.
+      const MmaConfig cfg = mma_config(batch, n, k);
+      const int btiles = batch / 8;
+      GLM52_MMA_MULTI_CASE(2, 4, 1)
+      GLM52_MMA_MULTI_CASE(4, 4, 1)
+      GLM52_MMA_MULTI_CASE(8, 4, 1)
+      if (cfg.ksplit != 0) return CUDA_ERROR_INVALID_VALUE;
+      return CUDA_ERROR_INVALID_VALUE;
+    }
     default:
       return CUDA_ERROR_INVALID_VALUE;
   }
   return consume_last_cuda_error();
 #undef GLM52_MMA_CASE
+#undef GLM52_MMA_MULTI_CASE
 }
 
 CUresult glm52_fp8_weight_only_gemv_batched_cuda(
@@ -858,7 +1063,9 @@ CUresult glm52_gemv_split_reduce_cuda(
 CUresult glm52_gemv_mma_ksplit_cuda(int batch, int n, int k, int* ksplit_out) {
   if (ksplit_out == nullptr) return CUDA_ERROR_INVALID_VALUE;
   *ksplit_out =
-      (batch == kBatchedGemvBatch4 || batch == kBatchedGemvBatchFull)
+      (batch == kBatchedGemvBatch4 || batch == kBatchedGemvBatchFull ||
+       batch == kBatchedGemvBatch16 || batch == kBatchedGemvBatch32 ||
+       batch == kBatchedGemvBatch64)
           ? mma_config(batch, n, k).ksplit
           : 0;
   return CUDA_SUCCESS;
