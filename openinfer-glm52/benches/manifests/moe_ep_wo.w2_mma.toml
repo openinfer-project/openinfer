@@ -1,0 +1,22 @@
+unit = "moe_ep_wo.w2_mma"
+phase = 2
+symbol = "glm52_moe_ep_wo_masked_mma_cuda"
+adapter = "moe_ep_wo_w2_mma"
+capability = { blackwell_only = true }
+[axes]
+rows = [1, 2, 4, 8]
+ep = [4, 8, 16]
+global_tokens = [4, 8, 16, 32, 64, 128]
+[shape]
+n = 6144
+k = 2048
+[contract]
+inputs = "act[bound_rows, 2048] bf16（SiLU 输出布局的 aligned slots）；weight[groups, 6144, 2048] e4m3 normal-quantized + scales[groups, 48, 16] f32；row_weights[bound_rows] f32（dispatch 路由权重，live 行 U(0.05,1)、gap 行 0 且不被读）；tiles/tile_count 由生产 tiles 内核惰性首跑生成"
+outputs = "out[bound_rows, 6144] bf16（写进 decode_combine 寻址的 aligned slots；gap 行保持 SENTINEL=-0.5，adapter 精确硬断言）"
+accumulation = "f32（m16n8k16 bf16 mma slot 序 + per-128-block partial × scale）；路由权重语义（读 .cu 确认，glm52_moe_ep_wo.cu:206-227）：row_weights 在 bf16 store 前乘 f32 累加器 out = bf16(rw × macc)——与 oracle 参考 post-down 乘同结合序"
+notes = "capacity-proportional launch 同 W13 twin：grid dim3(n/128=48, state_max_tiles)，缓冲 bound_rows（EP16×rows8 gt=128 → 2032 行）。W2 bank：EP4 805 MB / EP8 402 MB / EP16 201 MB，rows 扫描进程内缓存复用"
+[reference]
+mode = "torch_tolerance"
+[reference.tolerance]
+rel_l2 = 0.02
+note = "bf16 store floor + f32 结合序重排：torch 参考 = per-expert masked GEMM（per-128-block f32 partial × scale）后按行乘路由权重——与内核 rw×acc 同序。adapter 内另有 smoke 同款 per-element 2e-2（max(|want|,1)）硬门 + gap sentinel 全等硬断言。MEASURED rel_l2 ≤ 1.66e-3（ep{4,8,16}×rows{1,2,4,8} 全 12 点，GB300 sm_103 tray03，2026-07-29）；headroom ~12×"

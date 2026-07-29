@@ -71,7 +71,9 @@ def test_indexer_manifests_phase1_and_tolerances():
         assert m.reference["mode"] == "torch_tolerance"
         tol = m.tolerance
         assert tol["rel_l2"] > 0
-        assert "UNMEASURED" in tol.get("note", ""), f"{name}: tolerance note must stay UNMEASURED until GB300"
+        assert ("UNMEASURED" in tol.get("note", "")) or ("MEASURED" in tol.get("note", "")), (
+            f"{name}: tolerance note must state UNMEASURED or MEASURED (GB300-backfilled)"
+        )
 
 
 def test_ctx_axis_exactly_the_three_stops():

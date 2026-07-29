@@ -1,0 +1,27 @@
+unit = "moe_ep_wo.tiles"
+phase = 2
+symbol = "glm52_moe_ep_wo_tiles_cuda"
+adapter = "moe_ep_wo_tiles"
+capability = { blackwell_only = true }
+[axes]
+rows = [1, 2, 4, 8]
+ep = [4, 8, 16]
+global_tokens = [4, 8, 16, 32, 64, 128]
+[shape]
+# tiles 内核无 GEMV 几何：n=2 记 int2 描述子、k=128 仅为过 schema（k%128==0）。
+# 权威 shape/capacity 表 = kernel_lab.refs.moe_ep_wo.shape_point：
+# groups = 256/ep（64/32/16）；max_tiles = groups + ep*8（96/96/144，生产启动
+# 预算 state.max_tiles，moe_ep_wo.rs:137）；m_capacity = bound_rows =
+# min(expanded, gt*8 + 63*min(gt*8, groups))（moe_ep_wo.rs:197）。
+n = 2
+k = 128
+[contract]
+inputs = "psum_expert[groups] i32（DeepEP dispatch 的 64 对齐 running ends；seeded 偏斜路由合成，见 refs/moe_ep_wo.routing_counts）"
+outputs = "tiles[2*max_tiles] i32（int2 {aligned row base, expert | rows<<16}，仅前 tile_count 项被写）+ tile_count[1] i32（adapter 硬断言全等）"
+accumulation = "无（整数元数据扫描，单 block 32 线程）"
+notes = "rows 轴 = per-rank decode bucket（GLM52_DECODE_BUCKETS）；global_tokens = ep × rows（轴声明为并集，合法组合由 ep×rows 派生）；CLI 只扫 rows，ep 扫描走组 driver：python3 -m kernel_lab.refs.moe_ep_wo check moe_ep_wo.tiles --ep 4。launch 参数 = 生产逐步值（groups, m_capacity=bound_rows, masked_cap=global_tokens, max_tiles=state_max_tiles）；布局合法否则内核 __trap__（refs 在 CPU 侧先行断言：count ≤ global_tokens、aligned_end ≤ bound_rows、tiles ≤ max_tiles）"
+[reference]
+mode = "torch_tolerance"
+[reference.tolerance]
+rel_l2 = 1e-6
+note = "整数全等门：tile 描述子值 < 2^24 f32 精确，任何单 int 差异 rel_l2 >= ~1e-7 即 FAIL；tile_count 由 adapter 硬断言（CLI 单 tensor 门看不到 count 缓冲）。MEASURED rel_l2=0.0（ep{4,8,16}×rows{1,2,4,8} 全 12 点，GB300 sm_103 tray03，2026-07-29）"

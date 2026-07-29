@@ -51,6 +51,35 @@
 
 ## Execution Log
 
+- 2026-07-29 二期第一块落地：MoE 专家链单元组 `moe_ep_wo.{tiles,w13_mma,silu,w2_mma}`:
+  - **shape 轴**：`rows`（per-rank bucket {1,2,4,8}，CLI 原生可扫）× `ep`（{4,8,16} →
+    n_local 64/32/16，新轴，组 driver `python3 -m kernel_lab.refs.moe_ep_wo check|bench`
+    仿 attention 组 --ctx 模式）；global_tokens = ep×rows ∈ {4..128}（并集入 [axes]）。
+    **capacity-proportional 内建**：grid 恒为生产启动预算 state.max_tiles（96/96/144，
+    moe_ep_wo.rs:137），缓冲按 bound_rows（同 file:197 公式，CPU 测试钉死推导表）；
+    mma/silu 的 tiles 列表由生产 tiles 内核惰性首跑（plan-time，warmup 吸收）。
+  - **路由分布**：seeded 可复现非退化——lognormal 热度 σ=1.2 + Gumbel top-8 无放回
+    （仅用 random() 算术，跨 Python 版本稳定）；非退化 retry 守卫（近空 draw 确定性
+    重抽）修掉了 EP8×gt8 sum=1 的 Binomial 尾部（~1%）。CPU 测试钉死 6 个代表点的
+    总数/活跃数/max/tiles/aligned_end。skew 标定依据 = moe-bench-prompt-diversity
+    （diverse 生产点近均匀）。
+  - **GB300 check 48/48 一次通过**（sm_103 tray03）：tiles rel_l2=0.0（整数全等 +
+    tile_count adapter 硬断言）；**silu bit-exact 实测成立 rel_l2=0.0**（探针证实
+    torch sigmoid 与内核 1/(1+expf(-gate)) 对 [-30,30] 全部 bf16 输入逐位一致）；
+    w13/w2 mma rel_l2 ≤ 1.67e-3 / 1.66e-3（正中 bf16 floor，headroom ~12×，容差
+    0.02 未动；adapter 内 smoke 同款 per-element 2e-2 硬门 + gap sentinel 全等硬断言）。
+    bench 冒烟：EP8×gt64 W13 103µs、W2 62µs、tiles 7µs、silu 5µs。
+  - **参考端坑（新教训）**：bit-exact 门的参考必须先舍到目标存储精度再比——silu 首测
+    参考返回未舍入 f32，CLI 拿 bf16 内核输出对 f32 参考，把 bf16 store floor 当成
+    "内核误差"测出 rel_l2≈2.2e-4 假 FAIL；参考 `.to(bf16)` 回舍后归零（quant 组的
+    packed-byte surface 是同构解法）。另一侧：torch sigmoid 无 tensor÷CPU标量 陷阱。
+  - gap sentinel 取值论证：-0.5（bf16 精确、小量级）——大 sentinel（如 smoke 的
+    -1234.5）会稀释全面 rel_l2 范数让单点坏内核漏网（EP4×rows1 实测推导）；sentinel
+    全等性由 adapter 硬断言兜底。
+  - 容差已回填 MEASURED（机器 GB300 sm_103 tray03 2026-07-29）。**未做**：基线账本
+    （bench --save 未跑全轴）；EP4 最大点 hottest expert 仅 7 行（近均匀路由的真实
+    瘦瓦片负载，多瓦片覆盖在 EP8/EP16 大档自然出现）。
+
 - 2026-07-29 一期骨架落地（本地 x86_64 + RTX 5070 Ti，无 torch 环境）:
   - build.rs 双产物：`OPENINFER_KERNEL_LAB=1` 时在 `ar` 之后用同一 nvcc 把同一批 obj 链成
     `libglm52_kernel_lab.so` 并复制到 `target/release/`；env 未设置零新命令。

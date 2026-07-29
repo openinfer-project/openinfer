@@ -1,0 +1,22 @@
+unit = "moe_ep_wo.w13_mma"
+phase = 2
+symbol = "glm52_moe_ep_wo_masked_mma_cuda"
+adapter = "moe_ep_wo_w13_mma"
+capability = { blackwell_only = true }
+[axes]
+rows = [1, 2, 4, 8]
+ep = [4, 8, 16]
+global_tokens = [4, 8, 16, 32, 64, 128]
+[shape]
+n = 4096
+k = 6144
+[contract]
+inputs = "act[bound_rows, 6144] bf16（DeepEP 64 对齐 recv slots，gap 行也填 N(0,1)，内核不得寻址）；weight[groups, 4096, 6144] e4m3 normal-quantized + scales[groups, 32, 48] f32（checkpoint weight_scale_inv 布局）；tiles/tile_count 由生产 tiles 内核惰性首跑生成（plan-time，bench warmup 吸收）；row_weights = NULL（W13 不融合路由权重）"
+outputs = "out[bound_rows, 4096] bf16（live tile 行；alignment-gap 行保持 SENTINEL=-0.5，adapter 精确硬断言——smoke 测试 sentinel 检查同款）"
+accumulation = "f32（m16n8k16 bf16 mma slot 序 + per-128-block partial × scale，glm52_moe_ep_wo.cu:195-204）；确定性 per shape，bucket 间非 bit-identical"
+notes = "capacity-proportional launch（bench 诚信合同）：grid dim3(n/128=32, state_max_tiles=96/96/144)，超过 device tile_count 的 block 单次读即退——绝不可按实际 tile 数缩 grid，否则是在奉承它；缓冲按 bound_rows（EP4×rows8 gt=32 → 4288 行；推导表 refs/moe_ep_wo.shape_point）。权重 bank rows 无关，rows 扫描复用（EP4 W13 = 1.6 GB，进程内缓存）。masked 输入布局 = DeepEP recv 64 对齐 slots，seeded 偏斜路由驱动（lognormal 热度 σ=1.2 + Gumbel top-8 无放回，非全同非均匀）"
+[reference]
+mode = "torch_tolerance"
+[reference.tolerance]
+rel_l2 = 0.02
+note = "bf16 store floor（2^-8 相对量级）+ f32 结合序重排：torch 参考 = per-expert masked GEMM，按 smoke 测试结合序（per-128-block f32 partial 后 × scale，移植自 f64 host 参考；mma slot 序差异由容差吸收）。adapter 内另有 smoke 同款 per-element 2e-2（max(|want|,1)）硬门 + gap sentinel 全等硬断言。MEASURED rel_l2 ≤ 1.67e-3（ep{4,8,16}×rows{1,2,4,8} 全 12 点，GB300 sm_103 tray03，2026-07-29）；headroom ~12×"

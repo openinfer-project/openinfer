@@ -1,0 +1,24 @@
+unit = "moe_ep_wo.silu"
+phase = 2
+symbol = "glm52_moe_ep_wo_silu_cuda"
+adapter = "moe_ep_wo_silu"
+capability = { blackwell_only = true }
+[axes]
+rows = [1, 2, 4, 8]
+ep = [4, 8, 16]
+global_tokens = [4, 8, 16, 32, 64, 128]
+[shape]
+# n = inter = 2048（输出宽）；k = 2*inter = 4096（gate|up 输入宽）。权威
+# capacity 表 = kernel_lab.refs.moe_ep_wo.shape_point。
+n = 2048
+k = 4096
+[contract]
+inputs = "gate_up[bound_rows, 4096] bf16（W13 输出布局 [·, 2*inter]：前 2048 列 gate、后 2048 列 up；N(0,1) gate 压 sigmoid 敏感区；gap 行同样填充）；tiles/tile_count 由生产 tiles 内核惰性首跑生成"
+outputs = "out[bound_rows, 2048] bf16（silu(gate)*up，live tile 行；gap 行保持 SENTINEL=-0.5，adapter 精确硬断言）"
+accumulation = "无累加（elementwise f32：1.0f/(1.0f+expf(-gate))，再 (gate*sig)*up 左序两乘，bf16 RNE store）；路由权重不在此内核——融合在 W2 mma 的 f32 累加器上（见 moe_ep_wo.w2_mma）"
+notes = "grid dim3(state_max_tiles, TILE_ROWS=8) × 256 线程，超过 tile_count / live_rows 的 block 即退——capacity-proportional 同生产。inter=2048 固定（GLM52_EXPERT_INTERMEDIATE）"
+[reference]
+mode = "torch_tolerance"
+[reference.tolerance]
+rel_l2 = 1e-6
+note = "bit-exact 实测成立：MEASURED rel_l2=0.0（ep{4,8,16}×rows{1,2,4,8} 全 12 点，GB300 sm_103 tray03，2026-07-29）。论证：bf16→f32 widening 精确；内核 1/(1+expf(-gate)) 与 torch CUDA f32 sigmoid 同表达式（两侧 nvcc -O3 无 fast-math，expf 精确、div.rn；GB300 探针对 [-30,30] 全部 bf16 值 0/200001 分歧）；两乘同左序；同 RNE bf16 store。**教训**：bit-exact 门的参考必须先舍到 bf16 再比——首测参考返回未舍入 f32，把 bf16 store floor 当成误差测出 rel_l2≈2.2e-4 假 FAIL；参考 .to(bf16) 后归零。无 tensor÷CPU标量 陷阱（本参考无标量除法）"
