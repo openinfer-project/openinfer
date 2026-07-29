@@ -181,6 +181,35 @@
   - 迭代通道：本地改文件 → `rsync -e 'ssh -J gb300-login'` 单文件到 tray03 worktree →
     `docker exec -i kernel-lab` 重跑，绕过 git 往返，修复周期 <10 min/组。
 
+- 2026-07-29 EP4 实测 + nsys 归因 + 二期 MoE 单元 + 首轮调优（目标：bs1 vs bs8 差异归因）:
+  - **引擎实测**（`glm52_step_bench` EP4 单 tray，同会话）：bucket 1/2/4/8 p50 =
+    22.71/27.70/33.74/40.30 ms——bs1→8 差 +17.6ms(+77%)，与 ep4-gb300.md 历史值一致。
+  - **nsys node-trace 双 trace diff**（2025.6.3 + `--cuda-graph-trace=node --cuda-flush-interval 1000`，
+    配方见 gb300.md）：bs1→8 delta 的 **57% 来自 `moe_ep_wo_masked_mma_kernel`**（b8 GPU 时间
+    占比 47%）、DeepEP combine+dispatch ~17%、flashmla ~3%；投影 GEMV 的表观 delta 主要是
+    m=1→mma 路径切换 + node-trace 膨胀，solo 账本校准后真实 delta ~1ms——**nsys 原始数必须
+    用 kernel_lab solo 账本交叉校准，不能直接当 delta 用**。
+  - **二期 MoE 单元落地**：`moe_ep_wo.{tiles,w13_mma,silu,w2_mma}`（EP4/8/16 参数化，
+    capacity-proportional shape + seeded 偏斜路由；48/48 check PASS）。**首测教训**：参考返回
+    未舍入 f32 会把 bf16 store floor 测成"内核误差"——参考必须回舍到输出 dtype。
+    基线（EP4）：w13 rows=1 78.4µs（= #668 的 29% roofline 形状，实测 roofline ~44%）、
+    rows=8 118.5µs；w2 rows=8 69.4µs。
+  - **调优卡 A（moe masked mma）**：k-loop 双模板 `kPipe=2/4` 兄弟内核 + device guard
+    （live blocks ≤448 走 deep pipe）——w13 rows=1 78.4→67.4µs（**-14%**，roofline 44→51%），
+    rows≥2 因死兄弟启动 +1.5-2µs；bucket-1 净收益 ≈ -0.7ms/step（-9.5µs×75 层）。
+    负结果（都重要）：全局 depth-4 反噬 rows≥2 +13~32%（DRAM row locality + 寄存器占用墙）、
+    单内核运行时分支被最深路径连坐压占用。**真正的天花板是 DRAM activate-bound**
+    （fragment 布局把事务钉在 64B/6KB stride），下一步 = smem 宽连续加载解耦。
+  - **调优卡 B（rows=64 投影占位替换）**：q_b/o_proj/shared gate|up/down 的 {4,1} UNMEASURED
+    占位 → per-batch 实测表（+6 个模板实例）：rows=64 q_b 47.1→31.4µs（-32%）、
+    o_proj 133.6→78.8（-41%）、swiglu 59.2→44.8（-24%）。NTILES=activation L2 流量杠杆，
+    但 BTILES×NTILES×8 f32/thread 寄存器墙限制 BT=8 只能 NT=2。rows≤8 零字节改动
+    （diff 核对 + check canary）。
+  - **agent 并行调优基建**：tray03 每 agent 独立 worktree（kl-a/kl-b，避免 cargo target 锁与
+    .cu 半成品互染）+ 独立 GPU（CUDA_VISIBLE_DEVICES 钉卡）；openinfer-kernel-lab worktree
+    永保干净做基线。
+  - 引擎 A/B（候选 kl-a vs 基线同会话）结果待补。
+
 - 2026-07-29 GB300 bench：23/23 单元首批基线落账（`baselines/<unit>.json`）:
   - 全 rows 轴（各单元支持范围内）× 默认 ctx；30 rounds × 10 inner，clocks.sm=2070 MHz，
     git_rev=da68d4f9。示例：q_b_gemv rows=64 median 46.07µs、o_proj rows=64 134.36µs、

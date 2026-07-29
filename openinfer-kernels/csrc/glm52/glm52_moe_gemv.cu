@@ -646,22 +646,28 @@ MmaConfig mma_config(int batch, int n, int k) {
     if (n == 128   && k == 6144) return {16, 2};  // indexer wk
   }
   // MTP verify / large-batch rows (16/32/64 = BTILES 2/4/8 of the
-  // multi-subtile mma). Blackwell-only initial picks — UNMEASURED
-  // placeholders: the first kernel_lab GB300 sweep owns replacing them
-  // (docs/models/glm52/decode-op-bench-harness.md). No Hopper entries:
-  // off-Blackwell these batches get {0,0} and fail closed.
+  // multi-subtile mma). Blackwell-only measured picks — GB300 sm_103
+  // kernel_lab sweep 2026-07-29 (KSPLIT x NTILES grid per shape x batch;
+  // method in docs/models/glm52/decode-op-bench-harness.md). The winners are
+  // batch-dependent: activation L2 traffic scales as 1/NTILES while the
+  // accumulator register wall is BTILES*NTILES*8 f32/thread, so rows=64
+  // (BTILES=8) caps at NTILES=2 and wants a shallow ksplit, while rows=32
+  // fits NTILES=4. No Hopper entries: off-Blackwell these batches get {0,0}
+  // and fail closed.
   if (arch_is_blackwell() && (batch == 16 || batch == 32 || batch == 64)) {
-    if (n == 16384 && k == 2048)  return {4, 1};  // q_b (mirrors the batch-8 winner)
-    // o_proj deliberately does NOT mirror its batch-8 winner {16,2}: at
-    // rows>=16 the tensor-core work per weight byte already scales with
-    // batch, so a long-k weight-bound GEMV starts with a shallow split.
-    // Same UNMEASURED placeholder contract as q_b — the sweep owns the pick.
-    if (n == 6144  && k == 16384) return {4, 1};  // o_proj
-    // shared-expert SwiGLU pair (kernel_lab shared_expert.swiglu): same
-    // shallow-split start as o_proj — at rows>=16 the tensor-core work per
-    // weight byte already scales with batch. UNMEASURED placeholders.
-    if (n == 4096  && k == 6144)  return {4, 1};  // shared gate|up
-    if (n == 6144  && k == 2048)  return {4, 1};  // shared down
+    if (n == 16384 && k == 2048) {  // q_b
+      if (batch == 16) return {8, 2};
+      if (batch == 32) return {4, 4};
+      return {2, 2};
+    }
+    if (n == 6144  && k == 16384) {  // o_proj
+      if (batch == 64) return {16, 2};
+      return {8, 2};
+    }
+    // shared-expert SwiGLU pair (kernel_lab shared_expert.swiglu): {8,2} wins
+    // at every measured batch (16/32/64).
+    if (n == 4096  && k == 6144)  return {8, 2};  // shared gate|up
+    if (n == 6144  && k == 2048)  return {8, 2};  // shared down
   }
   return {0, 0};
 }
@@ -986,9 +992,13 @@ static CUresult gemv_batched_dispatch(
       // on the cfg.ksplit guard, same contract as the batch-4/8 arms.
       const MmaConfig cfg = mma_config(batch, n, k);
       const int btiles = batch / 8;
-      GLM52_MMA_MULTI_CASE(2, 4, 1)
-      GLM52_MMA_MULTI_CASE(4, 4, 1)
-      GLM52_MMA_MULTI_CASE(8, 4, 1)
+      // Measured GB300 winners only (mma_config batch 16/32/64 block).
+      GLM52_MMA_MULTI_CASE(2, 8, 2)
+      GLM52_MMA_MULTI_CASE(4, 4, 4)
+      GLM52_MMA_MULTI_CASE(4, 8, 2)
+      GLM52_MMA_MULTI_CASE(8, 2, 2)
+      GLM52_MMA_MULTI_CASE(8, 8, 2)
+      GLM52_MMA_MULTI_CASE(8, 16, 2)
       if (cfg.ksplit != 0) return CUDA_ERROR_INVALID_VALUE;
       return CUDA_ERROR_INVALID_VALUE;
     }

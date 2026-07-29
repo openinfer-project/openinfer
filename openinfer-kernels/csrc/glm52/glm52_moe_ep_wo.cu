@@ -39,6 +39,17 @@ constexpr int kExpertAlignment = 64;
 constexpr int kTileRows = 8;
 constexpr int kMmaWarps = 4;
 constexpr int kNTiles = 2;  // 16-row n-tiles per warp -> 128 output rows/block
+constexpr int kPrefetch = 4;  // k64 super-chunks in flight per weight row (deep path)
+// Working-block count (live tiles x n_blocks) at or below which the deep
+// pipeline wins: few active experts leave the grid far short of the
+// outstanding loads HBM latency needs, while the bigger buckets already
+// oversubscribe DRAM and a deeper pipeline only thrashes row locality.
+// Measured on GB300 EP4 (11/18/19/26 live tiles for rows=1/2/4/8): W13
+// rows=1 -> 352 blocks (deep), W2 rows=1 -> 528 and W13 rows=2 -> 576
+// (shallow). Both paths run bit-identical math, only the load schedule
+// moves; they ship as two sibling kernels because a shared kernel would
+// budget registers for the deep path and cap occupancy for both.
+constexpr int kDeepPipeBlocks = 448;
 constexpr int kSiluThreads = 256;
 
 __device__ __forceinline__ int align_up_int(int value, int alignment) {
@@ -95,6 +106,168 @@ __device__ __forceinline__ unsigned mma_cvt_pair(unsigned char b0, unsigned char
   return *reinterpret_cast<unsigned*>(&bb);
 }
 
+// Full-K sweep over one tile's weight rows for this warp's kNTiles 16-row
+// n-tiles, pipelined kPipe super-chunks deep (see glm52_moe_gemv.cu for the
+// slot permutation argument). Depth only moves the load schedule: the mma
+// slot order and per-128-column scale application are unchanged, so every
+// kPipe instantiation produces bit-identical results.
+template <int kPipe>
+__device__ __forceinline__ void moe_ep_wo_k_sweep(
+    const __nv_bfloat16* __restrict__ activation,
+    const unsigned char* __restrict__ w_base,
+    const float* __restrict__ scale_base, int row_base, int live_rows,
+    int gid, int tid, int k, int scale_cols, int tile0,
+    float macc[kNTiles][4]) {
+  float cacc[kNTiles][4];
+#pragma unroll
+  for (int t = 0; t < kNTiles; ++t)
+#pragma unroll
+    for (int i = 0; i < 4; ++i) cacc[t][i] = 0.f;
+
+  // Per chain: weight rows (gid, gid+8) of its 16-row tile; one 16B packet
+  // per row per k64 super-chunk.
+  const unsigned char* w0[kNTiles];
+  const unsigned char* w1[kNTiles];
+#pragma unroll
+  for (int t = 0; t < kNTiles; ++t) {
+    const int n0 = (tile0 + t) * 16;
+    w0[t] = w_base + (size_t)(n0 + gid) * k + tid * 16;
+    w1[t] = w_base + (size_t)(n0 + gid + 8) * k + tid * 16;
+  }
+
+  if (kPipe == 2) {
+    // Shallow path: the original 2-deep single-pass loop, kept flat — the
+    // rotating-slot generalization below costs ~20 extra registers here,
+    // which drops the occupancy cap from 6 to 5 blocks/SM and stalls the
+    // bigger buckets on a second wave.
+    uint4 wp0[kNTiles], wp1[kNTiles];
+#pragma unroll
+    for (int t = 0; t < kNTiles; ++t) {
+      wp0[t] = __ldcs(reinterpret_cast<const uint4*>(w0[t]));
+      wp1[t] = __ldcs(reinterpret_cast<const uint4*>(w1[t]));
+    }
+    for (int kk = 0; kk < k; kk += 64) {
+      uint4 c0[kNTiles], c1[kNTiles];
+#pragma unroll
+      for (int t = 0; t < kNTiles; ++t) {
+        c0[t] = wp0[t]; c1[t] = wp1[t];
+        w0[t] += 64; w1[t] += 64;
+      }
+      if (kk + 64 < k) {
+#pragma unroll
+        for (int t = 0; t < kNTiles; ++t) {
+          wp0[t] = __ldcs(reinterpret_cast<const uint4*>(w0[t]));
+          wp1[t] = __ldcs(reinterpret_cast<const uint4*>(w1[t]));
+        }
+      }
+#pragma unroll
+      for (int s = 0; s < 4; ++s) {  // four k16 mma steps per k64 super-chunk
+        unsigned b01 = 0, b23 = 0;
+        if (gid < live_rows) {
+          const __nv_bfloat16* xrow =
+              activation + (size_t)(row_base + gid) * k + kk + tid * 16 + 4 * s;
+          const uint2 bv = *reinterpret_cast<const uint2*>(xrow);
+          b01 = bv.x; b23 = bv.y;
+        }
+#pragma unroll
+        for (int t = 0; t < kNTiles; ++t) {
+          const unsigned char* p0 = reinterpret_cast<const unsigned char*>(&c0[t]) + 4 * s;
+          const unsigned char* p1 = reinterpret_cast<const unsigned char*>(&c1[t]) + 4 * s;
+          unsigned a0 = mma_cvt_pair(p0[0], p0[1]);
+          unsigned a1 = mma_cvt_pair(p1[0], p1[1]);
+          unsigned a2 = mma_cvt_pair(p0[2], p0[3]);
+          unsigned a3 = mma_cvt_pair(p1[2], p1[3]);
+          asm volatile(
+              "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+              "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+              : "+f"(cacc[t][0]), "+f"(cacc[t][1]), "+f"(cacc[t][2]), "+f"(cacc[t][3])
+              : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b01), "r"(b23));
+        }
+      }
+      if (((kk + 64) & 127) == 0) {  // end of a 128-col scale group
+#pragma unroll
+        for (int t = 0; t < kNTiles; ++t) {
+          // A 16-row weight tile never straddles a /128 scale-row boundary.
+          const float scale =
+              scale_base[(size_t)(((tile0 + t) * 16) >> 7) * scale_cols + (kk >> 7)];
+#pragma unroll
+          for (int i = 0; i < 4; ++i) { macc[t][i] += scale * cacc[t][i]; cacc[t][i] = 0.f; }
+        }
+      }
+    }
+    return;
+  }
+
+  // Rotating slot s holds super-chunk kk/64 == s (mod kPipe); the inner
+  // sweep is unrolled by kPipe so every slot index is compile-time.
+  uint4 wp0[kPipe][kNTiles], wp1[kPipe][kNTiles];
+#pragma unroll
+  for (int s = 0; s < kPipe; ++s) {
+#pragma unroll
+    for (int t = 0; t < kNTiles; ++t) {
+      if (s * 64 < k) {
+        wp0[s][t] = __ldcs(reinterpret_cast<const uint4*>(w0[t]));
+        wp1[s][t] = __ldcs(reinterpret_cast<const uint4*>(w1[t]));
+      }
+      w0[t] += 64; w1[t] += 64;
+    }
+  }
+  for (int kk = 0; kk < k; kk += 64 * kPipe) {
+#pragma unroll
+    for (int u = 0; u < kPipe; ++u) {
+      const int ck = kk + u * 64;
+      if (ck >= k) break;
+      uint4 c0[kNTiles], c1[kNTiles];
+#pragma unroll
+      for (int t = 0; t < kNTiles; ++t) {
+        c0[t] = wp0[u][t]; c1[t] = wp1[u][t];
+      }
+      if (ck + 64 * kPipe < k) {
+#pragma unroll
+        for (int t = 0; t < kNTiles; ++t) {
+          wp0[u][t] = __ldcs(reinterpret_cast<const uint4*>(w0[t]));
+          wp1[u][t] = __ldcs(reinterpret_cast<const uint4*>(w1[t]));
+          w0[t] += 64; w1[t] += 64;
+        }
+      }
+#pragma unroll
+      for (int s = 0; s < 4; ++s) {  // four k16 mma steps per k64 super-chunk
+        unsigned b01 = 0, b23 = 0;
+        if (gid < live_rows) {
+          const __nv_bfloat16* xrow =
+              activation + (size_t)(row_base + gid) * k + ck + tid * 16 + 4 * s;
+          const uint2 bv = *reinterpret_cast<const uint2*>(xrow);
+          b01 = bv.x; b23 = bv.y;
+        }
+#pragma unroll
+        for (int t = 0; t < kNTiles; ++t) {
+          const unsigned char* p0 = reinterpret_cast<const unsigned char*>(&c0[t]) + 4 * s;
+          const unsigned char* p1 = reinterpret_cast<const unsigned char*>(&c1[t]) + 4 * s;
+          unsigned a0 = mma_cvt_pair(p0[0], p0[1]);
+          unsigned a1 = mma_cvt_pair(p1[0], p1[1]);
+          unsigned a2 = mma_cvt_pair(p0[2], p0[3]);
+          unsigned a3 = mma_cvt_pair(p1[2], p1[3]);
+          asm volatile(
+              "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+              "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+              : "+f"(cacc[t][0]), "+f"(cacc[t][1]), "+f"(cacc[t][2]), "+f"(cacc[t][3])
+              : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b01), "r"(b23));
+        }
+      }
+      if (((ck + 64) & 127) == 0) {  // end of a 128-col scale group
+#pragma unroll
+        for (int t = 0; t < kNTiles; ++t) {
+          // A 16-row weight tile never straddles a /128 scale-row boundary.
+          const float scale =
+              scale_base[(size_t)(((tile0 + t) * 16) >> 7) * scale_cols + (ck >> 7)];
+#pragma unroll
+          for (int i = 0; i < 4; ++i) { macc[t][i] += scale * cacc[t][i]; cacc[t][i] = 0.f; }
+        }
+      }
+    }
+  }
+}
+
 // One expert tile (<= 8 aligned rows, one weight matrix) x one 128-row output
 // chunk per block: the glm52_gemv_batched_mma_kernel structure with the
 // weight/scale bases resolved per tile from the expert bank and the batch
@@ -102,6 +275,15 @@ __device__ __forceinline__ unsigned mma_cvt_pair(unsigned char b0, unsigned char
 // partial scratch): accumulation order is fixed per shape, and the store is
 // the only global write. Blocks whose tile index is at or past *tile_count
 // retire immediately (capacity-shaped grid, graph-stable).
+//
+// kPipe selects the prefetch depth (see kDeepPipeTiles). The launcher fires
+// both sibling instantiations with complementary guards — a single kernel
+// branching between depths would budget registers for the deep path and cap
+// occupancy for both. The rows=1 bucket has only ~active-experts tiles, far
+// too few outstanding loads to cover HBM latency at 2-deep prefetch, while
+// the bigger buckets already oversubscribe DRAM and only lose row locality
+// with a deeper pipeline.
+template <int kPipe>
 __global__ __launch_bounds__(kMmaWarps* WARP_SIZE) void
 moe_ep_wo_masked_mma_kernel(
     const __nv_bfloat16* __restrict__ activation,  // [expanded, k] aligned rows
@@ -112,7 +294,12 @@ moe_ep_wo_masked_mma_kernel(
     const float* __restrict__ row_weights,  // per aligned row f32 scale, or null
     __nv_bfloat16* __restrict__ out,               // [expanded, n] aligned rows
     int n, int k) {
-  if (static_cast<int>(blockIdx.y) >= *tile_count) {
+  const int live_tiles = *tile_count;
+  if ((live_tiles * static_cast<int>(gridDim.x) <= kDeepPipeBlocks) !=
+      (kPipe == kPrefetch)) {
+    return;
+  }
+  if (static_cast<int>(blockIdx.y) >= live_tiles) {
     return;
   }
   const int2 tile = tiles[blockIdx.y];
@@ -130,79 +317,14 @@ moe_ep_wo_masked_mma_kernel(
   const int gid = lane >> 2, tid = lane & 3;
   const int scale_cols = k >> 7;
 
-  float macc[kNTiles][4], cacc[kNTiles][4];
+  float macc[kNTiles][4];
 #pragma unroll
   for (int t = 0; t < kNTiles; ++t)
 #pragma unroll
-    for (int i = 0; i < 4; ++i) { macc[t][i] = 0.f; cacc[t][i] = 0.f; }
+    for (int i = 0; i < 4; ++i) macc[t][i] = 0.f;
 
-  // Per chain: weight rows (gid, gid+8) of its 16-row tile; one 16B packet
-  // per row per k64 super-chunk, 2-deep prefetch (see glm52_moe_gemv.cu for
-  // the slot permutation argument).
-  const unsigned char* w0[kNTiles];
-  const unsigned char* w1[kNTiles];
-#pragma unroll
-  for (int t = 0; t < kNTiles; ++t) {
-    const int n0 = (tile0 + t) * 16;
-    w0[t] = w_base + (size_t)(n0 + gid) * k + tid * 16;
-    w1[t] = w_base + (size_t)(n0 + gid + 8) * k + tid * 16;
-  }
-
-  uint4 wp0[kNTiles], wp1[kNTiles];
-#pragma unroll
-  for (int t = 0; t < kNTiles; ++t) {
-    wp0[t] = __ldcs(reinterpret_cast<const uint4*>(w0[t]));
-    wp1[t] = __ldcs(reinterpret_cast<const uint4*>(w1[t]));
-  }
-  for (int kk = 0; kk < k; kk += 64) {
-    uint4 c0[kNTiles], c1[kNTiles];
-#pragma unroll
-    for (int t = 0; t < kNTiles; ++t) {
-      c0[t] = wp0[t]; c1[t] = wp1[t];
-      w0[t] += 64; w1[t] += 64;
-    }
-    if (kk + 64 < k) {
-#pragma unroll
-      for (int t = 0; t < kNTiles; ++t) {
-        wp0[t] = __ldcs(reinterpret_cast<const uint4*>(w0[t]));
-        wp1[t] = __ldcs(reinterpret_cast<const uint4*>(w1[t]));
-      }
-    }
-#pragma unroll
-    for (int s = 0; s < 4; ++s) {  // four k16 mma steps per k64 super-chunk
-      unsigned b01 = 0, b23 = 0;
-      if (gid < live_rows) {
-        const __nv_bfloat16* xrow =
-            activation + (size_t)(row_base + gid) * k + kk + tid * 16 + 4 * s;
-        const uint2 bv = *reinterpret_cast<const uint2*>(xrow);
-        b01 = bv.x; b23 = bv.y;
-      }
-#pragma unroll
-      for (int t = 0; t < kNTiles; ++t) {
-        const unsigned char* p0 = reinterpret_cast<const unsigned char*>(&c0[t]) + 4 * s;
-        const unsigned char* p1 = reinterpret_cast<const unsigned char*>(&c1[t]) + 4 * s;
-        unsigned a0 = mma_cvt_pair(p0[0], p0[1]);
-        unsigned a1 = mma_cvt_pair(p1[0], p1[1]);
-        unsigned a2 = mma_cvt_pair(p0[2], p0[3]);
-        unsigned a3 = mma_cvt_pair(p1[2], p1[3]);
-        asm volatile(
-            "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-            : "+f"(cacc[t][0]), "+f"(cacc[t][1]), "+f"(cacc[t][2]), "+f"(cacc[t][3])
-            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b01), "r"(b23));
-      }
-    }
-    if (((kk + 64) & 127) == 0) {  // end of a 128-col scale group
-#pragma unroll
-      for (int t = 0; t < kNTiles; ++t) {
-        // A 16-row weight tile never straddles a /128 scale-row boundary.
-        const float scale =
-            scale_base[(size_t)(((tile0 + t) * 16) >> 7) * scale_cols + (kk >> 7)];
-#pragma unroll
-        for (int i = 0; i < 4; ++i) { macc[t][i] += scale * cacc[t][i]; cacc[t][i] = 0.f; }
-      }
-    }
-  }
+  moe_ep_wo_k_sweep<kPipe>(activation, w_base, scale_base, row_base,
+                           live_rows, gid, tid, k, scale_cols, tile0, macc);
   // C fragment: c0=(weight row gid, col tid*2) c1=(gid, +1) c2=(gid+8, tid*2)
   // c3=(gid+8, +1); cols index the tile's live activation rows. The optional
   // per-row weight (the dispatch route weight on W2) scales the f32
@@ -306,8 +428,21 @@ CUresult glm52_moe_ep_wo_masked_mma_cuda(
     return CUDA_ERROR_INVALID_VALUE;
   }
   const int n_blocks = n / (16 * kNTiles * kMmaWarps);
-  moe_ep_wo_masked_mma_kernel<<<dim3(n_blocks, max_tiles),
-                                kMmaWarps * WARP_SIZE, 0, stream>>>(
+  const dim3 grid(n_blocks, max_tiles);
+  // Both depth siblings launch with complementary device-side guards; the
+  // one whose depth does not fit this bucket retires on one 4-byte read.
+  // The deep sibling can only activate when live_tiles * n_blocks <=
+  // kDeepPipeBlocks, so its grid y caps at kDeepPipeBlocks / n_blocks — when
+  // it is the dead sibling (the bigger buckets) that keeps its retire cost
+  // at a few hundred blocks instead of the full capacity-shaped grid.
+  const int deep_cap_raw = kDeepPipeBlocks / n_blocks;
+  const int deep_cap = deep_cap_raw < 1 ? 1 : deep_cap_raw;
+  const dim3 deep_grid(n_blocks, deep_cap < max_tiles ? deep_cap : max_tiles);
+  moe_ep_wo_masked_mma_kernel<kPrefetch>
+      <<<deep_grid, kMmaWarps * WARP_SIZE, 0, stream>>>(
+          activation, weight, weight_scale, tiles, tile_count, row_weights,
+          out, n, k);
+  moe_ep_wo_masked_mma_kernel<2><<<grid, kMmaWarps * WARP_SIZE, 0, stream>>>(
       activation, weight, weight_scale, tiles, tile_count, row_weights, out,
       n, k);
   return consume_last_cuda_error();
