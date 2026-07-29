@@ -1057,7 +1057,7 @@ fn decode_overlap_admission_counts_inflight_prefill_capacity() {
     let executor = FakeExecutor::new(8, Arc::clone(&dropped))
         .with_decode_overlap(Arc::clone(&decode_pause), Arc::clone(&async_prefill_gate));
     let handle = start_with_executor(executor, 42, DEFAULT_MAX_PREFILL_TOKENS);
-    let mut load_watch = handle.load_watch().expect("scheduler exposes load watch");
+    let load_watch = handle.load_watch().expect("scheduler exposes load watch");
 
     let (active_request, mut active_rx) = request(16, 3);
     handle
