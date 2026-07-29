@@ -624,7 +624,12 @@ fn scheduler_loop<E>(
         }
 
         // 2. Reclaim settled prefetches, then offer fresh requests to prefetch.
-        let reserve_floor = admitted_future_blocks(&executor, &active, &prefilling);
+        let reserve_floor = admitted_future_blocks_with_inflight(
+            &executor,
+            &active,
+            &prefilling,
+            inflight_prefill_pending.as_deref().unwrap_or(&[]),
+        );
         reclaim_ready_prefetch(&mut executor, &mut deferred, &mut loading, reserve_floor);
         offer_prefetch(&mut executor, &mut deferred, &mut loading, reserve_floor);
 
@@ -686,10 +691,11 @@ fn scheduler_loop<E>(
             release_rejected(&mut executor, &mut tracker, rejected);
         }
 
-        let admission = admit_deferred_requests(
+        let admission = admit_deferred_requests_with_inflight(
             lora_validation.accepted,
             &active,
             &prefilling,
+            inflight_prefill_pending.as_deref().unwrap_or(&[]),
             executor.block_size(),
             executor.available_blocks(),
             executor.max_request_blocks(),
@@ -1178,9 +1184,21 @@ fn admitted_future_blocks<E: ModelExecutor>(
     active: &[ActiveRequestState],
     prefilling: &[PendingRequest],
 ) -> usize {
+    admitted_future_blocks_with_inflight(executor, active, prefilling, &[])
+}
+
+fn admitted_future_blocks_with_inflight<E: ModelExecutor>(
+    executor: &E,
+    active: &[ActiveRequestState],
+    prefilling: &[PendingRequest],
+    inflight_prefilling: &[PendingRequest],
+) -> usize {
     let block_size = executor.block_size();
     active_future_blocks(active, block_size)
         + prefilling_future_blocks(prefilling, block_size, |id| executor.prefetched_blocks(id))
+        + prefilling_future_blocks(inflight_prefilling, block_size, |id| {
+            executor.prefetched_blocks(id)
+        })
 }
 
 fn prefilling_future_blocks(
@@ -1220,10 +1238,42 @@ pub const DEFAULT_MAX_PREFILL_TOKENS: usize = 1024;
 fn admit_deferred_requests(
     deferred: Vec<PendingRequest>,
     active: &[ActiveRequestState],
+    prefilling: &[PendingRequest],
+    block_size: usize,
+    available_blocks: usize,
+    max_request_blocks: usize,
+    max_context_tokens: usize,
+    max_decode_batch_size: usize,
+    max_prefill_tokens: usize,
+    prefetch_credit: impl Fn(RequestId) -> usize,
+) -> AdmissionOutcome {
+    admit_deferred_requests_with_inflight(
+        deferred,
+        active,
+        prefilling,
+        &[],
+        block_size,
+        available_blocks,
+        max_request_blocks,
+        max_context_tokens,
+        max_decode_batch_size,
+        max_prefill_tokens,
+        prefetch_credit,
+    )
+}
+
+fn admit_deferred_requests_with_inflight(
+    deferred: Vec<PendingRequest>,
+    active: &[ActiveRequestState],
     // Admitted requests still mid-prefill: they hold KV for their applied
     // chunks and will take a decode slot when they promote, so admission
     // must reserve both or completing chunks can overshoot capacity.
     prefilling: &[PendingRequest],
+    // A decode-overlap prefill is temporarily removed from `prefilling` while
+    // its GPU work is in flight, but it still owns the same KV blocks and
+    // eventual decode slot. Keep it in the accounting view until its result
+    // is applied.
+    inflight_prefilling: &[PendingRequest],
     block_size: usize,
     available_blocks: usize,
     max_request_blocks: usize,
@@ -1242,10 +1292,16 @@ fn admit_deferred_requests(
             prefilling,
             block_size,
             &prefetch_credit,
+        ))
+        .saturating_sub(prefilling_future_blocks(
+            inflight_prefilling,
+            block_size,
+            &prefetch_credit,
         ));
     let mut decode_slots = max_decode_batch_size
         .saturating_sub(active.len())
-        .saturating_sub(prefilling.len());
+        .saturating_sub(prefilling.len())
+        .saturating_sub(inflight_prefilling.len());
     let mut pending = Vec::new();
     let mut still_deferred = Vec::new();
     let mut rejected = Vec::new();

@@ -1050,6 +1050,73 @@ fn decode_overlap_idle_wait_resolves_prefill_before_final_handle_drop() {
 }
 
 #[test]
+fn decode_overlap_admission_counts_inflight_prefill_capacity() {
+    let dropped = Arc::new(Mutex::new(Vec::new()));
+    let decode_pause = Arc::new(DecodePause::new());
+    let async_prefill_gate = Arc::new(AsyncPrefillGate::new());
+    let executor = FakeExecutor::new(8, Arc::clone(&dropped))
+        .with_decode_overlap(Arc::clone(&decode_pause), Arc::clone(&async_prefill_gate));
+    let handle = start_with_executor(executor, 42, DEFAULT_MAX_PREFILL_TOKENS);
+    let mut load_watch = handle.load_watch().expect("scheduler exposes load watch");
+
+    let (active_request, mut active_rx) = request(16, 3);
+    handle
+        .submit(active_request)
+        .expect("submit active request");
+    assert!(matches!(
+        recv_skipping_scheduled(&mut active_rx),
+        Some(TokenEvent::Token { id: 100, .. })
+    ));
+
+    decode_pause.started.wait();
+    let (overlap_request, mut overlap_rx) = request(16, 1);
+    handle
+        .submit(overlap_request)
+        .expect("submit overlap request");
+    decode_pause.release.wait();
+
+    assert!(wait_until(Duration::from_secs(1), || {
+        async_prefill_gate.wait_calls.load(Ordering::SeqCst) > 0
+    }));
+
+    let (deferred_request, mut deferred_rx) = request(16, 1);
+    handle
+        .submit(deferred_request)
+        .expect("submit request during async prefill");
+
+    // The active request and the in-flight prefill already occupy two
+    // scheduler slots. The third request must remain deferred until the
+    // asynchronous prefill is resolved.
+    let over_admitted = wait_until(Duration::from_secs(1), || {
+        load_watch.borrow().num_running_reqs > 2
+    });
+
+    async_prefill_gate.release();
+    assert!(matches!(
+        try_recv_event_with_timeout(&mut overlap_rx, Duration::from_secs(1)),
+        Some(TokenEvent::Token { id: 101, .. })
+    ));
+    assert!(matches!(
+        try_recv_event_with_timeout(&mut overlap_rx, Duration::from_secs(1)),
+        Some(TokenEvent::Finished { .. })
+    ));
+    assert!(matches!(
+        try_recv_event_with_timeout(&mut deferred_rx, Duration::from_secs(1)),
+        Some(TokenEvent::Token { id: 102, .. })
+    ));
+    assert!(matches!(
+        try_recv_event_with_timeout(&mut deferred_rx, Duration::from_secs(1)),
+        Some(TokenEvent::Finished { .. })
+    ));
+    drop(handle);
+
+    assert!(
+        !over_admitted,
+        "in-flight async prefill must reserve its scheduler slot before admitting new requests"
+    );
+}
+
+#[test]
 fn decode_overlap_missing_result_reports_chain_and_stops_scheduler() {
     let dropped = Arc::new(Mutex::new(Vec::new()));
     let decode_pause = Arc::new(DecodePause::new());
