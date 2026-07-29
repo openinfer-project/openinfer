@@ -208,7 +208,11 @@
   - **agent 并行调优基建**：tray03 每 agent 独立 worktree（kl-a/kl-b，避免 cargo target 锁与
     .cu 半成品互染）+ 独立 GPU（CUDA_VISIBLE_DEVICES 钉卡）；openinfer-kernel-lab worktree
     永保干净做基线。
-  - 引擎 A/B（候选 kl-a vs 基线同会话）结果待补。
+  - **引擎 A/B（同会话背靠背）**：bucket-1 22.73→21.75ms（**-4.3%，预测 -0.7ms 实测
+    -0.98ms**）；bucket 2/4/8 +0.5~0.7%（死兄弟启动开销，预测 +0.24ms 一致）——内核级
+    测量精确预测引擎级结果，harness 可信度闭环。净收益为正，入库；死启动开销的消除
+    方案（device 条件启动）与 smem 宽连续加载（DRAM activate-bound，rows=1 预计再 -30%）
+    列为下一轮调优卡；EP8/16 的 kDeepPipeBlocks=448 分类阈值需单独实测。
 
 - 2026-07-29 GB300 bench：23/23 单元首批基线落账（`baselines/<unit>.json`）:
   - 全 rows 轴（各单元支持范围内）× 默认 ctx；30 rounds × 10 inner，clocks.sm=2070 MHz，
