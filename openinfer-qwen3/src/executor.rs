@@ -1888,6 +1888,21 @@ impl Qwen3Executor {
         Ok(())
     }
 
+    /// Resolve a prefill after a fallible decode-side handoff step failed.
+    ///
+    /// The scheduler will drop the requests touched by the failed step, but the
+    /// worker still owns the prefill buffers until its stream is synchronized
+    /// and its in-flight state is consumed. Preserve the original execution
+    /// error while making cleanup failure visible as additional context.
+    fn resolve_async_prefill_after_error(&mut self, error: anyhow::Error) -> anyhow::Error {
+        match <Self as ModelExecutor>::wait_async_prefill(self) {
+            Ok(_) => error,
+            Err(cleanup_error) => error.context(format!(
+                "failed to clean up async prefill after execution error: {cleanup_error:#}"
+            )),
+        }
+    }
+
     /// vLLM-style `--no-prefix-cache`. Behaviour depends on whether offload is
     /// active:
     ///   * **No offload** — classic: disable prefix matching outright, so every
@@ -3322,21 +3337,6 @@ impl ModelExecutor for Qwen3Executor {
         self.poll_async_prefill()
             .ok_or_else(|| anyhow::anyhow!("async prefill completed without a result"))
     }
-
-    /// Resolve a prefill after a fallible decode-side handoff step failed.
-    ///
-    /// The scheduler will drop the requests touched by the failed step, but the
-    /// worker still owns the prefill buffers until its stream is synchronized
-    /// and its in-flight state is consumed. Preserve the original execution
-    /// error while making cleanup failure visible as additional context.
-    fn resolve_async_prefill_after_error(&mut self, error: anyhow::Error) -> anyhow::Error {
-        match self.wait_async_prefill() {
-            Ok(_) => error,
-            Err(cleanup_error) => error.context(format!(
-                "failed to clean up async prefill after execution error: {cleanup_error:#}"
-            )),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -3732,7 +3732,7 @@ impl LocalQwen3Lane {
 
     /// Sync the in-flight prefill stream and sample prefill tokens.
     fn resolve_inflight_prefill(&mut self) -> Result<PrefillResult> {
-        let mut state = self
+        let state = self
             .inflight_prefill
             .take()
             .ok_or_else(|| anyhow::anyhow!("no inflight prefill to resolve"))?;

@@ -507,7 +507,7 @@ impl Qwen3Model {
         let seq_lens: Vec<usize> = prompts.iter().map(|p| p.len()).collect();
         let lora_ranges =
             build_lora_token_ranges(seq_lens.iter().copied(), lora_adapters.iter().copied());
-        let mut lora_groups = prepare_lora_token_groups(&self.ctx, &lora_ranges)?;
+        let lora_groups = prepare_lora_token_groups(&self.ctx, &lora_ranges)?;
         let start_positions: Vec<usize> = kv_views
             .iter()
             .zip(prompts.iter())
