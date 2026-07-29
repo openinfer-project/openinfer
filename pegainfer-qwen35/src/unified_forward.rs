@@ -72,7 +72,7 @@ impl Qwen35Model {
         let cu_stream = stream.cu_stream();
         let original_stream = std::mem::replace(&mut self.ctx.stream, stream);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _stream_override = unsafe { StreamOverrideGuard::activate(cu_stream) };
+            let _stream_override = unsafe { StreamOverrideGuard::activate_prefill(cu_stream) };
             self.batch_prefill_logits(prompts, kv_states, recurrent_states)
         }));
         self.ctx.stream = original_stream;

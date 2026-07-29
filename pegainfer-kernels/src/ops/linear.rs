@@ -803,10 +803,9 @@ fn launch_gemm(
         NumericPolicy::PerToken => return launch_gemm_pertoken(w_ptr, x_ptr, y_ptr, m, n, k, ctx),
         NumericPolicy::Tuned => {}
     }
-    // A stream override denotes split-concurrent prefill. Keep even N=1
-    // projections on the dedicated prefill handle so they cannot rebind the
-    // graph-safe decode handle while a decode graph is running.
-    let graphsafe = graphsafe && !crate::tensor::has_stream_override();
+    // Split-concurrent prefill must keep even N=1 projections on its dedicated
+    // handle so it cannot rebind the graph-safe decode handle.
+    let graphsafe = graphsafe && !crate::tensor::has_prefill_stream_override();
     unsafe {
         // Small-N projections run the cublasLt algo selected by gemm_lt_tune.
         // Shapes this thread never tuned report GEMM_LT_UNTUNED and keep their

@@ -90,6 +90,11 @@ Unsupported combinations fail before model loading:
   Prefill-associated actions now publish their own active-width distribution;
   a synthetic overlap launch/decode/complete/wait log reports `decode_n=4`
   while counting the 8192-token chunk once.
+- RLCR found that treating every `StreamOverrideGuard` as prefill also disabled
+  graph-safe N=1 GEMMs for existing Qwen3 decode/Green Context overrides. A
+  nested, RAII-restored prefill marker now narrows that routing rule to Qwen3.5
+  async prefill. Its unit test and affected Qwen3/Qwen3.5 builds passed, and the
+  Shared-SM lifecycle gate still observed two `overlap_wait` actions.
 
 ## Verification Contract
 
@@ -98,7 +103,7 @@ Unsupported combinations fail before model loading:
 | GPU | 1x NVIDIA GeForce RTX 5090, 32 GB |
 | Driver / CUDA toolkit | `595.71.05` / `12.8.93`, target `sm_120` |
 | Rust / Triton build env | nightly 2026-07-10 / Triton 3.7.1 |
-| Source | upstream/main `e3f91120` plus this patch; validation source matched the local tree by checksum |
+| Source | benchmark binaries: `c405b556` on upstream/main `e3f91120`; the RLCR follow-up only narrows generic-vs-prefill override classification and was separately GPU-lifecycle verified |
 | Model | `Qwen/Qwen3.5-4B`, revision `851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a` |
 | HTTP client | vLLM 0.25.1 `bench serve` only; no vLLM server was used |
 | Server binary sha256 | `5f19998277f4be7577846cf3e78bc3fef43151a5add0b0a56dd443a06d39b091` |
