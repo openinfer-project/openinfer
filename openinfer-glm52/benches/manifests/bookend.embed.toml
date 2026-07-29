@@ -1,0 +1,22 @@
+unit = "bookend.embed"
+phase = 1
+symbol = "embedding_batched_cuda"
+adapter = "bookend_embed"
+# Portable kernel (uint4/scalar row copy, no arch gate); baselines stay
+# arch-bucketed in the ledger. Runs anywhere torch+cUDA do.
+capability = { blackwell_only = false }
+[axes]
+rows = [1, 2, 4, 8, 16, 32, 64]
+[shape]
+n = 154880  # GLM52_VOCAB (openinfer-glm52/src/config.rs)
+k = 6144    # GLM52_HIDDEN
+[contract]
+inputs = "table[154880, 6144] bf16 (model.embed_tokens.weight, 1.9 GB, seeded procedural normal); token_ids[rows] u32 device-resident (production: scheduler rewrites in place each decode step, CUDA-graph safe)"
+outputs = "out[rows, 6144] bf16 — out[r] = table[token_ids[r]], pure row gather"
+accumulation = "none — bit copy (vec4 uint4 path: hidden%8==0 and 16B-aligned base ptrs, both hold here; scalar fallback otherwise)"
+notes = "Production wrapper: glm52_embed_into (openinfer-glm52/src/bookend.rs:28) -> embedding_rows_into -> embedding_batched_cuda (csrc/shared/elementwise.cu:632). Kernel does NOT bounds-check ids; the factory draws ids ~ U[0, 154880). Any rows value is legal (grid is (seq_len, row_segs)); rows 16-64 are the MTP span-mapped verify rows. derive_shapes' weight_bytes counts n*k elements — the real bf16 table is 2x that (1,903,165,440 B)."
+[reference]
+mode = "torch_tolerance"
+[reference.tolerance]
+rel_l2 = 1e-06
+note = "Exact-gate: a correct gather is a bit copy, so rel_l2 is exactly 0.0. The tolerance only trips on systematic layout/stride bugs (wrong row gathered => rel_l2 ~= sqrt(2); wrong base/stride => O(1)). Not a measured constant — the semantics leave no numeric slack to measure."

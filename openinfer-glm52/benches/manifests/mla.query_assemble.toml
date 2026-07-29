@@ -1,0 +1,23 @@
+unit = "mla.query_assemble"
+phase = 1
+symbol = "glm52_mla_query_assemble_cuda"
+adapter = "mla_query_assemble"
+capability = { blackwell_only = true }
+[axes]
+rows = [1, 2, 4, 8, 16, 32, 64]
+ctx = [16384, 65536, 262144]
+[shape]
+# n/k keep `kernel_lab list` 派生表的 act/out 行有意义（flattened 全头宽）；
+# 权威 shape 表 = kernel_lab.refs.mla_attention.query_assemble_buffers。
+n = 36864
+k = 32768
+[contract]
+inputs = "ql_nope[rows,64,512] bf16（absorb GEMM 输出，紧凑头布局）；q_full[rows,64,256] bf16（q_b 输出，q_pe 原地读 [..,192:256]，production offset=192 stride=256，mla_decode.rs:474）；cos/sin[rows,32] bf16（每 token 一行 rotary 前半）"
+outputs = "query[rows,64,576] bf16 = [ql_nope | interleave-RoPE(q_pe)]；heads=64 全宽写出（num_q_heads<64 时 pad 槽保持调用方零填充，本单元不扫）"
+accumulation = "f32 单步（RoPE）；nope 段纯拷贝"
+notes = "grid (64, rows) x 192 线程，rows 无上界 → rows 16/32/64（MTP span-mapped verify 行）原生支持且逐行 bit-identical，零 .cu 改动。ctx 轴仅为 attention 组账面对齐：内核成本/语义与 ctx 无关（sweep 按轴重复同一 shape 三次）。blackwell_only 是调优台口径，内核本身 arch-generic。派生表 weight/scale 行对本 glue 内核无意义"
+[reference]
+mode = "torch_tolerance"
+[reference.tolerance]
+rel_l2 = 1e-09
+note = "构造上 bit-exact：bf16 x bf16 乘积在 f32 精确（8 位尾数）、单次舍入加减与 FMA 等值、两侧 RNE bf16 store（论证见 kernel_lab.refs.mla_attention）；任何 rel_l2 > 0 即 bug。UNMEASURED——GB300 首测在此确认 0.0 并回填机器名"

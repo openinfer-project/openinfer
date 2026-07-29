@@ -646,12 +646,22 @@ MmaConfig mma_config(int batch, int n, int k) {
     if (n == 128   && k == 6144) return {16, 2};  // indexer wk
   }
   // MTP verify / large-batch rows (16/32/64 = BTILES 2/4/8 of the
-  // multi-subtile mma). Blackwell-only initial picks mirroring the batch-8
-  // winners — UNMEASURED placeholders: the first kernel_lab GB300 sweep owns
-  // replacing them (docs/models/glm52/decode-op-bench-harness.md). No Hopper
-  // entries: off-Blackwell these batches get {0,0} and fail closed.
+  // multi-subtile mma). Blackwell-only initial picks — UNMEASURED
+  // placeholders: the first kernel_lab GB300 sweep owns replacing them
+  // (docs/models/glm52/decode-op-bench-harness.md). No Hopper entries:
+  // off-Blackwell these batches get {0,0} and fail closed.
   if (arch_is_blackwell() && (batch == 16 || batch == 32 || batch == 64)) {
-    if (n == 16384 && k == 2048) return {4, 1};   // q_b
+    if (n == 16384 && k == 2048)  return {4, 1};  // q_b (mirrors the batch-8 winner)
+    // o_proj deliberately does NOT mirror its batch-8 winner {16,2}: at
+    // rows>=16 the tensor-core work per weight byte already scales with
+    // batch, so a long-k weight-bound GEMV starts with a shallow split.
+    // Same UNMEASURED placeholder contract as q_b — the sweep owns the pick.
+    if (n == 6144  && k == 16384) return {4, 1};  // o_proj
+    // shared-expert SwiGLU pair (kernel_lab shared_expert.swiglu): same
+    // shallow-split start as o_proj — at rows>=16 the tensor-core work per
+    // weight byte already scales with batch. UNMEASURED placeholders.
+    if (n == 4096  && k == 6144)  return {4, 1};  // shared gate|up
+    if (n == 6144  && k == 2048)  return {4, 1};  // shared down
   }
   return {0, 0};
 }

@@ -1,0 +1,22 @@
+unit = "bookend.lm_head"
+phase = 1
+symbol = "gemm_strided_batched_bf16_cuda"
+adapter = "bookend_lm_head"
+# Plain cuBLAS bf16 GEMM on the graph-safe handle — portable; the adapter
+# calls cublas_init() once per loaded .so first (the handle is per-dlopen).
+capability = { blackwell_only = false }
+[axes]
+rows = [1, 2, 4, 8, 16, 32, 64]
+[shape]
+n = 154880  # GLM52_VOCAB — cuBLAS m
+k = 6144    # GLM52_HIDDEN — cuBLAS k
+[contract]
+inputs = "normed[rows, 6144] bf16 (post-final-RMSNorm hidden); lm_head[154880, 6144] bf16 (1.9 GB, seeded procedural normal — this is the weight-BW floor unit: every launch streams the full matrix once)"
+outputs = "logits[rows, 154880] bf16, compact row-major == cuBLAS col-major C[154880, rows] with ldc=154880 (the layout argmax_split consumes)"
+accumulation = "f32 (CUBLAS_COMPUTE_32F + CUBLAS_GEMM_DEFAULT_TENSOR_OP), bf16 store"
+notes = "Exact production call (openinfer-glm52/src/bookend.rs:63 glm52_lm_head_into): op_a=T op_b=N, m=vocab, n=rows, k=hidden, A=lm_head lda=6144 stride 0, B=normed ldb=6144 stride 0, C=out ldc=vocab stride 0, batch_count=1 — one cublasGemmStridedBatchedEx on the workspace-free graph-safe handle (csrc/shared/linear.cu:369). cuBLAS picks the algo/split-k per (rows, arch); rows 16-64 need nothing new."
+[reference]
+mode = "torch_tolerance"
+[reference.tolerance]
+rel_l2 = 0.02
+note = "bf16 store floor: per-logit round-to-nearest is <= 2^-8 relative, so the f32-reference gate sits at ~4e-3; cuBLAS vs torch f32 accumulation-order noise is ~sqrt(6144)*2^-24, two orders below. 0.02 = the demo unit's constant with ~5x headroom. UNMEASURED — GB300 first run backfills the measured value and machine here."

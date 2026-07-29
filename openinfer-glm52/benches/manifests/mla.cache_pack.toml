@@ -1,0 +1,24 @@
+unit = "mla.cache_pack"
+phase = 1
+symbol = "glm52_mla_cache_pack_cuda"
+adapter = "mla_cache_pack"
+capability = { blackwell_only = true }
+[axes]
+rows = [1, 2, 4, 8, 16, 32, 64]
+ctx = [16384, 65536, 262144]
+[shape]
+# n = 656 token 字节数、 k = 512 ckv 宽度：list 派生 act = rows x 512 输入
+# 字节、out = rows x 656 写入字节恰好正确；weight/scale 行无意义。
+# 权威 shape 表 = kernel_lab.refs.mla_attention.cache_pack_buffers。
+n = 656
+k = 512
+[contract]
+inputs = "ckv_fp8[rows,512] e4m3（UE8M0 quant 输出风格，无 NaN 码）；ckv_scales[rows,4] f32 **必须 2 的幂向上取整**（2^ceil(log2(amax/448))；harness 内建 pow2 断言，docs/lessons/flashmla-sm100-ue8m0-kv-scales.md）；k_pe[rows,64] bf16 pre-rope；cos/sin[rows,32] bf16；slot_mapping[rows] i64 distinct ∈ [0, ctx)"
+outputs = "cache[ctx,656] u8 paged tokens = [512 e4m3 | 16B f32 scales | 128B bf16 interleave-RoPE(k_pe)]，page = 64 token；slot 来自 device 内存（CUDA-graph 可重放），越界 slot 内核 __trap"
+accumulation = "无（字节拷贝 + f32 单步 RoPE）"
+notes = "grid rows x 128 线程，rows 无上界 → rows 16/32/64 原生支持逐行 bit-identical，零 .cu 改动。ctx 决定 paged 窗口 max_slots（= ctx）；写入成本 O(rows x 656B) 与窗口无关。生产调用 mla_decode.rs:501（上游 glm52_fp8_per_token_group_quant_bf16_ue8m0）。blackwell_only 是调优台口径，内核本身 arch-generic"
+[reference]
+mode = "torch_tolerance"
+[reference.tolerance]
+rel_l2 = 1e-09
+note = "字节级对拍：拷贝段 bit-exact，rope 段同 mla.query_assemble 的 bit-exact 论证；scale 区 pow2 由 harness 断言兜底（非 pow2 直接 AssertionError，非容差事件）。UNMEASURED——GB300 首测确认 0.0 并回填机器名"

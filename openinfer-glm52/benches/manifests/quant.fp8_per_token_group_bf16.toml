@@ -1,0 +1,24 @@
+unit = "quant.fp8_per_token_group_bf16"
+phase = 1
+symbol = "glm52_fp8_per_token_group_quant_bf16_cuda"
+adapter = "quant_fp8_per_token_group_bf16"
+capability = { blackwell_only = false }
+[axes]
+rows = [1, 2, 4, 8, 16, 32, 64]
+[shape]
+# quant 保宽：n = out 宽度 = k = in 宽度。shape.* 里 GEMV 味的派生字段
+# （weight_bytes / scale_len_bytes / scratch_rule）对本单元不适用 —— 真实
+# 缓冲推导见 notes 与 refs/quant.py packed_surface_len。
+n = 6144
+k = 6144
+group_size = 128
+[contract]
+inputs = "act[rows,6144] bf16（normed hidden；decode 路径 mla_front q_a/kv_a、indexer wq_b/wk、dense gate_up/down 的 FP8 GEMM 输入量化，prefill MoE TP chunk 同内核）"
+outputs = "out[rows,6144] e4m3 uint8；scales[rows,48] f32（per-128-group amax/448，eps=1e-10 下钳）"
+accumulation = "n/a（elementwise + 每组 128 线程 f32 max-reduce；无跨组累加）"
+notes = "内核行无关：grid=(min(rows,256), 48) block=128，grid-stride 行循环（masked EP twin 同循环跑 2080 行 recv 容量）→ rows 全轴 {1..64} 零 .cu 改动、无 shape 白名单、无 scratch。真实缓冲/行：act 12288 B、out 6144 B、scales 192 B（rows*48*4）。indexer per-head q 量化是同一内核 hidden=128（rows=t*32），本单元钉 decode 主宽度 H=6144（GLM52_HIDDEN，mla_front/indexer/dense 三处调用点）。内核本体无 sm100 专有指令（Hopper 生产同跑），blackwell_only=false；账本按 arch 分桶，H200 数字不迁移。check 比较面 = out 打包 [e4m3 bytes | scales 原始 LE 字节]，rel_l2 门即 bit-exact 门；输入工厂在 group(0,0) 注入全零以覆盖 eps 下钳分支"
+[reference]
+mode = "torch_tolerance"
+[reference.tolerance]
+rel_l2 = 1e-6
+note = "bit-exact 目标（UNMEASURED — 待 GB300 首测回填实测值与机器名）：kernel 编码 = PTX cvt.rn.satfinite.e4m3x2.f32（RNE + 饱和有限），torch 参考 = float8_e4m3fn cast（c10 RNE）且双侧预钳 ±448（satfinite 与溢出 NaN 之分不触发，midpoint tie 双侧同落偶数尾数）；scale 全 f32 IEEE（max-reduce 序无关 + clamp + div.rn/448，1e-10/448 字面量双侧同 f32）。推导：任一输出字节或 scale-bit 差异 ⇒ rel_l2 ≥ ~1e-4（最小面对 rows=1 约 2e-4，norm≈RMS(byte)*sqrt(6336)）≫ 1e-6，故 1e-6 等价 bit-exact 门，余量 ≥100x。若首测非零：查 cvt 舍入模式 / torch cast 实现差异，按 1 e4m3 encode step（每元素相对 ≤2^-3，实测远小）推导新界并记录于此"

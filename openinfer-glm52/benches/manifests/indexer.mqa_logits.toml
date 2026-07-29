@@ -1,0 +1,25 @@
+unit = "indexer.mqa_logits"
+phase = 1
+symbol = "glm52_deepgemm_paged_mqa_logits_cuda"
+adapter = "indexer_mqa_logits"
+capability = { blackwell_only = false }
+[axes]
+rows = [1, 2, 4, 8, 16, 32]
+ctx = [16384, 65536, 262144]
+[shape]
+# n/k 为 schema 占位语义：n = index heads、k = head_dim（真实派生表见 tests/test_indexer.py）。
+n = 32
+k = 128
+next_n = 1
+block_kv = 64
+num_sms = 132
+[contract]
+inputs = "q_fp8[rows*32*128] e4m3（原始码，q_scale 已折进 weights）、cache u8[rows*ctx/64 blocks * 8448B]（fp8+f32 scale 交错）、weights_folded[rows,32] f32、context_lens[rows] i32、block_table[rows,ctx/64] i32"
+outputs = "logits[rows, ctx] bf16（logits_stride=ctx，%256==0）；语义 logit[j]=sum_h relu(q_h·k_j_deq)*w_h（ReLU+per-head 加权核内融合，无 Hadamard）"
+accumulation = "f32（fp8 tensor-core mma 累加；bf16 写出）"
+notes = "每次 run = 生产同款双发射：metadata（schedule）+ logits（openinfer-glm52/src/indexer.rs:538-560）。AOT 实例化硬界（glm52_deepgemm_mqa.cu，sm90a/sm100f 两段）：batch<=32（kAotAlignedBatchSize）→ BLOCKED rows=64；num_sms==132（kAotNumSms，生产 model/mod.rs NUM_SMS 同源钉死）；next_n=1、heads=32、head_dim=128、block_kv=64、非 varlen/非 2d。sm_90a(Hopper)/sm_100f(Blackwell) 均可，其它 arch 编译为 NOT_SUPPORTED stub。仅比 [0, context_lens[r]) 列——其后是调度器越界区"
+[reference]
+mode = "torch_tolerance"
+[reference.tolerance]
+rel_l2 = 0.02
+note = "bf16 store floor（2^-8 相对量级）+ fp8-mma f32 结合序重排；UNMEASURED——首次 GB300 实测后回填 measured 值与机器"

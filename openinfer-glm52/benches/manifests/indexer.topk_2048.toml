@@ -1,0 +1,23 @@
+unit = "indexer.topk_2048"
+phase = 1
+symbol = "glm52_flashinfer_topk_2048_cuda"
+adapter = "indexer_topk_2048"
+capability = { blackwell_only = false }
+[axes]
+rows = [1, 2, 4, 8, 16, 32, 64]
+ctx = [16384, 65536, 262144]
+[shape]
+# n/k 为 schema 占位语义：n = top_k、k = ctx 轴下限（真实派生表见 tests/test_indexer.py）。
+n = 2048
+k = 16384
+top_k = 2048
+[contract]
+inputs = "logits[rows, max_len] f32（max_len=ctx+256：有效区 bf16 量化值上转——生产为 DeepGEMM bf16 logits 的 cast；[len_r, max_len) 填 1e30 陈旧尾作阴性对照）、lengths[rows] i32（逐行互异，>=2048）"
+outputs = "indices[rows,2048] i32（LaunchSortTopKByIndex：按 index 升序）、values[rows,2048] f32"
+accumulation = "无（选择算子）"
+notes = "FlashInfer FilteredTopK(deterministic=true, TopKTieBreak::Small, dsa_graph_safe=true) + SortTopKByIndex（glm52_topk.cu，绕过 TopKDispatch 以传 per-row lengths）。tie 规则：等值取小 index——torch 参考用 stable 降序 sort 复现；smem ~128KB，pre-Hopper 返回 NOT_SUPPORTED（fail-closed）。lengths 过滤是合同一部分（glm52_indexer_smoke.rs 的回归测试）：1e30 尾若漏滤必赢 topk"
+[reference]
+mode = "torch_tolerance"
+[reference.tolerance]
+rel_l2 = 1e-12
+note = "真门 = reference 内断言（oracle 同纪律）：逐行 index 集合 overlap>=2047/2048 且分歧仅限 f32 等值 tie；values 多重集精确全等。rel_l2 作用于按值排序后的 values（tie 换序不变量），仅 CLI 兜底；UNMEASURED"

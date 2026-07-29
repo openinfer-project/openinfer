@@ -15,7 +15,38 @@ sys.path.insert(0, str(BENCHES))
 from kernel_lab import loader, manifest, registry  # noqa: E402
 
 MANIFESTS = BENCHES / "manifests"
-EXPECTED_PHASE1_UNITS = {"mla_front.q_b_gemv"}
+EXPECTED_PHASE1_UNITS = {
+    "mla_front.q_b_gemv",
+    # norm group (one unit per line so parallel groups can append theirs).
+    "norm.fused_add_rmsnorm_round",
+    "norm.q_a_layernorm",
+    "norm.rms_norm",
+    # quant group.
+    "quant.fp8_per_token_group_bf16",
+    "quant.fp8_per_token_group_bf16_ue8m0",
+    # indexer group.
+    "indexer.weights_proj",
+    "indexer.rope",
+    "indexer.k_quant_cache",
+    "indexer.mqa_logits",
+    "indexer.topk_2048",
+    "indexer.local_topk_to_slots",
+    # attention group.
+    "mla.query_assemble",
+    "mla.cache_pack",
+    "flashmla_sparse.decode",
+    # bookends+shared group.
+    "bookend.embed",
+    "bookend.lm_head",
+    "bookend.argmax_split",
+    "shared_expert.swiglu",
+    # proj-gemv + router groups (registered on their behalf — landed without
+    # updating this set; verified complete and discovering cleanly).
+    "mla_front.o_proj_gemv",
+    "mla_front.qa_kva_pair_gemv",
+    "router.noaux_tc",
+    "router.select",
+}
 EXPECTED_ROWS = {1, 2, 4, 8, 16, 32, 64}
 
 

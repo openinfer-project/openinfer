@@ -1,0 +1,22 @@
+unit = "mla_front.qa_kva_pair_gemv"
+phase = 1
+symbol = "glm52_fp8_weight_only_gemv_pair_cuda"
+adapter = "mla_front_qa_kva_pair_gemv"
+capability = { blackwell_only = true }
+[axes]
+rows = [1]
+[shape]
+n = 2624
+k = 6144
+n_a = 2048
+n_b = 576
+[contract]
+inputs = "act[k] bf16（单行激活）; weight_a[2048,k] e4m3 + scales_a[16, k/128] f32; weight_b[576,k] e4m3 + scales_b[5, k/128] f32（均为 checkpoint weight_scale_inv raw bytes；kv_a 为 partial-N：576%128!=0，scale 仍按 ceil 给 5 行）"
+outputs = "out_a[2048] bf16; out_b[576] bf16（harness 侧呈现为同一 [2624] bf16 缓冲的两个视图，check 对拼接参考一次性计分）"
+accumulation = "f32"
+notes = "rows=[1]：生产仅用于 bs=1 —— 唯一调用点是 glm52_mla_front_q_into 的 t==1 分支（openinfer-glm52/src/mla_front.rs，t>1 改走 packed qa_kva batched-mma 路径 fp8_linear_partials_into + split_reduce），且 CUDA ABI 无 batch 参数、launcher 硬校验 n_a==2048/n_b==576/k==6144（off-shape INVALID_VALUE）。pair = 两个独立 GEMV 共享一行激活、grid 拼接而非权重拼接，每行点积序与单独发射一致；无 scratch（ABI 无 partials 表面，derive_shapes 的通用 ksplit scratch 文本不适用本单元）。shape.n=2624 = 2048+576 pack 宽（对齐 mma_config 的 q_a|kv_a pack 命名）；scale_len 恒等式 ceil(2048/128)+ceil(576/128) = 16+5 = 21 = ceil(2624/128)，故 derive_shapes 按 pack 宽推导的字节数与两侧之和精确相等"
+[reference]
+mode = "torch_tolerance"
+[reference.tolerance]
+rel_l2 = 0.02
+note = "同 proj-gemv 组推导：bf16 store floor <= 2^-9 ≈ 1.95e-3 + 零量子误差（e4m3 解码精确、scale 与 ref 同源）+ f32 重排 ~1e-5 可忽略 → 0.02 = ~10x headroom，UNMEASURED 待 GB300 回填；kv_a 侧 576 partial-N 由 kernel_lab.refs.proj_gemv 按 r>>7 行块索引精确建模"

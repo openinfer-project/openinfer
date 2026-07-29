@@ -1,0 +1,24 @@
+unit = "indexer.local_topk_to_slots"
+phase = 1
+symbol = "glm52_indexer_local_topk_to_slots_cuda"
+adapter = "indexer_local_topk_to_slots"
+capability = { blackwell_only = false }
+[axes]
+rows = [1, 2, 4, 8, 16, 32, 64]
+ctx = [16384, 65536, 262144]
+[shape]
+# n/k 为 schema 占位语义：n = top_k、k = ctx 轴下限（真实派生表见 tests/test_indexer.py）。
+n = 2048
+k = 16384
+top_k = 2048
+block_size = 64
+[contract]
+inputs = "local_topk_offsets[rows,2048] i32（升序、逐行取自 [0,len_r)，模拟 SortTopKByIndex 输出）、seq_lens[rows] i32、block_table[rows,ctx/64] i32（逐行自身页域的 seeded 置换，页域行间不相交）"
+outputs = "global_slots[rows,2048] i32（无效 -> -1）、topk_lens[rows] i32（有效槽计数）"
+accumulation = "无（纯整数 remap：page=block_table[t,off//64]; slot=page*64+off%64）"
+notes = "TokenSpeed Triton local_topk_to_global_slots 的移植（glm52_indexer.cu）。stride 合同：local_topk_stride==topk、block_table_stride==block_table_cols（glm52_indexer_smoke.rs 的 P1 回归钉死后者——stride 错传 topk 会跨行读表）。off<0 或 off>=seq_len 或块号越界 -> -1 且不计入 topk_lens；harness 输入全有效（生产 topk 已经 lengths 过滤）。grid=(tokens,) 无 rows 上限；ctx 轴影响表宽/槽空间，单发射代价由 topk 主导"
+[reference]
+mode = "torch_tolerance"
+[reference.tolerance]
+rel_l2 = 1e-12
+note = "真门 = reference 内整数全等断言（slots 与 topk_lens，纯整数 remap 无容差可言）；rel_l2 仅 CLI 兜底；UNMEASURED"

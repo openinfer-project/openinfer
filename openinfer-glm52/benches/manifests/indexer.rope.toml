@@ -1,0 +1,24 @@
+unit = "indexer.rope"
+phase = 1
+symbol = "glm52_indexer_rope_cuda"
+adapter = "indexer_rope"
+capability = { blackwell_only = false }
+[axes]
+rows = [1, 2, 4, 8, 16, 32, 64]
+[shape]
+# n/k 为 schema 占位语义：n = index heads、k = head_dim（派生/真实表见 tests/test_indexer.py）。
+n = 32
+k = 128
+heads = 32
+head_dim = 128
+rope_dim = 64
+[contract]
+inputs = "q[rows,32,128] bf16（原地）、k[rows,128] bf16（原地）、cos/sin[rows,32] bf16（每 token 一行）"
+outputs = "旋转后 q/k（仅前 64 维旋转，后 64 维直通；check 时按 [q|k] 拼接比较）"
+accumulation = "f32（bf16 载入上转，逐元素 float2bfloat16 存回）"
+notes = "half-split / NeoX 风格 RoPE：out[j]=x[j]*cos[j]-x[j+32]*sin[j]、out[j+32]=x[j+32]*cos[j]+x[j]*sin[j]（j<32）。注意：glm52_indexer_rope.cu 与 openinfer-glm52/src/layer.rs:105 都钉死 indexer 用 half-split（与 config indexer_rope_interleave=true 的表面语义相反，见 indexer-forward.md 的 transformers 5.12/5.13 纠纰）——torch 参考按 .cu 实际语义写。grid=(32, rows) 无 tokens 上限，rows 全轴可测。ctx 无关（逐 token O(1)），不设 ctx 轴"
+[reference]
+mode = "torch_tolerance"
+[reference.tolerance]
+rel_l2 = 0.01
+note = "bf16 store floor（逐输出 1 ulp bf16 舍入，2^-9 相对量级；nvcc 可能把 b*c+a*s 收缩成 FMA，与 torch f32 参考差 ≤1 f32 ulp，仍远低于 bf16 舍入）；UNMEASURED——首次 GB300 实测后回填"

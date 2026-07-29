@@ -1,0 +1,21 @@
+unit = "norm.q_a_layernorm"
+phase = 1
+symbol = "rms_norm_batched_cuda"
+adapter = "norm_q_a_layernorm"
+capability = { blackwell_only = true }
+[axes]
+rows = [1, 2, 4, 8, 16, 32, 64]
+[shape]
+n = 2048
+k = 2048
+eps = 1e-5
+[contract]
+inputs = "x[rows,2048] bf16（q_a_proj 输出，pre-norm）; weight[2048] bf16（q_a_layernorm gamma）"
+outputs = "out[rows,2048] bf16（q_resid——q_b GEMV 与 DSA indexer wq_b 的输入）"
+accumulation = "f32 行内归约（grid=rows，一 CTA 一行，行间互不依赖）"
+notes = "名为 layernorm 实为 RMSNorm：HF q_a_layernorm=GlmMoeDsaRMSNorm(q_lora_rank)（modeling_glm_moe_dsa.py:339），checkpoint 只有 weight 无 bias（weights.rs:528），生产 decode 经 rms_norm_rows_into(Q_LORA)（mla_front.rs:480，prefill twin :390）。indexer-forward.md 里的 LayerNorm-with-bias 是 DSA indexer k_norm（layer_norm_cuda，dim=128，eps=1e-6，f32 gamma/beta）——不同内核，归 indexer 链组，不在本单元。内核=FlashInfer norm::RMSNorm 模板（flashinfer_norm.cu:204），FFI void 返回。rows>8：一 CTA 一行、行归约自包含，任意 rows 每行与 rows=1 逐位一致，无 .cu 改动。manifest [shape] n=k=q_lora 只是 GEMV 词汇的 schema 映射——derive_shapes 的 weight_bytes/scale_len/scratch_rule 对本单元无语义；真实缓冲：x/out 各 rows*2048*2 B，weight 4096 B，无 scale/scratch。"
+[reference]
+mode = "torch_tolerance"
+[reference.tolerance]
+rel_l2 = 0.02
+note = "bf16 store floor：RN 半 ulp 相对误差 ≤2^-8/元素，张量级 rel_l2 典型 ~1e-3（2^-9/√3 量级）；rms 标量的 f32 归约序差（torch 参考不复现）远低于该 floor。0.02 ≈ 4×2^-8 余量。UNMEASURED，GB300 首测后回填实测值与机器。"

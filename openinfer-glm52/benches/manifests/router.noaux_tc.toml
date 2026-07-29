@@ -1,0 +1,20 @@
+unit = "router.noaux_tc"
+phase = 1
+symbol = "glm52_router_noaux_tc_cuda"
+adapter = "router_noaux_tc"
+capability = { blackwell_only = false }
+[axes]
+rows = [1, 2, 4, 8]
+[shape]
+n = 256
+k = 6144
+[contract]
+inputs = "hidden[rows,6144] bf16; gate_weight[256,6144] bf16; e_score_correction_bias[256] f32"
+outputs = "logits[rows,256] f32（= gated out，兼作 select 半段的 ABI scratch）; topk_weight[rows,8] f32; topk_idx[rows,8] i32（由 reference() 硬断言精确相等）"
+accumulation = "f32（min_gemv 固定归约序；select 单 block 256 线程 rank-count）"
+notes = "gate GEMV = glm52_min_gemv 单 PDL 内核（grid=256×128thr，6144→256，替代 cublas splitK 计划），select = router_scores_topk_normalize_kernel（grid=rows×256thr，smem 2080B）。EP 无关：每 rank 全量 256 expert 打分。harness 取 active=padded=rows（capacity 全行活；padded>active 的 select-silent 行由 Rust smoke 覆盖）。BLOCKED rows>8：min_gemv launch_tokens 编译期 switch 仅实例化 tokens 1..=8（kMaxTokens=8=GLM52_MAX_BATCH_PER_RANK，生产调度同样封顶 8 token/rank），default 分支 fail-closed INVALID_VALUE；kNumTokens=64 时 acc[kNumTokens] 每线程 64 个 f32 累加器撞设计文档已论证的寄存器墙，故不为本单元新增模板实例。check 门 = logits rel_l2（对 f64 参考，免 TF32）+ reference() 内置 select 硬断言（复刻 glm52_router_smoke.rs：参考吃 kernel 自己的 f32 logits，idx position-for-position、|Δweight|<1e-4）。manifest derive_shapes 为 GEMV 口径；router 实际 buffer 推导见 refs/router.py buffer_sizes()。"
+[reference]
+mode = "torch_tolerance"
+[reference.tolerance]
+rel_l2 = 0.005
+note = "logits：kernel f32 固定序 vs f64 参考的 6144 项点积重排差 ≈ sqrt(6144)·2^-24·(Σ|t|/‖logits‖) ~ 2e-4 rel（hidden~N(0,1) bf16、gate~0.03·N(0,1) bf16），5e-3 ≈ 25× 裕量；select 半段走硬断言不占此额度。UNMEASURED — GB300 首测后回填 measured 值与机器。"

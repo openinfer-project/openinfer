@@ -1,0 +1,20 @@
+unit = "router.select"
+phase = 1
+symbol = "glm52_router_select_cuda"
+adapter = "router_select"
+capability = { blackwell_only = false }
+[axes]
+rows = [1, 2, 4, 8, 16, 32, 64]
+[shape]
+n = 256
+k = 6144
+[contract]
+inputs = "logits[rows,256] f32（上游 gate GEMV 产物，本单元按 seed 直接生成）; e_score_correction_bias[256] f32"
+outputs = "topk_weight[rows,8] f32（= gated out）; topk_idx[rows,8] i32（由 reference() 硬断言精确相等）"
+accumulation = "f32"
+notes = "router_scores_topk_normalize_kernel 单内核：grid=padded_tokens(=rows)×256thr，smem=256×2×4+8×4=2080B；rank-count 选择 = 严格全序 (choice desc, index asc)，与旧 8 轮 masked reduction bit-identical（.cu 注释）。sigmoid 打分 + noaux_tc correction bias + top-8 + routed_scaling 2.5（checkpoint 常量；EP 无关：每 rank 全量 256 expert 打分）。内核架构上无 token 上限（每 token 一个 block），故 rows 全轴可发；生产 padded_tokens ≤ GLM52_MAX_BATCH_PER_RANK=8，16–64 为 MTP span-mapped verify / 未来大 batch headroom 测量。shape.k=6144 仅为来源 GEMV 标称（schema 要求 128 倍数；select 本身无 k 维）。tie 规则 (value desc, index asc)；参考与内核吃同一份 f32 logits（固定 seed，无 near-tie flake）。check 门 = topk_weight rel_l2 + reference() 内置 idx 精确硬断言（smoke 惯例）。"
+[reference]
+mode = "torch_tolerance"
+[reference.tolerance]
+rel_l2 = 0.0001
+note = "参考与内核同输入；差异仅 CUDA expf vs torch sigmoid ≤2 ulp 与 8 项 f32 顺序求和 → 预期 rel_l2 ~1e-6；1e-4 = 100× 裕量，而任何 pick/rank 翻转 → O(1e-2) 起步，四个数量级分离。UNMEASURED — GB300 首测后回填 measured 值与机器。"

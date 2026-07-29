@@ -1,0 +1,24 @@
+unit = "quant.fp8_per_token_group_bf16_ue8m0"
+phase = 1
+symbol = "glm52_fp8_per_token_group_quant_bf16_ue8m0_cuda"
+adapter = "quant_fp8_per_token_group_bf16_ue8m0"
+capability = { blackwell_only = false }
+[axes]
+rows = [1, 2, 4, 8, 16, 32, 64]
+[shape]
+# quant 保宽：n = out 宽度 = k = in 宽度 = KV_LORA_RANK 512（唯一生产宽度）。
+# GEMV 味派生字段（weight_bytes / scale_len_bytes / scratch_rule）不适用，
+# 真实推导见 notes 与 refs/quant.py packed_surface_len。
+n = 512
+k = 512
+group_size = 128
+[contract]
+inputs = "act[rows,512] bf16（MLA kv_c latent；mla_decode.rs:490 decode 与 prefill_tp.rs:603 pack_mla_cache 写 fp8_ds_mla 656B cache 行前的量化）"
+outputs = "out[rows,512] e4m3 uint8；scales[rows,4] f32（amax/448 后向上取整到 2 的幂：位操作 (bits+0x7FFFFF)&0x7F800000，无 log2f）"
+accumulation = "n/a（elementwise + 每组 128 线程 f32 max-reduce；无跨组累加）"
+notes = "UE8M0 = FlashMLA V3.2 fp8 sparse KV-cache 合同：sm100 decode 内核把存储的 f32 scale 向零截断成 e8m0（tcgen05 block-scaled MMA），非 2 幂 scale 在 Blackwell 被读小至多 2x，sm90 读 f32 精确会掩盖此 bug（docs/lessons/flashmla-sm100-ue8m0-kv-scales.md）；2 幂 scale 两 arch 读出同值。check 路径额外硬断言：每个 kernel 写出的 scale 必须为正有限 2 的幂（符号位 0、阶码 1..254、尾数全 0），违反即 AssertionError。行无关同 base twin：grid=(min(rows,256), 4) block=128 grid-stride 行循环 → rows 全轴 {1..64} 零 .cu 改动、无 scratch。真实缓冲/行：act 1024 B、out 512 B、scales 16 B（rows*4*4）。blackwell_only=false：内核本体可跑 Hopper（其量化输出在 sm90 同样合法），UE8M0 语义仅在 sm100 消费端 load-bearing；账本按 arch 分桶。比较面同 base：打包 [e4m3 bytes | scales LE 字节] 的 bit-exact 门"
+[reference]
+mode = "torch_tolerance"
+[reference.tolerance]
+rel_l2 = 1e-6
+note = "bit-exact 目标（UNMEASURED — 待 GB300 首测回填实测值与机器名）：舍入论证同 quant.fp8_per_token_group_bf16（kernel cvt.rn.satfinite.e4m3 = torch float8_e4m3fn cast，双侧 RNE）；ue8m0 向上取整为整数位操作，双侧逐位一致。推导：任一字节/scale-bit 差异 ⇒ rel_l2 ≥ ~7e-4（最小面 rows=1：528 B，norm≈RMS(byte)*23）≫ 1e-6，故等价 bit-exact 门。若首测非零：先查 scale 是否 2 幂（硬断言应已拦下），再查 cvt/torch 编码差异，按 1 e4m3 encode step（每元素相对 ≤2^-3）推导新界并记录于此"

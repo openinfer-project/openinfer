@@ -1,0 +1,24 @@
+unit = "flashmla_sparse.decode"
+phase = 1
+symbol = "glm52_flashmla_sparse_decode_launch_cuda"
+adapter = "flashmla_sparse_decode"
+capability = { blackwell_only = true }
+[axes]
+rows = [1, 2, 4, 8, 16, 32, 64]
+ctx = [16384, 65536, 262144]
+[shape]
+# n = 64 x 512 latent 宽、 k = 64 x 576 query 宽（flattened，让 list 派生
+# act/out 行正确）；weight/scale 行无意义（cache = ctx x 656 B 随 ctx 变）。
+# 权威 shape 表 = kernel_lab.refs.mla_attention.decode_buffers。
+n = 32768
+k = 36864
+[contract]
+inputs = "q[rows,64,576] bf16（mla.query_assemble 输出布局）；packed_kv_cache[ctx/64 页 x 64,656] u8 fp8_ds_mla（**UE8M0 pow2 scales**，sm100 e8m0 截断在 pow2 下无损）；topk_indices[rows,2048] i32 全 valid distinct ∈ [0,ctx)（ctx ≥ 16k 恒满 DSA top-2048，短 ctx 不测）；tile_scheduler_metadata/num_splits 由 glm52_flashmla_sparse_decode_metadata_cuda 生成（plan-time 一次性，同生产 Glm52MlaSchedMetadata；harness 首次 run 惰性发射，bench warmup 吸收）"
+outputs = "out_latent[rows,64,512] bf16；lse[rows,64] f32（side output，不对拍）"
+accumulation = "f32 split-KV + combine（sm_100f tcgen05 block-scaled MMA）；sm_scale = 0.0625（GLM52_SM_SCALE，内核外参数）"
+notes = "topk = 2048 固定；num_sm_parts 运行时查询 glm52_flashmla_sparse_decode_num_sm_parts_cuda（SM 数，<= 160）。scratch：tile_meta[num_sm_parts x 8] i32、num_splits[rows+1] i32、lse_accum[(rows+num_sm_parts) x 64] f32、o_accum[(rows+num_sm_parts) x 64 x 512] f32——harness 按 MAX_SM_PARTS = 160 容量预分配。batch <= 128 容量且为运行时调度参数（无逐 batch 模板实例化）→ rows <= 64 原生支持，零 .cu 改动；rows 1-8 行为不变（无任何 .cu 编辑）。生产调用 mla_decode.rs:536"
+[reference]
+mode = "torch_tolerance"
+[reference.tolerance]
+rel_l2 = 0.02
+note = "bf16 store floor（2^-8 相对量级）+ f32 split 累加重排 vs f64 naive 参考（移植自 glm52_sparse_mla.cu reference kernel；与 Rust 门 2e-2 mean-norm 同量级）。UNMEASURED——GB300 首测回填 measured 值与机器名"

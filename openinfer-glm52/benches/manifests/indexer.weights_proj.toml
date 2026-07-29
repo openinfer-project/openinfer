@@ -1,0 +1,23 @@
+unit = "indexer.weights_proj"
+phase = 1
+symbol = "glm52_fp8_weight_only_gemv_batched_cuda"
+adapter = "indexer_weights_proj"
+capability = { blackwell_only = false }
+[axes]
+rows = [1, 2, 4, 8]
+[shape]
+# 主 shape = wq_b（derive_shapes/list 展示用）；wk 形状由 adapter 读这两个键。
+n = 4096
+k = 2048
+wk_n = 128
+wk_k = 6144
+[contract]
+inputs = "q_resid[rows,2048] bf16 + wq_b[4096,2048] e4m3 + scales[32,16] f32; hidden[rows,6144] bf16 + wk[128,6144] e4m3 + scales[1,48] f32（checkpoint weight_scale_inv raw bytes）"
+outputs = "q[rows,4096] bf16 与 k_raw[rows,128] bf16（check 时按 [q|k_raw] 拼接比较）"
+accumulation = "f32"
+notes = "indexer 投影级 = 同一符号两次发射：wq_b(q_resid) 与 wk(hidden)（生产 openinfer-glm52/src/indexer.rs:421-441 的非 large_m 路径）。rows=1 CUDA-core GEMV；2 register tile bit-parity；4/8 按 mma_config 在 register tile 与 tensor-core mma 间路由（Blackwell batch8：wq_b {16,1}、wk {48,1}；batch4：wk {16,2}、wq_b off-table 走 register tile）。mma 路由需要 f32 scratch = ksplit*rows*n（逐发射，glm52_gemv_mma_ksplit_cuda 运行时查询；两发射复用同一缓冲取 max）。BLOCKED rows=16/32/64：multi-subtile mma 表只列 q_b(16384,2048)，(4096,2048)/(128,6144) off-table fail-closed INVALID_VALUE，且无 register-tile 回退；生产 indexer 链 t<=8=GLM52_MAX_BATCH_PER_RANK（prefill 走 large_m GEMM），按纪律不为无生产消费者的形状硬写未实测表项"
+[reference]
+mode = "torch_tolerance"
+[reference.tolerance]
+rel_l2 = 0.02
+note = "bf16 store floor（2^-8 相对量级）+ mma f32 结合序重排；UNMEASURED——首次 GB300 实测后回填 measured 值与机器"
