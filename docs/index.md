@@ -141,7 +141,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 
 | Path | TL;DR |
 | --- | --- |
-| `subsystems/tracing/e2e-router-tracing.md` | client → vllm-router → openinfer → prefill/decode 单 trace 已打通：router 开 OTel 注入 traceparent；openinfer 侧 axum middleware 提取 + `external_req_id` 关联接合（含 `cmpl-`/`chatcmpl-` 前缀坑）；上游 PR vllm#50370 合入后按 #790 迁移删 middleware。 |
+| `subsystems/tracing/e2e-router-tracing.md` | Single trace for client → vllm-router → openinfer → prefill/decode verified: the router injects traceparent with OTel on; openinfer's axum middleware stashes it and the bridge joins via `external_req_id` (incl. the `cmpl-`/`chatcmpl-` prefix pitfall). After upstream vllm#50370 merges, migrate per #790 and delete the middleware. |
 
 ## subsystems / frontend
 
