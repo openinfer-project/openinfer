@@ -5,15 +5,16 @@
 //! cannot reach the bridge's `request` root span. Until vllm-server populates
 //! `EngineCoreRequest.trace_headers` itself (upstream PR tracked in
 //! docs/subsystems/tracing/e2e-router-tracing.md), this module stashes the
-//! incoming `traceparent` at the axum boundary keyed by the request's
-//! external id, and the bridge pops it when the matching `EngineCoreRequest`
-//! arrives over ZMQ.
+//! incoming `traceparent` at the axum boundary, and the bridge pops it when
+//! the matching `EngineCoreRequest` arrives over ZMQ.
 //!
-//! Correlation key: the request's `X-Request-Id`, which vllm-server resolves
-//! into `EngineCoreRequest.external_req_id`. When the caller sent none, the
-//! middleware generates one and injects it into the request headers so both
-//! sides agree on the key. Entries are popped on use; requests rejected
-//! before reaching the engine leave stale entries that expire by TTL.
+//! Correlation key: `EngineCoreRequest.external_req_id`, computed at intake
+//! where the route is still known (route prefix + `X-Request-Id`, mirroring
+//! vllm-server's completions/chat prefixing), so the bridge lookup is exact.
+//! Requests without trace context reserve their slot with an untraced marker,
+//! so overlapping attempts reusing one id each consume only their own slot.
+//! Entries are popped on use; entries whose request never reaches the engine
+//! are discarded on the error response, or expire by TTL.
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -33,7 +34,7 @@ use axum::response::Response;
 
 /// Stale-entry lifetime and the stash's hard capacity. Entries are normally
 /// popped by the bridge within milliseconds of insertion; both bounds exist
-/// only for requests that never reach the engine (e.g. validation rejects).
+/// only as backstops for requests that never reach the engine.
 const TTL: Duration = Duration::from_secs(120);
 const CAPACITY: usize = 4096;
 
@@ -47,8 +48,10 @@ const GENERATION_PATHS: &[&str] = &[
     "/inference/v1/generate",
 ];
 
-/// `(token, traceparent, inserted-at)` entries queued under one id.
-type EntryQueue = VecDeque<(u64, String, Instant)>;
+/// `(token, traceparent, inserted-at)` entries queued under one id. A `None`
+/// traceparent is an untraced attempt's marker: it reserves the attempt's
+/// slot without supplying a parent to join.
+type EntryQueue = VecDeque<(u64, Option<String>, Instant)>;
 
 /// Per-insertion token: lets the HTTP layer discard exactly the entry it
 /// stashed even when responses complete out of FIFO order.
@@ -59,7 +62,7 @@ static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 /// Cheap to clone (inner `Arc`); one instance is shared between the axum
 /// layer (insert) and every engine bridge task (take). Entries queue FIFO per
 /// id: concurrent attempts reusing one `X-Request-Id` (e.g. hedged retries)
-/// each keep their own parent instead of the latest insert overwriting the
+/// each keep their own slot instead of the latest insert overwriting the
 /// rest. (A per-attempt unique key is not available — `external_req_id` is
 /// the only correlation key the bridge can derive downstream.)
 #[derive(Clone, Default)]
@@ -68,9 +71,10 @@ pub(crate) struct TraceContextStash {
 }
 
 impl TraceContextStash {
-    /// Queue `traceparent` under `request_id`, returning the insertion token
-    /// the HTTP layer needs to discard exactly this entry on the error path.
-    fn insert(&self, request_id: &str, traceparent: &str) -> u64 {
+    /// Queue `traceparent` (`None` for an untraced marker) under `request_id`,
+    /// returning the insertion token the HTTP layer needs to discard exactly
+    /// this entry on the error path.
+    fn insert(&self, request_id: &str, traceparent: Option<&str>) -> u64 {
         let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
         let mut inner = self.inner.lock().expect("trace context stash poisoned");
         let mut total: usize = inner.values().map(VecDeque::len).sum();
@@ -90,16 +94,19 @@ impl TraceContextStash {
         }
         inner.entry(request_id.to_owned()).or_default().push_back((
             token,
-            traceparent.to_owned(),
+            traceparent.map(str::to_owned),
             Instant::now(),
         ));
         token
     }
 
-    /// Pop the oldest unexpired traceparent queued for `request_id`; each
-    /// queued entry is consumed at most once. Entries older than [`TTL`] are
-    /// dropped instead of returned, so a request reusing an id never joins a
-    /// stale trace left behind by a request that never reached the engine.
+    /// Pop the oldest unexpired entry queued for `request_id`; each queued
+    /// entry is consumed at most once. A fresh parent comes back as `Some`,
+    /// anything else — no entry, an expired one, or an untraced marker — as
+    /// `None`, which the bridge treats as "start a fresh trace". Expired
+    /// entries are dropped, never joined: a request reusing an id must not
+    /// attach to a trace left behind by a request that never reached the
+    /// engine.
     pub(crate) fn take(&self, request_id: &str) -> Option<String> {
         let mut inner = self.inner.lock().expect("trace context stash poisoned");
         let (result, queue_empty) = {
@@ -107,7 +114,7 @@ impl TraceContextStash {
             let mut result = None;
             while let Some((_, traceparent, inserted)) = queue.pop_front() {
                 if inserted.elapsed() < TTL {
-                    result = Some(traceparent);
+                    result = traceparent;
                     break;
                 }
             }
@@ -117,34 +124,6 @@ impl TraceContextStash {
             inner.remove(request_id);
         }
         result
-    }
-
-    /// Pop the traceparent for a request the bridge just received.
-    ///
-    /// `external_req_id` is vllm-server's external request id: the caller's
-    /// `X-Request-Id` with an API-specific prefix prepended (`cmpl-` for
-    /// completions, `chatcmpl-` for chat completions) — exactly one prefix on
-    /// those routes. The stash is keyed by the bare header value, so strip one
-    /// known prefix and look that up first; the exact id is only a fallback
-    /// for routes that prepend nothing. Order matters: exact-first would let
-    /// header `foo` (bridge id `cmpl-foo`) steal a concurrent request whose
-    /// header is literally `cmpl-foo`.
-    pub(crate) fn take_for_external_req_id(&self, external_req_id: &str) -> Option<String> {
-        let bare = external_req_id
-            .strip_prefix("chatcmpl-")
-            .or_else(|| external_req_id.strip_prefix("cmpl-"));
-        if let Some(bare) = bare {
-            return self.take(bare);
-        }
-        self.take(external_req_id)
-    }
-
-    /// Remove any pending entry for `request_id`, regardless of age.
-    fn invalidate(&self, request_id: &str) {
-        self.inner
-            .lock()
-            .expect("trace context stash poisoned")
-            .remove(request_id);
     }
 
     /// Drop exactly the entry tagged `token`, wherever it sits in the queue.
@@ -174,6 +153,19 @@ impl TraceContextStash {
     }
 }
 
+/// The id vllm-server will put into `EngineCoreRequest.external_req_id` for a
+/// generation request on `path`: the route prefix plus the caller's
+/// `X-Request-Id`, mirroring the pinned server's completions/chat prefixing;
+/// other routes pass the id through verbatim. Computing it at intake — where
+/// the route is still known — keeps the bridge lookup a plain exact match.
+fn external_req_id_for(path: &str, request_id: &str) -> String {
+    match path {
+        "/v1/completions" => format!("cmpl-{request_id}"),
+        "/v1/chat/completions" => format!("chatcmpl-{request_id}"),
+        _ => request_id.to_owned(),
+    }
+}
+
 /// Axum middleware: stash the request's `traceparent` under its external id.
 ///
 /// Only generation routes are eligible — other routes never produce an
@@ -193,7 +185,8 @@ pub(crate) async fn stash_trace_context(
     {
         return next.run(request).await;
     }
-    let stashed = stash_from_headers(&stash, request.headers_mut());
+    let path = request.uri().path().to_owned();
+    let stashed = stash_from_headers(&stash, &path, request.headers_mut());
     let response = next.run(request).await;
     if !response.status().is_success() {
         if let Some((id, token)) = stashed {
@@ -205,14 +198,13 @@ pub(crate) async fn stash_trace_context(
 
 /// Read `traceparent` from `headers` and stash it under the request's
 /// external id, generating and injecting `X-Request-Id` when absent so the
-/// bridge and vllm-server agree on the correlation key. Returns the id and
-/// insertion token when an entry was stashed, `None` otherwise.
-///
-/// A request with no trace context of its own invalidates any pending entry
-/// under its id: entries are left behind by requests rejected before reaching
-/// the engine, and an untraced retry reusing the id must not join that older
-/// trace (the TTL only bounds, not prevents, within-window reuse).
-fn stash_from_headers(stash: &TraceContextStash, headers: &mut HeaderMap) -> Option<(String, u64)> {
+/// bridge and vllm-server agree on the correlation key. Returns the stash key
+/// and insertion token when an entry was queued, `None` otherwise.
+fn stash_from_headers(
+    stash: &TraceContextStash,
+    path: &str,
+    headers: &mut HeaderMap,
+) -> Option<(String, u64)> {
     let request_id = headers
         .get("x-request-id")
         .and_then(|v| v.to_str().ok())
@@ -222,10 +214,14 @@ fn stash_from_headers(stash: &TraceContextStash, headers: &mut HeaderMap) -> Opt
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned)
     else {
-        if let Some(id) = request_id {
-            stash.invalidate(&id);
-        }
-        return None;
+        // A request with no trace context of its own reserves its slot with
+        // an untraced marker, so an overlapping traced attempt reusing the id
+        // keeps its own parent and this attempt consumes nothing upstream.
+        // With no caller id at all, vllm-server mints a unique id downstream
+        // and no slot is needed.
+        let key = external_req_id_for(path, &request_id?);
+        let token = stash.insert(&key, None);
+        return Some((key, token));
     };
     let request_id = request_id.unwrap_or_else(|| {
         // Mirror vllm-server's own id shape (8 hex chars) so logs read the
@@ -237,8 +233,9 @@ fn stash_from_headers(stash: &TraceContextStash, headers: &mut HeaderMap) -> Opt
         }
         id
     });
-    let token = stash.insert(&request_id, &traceparent);
-    Some((request_id, token))
+    let key = external_req_id_for(path, &request_id);
+    let token = stash.insert(&key, Some(&traceparent));
+    Some((key, token))
 }
 
 #[cfg(test)]
@@ -248,22 +245,31 @@ mod tests {
     use super::*;
 
     const TRACEPARENT: &str = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+    const TRACEPARENT_B: &str = "00-1af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+    const COMPLETIONS: &str = "/v1/completions";
+    const CHAT: &str = "/v1/chat/completions";
+    const GENERATE: &str = "/inference/v1/generate";
+
+    fn traced_headers(id: &str, traceparent: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("traceparent", HeaderValue::from_str(traceparent).unwrap());
+        headers.insert("x-request-id", HeaderValue::from_str(id).unwrap());
+        headers
+    }
 
     #[test]
     fn stash_roundtrip_decodes_to_upstream_trace() {
         let stash = TraceContextStash::default();
-        let mut headers = HeaderMap::new();
-        headers.insert("traceparent", HeaderValue::from_static(TRACEPARENT));
-        headers.insert("x-request-id", HeaderValue::from_static("req-1"));
+        let mut headers = traced_headers("req-1", TRACEPARENT);
 
-        stash_from_headers(&stash, &mut headers);
+        stash_from_headers(&stash, COMPLETIONS, &mut headers);
 
-        let stashed = stash.take("req-1").expect("traceparent stashed");
+        let stashed = stash.take("cmpl-req-1").expect("traceparent stashed");
         let ctx = fastrace::collector::SpanContext::decode_w3c_traceparent(&stashed)
             .expect("valid W3C traceparent");
         assert_eq!(ctx.encode_w3c_traceparent(), TRACEPARENT);
         // One-shot: the bridge must not join a second request to the same span.
-        assert!(stash.take("req-1").is_none());
+        assert!(stash.take("cmpl-req-1").is_none());
     }
 
     #[test]
@@ -272,7 +278,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("traceparent", HeaderValue::from_static(TRACEPARENT));
 
-        stash_from_headers(&stash, &mut headers);
+        stash_from_headers(&stash, COMPLETIONS, &mut headers);
 
         let injected = headers
             .get("x-request-id")
@@ -281,33 +287,49 @@ mod tests {
             .expect("ascii request id");
         assert_eq!(injected.len(), 8);
         assert!(injected.chars().all(|c| c.is_ascii_hexdigit()));
-        assert!(stash.take(injected).is_some());
+        assert!(stash.take(&format!("cmpl-{injected}")).is_some());
     }
 
     #[test]
-    fn lookup_tolerates_vllm_api_prefixes() {
+    fn external_key_mirrors_route_prefixing() {
+        // Each route's stash key is exactly the external_req_id the bridge
+        // will see: completions/chat prepend, other routes pass through.
         let stash = TraceContextStash::default();
-        let mut headers = HeaderMap::new();
-        headers.insert("traceparent", HeaderValue::from_static(TRACEPARENT));
-        headers.insert("x-request-id", HeaderValue::from_static("dbg12345"));
+        for (path, expected_key) in [
+            (COMPLETIONS, "cmpl-dbg12345"),
+            (CHAT, "chatcmpl-dbg12345"),
+            (GENERATE, "dbg12345"),
+        ] {
+            let mut headers = traced_headers("dbg12345", TRACEPARENT);
+            stash_from_headers(&stash, path, &mut headers);
+            assert_eq!(stash.take(expected_key), Some(TRACEPARENT.to_owned()));
+        }
+    }
 
-        stash_from_headers(&stash, &mut headers);
+    #[test]
+    fn unprefixed_route_preserves_prefixed_header_ids() {
+        // /inference/v1/generate prepends nothing: a header literally named
+        // `cmpl-foo` must be looked up verbatim, not mistaken for a
+        // completions-generated prefix of `foo`.
+        let stash = TraceContextStash::default();
+        let mut generated = traced_headers("cmpl-foo", TRACEPARENT_B);
+        stash_from_headers(&stash, GENERATE, &mut generated);
 
-        assert!(stash.take_for_external_req_id("chatcmpl-nope").is_none());
-        assert_eq!(
-            stash.take_for_external_req_id("cmpl-dbg12345"),
-            Some(TRACEPARENT.to_owned())
-        );
-        assert!(stash.take_for_external_req_id("cmpl-dbg12345").is_none());
+        assert_eq!(stash.take("cmpl-foo"), Some(TRACEPARENT_B.to_owned()));
+    }
 
-        let mut headers = HeaderMap::new();
-        headers.insert("traceparent", HeaderValue::from_static(TRACEPARENT));
-        headers.insert("x-request-id", HeaderValue::from_static("dbg12345"));
-        stash_from_headers(&stash, &mut headers);
-        assert_eq!(
-            stash.take_for_external_req_id("chatcmpl-dbg12345"),
-            Some(TRACEPARENT.to_owned())
-        );
+    #[test]
+    fn prefixed_header_ids_collide_only_with_themselves() {
+        // Completions headers `foo` and `cmpl-foo` become `cmpl-foo` and
+        // `cmpl-cmpl-foo` at the bridge; each consumes its own traceparent.
+        let stash = TraceContextStash::default();
+        for (id, tp) in [("foo", TRACEPARENT), ("cmpl-foo", TRACEPARENT_B)] {
+            let mut headers = traced_headers(id, tp);
+            stash_from_headers(&stash, COMPLETIONS, &mut headers);
+        }
+
+        assert_eq!(stash.take("cmpl-foo"), Some(TRACEPARENT.to_owned()));
+        assert_eq!(stash.take("cmpl-cmpl-foo"), Some(TRACEPARENT_B.to_owned()));
     }
 
     #[test]
@@ -322,7 +344,7 @@ mod tests {
             .expect("trace context stash poisoned")
             .insert(
                 "old".to_owned(),
-                VecDeque::from([(1, TRACEPARENT.to_owned(), expired)]),
+                VecDeque::from([(1, Some(TRACEPARENT.to_owned()), expired)]),
             );
 
         assert!(stash.take("old").is_none());
@@ -332,19 +354,16 @@ mod tests {
     fn duplicate_ids_keep_separate_parents_fifo() {
         // Hedged retries reusing one X-Request-Id concurrently: each attempt
         // must consume a distinct parent, oldest first.
-        const TRACEPARENT_B: &str = "00-1af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
         let stash = TraceContextStash::default();
         for tp in [TRACEPARENT, TRACEPARENT_B] {
-            let mut headers = HeaderMap::new();
-            headers.insert("traceparent", HeaderValue::from_str(tp).unwrap());
-            headers.insert("x-request-id", HeaderValue::from_static("hedged"));
-            stash_from_headers(&stash, &mut headers);
+            let mut headers = traced_headers("hedged", tp);
+            stash_from_headers(&stash, COMPLETIONS, &mut headers);
         }
         assert_eq!(stash.len(), 2);
 
-        assert_eq!(stash.take("hedged"), Some(TRACEPARENT.to_owned()));
-        assert_eq!(stash.take("hedged"), Some(TRACEPARENT_B.to_owned()));
-        assert!(stash.take("hedged").is_none());
+        assert_eq!(stash.take("cmpl-hedged"), Some(TRACEPARENT.to_owned()));
+        assert_eq!(stash.take("cmpl-hedged"), Some(TRACEPARENT_B.to_owned()));
+        assert!(stash.take("cmpl-hedged").is_none());
         assert_eq!(stash.len(), 0);
     }
 
@@ -353,21 +372,16 @@ mod tests {
         // Two overlapping traced requests share an id; the later one errors
         // out first. Discarding must remove the later attempt's entry, not
         // the queue head.
-        const TRACEPARENT_B: &str = "00-1af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
         let stash = TraceContextStash::default();
-        let mut first = HeaderMap::new();
-        first.insert("traceparent", HeaderValue::from_static(TRACEPARENT));
-        first.insert("x-request-id", HeaderValue::from_static("dup"));
-        stash_from_headers(&stash, &mut first);
-        let mut second = HeaderMap::new();
-        second.insert("traceparent", HeaderValue::from_static(TRACEPARENT_B));
-        second.insert("x-request-id", HeaderValue::from_static("dup"));
-        let (_, token_b) = stash_from_headers(&stash, &mut second).unwrap();
+        let mut first = traced_headers("dup", TRACEPARENT);
+        stash_from_headers(&stash, COMPLETIONS, &mut first);
+        let mut second = traced_headers("dup", TRACEPARENT_B);
+        let (_, token_b) = stash_from_headers(&stash, COMPLETIONS, &mut second).unwrap();
 
-        stash.discard_entry("dup", token_b);
+        stash.discard_entry("cmpl-dup", token_b);
 
-        assert_eq!(stash.take("dup"), Some(TRACEPARENT.to_owned()));
-        assert!(stash.take("dup").is_none());
+        assert_eq!(stash.take("cmpl-dup"), Some(TRACEPARENT.to_owned()));
+        assert!(stash.take("cmpl-dup").is_none());
     }
 
     #[test]
@@ -375,77 +389,54 @@ mod tests {
         // First attempt is rejected before reaching the engine; the HTTP
         // layer discards its entry on the error response, so the traced
         // retry's own parent is what the bridge consumes.
-        const TRACEPARENT_B: &str = "00-1af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
         let stash = TraceContextStash::default();
-        let mut first = HeaderMap::new();
-        first.insert("traceparent", HeaderValue::from_static(TRACEPARENT));
-        first.insert("x-request-id", HeaderValue::from_static("retry-2"));
-        let id = stash_from_headers(&stash, &mut first);
-        assert_eq!(id.as_ref().map(|(id, _)| id.as_str()), Some("retry-2"));
+        let mut first = traced_headers("retry-2", TRACEPARENT);
+        let stashed = stash_from_headers(&stash, COMPLETIONS, &mut first);
+        assert_eq!(
+            stashed.as_ref().map(|(key, _)| key.as_str()),
+            Some("cmpl-retry-2")
+        );
 
-        let (id, token) = id.unwrap();
-        stash.discard_entry(&id, token);
+        let (key, token) = stashed.unwrap();
+        stash.discard_entry(&key, token);
         assert_eq!(stash.len(), 0);
 
-        let mut retry = HeaderMap::new();
-        retry.insert("traceparent", HeaderValue::from_static(TRACEPARENT_B));
-        retry.insert("x-request-id", HeaderValue::from_static("retry-2"));
-        stash_from_headers(&stash, &mut retry);
-        assert_eq!(stash.take("retry-2"), Some(TRACEPARENT_B.to_owned()));
+        let mut retry = traced_headers("retry-2", TRACEPARENT_B);
+        stash_from_headers(&stash, COMPLETIONS, &mut retry);
+        assert_eq!(stash.take("cmpl-retry-2"), Some(TRACEPARENT_B.to_owned()));
         assert_eq!(stash.len(), 0);
     }
 
     #[test]
-    fn ignores_requests_without_traceparent() {
+    fn untraced_attempt_reserves_its_own_slot() {
+        // An overlapping untraced request must neither consume the traced
+        // attempt's parent nor delete it: it queues a marker and the bridge
+        // opens a fresh trace for exactly that attempt.
+        let stash = TraceContextStash::default();
+        let mut traced = traced_headers("retry-1", TRACEPARENT);
+        stash_from_headers(&stash, COMPLETIONS, &mut traced);
+        assert_eq!(stash.len(), 1);
+
+        let mut retry = HeaderMap::new();
+        retry.insert("x-request-id", HeaderValue::from_static("retry-1"));
+        stash_from_headers(&stash, COMPLETIONS, &mut retry);
+        assert_eq!(stash.len(), 2);
+
+        // The traced attempt still consumes its own parent first...
+        assert_eq!(stash.take("cmpl-retry-1"), Some(TRACEPARENT.to_owned()));
+        // ...and the untraced attempt pops its marker: no parent, one-shot.
+        assert!(stash.take("cmpl-retry-1").is_none());
+        assert_eq!(stash.len(), 0);
+    }
+
+    #[test]
+    fn ignores_requests_without_traceparent_or_id() {
         let stash = TraceContextStash::default();
         let mut headers = HeaderMap::new();
 
-        stash_from_headers(&stash, &mut headers);
+        stash_from_headers(&stash, COMPLETIONS, &mut headers);
 
         assert_eq!(stash.len(), 0);
         assert!(headers.get("x-request-id").is_none());
-    }
-
-    #[test]
-    fn strip_lookup_wins_over_exact_on_prefix_collision() {
-        // Concurrent headers `foo` and `cmpl-foo` arrive at the bridge as
-        // `cmpl-foo` and `cmpl-cmpl-foo`; each must consume its own
-        // traceparent, not the other's.
-        const TRACEPARENT_B: &str = "00-1af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
-        let stash = TraceContextStash::default();
-        for (id, tp) in [("foo", TRACEPARENT), ("cmpl-foo", TRACEPARENT_B)] {
-            let mut headers = HeaderMap::new();
-            headers.insert("traceparent", HeaderValue::from_str(tp).unwrap());
-            headers.insert("x-request-id", HeaderValue::from_str(id).unwrap());
-            stash_from_headers(&stash, &mut headers);
-        }
-
-        assert_eq!(
-            stash.take_for_external_req_id("cmpl-foo"),
-            Some(TRACEPARENT.to_owned())
-        );
-        assert_eq!(
-            stash.take_for_external_req_id("cmpl-cmpl-foo"),
-            Some(TRACEPARENT_B.to_owned())
-        );
-    }
-
-    #[test]
-    fn untraced_retry_invalidates_pending_entry() {
-        let stash = TraceContextStash::default();
-        let mut traced = HeaderMap::new();
-        traced.insert("traceparent", HeaderValue::from_static(TRACEPARENT));
-        traced.insert("x-request-id", HeaderValue::from_static("retry-1"));
-        stash_from_headers(&stash, &mut traced);
-        assert_eq!(stash.len(), 1);
-
-        // A retry reusing the id without trace context must not consume the
-        // first attempt's traceparent at the bridge.
-        let mut retry = HeaderMap::new();
-        retry.insert("x-request-id", HeaderValue::from_static("retry-1"));
-        stash_from_headers(&stash, &mut retry);
-
-        assert_eq!(stash.len(), 0);
-        assert!(retry.get("traceparent").is_none());
     }
 }

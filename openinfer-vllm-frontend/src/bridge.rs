@@ -396,11 +396,12 @@ impl LocalEngineBridge {
         // its span work too.
         // Parent resolution: join the upstream trace when the HTTP layer
         // stashed a traceparent for this request (e.g. from vllm-router);
-        // otherwise start a fresh trace.
+        // otherwise start a fresh trace. The stash is keyed by
+        // external_req_id already, so the lookup is an exact match.
         let trace_root = if openinfer_engine::tracing_state::is_enabled() {
             let parent = external_req_id
                 .as_deref()
-                .and_then(|id| self.trace_stash.take_for_external_req_id(id))
+                .and_then(|id| self.trace_stash.take(id))
                 .and_then(|traceparent| SpanContext::decode_w3c_traceparent(&traceparent))
                 .unwrap_or_else(SpanContext::random);
             Span::root("request", parent).with_property(|| ("request_id", tag.to_string()))
