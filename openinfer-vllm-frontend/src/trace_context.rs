@@ -242,7 +242,9 @@ mod tests {
                 "old".to_owned(),
                 (
                     TRACEPARENT.to_owned(),
-                    Instant::now() - TTL - Duration::from_secs(1),
+                    Instant::now()
+                        .checked_sub(TTL + Duration::from_secs(1))
+                        .expect("TTL subtraction stays within Instant range"),
                 ),
             );
 
