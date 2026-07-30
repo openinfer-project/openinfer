@@ -91,6 +91,14 @@ impl TraceContextStash {
         })
     }
 
+    /// Remove any pending entry for `request_id`, regardless of age.
+    fn invalidate(&self, request_id: &str) {
+        self.inner
+            .lock()
+            .expect("trace context stash poisoned")
+            .remove(request_id);
+    }
+
     #[cfg(test)]
     fn len(&self) -> usize {
         self.inner
@@ -118,17 +126,27 @@ pub(crate) async fn stash_trace_context(
 /// Read `traceparent` from `headers` and stash it under the request's
 /// external id, generating and injecting `X-Request-Id` when absent so the
 /// bridge and vllm-server agree on the correlation key.
+///
+/// A request with no trace context of its own invalidates any pending entry
+/// under its id: entries are left behind by requests rejected before reaching
+/// the engine, and an untraced retry reusing the id must not join that older
+/// trace (the TTL only bounds, not prevents, within-window reuse).
 fn stash_from_headers(stash: &TraceContextStash, headers: &mut HeaderMap) {
+    let request_id = headers
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
     let Some(traceparent) = headers
         .get("traceparent")
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned)
     else {
+        if let Some(id) = request_id {
+            stash.invalidate(&id);
+        }
         return;
     };
-    let request_id = if let Some(id) = headers.get("x-request-id").and_then(|v| v.to_str().ok()) {
-        id.to_owned()
-    } else {
+    let request_id = request_id.unwrap_or_else(|| {
         // Mirror vllm-server's own id shape (8 hex chars) so logs read the
         // same regardless of which side generated the id.
         let mut id = uuid::Uuid::new_v4().simple().to_string();
@@ -137,7 +155,7 @@ fn stash_from_headers(stash: &TraceContextStash, headers: &mut HeaderMap) {
             headers.insert("x-request-id", value);
         }
         id
-    };
+    });
     stash.insert(&request_id, &traceparent);
 }
 
@@ -237,5 +255,24 @@ mod tests {
 
         assert_eq!(stash.len(), 0);
         assert!(headers.get("x-request-id").is_none());
+    }
+
+    #[test]
+    fn untraced_retry_invalidates_pending_entry() {
+        let stash = TraceContextStash::default();
+        let mut traced = HeaderMap::new();
+        traced.insert("traceparent", HeaderValue::from_static(TRACEPARENT));
+        traced.insert("x-request-id", HeaderValue::from_static("retry-1"));
+        stash_from_headers(&stash, &mut traced);
+        assert_eq!(stash.len(), 1);
+
+        // A retry reusing the id without trace context must not consume the
+        // first attempt's traceparent at the bridge.
+        let mut retry = HeaderMap::new();
+        retry.insert("x-request-id", HeaderValue::from_static("retry-1"));
+        stash_from_headers(&stash, &mut retry);
+
+        assert_eq!(stash.len(), 0);
+        assert!(retry.get("traceparent").is_none());
     }
 }
