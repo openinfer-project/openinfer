@@ -78,17 +78,20 @@ impl TraceContextStash {
     ///
     /// `external_req_id` is vllm-server's external request id: the caller's
     /// `X-Request-Id` with an API-specific prefix prepended (`cmpl-` for
-    /// completions, `chatcmpl-` for chat completions). The stash is keyed by
-    /// the bare header value, so try the id verbatim first, then with the
-    /// known prefixes stripped (longest first — `cmpl-` is a suffix of
-    /// `chatcmpl-`'s tail).
+    /// completions, `chatcmpl-` for chat completions) — exactly one prefix on
+    /// those routes. The stash is keyed by the bare header value, so strip one
+    /// known prefix and look that up first; the exact id is only a fallback
+    /// for routes that prepend nothing. Order matters: exact-first would let
+    /// header `foo` (bridge id `cmpl-foo`) steal a concurrent request whose
+    /// header is literally `cmpl-foo`.
     pub(crate) fn take_for_external_req_id(&self, external_req_id: &str) -> Option<String> {
-        self.take(external_req_id).or_else(|| {
-            let bare = external_req_id
-                .strip_prefix("chatcmpl-")
-                .or_else(|| external_req_id.strip_prefix("cmpl-"))?;
-            self.take(bare)
-        })
+        let bare = external_req_id
+            .strip_prefix("chatcmpl-")
+            .or_else(|| external_req_id.strip_prefix("cmpl-"));
+        if let Some(bare) = bare {
+            return self.take(bare);
+        }
+        self.take(external_req_id)
     }
 
     /// Remove any pending entry for `request_id`, regardless of age.
@@ -255,6 +258,30 @@ mod tests {
 
         assert_eq!(stash.len(), 0);
         assert!(headers.get("x-request-id").is_none());
+    }
+
+    #[test]
+    fn strip_lookup_wins_over_exact_on_prefix_collision() {
+        // Concurrent headers `foo` and `cmpl-foo` arrive at the bridge as
+        // `cmpl-foo` and `cmpl-cmpl-foo`; each must consume its own
+        // traceparent, not the other's.
+        const TRACEPARENT_B: &str = "00-1af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+        let stash = TraceContextStash::default();
+        for (id, tp) in [("foo", TRACEPARENT), ("cmpl-foo", TRACEPARENT_B)] {
+            let mut headers = HeaderMap::new();
+            headers.insert("traceparent", HeaderValue::from_str(tp).unwrap());
+            headers.insert("x-request-id", HeaderValue::from_str(id).unwrap());
+            stash_from_headers(&stash, &mut headers);
+        }
+
+        assert_eq!(
+            stash.take_for_external_req_id("cmpl-foo"),
+            Some(TRACEPARENT.to_owned())
+        );
+        assert_eq!(
+            stash.take_for_external_req_id("cmpl-cmpl-foo"),
+            Some(TRACEPARENT_B.to_owned())
+        );
     }
 
     #[test]
