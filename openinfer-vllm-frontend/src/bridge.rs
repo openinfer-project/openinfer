@@ -313,6 +313,19 @@ impl LocalEngineBridge {
             external_req_id,
             ..
         } = request;
+        // Consume any stashed trace context the moment the request arrives:
+        // the validation rejections below terminate the request without ever
+        // reaching span creation (and streaming clients still see a success
+        // status, so the middleware's error-path cleanup cannot cover them).
+        // Every terminal path must retire the entry, not leak it to a
+        // within-TTL reuse of the same external id.
+        let stashed_parent = if openinfer_engine::tracing_state::is_enabled() {
+            external_req_id
+                .as_deref()
+                .and_then(|id| self.trace_stash.take(id))
+        } else {
+            None
+        };
         let Some(prompt_tokens) = prompt_token_ids else {
             warn!("request {request_id} dropped: missing prompt_token_ids");
             send_terminal_output(
@@ -399,9 +412,7 @@ impl LocalEngineBridge {
         // otherwise start a fresh trace. The stash is keyed by
         // external_req_id already, so the lookup is an exact match.
         let trace_root = if openinfer_engine::tracing_state::is_enabled() {
-            let parent = external_req_id
-                .as_deref()
-                .and_then(|id| self.trace_stash.take(id))
+            let parent = stashed_parent
                 .and_then(|traceparent| SpanContext::decode_w3c_traceparent(&traceparent))
                 .unwrap_or_else(SpanContext::random);
             Span::root("request", parent).with_property(|| ("request_id", tag.to_string()))
