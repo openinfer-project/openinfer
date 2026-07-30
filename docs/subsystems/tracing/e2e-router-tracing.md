@@ -31,7 +31,7 @@
      - Unit tests: middleware injection/no-header paths + bridge parent resolution (TestReporter pattern from phase_trace.rs)
   2. Bring up the local stack: `docker compose -f deploy/tracing/docker-compose.yml up -d` (Tempo 4317 / Grafana 3000)
   3. Start openinfer: `OPENINFER_TRACE_OTLP_ENDPOINT=http://127.0.0.1:4317 cargo run --release -- --model-path models/Qwen3-4B --port 8000` (confirm weights and GPU first)
-  4. Build and start the router (/data/code/workspace-rustllm/router): `cargo build --release`, then `vllm-router --worker-urls http://127.0.0.1:8000 --port 8090 --enable-trace --otlp-traces-endpoint <4317>` (verify flag format at execution)
+  4. Build and start the router (/data/code/workspace-rustllm/router): `cargo build --release`, then `vllm-router --worker-urls http://127.0.0.1:8000 --port 8090 --enable-trace --otlp-traces-endpoint 127.0.0.1:4317`
   5. Verify one chain: send `/v1/completions` through the router; assert via Tempo HTTP API (`:3200/api/search` + `/api/traces/<id>`) that **one trace** contains router `http_request` → `http_client_request` → openinfer `request` → `queue`/`prefill`/`decode` with correct parenting
   6. Observe e2e behavior: small concurrent load (vllm-bench or multi-turn curl) — router forwarding overhead, queue wait, prefill/decode breakdown; also verify the client-supplied-traceparent case (the whole chain should hang under the client's span)
   7. Wrap up: update deploy/tracing comments and docs/index.md, write the Debrief

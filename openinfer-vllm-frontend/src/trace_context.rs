@@ -16,6 +16,7 @@
 //! before reaching the engine leave stale entries that expire by TTL.
 
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -33,45 +34,67 @@ use axum::response::Response;
 const TTL: Duration = Duration::from_secs(120);
 const CAPACITY: usize = 4096;
 
+/// `(traceparent, inserted-at)` entries queued under one correlation id.
+type EntryQueue = VecDeque<(String, Instant)>;
+
 /// Stashed `traceparent` headers awaiting pickup by the engine bridge.
 ///
 /// Cheap to clone (inner `Arc`); one instance is shared between the axum
-/// layer (insert) and every engine bridge task (take).
+/// layer (insert) and every engine bridge task (take). Entries queue FIFO per
+/// id: concurrent attempts reusing one `X-Request-Id` (e.g. hedged retries)
+/// each keep their own parent instead of the latest insert overwriting the
+/// rest. (A per-attempt unique key is not available — `external_req_id` is
+/// the only correlation key the bridge can derive downstream.)
 #[derive(Clone, Default)]
 pub(crate) struct TraceContextStash {
-    inner: Arc<Mutex<HashMap<String, (String, Instant)>>>,
+    inner: Arc<Mutex<HashMap<String, EntryQueue>>>,
 }
 
 impl TraceContextStash {
     fn insert(&self, request_id: &str, traceparent: &str) {
         let mut inner = self.inner.lock().expect("trace context stash poisoned");
-        if inner.len() >= CAPACITY {
+        let mut total: usize = inner.values().map(VecDeque::len).sum();
+        if total >= CAPACITY {
             let now = Instant::now();
-            inner.retain(|_, (_, inserted)| now.duration_since(*inserted) < TTL);
-            if inner.len() >= CAPACITY {
+            inner.retain(|_, queue| {
+                queue.retain(|(_, inserted)| now.duration_since(*inserted) < TTL);
+                !queue.is_empty()
+            });
+            total = inner.values().map(VecDeque::len).sum();
+            if total >= CAPACITY {
                 // Pathological: more live unreached requests than the stash
                 // holds. Dropping it splits some traces; the stash must never
                 // grow unbounded or stall serving.
                 inner.clear();
             }
         }
-        inner.insert(
-            request_id.to_owned(),
-            (traceparent.to_owned(), Instant::now()),
-        );
+        inner
+            .entry(request_id.to_owned())
+            .or_default()
+            .push_back((traceparent.to_owned(), Instant::now()));
     }
 
-    /// Pop the stashed traceparent for `request_id`. One-shot: a second call
-    /// for the same id returns `None`. Entries older than [`TTL`] are dropped
-    /// instead of returned, so a request reusing an id never joins a stale
-    /// trace left behind by a request that never reached the engine.
+    /// Pop the oldest unexpired traceparent queued for `request_id`; each
+    /// queued entry is consumed at most once. Entries older than [`TTL`] are
+    /// dropped instead of returned, so a request reusing an id never joins a
+    /// stale trace left behind by a request that never reached the engine.
     pub(crate) fn take(&self, request_id: &str) -> Option<String> {
-        let (traceparent, inserted) = self
-            .inner
-            .lock()
-            .expect("trace context stash poisoned")
-            .remove(request_id)?;
-        (inserted.elapsed() < TTL).then_some(traceparent)
+        let mut inner = self.inner.lock().expect("trace context stash poisoned");
+        let (result, queue_empty) = {
+            let queue = inner.get_mut(request_id)?;
+            let mut result = None;
+            while let Some((traceparent, inserted)) = queue.pop_front() {
+                if inserted.elapsed() < TTL {
+                    result = Some(traceparent);
+                    break;
+                }
+            }
+            (result, queue.is_empty())
+        };
+        if queue_empty {
+            inner.remove(request_id);
+        }
+        result
     }
 
     /// Pop the traceparent for a request the bridge just received.
@@ -107,7 +130,9 @@ impl TraceContextStash {
         self.inner
             .lock()
             .expect("trace context stash poisoned")
-            .len()
+            .values()
+            .map(VecDeque::len)
+            .sum()
     }
 }
 
@@ -234,21 +259,39 @@ mod tests {
     #[test]
     fn take_drops_expired_entries() {
         let stash = TraceContextStash::default();
+        let expired = Instant::now()
+            .checked_sub(TTL + Duration::from_secs(1))
+            .expect("TTL subtraction stays within Instant range");
         stash
             .inner
             .lock()
             .expect("trace context stash poisoned")
             .insert(
                 "old".to_owned(),
-                (
-                    TRACEPARENT.to_owned(),
-                    Instant::now()
-                        .checked_sub(TTL + Duration::from_secs(1))
-                        .expect("TTL subtraction stays within Instant range"),
-                ),
+                VecDeque::from([(TRACEPARENT.to_owned(), expired)]),
             );
 
         assert!(stash.take("old").is_none());
+    }
+
+    #[test]
+    fn duplicate_ids_keep_separate_parents_fifo() {
+        // Hedged retries reusing one X-Request-Id concurrently: each attempt
+        // must consume a distinct parent, oldest first.
+        const TRACEPARENT_B: &str = "00-1af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+        let stash = TraceContextStash::default();
+        for tp in [TRACEPARENT, TRACEPARENT_B] {
+            let mut headers = HeaderMap::new();
+            headers.insert("traceparent", HeaderValue::from_str(tp).unwrap());
+            headers.insert("x-request-id", HeaderValue::from_static("hedged"));
+            stash_from_headers(&stash, &mut headers);
+        }
+        assert_eq!(stash.len(), 2);
+
+        assert_eq!(stash.take("hedged"), Some(TRACEPARENT.to_owned()));
+        assert_eq!(stash.take("hedged"), Some(TRACEPARENT_B.to_owned()));
+        assert!(stash.take("hedged").is_none());
+        assert_eq!(stash.len(), 0);
     }
 
     #[test]
