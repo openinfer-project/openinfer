@@ -214,6 +214,27 @@
     方案（device 条件启动）与 smem 宽连续加载（DRAM activate-bound，rows=1 预计再 -30%）
     列为下一轮调优卡；EP8/16 的 kDeepPipeBlocks=448 分类阈值需单独实测。
 
+- 2026-07-30 rows=64 专项（用户指令"只针对 bs=64"）：两张卡均**负结果**，根因定量比赢值钱:
+  - **卡 C（multi-subtile mma 结构级，o_proj/q_b/swiglu rows=64）**：两个结构尝试全亏并回滚
+    （cp.async 256B smem 暂存 +8~13%、depth-4 深流水 +3~10%）。**证伪两条假设**：DRAM
+    模式不是主约束（rows=8 同布局跑到 4.4TB/s）；加寄存器深流水被占用墙抵消。
+    真正未排除项 = **activation L2 读取的串行依赖**（act uint2 load 直接喂 mma，~500cyc
+    L2 延迟暴露）。下一步：先 ncu（`--set full` 抓 o_proj rows=64 单 launch，看 stall 分解
+    与 L1/L2 hit rate）再动手；终极答案可能是 tcgen05.mma（tmem 累加绕开寄存器墙，立项级）。
+  - **卡 D（flashmla rows=64）**：config 级无可挖——num_sm_parts=152（SM 数）已是谷底
+    （扫 64/76/104/128/152/160 证实；parts>152 双波次 69µs）。拟合模型：**P≈11-12µs
+    固定 prologue/launch**（152 CTA 的 tmem alloc/mbarrier/TMA 描述符预取）+ **B≈1.75µs/
+    topk-block/CTA**（流水线延迟主导，非带宽——ctx 16k→256k 池 10.7MB→172MB 超 L2，
+    median 仅 43.5→44.6µs）。rows=64 = 16 blocks/CTA 线性 B 项。下一步：prologue 审计
+    （全 rows 档通吃的最大单项）+ B 项内核级 pass（TMA 深度/softmax warp 特化）。
+  - **卡 D 副产物（超范围但免费）**：批感知 split `parts=min(32×rows,152)` 给 rows 1-4
+    带来 -15~20%（rows=1 23.6→18.1µs）——落地只需 Rust ops 层一行 + step_bench A/B，
+    待用户决策。harness 新增两个 env 旋钮（`KERNEL_LAB_FLASHMLA_NUM_SM_PARTS` /
+    `KERNEL_LAB_FLASHMLA_GRAPH`，默认=生产行为）已入库。
+  - **集成教训**：调优卡改 .cu 表项后必须全量跑 pytest——两个组的 CPU 测试硬断言了旧
+    {4,1} 占位文本，红在集成时才发现；已改成"解析实际表项 ↔ 实例覆盖"的持久不变量
+    （bare return 只覆盖无 per-batch 项的 batch，须先剥离 per-batch 行再匹配）。
+
 - 2026-07-29 GB300 bench：23/23 单元首批基线落账（`baselines/<unit>.json`）:
   - 全 rows 轴（各单元支持范围内）× 默认 ctx；30 rounds × 10 inner，clocks.sm=2070 MHz，
     git_rev=da68d4f9。示例：q_b_gemv rows=64 median 46.07µs、o_proj rows=64 134.36µs、

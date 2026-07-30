@@ -118,8 +118,10 @@ def test_tolerance_discipline():
 
 def test_o_proj_mma_config_routes():
     # Text-level guard on csrc/glm52/glm52_moe_gemv.cu: o_proj must hold its
-    # measured batch-8 entry and the Blackwell-only batch 16/32/64
-    # multi-subtile placeholder, or the manifest's rows axis over-promises.
+    # measured batch-8 entry, and every (batch, ksplit, ntiles) routed in the
+    # Blackwell batch 16/32/64 block must have a matching GLM52_MMA_MULTI_CASE
+    # instantiation — the dispatch fails closed otherwise. Config values are
+    # swept on GB300 and may change; the parse-and-match invariant must not.
     src = MOE_GEMV_CU.read_text(encoding="utf-8")
     fn = src.split("MmaConfig mma_config(int batch, int n, int k)", 1)[1]
     fn = fn.split("return {0, 0};", 1)[0]
@@ -127,13 +129,21 @@ def test_o_proj_mma_config_routes():
     assert re.search(r"n == 6144\s+&& k == 16384\) +return \{16, 2\}", batch8), \
         "o_proj batch-8 Blackwell mma entry {16,2} missing"
     multi = fn.split("batch == 16 || batch == 32 || batch == 64", 1)[1]
-    assert re.search(r"n == 6144\s+&& k == 16384\) +return \{4, 1\}", multi), \
-        "o_proj batch 16/32/64 multi-subtile placeholder {4,1} missing (UNMEASURED)"
-    # The placeholder must reuse the already-instantiated (BTILES, 4, 1)
-    # dispatch cases — a new (ksplit, ntiles) pair without a GLM52_MMA_MULTI_CASE
-    # would fail closed at launch time.
-    for bt in (2, 4, 8):
-        assert f"GLM52_MMA_MULTI_CASE({bt}, 4, 1)" in src
+    scope = re.search(r"n == 6144\s+&& k == 16384\)(.*?)(?=if \(n == |\Z)", multi, re.S)
+    assert scope, "o_proj (6144,16384) entry missing in batch 16/32/64 block"
+    body = scope.group(1)
+    per_batch = re.findall(r"batch == (\d+)\) +return \{(\d+), (\d+)\}", body)
+    routes = [(int(b), int(ks), int(nt)) for b, ks, nt in per_batch]
+    body_wo = re.sub(r"batch == \d+\) +return \{\d+, \d+\};", "", body)
+    bare = re.search(r"return \{(\d+), (\d+)\};", body_wo)
+    assert per_batch or bare, "o_proj batch 16/32/64 has no mma route at all"
+    if bare:
+        covered = {b for b, _, _ in routes}
+        routes += [(b, int(bare.group(1)), int(bare.group(2)))
+                   for b in (16, 32, 64) if b not in covered]
+    for batch, ks, nt in routes:
+        assert f"GLM52_MMA_MULTI_CASE({batch // 8}, {ks}, {nt})" in src, \
+            f"o_proj batch {batch} route {{{ks},{nt}}} lacks dispatch instantiation"
 
 
 def test_pair_cu_guard_matches_manifest():

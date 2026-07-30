@@ -26,13 +26,24 @@ Reference: f64 naive sparse attention over the same packed cache
 glm52_sparse_mla.cu's reference kernel). The synthetic cache carries UE8M0
 pow2 scales, so the sm100 e8m0 truncation is lossless; the 0.02 rel_l2 gate
 covers bf16 store rounding + f32 split-KV accumulation reorder.
+
+Tuning knobs (harness-only, env-gated, default = production behavior):
+- KERNEL_LAB_FLASHMLA_NUM_SM_PARTS=<int 1..160>: override the .so
+  num_sm_parts query (metadata is re-planned for the override). Used for the
+  split-scheduling sweep; production keeps the SM-count query.
+- KERNEL_LAB_FLASHMLA_GRAPH=1: capture the decode launch (main + combine)
+  into a CUDA graph on first run() and replay it afterwards — the
+  production-representative measurement (the model runs this kernel under
+  CUDA-graph capture, so the eager path's host-side tensor-map encoding and
+  launch overhead is a harness artifact, not production time).
 """
 from __future__ import annotations
 
 import ctypes
+import os
 
 from kernel_lab import data
-from kernel_lab.loader import KernelLaunchError, as_dev_ptr, require_torch, resolve
+from kernel_lab.loader import KernelLaunchError, as_dev_ptr, current_stream_ptr, require_torch, resolve
 from kernel_lab.refs import mla_attention as mla
 
 SYMBOL = "glm52_flashmla_sparse_decode_launch_cuda"
@@ -74,6 +85,12 @@ def make_inputs(shape: dict, seed: int) -> dict:
 
 
 def _query_num_sm_parts(lib) -> int:
+    override = os.environ.get("KERNEL_LAB_FLASHMLA_NUM_SM_PARTS")
+    if override:
+        parts = int(override)
+        if not 1 <= parts <= mla.MAX_SM_PARTS:
+            raise ValueError(f"KERNEL_LAB_FLASHMLA_NUM_SM_PARTS {parts} out of 1..={mla.MAX_SM_PARTS}")
+        return parts
     fn = resolve(lib, NUM_SM_PARTS_SYMBOL, [ctypes.POINTER(ctypes.c_int)])
     out = ctypes.c_int(0)
     rc = fn(ctypes.byref(out))
@@ -88,8 +105,8 @@ def _ensure_metadata(lib, tensors: dict, rows: int, parts: int, stream) -> None:
     """Plan-time tile-scheduler metadata — production computes it once per
     (batch, topk, num_sm_parts) at model build; the harness launches it on
     the first run() so bench warmup absorbs it and timed launches carry the
-    decode kernel only."""
-    if tensors["_metadata_ready"]:
+    decode kernel only. Re-planned if num_sm_parts changed (env override)."""
+    if tensors["_metadata_ready"] and tensors.get("_metadata_parts") == parts:
         return
     fn = resolve(
         lib,
@@ -114,16 +131,11 @@ def _ensure_metadata(lib, tensors: dict, rows: int, parts: int, stream) -> None:
     if rc != 0:
         raise KernelLaunchError(METADATA_SYMBOL, rc)
     tensors["_metadata_ready"] = True
+    tensors["_metadata_parts"] = parts
 
 
-def run(lib, tensors: dict, shape: dict, stream) -> None:
-    """One production decode launch on `stream` (c_void_p cudaStream_t)."""
-    rows = shape["rows"]
-    parts = tensors.get("_num_sm_parts")
-    if parts is None:
-        parts = _query_num_sm_parts(lib)
-        tensors["_num_sm_parts"] = parts
-    _ensure_metadata(lib, tensors, rows, parts, stream)
+def _launch_decode(lib, tensors: dict, rows: int, parts: int, stream) -> None:
+    """The raw production decode launch (main split-KV kernel + combine)."""
     fn = resolve(
         lib,
         SYMBOL,
@@ -164,6 +176,38 @@ def run(lib, tensors: dict, shape: dict, stream) -> None:
     )
     if rc != 0:
         raise KernelLaunchError(SYMBOL, rc)
+
+
+def _replay_or_capture(lib, tensors: dict, rows: int, parts: int) -> None:
+    """CUDA-graph replay of the decode launch — production-representative
+    timing (the model captures this kernel; replay erases the eager path's
+    per-launch host work: 4x cuTensorMapEncodeTiled + 2 launches + ctypes)."""
+    torch = require_torch()
+    graph = tensors.get("_graph")
+    if graph is None:
+        # Warm the launch once outside capture (driver/JIT state, smem attr),
+        # then capture main+combine on torch's capture stream.
+        _launch_decode(lib, tensors, rows, parts, current_stream_ptr())
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            _launch_decode(lib, tensors, rows, parts, current_stream_ptr())
+        tensors["_graph"] = graph
+    graph.replay()
+
+
+def run(lib, tensors: dict, shape: dict, stream) -> None:
+    """One production decode launch on `stream` (c_void_p cudaStream_t)."""
+    rows = shape["rows"]
+    parts = tensors.get("_num_sm_parts")
+    if parts is None:
+        parts = _query_num_sm_parts(lib)
+        tensors["_num_sm_parts"] = parts
+    _ensure_metadata(lib, tensors, rows, parts, stream)
+    if os.environ.get("KERNEL_LAB_FLASHMLA_GRAPH") == "1":
+        _replay_or_capture(lib, tensors, rows, parts)
+        return
+    _launch_decode(lib, tensors, rows, parts, stream)
 
 
 def reference(tensors: dict, shape: dict):

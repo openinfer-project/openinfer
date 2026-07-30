@@ -82,19 +82,32 @@ def test_scratch_rule_math():
 
 def test_rows16_64_have_cu_table_entries():
     # The manifest's rows axis must stay within what the .cu dispatch admits
-    # (the bucket-label-drift guard class). rows 1-8 were already whitelisted
-    # production shapes; rows 16/32/64 rest on the pure-increment Blackwell
-    # table entries added for this unit — guard them against removal.
+    # (the bucket-label-drift guard class). rows 16/32/64 rest on the swept
+    # Blackwell table entries for the shared pair — guard the route-and-
+    # instantiation contract, not the specific tuned values (they change).
+    import re
+
     cu = (
         loader.repo_root()
         / "openinfer-kernels/csrc/glm52/glm52_moe_gemv.cu"
     ).read_text(encoding="utf-8")
     block = cu.split("batch == 16 || batch == 32 || batch == 64", 1)[1]
-    assert 'if (n == 4096  && k == 6144)  return {4, 1};' in block  # shared gate|up
-    assert 'if (n == 6144  && k == 2048)  return {4, 1};' in block  # shared down
-    # And the multi-subtile dispatch must instantiate the {4,1} configs.
-    for btiles in (2, 4, 8):
-        assert f"GLM52_MMA_MULTI_CASE({btiles}, 4, 1)" in cu
+    for n, k, tag in ((4096, 6144, "shared gate|up"), (6144, 2048, "shared down")):
+        scope = re.search(rf"n == {n}\s+&& k == {k}\)(.*?)(?=if \(n == |\Z)", block, re.S)
+        assert scope, f"{tag} ({n},{k}) entry missing in batch 16/32/64 block"
+        body = scope.group(1)
+        per_batch = re.findall(r"batch == (\d+)\) +return \{(\d+), (\d+)\}", body)
+        routes = [(int(b), int(ks), int(nt)) for b, ks, nt in per_batch]
+        body_wo = re.sub(r"batch == \d+\) +return \{\d+, \d+\};", "", body)
+        bare = re.search(r"return \{(\d+), (\d+)\};", body_wo)
+        assert per_batch or bare, f"{tag} has no mma route in batch 16/32/64 block"
+        if bare:
+            covered = {b for b, _, _ in routes}
+            routes += [(b, int(bare.group(1)), int(bare.group(2)))
+                       for b in (16, 32, 64) if b not in covered]
+        for batch, ks, nt in routes:
+            assert f"GLM52_MMA_MULTI_CASE({batch // 8}, {ks}, {nt})" in cu, \
+                f"{tag} batch {batch} route {{{ks},{nt}}} lacks dispatch instantiation"
 
 
 def test_symbols_resolvable_when_so_present():
