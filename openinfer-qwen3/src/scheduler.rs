@@ -1196,7 +1196,7 @@ fn admitted_future_blocks_with_inflight<E: ModelExecutor>(
     let block_size = executor.block_size();
     active_future_blocks(active, block_size)
         + prefilling_future_blocks(prefilling, block_size, |id| executor.prefetched_blocks(id))
-        + prefilling_future_blocks(inflight_prefilling, block_size, |id| {
+        + inflight_prefilling_future_blocks(inflight_prefilling, block_size, |id| {
             executor.prefetched_blocks(id)
         })
 }
@@ -1214,6 +1214,25 @@ fn prefilling_future_blocks(
         .map(|req| {
             pending_lifetime_blocks(req, block_size)
                 .saturating_sub(blocks_needed(req.prefill_pos, block_size))
+                .saturating_sub(prefetch_credit(req.request_id))
+        })
+        .sum()
+}
+
+fn inflight_prefilling_future_blocks(
+    prefilling: &[PendingRequest],
+    block_size: usize,
+    prefetch_credit: impl Fn(RequestId) -> usize,
+) -> usize {
+    prefilling
+        .iter()
+        .map(|req| {
+            let scheduled_prompt_tokens = req
+                .prefill_pos
+                .saturating_add(req.step_chunk)
+                .min(req.prompt_tokens.len());
+            pending_lifetime_blocks(req, block_size)
+                .saturating_sub(blocks_needed(scheduled_prompt_tokens, block_size))
                 .saturating_sub(prefetch_credit(req.request_id))
         })
         .sum()
@@ -1293,7 +1312,7 @@ fn admit_deferred_requests_with_inflight(
             block_size,
             &prefetch_credit,
         ))
-        .saturating_sub(prefilling_future_blocks(
+        .saturating_sub(inflight_prefilling_future_blocks(
             inflight_prefilling,
             block_size,
             &prefetch_credit,
