@@ -179,19 +179,32 @@ fn external_req_id_for(path: &str, request_id: &str) -> String {
 
 /// Drop guard for one stashed insertion. The bridge consumes an entry the
 /// moment its `EngineCoreRequest` arrives (accepted or rejected alike), so
-/// when the middleware future ends — normally, on an error response, or by
-/// cancellation when the client disconnects mid-pipeline — a still-present
-/// entry can only belong to a request that never reached the engine, and is
-/// discarded. For consumed entries the discard is a no-op.
+/// when the middleware future ends without a successful response — an error
+/// status, or cancellation when the client disconnects mid-pipeline — a
+/// still-present entry can only belong to a request that never reached the
+/// engine, and is discarded. For consumed entries the discard is a no-op.
 struct InsertionGuard {
     stash: TraceContextStash,
     key: String,
     token: u64,
+    armed: bool,
+}
+
+impl InsertionGuard {
+    /// Stand down: the response succeeded, so the engine request was already
+    /// sent and the bridge will consume the entry when it processes it.
+    /// (Streaming response heads can go out while the bridge is still behind;
+    /// dropping armed here would delete the parent first.)
+    fn disarm(mut self) {
+        self.armed = false;
+    }
 }
 
 impl Drop for InsertionGuard {
     fn drop(&mut self) {
-        self.stash.discard_entry(&self.key, self.token);
+        if self.armed {
+            self.stash.discard_entry(&self.key, self.token);
+        }
     }
 }
 
@@ -200,9 +213,10 @@ impl Drop for InsertionGuard {
 /// Only generation routes are eligible — other routes never produce an
 /// `EngineCoreRequest`, so their entries would leak until the TTL. Does
 /// nothing when request tracing is disabled. An [`InsertionGuard`] retires
-/// the entry if the request never reaches the engine: HTTP validation
-/// rejects, or a client disconnect dropping the future before the handler
-/// finishes.
+/// the entry when the request cannot have reached the engine: an error
+/// status, or a client disconnect dropping the future before the handler
+/// finishes. On success the guard is disarmed and the bridge consumes the
+/// entry itself.
 pub(crate) async fn stash_trace_context(
     State(stash): State<TraceContextStash>,
     mut request: Request,
@@ -215,14 +229,21 @@ pub(crate) async fn stash_trace_context(
         return next.run(request).await;
     }
     let path = request.uri().path().to_owned();
-    let _guard = stash_from_headers(&stash, &path, request.headers_mut()).map(|(key, token)| {
+    let guard = stash_from_headers(&stash, &path, request.headers_mut()).map(|(key, token)| {
         InsertionGuard {
             stash: stash.clone(),
             key,
             token,
+            armed: true,
         }
     });
-    next.run(request).await
+    let response = next.run(request).await;
+    if response.status().is_success() {
+        if let Some(guard) = guard {
+            guard.disarm();
+        }
+    }
+    response
 }
 
 /// Read `traceparent` from `headers` and stash it under the request's
@@ -473,10 +494,31 @@ mod tests {
             stash: stash.clone(),
             key: key_a,
             token: token_a,
+            armed: true,
         });
 
         assert_eq!(stash.take(&key_b), Some(TRACEPARENT_B.to_owned()));
         assert!(stash.take(&key_b).is_none());
+    }
+
+    #[test]
+    fn disarmed_guard_leaves_entry_for_bridge_consumption() {
+        // Successful (possibly streaming) responses disarm the guard: the
+        // entry must survive for the bridge, which may still be behind.
+        let stash = TraceContextStash::default();
+        let mut headers = traced_headers("s", TRACEPARENT);
+        let (key, token) = stash_from_headers(&stash, COMPLETIONS, &mut headers).unwrap();
+
+        InsertionGuard {
+            stash: stash.clone(),
+            key: key.clone(),
+            token,
+            armed: true,
+        }
+        .disarm();
+
+        assert_eq!(stash.take(&key), Some(TRACEPARENT.to_owned()));
+        assert_eq!(stash.len(), 0);
     }
 
     #[test]
