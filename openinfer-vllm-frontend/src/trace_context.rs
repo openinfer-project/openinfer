@@ -62,13 +62,16 @@ impl TraceContextStash {
     }
 
     /// Pop the stashed traceparent for `request_id`. One-shot: a second call
-    /// for the same id returns `None`.
+    /// for the same id returns `None`. Entries older than [`TTL`] are dropped
+    /// instead of returned, so a request reusing an id never joins a stale
+    /// trace left behind by a request that never reached the engine.
     pub(crate) fn take(&self, request_id: &str) -> Option<String> {
-        self.inner
+        let (traceparent, inserted) = self
+            .inner
             .lock()
             .expect("trace context stash poisoned")
-            .remove(request_id)
-            .map(|(traceparent, _)| traceparent)
+            .remove(request_id)?;
+        (inserted.elapsed() < TTL).then_some(traceparent)
     }
 
     /// Pop the traceparent for a request the bridge just received.
@@ -205,6 +208,24 @@ mod tests {
             stash.take_for_external_req_id("chatcmpl-dbg12345"),
             Some(TRACEPARENT.to_owned())
         );
+    }
+
+    #[test]
+    fn take_drops_expired_entries() {
+        let stash = TraceContextStash::default();
+        stash
+            .inner
+            .lock()
+            .expect("trace context stash poisoned")
+            .insert(
+                "old".to_owned(),
+                (
+                    TRACEPARENT.to_owned(),
+                    Instant::now() - TTL - Duration::from_secs(1),
+                ),
+            );
+
+        assert!(stash.take("old").is_none());
     }
 
     #[test]
