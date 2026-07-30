@@ -19,12 +19,15 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
 use axum::extract::Request;
 use axum::extract::State;
 use axum::http::HeaderMap;
+use axum::http::Method;
 use axum::middleware::Next;
 use axum::response::Response;
 
@@ -34,8 +37,22 @@ use axum::response::Response;
 const TTL: Duration = Duration::from_secs(120);
 const CAPACITY: usize = 4096;
 
-/// `(traceparent, inserted-at)` entries queued under one correlation id.
-type EntryQueue = VecDeque<(String, Instant)>;
+/// Routes whose accepted requests produce an `EngineCoreRequest` (and thus
+/// consume a stash entry at the bridge). Stashing anywhere else would leak
+/// entries for requests that never reach the engine (e.g. traced `/metrics`
+/// probes), eventually tripping the capacity clear and splitting live traces.
+const GENERATION_PATHS: &[&str] = &[
+    "/v1/completions",
+    "/v1/chat/completions",
+    "/inference/v1/generate",
+];
+
+/// `(token, traceparent, inserted-at)` entries queued under one id.
+type EntryQueue = VecDeque<(u64, String, Instant)>;
+
+/// Per-insertion token: lets the HTTP layer discard exactly the entry it
+/// stashed even when responses complete out of FIFO order.
+static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 /// Stashed `traceparent` headers awaiting pickup by the engine bridge.
 ///
@@ -51,13 +68,16 @@ pub(crate) struct TraceContextStash {
 }
 
 impl TraceContextStash {
-    fn insert(&self, request_id: &str, traceparent: &str) {
+    /// Queue `traceparent` under `request_id`, returning the insertion token
+    /// the HTTP layer needs to discard exactly this entry on the error path.
+    fn insert(&self, request_id: &str, traceparent: &str) -> u64 {
+        let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
         let mut inner = self.inner.lock().expect("trace context stash poisoned");
         let mut total: usize = inner.values().map(VecDeque::len).sum();
         if total >= CAPACITY {
             let now = Instant::now();
             inner.retain(|_, queue| {
-                queue.retain(|(_, inserted)| now.duration_since(*inserted) < TTL);
+                queue.retain(|(_, _, inserted)| now.duration_since(*inserted) < TTL);
                 !queue.is_empty()
             });
             total = inner.values().map(VecDeque::len).sum();
@@ -68,10 +88,12 @@ impl TraceContextStash {
                 inner.clear();
             }
         }
-        inner
-            .entry(request_id.to_owned())
-            .or_default()
-            .push_back((traceparent.to_owned(), Instant::now()));
+        inner.entry(request_id.to_owned()).or_default().push_back((
+            token,
+            traceparent.to_owned(),
+            Instant::now(),
+        ));
+        token
     }
 
     /// Pop the oldest unexpired traceparent queued for `request_id`; each
@@ -83,7 +105,7 @@ impl TraceContextStash {
         let (result, queue_empty) = {
             let queue = inner.get_mut(request_id)?;
             let mut result = None;
-            while let Some((traceparent, inserted)) = queue.pop_front() {
+            while let Some((_, traceparent, inserted)) = queue.pop_front() {
                 if inserted.elapsed() < TTL {
                     result = Some(traceparent);
                     break;
@@ -125,16 +147,17 @@ impl TraceContextStash {
             .remove(request_id);
     }
 
-    /// Drop the oldest queued entry for `request_id` without joining it.
-    /// Used when the HTTP layer learns the request never reached the engine
-    /// (error response), so a within-TTL retry carrying a fresh traceparent
-    /// does not inherit the abandoned attempt's parent.
-    fn discard_oldest(&self, request_id: &str) {
+    /// Drop exactly the entry tagged `token`, wherever it sits in the queue.
+    /// Responses can complete out of FIFO order, so the error path must not
+    /// assume the abandoned attempt is at the head.
+    fn discard_entry(&self, request_id: &str, token: u64) {
         let mut inner = self.inner.lock().expect("trace context stash poisoned");
         let Some(queue) = inner.get_mut(request_id) else {
             return;
         };
-        queue.pop_front();
+        if let Some(pos) = queue.iter().position(|(t, _, _)| *t == token) {
+            queue.remove(pos);
+        }
         if queue.is_empty() {
             inner.remove(request_id);
         }
@@ -153,24 +176,28 @@ impl TraceContextStash {
 
 /// Axum middleware: stash the request's `traceparent` under its external id.
 ///
-/// Does nothing when request tracing is disabled (the bridge would never
-/// look entries up). After the response, an error status means the request
-/// never reached the engine (validation rejects and the like), so the entry
-/// it stashed is dropped immediately rather than left for a within-TTL retry
-/// to inherit.
+/// Only generation routes are eligible — other routes never produce an
+/// `EngineCoreRequest`, so their entries would leak until the TTL. Does
+/// nothing when request tracing is disabled. After the response, an error
+/// status means the request never reached the engine (validation rejects and
+/// the like), so the exact entry it stashed is discarded immediately rather
+/// than left for a within-TTL retry to inherit.
 pub(crate) async fn stash_trace_context(
     State(stash): State<TraceContextStash>,
     mut request: Request,
     next: Next,
 ) -> Response {
-    if !openinfer_engine::tracing_state::is_enabled() {
+    if !openinfer_engine::tracing_state::is_enabled()
+        || request.method() != Method::POST
+        || !GENERATION_PATHS.contains(&request.uri().path())
+    {
         return next.run(request).await;
     }
-    let stashed_id = stash_from_headers(&stash, request.headers_mut());
+    let stashed = stash_from_headers(&stash, request.headers_mut());
     let response = next.run(request).await;
     if !response.status().is_success() {
-        if let Some(id) = stashed_id {
-            stash.discard_oldest(&id);
+        if let Some((id, token)) = stashed {
+            stash.discard_entry(&id, token);
         }
     }
     response
@@ -178,14 +205,14 @@ pub(crate) async fn stash_trace_context(
 
 /// Read `traceparent` from `headers` and stash it under the request's
 /// external id, generating and injecting `X-Request-Id` when absent so the
-/// bridge and vllm-server agree on the correlation key. Returns the id an
-/// entry was stashed under, `None` when nothing was stashed.
+/// bridge and vllm-server agree on the correlation key. Returns the id and
+/// insertion token when an entry was stashed, `None` otherwise.
 ///
 /// A request with no trace context of its own invalidates any pending entry
 /// under its id: entries are left behind by requests rejected before reaching
 /// the engine, and an untraced retry reusing the id must not join that older
 /// trace (the TTL only bounds, not prevents, within-window reuse).
-fn stash_from_headers(stash: &TraceContextStash, headers: &mut HeaderMap) -> Option<String> {
+fn stash_from_headers(stash: &TraceContextStash, headers: &mut HeaderMap) -> Option<(String, u64)> {
     let request_id = headers
         .get("x-request-id")
         .and_then(|v| v.to_str().ok())
@@ -210,8 +237,8 @@ fn stash_from_headers(stash: &TraceContextStash, headers: &mut HeaderMap) -> Opt
         }
         id
     });
-    stash.insert(&request_id, &traceparent);
-    Some(request_id)
+    let token = stash.insert(&request_id, &traceparent);
+    Some((request_id, token))
 }
 
 #[cfg(test)]
@@ -295,7 +322,7 @@ mod tests {
             .expect("trace context stash poisoned")
             .insert(
                 "old".to_owned(),
-                VecDeque::from([(TRACEPARENT.to_owned(), expired)]),
+                VecDeque::from([(1, TRACEPARENT.to_owned(), expired)]),
             );
 
         assert!(stash.take("old").is_none());
@@ -322,6 +349,28 @@ mod tests {
     }
 
     #[test]
+    fn error_path_discards_the_rejected_attempts_own_entry() {
+        // Two overlapping traced requests share an id; the later one errors
+        // out first. Discarding must remove the later attempt's entry, not
+        // the queue head.
+        const TRACEPARENT_B: &str = "00-1af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+        let stash = TraceContextStash::default();
+        let mut first = HeaderMap::new();
+        first.insert("traceparent", HeaderValue::from_static(TRACEPARENT));
+        first.insert("x-request-id", HeaderValue::from_static("dup"));
+        stash_from_headers(&stash, &mut first);
+        let mut second = HeaderMap::new();
+        second.insert("traceparent", HeaderValue::from_static(TRACEPARENT_B));
+        second.insert("x-request-id", HeaderValue::from_static("dup"));
+        let (_, token_b) = stash_from_headers(&stash, &mut second).unwrap();
+
+        stash.discard_entry("dup", token_b);
+
+        assert_eq!(stash.take("dup"), Some(TRACEPARENT.to_owned()));
+        assert!(stash.take("dup").is_none());
+    }
+
+    #[test]
     fn traced_retry_after_rejection_gets_fresh_parent() {
         // First attempt is rejected before reaching the engine; the HTTP
         // layer discards its entry on the error response, so the traced
@@ -332,9 +381,10 @@ mod tests {
         first.insert("traceparent", HeaderValue::from_static(TRACEPARENT));
         first.insert("x-request-id", HeaderValue::from_static("retry-2"));
         let id = stash_from_headers(&stash, &mut first);
-        assert_eq!(id.as_deref(), Some("retry-2"));
+        assert_eq!(id.as_ref().map(|(id, _)| id.as_str()), Some("retry-2"));
 
-        stash.discard_oldest(id.as_deref().unwrap());
+        let (id, token) = id.unwrap();
+        stash.discard_entry(&id, token);
         assert_eq!(stash.len(), 0);
 
         let mut retry = HeaderMap::new();
