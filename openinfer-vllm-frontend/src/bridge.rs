@@ -72,6 +72,7 @@ pub(crate) struct LocalEngineBridge {
     pub(crate) engine_index: u32,
     pub(crate) data_parallel_size: u32,
     pub(crate) load_watch: Option<watch::Receiver<LoadSnapshot>>,
+    pub(crate) trace_stash: crate::trace_context::TraceContextStash,
 }
 
 impl LocalEngineBridge {
@@ -309,6 +310,7 @@ impl LocalEngineBridge {
             request_id,
             prompt_token_ids,
             sampling_params,
+            external_req_id,
             ..
         } = request;
         let Some(prompt_tokens) = prompt_token_ids else {
@@ -392,9 +394,20 @@ impl LocalEngineBridge {
         // keeps the default (tracing-off) path free of per-request span work,
         // and `from_span` on a noop span yields `None` so the scheduler skips
         // its span work too.
+        //
+        // Parent resolution: if the HTTP layer stashed a W3C traceparent for
+        // this request (sent by an upstream such as vllm-router with OTel),
+        // join that trace so client → router → engine phases render as one
+        // trace; otherwise start a fresh trace with a random context. A
+        // non-sampled upstream context yields a non-collected root span,
+        // honoring the upstream sampling decision.
         let trace_root = if openinfer_engine::tracing_state::is_enabled() {
-            Span::root("request", SpanContext::random())
-                .with_property(|| ("request_id", tag.to_string()))
+            let parent = external_req_id
+                .as_deref()
+                .and_then(|id| self.trace_stash.take_for_external_req_id(id))
+                .and_then(|traceparent| SpanContext::decode_w3c_traceparent(&traceparent))
+                .unwrap_or_else(SpanContext::random);
+            Span::root("request", parent).with_property(|| ("request_id", tag.to_string()))
         } else {
             Span::noop()
         };

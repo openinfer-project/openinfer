@@ -26,6 +26,7 @@ use vllm_server::RendererSelection;
 mod bridge;
 mod lora;
 mod request_contract;
+mod trace_context;
 mod wire;
 
 use bridge::LocalEngineBridge;
@@ -220,11 +221,15 @@ where
     // in the registration wait.
     let server_shutdown = shutdown.child_token();
     let bridge_shutdown = shutdown.child_token();
+    // Shared between the axum layer (stash on HTTP intake) and every engine
+    // bridge below (pop on EngineCoreRequest) — see trace_context.rs.
+    let trace_stash = trace_context::TraceContextStash::default();
     let engine_task = tokio::spawn({
         let server_shutdown = server_shutdown.clone();
         let bridge_shutdown = bridge_shutdown.clone();
         let input_address = input_address.clone();
         let output_address = output_address.clone();
+        let trace_stash = trace_stash.clone();
         async move {
             let handle = match engine.await {
                 Ok(handle) => handle,
@@ -253,6 +258,7 @@ where
                     engine_index: engine_index as u32,
                     data_parallel_size,
                     load_watch: handle.load_watch_for(engine_index),
+                    trace_stash: trace_stash.clone(),
                 };
                 let shutdown = bridge_shutdown.clone();
                 bridges.spawn(async move { (engine_index, bridge.run(shutdown).await) });
@@ -334,6 +340,19 @@ where
         tls: None,
     };
 
+    // Outermost layer: stash W3C trace context on intake so the bridge can
+    // join each request's root span to the upstream trace. Must run before
+    // vllm-server reads headers (it forwards X-Request-Id but drops
+    // traceparent), so it wraps the router after all other extensions.
+    let extend_router = {
+        let trace_stash = trace_stash.clone();
+        move |router: Router| {
+            extend_router(router).layer(axum::middleware::from_fn_with_state(
+                trace_stash,
+                trace_context::stash_trace_context,
+            ))
+        }
+    };
     let result =
         vllm_server::serve_with_router_extension(config, server_shutdown, extend_router).await;
     // Stop the bridge (no-op if the caller's shutdown already cancelled it),
