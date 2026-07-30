@@ -12,6 +12,13 @@
 #   # to find requests whose prompt phase (first chunk on GPU → first token)
 #   # blew past 500ms. Emitted spans: request → {queue, prefill, decode}.
 #
+# Fronting openinfer with an OTel-enabled proxy (e.g. vllm-project/router with
+# --enable-trace --otlp-traces-endpoint 127.0.0.1:4317) joins both sides into
+# one trace — client → router http_request/http_client_request → openinfer
+# request → queue/prefill/decode — as long as both export to the same Tempo.
+# openinfer's HTTP layer stashes the incoming traceparent and the engine
+# bridge joins it; see docs/subsystems/tracing/e2e-router-tracing.md.
+#
 # Switching backend later (VictoriaTraces, etc.) is an endpoint/image change,
 # not a code change — everything downstream of OTLP is swappable.
 
@@ -35,8 +42,10 @@ services:
     restart: unless-stopped
     environment:
       GF_AUTH_ANONYMOUS_ENABLED: "true"
-      # Viewer, not Admin: Explore/dashboards need no write access.
-      GF_AUTH_ANONYMOUS_ORG_ROLE: "Viewer"
+      # Editor, not Viewer: anonymous Viewers are denied `datasources:explore`
+      # in Grafana 11.3 (Access denied in the server log, Explore silently
+      # returns nothing). Loopback-only binding keeps the write surface local.
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Editor"
       GF_AUTH_DISABLE_LOGIN_FORM: "true"
       # Enable the TraceQL editor and search UX.
       GF_FEATURE_TOGGLES_ENABLE: "traceqlEditor traceqlSearch"
