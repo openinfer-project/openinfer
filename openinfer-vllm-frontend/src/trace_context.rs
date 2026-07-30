@@ -125,6 +125,21 @@ impl TraceContextStash {
             .remove(request_id);
     }
 
+    /// Drop the oldest queued entry for `request_id` without joining it.
+    /// Used when the HTTP layer learns the request never reached the engine
+    /// (error response), so a within-TTL retry carrying a fresh traceparent
+    /// does not inherit the abandoned attempt's parent.
+    fn discard_oldest(&self, request_id: &str) {
+        let mut inner = self.inner.lock().expect("trace context stash poisoned");
+        let Some(queue) = inner.get_mut(request_id) else {
+            return;
+        };
+        queue.pop_front();
+        if queue.is_empty() {
+            inner.remove(request_id);
+        }
+    }
+
     #[cfg(test)]
     fn len(&self) -> usize {
         self.inner
@@ -139,27 +154,38 @@ impl TraceContextStash {
 /// Axum middleware: stash the request's `traceparent` under its external id.
 ///
 /// Does nothing when request tracing is disabled (the bridge would never
-/// look entries up) or the request carries no `traceparent`.
+/// look entries up). After the response, an error status means the request
+/// never reached the engine (validation rejects and the like), so the entry
+/// it stashed is dropped immediately rather than left for a within-TTL retry
+/// to inherit.
 pub(crate) async fn stash_trace_context(
     State(stash): State<TraceContextStash>,
     mut request: Request,
     next: Next,
 ) -> Response {
-    if openinfer_engine::tracing_state::is_enabled() {
-        stash_from_headers(&stash, request.headers_mut());
+    if !openinfer_engine::tracing_state::is_enabled() {
+        return next.run(request).await;
     }
-    next.run(request).await
+    let stashed_id = stash_from_headers(&stash, request.headers_mut());
+    let response = next.run(request).await;
+    if !response.status().is_success() {
+        if let Some(id) = stashed_id {
+            stash.discard_oldest(&id);
+        }
+    }
+    response
 }
 
 /// Read `traceparent` from `headers` and stash it under the request's
 /// external id, generating and injecting `X-Request-Id` when absent so the
-/// bridge and vllm-server agree on the correlation key.
+/// bridge and vllm-server agree on the correlation key. Returns the id an
+/// entry was stashed under, `None` when nothing was stashed.
 ///
 /// A request with no trace context of its own invalidates any pending entry
 /// under its id: entries are left behind by requests rejected before reaching
 /// the engine, and an untraced retry reusing the id must not join that older
 /// trace (the TTL only bounds, not prevents, within-window reuse).
-fn stash_from_headers(stash: &TraceContextStash, headers: &mut HeaderMap) {
+fn stash_from_headers(stash: &TraceContextStash, headers: &mut HeaderMap) -> Option<String> {
     let request_id = headers
         .get("x-request-id")
         .and_then(|v| v.to_str().ok())
@@ -172,7 +198,7 @@ fn stash_from_headers(stash: &TraceContextStash, headers: &mut HeaderMap) {
         if let Some(id) = request_id {
             stash.invalidate(&id);
         }
-        return;
+        return None;
     };
     let request_id = request_id.unwrap_or_else(|| {
         // Mirror vllm-server's own id shape (8 hex chars) so logs read the
@@ -185,6 +211,7 @@ fn stash_from_headers(stash: &TraceContextStash, headers: &mut HeaderMap) {
         id
     });
     stash.insert(&request_id, &traceparent);
+    Some(request_id)
 }
 
 #[cfg(test)]
@@ -291,6 +318,30 @@ mod tests {
         assert_eq!(stash.take("hedged"), Some(TRACEPARENT.to_owned()));
         assert_eq!(stash.take("hedged"), Some(TRACEPARENT_B.to_owned()));
         assert!(stash.take("hedged").is_none());
+        assert_eq!(stash.len(), 0);
+    }
+
+    #[test]
+    fn traced_retry_after_rejection_gets_fresh_parent() {
+        // First attempt is rejected before reaching the engine; the HTTP
+        // layer discards its entry on the error response, so the traced
+        // retry's own parent is what the bridge consumes.
+        const TRACEPARENT_B: &str = "00-1af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+        let stash = TraceContextStash::default();
+        let mut first = HeaderMap::new();
+        first.insert("traceparent", HeaderValue::from_static(TRACEPARENT));
+        first.insert("x-request-id", HeaderValue::from_static("retry-2"));
+        let id = stash_from_headers(&stash, &mut first);
+        assert_eq!(id.as_deref(), Some("retry-2"));
+
+        stash.discard_oldest(id.as_deref().unwrap());
+        assert_eq!(stash.len(), 0);
+
+        let mut retry = HeaderMap::new();
+        retry.insert("traceparent", HeaderValue::from_static(TRACEPARENT_B));
+        retry.insert("x-request-id", HeaderValue::from_static("retry-2"));
+        stash_from_headers(&stash, &mut retry);
+        assert_eq!(stash.take("retry-2"), Some(TRACEPARENT_B.to_owned()));
         assert_eq!(stash.len(), 0);
     }
 
