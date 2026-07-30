@@ -14,7 +14,8 @@
 //! Requests without trace context reserve their slot with an untraced marker,
 //! so overlapping attempts reusing one id each consume only their own slot.
 //! Entries are popped on use; entries whose request never reaches the engine
-//! are discarded on the error response, or expire by TTL.
+//! are retired by a middleware drop guard (error responses, client
+//! disconnects), or expire by TTL.
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -176,14 +177,32 @@ fn external_req_id_for(path: &str, request_id: &str) -> String {
     }
 }
 
+/// Drop guard for one stashed insertion. The bridge consumes an entry the
+/// moment its `EngineCoreRequest` arrives (accepted or rejected alike), so
+/// when the middleware future ends — normally, on an error response, or by
+/// cancellation when the client disconnects mid-pipeline — a still-present
+/// entry can only belong to a request that never reached the engine, and is
+/// discarded. For consumed entries the discard is a no-op.
+struct InsertionGuard {
+    stash: TraceContextStash,
+    key: String,
+    token: u64,
+}
+
+impl Drop for InsertionGuard {
+    fn drop(&mut self) {
+        self.stash.discard_entry(&self.key, self.token);
+    }
+}
+
 /// Axum middleware: stash the request's `traceparent` under its external id.
 ///
 /// Only generation routes are eligible — other routes never produce an
 /// `EngineCoreRequest`, so their entries would leak until the TTL. Does
-/// nothing when request tracing is disabled. After the response, an error
-/// status means the request never reached the engine (validation rejects and
-/// the like), so the exact entry it stashed is discarded immediately rather
-/// than left for a within-TTL retry to inherit.
+/// nothing when request tracing is disabled. An [`InsertionGuard`] retires
+/// the entry if the request never reaches the engine: HTTP validation
+/// rejects, or a client disconnect dropping the future before the handler
+/// finishes.
 pub(crate) async fn stash_trace_context(
     State(stash): State<TraceContextStash>,
     mut request: Request,
@@ -196,14 +215,14 @@ pub(crate) async fn stash_trace_context(
         return next.run(request).await;
     }
     let path = request.uri().path().to_owned();
-    let stashed = stash_from_headers(&stash, &path, request.headers_mut());
-    let response = next.run(request).await;
-    if !response.status().is_success() {
-        if let Some((id, token)) = stashed {
-            stash.discard_entry(&id, token);
+    let _guard = stash_from_headers(&stash, &path, request.headers_mut()).map(|(key, token)| {
+        InsertionGuard {
+            stash: stash.clone(),
+            key,
+            token,
         }
-    }
-    response
+    });
+    next.run(request).await
 }
 
 /// Read `traceparent` from `headers` and stash it under the request's
@@ -437,6 +456,27 @@ mod tests {
         // ...and the untraced attempt pops its marker: no parent, one-shot.
         assert!(stash.take("cmpl-retry-1").is_none());
         assert_eq!(stash.len(), 0);
+    }
+
+    #[test]
+    fn dropped_guard_retires_only_its_own_entry() {
+        // Client disconnects mid-pipeline drop the middleware future; the
+        // guard must retire exactly the cancelled attempt's entry.
+        let stash = TraceContextStash::default();
+        let mut first = traced_headers("g", TRACEPARENT);
+        let (key_a, token_a) = stash_from_headers(&stash, COMPLETIONS, &mut first).unwrap();
+        let mut second = traced_headers("g", TRACEPARENT_B);
+        let (key_b, _) = stash_from_headers(&stash, COMPLETIONS, &mut second).unwrap();
+        assert_eq!(key_a, key_b);
+
+        drop(InsertionGuard {
+            stash: stash.clone(),
+            key: key_a,
+            token: token_a,
+        });
+
+        assert_eq!(stash.take(&key_b), Some(TRACEPARENT_B.to_owned()));
+        assert!(stash.take(&key_b).is_none());
     }
 
     #[test]
