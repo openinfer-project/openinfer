@@ -102,13 +102,16 @@ impl TraceContextStash {
         token
     }
 
-    /// Pop the oldest unexpired entry queued for `request_id`; each queued
-    /// entry is consumed at most once. A fresh parent comes back as `Some`,
-    /// anything else — no entry, an expired one, or an untraced marker — as
-    /// `None`, which the bridge treats as "start a fresh trace". Expired
-    /// entries are dropped, never joined: a request reusing an id must not
-    /// attach to a trace left behind by a request that never reached the
-    /// engine.
+    /// Pop exactly one slot for `request_id`: the queue head. A fresh parent
+    /// comes back as `Some`; anything else — no entry, an expired one, or an
+    /// untraced marker — as `None`, which the bridge treats as "start a
+    /// fresh trace".
+    ///
+    /// One slot per bridge arrival, never a scan past an expired head: slots
+    /// pair attempts to arrivals in order, and an expired head belongs to
+    /// this arrival's own attempt (merely slow, e.g. a long body upload past
+    /// the TTL). Sliding into the next attempt's live parent would both
+    /// mis-attach this request and orphan the next one.
     ///
     /// Pairing ceiling: entries queue in middleware intake order, which the
     /// bridge normally follows. Concurrent requests reusing one id (hedged
@@ -122,13 +125,12 @@ impl TraceContextStash {
         let mut inner = self.inner.lock().expect("trace context stash poisoned");
         let (result, queue_empty) = {
             let queue = inner.get_mut(request_id)?;
-            let mut result = None;
-            while let Some((_, traceparent, inserted)) = queue.pop_front() {
-                if inserted.elapsed() < TTL {
-                    result = traceparent;
-                    break;
-                }
-            }
+            let result = queue
+                .pop_front()
+                .and_then(|(_, traceparent, inserted)| {
+                    (inserted.elapsed() < TTL).then_some(traceparent)
+                })
+                .flatten();
             (result, queue.is_empty())
         };
         if queue_empty {
@@ -398,6 +400,30 @@ mod tests {
             );
 
         assert!(stash.take("old").is_none());
+    }
+
+    #[test]
+    fn expired_head_slot_does_not_slide_into_next_attempt() {
+        // The first attempt spent longer than the TTL before reaching the
+        // bridge: its arrival consumes its own expired slot (fresh trace),
+        // leaving the second attempt's live parent untouched.
+        let stash = TraceContextStash::default();
+        let expired = Instant::now()
+            .checked_sub(TTL + Duration::from_secs(1))
+            .expect("TTL subtraction stays within Instant range");
+        stash
+            .inner
+            .lock()
+            .expect("trace context stash poisoned")
+            .entry("cmpl-slow".to_owned())
+            .or_default()
+            .push_back((1, Some(TRACEPARENT.to_owned()), expired));
+        let mut second = traced_headers("slow", TRACEPARENT_B);
+        stash_from_headers(&stash, COMPLETIONS, &mut second);
+
+        assert!(stash.take("cmpl-slow").is_none());
+        assert_eq!(stash.take("cmpl-slow"), Some(TRACEPARENT_B.to_owned()));
+        assert_eq!(stash.len(), 0);
     }
 
     #[test]
