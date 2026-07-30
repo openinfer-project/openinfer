@@ -96,6 +96,7 @@
 - Branch `feat/frontend-trace-context`, 3 Commitizen commits (feat(frontend) / fix(deploy) / docs(tracing)); the prek fmt hook reformatted on the first attempt, re-staged and passed
 - Pushed to origin (GitHub); PR: https://github.com/openinfer-project/openinfer/pull/791; #790 commented with the link
 - The Viewer→Editor compose fix rides along in fix(deploy) (anonymous Viewers lack `datasources:explore` on Grafana 11.3, contradicting the file's own usage comment)
+- Review follow-ups: Codex bot flagged a real P2 (`take` ignored entry timestamps — a reused X-Request-Id could join a stale trace) → fixed in `d513dde` with a TTL check on take + regression test; CI's DCO sign-off check failed (repo convention — main's commits all carry Signed-off-by) → all branch commits signed via `git rebase --signoff` and force-pushed
 
 ## Debrief
 
