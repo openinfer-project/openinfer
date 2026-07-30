@@ -394,13 +394,9 @@ impl LocalEngineBridge {
         // keeps the default (tracing-off) path free of per-request span work,
         // and `from_span` on a noop span yields `None` so the scheduler skips
         // its span work too.
-        //
-        // Parent resolution: if the HTTP layer stashed a W3C traceparent for
-        // this request (sent by an upstream such as vllm-router with OTel),
-        // join that trace so client → router → engine phases render as one
-        // trace; otherwise start a fresh trace with a random context. A
-        // non-sampled upstream context yields a non-collected root span,
-        // honoring the upstream sampling decision.
+        // Parent resolution: join the upstream trace when the HTTP layer
+        // stashed a traceparent for this request (e.g. from vllm-router);
+        // otherwise start a fresh trace.
         let trace_root = if openinfer_engine::tracing_state::is_enabled() {
             let parent = external_req_id
                 .as_deref()
