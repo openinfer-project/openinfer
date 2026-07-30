@@ -63,8 +63,9 @@ static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 /// layer (insert) and every engine bridge task (take). Entries queue FIFO per
 /// id: concurrent attempts reusing one `X-Request-Id` (e.g. hedged retries)
 /// each keep their own slot instead of the latest insert overwriting the
-/// rest. (A per-attempt unique key is not available — `external_req_id` is
-/// the only correlation key the bridge can derive downstream.)
+/// rest, paired best-effort in intake order (see `take`'s pairing-ceiling
+/// note). A per-attempt unique key is not available — `external_req_id` is
+/// the only correlation key the bridge can derive downstream.
 #[derive(Clone, Default)]
 pub(crate) struct TraceContextStash {
     inner: Arc<Mutex<HashMap<String, EntryQueue>>>,
@@ -107,6 +108,15 @@ impl TraceContextStash {
     /// entries are dropped, never joined: a request reusing an id must not
     /// attach to a trace left behind by a request that never reached the
     /// engine.
+    ///
+    /// Pairing ceiling: entries queue in middleware intake order, which the
+    /// bridge normally follows. Concurrent requests reusing one id (hedged
+    /// retries) can be reordered downstream — e.g. a LoRA request stalled in
+    /// body rewriting while a later request overtakes it — and would then
+    /// consume each other's parent. Exact pairing is impossible there: the
+    /// correlation key is identical by construction and the engine
+    /// `request_id`'s random suffix carries no intake information. Callers
+    /// needing deterministic pairing must use unique `X-Request-Id` values.
     pub(crate) fn take(&self, request_id: &str) -> Option<String> {
         let mut inner = self.inner.lock().expect("trace context stash poisoned");
         let (result, queue_empty) = {
