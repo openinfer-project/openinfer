@@ -10,21 +10,29 @@
 //! on top of the GPU-hit prefix (both anchor at prefix 0, so the combined hit
 //! is one contiguous prefix split at a single point — GPU→CPU→GPU interleaving
 //! is deliberately excluded). Save is best-effort fire-and-forget; load is on
-//! the critical path, strongly ordered, but never blocks admission — a request
-//! polls its [`LoadHandle`] each scheduler tick.
+//! the critical path, strongly ordered, but never blocks admission — every
+//! operation resolves through a pollable [`OffloadHandle`] a request polls
+//! each scheduler tick.
 
+mod config;
 mod engine;
+mod handle;
+mod host;
+mod layout;
 mod vllm_hash;
 
-pub use engine::HostConfig;
-pub use engine::KvArena;
-pub use engine::LoadHandle;
-pub use engine::OffloadConfig;
+pub use config::HostConfig;
+pub use config::OffloadConfig;
+pub use config::P2pConfig;
 pub use engine::OffloadEngine;
-pub use engine::OffloadHost;
-pub use engine::P2pConfig;
-pub use engine::QueryHit;
-pub use engine::QueryOutcome;
+pub use handle::LoadHandle;
+pub use handle::OffloadHandle;
+pub use handle::QueryHandle;
+pub use handle::QueryHit;
+pub use handle::QueryOutcome;
+pub use handle::SaveHandle;
+pub use host::OffloadHost;
+pub use layout::KvArena;
 // Re-exported so callers name pegaflow's engine types through this bridge.
 pub use pegaflow_core::{EngineError, PegaEngine, QueryLeaseId};
 pub use vllm_hash::VLLM_HASH_BYTES;

@@ -166,12 +166,17 @@ pub(super) fn admit_from_queue(
     native_mtp_prefill: bool,
     pending_resets: &mut Vec<usize>,
 ) -> anyhow::Result<()> {
-    // Release the page holds of abandoned loads whose DMA settled.
+    // Release what settled since the last attempt: abandoned loads' page
+    // holds, abandoned queries' stray leases, and finished tail saves' KVs.
+    let engine = offload.map(|o| &o.engine);
     if let Some(state) = host_restore.as_mut() {
-        state.reap();
+        state.reap(engine);
     }
     if let Some(state) = native_pd.as_mut() {
-        state.reap();
+        state.reap(engine);
+    }
+    if let Some(offload) = offload {
+        offload.reap_tail_saves();
     }
     let mut committed: usize = slots
         .iter()

@@ -1954,7 +1954,10 @@ impl Qwen3Executor {
                 breaker_closed,
                 || {
                     offload
-                        .query(&id.0.to_string(), &query_hashes)
+                        // Partial remote hits are a win here: the miss is
+                        // recomputed locally, so never hold out for the
+                        // full prefix.
+                        .query(&id.0.to_string(), &query_hashes, false)
                         .map(QueryView::from)
                         .map_err(|e| {
                             query_errored = true;
@@ -2418,7 +2421,9 @@ impl ModelExecutor for Qwen3Executor {
             park_on_loading,
             || {
                 offload
-                    .query(&request_id.0.to_string(), &query_hashes)
+                    // As in the re-query: partial hits shorten the local
+                    // prefill, so don't wait for the full prefix.
+                    .query(&request_id.0.to_string(), &query_hashes, false)
                     .map(QueryView::from)
                     .map_err(|e| {
                         log::warn!("KV offload query failed for {request_id:?} (skipping): {e}");

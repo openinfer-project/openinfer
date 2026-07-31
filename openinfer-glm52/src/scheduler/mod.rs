@@ -1163,6 +1163,9 @@ impl Glm52Engine {
             let outcome = active
                 .state
                 .advance_span(&span_outputs, &self.eos_token_ids);
+            // In-flight tail-page save of a finishing P/D handoff; the freed
+            // request's KV parks with it instead of releasing (#799).
+            let mut tail_save = None;
             let freed = match outcome {
                 Glm52StepOutcome::Prefilling => {
                     active.kv.apply_prefill_chunk(pool)?;
@@ -1199,16 +1202,19 @@ impl Glm52Engine {
                                 committed[0],
                             );
                             if let Some(offload) = offload {
-                                if let Err(err) = offload.save_native_tail(&active.kv, key) {
-                                    let message =
-                                        format!("GLM5.2 native P/D tail save failed: {err:#}");
-                                    log::warn!("{message}");
-                                    let _ = active.req.token_tx.send(TokenEvent::Error {
-                                        message,
-                                        prompt_tokens,
-                                        completion_tokens: active.state.completion_tokens(),
-                                    });
-                                    freed = true;
+                                match offload.save_native_tail(&active.kv, key) {
+                                    Ok(handle) => tail_save = Some(handle),
+                                    Err(err) => {
+                                        let message =
+                                            format!("GLM5.2 native P/D tail save failed: {err:#}");
+                                        log::warn!("{message}");
+                                        let _ = active.req.token_tx.send(TokenEvent::Error {
+                                            message,
+                                            prompt_tokens,
+                                            completion_tokens: active.state.completion_tokens(),
+                                        });
+                                        freed = true;
+                                    }
                                 }
                             }
                             Some(hex::encode(key))
@@ -1251,13 +1257,24 @@ impl Glm52Engine {
                 if let Some(offload) = offload {
                     offload.save_sealed_on_release(&active.kv);
                 }
-                if let Err(err) = active.kv.release() {
-                    log::warn!(
-                        "GLM5.2 rank {} prefill slot {slot_id} KV release failed: {err:#}",
-                        self.rank
-                    );
+                let finished = slot.take().expect("freed slot was active");
+                let mut kv = finished.kv;
+                match (tail_save, offload) {
+                    (Some(handle), Some(offload)) => {
+                        // The tail-page D2H may still be reading this KV's
+                        // pages: park the KV with the save instead of
+                        // releasing it (released when the save settles).
+                        offload.detach_tail_save(handle, Box::new(kv));
+                    }
+                    _ => {
+                        if let Err(err) = kv.release() {
+                            log::warn!(
+                                "GLM5.2 rank {} prefill slot {slot_id} KV release failed: {err:#}",
+                                self.rank
+                            );
+                        }
+                    }
                 }
-                *slot = None;
             }
         }
         Ok(())
@@ -1317,14 +1334,22 @@ impl Glm52Engine {
         // `flush_saves` is deadline-bounded, so a stuck host tier cannot hang
         // teardown. Admission loads first: an abandoned restore's H2D can
         // still be writing arena memory (both barriers are deadline-bounded).
+        // Any rank's engine reaches the shared per-node host for stray query
+        // leases (see `AbandonedOp::live`).
+        let lease_engine = self
+            .offload
+            .as_ref()
+            .and_then(|ranks| ranks.first())
+            .map(|rank| &rank.engine);
         if let Some(state) = self.host_restore.as_mut() {
-            state.drain_loads();
+            state.drain_loads(lease_engine);
         }
         if let Some(state) = self.native_pd.as_mut() {
-            state.drain_loads();
+            state.drain_loads(lease_engine);
         }
         if let Some(offload) = self.offload.take() {
             for rank in &offload {
+                rank.drain_tail_saves();
                 rank.engine.flush_saves();
             }
             drop(offload);

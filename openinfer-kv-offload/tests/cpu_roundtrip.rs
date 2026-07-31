@@ -112,7 +112,10 @@ fn gpu_cpu_gpu_roundtrip_preserves_kv_bytes() {
 
     // ── Query the CPU tier: the full 3-block prefix must be resident ──
     // Host-memory-only setup: `Loading` can't occur, the query is terminal.
-    let QueryOutcome::Ready(hit) = engine.query("roundtrip-req", &hashes).expect("query") else {
+    let QueryOutcome::Ready(hit) = engine
+        .query("roundtrip-req", &hashes, false)
+        .expect("query")
+    else {
         panic!("host-memory-only query must be terminal");
     };
     assert_eq!(

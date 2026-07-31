@@ -22,7 +22,7 @@ cudarc = { workspace = true }
 half = { workspace = true }
 log = { workspace = true }
 openinfer-kv-cache = { workspace = true }
-pegaflow-core = { git = "https://github.com/novitalabs/pegaflow.git", rev = "1473c5355d879b4fea23101760cb2a0074642ada", default-features = false, features = [
+pegaflow-core = { git = "https://github.com/novitalabs/pegaflow.git", rev = "14112403bc1d0ed5b44717c0a93743fb0de66fee", default-features = false, features = [
   "rdma",
 ] }
 tokio = { workspace = true }
