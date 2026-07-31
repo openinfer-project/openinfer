@@ -66,7 +66,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | `models/glm52/dp-scheduler-metrics.md` | GLM5.2 maps logical scheduler partitions onto vLLM EngineCore identities (EP multi-engine / historical TP8 single-engine). |
 | `models/glm52/moe-tp8-low-latency.md` | **Historical** Hopper TP8 LL decode record (path removed; not a launch contract). |
 | `models/glm52/pd-m2-execution.md` | Authoritative GLM5.2 P/D contract and evidence: vLLM prefill → OpenInfer EP decode; DSpark state transfer remains outside the contract. |
-| `models/glm52/pd-native-mtp-handoff.md` | TP4 P builds and transfers committed native-MTP layer-78 KV plus an initial proposal so D enters target verification on its first model step. |
+| `models/glm52/pd-native-mtp-handoff.md` | TP4 P transfers committed native-MTP KV + an initial proposal; D enters `first_step=verify`. P→EP16 gate closed on a Slurm bare-metal 4-node fleet (multi-turn c64 640/640); pool sizing (8→64 GiB) and session-affinity routing findings live here. |
 | `models/glm52/serving-status.md` | **Authoritative** GLM5.2 matrix: Blackwell-only; EP4/EP8/EP-N decode uses SM100 DeepGEMM masked grouped expert GEMMs; TP4 is prefill-only; Hopper/TP8/decode-TP are removed. Bring-up until indexer + lifecycle gates close. |
 | `models/glm52/tp4-gb300-bringup.md` | Historical TP4 decode bring-up notes on 4×GB300 (decode TP LL removed; active TP4 contract is prefill-only). |
 | `models/glm52/tp4-prefill-only.md` | Active TP4 contract: `--moe-topo=tp4 --glm52-prefill-only`, layer-outer NCCL bf16 AR on 4×GB300. |

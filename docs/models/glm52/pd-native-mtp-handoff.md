@@ -13,11 +13,19 @@
 > drift at `(input+output) ≡ 1 (mod 64)` (`d791dffc`). Scaling out: a second
 > TP4 prefill (2P, round_robin router) holds GSM8K full at c64 with strict
 > 1,273/1,319 (0.9718) and only a warm-up transient — the sustainable
-> envelope doubles from c32 to c64. A standalone EP16 decode fleet
+> envelope doubles from c32 to c64. Multi-turn chat at c16 exposed a second
+> reject cause: the stack script's default 8 GiB pegaflow host pool starves
+> D-side 256 MiB fetch chunks into the same 15 s deadline rejects — 64 GiB
+> clears it (TTFT p99 30 s → ≤6.3 s, +27% output). A standalone EP16 decode fleet
 > (4 trays × 4 ranks, local prefill) serves GSM8K n200 c32 at 0.985 strict
 > and ~944 tok/s out per endpoint decode-heavy (TPOT p50 29 ms), but
 > co-located prefill costs ~55% of mid-workload throughput versus a
-> dedicated P.
+> dedicated P. **The P → EP16 handoff gate is now closed**: a Slurm-deployed
+> bare-metal 4-node EP16 fleet admits handoffs `first_step=verify` on all
+> nodes, survives multi-turn c64 with zero rejects (640/640, 1,158 tok/s),
+> and exposes the next lever — without session-affinity routing, every turn
+> full-history-refetches (TTFT grows per turn as fleet width dilutes
+> rank-local KV reuse).
 >
 > **Last touched:** 2026-07
 
@@ -92,6 +100,107 @@
     gate.
 
 ## Execution Log
+
+### P → EP16 handoff gate closed; Slurm bare-metal fleet deployment (2026-07-31)
+
+The remaining deployment gate ("rerun the token-ID handoff contract against
+a P → EP16/EP32 D fleet") is closed: TP4 P + metaserver feeding a 4-node ×
+4-rank EP16 decode fleet through the dual-endpoint router (4 `--decode`
+endpoints, round_robin), native MTP on both sides. All four fleet nodes
+admitted handoffs with `first_step=verify drafts=5` on their local ranks
+(0/4/8/12).
+
+**Deployment moved from ssh+docker to Slurm, bare-metal.** The engine
+binary resolves entirely against host libraries; the only gap is NCCL
+(DeepEP needs 2.30.7 for `ncclCommQueryProperties`, hosts ship older) —
+solved by one shared-filesystem copy of `libnccl.so.2.30.7` on
+`LD_LIBRARY_PATH`. One sbatch job: node 0 starts first and must log
+`serving DeepEP id` before the other nodes launch (their rendezvous connect
+is not retried forever); two srun steps inside the allocation encode that
+ordering. `scancel` is the whole teardown story. This removes the container
+mount/NCCL-version/HF-snapshot-symlink failure class that cost three D
+bring-up attempts in the same session.
+
+Two operational facts any future fleet launch must respect:
+
+- **Slurm state and GPU occupancy are separate ledgers on this cluster.**
+  Nodes shown idle by `sinfo` carried full off-Slurm GPU loads (a vLLM TP4
+  and another engine), and OOM'd the first fleet attempt at weight load;
+  conversely this stack's own P/D trays look idle to Slurm. Verify
+  `nvidia-smi` per node before submitting; do not trust partition state.
+- **GPU-free ≠ node-clean**: idle leftover decode containers from prior
+  fleet experiments still held the KV-P2P transfer port (50104) on three
+  nodes and killed two more attempts with `Address already in use`. Sweep
+  stale engine containers/ports before reusing trays.
+
+**Multi-turn results on the EP16 fleet** (same 48×5-turn c16 workload as
+the pool-sizing A/B below, plus a 128×5-turn c64 run; 64 GiB pool):
+
+- c16: 240/240, zero failures, 948 tok/s out (EP4 same workload: 568),
+  TPOT p50 ~11.5 ms (EP4: ~21) — 16 ranks at c16 sit mostly in bucket 1.
+- c64: **640/640, zero failures, 1,158 tok/s out** — the historical 1P
+  c64 saturation (steady ~24% deadline rejects on EP8, 8 GiB era) is gone;
+  worst per-turn TTFT p99 8.5 s stays under the 15 s deadline.
+- ITL: p50/p90 improve over EP4 (30.9/37.6 ms vs 41.8/47.6 at the same
+  per-rank load) and barely move c16 → c64, but **p99 degrades** (52 →
+  98 ms at c16, 73.7 at c64): the fixed-cadence DeepEP chain couples all
+  16 ranks, so one rank pausing for an admission restore (the per-turn
+  full-history refetch) taxes every rank's ITL tail. Session-affinity
+  routing would shrink both this tail and the TTFT growth at once.
+  **Confirmed by control run**: the same fleet under single-turn
+  decode-heavy c16 (no mid-flight admissions) collapses ITL p99 98 → 40 ms
+  with p90 at 32 — the tail is admission-coupled, not decode-plane. The
+  admission-restore path still blocks the engine loop on the
+  coordinator-era assumption ("every rank is joined, so blocking on the
+  load is safe" — `scheduler/offload.rs`), which free-running invalidated;
+  moving restore install off the engine thread is the code-side fix,
+  session-affinity routing the traffic-side one.
+- **New lever surfaced — per-turn TTFT grows with fleet width**: EP16 c16
+  TTFT p50 climbs 455 → 912 ms across turns while EP4 stays flat. With 16
+  ranks a conversation's next turn almost never lands on the rank holding
+  its KV (~1/16), so every turn full-history-refetches over RDMA, growing
+  linearly with history (~130 MB by turn 5). At c64 this compounds with
+  the single-P queue into 2.9 → 7.8 s p50 by turn 5. Wide EP decode fleets
+  need session-affinity / cache-aware routing (the qwen3 KV-aware-routing
+  result) before this shape is production-shaped.
+
+### Multi-turn chat bench: 8 GiB pegaflow pool is a deadline-reject root cause (2026-07-31)
+
+First multi-turn (growing-history) load through the router: `vllm-bench`
+`openai-chat`, 48 conversations × 5 turns, turn-1 input 1,024 + 256/turn,
+output 128/turn `ignore_eos`, c16, temp 0, P TP4 tray03 + D EP4 tray04
+(`85fcc386`). Artifacts
+`bench-results/glm52-pd-multiturn-c16-1024-256-128*.json`.
+
+- **Prefix cache on P confirmed under multi-turn**: with history growing
+  1,152 → 2,672 tokens, turn-2+ TTFT p50 stays flat (~270–660 ms across all
+  runs) — suffix-only prefill; 240/240 turns, zero failures, TPOT ~21–23 ms.
+- **The stack script's `KV_OFFLOAD_HOST_GIB=8` default starves the D-side
+  fetch path at this load**: pegaflow fetch chunks are 256 MiB, and pool
+  exhaustion (`failed to allocate fetch chunk … on NUMA0`) drops the RDMA
+  connection and cascades into 15 s-quantized handoff rejects
+  ("retry via P") — turn-3/4/5 TTFT p99 hit 28.7/30.1/15.1 s and aggregate
+  output throughput sagged to 437 tok/s. Earlier c64 GSM8K reject rates in
+  this log likely include this cause, not just prefill capacity.
+- **64 GiB pool (both sides) clears it**: zero allocation failures, zero
+  deadline rejects, worst per-turn TTFT p99 ≤ 6.3 s, output 556–568 tok/s
+  (+27%). Both trays have ~750 GiB free DRAM; 64 GiB pinned is cheap.
+- **Decode plane is clean throughout; the jitter is TTFT-side.** ITL is
+  flat across all three runs (mean 38–41 ms, p90 ~47, p99 ~52) — no decode
+  tail even during the 8 GiB deadline storms. ITL p50 ~41 ms vs TPOT p50
+  ~21 ms is native MTP's burst delivery (~2 accepted tokens per verify
+  round on random prompts), not a discrepancy.
+- **Remaining signal — TTFT p99 jitter**: an episodic multi-second stall
+  (one wave of requests; 2.3 s p50 / 6.3 s p99 on the affected turn) moves
+  between turns run to run (turn-2 in one run, turn-4 in the next) with
+  clean D logs — consistent with the save/publish pipeline lever already
+  named below, not with pool exhaustion. The c16 workload is fully
+  phase-locked (temp 0, fixed lengths, no think time): all 16 conversations
+  release + re-arrive simultaneously each turn, so a few-second publish or
+  save-queue hiccup on P stalls a whole wave. Next probes: P-side
+  save/publish timestamps around a stalled wave, per-conversation D rank
+  placement / `cached_tokens` (rank-migration refetch), and a
+  `--multi-turn-delay-ms` jitter A/B to break the phase lock.
 
 ### EP16 decode-only fleet and second-prefill (2P) scaling (2026-07-31)
 
@@ -484,11 +593,17 @@ The post-review state bug also showed that a log describing the intended next
 step is not evidence of the slot's actual span kind. First-verify gates must
 assert the state transition or observed speculative span.
 
-Next action: the 2026-07-31 window closed both earlier follow-ups — the
-second prefill removed the c64 saturation rejects, and an EP16 fleet now
-serves standalone. What remains: (1) rerun the token-ID handoff contract
-against a P → EP16/EP32 D fleet (the EP16 run above was decode-only, no
-handoff); tray09–12 are still k3-held, so EP32 waits; (2) fold multi-P
-into `glm52_pd_stack.sh` (P2 launch and the dual-`--prefill` router were
-manual); (3) measure EP16 fleet-aggregate throughput across all 4
-endpoints, which needs a router or parallel clients in decode-only mode.
+Next action: the P → EP16 handoff contract is now hardware-closed (see the
+Slurm fleet section above), which also covers the fleet-aggregate
+measurement through the router. What remains: (1) EP32 handoff rerun when
+eight trays are actually free (Slurm-idle is not evidence — verify
+`nvidia-smi` per node); (2) **#799**: synchronous pegaflow restore/save on the engine thread —
+admission restore blocks the serve loop (fleet ITL p99 tail on EP,
+head-of-line prefill stall on TP4 P; control-run-confirmed) and
+`save_native_tail` is a per-handoff `save_blocking` on the same thread
+(prime suspect for the episodic 2–6 s phase-locked wave stall);
+(3) session-affinity / cache-aware decode routing — the per-turn
+full-history refetch is the dominant multi-turn TTFT term on wide fleets
+(also tracked in #799 as the traffic-side mitigation); (4) fold multi-P and
+the Slurm fleet launch into one operational entrypoint (the sbatch script
+and `glm52_pd_stack.sh` are separate today).
