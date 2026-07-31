@@ -182,6 +182,21 @@ impl LoadHandle {
             .blocking_recv()
             .unwrap_or_else(|_| Err(EngineError::Storage("load worker dropped reply".into())))
     }
+
+    /// A handle that is already settled with `result` — lets scheduler tests
+    /// drive their admission poll path without a pegaflow worker.
+    pub fn settled(result: Result<(), EngineError>) -> Self {
+        let (tx, rx) = oneshot::channel();
+        let _ = tx.send(result);
+        Self { rx }
+    }
+
+    /// A handle plus the sender that settles it — scheduler tests exercise
+    /// the parked/in-flight path, then resolve it on their own schedule.
+    pub fn in_flight() -> (Self, oneshot::Sender<Result<(), EngineError>>) {
+        let (tx, rx) = oneshot::channel();
+        (Self { rx }, tx)
+    }
 }
 
 /// One strided GPU arena to register as one pegaflow "layer": `num_blocks`

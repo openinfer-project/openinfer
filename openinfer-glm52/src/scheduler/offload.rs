@@ -1,8 +1,12 @@
 //! Host-tier KV offload glue: the engine's two touch points with the
-//! shared pegaflow pool. Restore runs at admission (a step boundary — every
-//! rank is joined, so blocking on the load is safe and the loaded pages race
-//! nothing); save runs on request release, fire-and-forget, with block
-//! guards pinning the pages until the D2H copy lands.
+//! shared pegaflow pool. Restore SUBMITS its host→GPU load at admission and
+//! polls the [`LoadHandle`] at the following step boundaries — the engine
+//! loop never blocks on the copy, because under free-running DP one rank
+//! stalled in admission stalls every peer in the fixed-cadence collective
+//! chain (#799). The waiting request stays at its queue front and the
+//! in-flight load's page holds ride the parked state ([`HostRestoreState`],
+//! [`NativePdState`]). Save runs on request release, fire-and-forget, with
+//! block guards pinning the pages until the D2H copy lands.
 //!
 //! Both legs are cache maintenance, never a correctness dependency: every
 //! failure degrades to a full prefill (or a forfeited future hit) with a
@@ -21,8 +25,10 @@ use anyhow::Context as _;
 use openinfer_core::engine::GenerateRequest;
 use openinfer_kv_cache::BlockPool;
 use openinfer_kv_cache::KvBlockGuard;
+use openinfer_kv_cache::LoadReservation;
 use openinfer_kv_cache::PrefixProbe;
 use openinfer_kv_cache::RequestKv;
+use openinfer_kv_offload::LoadHandle;
 use openinfer_kv_offload::OffloadEngine;
 use openinfer_kv_offload::QueryOutcome;
 use openinfer_kv_offload::VLLM_HASH_BYTES;
@@ -286,8 +292,35 @@ pub(super) fn native_kv_shape(
     })
 }
 
+/// A load whose admission owner is gone (disconnect, replaced front, or an
+/// exhausted deadline). pegaflow's worker still writes the destination pages
+/// after the handle is dropped, so the page holds ride here until the DMA
+/// settles; [`reap`](HostRestoreState::reap) drops the settled ones.
+struct AbandonedLoad {
+    handle: LoadHandle,
+    _hold: AbandonedHold,
+}
+
+/// What keeps an abandoned load's destination pages unallocatable. Never
+/// read — held purely for its `Drop`; holding the value IS the contract.
+#[allow(dead_code)]
+enum AbandonedHold {
+    /// Radix-bound restore: the reserved destination blocks.
+    Pages(LoadReservation),
+    /// Tail load: the whole request KV owns the scheduled destination page.
+    Request(Box<RequestKv>),
+}
+
+impl AbandonedLoad {
+    /// `true` while the DMA is still in flight (the hold must stay).
+    fn live(&mut self) -> bool {
+        self.handle.poll().is_none()
+    }
+}
+
 pub(super) struct NativePdState {
     parked: Vec<Option<NativeParked>>,
+    abandoned: Vec<AbandonedLoad>,
 }
 
 struct NativeParked {
@@ -295,6 +328,62 @@ struct NativeParked {
     query_key: String,
     parked_at: Instant,
     deadline: Instant,
+    /// This front's in-flight H2D load, polled on the next admission attempt.
+    pending: Option<NativePendingLoad>,
+}
+
+/// An admission-submitted native-P/D load in flight across step boundaries.
+/// Everything the commit needs — and everything pinning the DMA destination —
+/// lives here while the front is parked.
+enum NativePendingLoad {
+    /// Full committed pages, destined for the radix on completion.
+    Full {
+        probe: PrefixProbe,
+        reservation: LoadReservation,
+        handle: LoadHandle,
+    },
+    /// The mutable tail page, scheduled on the request's own KV.
+    Tail {
+        kv: Box<RequestKv>,
+        cached_tokens: usize,
+        handle: LoadHandle,
+    },
+}
+
+impl NativePendingLoad {
+    /// Pool pages this load holds for the parked front. They become the
+    /// request's blocks on admit, so the admission budget credits them back
+    /// against the request's need (they are already out of
+    /// `available_blocks`, and counting them on both sides would wedge the
+    /// front forever).
+    fn held_blocks(&self) -> usize {
+        match self {
+            Self::Full {
+                probe, reservation, ..
+            } => probe.held_blocks() + reservation.len(),
+            Self::Tail { kv, .. } => kv.resident_blocks(),
+        }
+    }
+
+    fn into_abandoned(self) -> AbandonedLoad {
+        match self {
+            Self::Full {
+                probe,
+                reservation,
+                handle,
+            } => {
+                drop(probe); // source holds; the DMA only writes the reservation
+                AbandonedLoad {
+                    handle,
+                    _hold: AbandonedHold::Pages(reservation),
+                }
+            }
+            Self::Tail { kv, handle, .. } => AbandonedLoad {
+                handle,
+                _hold: AbandonedHold::Request(kv),
+            },
+        }
+    }
 }
 
 /// Keep the final committed page out of the lineage-hashed full-page prefix.
@@ -314,6 +403,7 @@ impl NativePdState {
     pub(super) fn new(ranks: usize) -> Self {
         Self {
             parked: (0..ranks).map(|_| None).collect(),
+            abandoned: Vec::new(),
         }
     }
 
@@ -322,6 +412,7 @@ impl NativePdState {
             .as_ref()
             .is_none_or(|parked| parked.request_id != req.request_id);
         if stale {
+            self.scrap_pending(rank);
             let now = Instant::now();
             self.parked[rank] = Some(NativeParked {
                 request_id: req.request_id.clone(),
@@ -331,12 +422,41 @@ impl NativePdState {
                 ),
                 parked_at: now,
                 deadline: now + REMOTE_FETCH_DEADLINE,
+                pending: None,
             });
         }
         self.parked[rank].as_mut().expect("just initialized")
     }
 
+    /// Take the front's in-flight load for this attempt to settle or repark.
+    fn take_pending(&mut self, rank: usize) -> Option<NativePendingLoad> {
+        self.parked[rank].as_mut().and_then(|p| p.pending.take())
+    }
+
+    /// Move the rank's in-flight load (if any) onto the abandoned list — the
+    /// DMA still writes its destination pages, so they cannot release yet.
+    fn scrap_pending(&mut self, rank: usize) {
+        if let Some(pending) = self.take_pending(rank) {
+            self.abandoned.push(pending.into_abandoned());
+        }
+    }
+
+    /// Pool pages held by the rank's parked front for its in-flight load
+    /// (zero when nothing is parked). See [`NativePendingLoad::held_blocks`].
+    pub(super) fn front_held_blocks(&self, rank: usize) -> usize {
+        self.parked[rank]
+            .as_ref()
+            .and_then(|p| p.pending.as_ref())
+            .map_or(0, NativePendingLoad::held_blocks)
+    }
+
+    /// Drop abandoned loads whose DMA settled (their page holds release).
+    pub(super) fn reap(&mut self) {
+        self.abandoned.retain_mut(AbandonedLoad::live);
+    }
+
     pub(super) fn clear(&mut self, rank: usize) {
+        self.scrap_pending(rank);
         self.parked[rank] = None;
     }
 }
@@ -712,6 +832,11 @@ pub(super) fn admit_vllm_pd(
 /// Native OpenInfer P/D restore. Full pages use kvbm lineage hashes; the
 /// producer includes the partial-tail hash in metadata because a mutable
 /// page has no independently derivable cache key on the decode request.
+///
+/// Loads never block: the H2D copy is submitted, the request parks at its
+/// queue front with the [`NativePendingLoad`], and the next admission
+/// attempt polls the handle (#799 — a rank blocked in admission stalls
+/// every peer in the fixed-cadence collective chain).
 pub(super) fn admit_native_mtp_pd(
     state: &mut NativePdState,
     rank: usize,
@@ -736,127 +861,222 @@ pub(super) fn admit_native_mtp_pd(
     let prompt_kv = &req.prompt_tokens[..handoff.committed_len];
     let cache_salt = super::native_mtp_cache_salt(prompt_kv);
     let full_len = handoff.committed_len - handoff.tail_len;
-    let mut probe = pool.probe_prefix_with_cache_salt(prompt_kv.to_vec(), Some(&cache_salt), None);
-    let hashes = probe.cpu_query_hashes();
-    if !hashes.is_empty() {
-        match offload.engine.query(&format!("{query_key}-full"), &hashes) {
-            Ok(QueryOutcome::Ready(hit)) => match hit.lease {
-                Some(lease) if hit.num_blocks == hashes.len() => {
-                    let Some(reservation) = pool.reserve_loaded_blocks(hit.num_blocks) else {
-                        offload.engine.release_query_lease(lease);
-                        return native_pd_wait(state, rank, req, "GPU page reservation");
-                    };
-                    match offload.engine.load(lease, reservation.page_ids()) {
-                        Ok(handle) => {
-                            handle.wait().map_err(|err| {
-                                anyhow::anyhow!("native P/D full-page load: {err}")
-                            })?;
-                            pool.commit_loaded_blocks(&mut probe, reservation);
+
+    // Settle what this front parked for: its in-flight H2D load.
+    let mut full_hold: Option<PrefixProbe> = None;
+    let mut settled_tail: Option<(RequestKv, usize)> = None;
+    match state.take_pending(rank) {
+        None => {}
+        Some(NativePendingLoad::Full {
+            mut probe,
+            reservation,
+            mut handle,
+        }) => match handle.poll() {
+            None => {
+                return native_pd_park_pending(
+                    state,
+                    rank,
+                    req,
+                    NativePendingLoad::Full {
+                        probe,
+                        reservation,
+                        handle,
+                    },
+                    "full-page H2D copy",
+                );
+            }
+            Some(Ok(())) => {
+                pool.commit_loaded_blocks(&mut probe, reservation);
+                // Hold the probe through the rematch below: the committed
+                // blocks must not evict before the request re-pins them.
+                full_hold = Some(probe);
+            }
+            Some(Err(err)) => {
+                return native_pd_reject(state, rank, req, format!("full-page load: {err}"));
+            }
+        },
+        Some(NativePendingLoad::Tail {
+            mut kv,
+            cached_tokens,
+            mut handle,
+        }) => match handle.poll() {
+            None => {
+                return native_pd_park_pending(
+                    state,
+                    rank,
+                    req,
+                    NativePendingLoad::Tail {
+                        kv,
+                        cached_tokens,
+                        handle,
+                    },
+                    "tail H2D copy",
+                );
+            }
+            Some(Ok(())) => {
+                kv.apply_prefill_chunk(pool)?;
+                settled_tail = Some((*kv, cached_tokens + handoff.tail_len));
+            }
+            Some(Err(err)) => {
+                kv.revert_schedule()?;
+                return native_pd_reject(state, rank, req, format!("tail load: {err}"));
+            }
+        },
+    }
+
+    let (mut kv, cached_tokens) = if let Some(done) = settled_tail {
+        done
+    } else {
+        // Full pages: pull whatever the GPU cache no longer holds. A load
+        // settled above already committed its pages, so the fresh probe here
+        // reports them as GPU-hit and the query window is empty.
+        if full_hold.is_none() {
+            let probe =
+                pool.probe_prefix_with_cache_salt(prompt_kv.to_vec(), Some(&cache_salt), None);
+            let hashes = probe.cpu_query_hashes();
+            if !hashes.is_empty() {
+                match offload.engine.query(&format!("{query_key}-full"), &hashes) {
+                    Ok(QueryOutcome::Ready(hit)) => match hit.lease {
+                        Some(lease) if hit.num_blocks == hashes.len() => {
+                            let Some(reservation) = pool.reserve_loaded_blocks(hit.num_blocks)
+                            else {
+                                offload.engine.release_query_lease(lease);
+                                return native_pd_wait(state, rank, req, "GPU page reservation");
+                            };
+                            match offload.engine.load(lease, reservation.page_ids()) {
+                                Ok(handle) => {
+                                    return native_pd_park_pending(
+                                        state,
+                                        rank,
+                                        req,
+                                        NativePendingLoad::Full {
+                                            probe,
+                                            reservation,
+                                            handle,
+                                        },
+                                        "full-page H2D copy",
+                                    );
+                                }
+                                Err(err) => {
+                                    offload.engine.release_query_lease(lease);
+                                    return native_pd_reject(
+                                        state,
+                                        rank,
+                                        req,
+                                        format!("full-page load submit: {err}"),
+                                    );
+                                }
+                            }
                         }
-                        Err(err) => {
+                        Some(lease) => {
                             offload.engine.release_query_lease(lease);
-                            return native_pd_reject(
+                            return native_pd_wait(
                                 state,
                                 rank,
                                 req,
-                                format!("full-page load submit: {err}"),
+                                "partial full-page registration",
                             );
                         }
+                        None => return native_pd_wait(state, rank, req, "full-page registration"),
+                    },
+                    Ok(QueryOutcome::Loading) => {
+                        return native_pd_wait(state, rank, req, "full-page transfer");
+                    }
+                    Err(err) => {
+                        return native_pd_reject(
+                            state,
+                            rank,
+                            req,
+                            format!("full-page query: {err}"),
+                        );
                     }
                 }
-                Some(lease) => {
-                    offload.engine.release_query_lease(lease);
-                    return native_pd_wait(state, rank, req, "partial full-page registration");
-                }
-                None => return native_pd_wait(state, rank, req, "full-page registration"),
-            },
-            Ok(QueryOutcome::Loading) => {
-                return native_pd_wait(state, rank, req, "full-page transfer");
-            }
-            Err(err) => {
-                return native_pd_reject(state, rank, req, format!("full-page query: {err}"));
             }
         }
-    }
 
-    let mut logical_prompt = req.prompt_tokens.clone();
-    if anchor_plan.replay_to_client {
-        logical_prompt.push(anchor_plan.token);
-    }
-    let logical_prompt_len = logical_prompt.len();
-    let kv_shape = native_kv_shape(req, anchor_plan)?;
-    anyhow::ensure!(
-        logical_prompt_len == kv_shape.input_tokens,
-        "native-MTP P/D KV input shape drift: built {logical_prompt_len}, planned {}",
-        kv_shape.input_tokens
-    );
-    let mut kv = pool.new_request_with_cache_salt(
-        logical_prompt,
-        kv_shape.max_output_tokens,
-        Some(&cache_salt),
-        None,
-    );
-    let mut cached_tokens = kv.match_and_add_prefix(pool)?;
-    if cached_tokens < full_len {
-        return native_pd_wait(state, rank, req, "full-page rematch");
-    }
-    if native_pd_needs_tail_load(cached_tokens, handoff.committed_len, handoff.tail_len) {
-        let key = hex::decode(handoff.tail_key.as_deref().expect("validated tail key"))
-            .context("native-MTP P/D tail key is not hex")?;
+        let mut logical_prompt = req.prompt_tokens.clone();
+        if anchor_plan.replay_to_client {
+            logical_prompt.push(anchor_plan.token);
+        }
+        let logical_prompt_len = logical_prompt.len();
+        let kv_shape = native_kv_shape(req, anchor_plan)?;
         anyhow::ensure!(
-            key.len() == 16,
-            "native-MTP P/D tail key must be 16 bytes, got {}",
-            key.len()
+            logical_prompt_len == kv_shape.input_tokens,
+            "native-MTP P/D KV input shape drift: built {logical_prompt_len}, planned {}",
+            kv_shape.input_tokens
         );
-        match offload.engine.query(&format!("{query_key}-tail"), &[key]) {
-            Ok(QueryOutcome::Ready(hit)) => match hit.lease {
-                Some(lease) if hit.num_blocks == 1 => {
-                    kv.schedule_prefill(handoff.tail_len, pool)
-                        .map_err(|err| anyhow::anyhow!("native P/D tail schedule: {err}"))?;
-                    let tail_page = *kv
-                        .step_page_indices(handoff.tail_len)
-                        .last()
-                        .expect("tail schedule owns one page");
-                    match offload.engine.load(lease, vec![tail_page]) {
-                        Ok(handle) => {
-                            if let Err(err) = handle.wait() {
+        let mut kv = pool.new_request_with_cache_salt(
+            logical_prompt,
+            kv_shape.max_output_tokens,
+            Some(&cache_salt),
+            None,
+        );
+        let cached_tokens = kv.match_and_add_prefix(pool)?;
+        drop(full_hold); // rematch done — the request itself holds the pages now
+        if cached_tokens < full_len {
+            return native_pd_wait(state, rank, req, "full-page rematch");
+        }
+        if native_pd_needs_tail_load(cached_tokens, handoff.committed_len, handoff.tail_len) {
+            let key = hex::decode(handoff.tail_key.as_deref().expect("validated tail key"))
+                .context("native-MTP P/D tail key is not hex")?;
+            anyhow::ensure!(
+                key.len() == 16,
+                "native-MTP P/D tail key must be 16 bytes, got {}",
+                key.len()
+            );
+            match offload.engine.query(&format!("{query_key}-tail"), &[key]) {
+                Ok(QueryOutcome::Ready(hit)) => match hit.lease {
+                    Some(lease) if hit.num_blocks == 1 => {
+                        kv.schedule_prefill(handoff.tail_len, pool)
+                            .map_err(|err| anyhow::anyhow!("native P/D tail schedule: {err}"))?;
+                        let tail_page = *kv
+                            .step_page_indices(handoff.tail_len)
+                            .last()
+                            .expect("tail schedule owns one page");
+                        match offload.engine.load(lease, vec![tail_page]) {
+                            Ok(handle) => {
+                                return native_pd_park_pending(
+                                    state,
+                                    rank,
+                                    req,
+                                    NativePendingLoad::Tail {
+                                        kv: Box::new(kv),
+                                        cached_tokens,
+                                        handle,
+                                    },
+                                    "tail H2D copy",
+                                );
+                            }
+                            Err(err) => {
+                                offload.engine.release_query_lease(lease);
                                 kv.revert_schedule()?;
                                 return native_pd_reject(
                                     state,
                                     rank,
                                     req,
-                                    format!("tail load: {err}"),
+                                    format!("tail load submit: {err}"),
                                 );
                             }
-                            kv.apply_prefill_chunk(pool)?;
-                            cached_tokens += handoff.tail_len;
-                        }
-                        Err(err) => {
-                            offload.engine.release_query_lease(lease);
-                            kv.revert_schedule()?;
-                            return native_pd_reject(
-                                state,
-                                rank,
-                                req,
-                                format!("tail load submit: {err}"),
-                            );
                         }
                     }
+                    Some(lease) => {
+                        offload.engine.release_query_lease(lease);
+                        return native_pd_wait(state, rank, req, "partial tail registration");
+                    }
+                    None => return native_pd_wait(state, rank, req, "tail registration"),
+                },
+                Ok(QueryOutcome::Loading) => {
+                    return native_pd_wait(state, rank, req, "tail transfer");
                 }
-                Some(lease) => {
-                    offload.engine.release_query_lease(lease);
-                    return native_pd_wait(state, rank, req, "partial tail registration");
+                Err(err) => {
+                    return native_pd_reject(state, rank, req, format!("tail query: {err}"));
                 }
-                None => return native_pd_wait(state, rank, req, "tail registration"),
-            },
-            Ok(QueryOutcome::Loading) => {
-                return native_pd_wait(state, rank, req, "tail transfer");
-            }
-            Err(err) => {
-                return native_pd_reject(state, rank, req, format!("tail query: {err}"));
             }
         }
-    }
+        (kv, cached_tokens)
+    };
+
+    let logical_prompt_len = req.prompt_tokens.len() + usize::from(anchor_plan.replay_to_client);
     if cached_tokens != handoff.committed_len || logical_prompt_len - kv.kv_position() != 1 {
         return native_pd_wait(state, rank, req, "complete-prefix install");
     }
@@ -866,6 +1086,30 @@ pub(super) fn admit_native_mtp_pd(
     Ok(VllmAdmitOutcome::Admit {
         kv: Box::new(kv),
         cached_tokens,
+    })
+}
+
+/// Park with an in-flight H2D load — or, past the deadline, scrap the load
+/// onto the abandoned list (the DMA still writes its pages) and reject.
+fn native_pd_park_pending(
+    state: &mut NativePdState,
+    rank: usize,
+    req: &GenerateRequest,
+    pending: NativePendingLoad,
+    phase: &str,
+) -> anyhow::Result<VllmAdmitOutcome> {
+    let parked = state.parked(rank, req);
+    if Instant::now() < parked.deadline {
+        parked.pending = Some(pending);
+        return Ok(VllmAdmitOutcome::Park);
+    }
+    let waited = parked.parked_at.elapsed();
+    state.abandoned.push(pending.into_abandoned());
+    state.parked[rank] = None;
+    Ok(VllmAdmitOutcome::Reject {
+        message: format!(
+            "GLM5.2 native-MTP P/D handoff incomplete after {waited:?} ({phase}); retry via P"
+        ),
     })
 }
 
@@ -912,76 +1156,391 @@ fn fail_or_fallback(state: &VllmPdState, message: String) -> VllmAdmitOutcome {
     }
 }
 
-/// Restore the prompt-prefix blocks the GPU cache no longer holds from the
-/// host tier: probe → query → load into reserved pool pages → commit as
-/// matchable prefix. Blocks on the load — admission is a step boundary, and
-/// the request's first prefill chunk must not read half-restored pages.
+/// One rank's plain host-tier restore (the non-P/D admission leg): probe →
+/// query → load into reserved pool pages → commit as matchable prefix. The
+/// load's H2D copy is submitted here and polled at the following step
+/// boundaries instead of blocking the engine loop (#799); the front request
+/// parks in its queue meanwhile.
 ///
-/// Returns the probe, which holds the GPU-hit and freshly-committed blocks
-/// alive; the caller keeps it across `match_and_add_prefix` so the restored
-/// prefix cannot be evicted before it is re-matched.
-pub(super) fn restore_host_prefix(
-    engine: &OffloadEngine,
-    pool: &BlockPool,
-    prompt_tokens: &[u32],
-) -> PrefixProbe {
-    let mut probe = pool.probe_prefix(prompt_tokens.to_vec(), None);
-    let hashes = probe.cpu_query_hashes();
-    if hashes.is_empty() {
-        return probe;
+/// Every shortfall degrades to "admit without the restore" — cache
+/// maintenance, never a correctness dependency.
+pub(super) struct HostRestoreState {
+    pending: Option<PendingHostRestore>,
+    /// See [`AbandonedLoad`].
+    abandoned: Vec<AbandonedLoad>,
+}
+
+struct PendingHostRestore {
+    /// Re-identifies the front across admission retries.
+    fingerprint: (Option<String>, usize),
+    probe: PrefixProbe,
+    reservation: LoadReservation,
+    handle: LoadHandle,
+}
+
+/// One admission attempt's verdict for the plain host-tier restore.
+pub(super) enum HostRestoreOutcome {
+    /// Nothing (left) to load: admit now. The probe, when present, holds the
+    /// GPU-hit and freshly-committed blocks across the caller's
+    /// `match_and_add_prefix` so the restored prefix cannot evict before it
+    /// is re-matched.
+    Ready(Option<PrefixProbe>),
+    /// H2D copy in flight into reserved pages: leave the request at the
+    /// queue front and re-poll at the next step boundary.
+    Park,
+}
+
+impl HostRestoreState {
+    pub(super) fn new() -> Self {
+        Self {
+            pending: None,
+            abandoned: Vec::new(),
+        }
     }
-    let req_key = format!("glm52-admit-{}", QUERY_SEQ.fetch_add(1, Ordering::Relaxed));
-    let hit = match engine.query(&req_key, &hashes) {
-        Ok(QueryOutcome::Ready(hit)) => hit,
-        Ok(QueryOutcome::Loading) => {
-            // Host-memory-only setup: pegaflow has no deeper tier to fetch
-            // from, so an async outcome means a config drift worth seeing.
-            log::warn!("GLM5.2 host-tier query went async in a host-only setup; skipping restore");
-            return probe;
+
+    /// Pool pages held for the parked front's in-flight restore. They become
+    /// the request's cached prefix on admit, so the admission budget credits
+    /// them back against the request's need (they are already out of
+    /// `available_blocks`, and counting them on both sides would wedge the
+    /// front forever).
+    pub(super) fn front_held_blocks(&self) -> usize {
+        self.pending
+            .as_ref()
+            .map_or(0, |p| p.probe.held_blocks() + p.reservation.len())
+    }
+
+    /// Drop abandoned loads whose DMA settled (their page holds release).
+    pub(super) fn reap(&mut self) {
+        self.abandoned.retain_mut(AbandonedLoad::live);
+    }
+
+    /// The FIFO front left the queue (disconnect) — its in-flight load keeps
+    /// its page holds on the abandoned list until the DMA settles.
+    pub(super) fn abandon_front(&mut self) {
+        if let Some(p) = self.pending.take() {
+            drop(p.probe); // source holds; the DMA only writes the reservation
+            self.abandoned.push(AbandonedLoad {
+                handle: p.handle,
+                _hold: AbandonedHold::Pages(p.reservation),
+            });
         }
-        Err(err) => {
-            log::warn!("GLM5.2 host-tier query failed (prefill from scratch): {err}");
-            return probe;
+    }
+
+    /// Advance the front request's restore by one admission attempt: poll an
+    /// in-flight load, or probe/query/submit a fresh one. `engine` is `None`
+    /// only in offline contract tests; production callers always have the
+    /// rank's offload engine.
+    pub(super) fn poll_front(
+        &mut self,
+        engine: Option<&OffloadEngine>,
+        pool: &BlockPool,
+        req: &GenerateRequest,
+    ) -> HostRestoreOutcome {
+        let fingerprint = (req.request_id.clone(), req.prompt_tokens.len());
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|p| p.fingerprint != fingerprint)
+        {
+            // The front changed under an in-flight load (e.g. the previous
+            // front was rejected at intake): scrap its load, start fresh.
+            self.abandon_front();
         }
-    };
-    let Some(lease) = hit.lease else {
-        return probe;
-    };
-    let Some(reservation) = pool.reserve_loaded_blocks(hit.num_blocks) else {
-        // Block pressure: the pool cannot hold the restored prefix right
-        // now. Prefill recomputes it — correct, just colder.
-        engine.release_query_lease(lease);
-        return probe;
-    };
-    let page_ids = reservation.page_ids();
-    let restored = reservation.len();
-    match engine.load(lease, page_ids) {
-        Ok(handle) => match handle.wait() {
-            Ok(()) => {
-                pool.commit_loaded_blocks(&mut probe, reservation);
-                // The only signal separating a host-tier restore from a plain
-                // GPU prefix hit — the parity/eviction gates key on it.
-                log::info!("GLM5.2 host-tier restore: {restored} blocks committed");
+        if let Some(mut p) = self.pending.take() {
+            return match p.handle.poll() {
+                None => {
+                    self.pending = Some(p);
+                    HostRestoreOutcome::Park
+                }
+                Some(Ok(())) => {
+                    let restored = p.reservation.len();
+                    pool.commit_loaded_blocks(&mut p.probe, p.reservation);
+                    // The only signal separating a host-tier restore from a
+                    // plain GPU prefix hit — the parity/eviction gates key
+                    // on it.
+                    log::info!("GLM5.2 host-tier restore: {restored} blocks committed");
+                    HostRestoreOutcome::Ready(Some(p.probe))
+                }
+                Some(Err(err)) => {
+                    // The DMA settled, so the reservation can release; the
+                    // prefix just prefills from scratch.
+                    log::warn!("GLM5.2 host-tier load failed (prefill from scratch): {err}");
+                    HostRestoreOutcome::Ready(Some(p.probe))
+                }
+            };
+        }
+
+        let probe = pool.probe_prefix(req.prompt_tokens.clone(), None);
+        let hashes = probe.cpu_query_hashes();
+        if hashes.is_empty() {
+            return HostRestoreOutcome::Ready(Some(probe));
+        }
+        let Some(engine) = engine else {
+            return HostRestoreOutcome::Ready(Some(probe));
+        };
+        let req_key = format!("glm52-admit-{}", QUERY_SEQ.fetch_add(1, Ordering::Relaxed));
+        let hit = match engine.query(&req_key, &hashes) {
+            Ok(QueryOutcome::Ready(hit)) => hit,
+            Ok(QueryOutcome::Loading) => {
+                // Host-memory-only setup: pegaflow has no deeper tier to
+                // fetch from, so an async outcome means a config drift worth
+                // seeing.
+                log::warn!(
+                    "GLM5.2 host-tier query went async in a host-only setup; skipping restore"
+                );
+                return HostRestoreOutcome::Ready(Some(probe));
             }
             Err(err) => {
-                log::warn!("GLM5.2 host-tier load failed (prefill from scratch): {err}");
+                log::warn!("GLM5.2 host-tier query failed (prefill from scratch): {err}");
+                return HostRestoreOutcome::Ready(Some(probe));
             }
-        },
-        Err(err) => {
-            log::warn!("GLM5.2 host-tier load submit failed (prefill from scratch): {err}");
-            // `load` consumes the lease only past its early validation; a
-            // submit error may leave it pinning the host blocks until the
-            // lease TTL. Release explicitly (no-op if already consumed).
+        };
+        let Some(lease) = hit.lease else {
+            return HostRestoreOutcome::Ready(Some(probe));
+        };
+        let Some(reservation) = pool.reserve_loaded_blocks(hit.num_blocks) else {
+            // Block pressure: the pool cannot hold the restored prefix right
+            // now. Prefill recomputes it — correct, just colder.
             engine.release_query_lease(lease);
+            return HostRestoreOutcome::Ready(Some(probe));
+        };
+        match engine.load(lease, reservation.page_ids()) {
+            Ok(handle) => {
+                self.pending = Some(PendingHostRestore {
+                    fingerprint,
+                    probe,
+                    reservation,
+                    handle,
+                });
+                HostRestoreOutcome::Park
+            }
+            Err(err) => {
+                log::warn!("GLM5.2 host-tier load submit failed (prefill from scratch): {err}");
+                // `load` consumes the lease only past its early validation; a
+                // submit error may leave it pinning the host blocks until the
+                // lease TTL. Release explicitly (no-op if already consumed).
+                engine.release_query_lease(lease);
+                HostRestoreOutcome::Ready(Some(probe))
+            }
         }
     }
-    probe
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+
+    use openinfer_core::engine::TokenEvent;
+    use openinfer_core::engine::TokenSink;
+
+    use super::super::RankSlots;
+    use super::super::admission::admit_from_queue;
     use super::super::testkit;
     use super::*;
+
+    /// An in-flight plain restore parks the front without blocking, holds its
+    /// pages against the admission budget, and admits with the restored
+    /// prefix once the DMA settles — the end-to-end contract of #799.
+    #[test]
+    fn parked_restore_defers_then_admits_with_the_restored_prefix() {
+        let pool = BlockPool::new(PAGE, 8).expect("pool");
+        let prompt = vec![7_u32; 5 * PAGE]; // needs 6 lifetime blocks with max_tokens=1
+        let probe = pool.probe_prefix(prompt.clone(), None);
+        assert_eq!(probe.cpu_query_hashes().len(), 4);
+        let reservation = pool
+            .reserve_loaded_blocks(4)
+            .expect("4 destination pages fit");
+        let (handle, settle) = LoadHandle::in_flight();
+        let mut host_restore = Some(HostRestoreState {
+            pending: Some(PendingHostRestore {
+                fingerprint: (None, prompt.len()),
+                probe,
+                reservation,
+                handle,
+            }),
+            abandoned: Vec::new(),
+        });
+
+        let mut slots: RankSlots = std::array::from_fn(|_| None);
+        let mut pending = VecDeque::new();
+        let mut req = testkit::request(prompt, testkit::sampled(0.0), 1);
+        let (token_tx, mut token_rx) = TokenSink::standalone();
+        req.token_tx = token_tx;
+        pending.push_back(req);
+        let mut pending_resets = Vec::new();
+        let mut admit = |pending: &mut VecDeque<_>,
+                         slots: &mut RankSlots,
+                         host_restore: &mut Option<HostRestoreState>| {
+            admit_from_queue(
+                0,
+                pending,
+                slots,
+                &pool,
+                7,
+                None,
+                &mut None,
+                &mut None,
+                host_restore,
+                None,
+                false,
+                true,
+                false,
+                false,
+                &mut pending_resets,
+            )
+            .expect("admission");
+        };
+
+        // In flight: the front parks at the queue head. Without the
+        // held-block credit the budget check would break here forever (the
+        // reserved pages are out of `available_blocks` AND inside the
+        // request's own need).
+        admit(&mut pending, &mut slots, &mut host_restore);
+        assert_eq!(pending.len(), 1, "front stays parked");
+        assert!(slots.iter().all(Option::is_none));
+        assert_eq!(
+            host_restore.as_ref().unwrap().front_held_blocks(),
+            4,
+            "the in-flight load keeps its destination pages held"
+        );
+
+        settle.send(Ok(())).expect("handle alive");
+        admit(&mut pending, &mut slots, &mut host_restore);
+        assert!(pending.is_empty());
+        assert!(slots[0].is_some(), "settled restore admits the front");
+        assert_eq!(host_restore.as_ref().unwrap().front_held_blocks(), 0);
+        match token_rx.try_recv().map(|(_, event)| event) {
+            Ok(TokenEvent::Scheduled { cached_tokens, .. }) => {
+                assert_eq!(cached_tokens, 4 * PAGE, "restored pages matched as prefix");
+            }
+            other => panic!("expected Scheduled, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn failed_restore_load_releases_pages_and_degrades_to_plain_admission() {
+        let pool = BlockPool::new(PAGE, 8).expect("pool");
+        let base = pool.available_blocks();
+        let prompt = vec![7_u32; 3 * PAGE];
+        let probe = pool.probe_prefix(prompt.clone(), None);
+        let reservation = pool.reserve_loaded_blocks(2).expect("2 pages fit");
+        let mut state = HostRestoreState {
+            pending: Some(PendingHostRestore {
+                fingerprint: (None, prompt.len()),
+                probe,
+                reservation,
+                handle: LoadHandle::settled(Err(openinfer_kv_offload::EngineError::Storage(
+                    "injected".into(),
+                ))),
+            }),
+            abandoned: Vec::new(),
+        };
+        let req = testkit::request(prompt, testkit::sampled(0.0), 1);
+        match state.poll_front(None, &pool, &req) {
+            HostRestoreOutcome::Ready(probe) => {
+                assert_eq!(probe.expect("probe survives").held_blocks(), 0);
+            }
+            HostRestoreOutcome::Park => panic!("a settled load must not park"),
+        }
+        assert_eq!(
+            pool.available_blocks(),
+            base,
+            "the failed load's reservation released"
+        );
+    }
+
+    #[test]
+    fn abandoned_restore_holds_its_pages_until_the_dma_settles() {
+        let pool = BlockPool::new(PAGE, 8).expect("pool");
+        let base = pool.available_blocks();
+        let prompt = vec![7_u32; 3 * PAGE];
+        let probe = pool.probe_prefix(prompt.clone(), None);
+        let reservation = pool.reserve_loaded_blocks(2).expect("2 pages fit");
+        let (handle, settle) = LoadHandle::in_flight();
+        let mut state = HostRestoreState {
+            pending: Some(PendingHostRestore {
+                fingerprint: (None, prompt.len()),
+                probe,
+                reservation,
+                handle,
+            }),
+            abandoned: Vec::new(),
+        };
+
+        state.abandon_front();
+        state.reap();
+        assert_eq!(state.front_held_blocks(), 0);
+        assert_eq!(
+            pool.available_blocks(),
+            base - 2,
+            "the DMA still writes the reserved pages"
+        );
+
+        settle.send(Ok(())).expect("handle alive");
+        state.reap();
+        assert_eq!(pool.available_blocks(), base, "settled scrap releases");
+    }
+
+    #[test]
+    fn native_pd_clear_scraps_the_in_flight_tail_load() {
+        let pool = BlockPool::new(PAGE, 8).expect("pool");
+        let base = pool.available_blocks();
+        let mut kv = pool.new_request(vec![7_u32; PAGE], 1, None);
+        kv.schedule_prefill(PAGE, &pool).expect("tail page");
+        let held = kv.resident_blocks();
+        assert!(held > 0);
+        let (handle, settle) = LoadHandle::in_flight();
+
+        let mut state = NativePdState::new(1);
+        let req = testkit::request(vec![7_u32; PAGE], testkit::sampled(0.0), 1);
+        state.parked(0, &req).pending = Some(NativePendingLoad::Tail {
+            kv: Box::new(kv),
+            cached_tokens: 0,
+            handle,
+        });
+        assert_eq!(state.front_held_blocks(0), held);
+
+        state.clear(0);
+        state.reap();
+        assert_eq!(state.front_held_blocks(0), 0);
+        assert_eq!(
+            pool.available_blocks(),
+            base - held,
+            "the DMA still writes the scheduled page"
+        );
+
+        settle.send(Ok(())).expect("handle alive");
+        state.reap();
+        assert_eq!(pool.available_blocks(), base);
+    }
+
+    #[test]
+    fn a_new_native_front_scraps_the_predecessors_load() {
+        let pool = BlockPool::new(PAGE, 8).expect("pool");
+        let prompt = vec![7_u32; 3 * PAGE];
+        let probe = pool.probe_prefix(prompt.clone(), None);
+        let reservation = pool.reserve_loaded_blocks(2).expect("2 pages fit");
+        let (handle, _settle) = LoadHandle::in_flight();
+
+        let mut state = NativePdState::new(1);
+        let mut first = testkit::request(prompt.clone(), testkit::sampled(0.0), 1);
+        first.request_id = Some("first".to_string());
+        state.parked(0, &first).pending = Some(NativePendingLoad::Full {
+            probe,
+            reservation,
+            handle,
+        });
+
+        let mut second = testkit::request(prompt, testkit::sampled(0.0), 1);
+        second.request_id = Some("second".to_string());
+        state.parked(0, &second);
+        assert_eq!(state.front_held_blocks(0), 0);
+        assert_eq!(
+            state.abandoned.len(),
+            1,
+            "the predecessor's load rides the abandoned list"
+        );
+    }
 
     fn pd_state(miss_wait: Duration) -> VllmPdState {
         VllmPdState::new(

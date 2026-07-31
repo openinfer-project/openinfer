@@ -200,6 +200,9 @@ pub(crate) struct Glm52Engine {
     offload: Option<Vec<offload::RankOffload>>,
     vllm_pd: Option<VllmPdState>,
     native_pd: Option<offload::NativePdState>,
+    /// Plain host-tier restore in flight for this rank's queue front (the
+    /// non-P/D admission leg) — polled at step boundaries, never blocking.
+    host_restore: Option<offload::HostRestoreState>,
     moe_topo: crate::Glm52MoeTopo,
     load_tx: watch::Sender<LoadSnapshot>,
     graph_dump_request: Option<GraphDumpRequest>,
@@ -314,6 +317,8 @@ impl Glm52Engine {
         if spec.drafter.enabled() && !prefix_cache && !spec.no_prefix_cache {
             log::info!("GLM5.2 prefix cache disabled: speculative decoding is on");
         }
+        let host_restore = (offload.is_some() && prefix_cache && vllm_pd.is_none())
+            .then(offload::HostRestoreState::new);
         Ok(Self {
             rank: spec.rank,
             submit_rx: spec.submit_rx,
@@ -326,6 +331,7 @@ impl Glm52Engine {
             offload,
             vllm_pd,
             native_pd,
+            host_restore,
             moe_topo: spec.moe_topo,
             load_tx: spec.load_tx,
             graph_dump_request: spec.graph_dump_request,
@@ -556,6 +562,7 @@ impl Glm52Engine {
             self.offload.as_deref().and_then(<[_]>::first),
             &mut self.vllm_pd,
             &mut self.native_pd,
+            &mut self.host_restore,
             Some(&self.workers[0]),
             self.mirrored,
             self.prefix_cache,

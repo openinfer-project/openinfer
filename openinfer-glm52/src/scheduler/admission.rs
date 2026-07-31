@@ -163,6 +163,7 @@ pub(super) fn admit_from_queue(
     offload: Option<&offload::RankOffload>,
     vllm_pd: &mut Option<VllmPdState>,
     native_pd: &mut Option<offload::NativePdState>,
+    host_restore: &mut Option<offload::HostRestoreState>,
     // The rank's executor, only exercised by the vLLM-compat P/D admission
     // (the rope fixup rides its stream); `None` in offline contract tests.
     worker: Option<&Glm52Worker>,
@@ -172,6 +173,14 @@ pub(super) fn admit_from_queue(
     native_mtp_prefill: bool,
     pending_resets: &mut Vec<usize>,
 ) -> anyhow::Result<()> {
+    // Loads abandoned mid-flight (disconnects, deadline rejects) held their
+    // destination pages until the DMA settled — release the settled ones.
+    if let Some(state) = host_restore.as_mut() {
+        state.reap();
+    }
+    if let Some(state) = native_pd.as_mut() {
+        state.reap();
+    }
     let mut committed: usize = slots
         .iter()
         .flatten()
@@ -197,6 +206,9 @@ pub(super) fn admit_from_queue(
             }
             if let Some(pd) = native_pd.as_mut() {
                 pd.clear(rank);
+            }
+            if let Some(state) = host_restore.as_mut() {
+                state.abandon_front();
             }
             continue;
         }
@@ -243,7 +255,19 @@ pub(super) fn admit_from_queue(
             .flatten()
             .map(|active| active.kv.resident_blocks())
             .sum();
-        let physical_usable = pool.available_blocks().saturating_add(active_resident);
+        // Pages held by the front's own parked in-flight restore are destined
+        // for this request (already inside `need_blocks`), so credit them
+        // back — counting them on both sides would wedge the front forever.
+        let front_restore_held = host_restore
+            .as_ref()
+            .map_or(0, offload::HostRestoreState::front_held_blocks)
+            + native_pd
+                .as_ref()
+                .map_or(0, |pd| pd.front_held_blocks(rank));
+        let physical_usable = pool
+            .available_blocks()
+            .saturating_add(active_resident)
+            .saturating_add(front_restore_held);
         if committed + need_blocks > usable.min(physical_usable) {
             break;
         }
@@ -335,6 +359,24 @@ pub(super) fn admit_from_queue(
         let (mut kv, cached_tokens) = if let Some(admitted) = pd_admitted {
             admitted
         } else {
+            // Host-tier restore first, so the GPU prefix match sees the union
+            // of HBM-resident and freshly-restored blocks. The load's H2D
+            // copy is polled at step boundaries instead of blocking the
+            // engine loop (#799): Park leaves the request at the queue front.
+            // The probe stays alive across the match to close the eviction
+            // window.
+            let _restored_hold = match host_restore.as_mut() {
+                Some(state) if prefix_cache_enabled && vllm_pd.is_none() => {
+                    match state.poll_front(offload.map(|o| &o.engine), pool, &req) {
+                        offload::HostRestoreOutcome::Ready(probe) => probe,
+                        offload::HostRestoreOutcome::Park => {
+                            pending.push_front(req);
+                            break; // head-of-line wait: retry next step boundary
+                        }
+                    }
+                }
+                _ => None,
+            };
             let mut kv = if native_mtp_prefill {
                 let cache_salt = super::native_mtp_cache_salt(&req.prompt_tokens);
                 pool.new_request_with_cache_salt(
@@ -346,14 +388,6 @@ pub(super) fn admit_from_queue(
             } else {
                 pool.new_request(req.prompt_tokens.clone(), req.max_tokens, None)
             };
-            // Host-tier restore first, so the GPU prefix match sees the union
-            // of HBM-resident and freshly-restored blocks. The probe stays
-            // alive across the match to close the eviction window.
-            let _restored_hold = offload
-                .filter(|_| prefix_cache_enabled && vllm_pd.is_none())
-                .map(|offload| {
-                    offload::restore_host_prefix(&offload.engine, pool, &req.prompt_tokens)
-                });
             let cached_tokens = if prefix_cache_enabled {
                 match kv.match_and_add_prefix(pool) {
                     Ok(cached) => cached,
