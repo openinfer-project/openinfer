@@ -223,27 +223,37 @@ concurrent and page size 16 — while the full-attention pool takes the remainde
 
 Qwen3's `TensorParallelConfig::validate_for` refuses a world size that does not divide
 `num_key_value_heads`, and shards by integer division. That policy is private to that crate and
-Gemma 4 cannot reuse it: the full-attention group has 1 KV head at 12B, 2 at 26B, 4 at 31B, so above
-those counts it must be **replicated rather than sharded**. The per-rank mapping is:
+Gemma 4 cannot reuse it, because the full-attention group has fewer KV heads than a plausible world
+size: 1 at 12B, 2 at 26B, 4 at 31B.
+
+Integer division alone is not a contract — it silently drops heads. With `P = world_size`, `Q`,
+`Kv` and `G` the attention, sliding-KV and global-KV head counts, a legal `P` satisfies all three:
 
 ```
-local_sliding_kv_heads = num_key_value_heads / world_size            // sharded, must divide
-local_full_kv_heads    = max(1, num_global_key_value_heads / world_size)
-                         // replicated when world_size exceeds the head count
-local_q_heads          = num_attention_heads / world_size            // always sharded
+Q  % P == 0
+Kv % P == 0
+G  % P == 0   ||   P % G == 0
 ```
 
-**Replicated bytes are charged once per rank.** Each rank allocates its own pools, so a replicated
-full-attention group costs its full per-token rate on every rank rather than dividing. Every capacity
-figure in this document is therefore per rank, and the earlier tables are TP1. At 12B and 262144
-positions, unreclaimed, one request costs per rank:
+Without the third, 12B at `P = 6` yields `16/6 = 2` local query heads and `8/6 = 1` local sliding KV
+head, covering 12 of 16 and 6 of 8 — a silent loss, not an error. The third condition splits the
+full-attention group into two regimes, and the rank mapping differs by regime:
 
-| | TP1 | TP2 | TP4 |
+- **`G >= P`** — each rank owns a contiguous run of `G / P` KV heads. The group shards, so its bytes
+  divide by `P` like the sliding group's.
+- **`G < P`** — each KV head is replicated to `P / G` contiguous ranks, leaving exactly one head per
+  rank. The group no longer divides: from here on it costs the same per rank at every world size.
+
+**Every capacity figure in this document is per rank**, and the earlier tables are TP1. The floor
+matters more than the replication: at 12B `G = 1`, so the full group is already at its floor at TP1
+and never shrinks, which is why only the sliding half moves below.
+
+| 12B, one request at 262144, per rank | TP1 | TP2 | TP4 |
 | --- | --- | --- | --- |
 | sliding / full attention, KiB per token | 320 / 16 | 160 / 16 | 80 / 16 |
-| one request at 262144 | 84 GiB | 44 GiB | 24 GiB |
+| total | 84 GiB | 44 GiB | 24 GiB |
 
-TP therefore buys less than a naive division suggests: the group that does not shrink is the one that
+TP therefore buys less than a naive division suggests: the group that stops shrinking is the one that
 scales with context. It cuts the other way for kernels — `local_q_heads` shrinks, so the per-rank GQA
 group is 16 at TP1, 8 at TP2, 4 at TP4, and 12B's full-attention group lands back inside the compiled
 decode set above TP1.
@@ -298,6 +308,8 @@ than round or default, when any of these fails:
 - `num_attention_heads` is divisible by both KV head counts — a non-integral GQA group has no kernel.
 - Both head dims have a compiled attention backend, and the sliding group's has one with the window
   variant.
+- The world size is legal by the three conditions above. This is separate from the GQA divisibility
+  on the previous line, and its absence is what makes integer division drop heads silently.
 - Each group's **per-rank** GQA group, after query-head sharding and any KV-head replication, has a
   compiled decode kernel or an accepted fallback. This is the resolved mapping, not the config ratio.
 
