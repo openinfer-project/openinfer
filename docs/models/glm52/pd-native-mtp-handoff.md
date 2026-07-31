@@ -25,7 +25,10 @@
 > nodes, survives multi-turn c64 with zero rejects (640/640, 1,158 tok/s),
 > and exposes the next lever — without session-affinity routing, every turn
 > full-history-refetches (TTFT grows per turn as fleet width dilutes
-> rank-local KV reuse).
+> rank-local KV reuse). The admission-coupled ITL p99 tail is **fixed**
+> (PR #801, D-side #799): restores now park-and-poll instead of blocking the
+> engine loop — multi-turn ITL p99 98 → 31 ms (c16) and 74 → 30 ms (c64)
+> with zero rejects; the vLLM-compat P/D path is removed.
 >
 > **Last touched:** 2026-07
 
@@ -581,6 +584,39 @@ table:
   successful cross-page EP4 handoff remains the functional evidence, while
   the machine-level NCCL initialization needs a separate rerun.
 
+### Async admission restore closes the ITL p99 tail (2026-07-31, PR #801)
+
+The D-side half of #799 is implemented and verified on the same 4-node EP16
+fleet (Slurm job 5268, same trays/router as the 5193 baseline): admission
+restores now submit the pegaflow host→GPU load and poll `LoadHandle::poll()`
+at step boundaries while the request parks at its queue front — the engine
+loop never blocks, so one rank's restore no longer stalls the DeepEP chain.
+Abandoned loads keep their destination pages on a scrap list until the DMA
+settles; a parked front's held pages are credited back to the admission
+budget (double-counting would wedge the queue). The vLLM-compat P/D prefill
+path was removed in the same PR.
+
+Multi-turn 1024/256/128 × 5 turns, temperature 0, same workload as the
+baseline rows above:
+
+| metric | c16 old → new | c64 old → new |
+| --- | --- | --- |
+| ITL p99 | 98.0 → **30.7 ms** | 73.7 → **30.4 ms** |
+| ITL p90 | 38.7 → 29.9 | 37.6 → 29.2 |
+| TPOT p50 | 11.6 → 9.6 | 11.5 → 9.9 |
+| TTFT p50 | 524 → 645 ms | 5.18 → 5.24 s |
+| TTFT p99 | 1.28 → 1.73 s | 8.41 → 8.73 s |
+| out tok/s | 948 → 1,018 | 1,158 → 1,156 |
+
+Turns completed 240/240 and 640/640, zero rejects. ITL p99 now sits within
+~3 ms of p50 at both concurrencies — the admission-coupled tail is gone
+entirely, and the whole decode plane runs smoother (TPOT −17%). The cost is
+the predicted TTFT tax at low load (each restore leg pays one extra
+step-boundary round trip, ~+120 ms p50 / +440 ms p99 at c16); at c64 the
+queueing term dominates and TTFT/throughput are unchanged. The per-turn
+TTFT growth from rank-migration refetch remains — that is the
+session-affinity item, not this fix.
+
 ## Debrief
 
 The transferable cache format and the producer's fastest local execution
@@ -597,11 +633,11 @@ Next action: the P → EP16 handoff contract is now hardware-closed (see the
 Slurm fleet section above), which also covers the fleet-aggregate
 measurement through the router. What remains: (1) EP32 handoff rerun when
 eight trays are actually free (Slurm-idle is not evidence — verify
-`nvidia-smi` per node); (2) **#799**: synchronous pegaflow restore/save on the engine thread —
-admission restore blocks the serve loop (fleet ITL p99 tail on EP,
-head-of-line prefill stall on TP4 P; control-run-confirmed) and
-`save_native_tail` is a per-handoff `save_blocking` on the same thread
-(prime suspect for the episodic 2–6 s phase-locked wave stall);
+`nvidia-smi` per node); (2) **#799 remainder**: the D-side admission restore is fixed (PR #801,
+park-and-poll — see the async-restore section above); still open are the
+P-side `save_native_tail` per-handoff `save_blocking` on the engine thread
+(prime suspect for the episodic 2–6 s phase-locked wave stall) and the
+save submit-depth audit;
 (3) session-affinity / cache-aware decode routing — the per-turn
 full-history refetch is the dominant multi-turn TTFT term on wide fleets
 (also tracked in #799 as the traffic-side mitigation); (4) fold multi-P and
