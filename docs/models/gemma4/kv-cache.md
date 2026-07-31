@@ -235,9 +235,18 @@ Kv % P == 0
 G  % P == 0   ||   P % G == 0
 ```
 
-Without the third, 12B at `P = 6` yields `16/6 = 2` local query heads and `8/6 = 1` local sliding KV
-head, covering 12 of 16 and 6 of 8 — a silent loss, not an error. The third condition splits the
-full-attention group into two regimes, and the rank mapping differs by regime:
+The first two are what stop the silent loss: 12B at `P = 6` yields `16/6 = 2` local query heads and
+`8/6 = 1` local sliding KV head, covering 12 of 16 and 6 of 8 without erroring.
+
+The third is not witnessed by any published size — at 12B, 26B and 31B every `P` passing the first
+two also passes it, so it never rejects a shipping configuration. It is there because the rank
+mapping is otherwise undefined, which a synthetic shape shows: `Q = 24, Kv = 12, G = 4, P = 6` passes
+both divisibility checks, but `P / G = 1.5`, so "replicated to `P / G` contiguous ranks" has no
+meaning and six ranks holding one head each cannot cover four heads evenly. Check it anyway; the
+alternative is a mapping that holds only for the three published head counts.
+
+That condition splits the full-attention group into two regimes, and the rank mapping differs by
+regime:
 
 - **`G >= P`** — each rank owns a contiguous run of `G / P` KV heads. The group shards, so its bytes
   divide by `P` like the sliding group's.
