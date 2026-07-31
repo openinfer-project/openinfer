@@ -77,16 +77,16 @@ key off the resolved per-rank mapping.
 
 ## Capacity: what reclaiming the window buys
 
+All figures below are per rank at TP1; see the tensor-parallelism section for how they scale.
+
 With both backends and no reclamation, pages stay resident and the sliding group costs its full
 320 KiB per token. That is correct, and budget-limited rather than window-limited: one 12B request
 costs 336 KiB per token across both groups, so a 20 GiB budget reaches roughly 62k positions for one
-request, or 7.8k each at eight concurrent.
-
-The declared context is what it cannot reach. At 262144 positions one unreclaimed request wants
-**84 GiB** across both groups (55 GiB at 26B, 220 GiB at 31B); capping the sliding group at its
-residency drops it to about 4.6 GiB, so the same 20 GiB serves four at full declared length. The
-trade is "cannot serve one at the declared maximum" versus "serves four", not "1024 versus 262144" —
-a mask-only engine is shippable with a budget-derived context ceiling.
+request, or 7.8k each at eight concurrent. The declared context is what it cannot reach — at 262144
+positions one unreclaimed request wants **84 GiB** (55 GiB at 26B, 220 GiB at 31B), while capping the
+sliding group at its residency drops it to about 4.6 GiB, so the same 20 GiB serves four. The trade
+is "cannot serve one at the declared maximum" versus "serves four", not "1024 versus 262144": a
+mask-only engine is shippable with a budget-derived context ceiling.
 
 **Sliding residency is a window plus a shared prefill burst.** Prefill is append-then-attend, so
 while a request forwards a chunk of `C` tokens the span it needs resident is `C + window`, not
@@ -97,13 +97,22 @@ set. So the burst is bought once for the whole step, and the pool decomposes:
 ```
 sliding pages = concurrency × (ceil(window / page_size) + 1)   steady residency, per request
               + ceil(max_prefill_tokens / page_size)           in-flight burst, shared by the step
+              + (concurrency - 1)                             per-row chunk rounding
 ```
 
-At 12B with page size 16 and `max_prefill_tokens` 1024 that is 65 pages per request plus 64 shared:
-129 pages for one request, but 584 for eight concurrent, not 1032 — charging the burst per request
-overstates an eight-way pool by 1.8×. A conservative implementation may still reserve per request,
-but that is a simplification to declare, not the capacity the design requires. `max_prefill_tokens`
-enters the sum once rather than `concurrency` times, and still has to be bounded.
+The third term is not optional: rounding the *sum* of the chunks to pages is not the same as summing
+each row's rounded chunk, because every active row rounds its own frontier. With page size 16, a
+1024 window and eight rows taking `[1003, 3 × 7]` — exactly the 1024 budget — the rows need
+`[128, 66 × 7] = 590` pages while the first two terms give 584. Six pages, 30 MiB at 12B, and the
+failure mode is admission accepting a request the second pool then cannot schedule. Summing each
+row's real offset and chunk is exact; `(concurrency - 1)` is the cheap upper bound, and it uses
+concurrency because sizing happens before the live row count is known.
+
+At 12B, page size 16, `max_prefill_tokens` 1024: 129 pages for one request and 591 for eight
+concurrent, against 1032 if the burst were charged per request — the shared form is still 1.75×
+tighter. Reserving per request is a legitimate simplification to declare, not the capacity the design
+requires. `max_prefill_tokens` enters the sum once rather than `concurrency` times, and still has to
+be bounded.
 
 Reclamation granularity is one page, which does **not** require the page size to divide the window:
 the window's left edge lands mid-page at almost every position regardless — at 5000 it is 3977. The
@@ -205,55 +214,78 @@ the steady cap alone, `min(lifetime_blocks, ceil(window / page_size) + 1)`. The 
 pool formula above. Folding it into each request's reservation re-charges it per request.
 
 Pool sizing has two regimes. Without reclamation both pools need the same page count, and the sliding
-one takes 95% of the bytes and sets the context ceiling. With reclamation the sliding pool is
-`concurrency × steady residency + one shared prefill burst`, independent of context — 2.85 GiB at
-12B, eight concurrent, page size 16 — and the full-attention pool takes the remainder and sets the
-ceiling. `servable_len` and the load feed's single `kv_cache_usage` ratio have to state which pool
-they mean.
+one takes 95% of the bytes and sets the context ceiling. With reclamation the sliding pool follows
+the three-term formula above and is independent of context — 591 pages, 2.89 GiB, at 12B with eight
+concurrent and page size 16 — while the full-attention pool takes the remainder and sets the ceiling.
+`servable_len` and the load feed's single `kv_cache_usage` ratio have to state which pool they mean.
 
 ## Tensor parallelism
 
 Qwen3's `TensorParallelConfig::validate_for` refuses a world size that does not divide
 `num_key_value_heads`, and shards by integer division. That policy is private to that crate and
-Gemma 4 does not inherit it, but it cannot be reused either: the full-attention group has 1 KV head
-at 12B, 2 at 26B, 4 at 31B, so above those counts the group has to be **replicated rather than
-sharded**, and the contract must say whether its bytes are charged once or once per rank. That
-matters because a 31B request at the declared length wants 20 GiB of full-attention cache.
+Gemma 4 cannot reuse it: the full-attention group has 1 KV head at 12B, 2 at 26B, 4 at 31B, so above
+those counts it must be **replicated rather than sharded**. The per-rank mapping is:
 
-Replication cuts the other way too. Query heads still shard, so the per-rank GQA group shrinks with
-the world size and 12B's full-attention group lands back inside the compiled decode set at TP2 and
-above. Whether it needs a fallback decode path is a property of the deployment, not the checkpoint.
+```
+local_sliding_kv_heads = num_key_value_heads / world_size            // sharded, must divide
+local_full_kv_heads    = max(1, num_global_key_value_heads / world_size)
+                         // replicated when world_size exceeds the head count
+local_q_heads          = num_attention_heads / world_size            // always sharded
+```
+
+**Replicated bytes are charged once per rank.** Each rank allocates its own pools, so a replicated
+full-attention group costs its full per-token rate on every rank rather than dividing. Every capacity
+figure in this document is therefore per rank, and the earlier tables are TP1. At 12B and 262144
+positions, unreclaimed, one request costs per rank:
+
+| | TP1 | TP2 | TP4 |
+| --- | --- | --- | --- |
+| sliding / full attention, KiB per token | 320 / 16 | 160 / 16 | 80 / 16 |
+| one request at 262144 | 84 GiB | 44 GiB | 24 GiB |
+
+TP therefore buys less than a naive division suggests: the group that does not shrink is the one that
+scales with context. It cuts the other way for kernels — `local_q_heads` shrinks, so the per-rank GQA
+group is 16 at TP1, 8 at TP2, 4 at TP4, and 12B's full-attention group lands back inside the compiled
+decode set above TP1.
 
 ## CUDA graph capture
 
-Decode is captured with pre-allocated buffers for pointer stability, and two groups impose: two sets
+Decode is captured with pre-allocated buffers for pointer stability, and two groups impose two sets
 of page-table contents with independent CSR offsets, two attention geometries (different head dims,
-hence different plan tiling), and two buffer base pointers with their own per-layer offsets and
-strides. A shrinking page row is compatible with replay — sequence length, page count and last-page
-length are derived device-side, never host-baked.
+hence different plan tiling), and two base pointers with their own per-layer offsets. A shrinking
+page row is compatible with replay: sequence length, page count and last-page length are derived
+device-side, never host-baked.
 
-The layout is not settled here. One relevant behaviour in `openinfer-qwen3`'s executor: for GQA
-groups the decode kernel cannot instantiate, decode is rerouted to the eager unified path and capture
-is skipped. At TP1 12B's full-attention group is exactly such a group, so whether it is captured at
-all is the first question — and since the group shrinks with the world size, the answer differs per
-TP degree. Resolve that before arranging workspaces or graph keys.
+The layout is not settled here, and one question precedes it. For GQA groups the decode kernel
+cannot instantiate, `openinfer-qwen3`'s executor reroutes decode to the eager unified path and skips
+capture; at TP1 12B's full-attention group is exactly such a group. Whether it is captured at all
+therefore differs per TP degree, and that comes before workspaces or graph keys.
 
 ## RoPE precompute
 
 The two groups need different caches — theta 10000 with full rotation at 256 for sliding layers,
 theta 1000000 with proportional partial rotation for full-attention layers. `precompute_rope`
-allocates a cos and a sin buffer of `max_seq_len × head_dim` bf16 elements each; at 262144 positions
-each pair costs 256 MiB for the sliding group and 128 MiB for the full-attention one. They need no
-new accounting: the KV budget is measured after weight load and these are allocated during it, so
-they are already subtracted.
+allocates a cos and a sin buffer of `max_seq_len × head_dim` bf16 elements each, where the same
+`head_dim` sets both the buffer stride and the frequency denominator. That coupling is what makes
+the full-attention cost depend on whether the signature is fixed first:
+
+| cos + sin at 262144 positions | sliding | full attention |
+| --- | --- | --- |
+| as the signature stands (stride = head dim) | 256 MiB @ 256 | **512 MiB @ 512** |
+| with stride and denominator separated | 256 MiB | 128 MiB @ rotary 128, denominator 512 |
+
+Full attention rotates 128 dimensions but derives frequencies from the full 512, so on the current
+signature passing 128 would buy the smaller buffer at the price of wrong frequencies. A correct
+implementation on it therefore carries 768 MiB, not 384; separating the two parameters is the
+proportional-RoPE work. These need no new accounting either way — the KV budget is measured after
+weight load and these are allocated during it, so they are already subtracted — but a KV example
+that assumes 384 MiB is off by that difference.
 
 Their length is a configuration input, not something to derive from the budget: `servable_len` is
 computed *from* the KV budget, which is measured *after* these caches are allocated, so "size them to
 the servable context" is circular and resolving it would need two-phase allocation or a fixed point.
 The contract is to size both from an explicit configured serving limit, capped at the checkpoint's
-`max_position_embeddings`. Separately, the signature uses `head_dim` as both the layout stride and
-the frequency denominator; Gemma 4's full-attention RoPE rotates 128 dimensions but derives
-frequencies from the full 512, so those must become separate parameters.
+`max_position_embeddings`.
 
 ## What the loader must validate before building the layouts
 
@@ -290,5 +322,17 @@ probe pins the shape fields but not the counts.
 
 Order is forced. The two attention backends come first and are independent of everything here.
 One-pool plumbing with no reclamation is next and yields a correct engine with a budget-derived
-context ceiling. Two pools and reclamation are last; their blocking design question is the second
-`positions` array — cache-relative for the append, absolute for RoPE — which is local to Gemma 4.
+context ceiling. Two pools and reclamation are last, and reclamation needs three things, not one:
+
+1. **The second `positions` array** — cache-relative for the append, absolute for RoPE.
+2. **Resident origin and length as first-class request state.** `RequestKv::prefill_view` and
+   `decode_view` derive `KvView`'s `seq_len` from the absolute `kv_position`, so a front-trimmed page
+   row trips the exact-cover assertion on the next step even though the constructor itself is
+   position-relative. Gemma 4's request state has to carry absolute position and resident
+   origin/length separately and build its views from the latter.
+3. **An ownership path for releasing a live request's oldest assigned blocks.** Nothing exposes one:
+   the assignment list truncates from the end and the only partial drop is LIFO and Idle-only. This
+   is the piece with no existing analogue, and it is what decides whether reclamation is confined to
+   Gemma 4's own state or needs a shared-pool API.
+
+Items 1 and 2 are local to this model line. Item 3 may not be.
