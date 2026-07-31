@@ -27,7 +27,6 @@ use crate::layer::glm52_layer_attention_half;
 use crate::layer::glm52_layer_finish;
 use crate::layer::glm52_layer_finish_fused;
 use crate::moe_decode::run_ep_router_into;
-use crate::moe_decode::run_router_into;
 use crate::moe_ep::Glm52MoeEpState;
 use crate::moe_ep8::Glm52MoeEp8LayerWeights;
 use crate::moe_tp::Glm52MoeTpRank;
@@ -77,15 +76,15 @@ pub(super) fn run_step_body(
     let mut carry_ready = false;
     for (layer, (weights, cache)) in layers.iter().zip(caches.iter_mut()).enumerate() {
         let parity = layer % 2;
-        // Attention-TP: a head-sharded layer's o_proj partial crosses the AR
-        // brick inside the attention half; the layer index is its AR slot.
+        // Attention-TP: a head-sharded layer's o_proj partial crosses the
+        // NCCL all-reduce inside the attention half.
         let tp_ar = if weights.mla.heads == crate::config::GLM52_HEADS {
             None
         } else {
             let rank = tp
                 .as_deref_mut()
                 .context("GLM5.2 sharded attention without TP state")?;
-            Some((&mut rank.state, layer))
+            Some(&mut rank.state)
         };
         glm52_layer_attention_half(
             ctx,

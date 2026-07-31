@@ -29,7 +29,6 @@ use openinfer_kernels::ops::glm52_silu_and_mul_bf16_launch;
 use openinfer_kernels::tensor::DeviceContext;
 
 use crate::config::GLM52_EXPERT_INTERMEDIATE as INTERMEDIATE;
-use crate::config::GLM52_HIDDEN;
 use crate::fp8::Glm52Fp8GemmScratch;
 use crate::fp8::fp8_linear_large_m_bank_into;
 use crate::moe_decode::EXPERTS;

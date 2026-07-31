@@ -19,7 +19,9 @@ use openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_PAGE_SIZE;
 use openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_TOPK;
 use openinfer_kernels::ops::Glm52FlashMlaSparseDecode;
 use openinfer_kernels::ops::Glm52IndexerCacheLayout;
+use openinfer_kernels::ops::Glm52TpTopology;
 use openinfer_kernels::ops::argmax_bf16_split_into;
+use openinfer_kernels::ops::copy_hidden_rows_raw_into;
 use openinfer_kernels::ops::embedding_rows_into;
 use openinfer_kernels::ops::glm52_flashmla_sparse_decode_num_sm_parts;
 use openinfer_kernels::ops::rms_norm_rows_into;
@@ -54,6 +56,7 @@ use crate::mla_decode::Glm52MlaBackend;
 use crate::mla_decode::Glm52MlaSchedMetadata;
 use crate::mla_decode::glm52_select_mla_backend;
 use crate::moe_ep::Glm52MoeEpState;
+use crate::moe_tp::Glm52MoeTpPrefillScratch;
 use crate::moe_tp::Glm52MoeTpRank;
 use crate::mtp::GLM52_MTP_DRAFTS;
 use crate::mtp::Glm52MtpBookendWeights;
@@ -180,6 +183,9 @@ pub(super) struct Glm52NativeMtp {
     slot_mapping: CudaSlice<i64>,
     seq_lens: CudaSlice<i32>,
     committed_lens: [usize; GLM52_MAX_BATCH_PER_RANK],
+    /// TP4 only: the proposal layer-78 MoE runs through the prefill TP path
+    /// (rank slice + NCCL all-reduce); the LL decode path is gone (#805).
+    tp_moe: Option<Glm52MoeTpPrefillScratch>,
 }
 
 impl Glm52NativeMtp {
@@ -322,6 +328,15 @@ impl Glm52NativeMtp {
             },
         );
 
+        let tp_moe = match moe_topo {
+            crate::Glm52MoeTopo::Tp4 => Some(Glm52MoeTpPrefillScratch::new(
+                ctx,
+                Glm52TpTopology::Tp4,
+                GLM52_MAX_BATCH_PER_RANK,
+            )?),
+            _ => None,
+        };
+
         let mut buckets = Vec::with_capacity(GLM52_DECODE_BUCKETS.len());
         for rows in GLM52_DECODE_BUCKETS {
             let row_contract = Glm52FlashMlaSparseDecode {
@@ -383,6 +398,7 @@ impl Glm52NativeMtp {
             slot_mapping: ctx.stream.alloc_zeros(GLM52_MAX_BATCH_PER_RANK)?,
             seq_lens: ctx.stream.alloc_zeros(GLM52_MAX_BATCH_PER_RANK)?,
             committed_lens: [0; GLM52_MAX_BATCH_PER_RANK],
+            tp_moe,
         })
     }
 
@@ -778,11 +794,11 @@ impl Glm52NativeMtp {
         embedding_rows_into(ctx, sin_table, &self.positions, rows, &mut self.sin)?;
         ctx.stream
             .memcpy_htod(&pages, &mut self.buckets[bucket_index].block_table)?;
-        if let Some(rank) = tp.as_ref()
-            && !rank.slices.is_empty()
-        {
-            anyhow::bail!("GLM5.2 TP4 is prefill-only; MTP decode LL path was removed");
-        }
+        // TP4 runs the body eagerly: its NCCL collectives (attention AR +
+        // MoE reduce) stay out of CUDA graph capture, and proposal rounds on
+        // the prefill engine are not a hot decode loop (#805).
+        let tp_prefill = matches!(&self.layer.mlp, Glm52LayerMlp::MoeTp(_));
+        let tp_moe = self.tp_moe.as_mut();
         let bucket = &mut self.buckets[bucket_index];
         let Glm52MtpBucket {
             sched,
@@ -805,7 +821,7 @@ impl Glm52NativeMtp {
             block_table,
             seq_lens: &self.seq_lens,
         };
-        compute_graph.run_or_capture(ctx, || {
+        let body = || {
             glm52_embed_into(ctx, embed, &self.token_ids, embeds)?;
             glm52_mtp_prepare_into(
                 ctx,
@@ -833,7 +849,7 @@ impl Glm52NativeMtp {
                     let rank = tp
                         .as_deref_mut()
                         .context("GLM5.2 TP MTP attention has no TP runtime")?;
-                    Some((&mut rank.state, GLM52_MTP_LAYER))
+                    Some(&mut rank.state)
                 }
                 _ => None,
             };
@@ -867,8 +883,38 @@ impl Glm52NativeMtp {
                         self.ep_ranks * GLM52_MAX_BATCH_PER_RANK,
                     )?;
                 }
-                Glm52LayerMlp::MoeTp(_) => {
-                    anyhow::bail!("GLM5.2 TP4 is prefill-only; MTP decode MoE TP path was removed");
+                Glm52LayerMlp::MoeTp(router) => {
+                    let rank = tp
+                        .as_deref_mut()
+                        .context("GLM5.2 TP MTP layer has no TP runtime")?;
+                    let (state, _slot, bank) = rank
+                        .layer_bank(GLM52_MTP_LAYER)
+                        .context("GLM5.2 TP MTP layer has no layer-78 slice bank")?;
+                    let moe = tp_moe.context("GLM5.2 TP MTP layer has no prefill MoE scratch")?;
+                    // The prefill MoE forward rounds rows up to 4: bridge
+                    // through the fixed eight-row TP buffers, as the target
+                    // layers do. Padding rows carry deterministic bytes
+                    // (token 0 / position 0), identical on every rank.
+                    copy_hidden_rows_raw_into(
+                        ctx,
+                        scratch.layer.normed2.data(),
+                        GLM52_HIDDEN,
+                        &mut scratch.tp_normed2,
+                        GLM52_HIDDEN,
+                        0,
+                        rows,
+                    )?;
+                    moe.forward(
+                        ctx,
+                        state,
+                        router,
+                        bank,
+                        &scratch.tp_normed2,
+                        rows,
+                        &mut scratch.tp_mlp_out,
+                    )?;
+                    state.prefill_allreduce_in_place(ctx, rows, &mut scratch.tp_mlp_out)?;
+                    tp_padded_mlp = true;
                 }
                 Glm52LayerMlp::Dense(_) => {
                     anyhow::bail!("GLM5.2 MTP layer 78 unexpectedly has a dense MLP")
@@ -892,7 +938,12 @@ impl Glm52NativeMtp {
                 &mut scratch.argmax_values,
                 &mut scratch.argmax_indices,
             )
-        })
+        };
+        if tp_prefill {
+            body()
+        } else {
+            compute_graph.run_or_capture(ctx, body)
+        }
     }
 
     fn argmax_host(&self, ctx: &DeviceContext, bucket_index: usize) -> Result<Vec<u32>> {

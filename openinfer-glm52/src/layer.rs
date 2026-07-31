@@ -167,7 +167,7 @@ pub(crate) fn glm52_layer_attention_half(
     carry_ready: &mut bool,
     parity: usize,
     first_layer: bool,
-    tp_ar: Option<(&mut crate::moe_tp::Glm52MoeTpState, usize)>,
+    tp_ar: Option<&mut crate::moe_tp::Glm52MoeTpState>,
 ) -> Result<()> {
     // Attention-TP: a head-sharded layer (8 of 64 heads) produces an o_proj
     // PARTIAL that must cross the AR brick before the residual add; holding
@@ -255,26 +255,26 @@ pub(crate) fn glm52_layer_attention_half(
     } else {
         (&mut attn_hi[0], &attn_lo[0])
     };
-    match tp_ar {
-        Some(_) => {
-            anyhow::bail!(
-                "GLM5.2 TP4 is prefill-only; decode attention-TP LL allreduce was removed"
-            );
-        }
-        None => glm52_mla_attend_into(
-            ctx,
-            &w.mla,
-            &s.mla_front,
-            step.mla_cos,
-            step.mla_sin,
-            &mut caches.mla_cache,
-            step.slot_mapping,
-            &s.idx.global_slots,
-            step.seq_lens,
-            step.mla_sched,
-            &mut s.mla_attend,
-            attn_out,
-        )?,
+    glm52_mla_attend_into(
+        ctx,
+        &w.mla,
+        &s.mla_front,
+        step.mla_cos,
+        step.mla_sin,
+        &mut caches.mla_cache,
+        step.slot_mapping,
+        &s.idx.global_slots,
+        step.seq_lens,
+        step.mla_sched,
+        &mut s.mla_attend,
+        attn_out,
+    )?;
+    if let Some(state) = tp_ar {
+        // Sharded: this rank's head shard produced an o_proj PARTIAL; the
+        // NCCL all-reduce sums the ranks' partials in place (identical bytes
+        // on every rank) before the residual add. Callers run this path
+        // eagerly — the collective stays out of CUDA graph capture (#805).
+        state.prefill_allreduce_in_place(ctx, tokens, attn_out.data_mut())?;
     }
 
     // Fused add+norm at the post-attention boundary (bit-identical to separate
