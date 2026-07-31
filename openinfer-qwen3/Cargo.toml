@@ -47,6 +47,8 @@ test-fixtures = []
 [dev-dependencies]
 openinfer-qwen3 = { workspace = true, features = ["test-fixtures"] }
 openinfer-vllm-support = { workspace = true }
+parking_lot = { workspace = true }
+reqwest = { workspace = true, features = ["blocking", "json"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
 vllm-text = { workspace = true }
