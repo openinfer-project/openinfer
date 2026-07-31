@@ -507,9 +507,7 @@ pub struct DeepEpBase<A: DeepEpAbi> {
 /// The Kimi-K2 shim instantiation (deepep_* symbols).
 pub type DeepEp = DeepEpBase<KimiDeepEpAbi>;
 
-/// The GLM5.2 EP8 shim instantiation (glm52_deepep_* symbols), named
-/// concretely for the masked-fp8 chain; the weight-only chain stays generic
-/// over [`DeepEpAbi`] instead.
+/// The GLM5.2 EP8 shim instantiation (`glm52_deepep_*` symbols).
 #[cfg(feature = "glm52")]
 pub type Glm52DeepEp = DeepEpBase<Glm52DeepEpAbi>;
 

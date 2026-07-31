@@ -111,6 +111,9 @@ __global__ void fp8_per_token_group_quant_bf16_k128_kernel(
 // in the masked layout written by W13. Router weights are deliberately not
 // applied here: vLLM quantizes the unweighted SwiGLU activation and applies
 // routing weights after W2.
+// kUe8m0 rounds the group scale UP to the next power of two (same bit
+// manipulation as the plain quant kernel) — the Blackwell packed-SF contract.
+template <bool kUe8m0 = false>
 __global__ void silu_and_mul_per_token_group_quant_bf16_k128_masked_kernel(
     const __nv_bfloat16* __restrict__ input,
     unsigned char* __restrict__ output, float* __restrict__ scales, int rows,
@@ -159,6 +162,10 @@ __global__ void silu_and_mul_per_token_group_quant_bf16_k128_masked_kernel(
 
     if (tid == 0) {
       shared[0] = fmaxf(shared[0], kPerTokenGroupQuantEps) / kFp8Max;
+      if constexpr (kUe8m0) {
+        shared[0] = __uint_as_float(
+            (__float_as_uint(shared[0]) + 0x007FFFFFu) & 0x7F800000u);
+      }
       const int g = data_row / masked_cap;
       const int r_local = data_row % masked_cap;
       scales[((size_t)g * scale_cols + group) * masked_cap + r_local] = shared[0];
@@ -181,6 +188,91 @@ CUresult map_cuda_error(cudaError_t err) {
   if (err == cudaErrorMemoryAllocation) return CUDA_ERROR_OUT_OF_MEMORY;
   if (err == cudaErrorNotSupported) return CUDA_ERROR_NOT_SUPPORTED;
   return CUDA_ERROR_LAUNCH_FAILED;
+}
+
+// f32 mn-major scales [groups, scale_cols, cap] → packed UE8M0 i32
+// [groups, scale_cols/4, cap], LSB-first exponent bytes
+// (u32 = b0 | b1<<8 | b2<<16 | b3<<24 — smxx_layout.cuh's
+// (f0>>23)|(f1>>15)|(f2>>7)|(f3<<1)). Dense full-cover pass: every packed
+// word is rewritten each step, so stale bytes never reach the GEMM's UTCCP.
+// Inputs must already be power-of-two scales (emit them with the kUe8m0
+// quant variants); the SM100 kernel device-asserts exponent-only values.
+__global__ void fp8_scale_pack_ue8m0_kernel(const float* __restrict__ scales,
+                                            int* __restrict__ packed,
+                                            int groups, int scale_cols,
+                                            int cap) {
+  const int packed_cols = scale_cols / 4;
+  const size_t total = (size_t)groups * packed_cols * cap;
+  for (size_t idx = blockIdx.x * (size_t)blockDim.x + threadIdx.x; idx < total;
+       idx += (size_t)gridDim.x * blockDim.x) {
+    const int m = idx % cap;
+    const size_t gi = idx / cap;
+    const float* base = scales + (gi * 4) * (size_t)cap + m;
+    unsigned int word = 0;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const unsigned int bits = __float_as_uint(base[(size_t)j * cap]);
+      word |= ((bits >> 23) & 0xFFu) << (8 * j);
+    }
+    packed[idx] = static_cast<int>(word);
+  }
+}
+
+// Loader-time weight UE8M0 requant: per 128x128 block,
+// s' = 2^ceil(log2 s) and q' = round_e4m3(q * s / s'), in place on the fp8
+// bank. s/s' ∈ (0.5, 1] so no overflow is possible. Grid-strided elementwise
+// over the bank bytes (gridDim.y == groups).
+__global__ void fp8_weight_ue8m0_requant_kernel(unsigned char* __restrict__ weight,
+                                                const float* __restrict__ scales,
+                                                int n, int k) {
+  const int n_blocks = n / 128;
+  const int k_blocks = k / 128;
+  const size_t per_group = (size_t)n * k;
+  const size_t group_base = (size_t)blockIdx.y * per_group;
+  const float* group_scales =
+      scales + (size_t)blockIdx.y * n_blocks * k_blocks;
+  for (size_t idx = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+       idx < per_group; idx += (size_t)gridDim.x * blockDim.x) {
+    const int row = idx / k;
+    const int col = idx % k;
+    const float s = group_scales[(row >> 7) * k_blocks + (col >> 7)];
+    // s' = 2^ceil(log2 s): same bit bump as the quant kernels.
+    const float sp =
+        __uint_as_float((__float_as_uint(s) + 0x007FFFFFu) & 0x7F800000u);
+    const float value =
+        __half2float(__nv_cvt_fp8_to_halfraw(weight[group_base + idx], __NV_E4M3));
+    weight[group_base + idx] = quantize_e4m3(value * (s / sp), 1.0f);
+  }
+}
+
+// Loader-time weight-scale pack: block scales [groups, n/128, k/128] f32 →
+// packed UE8M0 i32 [groups, k/512, n], each block's exponent replicated
+// across its 128 rows (the SFB contract stores per-row exponents). The scale
+// tensor itself stays unmodified (requant above only touches the fp8 bank),
+// so this kernel applies the same 2^ceil(log2 s) bump before extracting the
+// exponent byte — identical to the s' the requant used (gridDim.y == groups).
+__global__ void fp8_weight_scale_pack_ue8m0_kernel(
+    const float* __restrict__ scales, int* __restrict__ packed, int n, int k) {
+  const int n_blocks = n / 128;
+  const int k_blocks = k / 128;
+  const int packed_cols = k_blocks / 4;  // == k / 512
+  const float* group_scales =
+      scales + (size_t)blockIdx.y * n_blocks * k_blocks;
+  int* group_packed = packed + (size_t)blockIdx.y * packed_cols * n;
+  const size_t per_group = (size_t)packed_cols * n;
+  for (size_t idx = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+       idx < per_group; idx += (size_t)gridDim.x * blockDim.x) {
+    const int row = idx % n;
+    const int i = idx / n;
+    const float* base = group_scales + (size_t)(row >> 7) * k_blocks + i * 4;
+    unsigned int word = 0;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const unsigned int sp = (__float_as_uint(base[j]) + 0x007FFFFFu) & 0x7F800000u;
+      word |= ((sp >> 23) & 0xFFu) << (8 * j);
+    }
+    group_packed[(size_t)i * n + row] = static_cast<int>(word);
+  }
 }
 
 CUresult consume_last_cuda_error() { return map_cuda_error(cudaGetLastError()); }
@@ -248,7 +340,7 @@ CUresult glm52_fp8_per_token_group_quant_bf16_masked_cuda(
     return CUDA_ERROR_INVALID_VALUE;
   }
   dim3 grid(row_grid(rows), hidden_dim / kGroupSize, 1);
-  fp8_per_token_group_quant_bf16_k128_kernel<true>
+  fp8_per_token_group_quant_bf16_k128_kernel<true, true>
       <<<grid, kGroupSize, 0, stream>>>(input, output, scales, rows,
                                         hidden_dim, row_bound, row_map,
                                         masked_cap);
@@ -267,10 +359,58 @@ CUresult glm52_silu_and_mul_per_token_group_quant_bf16_masked_cuda(
     return CUDA_ERROR_INVALID_VALUE;
   }
   dim3 grid(row_grid(rows), hidden_size / kGroupSize, 1);
-  silu_and_mul_per_token_group_quant_bf16_k128_masked_kernel
+  silu_and_mul_per_token_group_quant_bf16_k128_masked_kernel<true>
       <<<grid, kGroupSize, 0, stream>>>(input, output, scales, rows,
                                         hidden_size, row_bound, row_map,
                                         masked_cap);
+  return consume_last_cuda_error();
+}
+
+CUresult glm52_fp8_scale_pack_ue8m0_cuda(
+    const float* scales, int* packed, int groups, int scale_cols, int cap,
+    cudaStream_t stream) {
+  if (scales == nullptr || packed == nullptr || groups <= 0 || cap <= 0 ||
+      scale_cols <= 0 || scale_cols % 4 != 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  const size_t total = (size_t)groups * (scale_cols / 4) * cap;
+  const int threads = 256;
+  const size_t needed = (total + threads - 1) / threads;
+  const int blocks = static_cast<int>(needed < 256 ? needed : 256);
+  fp8_scale_pack_ue8m0_kernel<<<blocks, threads, 0, stream>>>(
+      scales, packed, groups, scale_cols, cap);
+  return consume_last_cuda_error();
+}
+
+CUresult glm52_fp8_weight_ue8m0_requant_cuda(
+    unsigned char* weight, const float* scales, int groups, int n, int k,
+    cudaStream_t stream) {
+  if (weight == nullptr || scales == nullptr || groups <= 0 || n <= 0 ||
+      k <= 0 || n % kGroupSize != 0 || k % kGroupSize != 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  const size_t elems = (size_t)n * k;
+  const int threads = 256;
+  const size_t needed = (elems + threads - 1) / threads;
+  const int blocks = static_cast<int>(needed < 256 ? needed : 256);
+  fp8_weight_ue8m0_requant_kernel<<<dim3(blocks, groups), threads, 0, stream>>>(
+      weight, scales, n, k);
+  return consume_last_cuda_error();
+}
+
+CUresult glm52_fp8_weight_scale_pack_ue8m0_cuda(
+    const float* scales, int* packed, int groups, int n, int k,
+    cudaStream_t stream) {
+  if (scales == nullptr || packed == nullptr || groups <= 0 || n <= 0 ||
+      k <= 0 || n % kGroupSize != 0 || k % (4 * kGroupSize) != 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  const size_t elems = (size_t)(k / (4 * kGroupSize)) * n;
+  const int threads = 256;
+  const size_t needed = (elems + threads - 1) / threads;
+  const int blocks = static_cast<int>(needed < 256 ? needed : 256);
+  fp8_weight_scale_pack_ue8m0_kernel
+      <<<dim3(blocks, groups), threads, 0, stream>>>(scales, packed, n, k);
   return consume_last_cuda_error();
 }
 

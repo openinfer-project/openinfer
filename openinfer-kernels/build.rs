@@ -536,6 +536,22 @@ fn glm52_deepgemm_mqa_arch_args(
     None
 }
 
+/// Arch args for TUs whose device code is raw Blackwell tcgen05: sm_100f
+/// ONLY (family arch — runs on the whole sm_10x line, incl. GB300's sm_103).
+/// Returns `None` when no sm_100 target is present (or nvcc lacks 100f); the
+/// TU then compiles its NOT_SUPPORTED stub for the requested targets instead.
+fn glm52_sm100f_only_arch_args(normalized_sms: &[String], nvcc: &str) -> Option<Vec<String>> {
+    let has_sm100 = normalized_sms
+        .iter()
+        .any(|sm| sm_numeric_prefix(sm).is_some_and(|n| (100..120).contains(&n)));
+    (has_sm100 && nvcc_accepts_gencode(nvcc, "100f", "100f")).then(|| {
+        vec![
+            "-gencode".to_string(),
+            "arch=compute_100f,code=sm_100f".to_string(),
+        ]
+    })
+}
+
 fn collect_files_recursively(dir: &Path, out: &mut Vec<PathBuf>) {
     let mut entries: Vec<_> = std::fs::read_dir(dir)
         .unwrap_or_else(|err| panic!("Failed to read {}: {err}", dir.display()))
@@ -1386,6 +1402,16 @@ fn main() {
                 );
                 nvcc_args.extend(arch_args.clone());
             }
+        } else if stem == "glm52_deepgemm_grouped_sm100" {
+            if let Some(sm100f_args) = glm52_sm100f_only_arch_args(&nvcc_sm_targets, &nvcc) {
+                nvcc_args.extend(sm100f_args);
+                nvcc_args.push("-DGLM52_DEEPGEMM_GROUPED_SM100F".to_string());
+            } else {
+                println!(
+                    "cargo:warning=No sm_100f target; GLM5.2 DeepGEMM {stem} kernels compile as NOT_SUPPORTED stubs"
+                );
+                nvcc_args.extend(arch_args.clone());
+            }
         } else {
             nvcc_args.extend(arch_args.clone());
         }
@@ -1545,8 +1571,8 @@ fn main() {
                 "-I".to_string(),
                 flashinfer.spdlog.to_string_lossy().to_string(),
             ]);
-        } else if stem == "glm52_deepgemm_mqa" {
-            // DeepGEMM paged MQA + masked grouped GEMM kernels,
+        } else if stem == "glm52_deepgemm_mqa" || stem == "glm52_deepgemm_grouped_sm100" {
+            // DeepGEMM MQA + masked grouped GEMM kernels,
             // AOT-instantiated from the vendored device headers (torch-free
             // via DG_NO_TORCH, no runtime JIT). Needs DeepGEMM csrc headers +
             // CUTLASS + fmt, C++20.

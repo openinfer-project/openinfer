@@ -1,7 +1,7 @@
 //! GLM5.2 EP MoE layer weights (router + shared + local expert bank).
 //!
 //! The Hopper DeepGEMM masked routed chain is gone; production decode runs
-//! the weight-only path in `moe_ep_wo`. This module only holds the layer
+//! the SM100 DeepGEMM path in `moe_ep`. This module only holds the layer
 //! weight bundle still shared by the model builder.
 
 use crate::moe_decode::Glm52MoeExpertBank;

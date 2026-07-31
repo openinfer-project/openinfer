@@ -43,12 +43,12 @@ use openinfer_kernels::tensor::DeviceContext;
 use super::layer::GateLayerMlp;
 use super::layer::LayerTensors;
 use super::layer::MOE_ORACLE_CTX;
+use super::layer::MOE_ORACLE_DEEPGEMM_LAYER_PROBES;
+use super::layer::MOE_ORACLE_DEEPGEMM_LAYER_TOL;
 use super::layer::MOE_ORACLE_HIDDEN_DIGEST;
 use super::layer::MOE_ORACLE_INPUT_SCALE;
 use super::layer::MOE_ORACLE_LAYER;
 use super::layer::MOE_ORACLE_SEED;
-use super::layer::MOE_ORACLE_WO_LAYER_PROBES;
-use super::layer::MOE_ORACLE_WO_LAYER_TOL;
 use super::layer::assert_layer_probes;
 use super::layer::checked_hidden;
 use super::layer::load_decoder_layer;
@@ -61,8 +61,8 @@ use crate::moe_decode::EXPERTS;
 use crate::moe_decode::HIDDEN;
 use crate::moe_decode::RoutedTopk;
 use crate::moe_decode::TOPK;
-use crate::moe_ep_wo::Glm52MoeEpWoState;
-use crate::moe_ep_wo::glm52_moe_ep_wo_routed_forward;
+use crate::moe_ep::Glm52MoeEpRankState;
+use crate::moe_ep::glm52_moe_ep_routed_forward;
 
 const EP_RANKS: usize = 4;
 /// The free-running conservative bound: every rank always passes the
@@ -170,18 +170,13 @@ fn freerun_hetero_traffic_gate() -> Result<()> {
                     let ctx = DeviceContext::new_with_device(rank)?;
                     let bank =
                         load_rank_expert_bank(&ctx, &tensors, MOE_ORACLE_LAYER, rank, EP_RANKS)?;
-                    let mut ep = Glm52MoeEpWoState::<Glm52Ep4DeepEpAbi>::new(
+                    let mut ep = Glm52MoeEpRankState::<Glm52Ep4DeepEpAbi>::new(
                         &ctx, &unique_id, EP_RANKS, rank,
                     )?;
                     // Pass A: quiet fleet — token-less entries only.
                     for _position in 0..MOE_ORACLE_CTX {
-                        let dispatched = glm52_moe_ep_wo_routed_forward(
-                            &ctx,
-                            &mut ep,
-                            &bank,
-                            None,
-                            PROTOCOL_MAX,
-                        )?;
+                        let dispatched =
+                            glm52_moe_ep_routed_forward(&ctx, &mut ep, &bank, None, PROTOCOL_MAX)?;
                         ensure!(!dispatched, "token-less rank produced a combined output");
                     }
                     // Pass B: heterogeneous traffic.
@@ -190,13 +185,8 @@ fn freerun_hetero_traffic_gate() -> Result<()> {
                         let tokens = side_tokens(position, rank);
                         let token =
                             (tokens > 0).then_some((&traffic.hidden, &traffic.route, tokens));
-                        let dispatched = glm52_moe_ep_wo_routed_forward(
-                            &ctx,
-                            &mut ep,
-                            &bank,
-                            token,
-                            PROTOCOL_MAX,
-                        )?;
+                        let dispatched =
+                            glm52_moe_ep_routed_forward(&ctx, &mut ep, &bank, token, PROTOCOL_MAX)?;
                         ensure!(dispatched == (tokens > 0), "dispatch/return mismatch");
                     }
                     Ok(())
@@ -212,7 +202,7 @@ fn freerun_hetero_traffic_gate() -> Result<()> {
         MOE_ORACLE_LAYER,
         GateLayerMlp::MoeEp4Rank0,
     )?;
-    let mut ep = Glm52MoeEpWoState::<Glm52Ep4DeepEpAbi>::new(&ctx, &unique_id, EP_RANKS, 0)?;
+    let mut ep = Glm52MoeEpRankState::<Glm52Ep4DeepEpAbi>::new(&ctx, &unique_id, EP_RANKS, 0)?;
     let quiet = run_layer_prefill_ep4(
         &ctx,
         &w,
@@ -247,15 +237,15 @@ fn freerun_hetero_traffic_gate() -> Result<()> {
     assert_layer_probes(
         "layer6/moe/ep4/freerun-quiet",
         &quiet,
-        MOE_ORACLE_WO_LAYER_PROBES,
-        MOE_ORACLE_WO_LAYER_TOL,
+        MOE_ORACLE_DEEPGEMM_LAYER_PROBES,
+        MOE_ORACLE_DEEPGEMM_LAYER_TOL,
         4,
     );
     assert_layer_probes(
         "layer6/moe/ep4/freerun-hetero",
         &hetero,
-        MOE_ORACLE_WO_LAYER_PROBES,
-        MOE_ORACLE_WO_LAYER_TOL,
+        MOE_ORACLE_DEEPGEMM_LAYER_PROBES,
+        MOE_ORACLE_DEEPGEMM_LAYER_TOL,
         4,
     );
     assert_bitwise_equal_f32("layer6/moe/ep4/freerun-invariance", &quiet, &hetero);
@@ -286,14 +276,14 @@ fn freerun_hetero_graph_gate() -> Result<()> {
                     let ctx = DeviceContext::new_with_device(rank)?;
                     let bank =
                         load_rank_expert_bank(&ctx, &tensors, MOE_ORACLE_LAYER, rank, EP_RANKS)?;
-                    let mut ep = Glm52MoeEpWoState::<Glm52Ep4DeepEpAbi>::new(
+                    let mut ep = Glm52MoeEpRankState::<Glm52Ep4DeepEpAbi>::new(
                         &ctx, &unique_id, EP_RANKS, rank,
                     )?;
                     let tokens = 1 << rank; // 1, 2, 4, 8
                     let traffic = SyntheticTraffic::new(&ctx, rank, tokens)?;
 
                     // Eager reference: one collective execution.
-                    let dispatched = glm52_moe_ep_wo_routed_forward(
+                    let dispatched = glm52_moe_ep_routed_forward(
                         &ctx,
                         &mut ep,
                         &bank,
@@ -311,7 +301,7 @@ fn freerun_hetero_graph_gate() -> Result<()> {
                     let mut graph = CudaGraphState::new();
                     for replay in 0..=REPLAYS {
                         graph.run_or_capture(&ctx, || {
-                            glm52_moe_ep_wo_routed_forward(
+                            glm52_moe_ep_routed_forward(
                                 &ctx,
                                 &mut ep,
                                 &bank,
@@ -372,7 +362,7 @@ fn freerun_bound_tax_probe() -> Result<()> {
                     let ctx = DeviceContext::new_with_device(rank)?;
                     let bank =
                         load_rank_expert_bank(&ctx, &tensors, MOE_ORACLE_LAYER, rank, EP_RANKS)?;
-                    let mut ep = Glm52MoeEpWoState::<Glm52Ep4DeepEpAbi>::new(
+                    let mut ep = Glm52MoeEpRankState::<Glm52Ep4DeepEpAbi>::new(
                         &ctx, &unique_id, EP_RANKS, rank,
                     )?;
                     let traffic = SyntheticTraffic::new(&ctx, rank, 1)?;
@@ -380,7 +370,7 @@ fn freerun_bound_tax_probe() -> Result<()> {
                         [("tight", EP_RANKS), ("protocol-max", PROTOCOL_MAX)]
                     {
                         for _ in 0..WARMUP {
-                            glm52_moe_ep_wo_routed_forward(
+                            glm52_moe_ep_routed_forward(
                                 &ctx,
                                 &mut ep,
                                 &bank,
@@ -391,7 +381,7 @@ fn freerun_bound_tax_probe() -> Result<()> {
                         ctx.stream.synchronize()?;
                         let start = Instant::now();
                         for _ in 0..ITERS {
-                            glm52_moe_ep_wo_routed_forward(
+                            glm52_moe_ep_routed_forward(
                                 &ctx,
                                 &mut ep,
                                 &bank,

@@ -133,41 +133,50 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    // --- EP weight-only routed-expert chain (glm52_moe_ep_wo.cu) -------------
-    // `tiles` is an int2 array on the C side: pass an i32 buffer of len
-    // 2 * max_tiles (16-byte-aligned allocation bases satisfy int2 alignment).
-    pub fn glm52_moe_ep_wo_tiles_cuda(
+    // --- SM100 (Blackwell) masked grouped fp8, packed-UE8M0 scales ----------
+    // Per-expert cap is a runtime multiple of 128; groups is a dispatch over
+    // the EP widths {64,32,16,8,4,2}, and both scale operands are the
+    // Blackwell packed-UE8M0 i32 layout ([groups, ceil(k/512), mn] MN-major,
+    // 4 exponent bytes per i32) instead of f32.
+
+    pub fn glm52_deepgemm_sm100_grouped_fp8_metadata_cuda(
         psum_expert: *const i32,
-        tiles: *mut i32,
-        tile_count: *mut i32,
+        expert_offsets: *mut i64,
+        masked_m: *mut i32,
+        row_map: *mut i32,
         groups: i32,
         m_capacity: i32,
+        expert_alignment: i32,
         masked_cap: i32,
-        max_tiles: i32,
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn glm52_moe_ep_wo_masked_mma_cuda(
-        activation: *const Half,
-        weight: *const u8,
-        weight_scale: *const f32,
-        tiles: *const i32,
-        tile_count: *const i32,
+    pub fn glm52_deepgemm_sm100_masked_out_to_aligned_cuda(
+        masked_out: *const Half,
+        masked_m: *const i32,
+        expert_offsets: *const i64,
         row_weights: *const f32,
+        aligned_out: *mut Half,
+        groups: i32,
+        masked_cap: i32,
+        aligned_rows: i32,
+        n: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn glm52_deepgemm_sm100_masked_grouped_fp8_launch_cuda(
+        operand_kind: i32,
+        a: *const u8,
+        a_scale: *const i32,
+        b: *const u8,
+        b_scale: *const i32,
+        masked_m: *const i32,
         out: *mut Half,
+        groups: i32,
         n: i32,
         k: i32,
-        max_tiles: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn glm52_moe_ep_wo_silu_cuda(
-        input: *const Half,
-        tiles: *const i32,
-        tile_count: *const i32,
-        output: *mut Half,
-        inter: i32,
-        max_tiles: i32,
+        masked_cap: i32,
+        num_sms: i32,
         stream: CUstream,
     ) -> CUresult;
 
@@ -288,6 +297,33 @@ unsafe extern "C" {
         row_bound: *const i64,
         row_map: *const i32,
         masked_cap: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn glm52_fp8_scale_pack_ue8m0_cuda(
+        scales: *const f32,
+        packed: *mut i32,
+        groups: i32,
+        scale_cols: i32,
+        cap: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn glm52_fp8_weight_ue8m0_requant_cuda(
+        weight: *mut u8,
+        scales: *const f32,
+        groups: i32,
+        n: i32,
+        k: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn glm52_fp8_weight_scale_pack_ue8m0_cuda(
+        scales: *const f32,
+        packed: *mut i32,
+        groups: i32,
+        n: i32,
+        k: i32,
         stream: CUstream,
     ) -> CUresult;
 

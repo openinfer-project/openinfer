@@ -1,6 +1,6 @@
 # GLM5.2 serving status
 
-> **TL;DR:** GLM5.2 is **Blackwell-only** (compute capability ≥ 10). Decode serving is EP4 / EP8 / one-domain EP-N with weight-only expert GEMMs; TP4 is **prefill-only** (NCCL). Hopper (SM9x), decode TP8/TP4 LL, and the DeepGEMM masked SM90 EP path are removed. Continuous batching, whole-step CUDA Graphs, sampling, DSpark, paged KV, prefix caching, host offload, and target-only vLLM→OpenInfer P/D remain on the EP decode path. The line stays Bring-up until long-context indexer correctness and lifecycle reliability are closed.
+> **TL;DR:** GLM5.2 is **Blackwell-only** (compute capability ≥ 10). Decode serving is EP4 / EP8 / one-domain EP-N with SM100 DeepGEMM masked grouped expert GEMMs; TP4 is **prefill-only** (NCCL). Hopper (SM9x), decode TP8/TP4 LL, and the old SM90 DeepGEMM path are removed. Continuous batching, whole-step CUDA Graphs, sampling, DSpark, paged KV, prefix caching, host offload, and target-only vLLM→OpenInfer P/D remain on the EP decode path. The line stays Bring-up until long-context indexer correctness and lifecycle reliability are closed.
 >
 > **Last touched:** 2026-07
 
@@ -12,9 +12,9 @@ GLM5.2 is a model-owned distributed serving engine. Launch fails closed on Hoppe
 
 | `--moe-topo` | Intended use | Evidence boundary |
 | --- | --- | --- |
-| `ep8` | Default high-throughput decode (8 GPUs / multi-tray EP8) | Strongest feature coverage on the free-running EP path: bucketed continuous batching, DSpark, prefix cache, offload, P/D. Expert GEMMs are weight-only (not Hopper DeepGEMM masked). |
-| `ep4` | Throughput decode on 4×GB300 | Functional and oracle-gated; equal-topology decode remains about 15% behind the measured vLLM reference (#668). Weight-only expert chain. |
-| `ep16` / `ep32` / `ep64` | Scale within one NVLink/IMEX domain | Per-width DeepEP shims + free-running ranks; multi-process via `--glm52-ranks` + `--glm52-rendezvous`. Strongest e2e evidence is still within one rack. |
+| `ep8` | Default high-throughput decode (8 GPUs / multi-tray EP8) | Strongest feature coverage on the free-running EP path: bucketed continuous batching, DSpark, prefix cache, offload, P/D. The SM100 DeepGEMM chain has cross-process EP8 execution coverage. |
+| `ep4` | Throughput decode on 4×GB300 | SM100 DeepGEMM numerical oracle, automatic VRAM-budget, and four-bucket graph-capture gates pass. Same-session replacement A/B improved decode p50 by 3.64% and aggregate throughput by 3.9%. |
+| `ep16` / `ep32` / `ep64` | Scale within one NVLink/IMEX domain | Per-width DeepEP shims + SM100 DeepGEMM template instantiations; multi-process via `--glm52-ranks` + `--glm52-rendezvous`. The current replacement was execution-tested at EP4 and EP8, not these wider widths. |
 | `tp4` | **Prefill-only** on 4×GB300 | Requires `--glm52-prefill-only` (and `--tp-size=4`). Layer-outer NCCL bf16 all-reduce path; no decode CUDA graph / no LL packet MoE. See `tp4-prefill-only.md`. |
 
 **Removed (no longer parse / fail at launch):**
@@ -78,7 +78,8 @@ In the multi-process cross-node shape, KV offload registers each node's local ar
 
 Measured open work is topology-specific:
 
-- #668: right-size the Blackwell EP4 masked expert kernel for bucket 1; the measured kernel reaches 29% of its byte roofline and leaves about 3 ms/step at equal topology.
+- The SM100 DeepGEMM replacement measured a same-session EP4 decode p50 improvement of 3.64% and aggregate throughput improvement of 3.9%. Re-profile this chain before carrying forward any expert-kernel optimization from the retired weight-only path.
+- The cross-process EP8 execution smoke measured approximately 22.3 ms p50 and 358–359 tok/s aggregate; it was not an EP8 A/B.
 - #582: graph the DSpark draft round only after its fixed launch cost matters; it is currently a small fraction of the verify round.
 - Older Hopper EP8/TP8 investigations (#542/#559/#569/#608/#625) are historical evidence only — do not implement without a matched A/B on the **current Blackwell** topology.
 

@@ -23,8 +23,8 @@ use crate::model::GLM52_MAX_BATCH_PER_RANK;
 use crate::model::Glm52RankModel;
 use crate::model::Glm52StepKv;
 use crate::model::Glm52StepShape;
-use crate::moe_ep_wo::Glm52MoeEpState;
-use crate::moe_ep_wo::Glm52MoeEpWoState;
+use crate::moe_ep::Glm52MoeEpRankState;
+use crate::moe_ep::Glm52MoeEpState;
 use crate::moe_tp::Glm52MoeTpRank;
 use crate::moe_tp::Glm52MoeTpSliceBank;
 use crate::moe_tp::Glm52MoeTpState;
@@ -872,25 +872,25 @@ impl Glm52RankThreadState {
         runtime.tp_exchange = tp_exchange.cloned();
         if moe_topo.uses_ep_expert_bundles() {
             // Collective: every EP rank calls this concurrently. Topology
-            // selects the DeepEP shim; every width runs the weight-only
-            // expert GEMM chain (the Hopper DeepGEMM masked path is gone).
+            // selects the DeepEP shim; every width runs the SM100 DeepGEMM
+            // masked expert chain.
             let ranks = moe_topo.expected_ep_size();
             let rank = self.placement.rank;
             runtime.ep8 = Some(match moe_topo {
-                crate::Glm52MoeTopo::Ep8 => Glm52MoeEpState::WeightOnlyEp8(Box::new(
-                    Glm52MoeEpWoState::new(&dev_ctx, unique_id, ranks, rank)?,
+                crate::Glm52MoeTopo::Ep8 => Glm52MoeEpState::Ep8(Box::new(
+                    Glm52MoeEpRankState::new(&dev_ctx, unique_id, ranks, rank)?,
                 )),
-                crate::Glm52MoeTopo::Ep4 => Glm52MoeEpState::WeightOnlyEp4(Box::new(
-                    Glm52MoeEpWoState::new(&dev_ctx, unique_id, ranks, rank)?,
+                crate::Glm52MoeTopo::Ep4 => Glm52MoeEpState::Ep4(Box::new(
+                    Glm52MoeEpRankState::new(&dev_ctx, unique_id, ranks, rank)?,
                 )),
-                crate::Glm52MoeTopo::Ep16 => Glm52MoeEpState::WeightOnlyEp16(Box::new(
-                    Glm52MoeEpWoState::new(&dev_ctx, unique_id, ranks, rank)?,
+                crate::Glm52MoeTopo::Ep16 => Glm52MoeEpState::Ep16(Box::new(
+                    Glm52MoeEpRankState::new(&dev_ctx, unique_id, ranks, rank)?,
                 )),
-                crate::Glm52MoeTopo::Ep32 => Glm52MoeEpState::WeightOnlyEp32(Box::new(
-                    Glm52MoeEpWoState::new(&dev_ctx, unique_id, ranks, rank)?,
+                crate::Glm52MoeTopo::Ep32 => Glm52MoeEpState::Ep32(Box::new(
+                    Glm52MoeEpRankState::new(&dev_ctx, unique_id, ranks, rank)?,
                 )),
-                crate::Glm52MoeTopo::Ep64 => Glm52MoeEpState::WeightOnlyEp64(Box::new(
-                    Glm52MoeEpWoState::new(&dev_ctx, unique_id, ranks, rank)?,
+                crate::Glm52MoeTopo::Ep64 => Glm52MoeEpState::Ep64(Box::new(
+                    Glm52MoeEpRankState::new(&dev_ctx, unique_id, ranks, rank)?,
                 )),
                 other => anyhow::bail!("GLM5.2 {other:?} is not an expert-bundle topology"),
             });

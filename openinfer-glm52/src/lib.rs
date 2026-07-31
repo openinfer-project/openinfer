@@ -25,8 +25,8 @@ mod mla_decode;
 mod mla_front;
 mod model;
 mod moe_decode;
+mod moe_ep;
 mod moe_ep8;
-mod moe_ep_wo;
 mod moe_tp;
 mod mtp;
 #[cfg(test)]
@@ -195,14 +195,13 @@ pub enum Glm52MoeTopo {
     Ep8,
     /// Four-GPU expert-parallel layout (DP4/EP4, 64 whole routed experts per
     /// rank — the GB300 high-throughput target). Same DeepEP protocol as EP8
-    /// with its own shim instantiation; the routed-expert GEMM runs the
-    /// arch-portable weight-only mma chain instead of the sm_90a DeepGEMM
-    /// masked chain.
+    /// with its own shim instantiation; routed experts use the SM100
+    /// DeepGEMM masked grouped chain.
     Ep4,
     /// Cross-tray expert-parallel widths on GB300 NVL72 (4 GPUs per tray;
     /// every tray's process hosts its own ranks behind `--glm52-ranks`).
     /// Same DeepEP protocol with one
-    /// shim instantiation per width; all run the weight-only chain.
+    /// shim instantiation per width; all run the SM100 DeepGEMM chain.
     Ep16,
     Ep32,
     Ep64,
@@ -428,7 +427,7 @@ pub struct Glm52VllmCompatOptions {
     pub allow_local_prefill: bool,
 }
 
-/// GLM5.2 kernels (FlashMLA SM100, DeepGEMM MQA SM100f, weight-only EP, …)
+/// GLM5.2 kernels (FlashMLA SM100, DeepGEMM MQA and routed experts, …)
 /// no longer ship a Hopper path. Refuse SM9x and older at launch.
 ///
 /// `local_gpus` is the number of GPUs **this process** hosts (mapped to local
@@ -633,7 +632,9 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
 /// the post-probe allocations the exact arena ledger does not model: the
 /// MLA W_UK/W_UV bf16 dequant during build (~1.1 GiB net over the freed fp8
 /// kv_b), DeepEP collective buffers, the 8 whole-step graph instantiations,
-/// cuBLAS workspaces, and allocator fragmentation. Measured on 8×H200
+/// cuBLAS workspaces, and allocator fragmentation. The SM100 DeepGEMM delta
+/// over the retired weight-only chain is charged exactly and separately.
+/// Measured on 8×H200
 /// (jz-38, 2026-07-06): the worst rank's non-arena post-probe allocations
 /// came to ~3.05 GiB, so 5 GiB leaves ~2 GiB of post-build headroom over
 /// the [`GLM52_POST_BUILD_MIN_FREE_BYTES`] floor; the post-build re-probe
@@ -864,13 +865,18 @@ fn start_engine(
         .copied()
         .min()
         .expect("at least one rank loaded");
-    // The q_a|kv_a packed twins allocate during rank-model build, after this
-    // probe — charge them to the budget here so the derived cap still leaves
-    // the post-build headroom floor.
+    // These model-build allocations land after the weight probe. Charge
+    // exact bytes here so auto mode cannot spend them on KV and then fail the
+    // post-build graph-capture headroom gate.
     let qa_kva_twin_bytes = mla_front::glm52_qa_kva_twin_bytes()?;
+    let deepgemm_vram_charge_bytes =
+        moe_ep::glm52_deepgemm_vram_charge_bytes(moe_topo, drafter.is_mtp())?;
+    let post_weight_charge_bytes = qa_kva_twin_bytes
+        .checked_add(deepgemm_vram_charge_bytes)
+        .context("GLM5.2 post-weight VRAM charge overflow")?;
     let budget = derive_max_model_len(
         requested_max_model_len,
-        min_free_vram_bytes.saturating_sub(qa_kva_twin_bytes),
+        min_free_vram_bytes.saturating_sub(post_weight_charge_bytes),
         &drafter,
         glm52_prefill_scratch_reservation(prefill_only)?,
         prefill_only.is_some(),
@@ -888,8 +894,8 @@ fn start_engine(
     let max_model_len = budget.max_model_len;
     log::info!(
         "GLM5.2 max_model_len={max_model_len} ({}): min rank free VRAM {} after weights \
-         (qa|kv_a twins {} charged), cap-scaled arenas {} across {} slots{}, reserve {}, \
-         budget {}{}",
+         (qa|kv_a twins {} + DeepGEMM post-weight delta {} charged), cap-scaled arenas {} \
+         across {} slots{}, reserve {}, budget {}{}",
         if requested_max_model_len.is_some() {
             "--max-model-len"
         } else {
@@ -897,6 +903,7 @@ fn start_engine(
         },
         ByteSize(min_free_vram_bytes as u64),
         ByteSize(qa_kva_twin_bytes as u64),
+        ByteSize(deepgemm_vram_charge_bytes as u64),
         ByteSize(budget.arena_bytes as u64),
         model::GLM52_MAX_BATCH_PER_RANK,
         if drafter.enabled() {

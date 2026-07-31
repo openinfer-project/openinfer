@@ -1,17 +1,12 @@
-//! EP4 layer-6 MoE oracle gate: the EP8 collective gate re-shaped to the
-//! four-GPU topology and the weight-only expert chain.
+//! EP4 layer-6 MoE oracle gate for the SM100 DeepGEMM expert chain.
 //!
 //! Rank 0 walks the full decoder layer (attention + indexer + EP4 MoE +
 //! shared expert) over the same seeded input as the EP1 gate; ranks 1..3
 //! hold their 64 local experts and replay one collective per position. The
-//! probes are the gemv-precision block (`MOE_ORACLE_WO_LAYER_PROBES`): the
-//! weight-only chain reads bf16 activations directly, so the fp8sim
-//! reference (which emulates the EP8 chain's activation re-quant) deviates
-//! from it by a systematic ~2-3× tol — the gemv reference is the matching
-//! numerics regime. Passing here proves the EP4 collective path (dispatch →
-//! tile metadata → weight-only mma GEMMs → combine) lands on the
-//! HF-oracle layer output within the same tolerance discipline as the EP1
-//! and EP8 gates.
+//! The probes use the `deepgemm` oracle regime: non-expert projections retain
+//! their GEMV precision while routed experts use UE8M0-scaled FP8 operands.
+//! Passing proves dispatch → metadata → DeepGEMM W13/W2 → combine lands on
+//! the modeled layer output.
 
 use std::sync::Arc;
 
@@ -31,12 +26,12 @@ use openinfer_kernels::tensor::DeviceContext;
 use super::layer::GateLayerMlp;
 use super::layer::LayerTensors;
 use super::layer::MOE_ORACLE_CTX;
+use super::layer::MOE_ORACLE_DEEPGEMM_LAYER_PROBES;
+use super::layer::MOE_ORACLE_DEEPGEMM_LAYER_TOL;
 use super::layer::MOE_ORACLE_HIDDEN_DIGEST;
 use super::layer::MOE_ORACLE_INPUT_SCALE;
 use super::layer::MOE_ORACLE_LAYER;
 use super::layer::MOE_ORACLE_SEED;
-use super::layer::MOE_ORACLE_WO_LAYER_PROBES;
-use super::layer::MOE_ORACLE_WO_LAYER_TOL;
 use super::layer::assert_layer_probes;
 use super::layer::checked_hidden;
 use super::layer::load_decoder_layer;
@@ -58,8 +53,8 @@ use crate::model::NUM_SMS;
 use crate::model::rope_tables;
 use crate::moe_decode::HIDDEN;
 use crate::moe_decode::run_ep_router;
-use crate::moe_ep_wo::Glm52MoeEpWoState;
-use crate::moe_ep_wo::glm52_moe_ep_wo_routed_forward;
+use crate::moe_ep::Glm52MoeEpRankState;
+use crate::moe_ep::glm52_moe_ep_routed_forward;
 use crate::scratch::Glm52DecodeScratch;
 
 const EP_RANKS: usize = 4;
@@ -99,12 +94,12 @@ fn layer_moe_ep4_oracle_gate() -> Result<()> {
                     let bank =
                         load_rank_expert_bank(&ctx, &tensors, MOE_ORACLE_LAYER, rank, EP_RANKS)?;
                     let mut ep4 =
-                        Glm52MoeEpWoState::<openinfer_kernels::ops::Glm52Ep4DeepEpAbi>::new(
+                        Glm52MoeEpRankState::<openinfer_kernels::ops::Glm52Ep4DeepEpAbi>::new(
                             &ctx, &unique_id, EP_RANKS, rank,
                         )?;
                     for global_tokens in GLOBAL_TOKEN_BUCKETS {
                         for _position in 0..MOE_ORACLE_CTX {
-                            let dispatched = glm52_moe_ep_wo_routed_forward(
+                            let dispatched = glm52_moe_ep_routed_forward(
                                 &ctx,
                                 &mut ep4,
                                 &bank,
@@ -128,7 +123,7 @@ fn layer_moe_ep4_oracle_gate() -> Result<()> {
         MOE_ORACLE_LAYER,
         GateLayerMlp::MoeEp4Rank0,
     )?;
-    let mut ep4 = Glm52MoeEpWoState::<openinfer_kernels::ops::Glm52Ep4DeepEpAbi>::new(
+    let mut ep4 = Glm52MoeEpRankState::<openinfer_kernels::ops::Glm52Ep4DeepEpAbi>::new(
         &ctx, &unique_id, EP_RANKS, 0,
     )?;
     let outputs: Result<Vec<Vec<f32>>> = GLOBAL_TOKEN_BUCKETS
@@ -158,8 +153,8 @@ fn layer_moe_ep4_oracle_gate() -> Result<()> {
         assert_layer_probes(
             &format!("layer6/moe/ep4/g{global_tokens}"),
             outputs,
-            MOE_ORACLE_WO_LAYER_PROBES,
-            MOE_ORACLE_WO_LAYER_TOL,
+            MOE_ORACLE_DEEPGEMM_LAYER_PROBES,
+            MOE_ORACLE_DEEPGEMM_LAYER_TOL,
             4,
         );
     }
@@ -168,13 +163,13 @@ fn layer_moe_ep4_oracle_gate() -> Result<()> {
 
 /// The EP4 variant of the gate's prefill-via-decode walk: same decode
 /// environment as `oracle::layer::run_layer_prefill`, with the MLP half
-/// driven through the weight-only collective chain. Shared with the
+/// driven through the DeepGEMM collective chain. Shared with the
 /// free-running DP gates (`freerun_ep4`), which re-run it under
 /// heterogeneous cross-rank traffic.
 pub(super) fn run_layer_prefill_ep4(
     ctx: &DeviceContext,
     w: &crate::layer::Glm52DecoderLayerWeights,
-    ep4: &mut Glm52MoeEpWoState<openinfer_kernels::ops::Glm52Ep4DeepEpAbi>,
+    ep4: &mut Glm52MoeEpRankState<openinfer_kernels::ops::Glm52Ep4DeepEpAbi>,
     hidden_host: &[bf16],
     oracle_ctx: usize,
     global_tokens: usize,
@@ -272,7 +267,7 @@ pub(super) fn run_layer_prefill_ep4(
             None,
         )?;
         let route = run_ep_router(ctx, &moe.router, scratch.layer.normed2.data())?;
-        let dispatched = glm52_moe_ep_wo_routed_forward(
+        let dispatched = glm52_moe_ep_routed_forward(
             ctx,
             ep4,
             &moe.bank,

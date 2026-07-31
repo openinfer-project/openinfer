@@ -10,6 +10,7 @@ use openinfer_kernels::ops::Glm52RouterBatch;
 use openinfer_kernels::ops::Glm52RouterConfig;
 use openinfer_kernels::ops::Glm52RouterOutput;
 use openinfer_kernels::ops::gemm_bf16_f32;
+use openinfer_kernels::ops::glm52_fp8_weight_ue8m0_prepare_launch;
 use openinfer_kernels::ops::glm52_router_noaux_tc_launch;
 use openinfer_kernels::ops::glm52_router_select_launch;
 use openinfer_kernels::tensor::DeviceContext;
@@ -121,22 +122,23 @@ impl Glm52MoeSharedExpert {
 /// The shared-expert intermediate width (sizes the decode mlp scratch).
 pub(crate) const GLM52_SHARED_EXPERT_INTERMEDIATE: usize = INTERMEDIATE;
 
-/// One EP8 rank's routed experts in expert-major packed layout.
+/// One EP rank's routed experts in the SM100 DeepGEMM layout.
 pub(crate) struct Glm52MoeExpertBank {
     n_experts: usize,
     pub(crate) w13_weight: CudaSlice<u8>, // fp8  [n_experts, W13_N, W13_K]
-    pub(crate) w13_scale: CudaSlice<f32>, // f32  [n_experts, W13_SCALE_ROWS, HIDDEN_SCALE_COLS]
+    pub(crate) w13_scale: CudaSlice<i32>, // UE8M0 [n_experts, W13_K/512, W13_N]
     pub(crate) w2_weight: CudaSlice<u8>,  // fp8  [n_experts, W2_N, W2_K]
-    pub(crate) w2_scale: CudaSlice<f32>,  // f32  [n_experts, W2_SCALE_ROWS, W2_SCALE_COLS]
+    pub(crate) w2_scale: CudaSlice<i32>,  // UE8M0 [n_experts, W2_K/512, W2_N]
 }
 
 impl Glm52MoeExpertBank {
     fn new(
+        ctx: &DeviceContext,
         n_experts: usize,
-        w13_weight: CudaSlice<u8>,
-        w13_scale: CudaSlice<f32>,
-        w2_weight: CudaSlice<u8>,
-        w2_scale: CudaSlice<f32>,
+        mut w13_weight: CudaSlice<u8>,
+        w13_scale_f32: CudaSlice<f32>,
+        mut w2_weight: CudaSlice<u8>,
+        w2_scale_f32: CudaSlice<f32>,
     ) -> Result<Self> {
         let check = |name: &str, have: usize, want: usize| -> Result<()> {
             ensure!(
@@ -148,14 +150,34 @@ impl Glm52MoeExpertBank {
         check("w13_weight", w13_weight.len(), n_experts * W13_N * W13_K)?;
         check(
             "w13_scale",
-            w13_scale.len(),
+            w13_scale_f32.len(),
             n_experts * W13_SCALE_ROWS * HIDDEN_SCALE_COLS,
         )?;
         check("w2_weight", w2_weight.len(), n_experts * W2_N * W2_K)?;
         check(
             "w2_scale",
-            w2_scale.len(),
+            w2_scale_f32.len(),
             n_experts * W2_SCALE_ROWS * W2_SCALE_COLS,
+        )?;
+        let mut w13_scale = ctx.stream.alloc_zeros(n_experts * (W13_K / 512) * W13_N)?;
+        let mut w2_scale = ctx.stream.alloc_zeros(n_experts * (W2_K / 512) * W2_N)?;
+        glm52_fp8_weight_ue8m0_prepare_launch(
+            ctx,
+            n_experts,
+            W13_N,
+            W13_K,
+            &mut w13_weight,
+            &w13_scale_f32,
+            &mut w13_scale,
+        )?;
+        glm52_fp8_weight_ue8m0_prepare_launch(
+            ctx,
+            n_experts,
+            W2_N,
+            W2_K,
+            &mut w2_weight,
+            &w2_scale_f32,
+            &mut w2_scale,
         )?;
         Ok(Self {
             n_experts,
@@ -166,7 +188,7 @@ impl Glm52MoeExpertBank {
         })
     }
 
-    /// Pack one rank's checkpoint experts for the EP8 oracle gate.
+    /// Pack one rank's checkpoint experts for the multi-GPU oracle gates.
     #[cfg(test)]
     pub(crate) fn pack_from_host(
         ctx: &DeviceContext,
@@ -216,6 +238,7 @@ impl Glm52MoeExpertBank {
             Ok(dev)
         };
         Self::new(
+            ctx,
             n_experts,
             upload_u8(&w13_host)?,
             upload_f32(&w13_scale_host)?,
@@ -224,11 +247,11 @@ impl Glm52MoeExpertBank {
         )
     }
 
-    /// Adopt one layer's loader-packed regions (this rank's local experts —
-    /// 32 for EP8, 64 for EP4) — a pure retype, no copies. The loader wrote
-    /// the regions in exactly the `from_host` packing (proven by
-    /// `expert_placement_matches_from_host_packing`); the expert count is
-    /// read back from the region size so bank and loader can never drift.
+    /// Adopt one layer's loader-packed regions, then convert weights and
+    /// scales to DeepGEMM's UE8M0 contract. The loader wrote the regions in
+    /// exactly the `from_host` packing (proven by
+    /// `expert_placement_matches_from_host_packing`); the expert count comes
+    /// from the region size so bank and loader cannot drift.
     pub(crate) fn from_regions(
         ctx: &DeviceContext,
         regions: crate::weights::Glm52ExpertLayerRegions,
@@ -241,6 +264,7 @@ impl Glm52MoeExpertBank {
         );
         let n_experts = regions.w13_weight.len() / stride;
         Self::new(
+            ctx,
             n_experts,
             regions.w13_weight,
             crate::weights::retype_owned::<f32>(&ctx.stream, regions.w13_scale)?,

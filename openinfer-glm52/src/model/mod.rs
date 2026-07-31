@@ -67,7 +67,7 @@ use crate::layer::Glm52LayerCaches;
 use crate::mla_decode::Glm52MlaSchedMetadata;
 use crate::mla_decode::glm52_mla_backend_preflight;
 use crate::mla_decode::glm52_select_mla_backend;
-use crate::moe_ep_wo::Glm52MoeEpState;
+use crate::moe_ep::Glm52MoeEpState;
 use crate::moe_tp::Glm52MoeTpRank;
 use crate::prefill_tp::Glm52TpPrefillExecutor;
 use crate::prefill_tp::Glm52TpPrefillModelView;

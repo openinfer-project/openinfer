@@ -131,12 +131,14 @@ fn validate_quant_buffers(
     Ok(())
 }
 
-/// Bounded re-quant writing the DeepGEMM masked grouped layout: the loop
+/// Bounded UE8M0 re-quant writing the DeepGEMM SM100 masked grouped layout:
+/// the loop
 /// space stays the aligned recv rows (`shape.rows` capacity, device bound),
 /// `row_map` redirects each row to its masked slot (skipping alignment
 /// gaps), values land in `[groups, masked_cap, width]` and scales in the
 /// mn-major `[groups, width/128, masked_cap]` layout the masked GEMM's SFA
-/// descriptor reads. Per-row math is bit-identical to the bounded twin.
+/// descriptor reads. Active-row scales are powers of two; pack them with
+/// [`glm52_fp8_scale_pack_ue8m0_launch`] before the GEMM.
 #[allow(clippy::too_many_arguments)]
 pub fn glm52_fp8_per_token_group_quant_bf16_masked_launch(
     ctx: &DeviceContext,
@@ -188,10 +190,10 @@ pub fn glm52_fp8_per_token_group_quant_bf16_masked_launch(
         .map_err(|err| anyhow!("GLM5.2 FP8 masked group quant launch failed: {err}"))
 }
 
-/// Bounded SwiGLU quant for the masked layout: the gate|up input rows are
-/// already masked (the W13 masked GEMM wrote them), and output/scales land in
-/// the masked layouts (see the quant twin above). Router weights are applied
-/// after W2, matching vLLM's DeepGEMM path.
+/// Bounded UE8M0 SwiGLU quant for the masked layout: the gate|up input rows
+/// are already masked (the W13 masked GEMM wrote them), and output/scales
+/// land in the masked layouts (see the quant twin above). Router weights are
+/// applied after W2.
 #[allow(clippy::too_many_arguments)]
 pub fn glm52_silu_and_mul_per_token_group_quant_bf16_masked_launch(
     ctx: &DeviceContext,
@@ -241,4 +243,104 @@ pub fn glm52_silu_and_mul_per_token_group_quant_bf16_masked_launch(
     result
         .result()
         .map_err(|err| anyhow!("GLM5.2 SiLU masked quant launch failed: {err}"))
+}
+
+/// Pack power-of-two f32 scales from `[groups, scale_cols, cap]` into the
+/// DeepGEMM SM100 MN-major UE8M0 layout `[groups, scale_cols / 4, cap]`.
+pub fn glm52_fp8_scale_pack_ue8m0_launch(
+    ctx: &DeviceContext,
+    groups: usize,
+    scale_cols: usize,
+    cap: usize,
+    scales: &CudaSlice<f32>,
+    packed: &mut CudaSlice<i32>,
+) -> Result<()> {
+    ensure!(
+        groups > 0 && cap > 0 && scale_cols > 0 && scale_cols.is_multiple_of(4),
+        "GLM5.2 UE8M0 scale pack needs positive groups/cap and scale_cols divisible by 4, got groups={groups}, scale_cols={scale_cols}, cap={cap}"
+    );
+    let input_len = groups * scale_cols * cap;
+    let output_len = groups * (scale_cols / 4) * cap;
+    ensure!(
+        scales.len() >= input_len && packed.len() >= output_len,
+        "GLM5.2 UE8M0 scale pack buffers too small: scales {}, packed {}, need {input_len}/{output_len}",
+        scales.len(),
+        packed.len()
+    );
+    let (scales_ptr, _scales_guard) = scales.device_ptr(&ctx.stream);
+    let (packed_ptr, _packed_guard) = packed.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::glm52_fp8_scale_pack_ue8m0_cuda(
+            scales_ptr as *const f32,
+            packed_ptr as *mut i32,
+            groups as i32,
+            scale_cols as i32,
+            cap as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result
+        .result()
+        .map_err(|err| anyhow!("GLM5.2 UE8M0 scale pack launch failed: {err}"))
+}
+
+/// Convert one expert bank in place from arbitrary f32 block scales to the
+/// power-of-two UE8M0 contract required by the SM100 DeepGEMM kernel, and
+/// pack those scales into `[groups, k / 512, n]`.
+pub fn glm52_fp8_weight_ue8m0_prepare_launch(
+    ctx: &DeviceContext,
+    groups: usize,
+    n: usize,
+    k: usize,
+    weight: &mut CudaSlice<u8>,
+    scales: &CudaSlice<f32>,
+    packed_scales: &mut CudaSlice<i32>,
+) -> Result<()> {
+    ensure!(
+        groups > 0
+            && n > 0
+            && n.is_multiple_of(GLM52_MOE_QUANT_GROUP_SIZE)
+            && k.is_multiple_of(4 * GLM52_MOE_QUANT_GROUP_SIZE),
+        "GLM5.2 weight UE8M0 prepare needs groups>0, n%128=0, k%512=0; got groups={groups}, n={n}, k={k}"
+    );
+    let weight_len = groups * n * k;
+    let scale_len = groups * (n / GLM52_MOE_QUANT_GROUP_SIZE) * (k / GLM52_MOE_QUANT_GROUP_SIZE);
+    let packed_len = groups * (k / (4 * GLM52_MOE_QUANT_GROUP_SIZE)) * n;
+    ensure!(
+        weight.len() >= weight_len
+            && scales.len() >= scale_len
+            && packed_scales.len() >= packed_len,
+        "GLM5.2 weight UE8M0 buffers too small: weight {}, scales {}, packed {}, need {weight_len}/{scale_len}/{packed_len}",
+        weight.len(),
+        scales.len(),
+        packed_scales.len()
+    );
+    let (weight_ptr, _weight_guard) = weight.device_ptr_mut(&ctx.stream);
+    let (scales_ptr, _scales_guard) = scales.device_ptr(&ctx.stream);
+    let (packed_ptr, _packed_guard) = packed_scales.device_ptr_mut(&ctx.stream);
+    let requant = unsafe {
+        ffi::glm52_fp8_weight_ue8m0_requant_cuda(
+            weight_ptr as *mut u8,
+            scales_ptr as *const f32,
+            groups as i32,
+            n as i32,
+            k as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    requant
+        .result()
+        .map_err(|err| anyhow!("GLM5.2 weight UE8M0 requant launch failed: {err}"))?;
+    let pack = unsafe {
+        ffi::glm52_fp8_weight_scale_pack_ue8m0_cuda(
+            scales_ptr as *const f32,
+            packed_ptr as *mut i32,
+            groups as i32,
+            n as i32,
+            k as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    pack.result()
+        .map_err(|err| anyhow!("GLM5.2 weight UE8M0 scale pack launch failed: {err}"))
 }

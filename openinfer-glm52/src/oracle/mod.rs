@@ -4,7 +4,7 @@
 //! against the pinned transformers `glm_moe_dsa` modeling code) through the
 //! engine and asserts the outputs land on hardcoded probe constants within an
 //! RMS-scaled tolerance. All gates are `#[ignore]` — they require GPU +
-//! checkpoint (and EP gates use weight-only; Hopper Masked EP8 oracle retired).
+//! checkpoint (EP gates use the SM100 DeepGEMM chain).
 //!
 //! Run any gate:
 //! ```text

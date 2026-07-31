@@ -222,84 +222,79 @@ pub(crate) const MOE_ORACLE_LAYER_PROBES: &[(usize, f32)] = &[
 ];
 // ---- END GENERATED ----
 
-// ---- BEGIN GENERATED: glm52_oracle layer probes (moe, layer 6, gemv precision) ----
-// The EP4 weight-only chain's reference: bf16 activations read directly (no
-// per-128-group activation quant anywhere in the layer), fp8 weights
-// block-dequanted, f32 accumulate — `GemvSimLinear` for every linear
-// including the routed experts. Same seed/ctx/layer/input-scale (and
-// therefore the same MOE_ORACLE_* input constants) as the fp8sim block above;
-// only the probe values and tolerance line differ. The fp8sim block was
-// regenerated with this exact build first and reproduced the committed
-// values bit-for-bit, so the two blocks share modeling provenance.
-// .../tfenv/bin/python tools/accuracy/glm52_oracle.py --model-path <GLM-5.2-FP8> \
-//     --ctx 200 --seed 0x5eed604d --layer 6 --precision gemv \
+// ---- BEGIN GENERATED: glm52_oracle layer probes (moe, layer 6, deepgemm precision) ----
+// Non-expert projections use the engine's bf16-activation GEMV precision.
+// Routed experts use loader-time UE8M0 weight requantization and UE8M0
+// activation quantization before W13 and W2, matching the SM100 DeepGEMM path.
+// uv run tools/accuracy/glm52_oracle.py --model-path <GLM-5.2-FP8> \
+//     --ctx 200 --seed 0x5eed604d --layer 6 --precision deepgemm \
 //     --stage layer --input-scale 0.02
-// transformers=5.14.0.dev0 torch=2.11.0+cu130
-// tap `layer_out` [200, 6144] bf16 digest=41ba172c249211cf (provenance only)
-// tol = max(rel_tol 0.05 x delta_rms 1.948e-03, 3 x bf16-ulp 9.021e-05) — see emit_rust_layer.
-pub(crate) const MOE_ORACLE_WO_LAYER_TOL: f32 = 2.706195228e-04;
-pub(crate) const MOE_ORACLE_WO_LAYER_PROBES: &[(usize, f32)] = &[
+// transformers=5.13.1 torch=2.11.0+cu130
+// tap `layer_out` [200, 6144] bf16 digest=765173988a1424b2 (provenance only)
+// tol = max(rel_tol 0.05 x delta_rms 1.945e-03, 3 x bf16-ulp 9.021e-05) — see emit_rust_layer.
+pub(crate) const MOE_ORACLE_DEEPGEMM_LAYER_TOL: f32 = 2.706195228e-04;
+pub(crate) const MOE_ORACLE_DEEPGEMM_LAYER_PROBES: &[(usize, f32)] = &[
     (7504, 3.369140625e-02),
-    (10832, 1.965332031e-02),
-    (30355, 4.028320312e-02),
-    (33148, -2.636718750e-02),
+    (10832, 1.977539062e-02),
+    (30355, 4.052734375e-02),
+    (33148, -2.648925781e-02),
     (69206, 2.172851562e-02),
     (146761, 3.100585938e-02),
-    (156574, 4.052734375e-02),
+    (156574, 4.028320312e-02),
     (161844, 2.575683594e-02),
     (240978, -1.855468750e-02),
     (307757, -2.380371094e-02),
     (319510, -2.880859375e-02),
-    (333821, 2.746582031e-02),
-    (337363, -8.773803711e-04),
+    (333821, 2.734375000e-02),
+    (337363, -8.506774902e-04),
     (345826, 1.135253906e-02),
     (368340, -3.540039062e-02),
-    (377565, -2.197265625e-03),
-    (387659, 1.953125000e-02),
+    (377565, -2.136230469e-03),
+    (387659, 1.965332031e-02),
     (432017, 3.219604492e-03),
-    (442664, 3.833007812e-02),
-    (446114, 2.539062500e-02),
+    (442664, 3.808593750e-02),
+    (446114, 2.526855469e-02),
     (468571, 2.160644531e-02),
-    (471935, 1.269531250e-02),
-    (488799, 9.887695312e-03),
+    (471935, 1.275634766e-02),
+    (488799, 9.948730469e-03),
     (520950, -3.784179688e-02),
     (530739, -2.697753906e-02),
     (534505, -3.564453125e-02),
     (534971, 3.710937500e-02),
-    (577397, 2.441406250e-03),
+    (577397, 2.380371094e-03),
     (604084, -3.369140625e-02),
     (636056, -2.441406250e-02),
     (668274, 1.953125000e-02),
-    (672858, -3.442382812e-02),
+    (672858, -3.417968750e-02),
     (714313, -8.056640625e-03),
     (743834, -2.648925781e-02),
-    (791113, 1.220703125e-02),
+    (791113, 1.226806641e-02),
     (802252, -1.403808594e-02),
     (807243, 1.611328125e-02),
     (818652, -1.818847656e-02),
-    (878485, 1.550292969e-02),
+    (878485, 1.544189453e-02),
     (879770, 3.320312500e-02),
     (880514, -3.344726562e-02),
-    (903613, 3.735351562e-02),
-    (915339, -1.861572266e-03),
-    (931272, -2.746582031e-02),
-    (943182, 1.684570312e-02),
-    (949584, -3.417968750e-03),
-    (980538, 2.050781250e-02),
-    (980931, -3.845214844e-03),
+    (903613, 3.759765625e-02),
+    (915339, -1.892089844e-03),
+    (931272, -2.758789062e-02),
+    (943182, 1.672363281e-02),
+    (949584, -3.448486328e-03),
+    (980538, 2.038574219e-02),
+    (980931, -3.860473633e-03),
     (1022303, -1.855468750e-02),
     (1023279, -8.544921875e-03),
     (1091288, 3.063964844e-02),
-    (1092832, -3.845214844e-03),
-    (1094227, 1.989746094e-02),
+    (1092832, -3.784179688e-03),
+    (1094227, 2.001953125e-02),
     (1094427, 1.422119141e-02),
-    (1102135, -2.795410156e-02),
+    (1102135, -2.807617188e-02),
     (1104580, -2.648925781e-02),
-    (1120355, 1.965332031e-02),
+    (1120355, 1.977539062e-02),
     (1158451, -1.586914062e-02),
     (1167014, -3.735351562e-02),
     (1176953, 3.247070312e-02),
-    (1181822, -5.264282227e-04),
+    (1181822, -5.187988281e-04),
     (1209754, 3.082275391e-03),
     (1216021, 4.052734375e-02),
     (1218315, 3.173828125e-02),

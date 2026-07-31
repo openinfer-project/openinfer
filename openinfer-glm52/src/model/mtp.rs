@@ -53,7 +53,7 @@ use crate::layer::glm52_layer_finish;
 use crate::mla_decode::Glm52MlaBackend;
 use crate::mla_decode::Glm52MlaSchedMetadata;
 use crate::mla_decode::glm52_select_mla_backend;
-use crate::moe_ep_wo::Glm52MoeEpState;
+use crate::moe_ep::Glm52MoeEpState;
 use crate::moe_tp::Glm52MoeTpRank;
 use crate::mtp::GLM52_MTP_DRAFTS;
 use crate::mtp::Glm52MtpBookendWeights;

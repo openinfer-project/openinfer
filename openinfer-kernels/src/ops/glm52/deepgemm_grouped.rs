@@ -1,4 +1,4 @@
-//! GLM5.2 EP shape constants shared by the weight-only expert chain.
+//! GLM5.2 EP shape constants shared by routed-expert kernels.
 //!
 //! Historically this module also launched the Hopper DeepGEMM masked
 //! grouped GEMM. That path is gone; only the protocol geometry and the
@@ -23,7 +23,7 @@ pub enum Glm52DeepGemmGroupedFp8Kind {
 }
 
 impl Glm52DeepGemmGroupedFp8Kind {
-    /// The operand's `(n, k)` for the weight-only EP chain.
+    /// The operand's `(n, k)`.
     pub fn shape(self) -> (usize, usize) {
         match self {
             Self::W13 => (4096, 6144),
