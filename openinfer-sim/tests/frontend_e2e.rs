@@ -67,6 +67,42 @@ impl SimServer {
         .await
     }
 
+    /// Spawn a sim server that replays `completion_ids` verbatim for every
+    /// request. Useful for protocol round-trip tests (e.g. tool calls) where
+    /// the engine output is irrelevant but the server must accept it.
+    async fn spawn_with_scripted_completion(completion_ids: Vec<u32>) -> Result<Self> {
+        let dir = model_dir_with_minimal_metadata()?;
+        let config = SimulatedEngineConfig::new(0.0, 1000.0, 0.0, 1)?
+            .with_scripted_completion(completion_ids);
+        let mut last_error = None;
+        for attempt in 1..=SERVER_START_ATTEMPTS {
+            match Self::spawn_once_with_config(&dir, config.clone(), false, 1, MODEL_NAME).await {
+                Ok(started) => {
+                    return Ok(Self {
+                        base_url: started.base_url,
+                        model_name: started.model_name,
+                        shutdown: started.shutdown,
+                        task: started.task,
+                        load_txs: started.load_txs,
+                        _model_dir: dir,
+                    });
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                    if attempt < SERVER_START_ATTEMPTS {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow!("sim frontend startup was not attempted")))
+            .with_context(|| {
+                format!(
+                    "failed to start scripted sim frontend after {SERVER_START_ATTEMPTS} attempts"
+                )
+            })
+    }
+
     async fn spawn_with_model_dir(model_dir: TempDir) -> Result<Self> {
         Self::spawn_with_model_dir_and_lora_routes(model_dir, false, 1, MODEL_NAME).await
     }
@@ -111,10 +147,28 @@ impl SimServer {
         engine_count: usize,
         model_name: &str,
     ) -> Result<StartedSimServer> {
+        let config = SimulatedEngineConfig::new(0.0, 1000.0, 0.0, 1)?;
+        Self::spawn_once_with_config(
+            model_dir,
+            config,
+            enable_lora_routes,
+            engine_count,
+            model_name,
+        )
+        .await
+    }
+
+    async fn spawn_once_with_config(
+        model_dir: &TempDir,
+        config: SimulatedEngineConfig,
+        enable_lora_routes: bool,
+        engine_count: usize,
+        model_name: &str,
+    ) -> Result<StartedSimServer> {
         let port = reserve_loopback_port()?;
         let base_url = format!("http://127.0.0.1:{port}");
         let shutdown = CancellationToken::new();
-        let mut engine = start_engine(SimulatedEngineConfig::new(0.0, 1000.0, 0.0, 1)?);
+        let mut engine = start_engine(config);
         let load_txs = if engine_count > 1 {
             let (load_txs, load_watches) = (0..engine_count)
                 .map(|_| watch::channel(LoadSnapshot::default()))
@@ -575,6 +629,141 @@ async fn chat_completions_returns_correct_format() -> Result<()> {
         total_tokens,
         prompt_tokens + completion_tokens,
         "total_tokens must equal prompt + completion: {response}"
+    );
+
+    server.shutdown().await
+}
+
+/// Round-trip test for the OpenAI tool-call protocol through the simulated
+/// frontend. The sim engine replays a fixed token-id sequence, so this does
+/// not assert that the model *emits* a tool call — it verifies that the
+/// frontend accepts `tools` + `tool_choice` on the way in and that the
+/// response keeps a well-formed chat-completion envelope (no `tool_calls`
+/// when `tool_choice` forces a normal reply). This is the protocol-level
+/// contract that real model backends must satisfy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chat_completions_tool_choice_none_round_trips() -> Result<()> {
+    let server = SimServer::spawn_with_scripted_completion(vec![11, 22, 33, 44]).await?;
+    let client = test_client()?;
+
+    let tools = json!([
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get the current weather for a city",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string", "description": "City name"}
+                    },
+                    "required": ["city"]
+                }
+            }
+        }
+    ]);
+
+    let response: Value = client
+        .post(format!("{}/v1/chat/completions", server.base_url))
+        .json(&json!({
+            "model": MODEL_NAME,
+            "messages": [{"role": "user", "content": "what is the weather in paris?"}],
+            "tools": tools,
+            "tool_choice": "none",
+            "max_tokens": 4,
+            "temperature": 0.0
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+
+    assert_eq!(
+        response["object"].as_str(),
+        Some("chat.completion"),
+        "tool-call request must still return a chat.completion envelope: {response}"
+    );
+
+    let choice = &response["choices"][0];
+    assert_eq!(
+        choice["message"]["role"].as_str(),
+        Some("assistant"),
+        "message role must be assistant: {response}"
+    );
+    // With tool_choice=none the server must not attach tool_calls.
+    assert!(
+        choice["message"]["tool_calls"].is_null(),
+        "tool_choice=none must not produce tool_calls: {response}"
+    );
+
+    let usage = &response["usage"];
+    assert!(
+        usage["prompt_tokens"].as_u64().is_some_and(|t| t > 0),
+        "prompt_tokens must be positive: {response}"
+    );
+    assert_eq!(
+        usage["completion_tokens"].as_u64(),
+        Some(4),
+        "completion_tokens must equal max_tokens: {response}"
+    );
+
+    server.shutdown().await
+}
+
+/// A simulated engine ships no registered tool parser (its temporary model id
+/// matches no parser pattern), and the upstream frontend validates tool parsing
+/// availability at request-submission time. Any request that carries `tools`
+/// (regardless of `tool_choice`) is therefore rejected. This test guards that the
+/// rejection is a *structured* error response rather than a panic or empty body,
+/// so the protocol path stays safe for the real backends that do register parsers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chat_completions_tools_without_parser_rejected_structured() -> Result<()> {
+    let server = SimServer::spawn_with_scripted_completion(vec![11, 22, 33, 44]).await?;
+    let client = test_client()?;
+
+    let tools = json!([
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get the current weather for a city",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string", "description": "City name"}
+                    },
+                    "required": ["city"]
+                }
+            }
+        }
+    ]);
+
+    let response = client
+        .post(format!("{}/v1/chat/completions", server.base_url))
+        .json(&json!({
+            "model": MODEL_NAME,
+            "messages": [{"role": "user", "content": "what is the weather in paris?"}],
+            "tools": tools,
+            "tool_choice": "auto",
+            "max_tokens": 4,
+            "temperature": 0.0
+        }))
+        .send()
+        .await?;
+
+    assert!(
+        !response.status().is_success(),
+        "request with tools but no parser must not be accepted"
+    );
+
+    let body_text = response.text().await?;
+    let body: Value = serde_json::from_str(&body_text).unwrap_or(Value::Null);
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|m| !m.is_empty()),
+        "error response must carry a non-empty message: {body}"
     );
 
     server.shutdown().await
