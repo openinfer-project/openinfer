@@ -46,7 +46,6 @@ use std::time::Instant;
 
 use anyhow::Context as _;
 use anyhow::Result;
-use anyhow::bail;
 use anyhow::ensure;
 use bytesize::ByteSize;
 pub(crate) use config::GLM52_LAYERS;
@@ -379,12 +378,6 @@ pub struct Glm52KvOffloadOptions {
     /// with the MetaServer and missing prefixes are pulled from peer
     /// instances over RDMA — the P/D disaggregation data plane.
     pub p2p: Option<Glm52P2pOptions>,
-    /// `Some` when the P/D prefill peer is vLLM (pegaflow connector): offload
-    /// query keys switch from kvbm lineage hashes to vLLM's prefix-cache hash
-    /// scheme so this decode node can find the blocks vLLM registered.
-    /// Requires `p2p` (the peer's KV lives in its pegaflow-server's pool,
-    /// even on the same host).
-    pub vllm_compat: Option<Glm52VllmCompatOptions>,
 }
 
 /// Cross-instance P2P KV sharing (see `openinfer_kv_offload::P2pConfig`).
@@ -397,34 +390,6 @@ pub struct Glm52P2pOptions {
     pub advertise_addr: String,
     /// RDMA NIC device names to register the pinned pool on.
     pub rdma_nics: Vec<String>,
-}
-
-/// Decode-node settings for a P/D deployment whose prefill node is vLLM with
-/// the pegaflow connector (see `openinfer_kv_offload::VllmBlockHasher` and
-/// `docs/models/glm52/pd-vllm-prefill.md`).
-///
-/// GLM5.2's decode node has no prefill path — prompt positions ride the
-/// decode kernels token-by-token (~worst case seconds per request) — so the
-/// contract here is stricter than qwen3's: the router appends the prefill
-/// peer's first generated token to the prompt, the full original prompt's KV
-/// (all full pages plus the partial tail page) must arrive from the peer, and
-/// a request whose remote KV never materializes is REJECTED for the router to
-/// retry, never silently prefilled locally.
-#[derive(Clone, Debug)]
-pub struct Glm52VllmCompatOptions {
-    /// The `PYTHONHASHSEED` value shared with every vLLM prefill process.
-    pub python_hash_seed: String,
-    /// The P side's pegaflow-connector namespace (8-hex digest logged by the
-    /// connector at startup as `namespace=...`).
-    pub namespace: String,
-    /// How long a cold request keeps re-querying a zero/partial hit before
-    /// giving up on the expected remote KV. Covers the P side's post-response
-    /// save + MetaServer-registration tail (tens of ms).
-    pub miss_wait: std::time::Duration,
-    /// Debug escape hatch: admit with local prompt compute when remote KV
-    /// never materializes, instead of rejecting. Leave OFF in production —
-    /// on GLM5.2 the fallback rides decode kernels token-by-token.
-    pub allow_local_prefill: bool,
 }
 
 /// GLM5.2 kernels (FlashMLA SM100, DeepGEMM MQA and routed experts, …)
@@ -580,33 +545,6 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
             || moe_topo.uses_ep_expert_bundles()
             || (moe_topo == Glm52MoeTopo::Tp4 && prefill_only.is_some()),
         "GLM5.2 --kv-offload requires EP decode or TP4 prefill-only"
-    );
-    ensure!(
-        kv_offload
-            .as_ref()
-            .is_none_or(|kv| kv.vllm_compat.is_none() || !drafter.is_mtp()),
-        "GLM5.2 native MTP uses 101 arenas and cannot restore vLLM's target-only 99 arenas"
-    );
-    // The vLLM prefill peer's KV lives in its pegaflow-server's pool (a
-    // separate process even on the same host); without the P2P mesh the
-    // compat keys would query an empty local tier and every request would
-    // wait out the full miss window.
-    ensure!(
-        kv_offload
-            .as_ref()
-            .is_none_or(|kv| kv.vllm_compat.is_none() || kv.p2p.is_some()),
-        "GLM5.2 --kv-pd-vllm-seed requires the KV P2P mesh (--kv-p2p-metaserver-addr, \
-         --kv-p2p-advertise-addr, --kv-p2p-nics)"
-    );
-    // The miss window must sit inside the in-flight-fetch ceiling, or the
-    // registration phase could never hand over to the fetch phase.
-    ensure!(
-        kv_offload
-            .as_ref()
-            .and_then(|kv| kv.vllm_compat.as_ref())
-            .is_none_or(|c| c.miss_wait < scheduler::REMOTE_FETCH_DEADLINE),
-        "GLM5.2 --kv-pd-miss-wait-ms must stay below the {}s remote-fetch deadline",
-        scheduler::REMOTE_FETCH_DEADLINE.as_secs(),
     );
     start_engine(
         model_path,
@@ -950,9 +888,6 @@ fn start_engine(
             return Err(err);
         }
     };
-    let vllm_compat = kv_offload
-        .as_ref()
-        .and_then(|opts| opts.vllm_compat.clone());
     let post_comm_startup = || -> Result<Option<Vec<OffloadEngine>>> {
         if prefill_only.is_some() {
             preflight_prefill_kernels(&loaded.workers)?;
@@ -1048,7 +983,6 @@ fn start_engine(
             max_model_len,
             no_prefix_cache,
             offload: engine_offload,
-            vllm_compat: vllm_compat.clone(),
             logical_ranks,
             moe_topo,
             load_tx: load_txs[engine_index].clone(),
@@ -1344,46 +1278,28 @@ fn build_offload_engines(
             }),
     })
     .map_err(|err| anyhow::anyhow!("GLM5.2 KV offload host: {err}"))?;
-    // vLLM-compat mode joins the *P side's* content domain: the pegaflow
-    // connector derives an 8-hex namespace from vLLM config (and logs it at
-    // startup); reproducing that derivation would mean chasing Python repr
-    // of vLLM internals, so the operator passes it through explicitly.
     let native_mtp = rank_arenas
         .first()
         .is_some_and(|arenas| arenas.iter().any(|arena| arena.name == "glm52.L78.mla"));
-    let namespace = match &opts.vllm_compat {
-        Some(compat) => compat.namespace.clone(),
-        None => format!(
-            "openinfer-glm52-l{GLM52_LAYERS}-p{}-mla{}-idxk{}-mtp{}",
-            mla_page_size,
-            mla_bytes_per_token,
-            config::GLM52_INDEX_HEAD_DIM + 4,
-            usize::from(native_mtp),
-        ),
-    };
-    // vLLM-compat: the P side's connector stores MLA-model blocks page-first —
-    // one host page per block, layers at offsets ordered by lexicographic
-    // layer name. Byte-identical interop therefore requires registering under
-    // vLLM's own layer names (same sort order ⇒ same page offsets; the
-    // per-layer byte widths already match by construction) and page-first.
-    let vllm_compat_active = opts.vllm_compat.is_some();
+    let namespace = format!(
+        "openinfer-glm52-l{GLM52_LAYERS}-p{}-mla{}-idxk{}-mtp{}",
+        mla_page_size,
+        mla_bytes_per_token,
+        config::GLM52_INDEX_HEAD_DIM + 4,
+        usize::from(native_mtp),
+    );
     let engines = rank_arenas
         .into_iter()
         .zip(device_ordinals)
         .enumerate()
-        .map(|(rank, (mut arenas, &device_ordinal))| {
-            if vllm_compat_active {
-                for arena in &mut arenas {
-                    arena.name = vllm_arena_name(&arena.name)?;
-                }
-            }
+        .map(|(rank, (arenas, &device_ordinal))| {
             OffloadEngine::with_arenas_on(
                 std::sync::Arc::clone(&host),
                 format!("glm52-rank{rank}"),
                 &namespace,
                 device_ordinal as i32,
                 &arenas,
-                vllm_compat_active,
+                false,
             )
             .map_err(|err| anyhow::anyhow!("GLM5.2 KV offload rank {rank} registration: {err}"))
         })
@@ -1406,22 +1322,6 @@ fn build_offload_engines(
 fn is_mla_arena_name(name: &str) -> bool {
     name.rsplit_once('.')
         .is_some_and(|(_, arena_kind)| arena_kind == "mla")
-}
-
-/// Map a native arena name (`glm52.L{n}.mla` / `glm52.L{n}.idxk`) to the name
-/// vLLM registers the same cache under (`GlmMoeDsaForCausalLM`, vLLM ≥ 0.24:
-/// MLA latent on every layer, indexer K only on full-indexer layers).
-fn vllm_arena_name(name: &str) -> Result<String> {
-    let parse = || -> Option<(usize, &str)> {
-        let rest = name.strip_prefix("glm52.L")?;
-        let (layer, kind) = rest.split_once('.')?;
-        Some((layer.parse().ok()?, kind))
-    };
-    match parse() {
-        Some((layer, "mla")) => Ok(format!("model.layers.{layer}.self_attn.attn")),
-        Some((layer, "idxk")) => Ok(format!("model.layers.{layer}.self_attn.indexer.k_cache")),
-        _ => bail!("GLM5.2 arena {name} has no vLLM-compat mapping"),
-    }
 }
 
 /// EOS ids from the checkpoint's generation_config.json (`eos_token_id` is a

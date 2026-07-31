@@ -155,15 +155,6 @@ pub(crate) struct Args {
     #[arg(long, default_value_t = 5000, requires = "kv_pd_vllm_seed")]
     pub kv_pd_miss_wait_ms: u64,
 
-    /// Debug escape hatch for --kv-pd-vllm-seed mode on models whose decode
-    /// node has no prefill path (GLM5.2): admit with local prompt compute
-    /// when the remote KV never materializes, instead of rejecting for the
-    /// router to retry. Local prompt compute rides the decode kernels
-    /// token-by-token — leave off in production. Qwen3 ignores this flag
-    /// (its miss path always falls back to a real local prefill).
-    #[arg(long, default_value_t = false, requires = "kv_pd_vllm_seed")]
-    pub kv_pd_allow_local_prefill: bool,
-
     /// vLLM-style no-prefix-cache. Without --kv-offload it disables prefix
     /// matching outright (every prefill recomputes the full prompt). With
     /// --kv-offload it is the pure-L2 mode: no cross-request HBM reuse, so every
@@ -370,10 +361,6 @@ fn consumed_args(model_type: ModelType) -> &'static [&'static str] {
             "kv_p2p_metaserver_addr",
             "kv_p2p_advertise_addr",
             "kv_p2p_nics",
-            "kv_pd_vllm_seed",
-            "kv_pd_vllm_namespace",
-            "kv_pd_miss_wait_ms",
-            "kv_pd_allow_local_prefill",
             "moe_topo",
             "glm52_weight_staging",
             "dump_graph_png",
@@ -582,11 +569,8 @@ impl Args {
                 if self.dflash_draft_model_path.is_some() {
                     bail!("--glm52-prefill-only is incompatible with the DSpark drafter");
                 }
-                if self.kv_pd_vllm_seed.is_some() || (self.kv_offload && !self.glm52_native_mtp) {
-                    bail!(
-                        "--glm52-prefill-only KV offload requires --glm52-native-mtp; \
-                         vLLM's 99-arena peer is incompatible with the 101-arena contract"
-                    );
+                if self.kv_offload && !self.glm52_native_mtp {
+                    bail!("--glm52-prefill-only KV offload requires --glm52-native-mtp");
                 }
                 if self.dump_graph_png.is_some() {
                     bail!("--glm52-prefill-only does not expose a decode CUDA graph");

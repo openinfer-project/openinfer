@@ -35,7 +35,7 @@
   - `docs/index.md` — GLM5.2 P/D state belongs with the model line, and the
     existing P/D execution record is authoritative for page naming, strict
     restore, and handoff failure semantics.
-  - `docs/models/glm52/pd-m2-execution.md` — the merged target-only contract
+  - the retired vLLM-prefill target-only contract (#657, removed)
     transfers 78 MLA plus 21 index-K arenas, forwards the first target token,
     and admits D at `suffix == 1`; speculative state is explicitly absent.
   - `docs/models/glm52/tp4-prefill-only.md` — native TP4 prefill already emits
@@ -46,7 +46,7 @@
     target's final-normalized hidden boundary and owns a separate layer-78 MLA
     plus index-K cache whose continuity affects acceptance.
 - **Relevant history**:
-  - `docs/models/glm52/pd-m2-execution.md` established that a strict D worker
+  - the retired target-only path (#657) established that a strict D worker
     must never silently recompute missing prompt state and that transfer
     completion can lag the P response.
   - Native MTP is currently restricted to single-process EP8: its layer-78

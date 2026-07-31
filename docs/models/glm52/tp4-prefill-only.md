@@ -14,7 +14,7 @@
 - **Read**:
   - `docs/index.md` — routed the work to the GLM5.2 model line.
   - `docs/models/glm52/tp4-prefill-only.md` — TP4 prefill currently persists a 576-byte cache row and rejects external P/D.
-  - `docs/models/glm52/pd-m2-execution.md` — the established P/D wire contract is the 656-byte `fp8_ds_mla` row plus the 132-byte index-K sidecar.
+  - the P/D wire contract is the 656-byte `fp8_ds_mla` row plus the 132-byte index-K sidecar (established by the retired vLLM-prefill path, #657).
 - **Relevant history**:
   - Existing P/D support validates TP8 vLLM → EP8 OpenInfer, but no TP4 → EP16 path exists.
 - **Plan**:

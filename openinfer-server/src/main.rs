@@ -214,19 +214,6 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
                                 }
                                 _ => None,
                             },
-                            vllm_compat: args.kv_pd_vllm_seed.clone().map(|seed| {
-                                openinfer_glm52::Glm52VllmCompatOptions {
-                                    python_hash_seed: seed,
-                                    namespace: args
-                                        .kv_pd_vllm_namespace
-                                        .clone()
-                                        .expect("clap requires kv_pd_vllm_namespace"),
-                                    miss_wait: std::time::Duration::from_millis(
-                                        args.kv_pd_miss_wait_ms,
-                                    ),
-                                    allow_local_prefill: args.kv_pd_allow_local_prefill,
-                                }
-                            }),
                         }),
                     moe_topo,
                     weight_staging: args.glm52_weight_staging,

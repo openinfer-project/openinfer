@@ -55,8 +55,6 @@ use graph::dump_rank0_decode_graph;
 use graph::precapture_step_graphs;
 use load::publish_load;
 use mtp::run_mtp_round;
-pub(crate) use offload::REMOTE_FETCH_DEADLINE;
-use offload::VllmPdState;
 use openinfer_core::engine::GenerateRequest;
 use openinfer_core::engine::LoadSnapshot;
 use openinfer_core::engine::TokenEvent;
@@ -173,7 +171,6 @@ pub(crate) struct Glm52EngineSpec {
     /// which uses the first — the historical layout); they hold the shared
     /// pegaflow host, which must outlive every in-flight save.
     pub(crate) offload: Option<Vec<OffloadEngine>>,
-    pub(crate) vllm_compat: Option<crate::Glm52VllmCompatOptions>,
     /// Fleet-wide logical rank count — the P/D states are sized by it so
     /// their indexing (and their log lines) keep the global rank numbers.
     pub(crate) logical_ranks: usize,
@@ -198,7 +195,6 @@ pub(crate) struct Glm52Engine {
     max_model_len: usize,
     prefix_cache: bool,
     offload: Option<Vec<offload::RankOffload>>,
-    vllm_pd: Option<VllmPdState>,
     native_pd: Option<offload::NativePdState>,
     /// Plain host-tier restore in flight for this rank's queue front (the
     /// non-P/D admission leg) — polled at step boundaries, never blocking.
@@ -276,19 +272,9 @@ impl Glm52Engine {
             },
             "one executor per EP rank; every mirrored worker under TP"
         );
-        // vLLM-compat P/D disables self-saves: the content domain carries the
-        // peer's key scheme, and the peer re-registers the full history each
-        // turn.
-        let save_enabled = spec.vllm_compat.is_none();
-        let offload: Option<Vec<offload::RankOffload>> = spec.offload.map(|engines| {
-            engines
-                .into_iter()
-                .map(|engine| offload::RankOffload::new(engine, save_enabled))
-                .collect()
-        });
-        let vllm_pd = spec
-            .vllm_compat
-            .map(|opts| VllmPdState::new(&opts, spec.logical_ranks));
+        let offload: Option<Vec<offload::RankOffload>> = spec
+            .offload
+            .map(|engines| engines.into_iter().map(offload::RankOffload::new).collect());
         let native_pd = (spec.drafter.is_mtp() && offload.is_some() && !prefill_only)
             .then(|| offload::NativePdState::new(spec.logical_ranks));
         // One KV page pool for this rank: pool block ids index the rank's
@@ -317,8 +303,7 @@ impl Glm52Engine {
         if spec.drafter.enabled() && !prefix_cache && !spec.no_prefix_cache {
             log::info!("GLM5.2 prefix cache disabled: speculative decoding is on");
         }
-        let host_restore = (offload.is_some() && prefix_cache && vllm_pd.is_none())
-            .then(offload::HostRestoreState::new);
+        let host_restore = (offload.is_some() && prefix_cache).then(offload::HostRestoreState::new);
         Ok(Self {
             rank: spec.rank,
             submit_rx: spec.submit_rx,
@@ -329,7 +314,6 @@ impl Glm52Engine {
             max_model_len: spec.max_model_len,
             prefix_cache,
             offload,
-            vllm_pd,
             native_pd,
             host_restore,
             moe_topo: spec.moe_topo,
@@ -560,11 +544,8 @@ impl Glm52Engine {
             &self.pool,
             self.usable_blocks,
             self.offload.as_deref().and_then(<[_]>::first),
-            &mut self.vllm_pd,
             &mut self.native_pd,
             &mut self.host_restore,
-            Some(&self.workers[0]),
-            self.mirrored,
             self.prefix_cache,
             self.drafter.enabled(),
             self.prefill_chunk_size.is_some() && self.drafter.is_mtp(),

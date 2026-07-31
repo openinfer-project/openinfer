@@ -15,7 +15,6 @@ mod prefill_moe_route;
 mod prefill_unpack;
 mod router;
 mod topk;
-mod vllm_fixup;
 
 pub use decode_feed::*;
 pub use deepgemm_grouped::*;
@@ -34,4 +33,3 @@ pub use prefill_moe_route::*;
 pub use prefill_unpack::*;
 pub use router::*;
 pub use topk::*;
-pub use vllm_fixup::*;

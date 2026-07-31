@@ -17,11 +17,9 @@ use openinfer_kv_cache::BlockPool;
 use super::ActiveRequest;
 use super::PAGE;
 use super::RankSlots;
-use super::offload::VllmAdmitOutcome;
-use super::offload::VllmPdState;
+use super::offload::NativeAdmitOutcome;
 use super::offload::{self};
 use super::slot::Glm52SlotState;
-use crate::runner::Glm52Worker;
 
 pub(super) fn validate_request(
     req: &GenerateRequest,
@@ -161,13 +159,8 @@ pub(super) fn admit_from_queue(
     pool: &BlockPool,
     usable_blocks: usize,
     offload: Option<&offload::RankOffload>,
-    vllm_pd: &mut Option<VllmPdState>,
     native_pd: &mut Option<offload::NativePdState>,
     host_restore: &mut Option<offload::HostRestoreState>,
-    // The rank's executor, only exercised by the vLLM-compat P/D admission
-    // (the rope fixup rides its stream); `None` in offline contract tests.
-    worker: Option<&Glm52Worker>,
-    mirrored: bool,
     prefix_cache_enabled: bool,
     drafter_enabled: bool,
     native_mtp_prefill: bool,
@@ -201,9 +194,6 @@ pub(super) fn admit_from_queue(
         // behind an admission budget it will never consume.
         if front.token_tx.is_closed() {
             pending.pop_front();
-            if let Some(pd) = vllm_pd.as_mut() {
-                pd.clear_parked(rank);
-            }
             if let Some(pd) = native_pd.as_mut() {
                 pd.clear(rank);
             }
@@ -293,70 +283,20 @@ pub(super) fn admit_from_queue(
                     }
                 };
             match outcome {
-                VllmAdmitOutcome::Admit { kv, cached_tokens } => Some((*kv, cached_tokens)),
-                VllmAdmitOutcome::Park => {
+                NativeAdmitOutcome::Admit { kv, cached_tokens } => Some((*kv, cached_tokens)),
+                NativeAdmitOutcome::Park => {
                     pending.push_front(req);
-                    break;
+                    break; // head-of-line wait: retry next step boundary
                 }
-                VllmAdmitOutcome::Reject { message } => {
+                NativeAdmitOutcome::Reject { message } => {
                     reject(&req, message);
                     continue;
-                }
-                VllmAdmitOutcome::LocalFallback => {
-                    unreachable!("native-MTP P/D never silently falls back to local prefill")
                 }
             }
         } else {
             None
         };
-        // vLLM-compat P/D admission: the full peer-prefilled prefix must
-        // restore (this node never computes prompt positions), a racing
-        // registration parks the request at the queue front for the next
-        // step boundary, and an exhausted wait window rejects it for the
-        // router to retry through the prefill peer.
-        let pd_admitted = if native_admitted.is_some() {
-            native_admitted
-        } else {
-            match vllm_pd.as_mut() {
-                Some(pd) => {
-                    let offload = offload.expect("vLLM-compat P/D requires --kv-offload");
-                    let worker = worker.expect("vLLM-compat P/D requires the rank executor");
-                    // Launch validation pins vllm-compat to the EP topology
-                    // (kv-offload ⇒ EP): the rank's executor owns the only
-                    // replica of its arenas, so it alone runs the fixup. A
-                    // mirrored topology would need every worker here.
-                    assert!(
-                        !mirrored,
-                        "vLLM-compat P/D admission assumes the EP topology"
-                    );
-                    match offload::admit_vllm_pd(pd, rank, offload, pool, &req, worker) {
-                        Ok(VllmAdmitOutcome::Admit { kv, cached_tokens }) => {
-                            Some((*kv, cached_tokens))
-                        }
-                        Ok(VllmAdmitOutcome::Park) => {
-                            pending.push_front(req);
-                            break; // head-of-line wait: retry next step boundary
-                        }
-                        Ok(VllmAdmitOutcome::Reject { message }) => {
-                            reject(&req, message);
-                            continue;
-                        }
-                        Ok(VllmAdmitOutcome::LocalFallback) => None,
-                        Err(err) => {
-                            let err = err.context("GLM5.2 P/D admission");
-                            let _ = req.token_tx.send(TokenEvent::Error {
-                                message: format!("{err:#}"),
-                                prompt_tokens: req.prompt_tokens.len(),
-                                completion_tokens: 0,
-                            });
-                            return Err(err);
-                        }
-                    }
-                }
-                None => None,
-            }
-        };
-        let (mut kv, cached_tokens) = if let Some(admitted) = pd_admitted {
+        let (mut kv, cached_tokens) = if let Some(admitted) = native_admitted {
             admitted
         } else {
             // Host-tier restore first, so the GPU prefix match sees the union
@@ -366,7 +306,7 @@ pub(super) fn admit_from_queue(
             // The probe stays alive across the match to close the eviction
             // window.
             let _restored_hold = match host_restore.as_mut() {
-                Some(state) if prefix_cache_enabled && vllm_pd.is_none() => {
+                Some(state) if prefix_cache_enabled => {
                     match state.poll_front(offload.map(|o| &o.engine), pool, &req) {
                         offload::HostRestoreOutcome::Ready(probe) => probe,
                         offload::HostRestoreOutcome::Park => {
