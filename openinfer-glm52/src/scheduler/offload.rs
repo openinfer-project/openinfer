@@ -113,6 +113,9 @@ impl RankOffload {
     /// seals, so capture this page synchronously while the request still owns
     /// it. The response may race cache visibility; D admission already parks
     /// and retries until PegaFlow publishes the key.
+    ///
+    /// Last `save_blocking` on an engine thread (#799): the handoff needs
+    /// page stability, not completion — #802 detaches it.
     pub(super) fn save_native_tail(&self, kv: &RequestKv, key: [u8; 16]) -> anyhow::Result<()> {
         let page_id = kv
             .current_page_indices()
@@ -305,11 +308,8 @@ enum NativePendingLoad {
 }
 
 impl NativePendingLoad {
-    /// Pool pages this load holds for the parked front. They become the
-    /// request's blocks on admit, so the admission budget credits them back
-    /// against the request's need (they are already out of
-    /// `available_blocks`, and counting them on both sides would wedge the
-    /// front forever).
+    /// Pool pages this load holds for the parked front — credited back by
+    /// the admission budget (they are already inside the front's own need).
     fn held_blocks(&self) -> usize {
         match self {
             Self::Full {
@@ -825,11 +825,8 @@ impl HostRestoreState {
         }
     }
 
-    /// Pool pages held for the parked front's in-flight restore. They become
-    /// the request's cached prefix on admit, so the admission budget credits
-    /// them back against the request's need (they are already out of
-    /// `available_blocks`, and counting them on both sides would wedge the
-    /// front forever).
+    /// Pool pages held for the parked front's in-flight restore — credited
+    /// back by the admission budget (already inside the front's own need).
     pub(super) fn front_held_blocks(&self) -> usize {
         self.pending
             .as_ref()

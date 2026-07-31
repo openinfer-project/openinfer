@@ -166,8 +166,7 @@ pub(super) fn admit_from_queue(
     native_mtp_prefill: bool,
     pending_resets: &mut Vec<usize>,
 ) -> anyhow::Result<()> {
-    // Loads abandoned mid-flight (disconnects, deadline rejects) held their
-    // destination pages until the DMA settled — release the settled ones.
+    // Release the page holds of abandoned loads whose DMA settled.
     if let Some(state) = host_restore.as_mut() {
         state.reap();
     }
@@ -245,9 +244,8 @@ pub(super) fn admit_from_queue(
             .flatten()
             .map(|active| active.kv.resident_blocks())
             .sum();
-        // Pages held by the front's own parked in-flight restore are destined
-        // for this request (already inside `need_blocks`), so credit them
-        // back — counting them on both sides would wedge the front forever.
+        // The parked front's own restore holds are already inside
+        // `need_blocks`; credit them back or the front wedges forever.
         let front_restore_held = host_restore
             .as_ref()
             .map_or(0, offload::HostRestoreState::front_held_blocks)
@@ -299,12 +297,9 @@ pub(super) fn admit_from_queue(
         let (mut kv, cached_tokens) = if let Some(admitted) = native_admitted {
             admitted
         } else {
-            // Host-tier restore first, so the GPU prefix match sees the union
-            // of HBM-resident and freshly-restored blocks. The load's H2D
-            // copy is polled at step boundaries instead of blocking the
-            // engine loop (#799): Park leaves the request at the queue front.
-            // The probe stays alive across the match to close the eviction
-            // window.
+            // Host-tier restore before the prefix match; the H2D is polled
+            // at step boundaries, never awaited (#799). The probe must
+            // outlive the match (eviction window).
             let _restored_hold = match host_restore.as_mut() {
                 Some(state) if prefix_cache_enabled => {
                     match state.poll_front(offload.map(|o| &o.engine), pool, &req) {
