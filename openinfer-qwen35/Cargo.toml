@@ -22,7 +22,6 @@ tokio = { workspace = true, features = ["sync"] }
 [dev-dependencies]
 criterion = { workspace = true }
 openinfer-vllm-frontend = { workspace = true }
-openinfer-vllm-support = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
 sha2 = { workspace = true }
 tempfile = { workspace = true }

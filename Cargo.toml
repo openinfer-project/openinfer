@@ -4,7 +4,6 @@ members = [
   "openinfer-engine",
   "openinfer-vllm-frontend",
   "openinfer-sim",
-  "openinfer-vllm-support",
   "openinfer-server",
   "openinfer-core",
   "openinfer-cupti",
@@ -119,7 +118,6 @@ memmap2 = "0.9"
 mio = "=1.1.1"
 mockall = "0.13.1"
 nvtx = "1.3.0"
-once_cell = "1.21.3"
 oneshot = "0.1.11"
 openinfer-bench = { path = "openinfer-bench" }
 openinfer-build = { path = "openinfer-build" }
@@ -137,7 +135,6 @@ openinfer-qwen3 = { path = "openinfer-qwen3" }
 openinfer-qwen35 = { path = "openinfer-qwen35" }
 openinfer-sample = { path = "openinfer-sample" }
 openinfer-vllm-frontend = { path = "openinfer-vllm-frontend" }
-openinfer-vllm-support = { path = "openinfer-vllm-support" }
 opentelemetry = { version = "0.31.0", features = ["trace", "logs"] }
 opentelemetry-appender-tracing = "0.31.0"
 opentelemetry-otlp = { version = "0.31.0", features = [

@@ -3325,7 +3325,6 @@ dependencies = [
  "openinfer-kv-offload",
  "openinfer-qwen3",
  "openinfer-sample",
- "openinfer-vllm-support",
  "rand 0.10.1",
  "safetensors",
  "serde",
@@ -3350,7 +3349,6 @@ dependencies = [
  "openinfer-kernels",
  "openinfer-sample",
  "openinfer-vllm-frontend",
- "openinfer-vllm-support",
  "rand 0.10.1",
  "reqwest",
  "safetensors",
@@ -3392,7 +3390,6 @@ dependencies = [
  "openinfer-qwen3",
  "openinfer-qwen35",
  "openinfer-vllm-frontend",
- "openinfer-vllm-support",
  "rand 0.10.1",
  "serde",
  "serde_json",
@@ -3438,16 +3435,6 @@ dependencies = [
  "vllm-engine-core-client",
  "vllm-server",
  "zeromq",
-]
-
-[[package]]
-name = "openinfer-vllm-support"
-version = "0.1.0"
-dependencies = [
- "once_cell",
- "tokio",
- "vllm-text",
- "vllm-tokenizer",
 ]
 
 [[package]]

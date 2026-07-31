@@ -35,7 +35,6 @@ use openinfer_core::engine::EngineLoadOptions;
 use openinfer_core::engine::EpBackend;
 #[cfg(feature = "kimi-k2")]
 use openinfer_core::parallel::ParallelConfig;
-use openinfer_vllm_support::load_tokenizer as load_vllm_tokenizer;
 use vllm_text::tokenizer::DynTokenizer;
 
 mod cli;
@@ -49,6 +48,7 @@ mod render;
 mod report;
 mod runners;
 mod snapshot;
+mod tokenizer;
 use cli::Cli;
 use cli::CliQwen35SchedulerPolicy;
 use cli::Command;
@@ -167,7 +167,7 @@ fn main() -> Result<()> {
     // the elapsed load time, wrap the handle, and dispatch. The per-model arms
     // below differ only in how they construct the engine handle.
     let finish = |handle: SchedulerHandle, cuda_graph: bool| -> Result<()> {
-        let tokenizer = load_vllm_tokenizer(&cli.model_path)?;
+        let tokenizer = tokenizer::load_tokenizer(&cli.model_path)?;
         let load_ms = dur_ms(load_start.elapsed());
         let mut bench = SchedulerBenchModel { handle };
         dispatch(
@@ -189,7 +189,7 @@ fn main() -> Result<()> {
                     seed: command_seed(&cli),
                 },
             )?;
-            let tokenizer = load_vllm_tokenizer(&cli.model_path)?;
+            let tokenizer = tokenizer::load_tokenizer(&cli.model_path)?;
             let load_ms = dur_ms(load_start.elapsed());
             let mut bench = DeepSeekV2LiteBenchModel { generator };
             dispatch(&cli, model_type, load_ms, false, &mut bench, &tokenizer)

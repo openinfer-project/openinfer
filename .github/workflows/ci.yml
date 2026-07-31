@@ -100,8 +100,6 @@ jobs:
             needs_protobuf: false
           - package: openinfer-engine
             needs_protobuf: false
-          - package: openinfer-vllm-support
-            needs_protobuf: false
           - package: openinfer-vllm-frontend
             needs_protobuf: true
           - package: openinfer-sim
@@ -165,7 +163,6 @@ jobs:
           cargo clippy --release --locked
           -p openinfer-build
           -p openinfer-engine
-          -p openinfer-vllm-support
           -p openinfer-vllm-frontend
           -p openinfer-sim
           -p kvbm-logical

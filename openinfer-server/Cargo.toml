@@ -37,7 +37,6 @@ openinfer-kimi-k2 = { workspace = true, optional = true }
 openinfer-qwen3 = { workspace = true, optional = true }
 openinfer-qwen35 = { workspace = true, optional = true }
 openinfer-vllm-frontend = { workspace = true }
-openinfer-vllm-support = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -46,9 +46,8 @@ test-fixtures = []
 
 [dev-dependencies]
 openinfer-qwen3 = { workspace = true, features = ["test-fixtures"] }
-openinfer-vllm-support = { workspace = true }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "net", "rt", "time"] }
 vllm-text = { workspace = true }
 
 [[bin]]
