@@ -430,9 +430,13 @@ pub struct Glm52VllmCompatOptions {
 
 /// GLM5.2 kernels (FlashMLA SM100, DeepGEMM MQA SM100f, weight-only EP, …)
 /// no longer ship a Hopper path. Refuse SM9x and older at launch.
-fn ensure_blackwell_devices(device_count: usize) -> Result<()> {
-    ensure!(device_count > 0, "GLM5.2 needs at least one GPU");
-    for ordinal in 0..device_count {
+///
+/// `local_gpus` is the number of GPUs **this process** hosts (mapped to local
+/// ordinals `0..local_gpus`), not the global EP width — multi-process
+/// EP16/32/64 shards may own only four devices on a tray.
+fn ensure_blackwell_devices(local_gpus: usize) -> Result<()> {
+    ensure!(local_gpus > 0, "GLM5.2 needs at least one GPU");
+    for ordinal in 0..local_gpus {
         let ctx = openinfer_kernels::tensor::DeviceContext::new_with_device(ordinal)
             .with_context(|| format!("GLM5.2 open device {ordinal} for arch check"))?;
         let major = ctx.ctx.attribute(
@@ -465,7 +469,6 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
         ranks,
         rendezvous,
     } = options;
-    ensure_blackwell_devices(moe_topo.device_count())?;
     let device_count = moe_topo.device_count();
     let ranks = ranks.unwrap_or(0..device_count);
     ensure!(
@@ -474,6 +477,9 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
         ranks.start,
         ranks.end
     );
+    // Probe only the GPUs this process hosts (local ordinals 0..N), not the
+    // global EP width — EP16 on one 4-GPU tray would otherwise try device 4+.
+    ensure_blackwell_devices(ranks.end - ranks.start)?;
     let multi_process = ranks != (0..device_count);
     if moe_topo.uses_tensor_replicated_moe() {
         ensure!(

@@ -56,7 +56,7 @@ This is also the tracing leg of the `direction.md` ledger → simulator → trac
 
 ### 4. GLM5.2 large-MoE mainline
 
-The original DP1/EP8 bring-up campaign is complete and has grown into Hopper EP8/TP8, Blackwell EP4/TP4, one-domain EP-N, and cross-engine P/D serving paths. Current capabilities and promotion blockers live in `docs/models/glm52/serving-status.md`.
+The original DP1/EP8 bring-up campaign is complete and has grown into Blackwell-only EP4/EP8/one-domain EP-N decode, TP4 prefill-only, and cross-engine P/D serving paths (Hopper and decode TP/LL removed). Current capabilities and promotion blockers live in `docs/models/glm52/serving-status.md`.
 
 It is also the deliberate **boundary test** for shared infrastructure: large MoE forces the question of which DeepGEMM / DeepEP / FlashMLA substrate is genuinely cross-model (`openinfer-kernels::moe`) versus model-local. We do not refactor scaffolding speculatively — the boundary moves when GLM5.2 provides evidence it must (per `direction.md`). Any extraction of shared MoE/MLA primitives falls out of this line, not out of a standalone "clean up the scaffolding" project.
 
