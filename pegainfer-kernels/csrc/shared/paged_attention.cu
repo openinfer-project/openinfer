@@ -1,7 +1,8 @@
 // Thin C wrappers around FlashInfer's attention kernels.
 //
 // We include FlashInfer headers (header-only C++) and instantiate only the
-// template variants needed: bf16 Q/KV/O, HEAD_DIM=128, NHD layout, no RoPE.
+// template variants needed: bf16 Q/KV/O, NHD layout, no RoPE, at HEAD_DIM 128
+// and 256, the latter both with and without a sliding-window mask.
 //
 // FlashInfer's dispatchers internally instantiate multiple GQA group sizes
 // (1,2,3,4,8) — this covers both Qwen3-4B (GQA=4) and Qwen3.5-4B (GQA=8).
@@ -28,6 +29,13 @@ using Variant = DefaultAttention</*custom_mask=*/false,
                                  /*sliding_window=*/false,
                                  /*logits_soft_cap=*/false,
                                  /*alibi=*/false>;
+
+// `window_left` is an inclusive distance: an N-token window passes N - 1, and
+// -1 degrades to full attention.
+using WindowVariant = DefaultAttention</*custom_mask=*/false,
+                                       /*sliding_window=*/true,
+                                       /*logits_soft_cap=*/false,
+                                       /*alibi=*/false>;
 
 // Helper: build paged_kv_t from our page-first layout.
 //
@@ -67,8 +75,6 @@ static paged_kv_t<DType, IdType> make_paged_kv(
         /*rope_pos_offset=*/nullptr);
 }
 
-extern "C" {
-
 // ---------------------------------------------------------------------------
 // Paged attention decode — wraps FlashInfer BatchDecodeWithPagedKVCache.
 //
@@ -76,7 +82,8 @@ extern "C" {
 // No RoPE applied inside (caller does RoPE beforehand).
 // No partition-KV (single block per batch×head) for Phase 1 simplicity.
 // ---------------------------------------------------------------------------
-int paged_attention_decode_cuda(
+template <uint32_t HEAD_DIM, typename VariantT>
+static int decode_launch(
     // Q and output
     void*    q,                    // [num_qo_heads * head_dim] bf16, device
     void*    output,               // [num_qo_heads * head_dim] bf16, device
@@ -100,6 +107,7 @@ int paged_attention_decode_cuda(
     int32_t  batch_size,           // 1 for Phase 1
     int64_t  stride_page,          // KvLayout.page_stride
     float    sm_scale,             // typically 1/sqrt(head_dim)
+    int32_t  window_left,
     // Stream
     void*    stream)
 {
@@ -119,7 +127,7 @@ int paged_attention_decode_cuda(
         num_qo_heads,
         /*q_stride_n=*/num_qo_heads * head_dim,
         /*q_stride_h=*/head_dim,
-        /*window_left=*/-1,
+        window_left,
         /*logits_soft_cap=*/0.0f,
         sm_scale,
         /*rope_scale=*/1.0f,
@@ -136,9 +144,9 @@ int paged_attention_decode_cuda(
     // tmp_v = nullptr → non-partition path (no merge step)
     return static_cast<int>(
         BatchDecodeWithPagedKVCacheDispatched<
-            /*HEAD_DIM=*/128,
+            HEAD_DIM,
             PosEncodingMode::kNone,
-            Variant,
+            VariantT,
             ParamsT>(
             params,
             /*tmp_v=*/nullptr,
@@ -146,6 +154,25 @@ int paged_attention_decode_cuda(
             /*enable_pdl=*/false,
             reinterpret_cast<cudaStream_t>(stream)));
   PEGAINFER_FFI_GUARD_END(-1)
+}
+
+extern "C" {
+
+int paged_attention_decode_cuda(
+    void* q, void* output, void* kv_data,
+    int64_t k_offset_elems, int64_t v_offset_elems,
+    int32_t* page_indices, int32_t* page_indptr, int32_t* last_page_len_d,
+    int32_t* request_indices, int32_t* kv_tile_indices, int32_t* kv_chunk_size_ptr,
+    int32_t num_qo_heads, int32_t num_kv_heads, int32_t head_dim,
+    int32_t page_size, int32_t batch_size, int64_t stride_page,
+    float sm_scale, void* stream)
+{
+  return decode_launch</*HEAD_DIM=*/128, Variant>(
+      q, output, kv_data, k_offset_elems, v_offset_elems,
+      page_indices, page_indptr, last_page_len_d,
+      request_indices, kv_tile_indices, kv_chunk_size_ptr,
+      num_qo_heads, num_kv_heads, head_dim, page_size, batch_size,
+      stride_page, sm_scale, /*window_left=*/-1, stream);
 }
 
 // ---------------------------------------------------------------------------
@@ -407,7 +434,10 @@ int32_t batch_prefill_cta_tile_q_with_override(
         packed_qo_len, head_dim, cta_tile_q_override));
 }
 
-int batch_prefill_paged_cuda_with_cta_tile_q(
+} // extern "C"
+
+template <uint32_t HEAD_DIM, typename VariantT>
+static int prefill_paged_launch(
     // Q and output (HiddenStates col-major: [q_dim, total_seq_len])
     void*    q,
     void*    output,
@@ -437,6 +467,7 @@ int batch_prefill_paged_cuda_with_cta_tile_q(
     int64_t  stride_page,
     float    sm_scale,
     int32_t  cta_tile_q_override,
+    int32_t  window_left,
     // Stream
     void*    stream)
 {
@@ -462,7 +493,7 @@ int batch_prefill_paged_cuda_with_cta_tile_q(
         num_qo_heads,
         q_stride_n,
         q_stride_h,
-        /*window_left=*/-1,
+        window_left,
         /*logits_soft_cap=*/0.0f,
         sm_scale,
         /*rope_scale=*/1.0f,
@@ -496,12 +527,12 @@ int batch_prefill_paged_cuda_with_cta_tile_q(
         result = static_cast<int>(
             BatchPrefillWithPagedKVCacheDispatched<
                 CTA_TILE_Q,
-                /*HEAD_DIM_QK=*/128,
-                /*HEAD_DIM_VO=*/128,
+                /*HEAD_DIM_QK=*/HEAD_DIM,
+                /*HEAD_DIM_VO=*/HEAD_DIM,
                 PosEncodingMode::kNone,
                 /*USE_FP16_QK_REDUCTION=*/false,
                 MaskMode::kCausal,
-                Variant,
+                VariantT,
                 BatchPrefillParamsT>(
                 params,
                 /*tmp_v=*/nullptr,
@@ -511,6 +542,28 @@ int batch_prefill_paged_cuda_with_cta_tile_q(
     });
     return result;
   PEGAINFER_FFI_GUARD_END(-1)
+}
+
+extern "C" {
+
+int batch_prefill_paged_cuda_with_cta_tile_q(
+    void* q, void* output, void* kv_data,
+    int64_t k_offset_elems, int64_t v_offset_elems,
+    int32_t* page_indices, int32_t* page_indptr, int32_t* last_page_len_d,
+    int32_t* q_indptr, int32_t* request_indices, int32_t* qo_tile_indices,
+    int32_t* kv_tile_indices, int32_t* kv_chunk_size_ptr, uint32_t* total_num_rows,
+    int32_t num_qo_heads, int32_t num_kv_heads, int32_t head_dim,
+    int32_t page_size, int32_t seq_len, int32_t batch_size,
+    int32_t padded_batch_size, int64_t stride_page, float sm_scale,
+    int32_t cta_tile_q_override, void* stream)
+{
+  return prefill_paged_launch</*HEAD_DIM=*/128, Variant>(
+      q, output, kv_data, k_offset_elems, v_offset_elems,
+      page_indices, page_indptr, last_page_len_d, q_indptr,
+      request_indices, qo_tile_indices, kv_tile_indices, kv_chunk_size_ptr,
+      total_num_rows, num_qo_heads, num_kv_heads, head_dim, page_size,
+      seq_len, batch_size, padded_batch_size, stride_page, sm_scale,
+      cta_tile_q_override, /*window_left=*/-1, stream);
 }
 
 int batch_prefill_paged_cuda(
@@ -964,169 +1017,81 @@ int single_prefill_cuda_hd256(
 }
 
 // ---------------------------------------------------------------------------
-// Paged attention decode for HEAD_DIM=256 — identical to paged_attention_decode_cuda
-// but dispatched with HEAD_DIM=256.  Used by Qwen3.5-4B full-attention layers.
+// HEAD_DIM=256 paged entry points.  Qwen3.5-4B uses the full-attention pair;
+// the windowed pair applies the sliding-window mask for Gemma 4's local layers.
 // ---------------------------------------------------------------------------
 int paged_attention_decode_cuda_hd256(
-    void*    q,
-    void*    output,
-    void*    kv_data,
-    int64_t  k_offset_elems,
-    int64_t  v_offset_elems,
-    int32_t* page_indices,
-    int32_t* page_indptr,
-    int32_t* last_page_len_d,
-    int32_t* request_indices,
-    int32_t* kv_tile_indices,
-    int32_t* kv_chunk_size_ptr,
-    int32_t  num_qo_heads,
-    int32_t  num_kv_heads,
-    int32_t  head_dim,
-    int32_t  page_size,
-    int32_t  batch_size,
-    int64_t  stride_page,
-    float    sm_scale,
-    void*    stream)
+    void* q, void* output, void* kv_data,
+    int64_t k_offset_elems, int64_t v_offset_elems,
+    int32_t* page_indices, int32_t* page_indptr, int32_t* last_page_len_d,
+    int32_t* request_indices, int32_t* kv_tile_indices, int32_t* kv_chunk_size_ptr,
+    int32_t num_qo_heads, int32_t num_kv_heads, int32_t head_dim,
+    int32_t page_size, int32_t batch_size, int64_t stride_page,
+    float sm_scale, void* stream)
 {
-  PEGAINFER_FFI_GUARD_BEGIN
-    auto paged_kv = make_paged_kv(
-        kv_data, k_offset_elems, v_offset_elems,
-        page_indices, page_indptr, last_page_len_d,
-        num_kv_heads, head_dim, page_size, batch_size, stride_page);
-
-    ParamsT params(
-        reinterpret_cast<DType*>(q),
-        /*q_rope_offset=*/nullptr,
-        paged_kv,
-        reinterpret_cast<DType*>(output),
-        /*lse=*/nullptr,
-        /*maybe_alibi_slopes=*/nullptr,
-        num_qo_heads,
-        /*q_stride_n=*/num_qo_heads * head_dim,
-        /*q_stride_h=*/head_dim,
-        /*window_left=*/-1,
-        /*logits_soft_cap=*/0.0f,
-        sm_scale,
-        /*rope_scale=*/1.0f,
-        /*rope_theta=*/1e6f);
-
-    params.padded_batch_size = batch_size;
-    params.request_indices   = request_indices;
-    params.kv_tile_indices   = kv_tile_indices;
-    params.o_indptr          = nullptr;
-    params.kv_chunk_size_ptr = kv_chunk_size_ptr;
-    params.block_valid_mask  = nullptr;
-    params.partition_kv      = false;
-
-    return static_cast<int>(
-        BatchDecodeWithPagedKVCacheDispatched<
-            /*HEAD_DIM=*/256,
-            PosEncodingMode::kNone,
-            Variant,
-            ParamsT>(
-            params,
-            /*tmp_v=*/nullptr,
-            /*tmp_s=*/nullptr,
-            /*enable_pdl=*/false,
-            reinterpret_cast<cudaStream_t>(stream)));
-  PEGAINFER_FFI_GUARD_END(-1)
+  return decode_launch</*HEAD_DIM=*/256, Variant>(
+      q, output, kv_data, k_offset_elems, v_offset_elems,
+      page_indices, page_indptr, last_page_len_d,
+      request_indices, kv_tile_indices, kv_chunk_size_ptr,
+      num_qo_heads, num_kv_heads, head_dim, page_size, batch_size,
+      stride_page, sm_scale, /*window_left=*/-1, stream);
 }
 
-// ---------------------------------------------------------------------------
-// Batch prefill with paged KV for HEAD_DIM=256 — identical to batch_prefill_paged_cuda
-// but dispatched with HEAD_DIM_QK/VO=256.  Used by Qwen3.5-4B multi-token prefill.
-// ---------------------------------------------------------------------------
-int batch_prefill_paged_cuda_hd256(
-    void*    q,
-    void*    output,
-    void*    kv_data,
-    int64_t  k_offset_elems,
-    int64_t  v_offset_elems,
-    int32_t* page_indices,
-    int32_t* page_indptr,
-    int32_t* last_page_len_d,
-    int32_t* q_indptr,
-    int32_t* request_indices,
-    int32_t* qo_tile_indices,
-    int32_t* kv_tile_indices,
-    int32_t* kv_chunk_size_ptr,
-    uint32_t* total_num_rows,
-    int32_t  num_qo_heads,
-    int32_t  num_kv_heads,
-    int32_t  head_dim,
-    int32_t  page_size,
-    int32_t  seq_len,
-    int32_t  batch_size,
-    int32_t  padded_batch_size,
-    int64_t  stride_page,
-    float    sm_scale,
-    void*    stream)
+int paged_attention_decode_window_cuda_hd256(
+    void* q, void* output, void* kv_data,
+    int64_t k_offset_elems, int64_t v_offset_elems,
+    int32_t* page_indices, int32_t* page_indptr, int32_t* last_page_len_d,
+    int32_t* request_indices, int32_t* kv_tile_indices, int32_t* kv_chunk_size_ptr,
+    int32_t num_qo_heads, int32_t num_kv_heads, int32_t head_dim,
+    int32_t page_size, int32_t batch_size, int64_t stride_page,
+    float sm_scale, int32_t window_left, void* stream)
 {
-  PEGAINFER_FFI_GUARD_BEGIN
-    auto paged_kv = make_paged_kv(
-        kv_data, k_offset_elems, v_offset_elems,
-        page_indices, page_indptr, last_page_len_d,
-        num_kv_heads, head_dim, page_size, batch_size, stride_page);
+  return decode_launch</*HEAD_DIM=*/256, WindowVariant>(
+      q, output, kv_data, k_offset_elems, v_offset_elems,
+      page_indices, page_indptr, last_page_len_d,
+      request_indices, kv_tile_indices, kv_chunk_size_ptr,
+      num_qo_heads, num_kv_heads, head_dim, page_size, batch_size,
+      stride_page, sm_scale, window_left, stream);
+}
 
-    uint32_t q_stride_n = num_qo_heads * head_dim;
-    uint32_t q_stride_h = head_dim;
+int batch_prefill_paged_cuda_hd256(
+    void* q, void* output, void* kv_data,
+    int64_t k_offset_elems, int64_t v_offset_elems,
+    int32_t* page_indices, int32_t* page_indptr, int32_t* last_page_len_d,
+    int32_t* q_indptr, int32_t* request_indices, int32_t* qo_tile_indices,
+    int32_t* kv_tile_indices, int32_t* kv_chunk_size_ptr, uint32_t* total_num_rows,
+    int32_t num_qo_heads, int32_t num_kv_heads, int32_t head_dim,
+    int32_t page_size, int32_t seq_len, int32_t batch_size,
+    int32_t padded_batch_size, int64_t stride_page, float sm_scale,
+    void* stream)
+{
+  return prefill_paged_launch</*HEAD_DIM=*/256, Variant>(
+      q, output, kv_data, k_offset_elems, v_offset_elems,
+      page_indices, page_indptr, last_page_len_d, q_indptr,
+      request_indices, qo_tile_indices, kv_tile_indices, kv_chunk_size_ptr,
+      total_num_rows, num_qo_heads, num_kv_heads, head_dim, page_size,
+      seq_len, batch_size, padded_batch_size, stride_page, sm_scale,
+      /*cta_tile_q_override=*/0, /*window_left=*/-1, stream);
+}
 
-    BatchPrefillParamsT params(
-        reinterpret_cast<DType*>(q),
-        paged_kv,
-        /*maybe_custom_mask=*/nullptr,
-        q_indptr,
-        /*maybe_mask_indptr=*/nullptr,
-        /*maybe_q_rope_offset=*/nullptr,
-        reinterpret_cast<DType*>(output),
-        /*lse=*/nullptr,
-        /*maybe_alibi_slopes=*/nullptr,
-        num_qo_heads,
-        q_stride_n,
-        q_stride_h,
-        /*window_left=*/-1,
-        /*logits_soft_cap=*/0.0f,
-        sm_scale,
-        /*rope_scale=*/1.0f,
-        /*rope_theta=*/1e6f);
-
-    params.request_indices   = request_indices;
-    params.qo_tile_indices   = qo_tile_indices;
-    params.kv_tile_indices   = kv_tile_indices;
-    params.merge_indptr      = nullptr;
-    params.o_indptr          = q_indptr;
-    params.block_valid_mask  = nullptr;
-    params.kv_chunk_size_ptr = kv_chunk_size_ptr;
-    params.max_total_num_rows = seq_len;
-    params.total_num_rows    = total_num_rows;
-    params.padded_batch_size = padded_batch_size;
-    params.partition_kv      = false;
-
-    uint32_t group_size = num_qo_heads / num_kv_heads;
-    int64_t packed_qo_len = static_cast<int64_t>(seq_len) * group_size;
-    uint32_t cta_tile_q = FA2DetermineCtaTileQ(packed_qo_len, head_dim);
-
-    cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
-    int result = 0;
-    DISPATCH_CTA_TILE_Q(cta_tile_q, CTA_TILE_Q, {
-        result = static_cast<int>(
-            BatchPrefillWithPagedKVCacheDispatched<
-                CTA_TILE_Q,
-                /*HEAD_DIM_QK=*/256,
-                /*HEAD_DIM_VO=*/256,
-                PosEncodingMode::kNone,
-                /*USE_FP16_QK_REDUCTION=*/false,
-                MaskMode::kCausal,
-                Variant,
-                BatchPrefillParamsT>(
-                params,
-                /*tmp_v=*/nullptr,
-                /*tmp_s=*/nullptr,
-                /*enable_pdl=*/false,
-                s));
-    });
-    return result;
-  PEGAINFER_FFI_GUARD_END(-1)
+int batch_prefill_paged_window_cuda_hd256(
+    void* q, void* output, void* kv_data,
+    int64_t k_offset_elems, int64_t v_offset_elems,
+    int32_t* page_indices, int32_t* page_indptr, int32_t* last_page_len_d,
+    int32_t* q_indptr, int32_t* request_indices, int32_t* qo_tile_indices,
+    int32_t* kv_tile_indices, int32_t* kv_chunk_size_ptr, uint32_t* total_num_rows,
+    int32_t num_qo_heads, int32_t num_kv_heads, int32_t head_dim,
+    int32_t page_size, int32_t seq_len, int32_t batch_size,
+    int32_t padded_batch_size, int64_t stride_page, float sm_scale,
+    int32_t window_left, void* stream)
+{
+  return prefill_paged_launch</*HEAD_DIM=*/256, WindowVariant>(
+      q, output, kv_data, k_offset_elems, v_offset_elems,
+      page_indices, page_indptr, last_page_len_d, q_indptr,
+      request_indices, qo_tile_indices, kv_tile_indices, kv_chunk_size_ptr,
+      total_num_rows, num_qo_heads, num_kv_heads, head_dim, page_size,
+      seq_len, batch_size, padded_batch_size, stride_page, sm_scale,
+      /*cta_tile_q_override=*/0, window_left, stream);
 }
 
 } // extern "C"

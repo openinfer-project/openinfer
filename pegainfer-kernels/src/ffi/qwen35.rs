@@ -5,7 +5,8 @@ use cudarc::driver::sys::CUstream;
 use super::Half;
 
 // Qwen3.5-4B private kernels (hybrid linear + HD256 full attention).
-// Sources: csrc/qwen35/*.cu; the *_hd256 paged variants live in csrc/shared/paged_attention.cu.
+// Sources: csrc/qwen35/*.cu. The paged HD256 attention entry points are shared
+// with Gemma 4 and are declared in `shared.rs`.
 unsafe extern "C" {
     // Qwen3.5 full-attention prefill prep that writes K/V directly into paged KV.
     pub fn prefill_attention_hd256_prep_paged_cuda(
@@ -215,57 +216,4 @@ unsafe extern "C" {
         scale: f32,
         stream: CUstream,
     ) -> CUresult;
-}
-
-unsafe extern "C" {
-    // Paged attention decode for HEAD_DIM=256 (Qwen3.5-4B full-attention layers).
-    pub fn paged_attention_decode_cuda_hd256(
-        q: *const Half,
-        output: *mut Half,
-        kv_data: *const Half,
-        k_offset_elems: i64,
-        v_offset_elems: i64,
-        page_indices: *const i32,
-        page_indptr: *const i32,
-        last_page_len_d: *const i32,
-        request_indices: *const i32,
-        kv_tile_indices: *const i32,
-        kv_chunk_size_ptr: *const i32,
-        num_qo_heads: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-        page_size: i32,
-        batch_size: i32,
-        stride_page: i64,
-        sm_scale: f32,
-        stream: CUstream,
-    ) -> i32;
-
-    // Batch prefill with paged KV for HEAD_DIM=256 (Qwen3.5-4B multi-token prefill).
-    pub fn batch_prefill_paged_cuda_hd256(
-        q: *const Half,
-        output: *mut Half,
-        kv_data: *const Half,
-        k_offset_elems: i64,
-        v_offset_elems: i64,
-        page_indices: *const i32,
-        page_indptr: *const i32,
-        last_page_len_d: *const i32,
-        q_indptr: *const i32,
-        request_indices: *const i32,
-        qo_tile_indices: *const i32,
-        kv_tile_indices: *const i32,
-        kv_chunk_size_ptr: *const i32,
-        total_num_rows: *const u32,
-        num_qo_heads: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-        page_size: i32,
-        seq_len: i32,
-        batch_size: i32,
-        padded_batch_size: i32,
-        stride_page: i64,
-        sm_scale: f32,
-        stream: CUstream,
-    ) -> i32;
 }
