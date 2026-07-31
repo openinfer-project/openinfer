@@ -409,9 +409,46 @@ impl NativePdState {
         self.abandoned.retain_mut(AbandonedLoad::live);
     }
 
+    /// Teardown barrier: block (bounded) until every in-flight and abandoned
+    /// load settles. The offload engines — and after them the workers' arena
+    /// device memory — are about to drop, and pegaflow's worker still writes
+    /// the destination pages after a handle drops; an outstanding copy must
+    /// not outlive either.
+    pub(super) fn drain_loads(&mut self) {
+        for rank in 0..self.parked.len() {
+            self.scrap_pending(rank);
+        }
+        drain_abandoned(&mut self.abandoned, "native P/D");
+    }
+
     pub(super) fn clear(&mut self, rank: usize) {
         self.scrap_pending(rank);
         self.parked[rank] = None;
+    }
+}
+
+/// Bound on the teardown load-drain barrier. H2D copies are ms-scale; a
+/// pegaflow worker that cannot settle within this is stuck, and hanging
+/// teardown on it would be worse than the (pre-existing) unsettled-copy
+/// race it guards against — warn and proceed.
+const TEARDOWN_LOAD_DRAIN_DEADLINE: Duration = Duration::from_secs(5);
+
+fn drain_abandoned(abandoned: &mut Vec<AbandonedLoad>, what: &str) {
+    let deadline = Instant::now() + TEARDOWN_LOAD_DRAIN_DEADLINE;
+    loop {
+        abandoned.retain_mut(AbandonedLoad::live);
+        if abandoned.is_empty() {
+            return;
+        }
+        if Instant::now() >= deadline {
+            log::warn!(
+                "GLM5.2 {what} teardown: {} load(s) still unsettled after \
+                 {TEARDOWN_LOAD_DRAIN_DEADLINE:?}; proceeding with teardown",
+                abandoned.len()
+            );
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(2));
     }
 }
 
@@ -816,6 +853,12 @@ impl HostRestoreState {
         }
     }
 
+    /// Teardown barrier — see [`NativePdState::drain_loads`].
+    pub(super) fn drain_loads(&mut self) {
+        self.abandon_front();
+        drain_abandoned(&mut self.abandoned, "host-tier restore");
+    }
+
     /// Advance the front request's restore by one admission attempt: poll an
     /// in-flight load, or probe/query/submit a fresh one. `engine` is `None`
     /// only in offline contract tests; production callers always have the
@@ -1098,6 +1141,30 @@ mod tests {
 
         settle.send(Ok(())).expect("handle alive");
         state.reap();
+        assert_eq!(pool.available_blocks(), base);
+    }
+
+    #[test]
+    fn teardown_drain_settles_outstanding_loads_before_engines_drop() {
+        let pool = BlockPool::new(PAGE, 8).expect("pool");
+        let base = pool.available_blocks();
+        let prompt = vec![7_u32; 3 * PAGE];
+        let probe = pool.probe_prefix(prompt.clone(), None);
+        let reservation = pool.reserve_loaded_blocks(2).expect("2 pages fit");
+        let mut state = HostRestoreState {
+            pending: Some(PendingHostRestore {
+                fingerprint: (None, prompt.len()),
+                probe,
+                reservation,
+                handle: LoadHandle::settled(Ok(())),
+            }),
+            abandoned: Vec::new(),
+        };
+        state.drain_loads();
+        assert!(
+            state.abandoned.is_empty(),
+            "settled loads drain immediately"
+        );
         assert_eq!(pool.available_blocks(), base);
     }
 

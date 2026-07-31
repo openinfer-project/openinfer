@@ -1315,7 +1315,14 @@ impl Glm52Engine {
         // must outlive every D2H copy (the `with_arenas_on` contract), and
         // pegaflow's save worker cannot cancel a copy already handed to it.
         // `flush_saves` is deadline-bounded, so a stuck host tier cannot hang
-        // teardown.
+        // teardown. Admission loads first: an abandoned restore's H2D can
+        // still be writing arena memory (both barriers are deadline-bounded).
+        if let Some(state) = self.host_restore.as_mut() {
+            state.drain_loads();
+        }
+        if let Some(state) = self.native_pd.as_mut() {
+            state.drain_loads();
+        }
         if let Some(offload) = self.offload.take() {
             for rank in &offload {
                 rank.engine.flush_saves();
