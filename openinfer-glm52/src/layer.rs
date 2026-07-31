@@ -61,7 +61,7 @@ const HIDDEN: usize = GLM52_HIDDEN;
 pub(crate) enum Glm52LayerMlp {
     Dense(Box<Glm52DenseMlpWeights>),
     MoeEp8(Box<Glm52MoeEp8LayerWeights>),
-    /// TP8 topology: the router is the only per-layer MLP weight here — the
+    /// TP topology: the router is the only per-layer MLP weight here — the
     /// routed experts AND the shared expert live in the rank's slice bank
     /// (`Glm52MoeTpRank.slices`, shared folded at bank index 256).
     MoeTp(Box<crate::moe_decode::Glm52MoeRouterWeights>),
@@ -256,31 +256,10 @@ pub(crate) fn glm52_layer_attention_half(
         (&mut attn_hi[0], &attn_lo[0])
     };
     match tp_ar {
-        Some((tp, layer_slot)) => {
-            // Sharded: attend lands the o_proj partial in `ar_partial`; the
-            // AR brick sums the 8 ranks' partials into `attn_out`
-            // (bit-identical on every rank, fixed source order).
-            glm52_mla_attend_into(
-                ctx,
-                &w.mla,
-                &s.mla_front,
-                step.mla_cos,
-                step.mla_sin,
-                &mut caches.mla_cache,
-                step.slot_mapping,
-                &s.idx.global_slots,
-                step.seq_lens,
-                step.mla_sched,
-                &mut s.mla_attend,
-                &mut s.layer.ar_partial,
-            )?;
-            tp.attn_ar_launch(
-                ctx,
-                layer_slot,
-                tokens,
-                s.layer.ar_partial.data(),
-                attn_out.data_mut(),
-            )?;
+        Some(_) => {
+            anyhow::bail!(
+                "GLM5.2 TP4 is prefill-only; decode attention-TP LL allreduce was removed"
+            );
         }
         None => glm52_mla_attend_into(
             ctx,
@@ -406,7 +385,7 @@ pub(crate) fn glm52_decoder_layer_forward(
             s.layer.mlp_out.data_mut(),
         )?,
         Glm52LayerMlp::MoeEp8(_) | Glm52LayerMlp::MoeTp(_) => anyhow::bail!(
-            "GLM5.2 EP8/TP8 MoE layers require their collective drivers, not the single-layer forward"
+            "GLM5.2 EP/TP MoE layers require their collective drivers, not the single-layer forward"
         ),
     }
     glm52_layer_finish(ctx, s, 0, false)

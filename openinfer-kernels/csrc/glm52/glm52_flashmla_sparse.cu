@@ -8,7 +8,6 @@
 #include "params.h"
 #include "sm100/decode/head64/kernel.cuh"
 #include "sm100/prefill/sparse/fwd/head64/phase1.cuh"
-#include "sm90/decode/sparse_fp8/splitkv_mla.cuh"
 #include "smxx/decode/combine/combine.cu"
 #include "smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu"
 
@@ -54,7 +53,6 @@ CUresult run_flashmla_host(Fn&& fn) {
 }
 
 enum class FlashMlaArch {
-  Sm90,
   Sm100,
 };
 
@@ -68,12 +66,8 @@ CUresult current_flashmla_arch(cudaDeviceProp* prop, FlashMlaArch* arch) {
   err = cudaGetDeviceProperties(prop, device);
   if (err != cudaSuccess) return map_cuda_error(err);
 
-  if (prop->major == 9 && prop->minor == 0) {
-    *arch = FlashMlaArch::Sm90;
-    return CUDA_SUCCESS;
-  }
-  // sm_100f family (10.x) only: the device code is assembled as sm_100f, so
-  // a future 11.x device must get NOT_SUPPORTED here, not a launch failure.
+  // GLM5.2 is Blackwell-only (sm_100f family). Hopper SM90 decode was
+  // removed with the rest of the Hopper path.
   if (prop->major == 10) {
     *arch = FlashMlaArch::Sm100;
     return CUDA_SUCCESS;
@@ -268,10 +262,6 @@ extern "C" CUresult glm52_flashmla_sparse_decode_launch_cuda(
 
   result = run_flashmla_host([&] {
     switch (arch) {
-      case FlashMlaArch::Sm90:
-        sm90::decode::sparse_fp8::run_flash_splitkv_mla_fp8_sparse_kernel<
-            ModelType::V32, kHeads>(params);
-        break;
       case FlashMlaArch::Sm100:
         sm100::decode::head64::run_flash_splitkv_mla_fp8_sparse_kernel<
             ModelType::V32>(params);

@@ -23,11 +23,9 @@ use openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN;
 #[cfg(test)]
 use openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_PAGE_SIZE;
 use openinfer_kernels::ops::GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW;
-use openinfer_kernels::ops::GLM52_SPARSE_MLA_HEAD_SLOTS;
 use openinfer_kernels::ops::Glm52FlashInferSparseDecode;
 use openinfer_kernels::ops::Glm52FlashMlaSparseDecode;
 use openinfer_kernels::ops::Glm52MoeQuantShape;
-use openinfer_kernels::ops::Glm52SparseMlaDecode;
 use openinfer_kernels::ops::gemm_strided_batched_bf16;
 use openinfer_kernels::ops::glm52_flashinfer_sparse_mla_fp8_launch;
 use openinfer_kernels::ops::glm52_flashinfer_sparse_mla_supported;
@@ -37,7 +35,6 @@ use openinfer_kernels::ops::glm52_fp8_per_token_group_quant_bf16_ue8m0_launch;
 use openinfer_kernels::ops::glm52_mla_cache_pack_launch;
 use openinfer_kernels::ops::glm52_mla_front_pack_fp8_launch;
 use openinfer_kernels::ops::glm52_mla_query_assemble_launch;
-use openinfer_kernels::ops::glm52_sparse_mla_decode_launch;
 use openinfer_kernels::tensor::DeviceContext;
 
 use crate::config::GLM52_HEADS;
@@ -119,10 +116,6 @@ struct Glm52Fp8DsScratch {
 }
 
 enum Glm52Fp8DsAttendScratch {
-    Rightsize {
-        o_part: CudaSlice<f32>,
-        ml_part: CudaSlice<f32>,
-    },
     FlashMla {
         lse: CudaSlice<f32>,
         lse_accum: CudaSlice<f32>,
@@ -159,24 +152,14 @@ impl Glm52MlaAttendScratch {
         let t = contract.batch_size;
         let backend = match backend {
             Glm52MlaBackend::FlashMlaFp8Ds => {
-                let attend = if heads <= GLM52_SPARSE_MLA_HEAD_SLOTS {
-                    let rightsize = rightsize_contract(contract, heads);
-                    rightsize.validate()?;
-                    Glm52Fp8DsAttendScratch::Rightsize {
-                        o_part: ctx.stream.alloc_zeros::<f32>(rightsize.o_part_len())?,
-                        ml_part: ctx.stream.alloc_zeros::<f32>(rightsize.ml_part_len())?,
-                    }
-                } else {
-                    Glm52Fp8DsAttendScratch::FlashMla {
-                        lse: ctx.stream.alloc_zeros::<f32>(contract.lse_len())?,
-                        lse_accum: ctx.stream.alloc_zeros::<f32>(contract.lse_accum_len())?,
-                        o_accum: ctx.stream.alloc_zeros::<f32>(contract.o_accum_len())?,
-                    }
-                };
                 Glm52MlaBackendScratch::Fp8Ds(Box::new(Glm52Fp8DsScratch {
                     query: ctx.stream.alloc_zeros::<bf16>(t * HEADS * QUERY_DIM)?,
                     latent: ctx.stream.alloc_zeros::<bf16>(contract.latent_len())?,
-                    attend,
+                    attend: Glm52Fp8DsAttendScratch::FlashMla {
+                        lse: ctx.stream.alloc_zeros::<f32>(contract.lse_len())?,
+                        lse_accum: ctx.stream.alloc_zeros::<f32>(contract.lse_accum_len())?,
+                        o_accum: ctx.stream.alloc_zeros::<f32>(contract.o_accum_len())?,
+                    },
                     ckv_fp8: ctx.stream.alloc_zeros::<u8>(t * KV_LORA)?,
                     ckv_scales: ctx.stream.alloc_zeros::<f32>(t * (KV_LORA / FP8_BLOCK))?,
                 }))
@@ -200,16 +183,6 @@ impl Glm52MlaAttendScratch {
                 .stream
                 .alloc_zeros::<f32>(t * GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW)?,
         })
-    }
-}
-
-fn rightsize_contract(contract: &Glm52FlashMlaSparseDecode, heads: usize) -> Glm52SparseMlaDecode {
-    Glm52SparseMlaDecode {
-        batch_size: contract.batch_size,
-        num_blocks: contract.num_blocks,
-        topk: contract.topk,
-        heads,
-        sm_scale: contract.sm_scale,
     }
 }
 
@@ -281,7 +254,6 @@ pub(crate) struct Glm52MlaSchedMetadata {
 }
 
 enum Glm52MlaBackendSchedule {
-    Rightsize,
     FlashMla {
         tile_scheduler_metadata: CudaSlice<i32>,
         num_splits: CudaSlice<i32>,
@@ -302,14 +274,10 @@ impl Glm52MlaSchedMetadata {
     pub(crate) fn new_for_backend(
         ctx: &DeviceContext,
         contract: Glm52FlashMlaSparseDecode,
-        heads: usize,
+        _heads: usize,
         backend: Glm52MlaBackend,
     ) -> Result<Self> {
         let backend = match backend {
-            Glm52MlaBackend::FlashMlaFp8Ds if heads <= GLM52_SPARSE_MLA_HEAD_SLOTS => {
-                rightsize_contract(&contract, heads).validate()?;
-                Glm52MlaBackendSchedule::Rightsize
-            }
             Glm52MlaBackend::FlashMlaFp8Ds => {
                 let mut tile_scheduler_metadata = ctx
                     .stream
@@ -366,10 +334,7 @@ pub(crate) fn glm52_mla_backend_preflight(
     let contract = sched.contract;
     let heads = s.heads;
     let (query, latent, workspace) = match (&sched.backend, &mut s.backend) {
-        (
-            Glm52MlaBackendSchedule::Rightsize | Glm52MlaBackendSchedule::FlashMla { .. },
-            Glm52MlaBackendScratch::Fp8Ds(_),
-        ) => {
+        (Glm52MlaBackendSchedule::FlashMla { .. }, Glm52MlaBackendScratch::Fp8Ds(_)) => {
             return Ok(());
         }
         (Glm52MlaBackendSchedule::FlashInfer, Glm52MlaBackendScratch::FlashInfer(scratch)) => (
@@ -467,8 +432,7 @@ pub(crate) fn glm52_mla_attend_into(
 
     let (latent, latent_token_stride) = match (&sched.backend, &mut s.backend) {
         (
-            schedule @ (Glm52MlaBackendSchedule::Rightsize
-            | Glm52MlaBackendSchedule::FlashMla { .. }),
+            schedule @ (Glm52MlaBackendSchedule::FlashMla { .. }),
             Glm52MlaBackendScratch::Fp8Ds(scratch),
         ) => {
             glm52_mla_query_assemble_launch(
@@ -510,19 +474,6 @@ pub(crate) fn glm52_mla_attend_into(
                 slot_mapping,
             )?;
             match (schedule, &mut scratch.attend) {
-                (
-                    Glm52MlaBackendSchedule::Rightsize,
-                    Glm52Fp8DsAttendScratch::Rightsize { o_part, ml_part },
-                ) => glm52_sparse_mla_decode_launch(
-                    ctx,
-                    rightsize_contract(&contract, heads),
-                    &scratch.query,
-                    cache,
-                    topk,
-                    o_part,
-                    ml_part,
-                    &mut scratch.latent,
-                )?,
                 (
                     Glm52MlaBackendSchedule::FlashMla {
                         tile_scheduler_metadata,

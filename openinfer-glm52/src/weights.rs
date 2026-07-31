@@ -268,7 +268,7 @@ impl Glm52WeightManifest {
             .collect()
     }
 
-    /// Shard file holding `name` (TP8 slice second-pass loads resolve every
+    /// Shard file holding `name` (TP slice second-pass loads resolve every
     /// expert's tensors, not just this rank's 32-expert bundle).
     pub(crate) fn shard_for(&self, name: &str) -> Result<&str> {
         self.weight_map
@@ -340,8 +340,8 @@ impl Glm52WeightManifest {
     }
 
     /// Tensors that must become GPU-resident for one serving rank. MTP layer
-    /// 78 enters the EP plan only when native MTP is enabled. TP8 gets all
-    /// routed + shared experts from `load_tp8_slice_layer`, so its first pass
+    /// 78 enters the EP plan only when native MTP is enabled. TP4 gets all
+    /// routed + shared experts from `load_tp_slice_layer`, so its first pass
     /// loads routers but not duplicate full shared-expert projections.
     fn rank_resident_tensor_names(
         &self,
@@ -759,23 +759,23 @@ mod tests {
         let ep8 = manifest
             .rank_resident_tensor_names(0, crate::Glm52MoeTopo::Ep8, false)
             .unwrap();
-        let tp8 = manifest
-            .rank_resident_tensor_names(0, crate::Glm52MoeTopo::Tp8, false)
+        let tp4 = manifest
+            .rank_resident_tensor_names(0, crate::Glm52MoeTopo::Tp4, false)
             .unwrap();
 
         let mtp_prefix = format!("model.layers.{GLM52_MTP_LAYER}.");
         assert!(ep8.iter().all(|name| !name.starts_with(&mtp_prefix)));
-        assert!(tp8.iter().all(|name| !name.starts_with(&mtp_prefix)));
+        assert!(tp4.iter().all(|name| !name.starts_with(&mtp_prefix)));
         assert!(ep8.iter().any(|name| name.contains(".mlp.shared_experts.")));
         assert!(
-            tp8.iter()
+            tp4.iter()
                 .all(|name| !name.contains(".mlp.shared_experts."))
         );
         assert!(
             ep8.iter()
                 .any(|name| name.contains(".mlp.experts.0.gate_proj.weight"))
         );
-        assert!(tp8.iter().all(|name| !name.contains(".mlp.experts.")));
+        assert!(tp4.iter().all(|name| !name.contains(".mlp.experts.")));
     }
 
     #[test]

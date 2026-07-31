@@ -23,7 +23,7 @@
 //! consecutive prompt positions through one step; decode slots feed one
 //! row), idle slots feed a padding row whose output is discarded. The
 //! bucket is the smallest member of `GLM52_DECODE_BUCKETS` covering the
-//! rank's own row demand. The TP8/TP4 replicated topologies are the N=1
+//! rank's own row demand. The TP4 replicated topology is the N=1
 //! special case: ONE logical rank's engine drives every mirrored worker
 //! with the identical step, and the join asserts bit-identical results (the
 //! replicated-activations contract); as the sole issuer of its collectives
@@ -207,11 +207,8 @@ pub(crate) struct Glm52Engine {
     /// Tensor-replicated topology: this rank drives mirrored executors with
     /// identical steps (bit-identical outputs asserted at the join).
     mirrored: bool,
-    /// TP8's phase kernels retain their original single bucket-8 contract.
-    full_bucket: bool,
-    /// Verify-span draft budget: EP8 feeds 3 (the measured bucket-4 optimum);
-    /// the tp8 full-bucket shape always computes 8 rows, so it feeds the
-    /// drafter's full proposal.
+    /// Verify-span draft budget: EP feeds 3 (the measured bucket-4 optimum);
+    /// TP4 mirrored topology feeds the drafter's full proposal.
     span_drafts: usize,
     pool: BlockPool,
     table_width: usize,
@@ -294,7 +291,7 @@ impl Glm52Engine {
         // One KV page pool for this rank: pool block ids index the rank's
         // per-layer MLA and index-K arenas directly (the arenas were built
         // for `glm52_pool_blocks` blocks). Block 0-equivalent is the reserved
-        // padding page. Under tp8 the single pool drives every executor — the
+        // padding page. Under mirrored TP the single pool drives every executor — the
         // mirrored steps write the identical block ids on all 8 arenas.
         let pool = BlockPool::new(
             PAGE,
@@ -334,7 +331,6 @@ impl Glm52Engine {
             graph_dump_request: spec.graph_dump_request,
             startup_tx: spec.startup_tx,
             mirrored,
-            full_bucket: matches!(spec.moe_topo, crate::Glm52MoeTopo::Tp8),
             span_drafts: if mirrored {
                 crate::dspark::GLM52_DSPARK_DRAFTS
             } else {
@@ -375,12 +371,10 @@ impl Glm52Engine {
                 std::slice::from_ref(&self.pool),
                 self.table_width,
                 self.mirrored,
-                self.full_bucket,
             )?;
         }
         if let Some((png_path, response)) = self.graph_dump_request.take() {
-            match dump_rank0_decode_graph(&self.workers, self.moe_topo, self.full_bucket, png_path)
-            {
+            match dump_rank0_decode_graph(&self.workers, self.moe_topo, png_path) {
                 Ok(summary) => {
                     let _ = response.send(Ok(summary));
                 }
@@ -465,7 +459,7 @@ impl Glm52Engine {
             let consume = self.leased_shape.is_some();
             let shape = match self.leased_shape.take() {
                 Some(leased) => leased,
-                None => plan_step_shape(&feed_wants(&self.slots), self.full_bucket),
+                None => plan_step_shape(&feed_wants(&self.slots)),
             };
             let flags = lease_flags(
                 consume,
@@ -498,9 +492,8 @@ impl Glm52Engine {
                 self.release_deferred();
             }
 
-            // TP8 speculative policy: draft only when the rank is solo — a
-            // concurrent batch's bucket rows go to liveness first, and
-            // feeding partial verify spans there is unmeasured territory.
+            // Mirrored-TP speculative policy: draft only when the rank is
+            // solo — a concurrent batch's bucket rows go to liveness first.
             // Suppress the proposals (appends and resets still flow, so the
             // drafter's shadow KV stays fresh and proposals resume the round
             // after the batch drains back to solo). Drafts already installed

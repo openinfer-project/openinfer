@@ -1,4 +1,4 @@
-//! Shared GLM5.2 MoE weights and router used by the EP8 and TP8 production
+//! Shared GLM5.2 MoE weights and router used by the EP and TP production
 //! paths.
 
 use anyhow::Result;

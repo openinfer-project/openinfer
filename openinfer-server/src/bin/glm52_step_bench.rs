@@ -4,9 +4,9 @@
 //!
 //! EP8 slot placement is least-loaded-rank-first, so submitting `8 × bucket`
 //! concurrent requests pins every rank at `bucket` resident rows. Tensor-
-//! replicated topologies (`tp8`/`tp4`) have one logical rank with eight slots,
-//! so `--buckets 1` submits eight streams and fills the single mirrored
-//! bucket-8 shape. Each request gets distinct random prompt ids because
+//! replicated topologies (`tp4`) have one logical rank with eight slots, so
+//! `--buckets 1` submits eight streams across the mirrored workers. Each
+//! request gets distinct random prompt ids because
 //! identical prompts under-measure MoE decode via degenerate expert routing.
 //!
 //!   cargo run -r --bin glm52_step_bench --features glm52 -- \
@@ -64,12 +64,10 @@ struct Cli {
     /// full-load bucket sweep above. 0 = off.
     #[arg(long, default_value_t = 0)]
     ingest_tokens: usize,
-    /// MoE topology: ep8 (default, all buckets), tp8, or tp4. Tensor-
-    /// replicated topologies expose ONE logical rank with 8 slots, so a
-    /// bucket value there IS the concurrency (1..=8). TP4 maps it onto its
-    /// compact 1/2/4/8 decode graphs; TP8 always replays its single bucket-8
-    /// graph (pad rows ride free slots), so smaller values measure
-    /// bucket-8-with-pads.
+    /// MoE topology: ep8 (default, all buckets) or tp4. Tensor-replicated
+    /// topologies expose ONE logical rank with 8 slots, so a bucket value
+    /// there IS the concurrency (1..=8). TP4 maps it onto its compact
+    /// 1/2/4/8 decode graphs.
     #[arg(long, default_value = "ep8")]
     moe_topo: String,
     /// GLM5.2 global DP ranks this process hosts, `start..end` — same
@@ -248,10 +246,7 @@ fn bench_concurrency(bucket: usize, moe_topo: openinfer_glm52::Glm52MoeTopo) -> 
 }
 
 fn is_tensor_replicated_moe(moe_topo: openinfer_glm52::Glm52MoeTopo) -> bool {
-    matches!(
-        moe_topo,
-        openinfer_glm52::Glm52MoeTopo::Tp8 | openinfer_glm52::Glm52MoeTopo::Tp4
-    )
+    matches!(moe_topo, openinfer_glm52::Glm52MoeTopo::Tp4)
 }
 
 fn run_stream(

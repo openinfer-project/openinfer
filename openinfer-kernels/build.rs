@@ -26,12 +26,6 @@ struct NvccTask {
     args: Vec<String>,
 }
 
-struct TileLangArtifacts {
-    cu_files: Vec<PathBuf>,
-    template_include: PathBuf,
-    cutlass_include: PathBuf,
-}
-
 struct FlashInferIncludes {
     include: PathBuf,
     csrc: PathBuf,
@@ -520,9 +514,8 @@ fn glm52_flashmla_sparse_arch_args(normalized_sms: &[String], nvcc: &str) -> Vec
     args
 }
 
-/// Arch args for the AOT-instantiated DeepGEMM MQA kernels. Hopper uses the
-/// sm90a implementation; Blackwell uses the sm100 implementation and must be
-/// assembled as sm_100f because it contains tcgen05 instructions.
+/// Arch args for the AOT-instantiated DeepGEMM MQA kernels. GLM5.2 is
+/// Blackwell-only: assembled as sm_100f (tcgen05). Hopper SM90A path removed.
 fn glm52_deepgemm_mqa_arch_args(
     normalized_sms: &[String],
     nvcc: &str,
@@ -530,17 +523,7 @@ fn glm52_deepgemm_mqa_arch_args(
     let has_sm100 = normalized_sms
         .iter()
         .any(|sm| sm_numeric_prefix(sm).is_some_and(|n| (100..120).contains(&n)));
-    let has_sm90 = normalized_sms.iter().any(|sm| sm == "90" || sm == "90a");
     if has_sm100 && nvcc_accepts_gencode(nvcc, "100f", "100f") {
-        if has_sm90 {
-            // The TU host-selects exactly one arch (#elif), so a mixed 90+100
-            // target list ships no Hopper MQA indexer — decode on the Hopper
-            // device would launch-fail. Warn instead of silently dropping it.
-            println!(
-                "cargo:warning=GLM5.2 DeepGEMM MQA compiles sm_100f ONLY in this mixed-SM \
-                 build; the sm_90 target gets no MQA indexer and fails at first decode"
-            );
-        }
         return Some((
             vec![
                 "-gencode".to_string(),
@@ -550,24 +533,7 @@ fn glm52_deepgemm_mqa_arch_args(
         ));
     }
 
-    if has_sm90 && nvcc_accepts_gencode(nvcc, "90a", "90a") {
-        return Some((
-            nvcc_arch_args(&["90a".to_string()]),
-            "-DGLM52_DEEPGEMM_MQA_SM90A".to_string(),
-        ));
-    }
-
     None
-}
-
-/// Arch args for TUs whose device code is raw Hopper wgmma: sm_90a ONLY — the
-/// instantiation cannot even be ptxas-assembled for other targets. Returns
-/// `None` when no sm_90 target is present (or nvcc lacks 90a); the TU then
-/// compiles its NOT_SUPPORTED stub for the requested targets instead.
-fn glm52_sm90a_only_arch_args(normalized_sms: &[String], nvcc: &str) -> Option<Vec<String>> {
-    let has_sm90 = normalized_sms.iter().any(|sm| sm == "90" || sm == "90a");
-    (has_sm90 && nvcc_accepts_gencode(nvcc, "90a", "90a"))
-        .then(|| nvcc_arch_args(&["90a".to_string()]))
 }
 
 fn collect_files_recursively(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -793,143 +759,6 @@ fn find_triton_python() -> Result<String, String> {
         "Could not find a Python interpreter with Triton installed. Set OPENINFER_TRITON_PYTHON, bootstrap .venv, or ensure `python3 -c 'import triton'` works. Probe results: {}.",
         diagnostics.join(" | ")
     ))
-}
-
-fn probe_tilelang_python(candidate: &str) -> Result<String, String> {
-    let output = Command::new(candidate)
-        .args(["-c", "import tilelang"])
-        .output()
-        .map_err(|err| format!("{candidate}: {err}"))?;
-
-    if output.status.success() {
-        Ok(candidate.to_string())
-    } else {
-        Err(format!(
-            "{candidate}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
-    }
-}
-
-fn find_tilelang_python() -> Result<String, String> {
-    if let Ok(candidate) = std::env::var("OPENINFER_TILELANG_PYTHON") {
-        let candidate = candidate.trim();
-        if candidate.is_empty() {
-            return Err("OPENINFER_TILELANG_PYTHON is set but empty.".to_string());
-        }
-        return probe_tilelang_python(candidate).map_err(|message| {
-            format!("OPENINFER_TILELANG_PYTHON=`{candidate}` could not import TileLang: {message}")
-        });
-    }
-
-    let local_venv = workspace_root().join("../.venv/bin/python");
-    let workspace_venv = workspace_root().join(".venv/bin/python");
-    let mut diagnostics = Vec::new();
-    let mut candidates = Vec::new();
-    if local_venv.exists() {
-        candidates.push(local_venv.to_string_lossy().to_string());
-    }
-    if workspace_venv.exists() {
-        candidates.push(workspace_venv.to_string_lossy().to_string());
-    }
-    candidates.extend(["python3".to_string(), "python".to_string()]);
-
-    for candidate in candidates {
-        match probe_tilelang_python(&candidate) {
-            Ok(path) => return Ok(path),
-            Err(message) => diagnostics.push(message),
-        }
-    }
-
-    Err(format!(
-        "Could not find a Python interpreter with TileLang installed. Probe results: {}.",
-        diagnostics.join(" | ")
-    ))
-}
-
-fn generate_tilelang_artifacts(out_dir: &Path, model_dir: &str, label: &str) -> TileLangArtifacts {
-    let python = find_tilelang_python().unwrap_or_else(|message| {
-        panic!("{label} TileLang kernels require TileLang at build time: {message}")
-    });
-
-    let root = crate_root();
-    let generator_path = root.join(format!("tools/tilelang/{model_dir}/generate.py"));
-    assert!(
-        generator_path.exists(),
-        "{label} TileLang generator is missing: {}",
-        generator_path.display()
-    );
-
-    let artifact_dir = out_dir.join("tilelang").join(model_dir);
-    let output = time_phase(format!("tilelang-gen {model_dir}"), || {
-        Command::new(&python)
-            .arg(&generator_path)
-            .arg("--out-dir")
-            .arg(&artifact_dir)
-            .output()
-            .unwrap_or_else(|err| panic!("failed to run {label} TileLang generator: {err}"))
-    });
-    assert!(
-        output.status.success(),
-        "{label} TileLang generator failed. stdout: {} stderr: {}",
-        String::from_utf8_lossy(&output.stdout).trim(),
-        String::from_utf8_lossy(&output.stderr).trim(),
-    );
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut cu_path = None;
-    let mut template_include = None;
-    let mut cutlass_include = None;
-    for line in stdout.lines() {
-        if let Some(value) = line.strip_prefix("CU_PATH=") {
-            cu_path = Some(PathBuf::from(value.trim()));
-        } else if let Some(value) = line.strip_prefix("TILELANG_TEMPLATE_PATH=") {
-            template_include = Some(PathBuf::from(value.trim()));
-        } else if let Some(value) = line.strip_prefix("CUTLASS_INCLUDE_DIR=") {
-            cutlass_include = Some(PathBuf::from(value.trim()));
-        }
-    }
-
-    let cu_path =
-        cu_path.unwrap_or_else(|| panic!("{label} TileLang generator did not print CU_PATH"));
-    let template_include = template_include.unwrap_or_else(|| {
-        panic!("{label} TileLang generator did not print TILELANG_TEMPLATE_PATH")
-    });
-    let cutlass_include = cutlass_include
-        .unwrap_or_else(|| panic!("{label} TileLang generator did not print CUTLASS_INCLUDE_DIR"));
-
-    println!(
-        "cargo:warning=Using {label} TileLang generated CUDA: {}",
-        cu_path.display()
-    );
-    println!("cargo:rerun-if-changed={}", generator_path.display());
-    println!("cargo:rerun-if-env-changed=OPENINFER_TILELANG_PYTHON");
-
-    TileLangArtifacts {
-        cu_files: vec![cu_path],
-        template_include,
-        cutlass_include,
-    }
-}
-
-/// The GLM5.2 sparse MLA main kernel is TileLang-generated Hopper wgmma
-/// (sm_90a only). Without an sm_90 target the launcher compiles as this
-/// stub so non-Hopper builds of the `glm52` feature need neither TileLang
-/// nor Python; the decode path then fails fast with cudaErrorNotSupported.
-fn write_glm52_tilelang_stub(out_dir: &Path) -> PathBuf {
-    let stub_path = out_dir.join("glm52_tilelang_sparse_mla_stub.cu");
-    std::fs::write(
-        &stub_path,
-        "// Generated by openinfer-kernels/build.rs: no sm_90a target.\n\
-         #include <cuda_runtime.h>\n\
-         extern \"C\" int glm52_tilelang_sparse_mla_decode(\n\
-             const void*, const void*, const int*, float*, float*, int,\n\
-             long long, int, int, int, cudaStream_t) {\n\
-           return static_cast<int>(cudaErrorNotSupported);\n\
-         }\n",
-    )
-    .unwrap_or_else(|err| panic!("failed to write GLM5.2 TileLang stub: {err}"));
-    stub_path
 }
 
 fn first_existing_dir(candidates: &[PathBuf], fallback: PathBuf) -> PathBuf {
@@ -1431,17 +1260,6 @@ fn main() {
     if glm52_enabled {
         generate_glm52_trtllm_fmha_cubins(&crate_root(), &out_dir);
     }
-    let glm52_tilelang_artifacts = if glm52_enabled {
-        glm52_sm90a_only_arch_args(&nvcc_sm_targets, &nvcc)
-            .map(|_| generate_tilelang_artifacts(&out_dir, "glm52", "GLM5.2"))
-    } else {
-        None
-    };
-    if glm52_enabled && glm52_tilelang_artifacts.is_none() {
-        println!(
-            "cargo:warning=No sm_90a target; GLM5.2 TileLang sparse MLA compiles as a NOT_SUPPORTED stub"
-        );
-    }
     println!(
         "cargo:warning=Detected CUDA SM targets: {}",
         sm_targets
@@ -1564,17 +1382,7 @@ fn main() {
                 nvcc_args.push(mqa_define);
             } else {
                 println!(
-                    "cargo:warning=No sm_90a or sm_100f target; GLM5.2 DeepGEMM {stem} kernels compile as NOT_SUPPORTED stubs"
-                );
-                nvcc_args.extend(arch_args.clone());
-            }
-        } else if stem == "glm52_deepgemm_grouped" {
-            if let Some(sm90a_args) = glm52_sm90a_only_arch_args(&nvcc_sm_targets, &nvcc) {
-                nvcc_args.extend(sm90a_args);
-                nvcc_args.push("-DGLM52_DEEPGEMM_GROUPED_SM90A".to_string());
-            } else {
-                println!(
-                    "cargo:warning=No sm_90a target; GLM5.2 DeepGEMM {stem} kernels compile as NOT_SUPPORTED stubs"
+                    "cargo:warning=No sm_100f target; GLM5.2 DeepGEMM {stem} kernels compile as NOT_SUPPORTED stubs"
                 );
                 nvcc_args.extend(arch_args.clone());
             }
@@ -1737,7 +1545,7 @@ fn main() {
                 "-I".to_string(),
                 flashinfer.spdlog.to_string_lossy().to_string(),
             ]);
-        } else if stem == "glm52_deepgemm_mqa" || stem == "glm52_deepgemm_grouped" {
+        } else if stem == "glm52_deepgemm_mqa" {
             // DeepGEMM paged MQA + masked grouped GEMM kernels,
             // AOT-instantiated from the vendored device headers (torch-free
             // via DG_NO_TORCH, no runtime JIT). Needs DeepGEMM csrc headers +
@@ -1789,67 +1597,6 @@ fn main() {
         println!(
             "cargo:warning=Kimi-K2 CUDA kernels disabled; enable the openinfer-kernels `kimi-k2` feature to build them"
         );
-    }
-
-    let mut tilelang_compile_jobs = Vec::new();
-    if let Some(artifacts) = glm52_tilelang_artifacts {
-        // TileLang-generated Hopper wgmma: sm_90a only (see
-        // glm52_sm90a_only_arch_args); artifact generation already required it.
-        let sm90a_args = glm52_sm90a_only_arch_args(&nvcc_sm_targets, &nvcc)
-            .expect("GLM5.2 TileLang artifacts generated without an sm_90a target");
-        tilelang_compile_jobs.push((artifacts, sm90a_args));
-    } else if glm52_enabled {
-        let stub_path = write_glm52_tilelang_stub(&out_dir);
-        let obj_file = out_dir.join("glm52_tilelang_sparse_mla_stub_cuda.o");
-        let mut nvcc_args = vec![
-            "-c".to_string(),
-            stub_path.to_string_lossy().to_string(),
-            "-o".to_string(),
-            obj_file.to_string_lossy().to_string(),
-            "-O3".to_string(),
-            "-I".to_string(),
-            cuda_include.to_string_lossy().to_string(),
-        ];
-        nvcc_args.extend(arch_args);
-        nvcc_args.extend(["--compiler-options".to_string(), "-fPIC".to_string()]);
-        nvcc_tasks.push(NvccTask {
-            cu_file: stub_path,
-            obj_file,
-            args: nvcc_args,
-        });
-    }
-    for (artifacts, job_arch_args) in tilelang_compile_jobs {
-        for cu_file in artifacts.cu_files {
-            let stem = cu_file.file_stem().unwrap().to_str().unwrap();
-            let obj_file = out_dir.join(format!("{stem}_cuda.o"));
-            let mut nvcc_args = vec![
-                "-c".to_string(),
-                cu_file.to_string_lossy().to_string(),
-                "-o".to_string(),
-                obj_file.to_string_lossy().to_string(),
-                "-O3".to_string(),
-                "-I".to_string(),
-                cuda_include.to_string_lossy().to_string(),
-            ];
-            nvcc_args.extend(job_arch_args.clone());
-            nvcc_args.extend([
-                "--std=c++20".to_string(),
-                "--compiler-options".to_string(),
-                "-fPIC".to_string(),
-                "-w".to_string(),
-                "-Xcudafe".to_string(),
-                "--diag_suppress=177".to_string(),
-                "-I".to_string(),
-                artifacts.template_include.to_string_lossy().to_string(),
-                "-I".to_string(),
-                artifacts.cutlass_include.to_string_lossy().to_string(),
-            ]);
-            nvcc_tasks.push(NvccTask {
-                cu_file,
-                obj_file,
-                args: nvcc_args,
-            });
-        }
     }
 
     nvcc_tasks.sort_by_key(|task| nvcc_task_priority(&task.cu_file));

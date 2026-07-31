@@ -7,15 +7,11 @@ use cudarc::driver::CudaSlice;
 use openinfer_kernels::ops::add_scaled_bf16_into;
 use openinfer_kernels::ops::argmax_bf16_split_into;
 use openinfer_kernels::ops::copy_hidden_rows_raw_into;
-use openinfer_kernels::ops::glm52_vocab_parallel_pack_launch;
-use openinfer_kernels::ops::glm52_vocab_parallel_unpack_launch;
 use openinfer_kernels::ops::rms_norm_rows_into;
 use openinfer_kernels::tensor::DeviceContext;
 use openinfer_kernels::tensor::DeviceMatrix;
 use openinfer_kernels::tensor::DeviceVec;
 
-use super::GLM52_MAX_BATCH_PER_RANK;
-use super::VOCAB_AR_SLOT;
 use crate::bookend::glm52_embed_into;
 use crate::bookend::glm52_final_norm_into;
 use crate::bookend::glm52_lm_head_into;
@@ -60,13 +56,10 @@ pub(super) fn run_step_body(
     global_tokens: usize,
 ) -> Result<()> {
     let batch = step.mla_sched.batch();
-    // TP8 step head: advance the shared LL epoch exactly once per replayed
-    // step that runs TP8 kernels (all TP8 layers of the step share the tag;
-    // per-layer slot regions alternate parity across steps).
-    if let Some(rank) = tp.as_deref_mut()
+    if let Some(rank) = tp.as_ref()
         && !rank.slices.is_empty()
     {
-        rank.state.advance_epoch(ctx)?;
+        anyhow::bail!("GLM5.2 TP4 is prefill-only; decode whole-step path (LL MoE/AR) was removed");
     }
     glm52_embed_into(ctx, embed, token_ids, &mut s.hidden)?;
     // Layer 0's input norm is standalone (the embedding is the residual);
@@ -123,52 +116,8 @@ pub(super) fn run_step_body(
                 glm52_moe_ep_layer(ctx, aux, ep8, moe, s, batch, global_tokens)
                     .with_context(|| format!("GLM5.2 layer {layer} EP MoE"))?;
             }
-            Glm52LayerMlp::MoeTp(router) => {
-                let (state, slot, bank) = tp
-                    .as_deref_mut()
-                    .and_then(|rank| rank.layer_bank(layer))
-                    .with_context(|| {
-                        format!("GLM5.2 TP8 layer {layer} has no slice bank — loader drifted")
-                    })?;
-                // Every rank routes all rows locally — bit-identical across
-                // ranks (same kernel, same replicated normed2), so the
-                // kernel's union and prob table need no routing exchange.
-                run_router_into(ctx, router, s.layer.normed2.data(), &mut s.router)?;
-                if batch == GLM52_MAX_BATCH_PER_RANK {
-                    state.forward(
-                        ctx,
-                        slot,
-                        bank,
-                        s.layer.normed2.data(),
-                        &s.router.route.topk_idx,
-                        &s.router.route.topk_weight,
-                        s.layer.mlp_out.data_mut(),
-                    )?;
-                } else {
-                    // TP4 keeps the proven eight-row MoE ABI while allowing
-                    // every other layer component to use bucket 1/2/4.
-                    copy_hidden_rows_raw_into(
-                        ctx,
-                        s.layer.normed2.data(),
-                        GLM52_HIDDEN,
-                        &mut s.tp_normed2,
-                        GLM52_HIDDEN,
-                        0,
-                        batch,
-                    )?;
-                    state.forward(
-                        ctx,
-                        slot,
-                        bank,
-                        &s.tp_normed2,
-                        &s.router.route.topk_idx,
-                        &s.router.route.topk_weight,
-                        &mut s.tp_mlp_out,
-                    )?;
-                    // The active rows are the contiguous prefix. The closing
-                    // residual/norm reads them directly from the padded output.
-                    tp_padded_mlp = true;
-                }
+            Glm52LayerMlp::MoeTp(_) => {
+                anyhow::bail!("GLM5.2 TP4 is prefill-only; decode MoE TP path was removed");
             }
         }
         if layer + 1 < layers.len() {
@@ -220,45 +169,13 @@ pub(super) fn run_step_body(
         &mut s.argmax_indices,
     )?;
 
-    if let Some(rank) = tp {
-        ensure!(
-            lm_head.rows * rank.state.ranks() == GLM52_VOCAB
-                && vocab_start == rank.state.rank() * lm_head.rows,
-            "GLM5.2 vocab shard [{vocab_start}..{}) does not match TP rank {}/{}",
-            vocab_start + lm_head.rows,
-            rank.state.rank(),
-            rank.state.ranks()
-        );
-        glm52_vocab_parallel_pack_launch(
-            ctx,
-            &s.argmax_values,
-            &s.argmax_indices,
-            s.layer.ar_partial.data_mut(),
-            batch,
-            rank.state.rank(),
-            vocab_start,
-        )?;
-        rank.state.attn_ar_launch(
-            ctx,
-            VOCAB_AR_SLOT,
-            batch,
-            s.layer.ar_partial.data(),
-            s.layer.attn[0].data_mut(),
-        )?;
-        glm52_vocab_parallel_unpack_launch(
-            ctx,
-            s.layer.attn[0].data(),
-            &mut s.argmax_values,
-            &mut s.argmax_indices,
-            batch,
-            rank.state.ranks(),
-        )?;
-    } else {
-        ensure!(
-            lm_head.rows == GLM52_VOCAB && vocab_start == 0,
-            "GLM5.2 non-TP decode received a sharded vocabulary head"
-        );
+    if tp.is_some() {
+        anyhow::bail!("GLM5.2 TP4 is prefill-only; decode vocab-parallel LL allreduce was removed");
     }
+    ensure!(
+        lm_head.rows == GLM52_VOCAB && vocab_start == 0,
+        "GLM5.2 non-TP decode received a sharded vocabulary head"
+    );
     Ok(())
 }
 

@@ -57,23 +57,12 @@ pub(super) fn padding_step_kv(
 /// so co-resident prefills drain in parallel; padding rows ride the free
 /// slots. Span rows are emitted as one contiguous run per slot — the
 /// [`Glm52StepShape`] contract.
-/// `full_bucket` pins the bucket to `GLM52_MAX_BATCH_PER_RANK` regardless of
-/// demand: the TP8 replicated topology serves exactly one graph shape (the
-/// MoE phase kernels are fixed 8-row), so solo decode rides 7 padding rows
-/// instead of a smaller bucket.
-pub(super) fn plan_step_shape(
-    wants: &[usize; GLM52_MAX_BATCH_PER_RANK],
-    full_bucket: bool,
-) -> Glm52StepShape {
+pub(super) fn plan_step_shape(wants: &[usize; GLM52_MAX_BATCH_PER_RANK]) -> Glm52StepShape {
     let demand = wants.iter().sum::<usize>().min(GLM52_MAX_BATCH_PER_RANK);
-    let bucket = if full_bucket {
-        GLM52_MAX_BATCH_PER_RANK
-    } else {
-        *GLM52_DECODE_BUCKETS
-            .iter()
-            .find(|&&rows| rows >= demand.max(1))
-            .expect("the largest bucket covers every demand by construction")
-    };
+    let bucket = *GLM52_DECODE_BUCKETS
+        .iter()
+        .find(|&&rows| rows >= demand.max(1))
+        .expect("the largest bucket covers every demand by construction");
     let spans = plan_prefill_spans(wants, bucket);
     let mut slots: [u8; GLM52_MAX_BATCH_PER_RANK] = std::array::from_fn(|slot| slot as u8);
     let mut dst = 0usize;
@@ -487,54 +476,19 @@ mod tests {
     }
 
     #[test]
-    fn full_bucket_pins_the_shape_to_the_max() {
-        // TP8 replicated: one graph shape. A mid-prefill request wanting 5
-        // rows takes 5 rows + 3 pads.
-        let mut wants = decode_wants(0);
-        wants[0] = 5;
-        let shape = plan_step_shape(&wants, true);
-        assert_eq!(forwarded(&shape), (8, vec![0, 0, 0, 0, 0, 1, 2, 3]));
-        assert_eq!(shape.active_rows, 5);
-
-        // Solo single-token decode still rides the full bucket (7 pads) —
-        // the MoE phase kernels are fixed 8-row.
-        assert_eq!(
-            forwarded(&plan_step_shape(&decode_wants(1), true)),
-            (8, vec![0, 1, 2, 3, 4, 5, 6, 7])
-        );
-
-        // Concurrency packs actives first, then pads.
-        assert_eq!(
-            forwarded(&plan_step_shape(&decode_wants(3), true)),
-            (8, vec![0, 1, 2, 3, 4, 5, 6, 7])
-        );
-
-        // A verify span (slot wants 8) owns the whole bucket.
-        let mut wants = decode_wants(0);
-        wants[0] = 8;
-        assert_eq!(forwarded(&plan_step_shape(&wants, true)), (8, vec![0; 8]));
-    }
-
-    #[test]
     fn bucket_is_the_smallest_covering_the_ranks_own_demand() {
+        assert_eq!(forwarded(&plan_step_shape(&decode_wants(0))), (1, vec![0]));
+        assert_eq!(forwarded(&plan_step_shape(&decode_wants(1))), (1, vec![0]));
         assert_eq!(
-            forwarded(&plan_step_shape(&decode_wants(0), false)),
-            (1, vec![0])
-        );
-        assert_eq!(
-            forwarded(&plan_step_shape(&decode_wants(1), false)),
-            (1, vec![0])
-        );
-        assert_eq!(
-            forwarded(&plan_step_shape(&decode_wants(2), false)),
+            forwarded(&plan_step_shape(&decode_wants(2))),
             (2, vec![0, 1])
         );
         assert_eq!(
-            forwarded(&plan_step_shape(&decode_wants(3), false)),
+            forwarded(&plan_step_shape(&decode_wants(3))),
             (4, vec![0, 1, 2, 3])
         );
         // Past the 4-row bucket the full batch takes over.
-        assert_eq!(plan_step_shape(&decode_wants(5), false).bucket, 8);
+        assert_eq!(plan_step_shape(&decode_wants(5)).bucket, 8);
     }
 
     #[test]
@@ -545,12 +499,12 @@ mod tests {
         let mut holey = decode_wants(0);
         holey[1] = 1;
         holey[5] = 1;
-        assert_eq!(forwarded(&plan_step_shape(&holey, false)), (2, vec![1, 5]));
+        assert_eq!(forwarded(&plan_step_shape(&holey)), (2, vec![1, 5]));
         let mut deep = decode_wants(5);
         deep[0] = 0;
         deep[7] = 1;
         assert_eq!(
-            forwarded(&plan_step_shape(&deep, false)),
+            forwarded(&plan_step_shape(&deep)),
             (8, vec![1, 2, 3, 4, 7, 0, 5, 6])
         );
     }
@@ -562,7 +516,7 @@ mod tests {
         let mut wants = decode_wants(0);
         wants[2] = 3000;
         assert_eq!(
-            forwarded(&plan_step_shape(&wants, false)),
+            forwarded(&plan_step_shape(&wants)),
             (8, vec![2, 2, 2, 2, 2, 2, 2, 2]),
             "one hungry slot owns every row of the max bucket"
         );
@@ -570,10 +524,7 @@ mod tests {
         // A short prompt remainder only lifts the bucket as far as needed.
         let mut wants = decode_wants(0);
         wants[0] = 3;
-        assert_eq!(
-            forwarded(&plan_step_shape(&wants, false)),
-            (4, vec![0, 0, 0, 1])
-        );
+        assert_eq!(forwarded(&plan_step_shape(&wants)), (4, vec![0, 0, 0, 1]));
     }
 
     #[test]
@@ -585,7 +536,7 @@ mod tests {
         wants[0] = 1;
         wants[1] = 100;
         assert_eq!(
-            forwarded(&plan_step_shape(&wants, false)),
+            forwarded(&plan_step_shape(&wants)),
             (8, vec![0, 1, 1, 1, 1, 1, 1, 1])
         );
 
@@ -595,7 +546,7 @@ mod tests {
         wants[0] = 3;
         wants[1] = 2;
         assert_eq!(
-            forwarded(&plan_step_shape(&wants, false)),
+            forwarded(&plan_step_shape(&wants)),
             (8, vec![0, 0, 0, 1, 1, 2, 3, 4]),
             "wants met, remaining rows pad on free slots"
         );
@@ -609,7 +560,7 @@ mod tests {
         wants[2] = 3000;
         wants[5] = 3000;
         assert_eq!(
-            forwarded(&plan_step_shape(&wants, false)),
+            forwarded(&plan_step_shape(&wants)),
             (8, vec![2, 2, 2, 2, 5, 5, 5, 5])
         );
 
@@ -620,7 +571,7 @@ mod tests {
         wants[3] = 3000;
         wants[6] = 3000;
         assert_eq!(
-            forwarded(&plan_step_shape(&wants, false)),
+            forwarded(&plan_step_shape(&wants)),
             (8, vec![0, 3, 3, 3, 3, 6, 6, 6])
         );
     }

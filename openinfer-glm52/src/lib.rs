@@ -1,4 +1,4 @@
-//! GLM5.2 engine surface (TP8/TP4 replicated, EP4..EP64 free-running).
+//! GLM5.2 engine surface (TP4 replicated, EP4..EP64 free-running).
 //!
 //! Startup validates the official GLM5.2 FP8 checkpoint layout, loads rank
 //! slices to GPU memory (the non-expert stack replicated to every rank,
@@ -164,22 +164,15 @@ pub struct Glm52LaunchOptions {
     pub kv_offload: Option<Glm52KvOffloadOptions>,
     /// Launch-time MoE sharding topology. `Ep8` (default) is the
     /// high-throughput configuration: 32 whole experts per rank, DeepEP
-    /// dispatch/combine, buckets 1-8. `Tp8` is the low-latency
-    /// configuration: replicated activations over head-sharded weights —
-    /// every rank holds a 1/8-intermediate slice of ALL experts plus 8 of
-    /// the 64 attention heads, all 8 workers mirror ONE logical rank (up to
-    /// 8 concurrent requests, single bucket-8 shape), and the MoE path is
-    /// the TP8 phase-kernel chain on all 75 layers. `Tp4` is the GB300
-    /// four-GPU bring-up target using 16 attention heads per rank and 1/4
-    /// intermediate MoE slices.
+    /// dispatch/combine, buckets 1-8. `Tp4` is GB300 **prefill-only**
+    /// tensor parallel (NCCL all-reduce; requires `--glm52-prefill-only`).
     pub moe_topo: Glm52MoeTopo,
     /// Stage checkpoint bytes through pinned double buffers. Intended for
     /// warm page-cache starts; cold network filesystems should leave it off.
     pub weight_staging: bool,
     /// Export rank 0's already pre-captured whole-step decode graph during
-    /// startup. EP8 and TP4 export bucket 1; TP8 exports its fixed bucket 8.
-    /// The requested PNG gets a complete sibling `.dot` for machine
-    /// inspection.
+    /// startup. EP and TP4 export bucket 1. The requested PNG gets a
+    /// complete sibling `.dot` for machine inspection.
     pub dump_graph_png: Option<PathBuf>,
     /// The global DP ranks THIS process hosts (default: the whole topology
     /// — the single-node engine). A partial range is the multi-process
@@ -213,7 +206,6 @@ pub enum Glm52MoeTopo {
     Ep16,
     Ep32,
     Ep64,
-    Tp8,
     Tp4,
 }
 
@@ -229,7 +221,7 @@ impl Glm52MoeTopo {
     #[must_use]
     fn device_count(self) -> usize {
         match self {
-            Self::Ep8 | Self::Tp8 => GLM52_EP_RANKS,
+            Self::Ep8 => GLM52_EP_RANKS,
             Self::Ep4 | Self::Tp4 => 4,
             Self::Ep16 => 16,
             Self::Ep32 => 32,
@@ -261,7 +253,6 @@ impl Glm52MoeTopo {
     #[must_use]
     fn expected_ep_size(self) -> usize {
         match self {
-            Self::Tp8 => GLM52_EP_RANKS,
             Self::Tp4 => 1,
             _ => self.device_count(),
         }
@@ -281,11 +272,11 @@ impl Glm52MoeTopo {
     }
 
     /// Whether this topology mirrors one logical rank across all workers
-    /// (TP8/TP4) — the server needs it to size the frontend partition count
+    /// (TP4) — the server needs it to size the frontend partition count
     /// for a hosted rank range.
     #[must_use]
     pub fn uses_tensor_replicated_moe(self) -> bool {
-        matches!(self, Self::Tp8 | Self::Tp4)
+        matches!(self, Self::Tp4)
     }
 }
 
@@ -299,11 +290,10 @@ impl std::str::FromStr for Glm52MoeTopo {
             "ep16" => Ok(Self::Ep16),
             "ep32" => Ok(Self::Ep32),
             "ep64" => Ok(Self::Ep64),
-            "tp8" => Ok(Self::Tp8),
             "tp4" => Ok(Self::Tp4),
             other => {
                 anyhow::bail!(
-                    "GLM5.2 MoE topology must be ep4, ep8, ep16, ep32, ep64, tp8, or tp4, \
+                    "GLM5.2 MoE topology must be ep4, ep8, ep16, ep32, ep64, or tp4, \
                      got {other}"
                 )
             }
@@ -327,20 +317,16 @@ mod topology_tests {
     }
 
     #[test]
-    fn tp8_and_ep8_shapes_remain_unchanged() {
-        for topo in [Glm52MoeTopo::Ep8, Glm52MoeTopo::Tp8] {
-            assert_eq!(topo.default_dp_size(), GLM52_EP_RANKS);
-            assert_eq!(topo.device_count(), GLM52_EP_RANKS);
-            assert_eq!(topo.expected_tp_size(), 1);
-            assert_eq!(topo.expected_ep_size(), GLM52_EP_RANKS);
-        }
-        assert_eq!(Glm52MoeTopo::Ep8.logical_rank_count(), GLM52_EP_RANKS);
-        assert_eq!(Glm52MoeTopo::Tp8.logical_rank_count(), 1);
-        assert!(Glm52MoeTopo::Ep8.uses_ep_expert_bundles());
-        assert!(!Glm52MoeTopo::Ep8.uses_tensor_replicated_moe());
-        assert!(!Glm52MoeTopo::Tp8.uses_ep_expert_bundles());
-        assert!(Glm52MoeTopo::Tp8.uses_tensor_replicated_moe());
-        assert_eq!(Glm52MoeTopo::Ep8.ep_local_experts(), 32);
+    fn ep8_shapes_remain_unchanged() {
+        let topo = Glm52MoeTopo::Ep8;
+        assert_eq!(topo.default_dp_size(), GLM52_EP_RANKS);
+        assert_eq!(topo.device_count(), GLM52_EP_RANKS);
+        assert_eq!(topo.expected_tp_size(), 1);
+        assert_eq!(topo.expected_ep_size(), GLM52_EP_RANKS);
+        assert_eq!(topo.logical_rank_count(), GLM52_EP_RANKS);
+        assert!(topo.uses_ep_expert_bundles());
+        assert!(!topo.uses_tensor_replicated_moe());
+        assert_eq!(topo.ep_local_experts(), 32);
     }
 
     #[test]
@@ -442,6 +428,28 @@ pub struct Glm52VllmCompatOptions {
     pub allow_local_prefill: bool,
 }
 
+/// GLM5.2 kernels (FlashMLA SM100, DeepGEMM MQA SM100f, weight-only EP, …)
+/// no longer ship a Hopper path. Refuse SM9x and older at launch.
+fn ensure_blackwell_devices(device_count: usize) -> Result<()> {
+    ensure!(device_count > 0, "GLM5.2 needs at least one GPU");
+    for ordinal in 0..device_count {
+        let ctx = openinfer_kernels::tensor::DeviceContext::new_with_device(ordinal)
+            .with_context(|| format!("GLM5.2 open device {ordinal} for arch check"))?;
+        let major = ctx.ctx.attribute(
+            cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+        )?;
+        let minor = ctx.ctx.attribute(
+            cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+        )?;
+        ensure!(
+            major >= 10,
+            "GLM5.2 requires Blackwell (compute capability ≥ 10.0); device {ordinal} is \
+             SM{major}.{minor}. Hopper (SM9x) support was removed."
+        );
+    }
+    Ok(())
+}
+
 pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHandle> {
     let Glm52LaunchOptions {
         tp_size,
@@ -457,6 +465,7 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
         ranks,
         rendezvous,
     } = options;
+    ensure_blackwell_devices(moe_topo.device_count())?;
     let device_count = moe_topo.device_count();
     let ranks = ranks.unwrap_or(0..device_count);
     ensure!(
@@ -503,6 +512,11 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
             ensure!(
                 dp_size == 1,
                 "GLM5.2 TP4 requires --dp-size=1 (or omitted), got {dp_size}"
+            );
+            ensure!(
+                prefill_only.is_some(),
+                "GLM5.2 TP4 is prefill-only: pass --glm52-prefill-only \
+                 (decode TP / LL packet path was removed)"
             );
         }
         _ => {
@@ -554,7 +568,7 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
         "GLM5.2 --kv-offload requires the prefix cache: drop --no-prefix-cache and the \
          DSpark drafter"
     );
-    // The tp8 topology mirrors KV on every rank; the host tier's restore leg
+    // The TP topology mirrors KV on every rank; the host tier's restore leg
     // H2Ds into ONE rank's arena, which would silently desync the other 7.
     ensure!(
         kv_offload.is_none()
@@ -904,7 +918,7 @@ fn start_engine(
     // the engine exit) — otherwise the first dropped worker blocks in
     // the destroy barrier waiting for ranks that were never told to shut
     // down, and the launch error surfaces only after the ~100 s DeepEP
-    // device timeout. The TP8 LL rendezvous rejecting a topology (poison
+    // device timeout. The TP LL rendezvous rejecting a topology (poison
     // pill, NVLink probe) is a real failure landing exactly in this window.
     let rank_arenas = match build_rank_models(
         &loaded.workers,
@@ -1204,7 +1218,7 @@ fn ensure_post_build_headroom(workers: &[Glm52Worker]) -> Result<()> {
 /// drift) — every rank must report success BEFORE anyone enters context
 /// creation, or a single failure strands peer ranks in a collective init with
 /// no useful error. TP4 currently stops after the per-rank build, before
-/// entering any EP8/TP8 collective setup.
+/// entering any EP/TP collective setup.
 fn build_rank_models(
     workers: &[Glm52Worker],
     max_model_len: usize,

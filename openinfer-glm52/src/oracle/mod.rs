@@ -4,7 +4,7 @@
 //! against the pinned transformers `glm_moe_dsa` modeling code) through the
 //! engine and asserts the outputs land on hardcoded probe constants within an
 //! RMS-scaled tolerance. All gates are `#[ignore]` — they require GPU +
-//! checkpoint (and EP8 needs 8×H200 + NCCL).
+//! checkpoint (and EP gates use weight-only; Hopper Masked EP8 oracle retired).
 //!
 //! Run any gate:
 //! ```text
@@ -16,17 +16,11 @@
 // them for these lints would churn on every regeneration.
 #![allow(clippy::unreadable_literal, clippy::excessive_precision)]
 
-mod attn_tp;
 mod bookend;
 mod freerun_ep4;
 mod freerun_step;
 mod indexer;
 mod layer;
 mod layer_ep4;
-mod layer_ep8;
-mod layer_tp8;
 mod mla;
-mod mtp;
 mod mtp_production;
-mod sparse_mla_probe;
-mod tp8_ar;

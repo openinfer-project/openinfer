@@ -56,8 +56,6 @@ use crate::moe_decode::TOPK;
 use crate::moe_decode::W2_K;
 use crate::moe_decode::W2_N;
 use crate::moe_decode::W13_N;
-use crate::moe_ep8::Glm52MoeEp8State;
-use crate::moe_ep8::glm52_moe_ep8_routed_forward;
 
 /// Per-rank DeepEP context plus every buffer the weight-only chain touches,
 /// allocated once at startup at worst-case capacity (pointer-stable for
@@ -161,7 +159,7 @@ impl<A: DeepEpAbi> Glm52MoeEpWoState<A> {
 
 /// One weight-only MoE layer's routed contribution — a collective every rank
 /// must enter simultaneously per layer, same contract as
-/// [`glm52_moe_ep8_routed_forward`] (see there for the `token` /
+/// the weight-only routed forward (see there for the `token` /
 /// `global_tokens` semantics).
 pub(crate) fn glm52_moe_ep_wo_routed_forward<A: DeepEpAbi>(
     ctx: &DeviceContext,
@@ -294,15 +292,9 @@ pub(crate) fn glm52_moe_ep_wo_routed_forward<A: DeepEpAbi>(
     Ok(token.is_some())
 }
 
-/// One rank's EP MoE state: the topology decides the routed-expert chain at
-/// launch. Both chains share the DeepEP protocol and the
-/// [`glm52_moe_ep8_routed_forward`] calling contract.
+/// One rank's EP MoE state: weight-only mma chain, one DeepEP shim per EP
+/// width. (Hopper DeepGEMM masked path removed — Blackwell-only.)
 pub(crate) enum Glm52MoeEpState {
-    /// EP8: sm_90a DeepGEMM masked grouped fp8 chain (8×H200 production).
-    MaskedFp8(Box<Glm52MoeEp8State>),
-    /// Arch-portable weight-only mma chain, one variant per shim
-    /// instantiation (EP8 uses it on Blackwell, where the masked DeepGEMM
-    /// chain's sm_90a kernels don't run).
     WeightOnlyEp4(Box<Glm52MoeEpWoState<Glm52Ep4DeepEpAbi>>),
     WeightOnlyEp8(Box<Glm52MoeEpWoState<Glm52DeepEpAbi>>),
     WeightOnlyEp16(Box<Glm52MoeEpWoState<Glm52Ep16DeepEpAbi>>),
@@ -319,9 +311,6 @@ impl Glm52MoeEpState {
         global_tokens: usize,
     ) -> Result<bool> {
         match self {
-            Self::MaskedFp8(state) => {
-                glm52_moe_ep8_routed_forward(ctx, state, bank, token, global_tokens)
-            }
             Self::WeightOnlyEp4(state) => {
                 glm52_moe_ep_wo_routed_forward(ctx, state, bank, token, global_tokens)
             }
@@ -344,7 +333,6 @@ impl Glm52MoeEpState {
     /// `routed_forward` call (valid only when that call returned `true`).
     pub(crate) fn combined(&self) -> &CudaSlice<bf16> {
         match self {
-            Self::MaskedFp8(state) => state.combined(),
             Self::WeightOnlyEp4(state) => state.combined(),
             Self::WeightOnlyEp8(state) => state.combined(),
             Self::WeightOnlyEp16(state) => state.combined(),

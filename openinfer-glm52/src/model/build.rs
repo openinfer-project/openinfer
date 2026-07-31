@@ -73,7 +73,7 @@ pub(super) fn build_decoder_layer(
     let q_b_full = take_proj(w, &format!("{p}.self_attn.q_b_proj"), 16_384, 2048)?;
     let o_proj_full = take_proj(w, &format!("{p}.self_attn.o_proj"), GLM52_HIDDEN, 16_384)?;
     // Attention-TP head shard: rank r keeps its 1/TP slice of q/v heads
-    // (TP8 = 8 heads, TP4 = 16 heads) — q_b/kv_b output rows, o_proj input
+    // (TP4 = 16 heads) — q_b/kv_b output rows, o_proj input
     // columns; `Glm52MlaLayerWeights` derives its head count from these
     // shapes. The indexer is NOT sharded (its logits sum over all 32 index
     // heads BEFORE the top-2048, so a shard would need a cross-rank logits

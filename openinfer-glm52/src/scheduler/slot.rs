@@ -134,10 +134,9 @@ pub(super) struct Glm52SlotState {
 /// docs/models/glm52/dspark-mtp.md): the bucket-4 step costs ~32 ms vs
 /// bucket-8's ~46, and that cheaper round beats span 8's extra accepted tail
 /// on EVERY tested prompt class. The drafter still proposes 7; the tail is
-/// simply not fed. Under the TP8 topology that economics inverts — the span
-/// MoE mapping computes 8 rows at the same MoE cost as 1 — so the tp8
-/// engine feeds all 7 (`GLM52_DSPARK_DRAFTS`); the cap is a per-round
-/// argument, not this constant.
+/// simply not fed. Mirrored TP may feed more drafts per round via the
+/// per-engine `span_drafts` argument (`GLM52_DSPARK_DRAFTS`); the cap is
+/// a per-round argument, not this constant.
 pub(super) const GLM52_DSPARK_EP8_SPAN_DRAFTS: usize = 3;
 
 /// Accept histogram over a request's verify rounds (spans that actually fed
@@ -337,7 +336,7 @@ impl Glm52SlotState {
 
     /// Install the draft lane's proposal for the next verify span, truncated
     /// to the topology's span cap ([`GLM52_DSPARK_EP8_SPAN_DRAFTS`] under EP8,
-    /// all of [`GLM52_DSPARK_DRAFTS`] under TP8's span shape).
+    /// all of [`GLM52_DSPARK_DRAFTS`] under the mirrored TP span shape).
     pub(super) fn set_drafts(&mut self, mut drafts: Vec<u32>, span_drafts: usize) {
         drafts.truncate(span_drafts);
         self.drafts = drafts;

@@ -25,7 +25,6 @@ use crate::model::Glm52StepKv;
 use crate::model::Glm52StepShape;
 use crate::moe_ep_wo::Glm52MoeEpState;
 use crate::moe_ep_wo::Glm52MoeEpWoState;
-use crate::moe_ep8::Glm52MoeEp8State;
 use crate::moe_tp::Glm52MoeTpRank;
 use crate::moe_tp::Glm52MoeTpSliceBank;
 use crate::moe_tp::Glm52MoeTpState;
@@ -222,7 +221,7 @@ enum Glm52RankCommand {
     },
     /// Collective: create the DeepEP context (barriers across ranks). Issued
     /// to every rank concurrently, only after all builds succeeded. Under the
-    /// TP8 topology, also allocates the LL buffers and rendezvouses peer
+    /// TP topology, also allocates the LL buffers and rendezvouses peer
     /// pointers through `tp_exchange`.
     SetupComm {
         unique_id: Box<[u8; 128]>,
@@ -571,14 +570,14 @@ struct Glm52RankRuntime {
     aux_ctx: openinfer_kernels::tensor::DeviceContext,
     /// Populated by SetupComm (collective), after every rank's build succeeded.
     ep8: Option<Glm52MoeEpState>,
-    /// Populated by SetupComm when the TP8 pilot is on (LL rendezvous is
+    /// Populated by SetupComm when TP is on (LL rendezvous is
     /// collective too): the runtime state plus the slice banks loaded in
     /// LoadWeights.
     tp: Option<Glm52MoeTpRank>,
     /// Kept from SetupComm for the shutdown-side teardown rendezvous: the
-    /// TP8 LL buffers are peer-mapped on every device, so no rank may unmap
+    /// TP LL buffers are peer-mapped on every device, so no rank may unmap
     /// (drop `tp`) until every rank has retired its GPU work — see
-    /// `teardown_tp`. Stored on ALL ranks (even if this rank's TP8 setup
+    /// `teardown_tp`. Stored on ALL ranks (even if this rank's TP setup
     /// failed) so the barrier's participant count is always the full fleet.
     tp_exchange: Option<Arc<Glm52TpExchange>>,
     /// Populated by LoadDspark when the drafter is enabled.
@@ -601,7 +600,7 @@ struct Glm52RankThreadState {
     ctx: Glm52RankGpuContext,
     bundle: Glm52RankLoadBundle,
     loaded: Option<Glm52RankGpuWeights>,
-    /// TP8-topology slice banks (loaded with the weights), waiting for the
+    /// TP-topology slice banks (loaded with the weights), waiting for the
     /// SetupComm rendezvous to assemble the runtime `Glm52MoeTpRank`.
     tp_slices: BTreeMap<usize, Glm52MoeTpSliceBank>,
     runtime: Option<Glm52RankRuntime>,
@@ -872,35 +871,28 @@ impl Glm52RankThreadState {
         // rank's TP setup fails below.
         runtime.tp_exchange = tp_exchange.cloned();
         if moe_topo.uses_ep_expert_bundles() {
-            // Collective: every EP rank calls this concurrently. The topology
-            // selects the shim instantiation; the device generation selects
-            // the routed-expert GEMM chain (the DeepGEMM masked chain is
-            // sm_90a-only; everything else runs the weight-only mma chain).
-            let sm_major = dev_ctx.ctx.attribute(
-                cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
-            )?;
+            // Collective: every EP rank calls this concurrently. Topology
+            // selects the DeepEP shim; every width runs the weight-only
+            // expert GEMM chain (the Hopper DeepGEMM masked path is gone).
             let ranks = moe_topo.expected_ep_size();
             let rank = self.placement.rank;
-            runtime.ep8 = Some(match (moe_topo, sm_major) {
-                (crate::Glm52MoeTopo::Ep8, 9) => Glm52MoeEpState::MaskedFp8(Box::new(
-                    Glm52MoeEp8State::new(&dev_ctx, unique_id, ranks, rank)?,
-                )),
-                (crate::Glm52MoeTopo::Ep8, _) => Glm52MoeEpState::WeightOnlyEp8(Box::new(
+            runtime.ep8 = Some(match moe_topo {
+                crate::Glm52MoeTopo::Ep8 => Glm52MoeEpState::WeightOnlyEp8(Box::new(
                     Glm52MoeEpWoState::new(&dev_ctx, unique_id, ranks, rank)?,
                 )),
-                (crate::Glm52MoeTopo::Ep4, _) => Glm52MoeEpState::WeightOnlyEp4(Box::new(
+                crate::Glm52MoeTopo::Ep4 => Glm52MoeEpState::WeightOnlyEp4(Box::new(
                     Glm52MoeEpWoState::new(&dev_ctx, unique_id, ranks, rank)?,
                 )),
-                (crate::Glm52MoeTopo::Ep16, _) => Glm52MoeEpState::WeightOnlyEp16(Box::new(
+                crate::Glm52MoeTopo::Ep16 => Glm52MoeEpState::WeightOnlyEp16(Box::new(
                     Glm52MoeEpWoState::new(&dev_ctx, unique_id, ranks, rank)?,
                 )),
-                (crate::Glm52MoeTopo::Ep32, _) => Glm52MoeEpState::WeightOnlyEp32(Box::new(
+                crate::Glm52MoeTopo::Ep32 => Glm52MoeEpState::WeightOnlyEp32(Box::new(
                     Glm52MoeEpWoState::new(&dev_ctx, unique_id, ranks, rank)?,
                 )),
-                (crate::Glm52MoeTopo::Ep64, _) => Glm52MoeEpState::WeightOnlyEp64(Box::new(
+                crate::Glm52MoeTopo::Ep64 => Glm52MoeEpState::WeightOnlyEp64(Box::new(
                     Glm52MoeEpWoState::new(&dev_ctx, unique_id, ranks, rank)?,
                 )),
-                (other, _) => anyhow::bail!("GLM5.2 {other:?} is not an expert-bundle topology"),
+                other => anyhow::bail!("GLM5.2 {other:?} is not an expert-bundle topology"),
             });
         }
         if let Some(exchange) = tp_exchange {
@@ -909,29 +901,17 @@ impl Glm52RankThreadState {
                 "GLM5.2 rank {} TP rendezvous without slice banks — load/setup drifted",
                 self.placement.rank
             );
-            // Collective: the LL pointer rendezvous blocks until all topology
-            // ranks publish.
             let topology = match moe_topo {
-                crate::Glm52MoeTopo::Tp8 => openinfer_kernels::ops::Glm52TpTopology::Tp8,
                 crate::Glm52MoeTopo::Tp4 => openinfer_kernels::ops::Glm52TpTopology::Tp4,
                 _ => anyhow::bail!("GLM5.2 {moe_topo:?} setup received a TP exchange"),
             };
-            let mut state = Glm52MoeTpState::new(
-                &dev_ctx,
-                topology,
-                self.placement.rank,
-                self.placement.device_ordinal,
-                exchange,
-                self.tp_slices.len(),
-                // One tail slot gathers rank-local vocabulary argmax
-                // candidates after the 78 attention slots.
-                crate::config::GLM52_LAYERS + 1,
-            )?;
-            if runtime.model.is_prefill_only() {
-                // Collective like the LL rendezvous above: every TP rank
-                // reaches this concurrently in its own SetupComm.
-                state.init_prefill_nccl(&dev_ctx, exchange)?;
-            }
+            ensure!(
+                runtime.model.is_prefill_only(),
+                "GLM5.2 TP4 is prefill-only; launch with --glm52-prefill-only"
+            );
+            let mut state = Glm52MoeTpState::new(topology, self.placement.rank)?;
+            // Collective: every TP rank reaches NCCL init concurrently.
+            state.init_prefill_nccl(&dev_ctx, exchange)?;
             runtime.tp = Some(Glm52MoeTpRank {
                 state,
                 slices: std::mem::take(&mut self.tp_slices),
@@ -955,13 +935,13 @@ impl Glm52RankThreadState {
             Ok(dev_ctx) => {
                 if let Err(err) = dev_ctx.stream.synchronize() {
                     log::warn!(
-                        "GLM5.2 rank {} TP8 teardown stream sync failed: {err:#}",
+                        "GLM5.2 rank {} TP teardown stream sync failed: {err:#}",
                         self.placement.rank
                     );
                 }
             }
             Err(err) => log::warn!(
-                "GLM5.2 rank {} TP8 teardown could not reach its device: {err:#}",
+                "GLM5.2 rank {} TP teardown could not reach its device: {err:#}",
                 self.placement.rank
             ),
         }
@@ -1135,7 +1115,7 @@ fn rank_worker_loop(rx: &Receiver<Glm52RankCommand>, mut state: Glm52RankThreadS
             "channel closed with queued commands"
         }
     );
-    // TP8 LL buffers are peer-mapped on every device, and a speculative
+    // TP LL buffers are peer-mapped on every device, and a speculative
     // launch-ahead replay can still be in flight when Shutdown lands (harvest
     // only blocks on the argmax D2H). Quiesce this rank, then rendezvous with
     // the fleet before any rank unmaps — must run before the collective

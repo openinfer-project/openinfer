@@ -7,8 +7,6 @@ mod flashmla_sparse;
 pub use flashmla_sparse::*;
 mod flashinfer_sparse;
 pub use flashinfer_sparse::*;
-mod sparse_mla;
-pub use sparse_mla::*;
 mod indexer;
 pub use indexer::*;
 mod indexer_rope;
@@ -135,43 +133,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn glm52_deepgemm_grouped_fp8_metadata_cuda(
-        psum_expert: *const i32,
-        expert_offsets: *mut i64,
-        masked_m: *mut i32,
-        row_map: *mut i32,
-        groups: i32,
-        m_capacity: i32,
-        expert_alignment: i32,
-        masked_cap: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn glm52_deepgemm_masked_out_to_aligned_cuda(
-        masked_out: *const Half,
-        masked_m: *const i32,
-        expert_offsets: *const i64,
-        row_weights: *const f32,
-        aligned_out: *mut Half,
-        aligned_rows: i32,
-        n: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn glm52_deepgemm_masked_grouped_fp8_launch_cuda(
-        operand_kind: i32,
-        a: *const u8,
-        a_scale: *const f32,
-        b: *const u8,
-        b_scale: *const f32,
-        masked_m: *const i32,
-        out: *mut Half,
-        n: i32,
-        k: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    // --- EP4 weight-only routed-expert chain (glm52_moe_ep_wo.cu) -------------
+    // --- EP weight-only routed-expert chain (glm52_moe_ep_wo.cu) -------------
     // `tiles` is an int2 array on the C side: pass an i32 buffer of len
     // 2 * max_tiles (16-byte-aligned allocation bases satisfy int2 alignment).
     pub fn glm52_moe_ep_wo_tiles_cuda(
@@ -428,74 +390,3 @@ unsafe extern "C" {
     pub fn glm52_gemv_mma_ksplit_cuda(batch: i32, n: i32, k: i32, ksplit_out: *mut i32)
     -> CUresult;
 }
-
-macro_rules! declare_tp_ffi {
-    ($max_blocks:ident, $alloc_ll:ident, $free_ll:ident, $layer:ident, $epoch:ident, $ar:ident) => {
-        unsafe extern "C" {
-            pub fn $max_blocks(out_blocks: *mut i32) -> CUresult;
-            pub fn $alloc_ll(
-                bytes: usize,
-                device_ordinals: *const i32,
-                n_devices: i32,
-                out_vas: *mut u64,
-            ) -> CUresult;
-            pub fn $free_ll(p: *mut std::ffi::c_void) -> CUresult;
-            pub fn $layer(
-                normed2: *const Half,
-                topk_idx: *const i32,
-                topk_prob: *const f32,
-                w13: *const u8,
-                w13_scale: *const f32,
-                w2: *const u8,
-                w2_scale: *const f32,
-                mlp_out: *mut Half,
-                guidx: *mut i32,
-                guprob: *mut f32,
-                gucnt: *mut i32,
-                gused: *mut i32,
-                ug: *mut Half,
-                cpart: *mut f32,
-                rs_local: *mut std::ffi::c_void,
-                peer_rs: *const *const std::ffi::c_void,
-                epoch_dev: *mut u64,
-                active_rows: *const i32,
-                layer_slot: i32,
-                nranks: i32,
-                myrank: i32,
-                grid_blocks: i32,
-                stream: CUstream,
-            ) -> CUresult;
-            pub fn $epoch(epoch_dev: *mut std::ffi::c_void, stream: CUstream) -> CUresult;
-            pub fn $ar(
-                partial: *const Half,
-                out: *mut Half,
-                ar_local: *mut std::ffi::c_void,
-                peer_ar: *const *const std::ffi::c_void,
-                epoch_dev: *const u64,
-                active_rows: *const i32,
-                layer_slot: i32,
-                rows: i32,
-                nranks: i32,
-                myrank: i32,
-                stream: CUstream,
-            ) -> CUresult;
-        }
-    };
-}
-
-declare_tp_ffi!(
-    glm52_moe_tp4_max_blocks_cuda,
-    glm52_moe_tp4_alloc_ll_cuda,
-    glm52_moe_tp4_free_ll_cuda,
-    glm52_moe_tp4_layer_launch_cuda,
-    glm52_moe_tp4_epoch_advance_cuda,
-    glm52_tp4_ar_launch_cuda
-);
-declare_tp_ffi!(
-    glm52_moe_tp8_max_blocks_cuda,
-    glm52_moe_tp8_alloc_ll_cuda,
-    glm52_moe_tp8_free_ll_cuda,
-    glm52_moe_tp8_layer_launch_cuda,
-    glm52_moe_tp8_epoch_advance_cuda,
-    glm52_tp8_ar_launch_cuda
-);

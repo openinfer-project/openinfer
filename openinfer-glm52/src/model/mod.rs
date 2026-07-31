@@ -200,9 +200,8 @@ fn glm52_persistent_mla_bytes_per_token(
 /// continuum) keep the whole-step graphs' fixed-shape contract.
 pub(crate) const GLM52_DECODE_BUCKETS: [usize; 4] = [1, 2, 4, GLM52_MAX_BATCH_PER_RANK];
 
-// The DeepGEMM masked grouped expert GEMM gives every local expert a fixed
-// per-expert row slab; each source token contributes at most one row per
-// expert, so the protocol's worst-case global token count must fit it.
+// DeepEP protocol worst-case: each source token contributes ≤1 row per
+// local expert, so fleet_ranks × max_batch must fit the per-expert slab.
 // Compile-time so a future GLM52_MAX_BATCH_PER_RANK bump fails here, not at
 // graph capture.
 const _: () = assert!(
@@ -818,7 +817,6 @@ impl Glm52RankModel {
             .map(|chunk_rows| {
                 let topology = match moe_topo {
                     crate::Glm52MoeTopo::Tp4 => openinfer_kernels::ops::Glm52TpTopology::Tp4,
-                    crate::Glm52MoeTopo::Tp8 => openinfer_kernels::ops::Glm52TpTopology::Tp8,
                     other => anyhow::bail!(
                         "GLM5.2 prefill-only execution requires a TP topology, got {other:?}"
                     ),
@@ -1382,18 +1380,6 @@ impl Glm52RankModel {
         // rows ride the padding page).
         ctx.stream
             .memcpy_htod(&kv.pages[..], &mut bucket.block_table)?;
-        // Want-mask for the TP8 kernels: pad rows (>= active_rows, a prefix
-        // by plan construction) skip the LL wire and shrink the expert union.
-        // Every rank stages the same value — the engine mirrors the
-        // step, and LL push/wait symmetry depends on it. A leased replay
-        // (consume path) skips this prologue, which is safe: the lease
-        // guarantees the identical shape, so the staged value still holds.
-        if let Some(rank) = tp.as_deref_mut() {
-            if !rank.slices.is_empty() {
-                rank.state.stage_active_rows(ctx, shape.active_rows)?;
-            }
-        }
-
         // The bucket state selected above carries the plan, scratch, graph,
         // and block table together — one coherent shape.
         let step = Glm52DecodeStep {

@@ -8,9 +8,9 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
-// GLM5.2 (FP8 + FlashMLA) cannot run below Hopper; refuse the target.
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 900)
-#error "GLM5.2 kernels require sm_90+ (check OPENINFER_CUDA_SM / detected GPU targets)"
+// GLM5.2 is Blackwell-only; refuse Hopper and older targets.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+#error "GLM5.2 kernels require sm_100+ (check OPENINFER_CUDA_SM / detected GPU targets)"
 #endif
 
 namespace glm52_min_gemv {

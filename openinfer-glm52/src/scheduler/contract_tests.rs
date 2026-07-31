@@ -26,17 +26,8 @@ use super::testkit::request;
 use crate::model::GLM52_MAX_BATCH_PER_RANK;
 
 #[test]
-fn graph_dump_uses_a_serving_shape_for_each_topology() {
-    assert_eq!(
-        graph_dump_bucket(false),
-        1,
-        "EP8 and TP4 have a true bucket-1 graph"
-    );
-    assert_eq!(
-        graph_dump_bucket(true),
-        GLM52_MAX_BATCH_PER_RANK,
-        "full-bucket TP8 only captures its fixed bucket-8 shape"
-    );
+fn graph_dump_uses_bucket_one() {
+    assert_eq!(graph_dump_bucket(), 1, "EP and TP4 export bucket-1 graphs");
 }
 
 #[test]

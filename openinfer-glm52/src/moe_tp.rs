@@ -1,9 +1,6 @@
-//! GLM5.2 tensor-parallel MoE: per-rank slices of all 257 experts
-//! (shared folded at bank index 256) + the phase-kernel chain state (LL
-//! packet buffers, cross-rank pointer exchange, scratch arena). Replicated
-//! activations: every rank passes all 8 rows and receives all 8 reduced
-//! rows back, bit-identical. Design:
-//! `docs/models/glm52/moe-tp8-low-latency.md`.
+//! GLM5.2 tensor-parallel MoE for **TP4 prefill-only**: per-rank slices of
+//! all 257 experts (shared at bank index 256) plus NCCL bf16 all-reduce.
+//! Decode-side LL packet MoE/attention kernels are gone.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -21,24 +18,14 @@ use openinfer_kernels::ops::GLM52_FP8_GROUPED_GEMM_WORKSPACE_BYTES;
 use openinfer_kernels::ops::GLM52_TP_BANK_EXPERTS;
 use openinfer_kernels::ops::GLM52_TP_HIDDEN;
 use openinfer_kernels::ops::GLM52_TP_MAX_RANKS;
-use openinfer_kernels::ops::GLM52_TP_TOKENS;
-use openinfer_kernels::ops::GLM52_TP_UNION_MAX;
 use openinfer_kernels::ops::Glm52MoeQuantShape;
-use openinfer_kernels::ops::Glm52MoeTpBuffers;
-use openinfer_kernels::ops::Glm52TpLlBuffer;
 use openinfer_kernels::ops::Glm52TpTopology;
 use openinfer_kernels::ops::glm52_fp8_grouped_gemm_sm100_launch;
 use openinfer_kernels::ops::glm52_fp8_per_token_group_quant_bf16_launch;
-use openinfer_kernels::ops::glm52_moe_tp_epoch_advance;
-use openinfer_kernels::ops::glm52_moe_tp_layer_launch;
-use openinfer_kernels::ops::glm52_moe_tp_max_blocks;
 use openinfer_kernels::ops::glm52_prefill_moe_combine_launch;
 use openinfer_kernels::ops::glm52_prefill_moe_gather_fp8_launch;
 use openinfer_kernels::ops::glm52_prefill_moe_route_launch;
 use openinfer_kernels::ops::glm52_silu_and_mul_bf16_launch;
-use openinfer_kernels::ops::glm52_tp_ar_buffer_bytes;
-use openinfer_kernels::ops::glm52_tp_ar_chunk_packets;
-use openinfer_kernels::ops::glm52_tp_ar_launch;
 use openinfer_kernels::tensor::DeviceContext;
 
 use crate::config::GLM52_EXPERT_INTERMEDIATE as INTERMEDIATE;
@@ -63,17 +50,11 @@ use crate::weights::retype_owned;
 const H: usize = GLM52_TP_HIDDEN;
 const RANKS: usize = GLM52_TP_MAX_RANKS;
 
-// The replicated shape assumes the scheduler's largest bucket IS the
-// kernel's row count: a bigger bucket would pass every >= buffer ensure
-// while the kernel silently computes only 8 rows (stale mlp_out on the
-// rest).
-const _: () =
-    assert!(crate::model::GLM52_MAX_BATCH_PER_RANK == openinfer_kernels::ops::GLM52_TP_TOKENS);
 const BANK: usize = GLM52_TP_BANK_EXPERTS;
 #[cfg(test)]
-const SLICE_ROWS: usize = Glm52TpTopology::Tp8.slice_rows();
+const SLICE_ROWS: usize = Glm52TpTopology::Tp4.slice_rows();
 #[cfg(test)]
-const SLICE_I: usize = Glm52TpTopology::Tp8.slice_i();
+const SLICE_I: usize = Glm52TpTopology::Tp4.slice_i();
 
 /// One pilot layer's TP slice bank: this rank's intermediate rows of all 257
 /// experts, in the layout the cooperative kernel consumes.
@@ -212,22 +193,8 @@ impl SliceStaging {
     }
 }
 
-/// Second-pass load of one pilot layer's TP8 slice bank for `rank`: re-reads
-/// every expert's fp8 tensors (plus the shared expert) from the checkpoint
-/// shards and gathers this rank's 1/8-I slice host-side, then uploads.
-#[allow(dead_code)] // Used by GPU oracle gates; production uses topology-aware load_tp_slice_layer.
-pub(crate) fn load_tp8_slice_layer(
-    ctx: &DeviceContext,
-    model_path: &Path,
-    manifest: &Glm52WeightManifest,
-    rank: usize,
-    layer: usize,
-) -> Result<Glm52MoeTpSliceBank> {
-    load_tp_slice_layer(ctx, model_path, manifest, rank, RANKS, layer)
-}
-
 /// Second-pass load of one tensor-replicated MoE slice bank for `rank`.
-/// TP8 uses 1/8-intermediate slices; TP4 uses 1/4-intermediate slices.
+/// TP4 uses 1/4-intermediate slices.
 pub(crate) fn load_tp_slice_layer(
     ctx: &DeviceContext,
     model_path: &Path,
@@ -326,204 +293,13 @@ pub(crate) fn load_tp_slice_layer(
     staging.upload(ctx)
 }
 
-/// One rank's published LL buffer mappings: per-accessor VA tables (indexed
-/// by fleet device ordinal) for its MoE all-reduce buffer and its attention
-/// (o_proj epilogue) all-reduce buffer.
-#[derive(Clone, Copy)]
-struct Glm52TpLlVas {
-    rs: [u64; RANKS],
-    ar: [u64; RANKS],
-}
-
-/// Cross-rank rendezvous for LL buffer mappings: every rank publishes its
-/// per-accessor VA tables (or its setup failure, as a poison pill) and blocks
-/// until the topology's ranks are in. Also owns the shutdown-side rendezvous so no rank
-/// unmaps LL buffers a peer's in-flight kernels could still be reading.
-pub(crate) struct Glm52TpExchange {
-    rank_count: usize,
-    slots: Mutex<[Option<Result<Glm52TpLlVas, String>>; RANKS]>,
-    all_in: Condvar,
-    departed: Mutex<usize>,
-    all_out: Condvar,
-    nccl_id: Mutex<Option<[core::ffi::c_char; 128]>>,
-    nccl_ready: Condvar,
-}
-
-impl Glm52TpExchange {
-    pub(crate) fn new(rank_count: usize) -> Self {
-        assert!(
-            rank_count > 0 && rank_count <= RANKS,
-            "TP exchange rank count out of range"
-        );
-        Self {
-            rank_count,
-            slots: Mutex::new(std::array::from_fn(|_| None)),
-            all_in: Condvar::new(),
-            departed: Mutex::new(0),
-            all_out: Condvar::new(),
-            nccl_id: Mutex::new(None),
-            nccl_ready: Condvar::new(),
-        }
-    }
-
-    /// Share one NCCL unique id across the in-process rank threads: rank 0
-    /// mints it, everyone returns the same bytes. Used only by the
-    /// prefill-only NCCL all-reduce bring-up (collective — all ranks must
-    /// call this concurrently, like the LL pointer rendezvous).
-    fn nccl_id_rendezvous(&self, rank: usize) -> Result<cudarc::nccl::Id> {
-        let mut slot = self.nccl_id.lock().expect("TP exchange poisoned");
-        if rank == 0 {
-            ensure!(slot.is_none(), "TP NCCL id minted twice");
-            let id = cudarc::nccl::Id::new()
-                .map_err(|err| anyhow::anyhow!("NCCL unique id creation failed: {:?}", err.0))?;
-            *slot = Some(*id.internal());
-            self.nccl_ready.notify_all();
-            return Ok(id);
-        }
-        while slot.is_none() {
-            let (guard, timeout) = self
-                .nccl_ready
-                .wait_timeout(slot, Duration::from_secs(120))
-                .expect("TP exchange poisoned");
-            slot = guard;
-            if timeout.timed_out() && slot.is_none() {
-                bail!("TP NCCL id rendezvous timed out after 120s — rank 0 never published");
-            }
-        }
-        Ok(cudarc::nccl::Id::uninit(
-            *slot.as_ref().expect("checked above"),
-        ))
-    }
-
-    /// Publish this rank's mappings — or its failure. A failed rank MUST
-    /// still publish (the `Err` is the poison pill): otherwise the other 7
-    /// ranks would block forever and the launch error would surface as a
-    /// silent hang instead of a message.
-    fn publish_and_wait(
-        &self,
-        rank: usize,
-        vas: Result<Glm52TpLlVas, String>,
-    ) -> Result<[Glm52TpLlVas; RANKS]> {
-        let mut slots = self.slots.lock().expect("TP8 exchange poisoned");
-        ensure!(
-            rank < self.rank_count,
-            "TP exchange rank {rank} out of range for {} ranks",
-            self.rank_count
-        );
-        ensure!(
-            slots[rank].is_none(),
-            "TP exchange rank {rank} published twice"
-        );
-        slots[rank] = Some(vas);
-        self.all_in.notify_all();
-        while slots[..self.rank_count].iter().any(Option::is_none) {
-            let (guard, timeout) = self
-                .all_in
-                .wait_timeout(slots, Duration::from_secs(120))
-                .expect("TP8 exchange poisoned");
-            slots = guard;
-            if timeout.timed_out() && slots[..self.rank_count].iter().any(Option::is_none) {
-                let missing: Vec<usize> = (0..self.rank_count)
-                    .filter(|&r| slots[r].is_none())
-                    .collect();
-                bail!(
-                    "TP LL rendezvous timed out after 120s — rank(s) {missing:?} never \
-                     published (worker died before reaching the exchange?)"
-                );
-            }
-        }
-        let failed: Vec<String> = slots
-            .iter()
-            .take(self.rank_count)
-            .enumerate()
-            .filter_map(|(r, s)| match s {
-                Some(Err(err)) => Some(format!("rank {r}: {err}")),
-                _ => None,
-            })
-            .collect();
-        ensure!(
-            failed.is_empty(),
-            "TP LL setup failed on peer rank(s): {}",
-            failed.join("; ")
-        );
-        Ok(std::array::from_fn(|r| {
-            if r < self.rank_count {
-                *slots[r]
-                    .as_ref()
-                    .expect("checked above")
-                    .as_ref()
-                    .expect("failures bailed above")
-            } else {
-                Glm52TpLlVas {
-                    rs: [0; RANKS],
-                    ar: [0; RANKS],
-                }
-            }
-        }))
-    }
-
-    /// Shutdown-side barrier: the caller must have synchronized its stream
-    /// first (its own kernels are retired). Once all 8 ranks arrive, no
-    /// kernel anywhere can still touch an LL buffer, so every rank may unmap
-    /// in any order. On timeout (a peer died mid-serving and will never
-    /// arrive) we log and proceed — the dead peer's device may see an
-    /// illegal-address on its already-doomed context, which beats hanging
-    /// the whole process shutdown.
-    pub(crate) fn teardown_rendezvous(&self, rank: usize) {
-        let mut departed = self.departed.lock().expect("TP8 exchange poisoned");
-        *departed += 1;
-        self.all_out.notify_all();
-        while *departed < self.rank_count {
-            let (guard, timeout) = self
-                .all_out
-                .wait_timeout(departed, Duration::from_secs(120))
-                .expect("TP8 exchange poisoned");
-            departed = guard;
-            if timeout.timed_out() && *departed < self.rank_count {
-                log::warn!(
-                    "GLM5.2 rank {rank} TP teardown rendezvous timed out ({}/{} arrived) \
-                     — unmapping anyway; a peer rank likely died",
-                    *departed,
-                    self.rank_count
-                );
-                return;
-            }
-        }
-    }
-}
-
-/// A rank's complete tensor-replicated MoE runtime: the state plus the
-/// per-layer slice banks (keyed by absolute layer index).
-pub(crate) struct Glm52MoeTpRank {
-    pub(crate) state: Glm52MoeTpState,
-    pub(crate) slices: BTreeMap<usize, Glm52MoeTpSliceBank>,
-}
-
-impl Glm52MoeTpRank {
-    /// This layer's TP pieces: runtime state, LL slot index (the layer's
-    /// position among this rank's sliced layers), and slice bank.
-    pub(crate) fn layer_bank(
-        &mut self,
-        layer: usize,
-    ) -> Option<(&mut Glm52MoeTpState, usize, &Glm52MoeTpSliceBank)> {
-        let slot = self.slices.range(..layer).count();
-        let bank = self.slices.get(&layer)?;
-        Some((&mut self.state, slot, bank))
-    }
-}
-
-/// Row-block bound for the chunk-scale MoE: bounds the gathered-route
+/// Max rows per prefill MoE sub-block. Bounds routed gather/GEMM scratch
 /// buffers (`block * TOPK` rows) while keeping per-layer expert weight
 /// re-reads to `ceil(chunk / block)` passes.
 pub(crate) const GLM52_PREFILL_MOE_BLOCK_ROWS: usize = 8192;
 
 /// Chunk-scale TP prefill MoE scratch: the router runs over the whole
-/// prefill batch, routes are grouped on device, and both expert
-/// projections run as ONE FlashInfer CUTLASS grouped GEMM over the rank's
-/// 256 routed-expert slices (fp8 weights + f32 block scales, checkpoint
-/// layout as-is — no cubins, no UE8M0 requant). The shared expert (bank
-/// index 256) takes every row and runs as a dense large-M chain; the
-/// deterministic combine folds `shared + Σ_j w_j * routed_j` in f32.
+/// chunk once; expert compute walks the chunk in blocks of this size.
 pub(crate) struct Glm52MoeTpPrefillScratch {
     chunk_rows: usize,
     block_rows: usize,
@@ -770,6 +546,103 @@ impl Glm52MoeTpPrefillScratch {
     }
 }
 
+/// In-process rendezvous for TP4 prefill NCCL unique id (+ optional
+/// shutdown barrier so rank teardown stays ordered).
+pub(crate) struct Glm52TpExchange {
+    rank_count: usize,
+    nccl_id: Mutex<Option<[core::ffi::c_char; 128]>>,
+    nccl_ready: Condvar,
+    departed: Mutex<usize>,
+    all_out: Condvar,
+}
+
+impl Glm52TpExchange {
+    pub(crate) fn new(rank_count: usize) -> Self {
+        assert!(
+            rank_count > 0 && rank_count <= RANKS,
+            "TP exchange rank count out of range"
+        );
+        Self {
+            rank_count,
+            nccl_id: Mutex::new(None),
+            nccl_ready: Condvar::new(),
+            departed: Mutex::new(0),
+            all_out: Condvar::new(),
+        }
+    }
+
+    /// Share one NCCL unique id across the in-process rank threads: rank 0
+    /// mints it, everyone returns the same bytes. Prefill all-reduce bring-up
+    /// — all ranks must call this concurrently.
+    fn nccl_id_rendezvous(&self, rank: usize) -> Result<cudarc::nccl::Id> {
+        let mut slot = self.nccl_id.lock().expect("TP exchange poisoned");
+        if rank == 0 {
+            ensure!(slot.is_none(), "TP NCCL id minted twice");
+            let id = cudarc::nccl::Id::new()
+                .map_err(|err| anyhow::anyhow!("NCCL unique id creation failed: {:?}", err.0))?;
+            *slot = Some(*id.internal());
+            self.nccl_ready.notify_all();
+            return Ok(id);
+        }
+        while slot.is_none() {
+            let (guard, timeout) = self
+                .nccl_ready
+                .wait_timeout(slot, Duration::from_secs(120))
+                .expect("TP exchange poisoned");
+            slot = guard;
+            if timeout.timed_out() && slot.is_none() {
+                bail!("TP NCCL id rendezvous timed out after 120s — rank 0 never published");
+            }
+        }
+        Ok(cudarc::nccl::Id::uninit(
+            *slot.as_ref().expect("checked above"),
+        ))
+    }
+
+    /// Shutdown-side barrier: optional ordering before dropping NCCL comms.
+    pub(crate) fn teardown_rendezvous(&self, rank: usize) {
+        let mut departed = self.departed.lock().expect("TP exchange poisoned");
+        *departed += 1;
+        self.all_out.notify_all();
+        while *departed < self.rank_count {
+            let (guard, timeout) = self
+                .all_out
+                .wait_timeout(departed, Duration::from_secs(120))
+                .expect("TP exchange poisoned");
+            departed = guard;
+            if timeout.timed_out() && *departed < self.rank_count {
+                log::warn!(
+                    "GLM5.2 rank {rank} TP teardown rendezvous timed out ({}/{} arrived) \
+                     — continuing; a peer rank likely died",
+                    *departed,
+                    self.rank_count
+                );
+                return;
+            }
+        }
+    }
+}
+
+/// A rank's complete tensor-replicated MoE runtime: the state plus the
+/// per-layer slice banks (keyed by absolute layer index).
+pub(crate) struct Glm52MoeTpRank {
+    pub(crate) state: Glm52MoeTpState,
+    pub(crate) slices: BTreeMap<usize, Glm52MoeTpSliceBank>,
+}
+
+impl Glm52MoeTpRank {
+    /// This layer's TP pieces: runtime state, slot index among sliced layers,
+    /// and slice bank.
+    pub(crate) fn layer_bank(
+        &mut self,
+        layer: usize,
+    ) -> Option<(&mut Glm52MoeTpState, usize, &Glm52MoeTpSliceBank)> {
+        let slot = self.slices.range(..layer).count();
+        let bank = self.slices.get(&layer)?;
+        Some((&mut self.state, slot, bank))
+    }
+}
+
 /// cudarc's `Comm` holds a raw `ncclComm_t` and is `!Send`; this rank's
 /// runtime (and therefore the comm) is created and used on its own worker
 /// thread only, so moving the containing runtime between threads before
@@ -778,147 +651,25 @@ pub(crate) struct Glm52PrefillNccl(cudarc::nccl::Comm);
 
 unsafe impl Send for Glm52PrefillNccl {}
 
-/// Per-rank tensor-parallel runtime state shared by TP4 and TP8.
+/// Per-rank tensor-parallel runtime for **TP4 prefill-only** (NCCL all-reduce).
 pub(crate) struct Glm52MoeTpState {
     topology: Glm52TpTopology,
     rank: usize,
-    ar_slots: usize,
-    grid_blocks: usize,
-    _rs: Glm52TpLlBuffer,
-    _ar: Glm52TpLlBuffer,
-    rs_local: u64,
-    ar_local: u64,
-    peer_rs: [u64; RANKS],
-    peer_ar: [u64; RANKS],
-    /// Prefill-only NCCL communicator over the TP fleet: the chunk-scale
-    /// prefill all-reduces ride ncclAllReduce(bf16) instead of a custom
-    /// kernel. Created collectively in `init_prefill_nccl`.
+    /// Prefill NCCL communicator over the TP fleet.
     nccl: Option<Glm52PrefillNccl>,
-    epoch_dev: CudaSlice<u64>,
-    active_rows_dev: CudaSlice<i32>,
-    guidx: CudaSlice<i32>,
-    guprob: CudaSlice<f32>,
-    gucnt: CudaSlice<i32>,
-    gused: CudaSlice<i32>,
-    ug: CudaSlice<bf16>,
-    cpart: CudaSlice<f32>,
 }
 
 impl Glm52MoeTpState {
-    pub(crate) fn new(
-        ctx: &DeviceContext,
-        topology: Glm52TpTopology,
-        rank: usize,
-        device_ordinal: usize,
-        exchange: &Glm52TpExchange,
-        slots: usize,
-        ar_slots: usize,
-    ) -> Result<Self> {
-        let ranks = topology.ranks();
-        let prep = (|| -> Result<(Glm52TpLlBuffer, Glm52TpLlBuffer)> {
-            ensure!(rank < ranks, "{topology:?} rank {rank} out of range");
-            ensure!(
-                slots > 0 && ar_slots > 0,
-                "{topology:?} needs at least one layer slot (moe {slots}, ar {ar_slots})"
-            );
-            ensure!(
-                device_ordinal < ranks,
-                "{topology:?} device ordinal {device_ordinal} outside its fleet"
-            );
-            ensure!(
-                exchange.rank_count == ranks,
-                "{topology:?} exchange has {} ranks, expected {ranks}",
-                exchange.rank_count
-            );
-            let fleet: Vec<usize> = (0..ranks).collect();
-            let rs =
-                Glm52TpLlBuffer::alloc(topology, slots * topology.rs_slot_packets() * 16, &fleet)?;
-            let ar = Glm52TpLlBuffer::alloc(
-                topology,
-                glm52_tp_ar_buffer_bytes(topology, ar_slots),
-                &fleet,
-            )?;
-            Ok((rs, ar))
-        })();
-        let vas = prep
-            .as_ref()
-            .map(|(rs, ar)| Glm52TpLlVas {
-                rs: std::array::from_fn(|accessor| {
-                    if accessor < ranks {
-                        rs.addr_for(accessor)
-                    } else {
-                        0
-                    }
-                }),
-                ar: std::array::from_fn(|accessor| {
-                    if accessor < ranks {
-                        ar.addr_for(accessor)
-                    } else {
-                        0
-                    }
-                }),
-            })
-            .map_err(|err| format!("{err:#}"));
-        let table = exchange.publish_and_wait(rank, vas)?;
-        let (rs, ar) = prep.expect("own failure would have surfaced via publish_and_wait");
-        let rs_slot = GLM52_TP_HIDDEN * 16;
-        let ar_slot = glm52_tp_ar_chunk_packets(topology) * 16;
-        let peer_rs = std::array::from_fn(|peer| {
-            if peer < ranks {
-                table[peer].rs[device_ordinal] + (rank * rs_slot) as u64
-            } else {
-                0
-            }
-        });
-        let peer_ar = std::array::from_fn(|peer| {
-            if peer < ranks {
-                table[peer].ar[device_ordinal] + (rank * ar_slot) as u64
-            } else {
-                0
-            }
-        });
-        let mut epoch_dev = ctx.stream.alloc_zeros::<u64>(1)?;
-        ctx.stream.memcpy_htod(&[1u64], &mut epoch_dev)?;
-        let mut active_rows_dev = ctx.stream.alloc_zeros::<i32>(1)?;
-        ctx.stream
-            .memcpy_htod(&[GLM52_TP_TOKENS as i32], &mut active_rows_dev)?;
-        let grid_blocks = glm52_moe_tp_max_blocks(topology)?;
+    pub(crate) fn new(topology: Glm52TpTopology, rank: usize) -> Result<Self> {
+        ensure!(
+            rank < topology.ranks(),
+            "{topology:?} rank {rank} out of range"
+        );
         Ok(Self {
             topology,
             rank,
-            ar_slots,
-            grid_blocks,
-            rs_local: rs.addr_for(device_ordinal),
-            ar_local: ar.addr_for(device_ordinal),
-            _rs: rs,
-            _ar: ar,
-            peer_rs,
-            peer_ar,
             nccl: None,
-            epoch_dev,
-            active_rows_dev,
-            guidx: ctx.stream.alloc_zeros(GLM52_TP_UNION_MAX)?,
-            guprob: ctx.stream.alloc_zeros(topology.guprob_len())?,
-            gucnt: ctx.stream.alloc_zeros(1)?,
-            gused: ctx.stream.alloc_zeros(EXPERTS)?,
-            ug: ctx.stream.alloc_zeros(topology.ug_len())?,
-            cpart: ctx.stream.alloc_zeros(topology.cpart_len())?,
         })
-    }
-
-    pub(crate) fn advance_epoch(&mut self, ctx: &DeviceContext) -> Result<()> {
-        glm52_moe_tp_epoch_advance(ctx, self.topology, &mut self.epoch_dev)
-    }
-
-    pub(crate) fn stage_active_rows(&mut self, ctx: &DeviceContext, active: usize) -> Result<()> {
-        ensure!(
-            active <= GLM52_TP_TOKENS,
-            "{:?} active rows {active} exceeds the bucket {GLM52_TP_TOKENS}",
-            self.topology
-        );
-        ctx.stream
-            .memcpy_htod(&[active as i32], &mut self.active_rows_dev)?;
-        Ok(())
     }
 
     pub(crate) fn rank(&self) -> usize {
@@ -927,35 +678,6 @@ impl Glm52MoeTpState {
 
     pub(crate) fn ranks(&self) -> usize {
         self.topology.ranks()
-    }
-
-    pub(crate) fn attn_ar_launch(
-        &mut self,
-        ctx: &DeviceContext,
-        layer_slot: usize,
-        rows: usize,
-        partial: &CudaSlice<bf16>,
-        out: &mut CudaSlice<bf16>,
-    ) -> Result<()> {
-        ensure!(
-            layer_slot < self.ar_slots,
-            "{:?} AR slot {layer_slot} outside allocated {} slots",
-            self.topology,
-            self.ar_slots
-        );
-        glm52_tp_ar_launch(
-            ctx,
-            self.topology,
-            layer_slot,
-            rows,
-            partial,
-            out,
-            self.ar_local,
-            self.peer_ar,
-            &self.epoch_dev,
-            Some(&self.active_rows_dev),
-            self.rank,
-        )
     }
 
     /// Collective NCCL bring-up for the prefill-only path: all TP ranks must
@@ -977,7 +699,7 @@ impl Glm52MoeTpState {
     }
 
     /// Sum-all-reduce `partial[..rows * H]` into `out[..rows * H]` across the
-    /// TP fleet on this rank\'s stream (ncclAllReduce, bf16).
+    /// TP fleet on this rank's stream (ncclAllReduce, bf16).
     pub(crate) fn prefill_allreduce(
         &mut self,
         _ctx: &DeviceContext,
@@ -1022,58 +744,6 @@ impl Glm52MoeTpState {
             .map_err(|err| anyhow::anyhow!("GLM5.2 prefill NCCL all-reduce failed: {:?}", err.0))?;
         Ok(())
     }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn forward(
-        &mut self,
-        ctx: &DeviceContext,
-        slot: usize,
-        bank: &Glm52MoeTpSliceBank,
-        normed2: &CudaSlice<bf16>,
-        topk_idx: &CudaSlice<i32>,
-        topk_prob: &CudaSlice<f32>,
-        mlp_out: &mut CudaSlice<bf16>,
-    ) -> Result<()> {
-        debug_assert_eq!(GLM52_HIDDEN, H);
-        ensure!(
-            bank.tp_ranks == self.topology.ranks()
-                && bank.slice_i == self.topology.slice_i()
-                && bank.slice_rows == self.topology.slice_rows(),
-            "{:?} launcher received TP{} slice geometry (slice_i={}, slice_rows={})",
-            self.topology,
-            bank.tp_ranks,
-            bank.slice_i,
-            bank.slice_rows
-        );
-        let mut bufs = Glm52MoeTpBuffers {
-            guidx: &mut self.guidx,
-            guprob: &mut self.guprob,
-            gucnt: &mut self.gucnt,
-            gused: &mut self.gused,
-            ug: &mut self.ug,
-            cpart: &mut self.cpart,
-            rs_local: self.rs_local,
-            peer_rs: self.peer_rs,
-            epoch_dev: &mut self.epoch_dev,
-            active_rows: Some(&self.active_rows_dev),
-        };
-        glm52_moe_tp_layer_launch(
-            ctx,
-            self.topology,
-            slot,
-            normed2,
-            topk_idx,
-            topk_prob,
-            &bank.w13,
-            &bank.w13_scale,
-            &bank.w2,
-            &bank.w2_scale,
-            mlp_out,
-            &mut bufs,
-            self.rank,
-            self.grid_blocks,
-        )
-    }
 }
 
 #[cfg(test)]
@@ -1095,7 +765,7 @@ mod tests {
             }
         }
         for rank in 0..RANKS {
-            let mut s = SliceStaging::new(rank, RANKS).expect("TP8 slice staging");
+            let mut s = SliceStaging::new(rank, RANKS).expect("TP slice staging");
             s.put_w13_weight(3, false, &w13_src);
             s.put_w13_weight(3, true, &w13_src);
             s.put_w2_weight(3, &w2_src);
@@ -1138,7 +808,7 @@ mod tests {
             }
         }
         for rank in 0..RANKS {
-            let mut s = SliceStaging::new(rank, RANKS).expect("TP8 slice staging");
+            let mut s = SliceStaging::new(rank, RANKS).expect("TP slice staging");
             s.put_w13_scale(0, false, &w13s);
             s.put_w13_scale(0, true, &w13s);
             s.put_w2_scale(0, &w2s);

@@ -31,15 +31,8 @@ pub(super) fn precapture_step_graphs(
     pools: &[BlockPool],
     table_width: usize,
     mirrored: bool,
-    full_bucket: bool,
 ) -> anyhow::Result<()> {
-    // TP8 serves exactly one shape. EP8 and TP4 capture every bucket; TP4 is
-    // still mirrored, but only its MoE subgraph pads to eight rows.
-    let capture_bucket = |bucket: usize| !full_bucket || bucket == GLM52_MAX_BATCH_PER_RANK;
-    for &bucket in GLM52_DECODE_BUCKETS
-        .iter()
-        .filter(|&&bucket| capture_bucket(bucket))
-    {
+    for bucket in GLM52_DECODE_BUCKETS {
         let mut shape = Glm52StepShape {
             bucket,
             slots: [0; GLM52_MAX_BATCH_PER_RANK],
@@ -73,34 +66,27 @@ pub(super) fn precapture_step_graphs(
     }
     log::info!(
         "GLM5.2 whole-step graphs pre-captured: {} buckets",
-        GLM52_DECODE_BUCKETS
-            .iter()
-            .filter(|&&bucket| capture_bucket(bucket))
-            .count()
+        GLM52_DECODE_BUCKETS.len()
     );
     Ok(())
 }
 
 /// Export rank 0's serving graph after the all-rank pre-capture barrier.
-/// EP8 and TP4 have a true bucket-1 graph; TP8 always executes the mirrored
-/// full-bucket shape.
 pub(super) fn dump_rank0_decode_graph(
     workers: &[Glm52Worker],
     moe_topo: Glm52MoeTopo,
-    full_bucket: bool,
     png_path: PathBuf,
 ) -> anyhow::Result<CudaGraphDumpSummary> {
     let rank0 = workers
         .first()
         .context("GLM5.2 graph export requires rank 0")?;
-    let bucket = graph_dump_bucket(full_bucket);
+    let bucket = graph_dump_bucket();
     let topology = match moe_topo {
         Glm52MoeTopo::Ep4 => "DP4/EP4",
         Glm52MoeTopo::Ep8 => "DP8/EP8",
         Glm52MoeTopo::Ep16 => "DP16/EP16",
         Glm52MoeTopo::Ep32 => "DP32/EP32",
         Glm52MoeTopo::Ep64 => "DP64/EP64",
-        Glm52MoeTopo::Tp8 => "MoE TP8 · mirrored",
         Glm52MoeTopo::Tp4 => "MoE TP4 · mirrored",
     };
     let title =
@@ -111,10 +97,6 @@ pub(super) fn dump_rank0_decode_graph(
         .map_err(|_| anyhow::anyhow!("GLM5.2 rank 0 dropped its graph export response"))?
 }
 
-pub(super) fn graph_dump_bucket(full_bucket: bool) -> usize {
-    if full_bucket {
-        GLM52_MAX_BATCH_PER_RANK
-    } else {
-        1
-    }
+pub(super) fn graph_dump_bucket() -> usize {
+    1
 }

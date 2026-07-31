@@ -38,10 +38,10 @@ pub(crate) struct Args {
     pub cuda_graph: bool,
 
     /// Dump a live rank-0 decode CUDA Graph during startup. Qwen3 exports its
-    /// batch-1 SplitKv graph; GLM5.2 exports EP8 bucket 1 or the fixed TP8
-    /// bucket 8 selected by `--moe-topo`. Writes a complete sibling `.dot` for
-    /// machine inspection and a folded Graphviz PNG at this path. Requires
-    /// CUDA driver API 12.3 or newer for kernel-name inspection.
+    /// batch-1 SplitKv graph; GLM5.2 exports EP bucket 1 selected by
+    /// `--moe-topo`. Writes a complete sibling `.dot` for machine inspection
+    /// and a folded Graphviz PNG at this path. Requires CUDA driver API 12.3
+    /// or newer for kernel-name inspection.
     #[arg(long)]
     pub dump_graph_png: Option<PathBuf>,
 
@@ -73,7 +73,7 @@ pub(crate) struct Args {
     #[arg(long, default_value_t = 1)]
     pub tp_size: usize,
 
-    /// Data-parallel world size. Kimi-K2 and GLM5.2 EP8/TP8 default to 8;
+    /// Data-parallel world size. Kimi-K2 and GLM5.2 EP8 default to 8;
     /// GLM5.2 TP4 defaults to 1.
     #[arg(long)]
     pub dp_size: Option<usize>,
@@ -217,10 +217,9 @@ pub(crate) struct Args {
     /// high-throughput configuration (32 whole experts per rank, DeepEP
     /// dispatch/combine, buckets 1-8); `ep4` is its four-GPU counterpart
     /// (64 whole experts per rank, weight-only expert GEMMs — the GB300
-    /// high-throughput topology); `tp8` is the low-latency
-    /// configuration (1/8-intermediate slice of ALL experts per rank on
-    /// every MoE layer, bucket-1 only — at most one request per rank);
-    /// `tp4` is the GB300 four-GPU low-latency topology.
+    /// high-throughput topology); `tp4` is GB300 **prefill-only** tensor
+    /// parallel (requires `--glm52-prefill-only`; NCCL all-reduce). Hopper
+    /// (SM9x) and decode TP/LL paths are not supported.
     #[arg(long, default_value = "ep8")]
     pub moe_topo: String,
 
@@ -1102,7 +1101,11 @@ mod tests {
         let error = args
             .validate(ModelType::Glm52, &provided)
             .expect_err("GLM5.2 should reject an unknown topology string");
-        assert!(error.to_string().contains("ep8, ep4, tp8, or tp4"));
+        assert!(
+            error
+                .to_string()
+                .contains("ep4, ep8, ep16, ep32, ep64, or tp4")
+        );
     }
 
     #[cfg(feature = "glm52")]

@@ -20,7 +20,6 @@ use openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_TOPK;
 use openinfer_kernels::ops::Glm52FlashMlaSparseDecode;
 use openinfer_kernels::ops::Glm52IndexerCacheLayout;
 use openinfer_kernels::ops::argmax_bf16_split_into;
-use openinfer_kernels::ops::copy_hidden_rows_raw_into;
 use openinfer_kernels::ops::embedding_rows_into;
 use openinfer_kernels::ops::glm52_flashmla_sparse_decode_num_sm_parts;
 use openinfer_kernels::ops::rms_norm_rows_into;
@@ -54,7 +53,6 @@ use crate::layer::glm52_layer_finish;
 use crate::mla_decode::Glm52MlaBackend;
 use crate::mla_decode::Glm52MlaSchedMetadata;
 use crate::mla_decode::glm52_select_mla_backend;
-use crate::moe_decode::run_router_into;
 use crate::moe_ep_wo::Glm52MoeEpState;
 use crate::moe_tp::Glm52MoeTpRank;
 use crate::mtp::GLM52_MTP_DRAFTS;
@@ -780,12 +778,10 @@ impl Glm52NativeMtp {
         embedding_rows_into(ctx, sin_table, &self.positions, rows, &mut self.sin)?;
         ctx.stream
             .memcpy_htod(&pages, &mut self.buckets[bucket_index].block_table)?;
-        if let Some(rank) = tp.as_deref_mut() {
-            // This is an independent TP model step, not part of the target
-            // graph that normally advances the LL epoch. Attention AR and
-            // the layer-78 MoE must share a fresh epoch on every context or
-            // proposal iteration.
-            rank.state.advance_epoch(ctx)?;
+        if let Some(rank) = tp.as_ref()
+            && !rank.slices.is_empty()
+        {
+            anyhow::bail!("GLM5.2 TP4 is prefill-only; MTP decode LL path was removed");
         }
         let bucket = &mut self.buckets[bucket_index];
         let Glm52MtpBucket {
@@ -871,48 +867,8 @@ impl Glm52NativeMtp {
                         self.ep_ranks * GLM52_MAX_BATCH_PER_RANK,
                     )?;
                 }
-                Glm52LayerMlp::MoeTp(router) => {
-                    let (state, slot, bank) = tp
-                        .as_deref_mut()
-                        .and_then(|rank| rank.layer_bank(GLM52_MTP_LAYER))
-                        .context("GLM5.2 TP MTP layer has no layer-78 slice bank")?;
-                    run_router_into(
-                        ctx,
-                        router,
-                        scratch.layer.normed2.data(),
-                        &mut scratch.router,
-                    )?;
-                    if rows == GLM52_MAX_BATCH_PER_RANK {
-                        state.forward(
-                            ctx,
-                            slot,
-                            bank,
-                            scratch.layer.normed2.data(),
-                            &scratch.router.route.topk_idx,
-                            &scratch.router.route.topk_weight,
-                            scratch.layer.mlp_out.data_mut(),
-                        )?;
-                    } else {
-                        copy_hidden_rows_raw_into(
-                            ctx,
-                            scratch.layer.normed2.data(),
-                            GLM52_HIDDEN,
-                            &mut scratch.tp_normed2,
-                            GLM52_HIDDEN,
-                            0,
-                            rows,
-                        )?;
-                        state.forward(
-                            ctx,
-                            slot,
-                            bank,
-                            &scratch.tp_normed2,
-                            &scratch.router.route.topk_idx,
-                            &scratch.router.route.topk_weight,
-                            &mut scratch.tp_mlp_out,
-                        )?;
-                        tp_padded_mlp = true;
-                    }
+                Glm52LayerMlp::MoeTp(_) => {
+                    anyhow::bail!("GLM5.2 TP4 is prefill-only; MTP decode MoE TP path was removed");
                 }
                 Glm52LayerMlp::Dense(_) => {
                     anyhow::bail!("GLM5.2 MTP layer 78 unexpectedly has a dense MLP")
