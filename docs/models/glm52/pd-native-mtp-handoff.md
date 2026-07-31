@@ -28,7 +28,13 @@
 > rank-local KV reuse). The admission-coupled ITL p99 tail is **fixed**
 > (PR #801, D-side #799): restores now park-and-poll instead of blocking the
 > engine loop — multi-turn ITL p99 98 → 31 ms (c16) and 74 → 30 ms (c64)
-> with zero rejects; the vLLM-compat P/D path is removed.
+> with zero rejects; the vLLM-compat P/D path is removed. PR #804 finishes
+> the line (#799/#802/#805): every offload leg — query, load, save — is a
+> pollable handle (pegaflow 0.23.5, `wait_for_full_prefix` on handoff
+> queries), the P-side tail save detaches instead of blocking, and the TP4
+> native-MTP proposal path broken by #797 is repaired (P dies on first
+> handoff on any #797..#804 build without it). Same-fleet A/B: ITL p90 −27%
+> / p99 −32% vs the pre-async binary; c64 full-stack 640/640 at 1,189 tok/s.
 >
 > **Last touched:** 2026-07
 
@@ -617,6 +623,50 @@ queueing term dominates and TTFT/throughput are unchanged. The per-turn
 TTFT growth from rank-migration refetch remains — that is the
 session-affinity item, not this fix.
 
+### Poll-everything offload + TP4 proposal repair (2026-07-31, PR #804)
+
+PR #804 closes #799/#802/#805 in one change: pegaflow bumped to 0.23.5, the
+shim rebuilt around pollable `OffloadHandle<T>` handles (`submit_query` /
+`submit_save` / `load`), the D-side admission restore extended to poll the
+*query* leg too (`FullQuery → FullLoad → TailQuery → TailLoad`, one settled
+handle per admission attempt), and the P-side `save_native_tail` detached
+(the finished request's KV parks on a tail-save list until the D2H settles).
+Handoff queries pass pegaflow's new `wait_for_full_prefix=true`: D cannot
+recompute a miss, so the query holds `Loading` until the full prefix is
+fetched instead of surfacing a useless partial hit.
+
+**#805 found and fixed in the process**: #797 removed the LL decode paths
+and left the TP4 native-MTP proposal forward bailing — the P role died
+fatally on its *first* handoff request on any current build. This went
+unnoticed because P validation kept running a pre-#797 binary. Rebuilt on
+the prefill machinery (attention o_proj partial + layer-78 MoE both cross
+the NCCL prefill all-reduce; the TP4 proposal body runs eagerly so the
+collectives stay out of CUDA graph capture). Verified: greedy outputs
+byte-identical to the pre-#797 binary through the router, proposals produce
+`drafts=5`, D admits `first_step=verify`.
+
+Multi-turn 1024/256/128 × 5 turns, temp 0, TP4 P + 4-node EP16 D fleet,
+whole stack on the PR binary (artifacts
+`bench-results/glm52-pd-multiturn-*-ep16-asyncall-fullstack.json`):
+
+| metric | c16 | c64 |
+| --- | --- | --- |
+| turns completed | 240/240 | 640/640 |
+| ITL p50/p90/p99 | 31.7 / 32.5 / 32.9 ms | 32.4 / 33.3 / 33.7 ms |
+| TTFT p50/p99 | 0.64 / 1.42 s | 5.11 / 8.26 s |
+| out tok/s | 871 | **1,189** |
+
+A same-fleet control (identical trays, pre-async D binary,
+`*-asyncall-oldD-control.json`) measured ITL p50/p90/p99 =
+36.0/44.4/48.7 ms — the PR binary improves the whole ITL distribution on
+identical hardware (p90 −27%, p99 −32%) and c64 sets the best throughput
+and TTFT/e2e p99 of any run of this workload. Do not compare ITL absolutes
+against the #801-era rows above: one fleet node differs, and the
+fixed-cadence DeepEP chain paces every rank at the slowest node (~+4 ms
+ITL p50 fleet-to-fleet). The c16 TTFT park tax (~+0.1 s p50) persists —
+restore pipelining (deferred in #802) is the code-side answer,
+session-affinity routing the traffic-side one.
+
 ## Debrief
 
 The transferable cache format and the producer's fastest local execution
@@ -633,13 +683,12 @@ Next action: the P → EP16 handoff contract is now hardware-closed (see the
 Slurm fleet section above), which also covers the fleet-aggregate
 measurement through the router. What remains: (1) EP32 handoff rerun when
 eight trays are actually free (Slurm-idle is not evidence — verify
-`nvidia-smi` per node); (2) **#799 remainder**: the D-side admission restore is fixed (PR #801,
-park-and-poll — see the async-restore section above); still open are the
-P-side `save_native_tail` per-handoff `save_blocking` on the engine thread
-(prime suspect for the episodic 2–6 s phase-locked wave stall) and the
-save submit-depth audit;
+`nvidia-smi` per node); (2) **#799/#802/#805 are closed by PR #804** (poll-everything section
+above): D-side query+load park-and-poll, P-side tail-save detach, save
+submit-depth audited, TP4 proposal path repaired;
 (3) session-affinity / cache-aware decode routing — the per-turn
 full-history refetch is the dominant multi-turn TTFT term on wide fleets
-(also tracked in #799 as the traffic-side mitigation); (4) fold multi-P and
+(tracked in #799's discussion as the traffic-side mitigation; restore
+pipelining is the complementary code-side lever, deferred in #802); (4) fold multi-P and
 the Slurm fleet launch into one operational entrypoint (the sbatch script
 and `glm52_pd_stack.sh` are separate today).
