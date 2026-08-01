@@ -570,7 +570,10 @@ struct Glm52RankRuntime {
 struct Glm52DsparkRank {
     model: Glm52DsparkModel,
     scratch: Glm52DsparkScratch,
-    slots: [Glm52DsparkSlotState; GLM52_MAX_BATCH_PER_RANK],
+    // Sized to the RUNTIME slot count (admission never fills past it) — the
+    // cache-length-scaled states are exactly what the dspark arena ledger
+    // charges, and a ceiling-sized array would allocate unledgered GiBs.
+    slots: Vec<Glm52DsparkSlotState>,
 }
 
 struct Glm52RankThreadState {
@@ -728,16 +731,15 @@ impl Glm52RankThreadState {
         );
         let model = Glm52DsparkModel::load(&dev_ctx, path, runtime.model.max_model_len())?;
         let scratch = Glm52DsparkScratch::new(&dev_ctx, model.cache_len())?;
-        let mut slots = Vec::with_capacity(GLM52_MAX_BATCH_PER_RANK);
-        for _ in 0..GLM52_MAX_BATCH_PER_RANK {
+        let slot_count = crate::model::glm52_decode_slots();
+        let mut slots = Vec::with_capacity(slot_count);
+        for _ in 0..slot_count {
             slots.push(Glm52DsparkSlotState::new(&dev_ctx, model.cache_len())?);
         }
         runtime.dspark = Some(Glm52DsparkRank {
             model,
             scratch,
-            slots: slots
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("GLM5.2 dspark slot state count drifted"))?,
+            slots,
         });
         Ok(())
     }
