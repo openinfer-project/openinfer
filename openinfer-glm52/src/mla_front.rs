@@ -201,11 +201,7 @@ fn pack_qa_kva(
     q_a: &ProjWeight,
     kv_a: &ProjWeight,
 ) -> Result<Option<ProjWeight>> {
-    if !glm52_gemv_mma_routes(
-        crate::model::GLM52_MAX_BATCH_PER_RANK,
-        q_a.n + kv_a.n,
-        q_a.k,
-    )? {
+    if !glm52_gemv_mma_routes(crate::fp8::FP8_GEMV_MAX_ROWS, q_a.n + kv_a.n, q_a.k)? {
         return Ok(None);
     }
     Ok(Some(pack_proj_pair(ctx, q_a, kv_a)?))
@@ -220,7 +216,7 @@ fn pack_qa_kva(
 /// headroom re-probe is the backstop.
 pub(crate) fn glm52_qa_kva_twin_bytes() -> Result<usize> {
     let n = Q_LORA + KV_A_OUT;
-    if !glm52_gemv_mma_routes(crate::model::GLM52_MAX_BATCH_PER_RANK, n, HIDDEN)? {
+    if !glm52_gemv_mma_routes(crate::fp8::FP8_GEMV_MAX_ROWS, n, HIDDEN)? {
         return Ok(0);
     }
     let scale = n.div_ceil(FP8_BLOCK) * HIDDEN.div_ceil(FP8_BLOCK) * 4;

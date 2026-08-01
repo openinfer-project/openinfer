@@ -71,7 +71,7 @@ pub(super) fn run_mtp_round(
             super::slot::record_mtp_proposal(active.req.request_id.as_deref(), &span);
             active
                 .state
-                .set_drafts(span.to_vec(), crate::mtp::GLM52_MTP_DRAFTS);
+                .set_drafts(span.to_vec(), crate::mtp::glm52_mtp_draft_len());
         }
     }
     Ok(())

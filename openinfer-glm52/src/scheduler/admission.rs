@@ -51,12 +51,12 @@ pub(super) fn validate_request(
         ));
     }
     if native_mtp_prefill
-        && req.prompt_tokens.len() + crate::mtp::GLM52_MTP_DRAFTS - 1 > max_model_len
+        && req.prompt_tokens.len() + crate::mtp::glm52_mtp_draft_len() - 1 > max_model_len
     {
         return Err(format!(
             "GLM5.2 native-MTP prefill requires {} positions of proposal headroom: \
              prompt {} exceeds max_model_len {max_model_len}",
-            crate::mtp::GLM52_MTP_DRAFTS - 1,
+            crate::mtp::glm52_mtp_draft_len() - 1,
             req.prompt_tokens.len()
         ));
     }
@@ -190,7 +190,12 @@ pub(super) fn admit_from_queue(
     let usable =
         usable_blocks.saturating_sub(offload.map_or(0, offload::RankOffload::pinned_blocks));
 
-    while let Some(slot) = slots.iter().position(Option::is_none) {
+    // Admission fills only the configured slot count; the fixed array's tail
+    // beyond `glm52_decode_slots()` stays permanently empty.
+    while let Some(slot) = slots[..crate::model::glm52_decode_slots()]
+        .iter()
+        .position(Option::is_none)
+    {
         let Some(front) = pending.front() else {
             break;
         };
@@ -401,7 +406,10 @@ pub(super) fn admit_from_queue(
             } else {
                 state.seed_native_pd_anchor();
             }
-            state.set_drafts(handoff.draft_tokens.to_vec(), crate::mtp::GLM52_MTP_DRAFTS);
+            state.set_drafts(
+                handoff.draft_tokens.to_vec(),
+                crate::mtp::glm52_mtp_draft_len(),
+            );
             log::info!(
                 "GLM5.2 native P/D admitted: rank={rank} slot={slot} \
                  committed_len={} drafts={} first_step=verify",
@@ -559,14 +567,16 @@ mod tests {
 
     #[test]
     fn native_mtp_prefill_reserves_the_fixed_proposal_positions() {
-        let fits = request(vec![10; 4092], SamplingParams::default(), 1);
+        // Headroom tracks the configured draft span, not the compile ceiling.
+        let headroom = crate::mtp::glm52_mtp_draft_len() - 1;
+        let fits = request(vec![10; 4096 - headroom], SamplingParams::default(), 1);
         assert!(validate_request(&fits, 4096, true, true).is_ok());
 
-        let overflows = request(vec![10; 4093], SamplingParams::default(), 1);
+        let overflows = request(vec![10; 4096 - headroom + 1], SamplingParams::default(), 1);
         let error = validate_request(&overflows, 4096, true, true)
             .expect_err("fixed MTP proposal must fit inside the context cap");
         assert!(
-            error.contains("4 positions of proposal headroom"),
+            error.contains(&format!("{headroom} positions of proposal headroom")),
             "{error}"
         );
 

@@ -37,13 +37,30 @@ use crate::config::GLM52_HIDDEN;
 use crate::config::GLM52_INDEX_HEAD_DIM;
 use crate::config::GLM52_RMS_EPS;
 use crate::model::GLM52_DECODE_BUCKETS;
-use crate::model::GLM52_MAX_BATCH_PER_RANK;
 use crate::model::GLM52_MODEL_LEN_ALIGN;
 use crate::model::glm52_pool_blocks;
 use crate::rows::Rows;
 
 const MTP_FUSED_INPUT: usize = 2 * GLM52_HIDDEN;
 pub(crate) const GLM52_MTP_DRAFTS: usize = 5;
+
+/// The draft span length actually proposed and verified: `GLM52_MTP_DRAFTS`
+/// (1..=5), default the full 5. Every wire/array shape stays at the compile
+/// ceiling — a shorter span just leaves the tail rows unproposed, so P and D
+/// may even disagree on this knob (D truncates to its own length; a longer
+/// D span verifies zero-filled rows that simply fail the prefix match).
+/// Wide-EP throughput deployments pair 2 drafts with 16 decode slots: fewer
+/// sequential proposal forwards per step, same 48-row verify ceiling.
+pub(crate) fn glm52_mtp_draft_len() -> usize {
+    static LEN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LEN.get_or_init(|| {
+        std::env::var("GLM52_MTP_DRAFTS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|v| v.clamp(1, GLM52_MTP_DRAFTS))
+            .unwrap_or(GLM52_MTP_DRAFTS)
+    })
+}
 
 /// Context-scaled device memory owned by the native MTP lane: one execution
 /// cache, TP4's additional P/D wire cache, and one set of per-bucket indexer
@@ -57,8 +74,8 @@ pub(crate) fn glm52_mtp_arena_bytes(
     // Two private pages per slot hold unverified proposal KV. Committed
     // layer-78 rows use the target BlockPool page IDs and are transferable;
     // scratch pages sit beyond that registered range.
-    let blocks =
-        glm52_pool_blocks(max_model_len, GLM52_MAX_BATCH_PER_RANK) + 2 * GLM52_MAX_BATCH_PER_RANK;
+    let blocks = glm52_pool_blocks(max_model_len, crate::model::glm52_decode_slots())
+        + 2 * crate::model::glm52_decode_slots();
     let execution_bytes_per_token = if topology == crate::Glm52MoeTopo::Tp4 {
         openinfer_kernels::ops::GLM52_FLASHINFER_SPARSE_BYTES_PER_TOKEN
     } else {

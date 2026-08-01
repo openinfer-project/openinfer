@@ -441,6 +441,17 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
         ranks.start,
         ranks.end
     );
+    // The (slots, drafts) startup pair must fit the 48-row step budget —
+    // an over-committed pair would silently cap verify spans under full
+    // occupancy and collapse speculation (#812's original failure mode).
+    let slots = model::glm52_decode_slots();
+    let draft_len = crate::mtp::glm52_mtp_draft_len();
+    ensure!(
+        slots * (1 + draft_len) <= model::GLM52_MAX_STEP_ROWS,
+        "GLM5.2 GLM52_DECODE_SLOTS={slots} x (1 + GLM52_MTP_DRAFTS={draft_len}) exceeds the \
+         {}-row step budget; 16 slots need GLM52_MTP_DRAFTS=2",
+        model::GLM52_MAX_STEP_ROWS
+    );
     // Probe only the GPUs this process hosts (local ordinals 0..N), not the
     // global EP width — EP16 on one 4-GPU tray would otherwise try device 4+.
     ensure_blackwell_devices(ranks.end - ranks.start)?;
@@ -629,7 +640,7 @@ fn glm52_cap_bytes(
     // Prefill-only sizes the full slot count too (it used to hold exactly one
     // request): the prefix cache needs blocks to retain released prefixes
     // across turns, and the headroom lets prefills overlap.
-    let pool_slots = model::GLM52_MAX_BATCH_PER_RANK;
+    let pool_slots = model::glm52_decode_slots();
     Ok(glm52_arena_bytes(max_model_len, pool_slots, prefill_only)?
         + if drafter.is_dspark() {
             crate::dspark::glm52_dspark_arena_bytes(max_model_len)
@@ -842,7 +853,7 @@ fn start_engine(
         ByteSize(qa_kva_twin_bytes as u64),
         ByteSize(deepgemm_vram_charge_bytes as u64),
         ByteSize(budget.arena_bytes as u64),
-        model::GLM52_MAX_BATCH_PER_RANK,
+        model::glm52_decode_slots(),
         if drafter.enabled() {
             " (draft lane included)"
         } else {
@@ -911,7 +922,7 @@ fn start_engine(
         }
     };
     let logical_ranks = moe_topo.logical_rank_count();
-    let kv_total_blocks = glm52_pool_blocks(max_model_len, model::GLM52_MAX_BATCH_PER_RANK) - 1;
+    let kv_total_blocks = glm52_pool_blocks(max_model_len, model::glm52_decode_slots()) - 1;
     // One autonomous engine per LOCAL logical rank (a mirrored topology
     // collapses to a single engine driving every worker). Each engine owns
     // its submit queue and load feed, so the frontend sees one scheduler

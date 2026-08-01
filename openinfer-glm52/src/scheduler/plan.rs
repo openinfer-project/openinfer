@@ -598,15 +598,50 @@ mod tests {
     /// (measured as TPOT == ITL at full occupancy).
     #[test]
     fn full_occupancy_verify_spans_fit_the_max_bucket() {
-        let wants = [6usize; GLM52_MAX_BATCH_PER_RANK];
+        // The latency profile: 8 slots riding the full 5-draft span.
+        let mut wants = [0usize; GLM52_MAX_BATCH_PER_RANK];
+        wants[..8].fill(6);
+        let shape = plan_step_shape(&wants);
+        assert_eq!(shape.bucket, GLM52_MAX_STEP_ROWS);
+        assert_eq!(shape.active_rows, GLM52_MAX_STEP_ROWS);
+        let mut expect = Vec::new();
+        for slot in 0..8 {
+            expect.extend(std::iter::repeat_n(slot as u8, 6));
+        }
+        assert_eq!(shape.slots[..GLM52_MAX_STEP_ROWS].to_vec(), expect);
+    }
+
+    #[test]
+    fn wide_occupancy_two_draft_spans_fit_the_max_bucket() {
+        // The throughput profile: 16 slots riding a 2-draft span — the
+        // ceiling slot count saturates the same 48-row budget exactly.
+        let wants = [3usize; GLM52_MAX_BATCH_PER_RANK];
         let shape = plan_step_shape(&wants);
         assert_eq!(shape.bucket, GLM52_MAX_STEP_ROWS);
         assert_eq!(shape.active_rows, GLM52_MAX_STEP_ROWS);
         let mut expect = Vec::new();
         for slot in 0..GLM52_MAX_BATCH_PER_RANK {
-            expect.extend(std::iter::repeat_n(slot as u8, 6));
+            expect.extend(std::iter::repeat_n(slot as u8, 3));
         }
-        assert_eq!(shape.slots[..].to_vec(), expect);
+        assert_eq!(shape.slots[..GLM52_MAX_STEP_ROWS].to_vec(), expect);
+    }
+
+    #[test]
+    fn over_committed_wants_shrink_round_robin_not_collapse() {
+        // A mis-paired (slots, drafts) config (launch() rejects it, but the
+        // planner must still be safe): 16 slots each wanting the 6-row span
+        // get round-robined down to 3 rows apiece, never to a bare anchor.
+        let wants = [6usize; GLM52_MAX_BATCH_PER_RANK];
+        let shape = plan_step_shape(&wants);
+        assert_eq!(shape.bucket, GLM52_MAX_STEP_ROWS);
+        assert_eq!(shape.active_rows, GLM52_MAX_STEP_ROWS);
+        for slot in 0..GLM52_MAX_BATCH_PER_RANK {
+            let rows = shape.slots[..GLM52_MAX_STEP_ROWS]
+                .iter()
+                .filter(|&&s| s as usize == slot)
+                .count();
+            assert_eq!(rows, 3, "slot {slot} should get an even 3-row share");
+        }
     }
 
     #[test]
@@ -622,6 +657,8 @@ mod tests {
             spans[0].abs_diff(spans[3]) <= 1,
             "long requests must share the remaining rows: {spans:?}"
         );
-        assert_eq!(plan_prefill_spans(&wants, 2), [1, 0, 0, 1, 0, 0, 0, 0]);
+        let mut tight = [0; GLM52_MAX_BATCH_PER_RANK];
+        (tight[0], tight[3]) = (1, 1);
+        assert_eq!(plan_prefill_spans(&wants, 2), tight);
     }
 }

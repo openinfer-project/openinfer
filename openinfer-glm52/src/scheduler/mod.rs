@@ -929,7 +929,9 @@ impl Glm52Engine {
                     }
                 }
                 let wants_drafts = if self.drafter.is_mtp() {
-                    active.state.wants_full_draft(crate::mtp::GLM52_MTP_DRAFTS)
+                    active
+                        .state
+                        .wants_full_draft(crate::mtp::glm52_mtp_draft_len())
                 } else {
                     active.state.wants_drafts()
                 };

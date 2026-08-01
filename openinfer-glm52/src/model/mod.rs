@@ -81,10 +81,29 @@ use launch_ahead::Glm52SpeculatedStep;
 use mtp::Glm52NativeMtp;
 use step_body::run_step_body;
 
-/// The per-rank slot count and the largest decode bucket. A slot is a batch
-/// lane (and the draft lane's state key), not a cache region — KV pages come
-/// from the rank's shared pool.
-pub(crate) const GLM52_MAX_BATCH_PER_RANK: usize = 8;
+/// The compile-time slot-count CEILING: fixed arrays (`RankSlots`,
+/// launch-ahead seen-sets, contiguity walks) are sized to it. A slot is a
+/// batch lane (and the draft lane's state key), not a cache region — KV
+/// pages come from the rank's shared pool. The count actually admitted and
+/// sized for is [`glm52_decode_slots`], a startup knob; the pair
+/// (slots, drafts) must satisfy `slots * (1 + drafts) <= GLM52_MAX_STEP_ROWS`
+/// (validated at engine build), so the ceiling is only reachable with a
+/// shortened draft span.
+pub(crate) const GLM52_MAX_BATCH_PER_RANK: usize = 16;
+
+/// The per-rank decode slot count: `GLM52_DECODE_SLOTS` (1..=ceiling),
+/// default 8 — the latency-lean P/D profile. Wide-EP throughput deployments
+/// run 16 slots with `GLM52_MTP_DRAFTS=2` to stay inside the 48-row step.
+pub(crate) fn glm52_decode_slots() -> usize {
+    static SLOTS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SLOTS.get_or_init(|| {
+        std::env::var("GLM52_DECODE_SLOTS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|v| v.clamp(1, GLM52_MAX_BATCH_PER_RANK))
+            .unwrap_or(8)
+    })
+}
 
 /// Cache geometry is carved in units of the 64-token FlashMLA page (== the
 /// index-K cache block), so the per-request context cap must sit on a page
@@ -188,13 +207,15 @@ fn glm52_persistent_mla_bytes_per_token(
     }
 }
 
-/// The step-row ceiling: every slot verifying at the full native-MTP span
-/// (1 anchor + `GLM52_MTP_DRAFTS` drafts). Step rows and slots are SEPARATE
-/// dimensions — they were both 8 until #812, which silently capped verify
-/// spans at 1 row/slot under full occupancy and collapsed speculation
-/// (measured: TPOT == ITL at c32 on EP4).
-pub(crate) const GLM52_MAX_STEP_ROWS: usize =
-    GLM52_MAX_BATCH_PER_RANK * (1 + crate::mtp::GLM52_MTP_DRAFTS);
+/// The step-row ceiling. Step rows and slots are SEPARATE dimensions — they
+/// were both 8 until #812, which silently capped verify spans at 1 row/slot
+/// under full occupancy and collapsed speculation (measured: TPOT == ITL at
+/// c32 on EP4). Since the slot count and draft length became startup knobs
+/// this is a standalone budget the runtime pair must fit
+/// (`slots * (1 + drafts) <= 48`, validated at engine build): 8 slots ride
+/// the full 5-draft span, 16 slots ride a 2-draft span — same row ceiling,
+/// so every #813 bucket, graph, and kernel instantiation is shared.
+pub(crate) const GLM52_MAX_STEP_ROWS: usize = 48;
 
 /// The decode batch buckets, ascending. Each bucket has its own captured
 /// CUDA graphs, scratch arena, and FlashMLA plans, and the batched GEMV
@@ -211,13 +232,11 @@ pub(crate) const GLM52_DECODE_BUCKETS: [usize; 7] = [1, 2, 4, 8, 16, 32, GLM52_M
 // bucket list must match the decode buckets.
 
 // DeepEP protocol worst-case: each source token contributes ≤1 row per
-// local expert, so fleet_ranks × max_batch must fit the per-expert slab.
-// Compile-time so a future GLM52_MAX_BATCH_PER_RANK bump fails here, not at
-// graph capture.
-const _: () = assert!(
-    crate::weights::GLM52_EP_RANKS * GLM52_MAX_BATCH_PER_RANK
-        <= openinfer_kernels::ops::GLM52_DEEPGEMM_MASKED_CAP
-);
+// local expert. The per-expert recv slab is sized at RUNTIME from the launch
+// topology (`deepgemm_masked_cap(num_ranks)` = ranks × GLM52_MAX_STEP_ROWS,
+// alignment-padded), so no compile-time rank×batch bound exists anymore —
+// the EP8-flavored `GLM52_DEEPGEMM_MASKED_CAP` assert that stood here
+// predated verify-span rows and under-counted every fleet wider than EP8.
 
 // The min-latency GEMV (router logits, indexer weights_proj) dispatches
 // tokens 1..=8 plus the decode bucket sizes; a bucket bump must extend
@@ -594,7 +613,7 @@ impl Glm52RankModel {
         // Prefill-only allocates the full slot count too — the scheduler pool
         // is sized to match, and the prefix cache retains released prefixes
         // in the headroom.
-        let pool_slots = GLM52_MAX_BATCH_PER_RANK;
+        let pool_slots = glm52_decode_slots();
         let pool_blocks = glm52_pool_blocks(max_model_len, pool_slots);
         let contract = Glm52FlashMlaSparseDecode {
             batch_size: batch,
