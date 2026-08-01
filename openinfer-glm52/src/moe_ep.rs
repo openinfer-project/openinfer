@@ -500,35 +500,35 @@ mod tests {
 
     #[test]
     fn masked_cap_covers_every_supported_ep_width() {
-        // ranks x GLM52_MAX_STEP_ROWS (48 since #812), aligned up to 128.
-        assert_eq!(deepgemm_masked_cap(4), 256);
-        assert_eq!(deepgemm_masked_cap(8), 384);
-        assert_eq!(deepgemm_masked_cap(16), 768);
-        assert_eq!(deepgemm_masked_cap(32), 1536);
-        assert_eq!(deepgemm_masked_cap(64), 3072);
+        // ranks x GLM52_MAX_STEP_ROWS (96 since #817), aligned up to 128.
+        assert_eq!(deepgemm_masked_cap(4), 384);
+        assert_eq!(deepgemm_masked_cap(8), 768);
+        assert_eq!(deepgemm_masked_cap(16), 1536);
+        assert_eq!(deepgemm_masked_cap(32), 3072);
+        assert_eq!(deepgemm_masked_cap(64), 6144);
     }
 
     #[test]
     fn post_weight_vram_charge_tracks_topology_and_native_mtp() {
         assert_eq!(
             glm52_deepgemm_vram_charge_bytes(Glm52MoeTopo::Ep4, false).expect("EP4 charge"),
-            1_746_500_100
+            1_984_001_028
         );
         assert_eq!(
             glm52_deepgemm_vram_charge_bytes(Glm52MoeTopo::Ep8, false).expect("EP8 charge"),
-            916_132_996
+            1_272_383_620
         );
         assert_eq!(
             glm52_deepgemm_vram_charge_bytes(Glm52MoeTopo::Ep16, false).expect("EP16 charge"),
-            485_242_948
+            841_490_500
         );
         assert_eq!(
             glm52_deepgemm_vram_charge_bytes(Glm52MoeTopo::Ep32, false).expect("EP32 charge"),
-            118_847_524
+            475_088_932
         );
         assert_eq!(
             glm52_deepgemm_vram_charge_bytes(Glm52MoeTopo::Ep64, false).expect("EP64 charge"),
-            36_271_124
+            392_500_244
         );
         assert_eq!(
             glm52_deepgemm_vram_charge_bytes(Glm52MoeTopo::Tp4, false).expect("TP4 charge"),

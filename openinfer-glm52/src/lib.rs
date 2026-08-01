@@ -455,7 +455,7 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
     ensure!(
         slots * (1 + draft_len) <= model::GLM52_MAX_STEP_ROWS,
         "GLM5.2 GLM52_DECODE_SLOTS={slots} x (1 + GLM52_MTP_DRAFTS={draft_len}) exceeds the \
-         {}-row step budget; 16 slots need GLM52_MTP_DRAFTS=2",
+         {}-row step budget; 32 slots need GLM52_MTP_DRAFTS=2",
         model::GLM52_MAX_STEP_ROWS
     );
     // Probe only the GPUs this process hosts (local ordinals 0..N), not the

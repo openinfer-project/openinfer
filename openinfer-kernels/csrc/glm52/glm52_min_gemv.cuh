@@ -16,8 +16,12 @@
 namespace glm52_min_gemv {
 
 constexpr int kHidden = 6144;
-constexpr int kMaxTokens = 48;  // = GLM52_MAX_STEP_ROWS (#812); dispatch
-                                // covers 1..=8 plus the bucket sizes.
+constexpr int kMaxTokens = 96;  // = GLM52_MAX_STEP_ROWS (#812/#817);
+                                // dispatch covers 1..=8 plus the bucket
+                                // sizes. 64/96 decompose into two sub-launches
+                                // (token-major out lets the tile split on the
+                                // token axis) — a 96-wide accumulator tile
+                                // would spill far past 255 regs/thread.
 
 // out[token * kNumRows + row] = dot(hidden[token], weight[row]); weight is
 // row-major [kNumRows, kHidden].
@@ -124,6 +128,22 @@ cudaError_t launch_tokens(OutT* out, const __nv_bfloat16* hidden,
     case 16: return launch<16, kNumRows>(out, hidden, weight, stream);
     case 32: return launch<32, kNumRows>(out, hidden, weight, stream);
     case 48: return launch<48, kNumRows>(out, hidden, weight, stream);
+    case 64: {
+      const cudaError_t first =
+          launch<32, kNumRows>(out, hidden, weight, stream);
+      if (first != cudaSuccess) return first;
+      return launch<32, kNumRows>(out + 32 * static_cast<size_t>(kNumRows),
+                                  hidden + 32 * static_cast<size_t>(kHidden),
+                                  weight, stream);
+    }
+    case 96: {
+      const cudaError_t first =
+          launch<48, kNumRows>(out, hidden, weight, stream);
+      if (first != cudaSuccess) return first;
+      return launch<48, kNumRows>(out + 48 * static_cast<size_t>(kNumRows),
+                                  hidden + 48 * static_cast<size_t>(kHidden),
+                                  weight, stream);
+    }
     default: return cudaErrorInvalidValue;
   }
 }

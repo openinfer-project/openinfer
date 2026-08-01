@@ -135,11 +135,22 @@ pub(super) fn lease_flags(
         && slots.iter().flatten().all(|active| {
             takes_argmax(&active.req.params) && lease_ok(&active.state, max_model_len)
         });
+    // `GLM52_EAGER_DECODE=1` runs every decode step through the eager path
+    // (same step body, no graph capture/replay) — the stage-3 measurement
+    // switch for the graph-vs-padding trade at wide buckets. Eager steps
+    // cannot ride launch-ahead replays, so the lease is withheld too.
+    let eager = eager_decode_forced();
     Glm52StepFlags {
         consume,
-        lease,
-        eager: false,
+        lease: lease && !eager,
+        eager,
     }
+}
+
+/// Whether `GLM52_EAGER_DECODE=1` forces the eager (graph-free) decode path.
+pub(super) fn eager_decode_forced() -> bool {
+    static EAGER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *EAGER.get_or_init(|| std::env::var("GLM52_EAGER_DECODE").as_deref() == Ok("1"))
 }
 
 /// Whether a request's committed rows take the fused argmax — the shared
@@ -584,8 +595,8 @@ mod tests {
         wants[3] = 3000;
         wants[6] = 3000;
         let mut expect = vec![0u8];
-        expect.extend(std::iter::repeat_n(3u8, 24));
-        expect.extend(std::iter::repeat_n(6u8, 23));
+        expect.extend(std::iter::repeat_n(3u8, 48));
+        expect.extend(std::iter::repeat_n(6u8, 47));
         assert_eq!(
             forwarded(&plan_step_shape(&wants)),
             (GLM52_MAX_STEP_ROWS, expect)
@@ -598,17 +609,21 @@ mod tests {
     /// (measured as TPOT == ITL at full occupancy).
     #[test]
     fn full_occupancy_verify_spans_fit_the_max_bucket() {
-        // The latency profile: 8 slots riding the full 5-draft span.
+        // The latency profile: 16 slots riding the full 5-draft span fill
+        // the max bucket exactly (8 slots land on the 48 bucket unchanged).
         let mut wants = [0usize; GLM52_MAX_BATCH_PER_RANK];
-        wants[..8].fill(6);
+        wants[..16].fill(6);
         let shape = plan_step_shape(&wants);
         assert_eq!(shape.bucket, GLM52_MAX_STEP_ROWS);
         assert_eq!(shape.active_rows, GLM52_MAX_STEP_ROWS);
         let mut expect = Vec::new();
-        for slot in 0..8 {
+        for slot in 0..16 {
             expect.extend(std::iter::repeat_n(slot as u8, 6));
         }
         assert_eq!(shape.slots[..GLM52_MAX_STEP_ROWS].to_vec(), expect);
+        let mut eight = [0usize; GLM52_MAX_BATCH_PER_RANK];
+        eight[..8].fill(6);
+        assert_eq!(plan_step_shape(&eight).bucket, 48);
     }
 
     #[test]

@@ -89,11 +89,11 @@ use step_body::run_step_body;
 /// (slots, drafts) must satisfy `slots * (1 + drafts) <= GLM52_MAX_STEP_ROWS`
 /// (validated at engine build), so the ceiling is only reachable with a
 /// shortened draft span.
-pub(crate) const GLM52_MAX_BATCH_PER_RANK: usize = 16;
+pub(crate) const GLM52_MAX_BATCH_PER_RANK: usize = 32;
 
 /// The per-rank decode slot count: `GLM52_DECODE_SLOTS` (1..=ceiling),
 /// default 8 — the latency-lean P/D profile. Wide-EP throughput deployments
-/// run 16 slots with `GLM52_MTP_DRAFTS=2` to stay inside the 48-row step.
+/// run 32 slots with `GLM52_MTP_DRAFTS=2` to stay inside the 96-row step.
 pub(crate) fn glm52_decode_slots() -> usize {
     static SLOTS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *SLOTS.get_or_init(|| {
@@ -212,10 +212,13 @@ fn glm52_persistent_mla_bytes_per_token(
 /// under full occupancy and collapsed speculation (measured: TPOT == ITL at
 /// c32 on EP4). Since the slot count and draft length became startup knobs
 /// this is a standalone budget the runtime pair must fit
-/// (`slots * (1 + drafts) <= 48`, validated at engine build): 8 slots ride
-/// the full 5-draft span, 16 slots ride a 2-draft span — same row ceiling,
-/// so every #813 bucket, graph, and kernel instantiation is shared.
-pub(crate) const GLM52_MAX_STEP_ROWS: usize = 48;
+/// (`slots * (1 + drafts) <= 96`, validated at engine build): 16 slots ride
+/// the full 5-draft span, 32 slots ride a 2-draft span — the same row
+/// ceiling, so bucket/graph/kernel instantiations are shared across
+/// profiles. 96 (not more) because the min-gemv token split, the MQA AOT
+/// batch guard, and the decode-feed slot kernel are all extended exactly
+/// this far (#817).
+pub(crate) const GLM52_MAX_STEP_ROWS: usize = 96;
 
 /// The decode batch buckets, ascending. Each bucket has its own captured
 /// CUDA graphs, scratch arena, and FlashMLA plans, and the batched GEMV
@@ -224,7 +227,8 @@ pub(crate) const GLM52_MAX_STEP_ROWS: usize = 48;
 /// engine picks the smallest bucket covering its own demand, so a
 /// lightly-loaded rank keeps the small-step cost; discrete buckets (not a
 /// continuum) keep the whole-step graphs' fixed-shape contract.
-pub(crate) const GLM52_DECODE_BUCKETS: [usize; 7] = [1, 2, 4, 8, 16, 32, GLM52_MAX_STEP_ROWS];
+pub(crate) const GLM52_DECODE_BUCKETS: [usize; 9] =
+    [1, 2, 4, 8, 16, 32, 48, 64, GLM52_MAX_STEP_ROWS];
 
 // NOTE (#812): the MTP round shares GLM52_DECODE_BUCKETS. The draft leg
 // never exceeds one row per slot, but the CONTEXT leg ingests every

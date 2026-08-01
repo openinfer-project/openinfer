@@ -100,7 +100,9 @@ pub(crate) fn glm52_dspark_arena_bytes(max_model_len: usize) -> usize {
     let context = 2 * GLM52_HIDDEN * cache_len * bf16;
     let tail = (GLM52_HIDDEN + 2 * DSPARK_QKV_DIM) * cache_len * bf16;
     let rope = 2 * cache_len * DSPARK_HEAD_DIM * bf16;
-    GLM52_MAX_BATCH_PER_RANK * (kv + pending + context) + tail + rope
+    // Cap-scaled term: like the native-MTP arena, charge the RUNTIME slot
+    // count — the aux-hidden lanes are per admitted slot, not per ceiling.
+    crate::model::glm52_decode_slots() * (kv + pending + context) + tail + rope
 }
 
 const DSPARK_LAYERS: usize = 5;

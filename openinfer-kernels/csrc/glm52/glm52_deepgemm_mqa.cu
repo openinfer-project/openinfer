@@ -51,7 +51,7 @@ constexpr int kAotNumSms = 132;
 // Launcher guard only — batch is a runtime argument of both kernels (the
 // grid-stride scheduler walks q atoms); no template arg depends on it.
 // 64 covers the verify-span row ceiling (48, #812).
-constexpr int kAotAlignedBatchSize = 64;
+constexpr int kAotAlignedBatchSize = 96;
 
 const auto kMetadataKernel = &deep_gemm::sched::sm100_paged_mqa_logits_metadata<
     kAotNextN, /*kIsContextLens2D=*/false, /*kIsVarlen=*/false,
