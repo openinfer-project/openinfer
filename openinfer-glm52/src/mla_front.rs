@@ -9,6 +9,7 @@ use anyhow::ensure;
 use cudarc::driver::CudaSlice;
 use half::bf16;
 use openinfer_kernels::ops::GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW;
+use openinfer_kernels::ops::extract_hidden_rows_raw_into;
 use openinfer_kernels::ops::glm52_gemv_mma_routes;
 use openinfer_kernels::ops::glm52_gemv_split_reduce_launch;
 use openinfer_kernels::ops::glm52_mla_ckv_split_launch;
@@ -71,7 +72,9 @@ pub(crate) struct Glm52MlaLayerWeights {
     // alone (7.3 vs 7.1 us at batch 8 on GB300 — the kv_a bytes ride free).
     // Built only where the mma table routes the packed shape (Blackwell batch
     // 8); everywhere else the separate weights above stay the launch path, so
-    // the twin costs ~15.4 MiB/layer only where it earns its keep.
+    // the twin costs ~15.4 MiB/layer only where it earns its keep. The
+    // wide-bucket GEMM route (#812) reuses the same pack: one GEMM + one
+    // activation quant replace the separate q_a/kv_a pair there too.
     qa_kva: Option<ProjWeight>,
     pub(crate) heads: usize,
 }
@@ -477,7 +480,34 @@ pub(crate) fn glm52_mla_front_q_into(
             &mut front.ckv,
         )?;
     } else if let Some(wide) = front.wide.as_mut() {
-        fp8_linear_large_m_into(ctx, &w.q_a, t, hidden.data(), wide, &mut front.q_a)?;
+        if let Some(qa_kva) = w.qa_kva.as_ref() {
+            // One packed GEMM computes q_a AND kv_a from ONE quantization of
+            // `hidden` — the #812 profile showed the wide step dominated by
+            // skinny per-projection GEMMs plus their activation quants; the
+            // pack halves both for this pair. `front_rest` skips its kv_a
+            // launch (same `qa_kva_packed_wide` predicate).
+            fp8_linear_large_m_into(ctx, qa_kva, t, hidden.data(), wide, &mut front.qa_kva_out)?;
+            extract_hidden_rows_raw_into(
+                ctx,
+                &front.qa_kva_out,
+                Q_LORA + KV_A_OUT,
+                &mut front.q_a,
+                Q_LORA,
+                0,
+                t,
+            )?;
+            extract_hidden_rows_raw_into(
+                ctx,
+                &front.qa_kva_out,
+                Q_LORA + KV_A_OUT,
+                &mut front.ckv,
+                KV_A_OUT,
+                Q_LORA,
+                t,
+            )?;
+        } else {
+            fp8_linear_large_m_into(ctx, &w.q_a, t, hidden.data(), wide, &mut front.q_a)?;
+        }
     } else {
         fp8_linear_into(
             ctx,
@@ -507,6 +537,12 @@ fn qa_kva_fused(w: &Glm52MlaLayerWeights, t: usize) -> Result<Option<&ProjWeight
         return Ok(None);
     };
     Ok(glm52_gemv_mma_routes(t, qa_kva.n, qa_kva.k)?.then_some(qa_kva))
+}
+
+/// Whether the wide-bucket route already computed kv_a through the packed
+/// q_a|kv_a GEMM (#812) — front_rest's twin of [`qa_kva_fused`].
+fn qa_kva_packed_wide(w: &Glm52MlaLayerWeights, front: &Glm52MlaFront) -> bool {
+    w.qa_kva.is_some() && front.wide.is_some()
 }
 
 /// The remainder of the MLA front: q_b + kv_a projections and the kv_c/k_pe
@@ -548,7 +584,7 @@ pub(crate) fn glm52_mla_front_rest_into(
             &mut front.q_full,
         )?; // [T, heads, 256]
     }
-    if t != 1 && qa_kva_fused(w, t)?.is_none() {
+    if t != 1 && qa_kva_fused(w, t)?.is_none() && !qa_kva_packed_wide(w, front) {
         if let Some(wide) = front.wide.as_mut() {
             fp8_linear_large_m_into(ctx, &w.kv_a, t, hidden.data(), wide, &mut front.ckv)?;
         } else {

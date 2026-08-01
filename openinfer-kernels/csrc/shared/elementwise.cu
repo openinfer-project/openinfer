@@ -101,6 +101,28 @@ __global__ void copy_hidden_rows_kernel(
   }
 }
 
+// Inverse of copy_hidden_rows_kernel: extract a column window
+// [col_offset, col_offset + rows) of each token's wide src row into a
+// compact dst row (the packed-projection split, #812).
+__global__ void extract_hidden_rows_kernel(
+    const __nv_bfloat16 *__restrict__ src,
+    __nv_bfloat16 *__restrict__ dst,
+    int src_hidden_dim,
+    int dst_hidden_dim,
+    int col_offset,
+    int rows,
+    int seq_len) {
+  int total = rows * seq_len;
+  for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+       idx < total;
+       idx += gridDim.x * blockDim.x) {
+    int token = idx / rows;
+    int row = idx % rows;
+    dst[(size_t)token * dst_hidden_dim + row] =
+        src[(size_t)token * src_hidden_dim + col_offset + row];
+  }
+}
+
 __global__ void mask_position_zero_rows_kernel(
     const __nv_bfloat16 *__restrict__ src,
     const uint32_t *__restrict__ positions,
@@ -445,6 +467,28 @@ CUresult gather_hidden_tokens_cuda(
   int grid = (total + block - 1) / block;
   gather_hidden_tokens_kernel<<<grid, block, 0, stream>>>(
       input, token_indices, out, hidden_dim, token_count, input_seq_len);
+  return (CUresult)cudaGetLastError();
+}
+
+CUresult extract_hidden_rows_cuda(
+    const __nv_bfloat16 *src,
+    __nv_bfloat16 *dst,
+    int src_hidden_dim,
+    int dst_hidden_dim,
+    int col_offset,
+    int rows,
+    int seq_len,
+    cudaStream_t stream) {
+  if (src == nullptr || dst == nullptr || src_hidden_dim <= 0 ||
+      dst_hidden_dim <= 0 || col_offset < 0 || rows <= 0 || seq_len <= 0 ||
+      rows > dst_hidden_dim || col_offset + rows > src_hidden_dim) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  int total = rows * seq_len;
+  int block = 256;
+  int grid = (total + block - 1) / block;
+  extract_hidden_rows_kernel<<<grid, block, 0, stream>>>(
+      src, dst, src_hidden_dim, dst_hidden_dim, col_offset, rows, seq_len);
   return (CUresult)cudaGetLastError();
 }
 

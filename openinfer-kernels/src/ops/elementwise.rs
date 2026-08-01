@@ -282,6 +282,53 @@ pub fn copy_hidden_rows_into(
 /// [`copy_hidden_rows_into`] over raw device slices: per token, copy the
 /// `src_dim` features of `src` (row stride `src_dim`) into `dst` at feature
 /// offset `row_offset` (row stride `dst_dim`), for `tokens` tokens.
+/// Inverse of [`copy_hidden_rows_raw_into`]: extract the column window
+/// `[col_offset, col_offset + dst_dim)` of each token's `src_dim`-wide row
+/// into a compact `dst_dim`-wide destination row — the packed-projection
+/// output split (#812).
+pub fn extract_hidden_rows_raw_into(
+    ctx: &DeviceContext,
+    src: &CudaSlice<half::bf16>,
+    src_dim: usize,
+    dst: &mut CudaSlice<half::bf16>,
+    dst_dim: usize,
+    col_offset: usize,
+    tokens: usize,
+) -> Result<()> {
+    assert!(
+        col_offset + dst_dim <= src_dim,
+        "column window [{}..{}) exceeds source hidden_dim {}",
+        col_offset,
+        col_offset + dst_dim,
+        src_dim
+    );
+    assert!(
+        tokens * src_dim <= src.len() && tokens * dst_dim <= dst.len(),
+        "extract_hidden_rows_raw_into token count {} exceeds src {} / dst {} capacity",
+        tokens,
+        src.len(),
+        dst.len()
+    );
+
+    let (src_ptr, _gs) = src.device_ptr(&ctx.stream);
+    let (dst_ptr, _gd) = dst.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::extract_hidden_rows_cuda(
+            src_ptr as *const ffi::Half,
+            dst_ptr as *mut ffi::Half,
+            src_dim as i32,
+            dst_dim as i32,
+            col_offset as i32,
+            dst_dim as i32,
+            tokens as i32,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    result
+        .result()
+        .map_err(|err| anyhow!("extract_hidden_rows launch failed: {err}"))
+}
+
 pub fn copy_hidden_rows_raw_into(
     ctx: &DeviceContext,
     src: &CudaSlice<half::bf16>,

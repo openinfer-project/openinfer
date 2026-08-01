@@ -72,6 +72,7 @@ pub use elementwise::bf16_hidden_to_f32_into;
 pub use elementwise::copy_hidden_rows_into;
 pub use elementwise::copy_hidden_rows_raw_into;
 pub use elementwise::copy_hidden_token_range_into;
+pub use elementwise::extract_hidden_rows_raw_into;
 pub use elementwise::extract_vec;
 pub use elementwise::extract_vec_into;
 pub use elementwise::extract_vec_ref;

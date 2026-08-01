@@ -41,6 +41,17 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn extract_hidden_rows_cuda(
+        src: *const Half,
+        dst: *mut Half,
+        src_hidden_dim: i32,
+        dst_hidden_dim: i32,
+        col_offset: i32,
+        rows: i32,
+        seq_len: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn copy_hidden_rows_cuda(
         src: *const Half,
         dst: *mut Half,
