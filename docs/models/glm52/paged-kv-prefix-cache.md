@@ -2,7 +2,7 @@
 
 **TL;DR**: The static per-slot KV partitions (slot `b` owns tokens `[b*cap, (b+1)*cap)`, identity block table) are replaced by a per-rank `openinfer-kv-cache::BlockPool` of 64-token pages with content-hashed blocks — the Kimi #239 pattern, zero kernel changes. Admission reserves a request's full-lifetime page count (honor-or-reject), prefix caching is on by default (suffix-only prefill, `cached_tokens` reported), and the coordinator ships each step's page rows + write slots to the ranks as `Glm52StepKv`. DSpark and prefix caching are mutually exclusive (draft anchor-position assert). **jz-38 validated 2026-07-06: warm prefix TTFT 14.1 s → 0.84 s (16.9×) on a 1200-token varied prompt with byte-identical output; step-bench sweep dead even with the D5 main anchors (b1 25.4 / b8 43.2 ms, c64 1483 tok/s); oracle gates green; 9-way near-tie divergence adjudicated under the D2 cross-bucket contract.**
 
-Last touched: 2026-07
+Last touched: 2026-08
 
 ## Why the kernels needed nothing
 
@@ -49,8 +49,8 @@ The coordinator (which owns the pools) computes per step, per rank:
 - `pages: [bucket, table_width]` row-major page ids (span rows repeat their
   slot's row; tails and padding rows = padding page). The prologue uploads it
   H2D into the bucket's device block table (replacing the old per-row dtod
-  gathers from the static identity table). ~36 KB worst case (bucket 8 at cap
-  72576).
+  gathers from the static identity table). ~36 KB at bucket 8 / cap 72576;
+  the #812 verify-span buckets raise the worst case 6x (bucket 48).
 - `slot_mapping[row] = pages[pos/64]*64 + pos%64` — the flat write slot for
   both caches. The prologue cross-checks it against the page row (drift =
   failed step, not silent cross-request corruption).
