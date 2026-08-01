@@ -858,6 +858,31 @@ impl Glm52TpPrefillExecutor {
             batch.positions.len() == rows && batch.slot_mapping.len() == rows,
             "prefill chunk rows/positions mismatch"
         );
+        // The cache-pack kernel traps (unrecoverable launch failure with no
+        // context) on any out-of-window slot. Catch a poisoned batch here
+        // with context instead — this is the contract that the scheduler's
+        // pool and the executor's cache slab are sized from the SAME slot
+        // count (a drift once shipped page ids past the slab, #816).
+        let kv_slots = self.layout.kv_slots as i64;
+        for (row, &slot) in batch.slot_mapping.iter().enumerate() {
+            ensure!(
+                (0..kv_slots).contains(&slot),
+                "prefill chunk slot_mapping[{row}] = {slot} outside the {kv_slots}-slot cache \
+                 window: position={} request_indptr={:?} block_indptr={:?} block_ids(head)={:?}",
+                batch.positions[row],
+                batch.request_indptr,
+                batch.block_indptr,
+                &batch.block_ids[..batch.block_ids.len().min(24)],
+            );
+        }
+        for (i, &page) in batch.block_ids.iter().enumerate() {
+            ensure!(
+                page >= 0 && (page as i64 + 1) * 64 <= kv_slots,
+                "prefill chunk block_ids[{i}] = {page} outside the {kv_slots}-slot cache window \
+                 (indptr {:?})",
+                batch.block_indptr,
+            );
+        }
         ctx.stream
             .memcpy_htod(&batch.token_ids, &mut self.token_ids.slice_mut(..rows))?;
         ctx.stream

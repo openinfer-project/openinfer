@@ -306,7 +306,7 @@ impl Glm52Engine {
         // keeps this cheap (~54 KB/token/rank -> a few GiB at 16K x 8).
         let pool = BlockPool::new(
             PAGE,
-            glm52_pool_blocks(spec.max_model_len, GLM52_MAX_BATCH_PER_RANK),
+            glm52_pool_blocks(spec.max_model_len, crate::model::glm52_decode_slots()),
         )?;
         let table_width = glm52_table_width(spec.max_model_len);
         // Prefix matching policy lives in `prefix_cache_enabled`: DSpark is
