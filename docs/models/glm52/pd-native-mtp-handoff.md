@@ -41,7 +41,7 @@
 > of linear in history (c1 p50 ~270 ms at every turn; c8 late-turn p50
 > 1,186 → 454 ms), with byte-identical greedy outputs.
 >
-> **Last touched:** 2026-07
+> **Last touched:** 2026-08
 
 ## Preparation
 
