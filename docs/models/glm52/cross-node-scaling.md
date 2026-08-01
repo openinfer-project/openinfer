@@ -4,7 +4,12 @@
 > ONE NVLink/IMEX domain, so the existing single-LSA DeepEP shim works cross-tray with
 > **no GIN un-baking at all** — live-verified up to **EP32 across 8 trays**: bucket-1 solo p50
 > is flat at ~23.3-23.6 ms from EP4 loopback through EP32 (intra-rack width tax ≈ nil),
-> bucket-8 EP32 c256 9072 tok/s, greedy text coherent through the serving path (EP8). EP widths
+> bucket-8 EP32 c256 9072 tok/s, greedy text coherent through the serving path (EP8). **EP32
+> serving is production-shaped (2026-08, #812 stages 2+3):** 8-tray decode fleet + 3x TP4
+> prefill + router, throughput profile `GLM52_DECODE_SLOTS=16 GLM52_MTP_DRAFTS=2` (same 48-row
+> step as the 8x5+1 latency profile) — fleet c512 through the router: **626 tok/s per D-GPU,
+> mean TPOT 19.8 ms, zero failures** (decode-only endpoints: 522 at c64/node, 559 at 1.5x
+> oversubscription). Width remains a KV-capacity lever, not a throughput one. EP widths
 > {4,8,16,32,64} each get a constexpr shim instantiation + `Glm52MoeTopo` variant; the
 > weight-only expert chain is ABI-generic so a new width is a config header, not new code.
 > The GIN scale-out sections below remain the design for IB/RoCE clusters beyond one rack.
@@ -18,7 +23,7 @@
 > cross-tray LSA), and a remote-node teardown must `shutdown()` the socket, not just drop
 > the writer (a reader clone keeps the fd alive → no FIN → both sides hang).
 >
-> **Last touched:** 2026-07
+> **Last touched:** 2026-08
 
 ## Scope and status
 

@@ -43,6 +43,7 @@ cargo run --release --features glm52 -- --model-path models/GLM5.2
 - `OPENINFER_TEST_MODEL_PATH` — override test model path (default: `models/Qwen3-4B`)
 - `OPENINFER_BUILD_TIMING=1` — print per-phase build timings (nvcc, Triton AOT, etc.)
 - `OPENINFER_NVCC_JOBS` — override parallel nvcc job count
+- `GLM52_DECODE_SLOTS` / `GLM52_MTP_DRAFTS` — glm52 runtime profile: decode slots per rank (default 8, ceiling 16) and MTP draft span (default 5); `slots x (1+drafts)` must fit the 48-row step (validated at launch). Wide-EP throughput profile: `16` / `2`.
 
 ## Tests
 
