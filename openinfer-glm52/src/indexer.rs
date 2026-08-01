@@ -301,7 +301,9 @@ pub(crate) struct Glm52IndexerScratch {
 
 impl Glm52IndexerScratch {
     pub(crate) fn new(ctx: &DeviceContext, shape: Glm52DeepGemmMqaLogitsShape) -> Result<Self> {
-        Self::with_large_gemm(ctx, shape, false)
+        // Wide buckets (#812) route wq_b/wk through the fp8 GEMM — the same
+        // path the prefill-side indexer already takes.
+        Self::with_large_gemm(ctx, shape, shape.batch_size > crate::fp8::FP8_GEMV_MAX_ROWS)
     }
 
     fn with_large_gemm(

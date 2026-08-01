@@ -16,7 +16,8 @@
 namespace glm52_min_gemv {
 
 constexpr int kHidden = 6144;
-constexpr int kMaxTokens = 8;  // = GLM52_MAX_BATCH_PER_RANK
+constexpr int kMaxTokens = 48;  // = GLM52_MAX_STEP_ROWS (#812); dispatch
+                                // covers 1..=8 plus the bucket sizes.
 
 // out[token * kNumRows + row] = dot(hidden[token], weight[row]); weight is
 // row-major [kNumRows, kHidden].
@@ -118,6 +119,11 @@ cudaError_t launch_tokens(OutT* out, const __nv_bfloat16* hidden,
     case 6: return launch<6, kNumRows>(out, hidden, weight, stream);
     case 7: return launch<7, kNumRows>(out, hidden, weight, stream);
     case 8: return launch<8, kNumRows>(out, hidden, weight, stream);
+    // Verify-span buckets (#812): token counts land on the decode bucket
+    // sizes, so only the bucket members above 8 are instantiated.
+    case 16: return launch<16, kNumRows>(out, hidden, weight, stream);
+    case 32: return launch<32, kNumRows>(out, hidden, weight, stream);
+    case 48: return launch<48, kNumRows>(out, hidden, weight, stream);
     default: return cudaErrorInvalidValue;
   }
 }

@@ -2,7 +2,7 @@
 //
 // The decode path's codegen parameters are all compile-time constants
 // (next_n=1, 32 heads, head_dim 128, block_kv 64, split_kv 256, bf16 logits,
-// batch <= 32, 132 SMs), so both kernels are instantiated here directly from
+// batch <= 64, 132 SMs), so both kernels are instantiated here directly from
 // DeepGEMM's device headers and launched with cudaLaunchKernelExC. This
 // removes DeepGEMM's runtime JIT entirely — its compiler, include parser and
 // launch-config helpers keep unsynchronized global state that the DP8
@@ -48,7 +48,10 @@ constexpr int kAotHeadDim = 128;
 constexpr int kAotBlockQ = 128 / kAotNumHeads;
 constexpr int kAotBlockKv = 64;
 constexpr int kAotNumSms = 132;
-constexpr int kAotAlignedBatchSize = 32;
+// Launcher guard only — batch is a runtime argument of both kernels (the
+// grid-stride scheduler walks q atoms); no template arg depends on it.
+// 64 covers the verify-span row ceiling (48, #812).
+constexpr int kAotAlignedBatchSize = 64;
 
 const auto kMetadataKernel = &deep_gemm::sched::sm100_paged_mqa_logits_metadata<
     kAotNextN, /*kIsContextLens2D=*/false, /*kIsVarlen=*/false,

@@ -28,6 +28,12 @@ use openinfer_kernels::tensor::DeviceContext;
 pub(crate) const FP8_BLOCK: usize = 128;
 const FP8_GEMM_WORKSPACE_BYTES: usize = 32 << 20;
 
+/// The batched GEMV's row ceiling: past this the register tile spills and
+/// the fp8 GEMM path (activation quant + FlashInfer SM100 groupwise GEMM)
+/// wins — measured on the #812 verify-span buckets, where GEMV-at-48 tripled
+/// the step time.
+pub(crate) const FP8_GEMV_MAX_ROWS: usize = 8;
+
 pub(crate) struct Glm52Fp8GemmScratch {
     rows: usize,
     width: usize,
@@ -463,6 +469,9 @@ pub(crate) struct Glm52MlpScratch {
     // Owned mma partial buffer: one per scratch so the ctx/aux stream overlap
     // can never see a shared pointer (see glm52_fp8_weight_only_gemv_launch).
     gemv_partial: CudaSlice<f32>,
+    // Wide-bucket route (#812): rows past the GEMV ceiling run the fp8 GEMM
+    // instead. Same per-scratch ownership discipline as `gemv_partial`.
+    wide: Option<Glm52Fp8GemmScratch>,
 }
 
 impl Glm52MlpScratch {
@@ -480,6 +489,17 @@ impl Glm52MlpScratch {
             gemv_partial: ctx
                 .stream
                 .alloc_zeros::<f32>(rows * GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW)?,
+            wide: (rows > FP8_GEMV_MAX_ROWS)
+                .then(|| {
+                    // gate|up consumes hidden (k = 6144); down consumes the
+                    // intermediate — one scratch covers both legs.
+                    Glm52Fp8GemmScratch::new(
+                        ctx,
+                        rows.next_multiple_of(4),
+                        crate::config::GLM52_HIDDEN.max(intermediate),
+                    )
+                })
+                .transpose()?,
         })
     }
 
@@ -517,6 +537,13 @@ pub(crate) fn fp8_mlp_into(
         "GLM5.2 fp8_mlp scratch sized for intermediate {} but weights have {intermediate}",
         s.intermediate
     );
+    // Wide buckets (#812): both projections run the fp8 GEMM; the SwiGLU is
+    // the standalone bf16 kernel (no partials to absorb).
+    if let Some(wide) = s.wide.as_mut() {
+        fp8_linear_large_m_into(ctx, gate_up, s.rows, input, wide, &mut s.gate_up)?;
+        glm52_silu_and_mul_bf16_launch(ctx, s.rows, intermediate, &s.gate_up, &mut s.silu_out)?;
+        return fp8_linear_large_m_into(ctx, down, s.rows, &s.silu_out, wide, out);
+    }
     // The gate|up projection stops at its f32 k-slice partials when the
     // (rows, shape) routes to the mma path, and the SwiGLU absorbs the
     // fixed-order reduce (one launch instead of two, bit-identical); the

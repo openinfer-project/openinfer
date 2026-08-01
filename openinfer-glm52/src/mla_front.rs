@@ -322,6 +322,9 @@ pub(crate) struct Glm52MlaFront {
     // Validation-only bf16 sink for the packed q_a|kv_a partials launch (the
     // route gate guarantees the mma path, which leaves it untouched).
     qa_kva_out: CudaSlice<bf16>, // [T, 2624]
+    // Wide-bucket route (#812): q_a/q_b/kv_a run the fp8 GEMM past the GEMV
+    // row ceiling. Owned per scratch, like `gemv_partial`.
+    wide: Option<Glm52Fp8GemmScratch>,
 }
 
 impl Glm52MlaFront {
@@ -362,6 +365,12 @@ impl Glm52MlaFront {
             } else {
                 1
             })?,
+            wide: (decode_scratch && tokens > crate::fp8::FP8_GEMV_MAX_ROWS)
+                .then(|| {
+                    // q_a/kv_a consume hidden (k = 6144), q_b consumes Q_LORA.
+                    Glm52Fp8GemmScratch::new(ctx, tokens.next_multiple_of(4), HIDDEN)
+                })
+                .transpose()?,
         })
     }
 
@@ -467,6 +476,8 @@ pub(crate) fn glm52_mla_front_q_into(
             &mut front.q_a,
             &mut front.ckv,
         )?;
+    } else if let Some(wide) = front.wide.as_mut() {
+        fp8_linear_large_m_into(ctx, &w.q_a, t, hidden.data(), wide, &mut front.q_a)?;
     } else {
         fp8_linear_into(
             ctx,
@@ -518,23 +529,38 @@ pub(crate) fn glm52_mla_front_rest_into(
         front.heads,
         w.heads
     );
-    fp8_linear_into(
-        ctx,
-        &w.q_b,
-        t,
-        front.q_resid.data(),
-        Some(&mut front.gemv_partial),
-        &mut front.q_full,
-    )?; // [T, heads, 256]
-    if t != 1 && qa_kva_fused(w, t)?.is_none() {
+    if let Some(wide) = front.wide.as_mut() {
+        fp8_linear_large_m_into(
+            ctx,
+            &w.q_b,
+            t,
+            front.q_resid.data(),
+            wide,
+            &mut front.q_full,
+        )?;
+    } else {
         fp8_linear_into(
             ctx,
-            &w.kv_a,
+            &w.q_b,
             t,
-            hidden.data(),
+            front.q_resid.data(),
             Some(&mut front.gemv_partial),
-            &mut front.ckv,
-        )?;
+            &mut front.q_full,
+        )?; // [T, heads, 256]
+    }
+    if t != 1 && qa_kva_fused(w, t)?.is_none() {
+        if let Some(wide) = front.wide.as_mut() {
+            fp8_linear_large_m_into(ctx, &w.kv_a, t, hidden.data(), wide, &mut front.ckv)?;
+        } else {
+            fp8_linear_into(
+                ctx,
+                &w.kv_a,
+                t,
+                hidden.data(),
+                Some(&mut front.gemv_partial),
+                &mut front.ckv,
+            )?;
+        }
     }
     if fold_kv_pack {
         return Ok(());

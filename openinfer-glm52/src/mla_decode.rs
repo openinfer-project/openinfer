@@ -100,6 +100,9 @@ pub(crate) struct Glm52MlaAttendScratch {
     heads: usize,
     // Owned mma partial buffer for the o_proj projection (see Glm52MlaFront).
     gemv_partial: CudaSlice<f32>,
+    // Wide-bucket route (#812): o_proj runs the fp8 GEMM past the GEMV row
+    // ceiling. Owned per scratch, like `gemv_partial`.
+    wide: Option<crate::fp8::Glm52Fp8GemmScratch>,
 }
 
 enum Glm52MlaBackendScratch {
@@ -182,6 +185,12 @@ impl Glm52MlaAttendScratch {
             gemv_partial: ctx
                 .stream
                 .alloc_zeros::<f32>(t * GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW)?,
+            wide: (t > crate::fp8::FP8_GEMV_MAX_ROWS)
+                .then(|| {
+                    // o_proj consumes the [T, heads * V_HEAD] attention out.
+                    crate::fp8::Glm52Fp8GemmScratch::new(ctx, t.next_multiple_of(4), heads * V_HEAD)
+                })
+                .transpose()?,
         })
     }
 }
@@ -565,6 +574,9 @@ pub(crate) fn glm52_mla_attend_into(
         V_HEAD,
         heads,
     )?;
+    if let Some(wide) = s.wide.as_mut() {
+        return crate::fp8::fp8_linear_large_m_into(ctx, &w.o_proj, t, &s.v, wide, out.data_mut());
+    }
     fp8_linear_into(
         ctx,
         &w.o_proj,

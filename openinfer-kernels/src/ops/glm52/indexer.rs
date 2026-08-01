@@ -226,7 +226,14 @@ pub fn glm52_indexer_local_topk_to_slots_launch(
 }
 
 /// Token bound baked into `glm52_min_gemv.cuh`'s `launch_tokens` switch.
-pub const GLM52_MIN_GEMV_MAX_TOKENS: usize = 8;
+pub const GLM52_MIN_GEMV_MAX_TOKENS: usize = 48;
+
+/// The token counts `glm52_min_gemv.cuh` instantiates: 1..=8 plus the
+/// verify-span decode bucket sizes (#812) — token counts always land on a
+/// bucket member.
+pub fn glm52_min_gemv_tokens_supported(tokens: usize) -> bool {
+    (1..=8).contains(&tokens) || matches!(tokens, 16 | 32 | 48)
+}
 
 /// weights_proj min-latency GEMV: `out[t, h] = dot(hidden[t], weights[h])`,
 /// bf16 in/out with fixed-order f32 accumulation. Replaces the cublas splitK
@@ -241,8 +248,9 @@ pub fn glm52_indexer_weights_proj_launch(
     out: &mut CudaSlice<bf16>,
 ) -> Result<()> {
     ensure!(
-        (1..=GLM52_MIN_GEMV_MAX_TOKENS).contains(&tokens),
-        "GLM5.2 indexer weights_proj tokens {tokens} outside 1..={GLM52_MIN_GEMV_MAX_TOKENS}"
+        glm52_min_gemv_tokens_supported(tokens),
+        "GLM5.2 indexer weights_proj tokens {tokens} not instantiated \
+         (1..=8 or a decode bucket size)"
     );
     ensure!(
         hidden.len() >= tokens * hidden_dim,

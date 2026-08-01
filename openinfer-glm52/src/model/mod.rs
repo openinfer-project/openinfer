@@ -205,11 +205,10 @@ pub(crate) const GLM52_MAX_STEP_ROWS: usize =
 /// continuum) keep the whole-step graphs' fixed-shape contract.
 pub(crate) const GLM52_DECODE_BUCKETS: [usize; 7] = [1, 2, 4, 8, 16, 32, GLM52_MAX_STEP_ROWS];
 
-/// The native-MTP proposal/context buckets. Proposal batches carry at most
-/// one row per slot, so this list stays at the slot count — sharing the
-/// (now wider) decode bucket list would allocate proposal scratch and
-/// graphs for row counts a proposal can never reach.
-pub(crate) const GLM52_MTP_BUCKETS: [usize; 4] = [1, 2, 4, GLM52_MAX_BATCH_PER_RANK];
+// NOTE (#812): the MTP round shares GLM52_DECODE_BUCKETS. The draft leg
+// never exceeds one row per slot, but the CONTEXT leg ingests every
+// committed token of a verify step — up to the full row ceiling — so its
+// bucket list must match the decode buckets.
 
 // DeepEP protocol worst-case: each source token contributes ≤1 row per
 // local expert, so fleet_ranks × max_batch must fit the per-expert slab.
@@ -221,9 +220,9 @@ const _: () = assert!(
 );
 
 // The min-latency GEMV (router logits, indexer weights_proj) dispatches
-// tokens 1..=8; a bucket bump must extend glm52_min_gemv.cuh first.
-const _: () =
-    assert!(GLM52_MAX_BATCH_PER_RANK <= openinfer_kernels::ops::GLM52_MIN_GEMV_MAX_TOKENS);
+// tokens 1..=8 plus the decode bucket sizes; a bucket bump must extend
+// glm52_min_gemv.cuh first (#812 added 16/32/48).
+const _: () = assert!(GLM52_MAX_STEP_ROWS <= openinfer_kernels::ops::GLM52_MIN_GEMV_MAX_TOKENS);
 
 // The decode feed kernel runs one 32-thread block (`glm52_decode_feed.cu`);
 // a batch-cap bump past it must widen the kernel, not silently truncate.
@@ -948,10 +947,10 @@ impl Glm52RankModel {
             "GLM5.2 MTP boundary metadata count {boundary} != target outputs {}",
             output.target_tokens.len()
         );
-        let bucket = GLM52_MTP_BUCKETS
+        let bucket = GLM52_DECODE_BUCKETS
             .into_iter()
             .find(|&bucket| bucket >= appends.len())
-            .context("GLM5.2 TP4 prefill proposal exceeds MTP bucket capacity")?;
+            .context("GLM5.2 TP4 prefill proposal exceeds decode bucket capacity")?;
         mtp.reset_slots(&proposal_slots)?;
         mtp.resume_reset_slots(&proposal_slots, &appends)?;
         let round = crate::runner::Glm52MtpRound {
