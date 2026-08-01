@@ -85,6 +85,7 @@ use tokio::sync::mpsc;
 use tokio::sync::watch;
 
 use crate::model::GLM52_MAX_BATCH_PER_RANK;
+use crate::model::GLM52_MAX_STEP_ROWS;
 use crate::model::GLM52_MODEL_LEN_ALIGN;
 use crate::model::Glm52StepKv;
 use crate::model::Glm52StepShape;
@@ -589,9 +590,9 @@ impl Glm52Engine {
         shape: &Glm52StepShape,
         flags: Glm52StepFlags,
     ) -> anyhow::Result<(
-        [u32; GLM52_MAX_BATCH_PER_RANK],
+        [u32; GLM52_MAX_STEP_ROWS],
         [Option<SpanKind>; GLM52_MAX_BATCH_PER_RANK],
-        [(u32, usize); GLM52_MAX_BATCH_PER_RANK],
+        [(u32, usize); GLM52_MAX_STEP_ROWS],
     )> {
         let pool = &self.pool;
         let padding_page = pool.padding_block_id();
@@ -602,7 +603,7 @@ impl Glm52Engine {
         );
         let mut span_kinds = [None; GLM52_MAX_BATCH_PER_RANK];
         let mut inputs =
-            [(GLM52_PADDING_STEP.token, GLM52_PADDING_STEP.position); GLM52_MAX_BATCH_PER_RANK];
+            [(GLM52_PADDING_STEP.token, GLM52_PADDING_STEP.position); GLM52_MAX_STEP_ROWS];
         // A consumed speculation replays with device-advanced inputs and
         // never reads the step KV — skip building the page rows (the whole
         // point of launch-ahead is keeping this host path off the hot step
@@ -613,13 +614,15 @@ impl Glm52Engine {
         } else {
             vec![padding_page; shape.bucket * self.table_width]
         };
-        let mut slot_mapping = [padding_page as i64 * PAGE as i64; GLM52_MAX_BATCH_PER_RANK];
-        // Walk the shape's contiguous per-slot runs.
+        let mut slot_mapping = [padding_page as i64 * PAGE as i64; GLM52_MAX_STEP_ROWS];
+        // Walk the shape's contiguous per-slot runs. Real rows end at
+        // `active_rows`; the padding tail keeps the padding defaults (its
+        // slot ids are insignificant, #812).
         let mut row = 0usize;
-        while row < shape.bucket {
+        while row < shape.active_rows {
             let slot_id = shape.slots[row] as usize;
             let mut end = row + 1;
-            while end < shape.bucket && shape.slots[end] as usize == slot_id {
+            while end < shape.active_rows && shape.slots[end] as usize == slot_id {
                 end += 1;
             }
             let span = end - row;
@@ -727,7 +730,7 @@ impl Glm52Engine {
                         self.rank
                     );
                     step_err.get_or_insert(err);
-                    outputs.push([0; GLM52_MAX_BATCH_PER_RANK]);
+                    outputs.push([0; GLM52_MAX_STEP_ROWS]);
                 }
             }
         }
@@ -758,10 +761,10 @@ impl Glm52Engine {
     #[allow(clippy::type_complexity)]
     fn apply_step_outputs(
         &mut self,
-        outputs: &[u32; GLM52_MAX_BATCH_PER_RANK],
+        outputs: &[u32; GLM52_MAX_STEP_ROWS],
         shape: &Glm52StepShape,
         span_kinds: [Option<SpanKind>; GLM52_MAX_BATCH_PER_RANK],
-        step_inputs: &[(u32, usize); GLM52_MAX_BATCH_PER_RANK],
+        step_inputs: &[(u32, usize); GLM52_MAX_STEP_ROWS],
     ) -> anyhow::Result<(
         Vec<(usize, usize)>,
         Vec<Glm52MtpAppend>,
@@ -772,12 +775,13 @@ impl Glm52Engine {
         let mut mtp_appends = Vec::new();
         let mut rank_proposals = Vec::new();
         // Walk the shape's contiguous per-slot runs; each active slot folds
-        // its whole span of row outputs in at once.
+        // its whole span of row outputs in at once. Padding rows (past
+        // `active_rows`) carry no outputs anyone reads (#812).
         let mut row = 0usize;
-        while row < shape.bucket {
+        while row < shape.active_rows {
             let slot_id = shape.slots[row] as usize;
             let mut end = row + 1;
-            while end < shape.bucket && shape.slots[end] as usize == slot_id {
+            while end < shape.active_rows && shape.slots[end] as usize == slot_id {
                 end += 1;
             }
             let span_rows = row..end;

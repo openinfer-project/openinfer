@@ -3,7 +3,7 @@
 use anyhow::Context as _;
 
 use super::RankSlots;
-use crate::model::GLM52_DECODE_BUCKETS;
+use crate::model::GLM52_MTP_BUCKETS;
 use crate::runner::Glm52MtpAppend;
 use crate::runner::Glm52MtpRound;
 use crate::runner::Glm52Worker;
@@ -25,7 +25,7 @@ pub(super) fn run_mtp_round(
     proposals: Vec<(usize, u32, usize)>,
 ) -> anyhow::Result<()> {
     let pick_bucket = |rows: usize| {
-        GLM52_DECODE_BUCKETS
+        GLM52_MTP_BUCKETS
             .into_iter()
             .find(|&bucket| bucket >= rows.max(1))
             .with_context(|| format!("GLM5.2 native MTP row count {rows} exceeds bucket capacity"))

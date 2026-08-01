@@ -10,6 +10,7 @@ use openinfer_kernels::ops::glm52_decode_feed_launch;
 use openinfer_kernels::tensor::DeviceContext;
 
 use super::GLM52_MAX_BATCH_PER_RANK;
+use super::GLM52_MAX_STEP_ROWS;
 use super::GLM52_VOCAB;
 use super::Glm52RankModel;
 use super::Glm52StepShape;
@@ -26,12 +27,12 @@ use super::Glm52StepShape;
 pub(super) struct Glm52SpeculatedStep {
     pub(super) bucket: usize,
     pub(super) active_rows: usize,
-    pub(super) slots: [u8; GLM52_MAX_BATCH_PER_RANK],
+    pub(super) slots: [u8; GLM52_MAX_STEP_ROWS],
     /// The engine inputs this speculation assumed: active rows carry
     /// (this step's argmax, position + 1); padding rows echo this step's
     /// padding input verbatim (their device rows keep self-feeding, which
     /// is harmless — pad outputs are never read and rows are isolated).
-    pub(super) expect: [(u32, usize); GLM52_MAX_BATCH_PER_RANK],
+    pub(super) expect: [(u32, usize); GLM52_MAX_STEP_ROWS],
 }
 
 impl Glm52RankModel {
@@ -44,10 +45,10 @@ impl Glm52RankModel {
     pub(super) fn decode_step_harvest(
         &mut self,
         ctx: &DeviceContext,
-        inputs: &[(u32, usize); GLM52_MAX_BATCH_PER_RANK],
+        inputs: &[(u32, usize); GLM52_MAX_STEP_ROWS],
         shape: Glm52StepShape,
         lease: bool,
-    ) -> Result<[u32; GLM52_MAX_BATCH_PER_RANK]> {
+    ) -> Result<[u32; GLM52_MAX_STEP_ROWS]> {
         let batch = shape.bucket;
         let bucket = self
             .buckets
@@ -72,8 +73,10 @@ impl Glm52RankModel {
         // the collective pairing; crash early instead.
         let mut speculated = false;
         if lease {
+            // Only real rows carry slot semantics; the padding tail reuses
+            // slot id 0 (#812) and self-feeds harmlessly.
             let mut seen = [false; GLM52_MAX_BATCH_PER_RANK];
-            for &slot in &shape.slots[..batch] {
+            for &slot in &shape.slots[..shape.active_rows] {
                 let slot = slot as usize;
                 ensure!(
                     slot < GLM52_MAX_BATCH_PER_RANK && !std::mem::replace(&mut seen[slot], true),
@@ -140,7 +143,7 @@ impl Glm52RankModel {
             .argmax_indices_host
             .as_slice()
             .map_err(|err| anyhow::anyhow!("GLM5.2 argmax indices D2H sync failed: {err}"))?;
-        let mut outputs = [0u32; GLM52_MAX_BATCH_PER_RANK];
+        let mut outputs = [0u32; GLM52_MAX_STEP_ROWS];
         for row in 0..batch {
             outputs[row] = top_indices[row].max(0) as u32;
         }

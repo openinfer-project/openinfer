@@ -613,6 +613,14 @@ CUresult plain_rows_per_warp(int k, int* rows) {
 constexpr int kBatchedGemvBatch2 = 2;
 constexpr int kBatchedGemvBatch4 = 4;
 constexpr int kBatchedGemvBatchFull = 8;
+// Verify-span buckets (#812): correct-first register-tile instantiations at
+// ROWS=1 (the per-thread activation preload dominates registers at these
+// batches and spills regardless of ROWS). No measured mma table yet —
+// profile before trusting their latency; the expected endgame for m >= 16
+// is the fp8 GEMM path, not a wider GEMV.
+constexpr int kBatchedGemvBatch16 = 16;
+constexpr int kBatchedGemvBatch32 = 32;
+constexpr int kBatchedGemvBatch48 = 48;
 // Per-batch (ROWS, WARPS) tile — measured, see the kernel comment.
 constexpr int kBatchedRows  = 4;
 constexpr int kBatchedWarps = 4;
@@ -776,6 +784,30 @@ static CUresult gemv_batched_dispatch(
                                                 kBatchedWarps>
           <<<grid, kBatchedWarps * kWarpSize, 0, stream>>>(
               activation, weight, weight_scale, out, n, k);
+      break;
+    }
+    case kBatchedGemvBatch16: {
+      if (!valid_tiling(n, k, kWarpsPerBlk)) return CUDA_ERROR_INVALID_VALUE;
+      const dim3 grid(1, n / kWarpsPerBlk, 1);
+      glm52_fp8_weight_only_gemv_batched_kernel<kBatchedGemvBatch16, 1, kWarpsPerBlk>
+          <<<grid, kBlockThreads, 0, stream>>>(activation, weight, weight_scale,
+                                               out, n, k);
+      break;
+    }
+    case kBatchedGemvBatch32: {
+      if (!valid_tiling(n, k, kWarpsPerBlk)) return CUDA_ERROR_INVALID_VALUE;
+      const dim3 grid(1, n / kWarpsPerBlk, 1);
+      glm52_fp8_weight_only_gemv_batched_kernel<kBatchedGemvBatch32, 1, kWarpsPerBlk>
+          <<<grid, kBlockThreads, 0, stream>>>(activation, weight, weight_scale,
+                                               out, n, k);
+      break;
+    }
+    case kBatchedGemvBatch48: {
+      if (!valid_tiling(n, k, kWarpsPerBlk)) return CUDA_ERROR_INVALID_VALUE;
+      const dim3 grid(1, n / kWarpsPerBlk, 1);
+      glm52_fp8_weight_only_gemv_batched_kernel<kBatchedGemvBatch48, 1, kWarpsPerBlk>
+          <<<grid, kBlockThreads, 0, stream>>>(activation, weight, weight_scale,
+                                               out, n, k);
       break;
     }
     default:

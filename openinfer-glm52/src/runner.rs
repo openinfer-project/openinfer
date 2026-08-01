@@ -20,6 +20,7 @@ use crate::dspark::Glm52DsparkModel;
 use crate::dspark::Glm52DsparkScratch;
 use crate::dspark::Glm52DsparkSlotState;
 use crate::model::GLM52_MAX_BATCH_PER_RANK;
+use crate::model::GLM52_MAX_STEP_ROWS;
 use crate::model::Glm52RankModel;
 use crate::model::Glm52StepKv;
 use crate::model::Glm52StepShape;
@@ -238,7 +239,7 @@ enum Glm52RankCommand {
     /// MoE collectives take rank-local row counts under the conservative
     /// protocol-max bound).
     Step {
-        inputs: Box<[(u32, usize); GLM52_MAX_BATCH_PER_RANK]>,
+        inputs: Box<[(u32, usize); GLM52_MAX_STEP_ROWS]>,
         shape: Glm52StepShape,
         kv: Box<Glm52StepKv>,
         flags: Glm52StepFlags,
@@ -247,7 +248,7 @@ enum Glm52RankCommand {
         /// unseeded members.
         sampling: Vec<Glm52RowSample>,
         seed: u64,
-        resp: Sender<Result<[u32; GLM52_MAX_BATCH_PER_RANK]>>,
+        resp: Sender<Result<[u32; GLM52_MAX_STEP_ROWS]>>,
     },
     PrefillChunk {
         batch: Glm52PrefillBatch,
@@ -398,13 +399,13 @@ impl Glm52RankWorker {
 
     pub(crate) fn step_async(
         &self,
-        inputs: [(u32, usize); GLM52_MAX_BATCH_PER_RANK],
+        inputs: [(u32, usize); GLM52_MAX_STEP_ROWS],
         shape: Glm52StepShape,
         kv: Glm52StepKv,
         flags: Glm52StepFlags,
         sampling: Vec<Glm52RowSample>,
         seed: u64,
-    ) -> Result<Receiver<Result<[u32; GLM52_MAX_BATCH_PER_RANK]>>> {
+    ) -> Result<Receiver<Result<[u32; GLM52_MAX_STEP_ROWS]>>> {
         let (resp_tx, resp_rx) = bounded(1);
         self.tx
             .send(Glm52RankCommand::Step {
@@ -928,13 +929,13 @@ impl Glm52RankThreadState {
 
     fn step(
         &mut self,
-        inputs: &[(u32, usize); GLM52_MAX_BATCH_PER_RANK],
+        inputs: &[(u32, usize); GLM52_MAX_STEP_ROWS],
         shape: Glm52StepShape,
         kv: &Glm52StepKv,
         flags: Glm52StepFlags,
         sampling: &[Glm52RowSample],
         seed: u64,
-    ) -> Result<[u32; GLM52_MAX_BATCH_PER_RANK]> {
+    ) -> Result<[u32; GLM52_MAX_STEP_ROWS]> {
         let dev_ctx = self.ctx.device_context()?;
         let runtime = self
             .runtime

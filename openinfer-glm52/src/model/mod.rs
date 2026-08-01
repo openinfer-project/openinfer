@@ -188,6 +188,14 @@ fn glm52_persistent_mla_bytes_per_token(
     }
 }
 
+/// The step-row ceiling: every slot verifying at the full native-MTP span
+/// (1 anchor + `GLM52_MTP_DRAFTS` drafts). Step rows and slots are SEPARATE
+/// dimensions — they were both 8 until #812, which silently capped verify
+/// spans at 1 row/slot under full occupancy and collapsed speculation
+/// (measured: TPOT == ITL at c32 on EP4).
+pub(crate) const GLM52_MAX_STEP_ROWS: usize =
+    GLM52_MAX_BATCH_PER_RANK * (1 + crate::mtp::GLM52_MTP_DRAFTS);
+
 /// The decode batch buckets, ascending. Each bucket has its own captured
 /// CUDA graphs, scratch arena, and FlashMLA plans, and the batched GEMV
 /// kernel is instantiated for exactly these row counts (`kBatchedGemvBatch*`
@@ -195,7 +203,13 @@ fn glm52_persistent_mla_bytes_per_token(
 /// engine picks the smallest bucket covering its own demand, so a
 /// lightly-loaded rank keeps the small-step cost; discrete buckets (not a
 /// continuum) keep the whole-step graphs' fixed-shape contract.
-pub(crate) const GLM52_DECODE_BUCKETS: [usize; 4] = [1, 2, 4, GLM52_MAX_BATCH_PER_RANK];
+pub(crate) const GLM52_DECODE_BUCKETS: [usize; 7] = [1, 2, 4, 8, 16, 32, GLM52_MAX_STEP_ROWS];
+
+/// The native-MTP proposal/context buckets. Proposal batches carry at most
+/// one row per slot, so this list stays at the slot count — sharing the
+/// (now wider) decode bucket list would allocate proposal scratch and
+/// graphs for row counts a proposal can never reach.
+pub(crate) const GLM52_MTP_BUCKETS: [usize; 4] = [1, 2, 4, GLM52_MAX_BATCH_PER_RANK];
 
 // DeepEP protocol worst-case: each source token contributes ≤1 row per
 // local expert, so fleet_ranks × max_batch must fit the per-expert slab.
@@ -231,7 +245,8 @@ const _: () = assert!(GLM52_MAX_BATCH_PER_RANK <= 32);
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Glm52StepShape {
     pub(crate) bucket: usize,
-    pub(crate) slots: [u8; GLM52_MAX_BATCH_PER_RANK],
+    #[serde(with = "serde_step_rows")]
+    pub(crate) slots: [u8; GLM52_MAX_STEP_ROWS],
     /// Rows `0..active_rows` carry real requests; `active_rows..bucket` are
     /// padding. Carried explicitly because a padding input is NOT
     /// value-distinguishable from an active one (a single-token prompt `[0]`
@@ -254,7 +269,32 @@ pub(crate) struct Glm52StepKv {
     /// Per-row flat cache write slot: `pages[position/64]*64 + position%64`
     /// (the fp8_ds_mla packed cache and the index-K cache share this token
     /// index space). Padding rows point into the padding page.
-    pub(crate) slot_mapping: [i64; GLM52_MAX_BATCH_PER_RANK],
+    #[serde(with = "serde_step_rows")]
+    pub(crate) slot_mapping: [i64; GLM52_MAX_STEP_ROWS],
+}
+
+/// serde's derive stops at 32-element arrays; the step-row arrays serialize
+/// as plain sequences (the record/replay probes are the only consumer).
+mod serde_step_rows {
+    pub(crate) fn serialize<S, T>(value: &[T], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+        T: serde::Serialize,
+    {
+        serializer.collect_seq(value)
+    }
+
+    pub(crate) fn deserialize<'de, D, T, const N: usize>(
+        deserializer: D,
+    ) -> Result<[T; N], D::Error>
+    where
+        D: serde::Deserializer<'de>,
+        T: serde::Deserialize<'de>,
+    {
+        let rows = <Vec<T> as serde::Deserialize>::deserialize(deserializer)?;
+        rows.try_into()
+            .map_err(|rows: Vec<T>| serde::de::Error::invalid_length(rows.len(), &"step-row array"))
+    }
 }
 
 // There used to be a short-context attention tier here (topk 256 while every
@@ -354,7 +394,7 @@ pub(crate) struct Glm52RankModel {
     /// What the per-row `positions` device buffer currently holds (padding
     /// rows included): the feed kernel advances it without host readback,
     /// and a speculation must keep every row under the model-length cap.
-    device_positions: [usize; GLM52_MAX_BATCH_PER_RANK],
+    device_positions: [usize; GLM52_MAX_STEP_ROWS],
 }
 
 /// Everything one decode bucket owns: the MLA schedule and whole-step
@@ -512,7 +552,7 @@ impl Glm52RankModel {
             "GLM5.2 max_model_len {max_model_len} must be a positive multiple of \
              {GLM52_MODEL_LEN_ALIGN} (the FlashMLA page / index-K block size)"
         );
-        let batch = GLM52_MAX_BATCH_PER_RANK;
+        let batch = GLM52_MAX_STEP_ROWS;
         let mla_heads = if attn_shard.is_some() {
             crate::config::GLM52_HEADS / moe_topo.device_count()
         } else {
@@ -736,15 +776,11 @@ impl Glm52RankModel {
             let scale = ctx
                 .stream
                 .alloc_zeros::<u8>(n.div_ceil(128) * k.div_ceil(128) * 4)?;
-            let activation = ctx
+            let activation = ctx.stream.alloc_zeros::<bf16>(GLM52_MAX_STEP_ROWS * k)?;
+            let mut out = ctx.stream.alloc_zeros::<bf16>(GLM52_MAX_STEP_ROWS * n)?;
+            let mut gemv_partial = ctx
                 .stream
-                .alloc_zeros::<bf16>(GLM52_MAX_BATCH_PER_RANK * k)?;
-            let mut out = ctx
-                .stream
-                .alloc_zeros::<bf16>(GLM52_MAX_BATCH_PER_RANK * n)?;
-            let mut gemv_partial = ctx.stream.alloc_zeros::<f32>(
-                GLM52_MAX_BATCH_PER_RANK * GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW,
-            )?;
+                .alloc_zeros::<f32>(GLM52_MAX_STEP_ROWS * GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW)?;
             for rows in GLM52_DECODE_BUCKETS {
                 glm52_fp8_weight_only_gemv_launch(
                     ctx,
@@ -819,7 +855,7 @@ impl Glm52RankModel {
             sampling_scratch: Some(BatchSamplingScratch::new(ctx, batch, GLM52_VOCAB)?),
             prefill,
             speculated: None,
-            device_positions: [0; GLM52_MAX_BATCH_PER_RANK],
+            device_positions: [0; GLM52_MAX_STEP_ROWS],
         })
     }
 
@@ -912,10 +948,10 @@ impl Glm52RankModel {
             "GLM5.2 MTP boundary metadata count {boundary} != target outputs {}",
             output.target_tokens.len()
         );
-        let bucket = GLM52_DECODE_BUCKETS
+        let bucket = GLM52_MTP_BUCKETS
             .into_iter()
             .find(|&bucket| bucket >= appends.len())
-            .context("GLM5.2 TP4 prefill proposal exceeds decode bucket capacity")?;
+            .context("GLM5.2 TP4 prefill proposal exceeds MTP bucket capacity")?;
         mtp.reset_slots(&proposal_slots)?;
         mtp.resume_reset_slots(&proposal_slots, &appends)?;
         let round = crate::runner::Glm52MtpRound {
@@ -1032,13 +1068,13 @@ impl Glm52RankModel {
         aux: &DeviceContext,
         ep8: Option<&mut Glm52MoeEpState>,
         tp: Option<&mut Glm52MoeTpRank>,
-        inputs: &[(u32, usize); GLM52_MAX_BATCH_PER_RANK],
+        inputs: &[(u32, usize); GLM52_MAX_STEP_ROWS],
         shape: Glm52StepShape,
         kv: &Glm52StepKv,
         flags: crate::runner::Glm52StepFlags,
         sampling: &[crate::runner::Glm52RowSample],
         seed: u64,
-    ) -> Result<[u32; GLM52_MAX_BATCH_PER_RANK]> {
+    ) -> Result<[u32; GLM52_MAX_STEP_ROWS]> {
         assert!(
             self.prefill.is_none(),
             "GLM5.2 prefill-only execution entered decode_step"
@@ -1111,7 +1147,7 @@ impl Glm52RankModel {
         shape: Glm52StepShape,
         sampling: &[crate::runner::Glm52RowSample],
         seed: u64,
-        outputs: &mut [u32; GLM52_MAX_BATCH_PER_RANK],
+        outputs: &mut [u32; GLM52_MAX_STEP_ROWS],
     ) -> Result<()> {
         if sampling.is_empty() {
             return Ok(());
@@ -1236,7 +1272,7 @@ impl Glm52RankModel {
         aux: &DeviceContext,
         ep8: Option<&mut Glm52MoeEpState>,
         mut tp: Option<&mut Glm52MoeTpRank>,
-        inputs: &[(u32, usize); GLM52_MAX_BATCH_PER_RANK],
+        inputs: &[(u32, usize); GLM52_MAX_STEP_ROWS],
         shape: Glm52StepShape,
         kv: &Glm52StepKv,
         eager: bool,
@@ -1259,8 +1295,10 @@ impl Glm52RankModel {
         // unwritten this step (stale data from whatever request last held the
         // slot), and a second run would re-enter a region the first already
         // wrote. Single-row slots are the trivial run.
+        // Only real rows carry span semantics; padding rows (>= active_rows)
+        // reuse slot id 0 with padding inputs and are exempt (#812).
         let mut slot_last_row = [None::<usize>; GLM52_MAX_BATCH_PER_RANK];
-        for row in 0..batch {
+        for row in 0..shape.active_rows {
             let slot = shape.slots[row] as usize;
             ensure!(
                 slot < GLM52_MAX_BATCH_PER_RANK,
@@ -1287,9 +1325,9 @@ impl Glm52RankModel {
             kv.pages.len(),
             self.table_width
         );
-        let mut tokens_host = [0u32; GLM52_MAX_BATCH_PER_RANK];
-        let mut positions_host = [0u32; GLM52_MAX_BATCH_PER_RANK];
-        let mut seq_lens_host = [0i32; GLM52_MAX_BATCH_PER_RANK];
+        let mut tokens_host = [0u32; GLM52_MAX_STEP_ROWS];
+        let mut positions_host = [0u32; GLM52_MAX_STEP_ROWS];
+        let mut seq_lens_host = [0i32; GLM52_MAX_STEP_ROWS];
         for row in 0..batch {
             let slot = shape.slots[row] as usize;
             let (token, position) = inputs[row];
@@ -1347,13 +1385,13 @@ impl Glm52RankModel {
         };
         // The MoE collectives take this rank's real row count plus a GEMM
         // tile bound that only has to be conservative — every rank passes the
-        // protocol max (`ep_ranks × GLM52_MAX_BATCH_PER_RANK`) so the bound
+        // protocol max (`ep_ranks × GLM52_MAX_STEP_ROWS`) so the bound
         // never depends on other ranks' buckets. Measured at zero cost vs the
         // tight bound (free-running gate 3, `docs/models/glm52/
         // free-running-dp.md` §8); the recv-side truth comes from the device
         // expert counts, not this value. (`ep_ranks` is 1 on
         // tensor-replicated topologies, where the value is never consumed.)
-        let global_tokens = self.ep_ranks * GLM52_MAX_BATCH_PER_RANK;
+        let global_tokens = self.ep_ranks * GLM52_MAX_STEP_ROWS;
 
         let s = &mut bucket.scratch;
         let decode_lm_head = self.decode_lm_head.as_ref().unwrap_or(&self.lm_head);

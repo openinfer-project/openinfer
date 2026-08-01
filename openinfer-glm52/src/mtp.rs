@@ -36,9 +36,9 @@ use openinfer_kernels::tensor::HiddenStates;
 use crate::config::GLM52_HIDDEN;
 use crate::config::GLM52_INDEX_HEAD_DIM;
 use crate::config::GLM52_RMS_EPS;
-use crate::model::GLM52_DECODE_BUCKETS;
 use crate::model::GLM52_MAX_BATCH_PER_RANK;
 use crate::model::GLM52_MODEL_LEN_ALIGN;
+use crate::model::GLM52_MTP_BUCKETS;
 use crate::model::glm52_pool_blocks;
 use crate::rows::Rows;
 
@@ -86,7 +86,7 @@ pub(crate) fn glm52_mtp_arena_bytes(
         .and_then(|v| v.checked_mul(GLM52_INDEX_HEAD_DIM + size_of::<f32>()))
         .and_then(|v| v.checked_mul(index_k_copies))
         .context("GLM5.2 MTP index-K arena byte count overflow")?;
-    let rows: usize = GLM52_DECODE_BUCKETS.iter().sum();
+    let rows: usize = GLM52_MTP_BUCKETS.iter().sum();
     let indexer_logits = rows
         .checked_mul(max_model_len.next_multiple_of(256))
         .and_then(|v| v.checked_mul(size_of::<bf16>() + size_of::<f32>()))

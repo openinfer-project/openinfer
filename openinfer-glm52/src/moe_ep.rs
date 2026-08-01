@@ -51,7 +51,7 @@ use openinfer_kernels::tensor::DeviceContext;
 
 use crate::config::GLM52_DENSE_LAYERS;
 use crate::config::GLM52_LAYERS;
-use crate::model::GLM52_MAX_BATCH_PER_RANK;
+use crate::model::GLM52_MAX_STEP_ROWS;
 use crate::moe_decode::EXPERTS;
 use crate::moe_decode::Glm52MoeExpertBank;
 use crate::moe_decode::HIDDEN;
@@ -131,7 +131,7 @@ fn deepgemm_vram_charge_for<A: DeepEpAbi>(
     // combined output, and DeepEP's own context/scratch are unchanged and
     // cancel out. The old tile budget formula is retained here solely as the
     // baseline represented by the measured reserve.
-    let old_max_tiles = n_local + (num_ranks * GLM52_MAX_BATCH_PER_RANK * TOPK).div_ceil(8);
+    let old_max_tiles = n_local + (num_ranks * GLM52_MAX_STEP_ROWS * TOPK).div_ceil(8);
     let weight_only_scratch_bytes = 2 * old_max_tiles * size_of::<i32>()
         + size_of::<i32>()
         + expanded * W13_N * size_of::<bf16>()
@@ -272,7 +272,7 @@ impl<A: DeepEpAbi> Glm52MoeEpRankState<A> {
 }
 
 fn deepgemm_masked_cap(num_ranks: usize) -> usize {
-    (num_ranks * GLM52_MAX_BATCH_PER_RANK).next_multiple_of(GLM52_DEEPGEMM_SM100_MASKED_ALIGNMENT)
+    (num_ranks * GLM52_MAX_STEP_ROWS).next_multiple_of(GLM52_DEEPGEMM_SM100_MASKED_ALIGNMENT)
 }
 
 /// One MoE layer's routed contribution. Every rank must enter the collective
@@ -301,7 +301,7 @@ pub(crate) fn glm52_moe_ep_routed_forward<A: DeepEpAbi>(
         "GLM5.2 EP MoE global_tokens {global_tokens} must be positive and >= local tokens {num_tokens}"
     );
     // Startup scratch covers the protocol's max global token count.
-    let max_global_tokens = state.info.num_ranks as usize * GLM52_MAX_BATCH_PER_RANK;
+    let max_global_tokens = state.info.num_ranks as usize * GLM52_MAX_STEP_ROWS;
     ensure!(
         global_tokens <= max_global_tokens,
         "GLM5.2 EP MoE global_tokens {global_tokens} exceeds the protocol cap {max_global_tokens}"
@@ -500,34 +500,35 @@ mod tests {
 
     #[test]
     fn masked_cap_covers_every_supported_ep_width() {
-        assert_eq!(deepgemm_masked_cap(4), 128);
-        assert_eq!(deepgemm_masked_cap(8), 128);
-        assert_eq!(deepgemm_masked_cap(16), 128);
-        assert_eq!(deepgemm_masked_cap(32), 256);
-        assert_eq!(deepgemm_masked_cap(64), 512);
+        // ranks x GLM52_MAX_STEP_ROWS (48 since #812), aligned up to 128.
+        assert_eq!(deepgemm_masked_cap(4), 256);
+        assert_eq!(deepgemm_masked_cap(8), 384);
+        assert_eq!(deepgemm_masked_cap(16), 768);
+        assert_eq!(deepgemm_masked_cap(32), 1536);
+        assert_eq!(deepgemm_masked_cap(64), 3072);
     }
 
     #[test]
     fn post_weight_vram_charge_tracks_topology_and_native_mtp() {
         assert_eq!(
             glm52_deepgemm_vram_charge_bytes(Glm52MoeTopo::Ep4, false).expect("EP4 charge"),
-            1_508_998_916
+            1_746_500_100
         );
         assert_eq!(
             glm52_deepgemm_vram_charge_bytes(Glm52MoeTopo::Ep8, false).expect("EP8 charge"),
-            678_633_092
+            916_132_996
         );
         assert_eq!(
             glm52_deepgemm_vram_charge_bytes(Glm52MoeTopo::Ep16, false).expect("EP16 charge"),
-            188_369_988
+            485_242_948
         );
         assert_eq!(
             glm52_deepgemm_vram_charge_bytes(Glm52MoeTopo::Ep32, false).expect("EP32 charge"),
-            0
+            118_847_524
         );
         assert_eq!(
             glm52_deepgemm_vram_charge_bytes(Glm52MoeTopo::Ep64, false).expect("EP64 charge"),
-            0
+            36_271_124
         );
         assert_eq!(
             glm52_deepgemm_vram_charge_bytes(Glm52MoeTopo::Tp4, false).expect("TP4 charge"),

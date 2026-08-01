@@ -29,8 +29,8 @@ use openinfer_kernels::tensor::DeviceContext;
 use openinfer_kernels::tensor::DeviceMatrix;
 use openinfer_kv_offload::KvArena;
 
-use super::GLM52_DECODE_BUCKETS;
 use super::GLM52_MAX_BATCH_PER_RANK;
+use super::GLM52_MTP_BUCKETS;
 use super::INDEX_CACHE_BLOCK;
 use super::NUM_SMS;
 use super::build;
@@ -171,7 +171,7 @@ pub(super) struct Glm52NativeMtp {
     /// so the producer keeps this alongside its local FlashInfer cache.
     transfer_cache: Option<Glm52LayerCaches>,
     cache_bytes_per_token: usize,
-    buckets: [Glm52MtpBucket; GLM52_DECODE_BUCKETS.len()],
+    buckets: [Glm52MtpBucket; GLM52_MTP_BUCKETS.len()],
     max_model_len: usize,
     table_width: usize,
     committed_blocks: usize,
@@ -337,8 +337,8 @@ impl Glm52NativeMtp {
             _ => None,
         };
 
-        let mut buckets = Vec::with_capacity(GLM52_DECODE_BUCKETS.len());
-        for rows in GLM52_DECODE_BUCKETS {
+        let mut buckets = Vec::with_capacity(GLM52_MTP_BUCKETS.len());
+        for rows in GLM52_MTP_BUCKETS {
             let row_contract = Glm52FlashMlaSparseDecode {
                 batch_size: rows,
                 ..contract
@@ -646,7 +646,7 @@ impl Glm52NativeMtp {
         self.buckets
             .iter()
             .position(|bucket| bucket.rows == rows)
-            .with_context(|| format!("GLM5.2 MTP bucket {rows} is not in {GLM52_DECODE_BUCKETS:?}"))
+            .with_context(|| format!("GLM5.2 MTP bucket {rows} is not in {GLM52_MTP_BUCKETS:?}"))
     }
 
     /// Zero the padding rows of a bucket's `previous` hidden buffer before a

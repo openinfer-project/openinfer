@@ -16,6 +16,7 @@ use super::slot::Glm52SlotState;
 use crate::config::GLM52_VOCAB;
 use crate::model::GLM52_DECODE_BUCKETS;
 use crate::model::GLM52_MAX_BATCH_PER_RANK;
+use crate::model::GLM52_MAX_STEP_ROWS;
 use crate::model::Glm52StepKv;
 use crate::model::Glm52StepShape;
 use crate::runner::Glm52RowSample;
@@ -26,10 +27,10 @@ pub(super) fn padding_step_kv(
     bucket: usize,
     table_width: usize,
     padding_page: i32,
-    inputs: &[(u32, usize); GLM52_MAX_BATCH_PER_RANK],
+    inputs: &[(u32, usize); GLM52_MAX_STEP_ROWS],
 ) -> Glm52StepKv {
     let pages = vec![padding_page; bucket * table_width].into_boxed_slice();
-    let mut slot_mapping = [0i64; GLM52_MAX_BATCH_PER_RANK];
+    let mut slot_mapping = [0i64; GLM52_MAX_STEP_ROWS];
     for (row, slot) in slot_mapping.iter_mut().enumerate().take(bucket) {
         *slot = padding_page as i64 * PAGE as i64 + (inputs[row].1 % PAGE) as i64;
     }
@@ -54,17 +55,17 @@ pub(super) fn padding_step_kv(
 /// Every active slot first gets one row (liveness), then the leftover bucket
 /// capacity extends mid-prefill slots into *spans* (consecutive prompt
 /// positions batched through one step), round-robin across the hungry slots
-/// so co-resident prefills drain in parallel; padding rows ride the free
-/// slots. Span rows are emitted as one contiguous run per slot — the
-/// [`Glm52StepShape`] contract.
+/// so co-resident prefills drain in parallel; rows past `active_rows` are
+/// padding (their slot ids are insignificant — see the body). Span rows are
+/// emitted as one contiguous run per slot — the [`Glm52StepShape`] contract.
 pub(super) fn plan_step_shape(wants: &[usize; GLM52_MAX_BATCH_PER_RANK]) -> Glm52StepShape {
-    let demand = wants.iter().sum::<usize>().min(GLM52_MAX_BATCH_PER_RANK);
+    let demand = wants.iter().sum::<usize>().min(GLM52_MAX_STEP_ROWS);
     let bucket = *GLM52_DECODE_BUCKETS
         .iter()
         .find(|&&rows| rows >= demand.max(1))
         .expect("the largest bucket covers every demand by construction");
     let spans = plan_prefill_spans(wants, bucket);
-    let mut slots: [u8; GLM52_MAX_BATCH_PER_RANK] = std::array::from_fn(|slot| slot as u8);
+    let mut slots: [u8; GLM52_MAX_STEP_ROWS] = [0; GLM52_MAX_STEP_ROWS];
     let mut dst = 0usize;
     for (slot, &span) in spans.iter().enumerate() {
         for _ in 0..span {
@@ -72,14 +73,13 @@ pub(super) fn plan_step_shape(wants: &[usize; GLM52_MAX_BATCH_PER_RANK]) -> Glm5
             dst += 1;
         }
     }
-    // Padding rows on free slots: there are always enough, because
-    // used >= actives and bucket <= MAX, so bucket - used <= frees.
+    // Rows `active_rows..bucket` are padding. Their slot ids are
+    // insignificant — a bucket may hold more rows than there are slots
+    // (verify spans, #812), so padding no longer maps onto distinct free
+    // slots. Every consumer bounds its semantic walk by `active_rows`;
+    // padding rows keep deterministic defaults (padding token/position,
+    // padding-page KV) regardless of the id here.
     let active_rows = dst;
-    let mut frees = (0..GLM52_MAX_BATCH_PER_RANK).filter(|&slot| wants[slot] == 0);
-    while dst < bucket {
-        slots[dst] = frees.next().expect("bucket - used <= free slots") as u8;
-        dst += 1;
-    }
     Glm52StepShape {
         bucket,
         slots,
@@ -173,10 +173,10 @@ pub(super) fn collect_sampling_rows(
 ) -> Vec<Glm52RowSample> {
     let mut sampling = Vec::new();
     let mut row = 0usize;
-    while row < shape.bucket {
+    while row < shape.active_rows {
         let slot = shape.slots[row] as usize;
         let mut end = row + 1;
-        while end < shape.bucket && shape.slots[end] as usize == slot {
+        while end < shape.active_rows && shape.slots[end] as usize == slot {
             end += 1;
         }
         if let Some(active) = &rank_slots[slot]
@@ -352,9 +352,11 @@ mod tests {
         // installed), slot 1 finishes its prompt with a 3-row span
         // (non-greedy), slot 3 is mid-prompt (non-greedy, span does NOT
         // complete), slot 2 decodes greedily, row 7 pads.
+        let mut slots = [0u8; GLM52_MAX_STEP_ROWS];
+        slots[..8].copy_from_slice(&[0, 0, 1, 1, 1, 3, 2, 4]);
         let shape = Glm52StepShape {
             bucket: 8,
-            slots: [0, 0, 1, 1, 1, 3, 2, 4],
+            slots,
             active_rows: 7,
         };
         let mut rank_slots: RankSlots = std::array::from_fn(|_| None);
@@ -424,7 +426,7 @@ mod tests {
         // `select_batch` pins this case to the deterministic argmax.
         let shape = Glm52StepShape {
             bucket: 1,
-            slots: [0; GLM52_MAX_BATCH_PER_RANK],
+            slots: [0; GLM52_MAX_STEP_ROWS],
             active_rows: 1,
         };
         let mut rank_slots: RankSlots = std::array::from_fn(|_| None);
@@ -483,19 +485,22 @@ mod tests {
             forwarded(&plan_step_shape(&decode_wants(2))),
             (2, vec![0, 1])
         );
+        // The padding row reuses slot id 0 (#812) — insignificant past
+        // `active_rows`.
         assert_eq!(
             forwarded(&plan_step_shape(&decode_wants(3))),
-            (4, vec![0, 1, 2, 3])
+            (4, vec![0, 1, 2, 0])
         );
-        // Past the 4-row bucket the full batch takes over.
+        assert_eq!(plan_step_shape(&decode_wants(3)).active_rows, 3);
+        // Past the 4-row bucket the eight-row bucket takes over.
         assert_eq!(plan_step_shape(&decode_wants(5)).bucket, 8);
     }
 
     #[test]
     fn partial_buckets_pack_actives_first() {
         // A rank holding slots {1, 5} forwards them in rows 0..2 in its own
-        // bucket-2 shape; a rank with 3 actives rides a bucket-4 shape whose
-        // padding row lands on the lowest free slot.
+        // bucket-2 shape; a rank with 5 actives rides a bucket-8 shape whose
+        // padding rows carry the insignificant slot id 0 (#812).
         let mut holey = decode_wants(0);
         holey[1] = 1;
         holey[5] = 1;
@@ -505,26 +510,27 @@ mod tests {
         deep[7] = 1;
         assert_eq!(
             forwarded(&plan_step_shape(&deep)),
-            (8, vec![1, 2, 3, 4, 7, 0, 5, 6])
+            (8, vec![1, 2, 3, 4, 7, 0, 0, 0])
         );
+        assert_eq!(plan_step_shape(&deep).active_rows, 5);
     }
 
     #[test]
     fn prefill_want_extends_one_slot_into_a_span() {
         // A lone mid-prefill request with plenty of prompt left fills the
-        // whole max bucket with its span.
+        // whole max bucket with its span — 48 rows since #812.
         let mut wants = decode_wants(0);
         wants[2] = 3000;
         assert_eq!(
             forwarded(&plan_step_shape(&wants)),
-            (8, vec![2, 2, 2, 2, 2, 2, 2, 2]),
+            (GLM52_MAX_STEP_ROWS, vec![2; GLM52_MAX_STEP_ROWS]),
             "one hungry slot owns every row of the max bucket"
         );
 
         // A short prompt remainder only lifts the bucket as far as needed.
         let mut wants = decode_wants(0);
         wants[0] = 3;
-        assert_eq!(forwarded(&plan_step_shape(&wants)), (4, vec![0, 0, 0, 1]));
+        assert_eq!(forwarded(&plan_step_shape(&wants)), (4, vec![0, 0, 0, 0]));
     }
 
     #[test]
@@ -535,21 +541,25 @@ mod tests {
         let mut wants = decode_wants(0);
         wants[0] = 1;
         wants[1] = 100;
+        let mut expect = vec![1u8; GLM52_MAX_STEP_ROWS];
+        expect[0] = 0;
         assert_eq!(
             forwarded(&plan_step_shape(&wants)),
-            (8, vec![0, 1, 1, 1, 1, 1, 1, 1])
+            (GLM52_MAX_STEP_ROWS, expect)
         );
 
         // Two mid-prefill slots with small wants: both met, remaining rows
-        // pad on free slots.
+        // are padding (slot id 0, insignificant).
         let mut wants = decode_wants(0);
         wants[0] = 3;
         wants[1] = 2;
         assert_eq!(
             forwarded(&plan_step_shape(&wants)),
-            (8, vec![0, 0, 0, 1, 1, 2, 3, 4]),
-            "wants met, remaining rows pad on free slots"
+            (8, vec![0, 0, 0, 1, 1, 0, 0, 0]),
+            "wants met, remaining rows are padding"
         );
+        let shape = plan_step_shape(&wants);
+        assert_eq!(shape.active_rows, 5);
     }
 
     #[test]
@@ -559,21 +569,44 @@ mod tests {
         let mut wants = decode_wants(0);
         wants[2] = 3000;
         wants[5] = 3000;
+        let half = GLM52_MAX_STEP_ROWS / 2;
+        let mut expect = vec![2u8; half];
+        expect.extend(std::iter::repeat_n(5u8, half));
         assert_eq!(
             forwarded(&plan_step_shape(&wants)),
-            (8, vec![2, 2, 2, 2, 5, 5, 5, 5])
+            (GLM52_MAX_STEP_ROWS, expect)
         );
 
         // A decode slot in the mix keeps its single row; the prefills split
-        // what remains (7 rows -> 4 + 3 by round-robin order).
+        // what remains (47 rows -> 24 + 23 by round-robin order).
         let mut wants = decode_wants(0);
         wants[0] = 1;
         wants[3] = 3000;
         wants[6] = 3000;
+        let mut expect = vec![0u8];
+        expect.extend(std::iter::repeat_n(3u8, 24));
+        expect.extend(std::iter::repeat_n(6u8, 23));
         assert_eq!(
             forwarded(&plan_step_shape(&wants)),
-            (8, vec![0, 3, 3, 3, 3, 6, 6, 6])
+            (GLM52_MAX_STEP_ROWS, expect)
         );
+    }
+
+    /// The #812 headline: eight verifying slots each want a full native-MTP
+    /// span (1 anchor + 5 drafts) and ALL of them get it — pre-#812 the
+    /// demand cap at the slot count collapsed every span to one row
+    /// (measured as TPOT == ITL at full occupancy).
+    #[test]
+    fn full_occupancy_verify_spans_fit_the_max_bucket() {
+        let wants = [6usize; GLM52_MAX_BATCH_PER_RANK];
+        let shape = plan_step_shape(&wants);
+        assert_eq!(shape.bucket, GLM52_MAX_STEP_ROWS);
+        assert_eq!(shape.active_rows, GLM52_MAX_STEP_ROWS);
+        let mut expect = Vec::new();
+        for slot in 0..GLM52_MAX_BATCH_PER_RANK {
+            expect.extend(std::iter::repeat_n(slot as u8, 6));
+        }
+        assert_eq!(shape.slots[..].to_vec(), expect);
     }
 
     #[test]

@@ -9,6 +9,7 @@ use super::slot::GLM52_PADDING_STEP;
 use crate::Glm52MoeTopo;
 use crate::model::GLM52_DECODE_BUCKETS;
 use crate::model::GLM52_MAX_BATCH_PER_RANK;
+use crate::model::GLM52_MAX_STEP_ROWS;
 use crate::model::Glm52StepShape;
 use crate::runner::Glm52StepFlags;
 use crate::runner::Glm52Worker;
@@ -35,14 +36,15 @@ pub(super) fn precapture_step_graphs(
     for bucket in GLM52_DECODE_BUCKETS {
         let mut shape = Glm52StepShape {
             bucket,
-            slots: [0; GLM52_MAX_BATCH_PER_RANK],
+            slots: [0; GLM52_MAX_STEP_ROWS],
             active_rows: 0,
         };
-        for (slot, dst) in shape.slots.iter_mut().enumerate().take(bucket) {
-            *dst = slot as u8;
+        // Slot ids are row % slots: a bucket may hold more rows than slots
+        // (verify spans), and every row here is padding anyway.
+        for (row, dst) in shape.slots.iter_mut().enumerate().take(bucket) {
+            *dst = (row % GLM52_MAX_BATCH_PER_RANK) as u8;
         }
-        let inputs =
-            [(GLM52_PADDING_STEP.token, GLM52_PADDING_STEP.position); GLM52_MAX_BATCH_PER_RANK];
+        let inputs = [(GLM52_PADDING_STEP.token, GLM52_PADDING_STEP.position); GLM52_MAX_STEP_ROWS];
         let flags = Glm52StepFlags::plain();
         let responses = workers
             .iter()
