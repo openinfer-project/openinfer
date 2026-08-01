@@ -105,7 +105,17 @@ const PAGE: usize = GLM52_MODEL_LEN_ALIGN;
 const GLM52_SAMPLE_SEED: u64 = 42;
 
 fn prefix_cache_enabled(drafter: &crate::Glm52Drafter, no_prefix_cache: bool) -> bool {
-    !drafter.enabled() && !no_prefix_cache
+    match drafter {
+        // DSpark consumes aux-hidden captures produced by exactly the target
+        // forwards a prefix hit skips — missing state, not stale state (#590).
+        crate::Glm52Drafter::Dspark(_) => false,
+        // Native MTP's layer-78 KV rides the same pool page ids as the main
+        // cache, so a GPU radix hit reuses it for free: a hit means the pages
+        // were never recycled, and their L78 rows are exactly the ones written
+        // when the main KV was. See `native_mtp_cache_salt` for the
+        // shifted-token page-boundary caveat this accepts.
+        crate::Glm52Drafter::NativeMtp | crate::Glm52Drafter::None => !no_prefix_cache,
+    }
 }
 
 #[cfg(test)]
@@ -113,9 +123,15 @@ mod prefix_cache_policy_tests {
     use super::*;
 
     #[test]
-    fn native_mtp_never_matches_target_only_prefix_state() {
+    fn native_mtp_matches_prefixes_dspark_never_does() {
+        // Native MTP page identity is prefix-stable (constant salt) and its
+        // L78 KV lives at the matched pages themselves, so radix hits are
+        // sound; DSpark stays excluded — its aux-hidden captures cannot be
+        // recovered from a hit at all.
+        assert!(prefix_cache_enabled(&crate::Glm52Drafter::NativeMtp, false));
+        assert!(!prefix_cache_enabled(&crate::Glm52Drafter::NativeMtp, true));
         assert!(!prefix_cache_enabled(
-            &crate::Glm52Drafter::NativeMtp,
+            &crate::Glm52Drafter::Dspark(std::path::PathBuf::from("draft")),
             false
         ));
         assert!(prefix_cache_enabled(&crate::Glm52Drafter::None, false));
@@ -282,28 +298,30 @@ impl Glm52Engine {
         // for `glm52_pool_blocks` blocks). Block 0-equivalent is the reserved
         // padding page. Under mirrored TP the single pool drives every executor — the
         // mirrored steps write the identical block ids on all 8 arenas.
+        // The prefill-only pool sizes for the full slot count too (it used to
+        // hold exactly one request's lifetime): the prefix cache needs spare
+        // blocks to RETAIN released prefixes across turns, and the headroom
+        // lets admission overlap prefills instead of serializing them. MLA
+        // keeps this cheap (~54 KB/token/rank -> a few GiB at 16K x 8).
         let pool = BlockPool::new(
             PAGE,
-            glm52_pool_blocks(
-                spec.max_model_len,
-                if prefill_only {
-                    1
-                } else {
-                    GLM52_MAX_BATCH_PER_RANK
-                },
-            ),
+            glm52_pool_blocks(spec.max_model_len, GLM52_MAX_BATCH_PER_RANK),
         )?;
         let table_width = glm52_table_width(spec.max_model_len);
-        // A cache-hit prefix skips state required by either speculative lane:
-        // DSpark loses the aux-hidden captures it consumes. Native MTP loses
-        // continuity in its separate KV cache; TP4 P additionally restores only
-        // the 656-byte wire cache, not its 576-byte local proposal cache. Prefix
-        // matching therefore stays off while any drafter is active.
+        // Prefix matching policy lives in `prefix_cache_enabled`: DSpark is
+        // the only drafter that forces it off (aux-hidden captures cannot be
+        // recovered from a hit).
         let prefix_cache = prefix_cache_enabled(&spec.drafter, spec.no_prefix_cache);
         if spec.drafter.enabled() && !prefix_cache && !spec.no_prefix_cache {
-            log::info!("GLM5.2 prefix cache disabled: speculative decoding is on");
+            log::info!("GLM5.2 prefix cache disabled: DSpark drafting is on");
         }
-        let host_restore = (offload.is_some() && prefix_cache).then(offload::HostRestoreState::new);
+        // The prefill-only engine keeps host-tier restore off: a restore
+        // recovers the 656-byte wire arenas but neither the 576-byte
+        // FlashInfer proposal cache (unregistered) nor the mirrors on the
+        // other three ranks (the H2D lands on one rank's arena) — GPU radix
+        // hits have neither problem, so plain prefix matching stays on.
+        let host_restore = (offload.is_some() && prefix_cache && spec.prefill_chunk_size.is_none())
+            .then(offload::HostRestoreState::new);
         Ok(Self {
             rank: spec.rank,
             submit_rx: spec.submit_rx,
@@ -1377,19 +1395,25 @@ fn take_boundary_drafts<'a>(
     if boundary { drafts.next() } else { None }
 }
 
-/// Scope every lineage-hashed page in one native-MTP P/D request by its full
-/// committed prompt. Layer 78 consumes shifted tokens, so the last row of a
-/// page depends on the first token of the following page; token-only per-page
-/// hashes would otherwise alias MTP bytes across diverging continuations.
-fn native_mtp_cache_salt(committed_prompt: &[u32]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"openinfer-glm52-native-mtp-pages-v1");
-    hasher.update((committed_prompt.len() as u64).to_le_bytes());
-    for token in committed_prompt {
-        hasher.update(token.to_le_bytes());
-    }
-    let digest = hasher.finalize();
-    hex::encode(&digest[..16])
+/// Partition lineage-hashed native-MTP pages from plain (drafterless) pages:
+/// layer-78 rows ride the same pool pages, so an MTP request must never match
+/// a block whose L78 arenas were never written — and vice versa.
+///
+/// The salt is CONSTANT, which makes page identity prefix-stable across
+/// requests and turns (v1 hashed the full prompt into the salt, which made
+/// every continuation its own cache universe and killed all cross-turn
+/// reuse). The accepted trade: layer 78 consumes shifted tokens, so the last
+/// MTP row of page k depends on the first token of page k+1. Two prompts
+/// that share pages and diverge EXACTLY at a page boundary therefore share
+/// one L78 row whose shifted input came from the other continuation. That
+/// row only feeds draft proposals — target verification rejects any draft it
+/// misleads, so output text is never affected. Same-conversation multi-turn
+/// extensions agree on every shared token and never alias at all; the
+/// anchor-dependent final row always lives in the tail page, which is
+/// excluded from lineage hashing (`native_pd_tail_len` keeps it explicit,
+/// `native_mtp_tail_key` scopes it by prompt + anchor).
+fn native_mtp_cache_salt() -> &'static str {
+    "openinfer-glm52-native-mtp-pages-v2"
 }
 
 fn native_mtp_tail_key(committed_prompt: &[u32], anchor_token: u32) -> [u8; 16] {
@@ -1442,21 +1466,18 @@ mod tp_prefill_output_tests {
     }
 
     #[test]
-    fn token_after_a_full_page_is_part_of_the_native_mtp_page_identity() {
-        let mut first = vec![7; PAGE + 1];
-        let mut second = first.clone();
-        first[PAGE] = 10;
-        second[PAGE] = 11;
-
-        assert_ne!(
-            native_mtp_cache_salt(&first),
-            native_mtp_cache_salt(&second),
-            "the last MTP row in page 0 consumes token PAGE through shifted input"
-        );
-        assert_eq!(
-            native_mtp_cache_salt(&first),
-            native_mtp_cache_salt(&first),
-            "P and D must derive the same cache scope from the committed prompt"
+    fn native_mtp_page_identity_is_prefix_stable() {
+        // The salt is constant: a turn that extends its predecessor derives
+        // identical block hashes for the shared prefix, so radix / host-tier
+        // reuse works across turns and requests. The v1 full-prompt salt made
+        // every continuation its own cache universe (zero reuse); the
+        // page-boundary shifted-token alias this accepts is draft-quality
+        // only — see `native_mtp_cache_salt`.
+        assert_eq!(native_mtp_cache_salt(), native_mtp_cache_salt());
+        assert!(
+            !native_mtp_cache_salt().is_empty(),
+            "the constant salt must still partition MTP pages from plain \
+             (drafterless) pages, whose L78 arenas were never written"
         );
     }
 }

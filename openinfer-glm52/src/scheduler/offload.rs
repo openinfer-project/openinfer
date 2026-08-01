@@ -626,7 +626,7 @@ pub(super) fn admit_native_mtp_pd(
 
     let query_key = state.parked(rank, req).query_key.clone();
     let prompt_kv = &req.prompt_tokens[..handoff.committed_len];
-    let cache_salt = super::native_mtp_cache_salt(prompt_kv);
+    let cache_salt = super::native_mtp_cache_salt();
     let full_len = handoff.committed_len - handoff.tail_len;
 
     // Settle what this front parked for: its in-flight query or H2D load.
@@ -828,7 +828,7 @@ pub(super) fn admit_native_mtp_pd(
         // reports them as GPU-hit and the query window is empty.
         if full_hold.is_none() {
             let probe =
-                pool.probe_prefix_with_cache_salt(prompt_kv.to_vec(), Some(&cache_salt), None);
+                pool.probe_prefix_with_cache_salt(prompt_kv.to_vec(), Some(cache_salt), None);
             let hashes = probe.cpu_query_hashes();
             if !hashes.is_empty() {
                 // Decode-only can't recompute a miss: hold the query in
@@ -868,7 +868,7 @@ pub(super) fn admit_native_mtp_pd(
         let mut kv = pool.new_request_with_cache_salt(
             logical_prompt,
             kv_shape.max_output_tokens,
-            Some(&cache_salt),
+            Some(cache_salt),
             None,
         );
         let cached_tokens = kv.match_and_add_prefix(pool)?;

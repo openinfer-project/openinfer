@@ -626,11 +626,10 @@ fn glm52_cap_bytes(
     prefill_only: bool,
     moe_topo: Glm52MoeTopo,
 ) -> Result<usize> {
-    let pool_slots = if prefill_only {
-        1
-    } else {
-        model::GLM52_MAX_BATCH_PER_RANK
-    };
+    // Prefill-only sizes the full slot count too (it used to hold exactly one
+    // request): the prefix cache needs blocks to retain released prefixes
+    // across turns, and the headroom lets prefills overlap.
+    let pool_slots = model::GLM52_MAX_BATCH_PER_RANK;
     Ok(glm52_arena_bytes(max_model_len, pool_slots, prefill_only)?
         + if drafter.is_dspark() {
             crate::dspark::glm52_dspark_arena_bytes(max_model_len)
@@ -912,12 +911,7 @@ fn start_engine(
         }
     };
     let logical_ranks = moe_topo.logical_rank_count();
-    let kv_pool_slots = if prefill_only.is_some() {
-        1
-    } else {
-        model::GLM52_MAX_BATCH_PER_RANK
-    };
-    let kv_total_blocks = glm52_pool_blocks(max_model_len, kv_pool_slots) - 1;
+    let kv_total_blocks = glm52_pool_blocks(max_model_len, model::GLM52_MAX_BATCH_PER_RANK) - 1;
     // One autonomous engine per LOCAL logical rank (a mirrored topology
     // collapses to a single engine driving every worker). Each engine owns
     // its submit queue and load feed, so the frontend sees one scheduler
@@ -1674,7 +1668,7 @@ mod max_model_len_tests {
     }
 
     #[test]
-    fn shared_prefill_pool_outgrows_eight_slot_decode_cap() {
+    fn prefill_pool_budgets_the_full_slot_count_plus_scratch() {
         let prefill = Glm52PrefillOnlyOptions {
             chunk_size: GLM52_DEFAULT_PREFILL_CHUNK_SIZE,
         };
@@ -1686,9 +1680,15 @@ mod max_model_len_tests {
         let prefill =
             derive_max_model_len(None, free, &Glm52Drafter::None, scratch, true, TEST_TOPO)
                 .expect("prefill budget");
+        // Prefill-only budgets the full slot count too (the prefix cache
+        // retains released prefixes in the pool headroom), so its cap can
+        // only trail the decode cap — by exactly the scratch reservation.
         assert!(
-            prefill.max_model_len > decode.max_model_len,
-            "one shared prefill pool must fit a larger per-request cap than eight decode maxima"
+            prefill.max_model_len <= decode.max_model_len,
+            "prefill cap {} must not exceed the decode cap {} once both \
+             budget the full slot count",
+            prefill.max_model_len,
+            decode.max_model_len,
         );
         assert_eq!(prefill.reserve_bytes, GLM52_VRAM_RESERVE_BYTES + scratch);
     }

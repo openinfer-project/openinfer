@@ -552,11 +552,10 @@ impl Glm52RankModel {
         } else {
             glm52_flashmla_sparse_decode_num_sm_parts()?
         };
-        let pool_slots = if prefill_chunk_size.is_some() {
-            1
-        } else {
-            GLM52_MAX_BATCH_PER_RANK
-        };
+        // Prefill-only allocates the full slot count too — the scheduler pool
+        // is sized to match, and the prefix cache retains released prefixes
+        // in the headroom.
+        let pool_slots = GLM52_MAX_BATCH_PER_RANK;
         let pool_blocks = glm52_pool_blocks(max_model_len, pool_slots);
         let contract = Glm52FlashMlaSparseDecode {
             batch_size: batch,

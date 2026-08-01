@@ -318,11 +318,10 @@ pub(super) fn admit_from_queue(
                 _ => None,
             };
             let mut kv = if native_mtp_prefill {
-                let cache_salt = super::native_mtp_cache_salt(&req.prompt_tokens);
                 pool.new_request_with_cache_salt(
                     req.prompt_tokens.clone(),
                     req.max_tokens,
-                    Some(&cache_salt),
+                    Some(super::native_mtp_cache_salt()),
                     None,
                 )
             } else {
