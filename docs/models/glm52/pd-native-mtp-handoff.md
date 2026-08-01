@@ -35,6 +35,11 @@
 > native-MTP proposal path broken by #797 is repaired (P dies on first
 > handoff on any #797..#804 build without it). Same-fleet A/B: ITL p90 −27%
 > / p99 −32% vs the pre-async binary; c64 full-stack 640/640 at 1,189 tok/s.
+> **Prefix caching now works under native MTP** (constant v2 page salt —
+> the v1 full-prompt salt had killed all cross-turn reuse) and the prefill
+> pool retains released prefixes: multi-turn per-turn TTFT is flat instead
+> of linear in history (c1 p50 ~270 ms at every turn; c8 late-turn p50
+> 1,186 → 454 ms), with byte-identical greedy outputs.
 >
 > **Last touched:** 2026-07
 
@@ -666,6 +671,39 @@ fixed-cadence DeepEP chain paces every rank at the slowest node (~+4 ms
 ITL p50 fleet-to-fleet). The c16 TTFT park tax (~+0.1 s p50) persists —
 restore pipelining (deferred in #802) is the code-side answer,
 session-affinity routing the traffic-side one.
+
+### Prefix cache under native MTP: multi-turn TTFT decoupled from history (2026-08-01)
+
+TTFT diagnosis on a 2P (TP4) + 1D (EP4) stack, multi-turn 1024 + 256/turn ×
+8 turns, 2-token outputs (`max_tokens=1` finishes at admission via anchor
+replay — it exercises the restore but skips the verify step and its admit
+log, so TTFT probes must use ≥2): per-turn TTFT p50 grew 243 → 374 ms at c1
+and 432 → 1,186 ms at c8. Decomposition: bs=1 direct-P prefill is
+`~80 ms + len/9.2K tok/s`, the handoff adds ~72 ms — the growth was P
+re-prefilling the FULL history every turn, and the c8 blowup was P's
+serial single-request pool. Root cause of both: the v1 native-MTP cache
+salt hashed the whole prompt, giving every continuation its own cache
+universe — zero cross-turn reuse anywhere (P radix, D radix, host tier).
+
+Fix (same-day): constant v2 salt + prefix matching enabled under native
+MTP + the prefill pool sized for the full slot count. Layer-78 KV rides
+the same pool page ids as the main cache, so a radix hit reuses it for
+free; the accepted alias (two prompts diverging exactly at a page boundary
+share one shifted-token L78 row) affects draft quality only — target
+verification rejects any draft it misleads. Verified on the same stack:
+
+- greedy 2-turn goldens byte-identical across the flip;
+- c1 per-turn TTFT p50 `[303, 271, 270, 270, 271, 271, 302, 281]` — flat
+  (was 243 → 374 and linear in history; at 8K histories the projected gap
+  is ~3×);
+- c8 per-turn TTFT p50 turn-7/8 `454/374` ms (was `1,186/993`), p99 flat
+  ~600–900 ms (was growing to 2,247) — concurrent prefills replace the
+  head-of-line queue;
+- 24/24 conversations, zero failures, D admits on every turn.
+
+The bare-metal P deployment also surfaced #810 (two NCCL copies corrupt
+the TP4 comm when the shared lib dir lacks the unversioned symlink) —
+fixed operationally, hardening tracked there.
 
 ## Debrief
 
