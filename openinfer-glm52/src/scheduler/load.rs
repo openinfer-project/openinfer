@@ -26,5 +26,6 @@ pub(super) fn publish_load(
         kv_total_blocks: kv_total_blocks as u64,
         num_running_reqs: slots.iter().flatten().count() as u64,
         num_waiting_reqs: pending.len() as u64,
+        ..Default::default()
     });
 }

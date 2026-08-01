@@ -367,6 +367,18 @@ pub struct LoadSnapshot {
     pub num_running_reqs: u64,
     /// Requests admitted but not yet running (KV pressure, prefetch wait).
     pub num_waiting_reqs: u64,
+    /// Cumulative number of prompt tokens that queried the prefix cache.
+    ///
+    /// Feeds the upstream `SchedulerStats.prefix_cache_stats.base.queries`
+    /// counter (`prefix_cache_queries_total`). Left 0 by schedulers that do not
+    /// yet track it; the bridge maps it through regardless so the metric
+    /// pipeline is wired end-to-end.
+    pub prefix_cache_queries: u64,
+    /// Cumulative number of prompt tokens served from the prefix cache
+    /// (i.e. prefix-cache hits). Maps to
+    /// `SchedulerStats.prefix_cache_stats.base.hits`
+    /// (`prefix_cache_hits_total`).
+    pub prefix_cache_hits: u64,
 }
 
 /// One full KV block that just became reusable from this engine's prefix cache.
