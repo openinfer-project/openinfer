@@ -1,0 +1,25 @@
+unit = "norm.fused_add_rmsnorm_round"
+phase = 1
+symbol = "fused_add_rms_norm_round_batched_cuda"
+adapter = "norm_fused_add_rmsnorm_round"
+capability = { blackwell_only = true }
+[axes]
+rows = [1, 2, 4, 8, 16, 32, 64]
+[shape]
+n = 6144
+k = 6144
+eps = 1e-5
+[contract]
+inputs = "hidden[rows,6144] bf16（残差流累加器，原地更新）; residual[rows,6144] bf16（分支输出加数）; weight[6144] bf16（下一层 input_layernorm / post_attn_ln gamma）"
+outputs = "hidden[rows,6144] bf16（= bf16(hidden+residual)，原地）+ out[rows,6144] bf16（= rms_norm(hidden_rounded, weight)）"
+accumulation = "f32 行内归约（grid=rows，一 CTA 一行；d=6144 时 768 线程/24 warp，vec8，动态 smem 24672 B）"
+notes = "层收尾融合核：hidden=bf16(hidden+residual) 后接 RMSNorm——`_round` 变体先把和舍入 bf16 再进方差，与分离 add+rms_norm 逐位一致（layer.rs:322-326 生产不变量，本单元第二层参考从同 .so 实证）。调用点 layer.rs:332（post-attn 边界）/:363（closing add 融合下一层 input_ln）。内核=手写 FusedAddRMSNormRoundKernel（flashinfer_norm.cu:252），非 FlashInfer FusedAddRMSNorm 模板。rows>8：一 CTA 一行、行归约自包含，任意 rows 每行与 rows=1 逐位一致，无 .cu 改动。manifest [shape] n=k=hidden 只是 GEMV 词汇的 schema 映射——derive_shapes 的 weight_bytes/scale_len/scratch_rule 对本单元无语义；真实缓冲：hidden/residual/out 各 rows*6144*2 B，weight 12288 B，无 scale/scratch。"
+[reference]
+mode = "torch_tolerance"
+[reference.tolerance]
+rel_l2 = 0.02
+note = "bf16 store floor：RN 半 ulp 相对误差 ≤2^-8/元素，张量级 rel_l2 典型 ~1e-3（2^-9/√3 量级）；torch 参考已复现 bf16 和的舍入边界，剩余分歧仅 rms 标量的 f32 归约序（<< floor）。0.02 ≈ 4×2^-8 余量。UNMEASURED，GB300 首测后回填实测值与机器。"
+[reference.unfused_byte_compare]
+chain = ["add_cuda", "rms_norm_batched_cuda"]
+outputs = ["hidden_sum", "out"]
+note = "第二层（必过）：生产未融合链 add_cuda→rms_norm_batched_cuda（同 .so）须逐位复现融合核两个输出——torch 无法复现 f32 结合序，bit-exact 只能靠生产链。经 benches/tests/test_norm.py 的 GPU 用例门控（check 子命令无双模钩子，已作为 harness 缺口上报）。"

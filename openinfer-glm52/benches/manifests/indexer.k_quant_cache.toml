@@ -1,0 +1,23 @@
+unit = "indexer.k_quant_cache"
+phase = 1
+symbol = "glm52_indexer_k_quant_and_cache_cuda"
+adapter = "indexer_k_quant_cache"
+capability = { blackwell_only = false }
+[axes]
+rows = [1, 2, 4, 8, 16, 32, 64]
+ctx = [16384, 65536, 262144]
+[shape]
+# n/k 为 schema 占位语义：n = head_dim、k = quant_block。
+n = 128
+k = 128
+block_size = 64
+[contract]
+inputs = "k[rows,128] bf16（RoPE 后）、slot_mapping[rows] i64（全局槽位，互异）、cache u8[num_blocks*8448]（num_blocks=ctx/64）"
+outputs = "cache 原地写入：每 block [64*128 fp8 值][64*4 f32 scale]（vLLM indexer_k_quant_and_cache 布局，DeepGEMM TMA 直读）"
+accumulation = "无（纯量化+scatter；amax/scale 为精确 f32 运算）"
+notes = "逐 token 一组 128 维：amax -> scale=max(amax,1e-4)/448 -> value/scale SATFINITE RNE 转 e4m3。量化全链确定性（amax/scale 是精确 f32 规约与除法，RNE cast 确定性），check 门为整 cache 字节级全等（含未写入区，基线两侧同置零）。slot_idx<0 跳过写入（harness 不生成负槽）。grid=(tokens,1) 无 rows 上限；ctx 轴只影响 cache 几何与槽位采样，单发射代价与 ctx 无关"
+[reference]
+mode = "torch_tolerance"
+[reference.tolerance]
+rel_l2 = 1e-12
+note = "真门 = reference 内字节级全等断言（fp8 RNE 与 scale 推导全确定性，无容差可言）；rel_l2 仅 CLI 兜底；UNMEASURED——GB300 首测确认字节全等后改为 measured 注记"

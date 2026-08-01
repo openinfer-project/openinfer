@@ -1,0 +1,20 @@
+unit = "mla_front.o_proj_gemv"
+phase = 1
+symbol = "glm52_fp8_weight_only_gemv_batched_cuda"
+adapter = "mla_front_o_proj_gemv"
+capability = { blackwell_only = true }
+[axes]
+rows = [1, 2, 4, 8, 16, 32, 64]
+[shape]
+n = 6144
+k = 16384
+[contract]
+inputs = "act[bs,k] bf16; weight[n,k] e4m3; scales[ceil(n/128), k/128] f32 (checkpoint weight_scale_inv raw bytes)"
+outputs = "out[bs,n] bf16"
+accumulation = "f32"
+notes = "rows=1 CUDA-core GEMV（long-K 全架构 1 row/warp）; rows=2 register tile bit-parity; rows=4 register tile（o_proj 不在 batch-4 mma 表）; rows=8 tensor-core mma（Blackwell 与 Hopper 表均为 {16,2}，需 f32 scratch partials，大小规则见 csrc/glm52/glm52_moe_gemv.cu）; rows 16/32/64 = MTP span-mapped verify 行 / 未来大 batch — multi-subtile mma（BTILES=rows/8，Blackwell-only 实测表 {16/32:8,2; 64:16,2}，GB300 kernel_lab 2026-07-29），由 KERNEL_LAB_GEMV_MMA_MULTI 门控（harness 默认置 1；生产侧 16/32/48 仍走 #812 register tile），off-table / 非 Blackwell / knob-unset 下 rows>8 fail-closed INVALID_VALUE。bucket 间非 bit-identical"
+[reference]
+mode = "torch_tolerance"
+[reference.tolerance]
+rel_l2 = 0.02
+note = "推导：bf16 store floor —— 8 位尾数 RN，元素级相对误差 <= 2^-9 ≈ 1.95e-3（binade 半 ulp）；e4m3→bf16→f32 解码精确（3 位尾数 ⊂ 8 位），fp8 block absmax 量子与 ref 同源（同一 codes × 同一 scale 反量化），贡献 0；f32 累加重排 ~2^-24×O(sqrt(k)) ≈ 1e-5 可忽略 → 距离 ≈ bf16 store floor，0.02 = ~10x headroom。UNMEASURED：首次 GB300 实测后在此补 measured 值与机器"

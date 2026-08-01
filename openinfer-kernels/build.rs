@@ -707,6 +707,69 @@ fn link_deepep_nccl(nccl_root: &Path, out_dir: &Path) {
     println!("cargo:rustc-link-lib=dylib=nccl");
 }
 
+/// Link the freshly compiled CUDA objects into `libglm52_kernel_lab.so` for
+/// the kernel-lab Python harness (`OPENINFER_KERNEL_LAB=1` only). The objects
+/// are already PIC (every nvcc task adds `--compiler-options -fPIC`), so the
+/// same .o files that feed `libkernels_cuda.a` link into a shared object
+/// without a second compile pass. DeepEP shim objects reference NCCL symbols
+/// that stay unresolved in the .so — the harness dlopens with `RTLD_LAZY` and
+/// never calls into DeepEP for these units.
+fn link_kernel_lab_shared(
+    nvcc: &str,
+    toolkit: &openinfer_build::CudaToolkit,
+    out_dir: &Path,
+    obj_files: &[PathBuf],
+) {
+    let so_path = out_dir.join("libglm52_kernel_lab.so");
+    let _ = fs::remove_file(&so_path);
+    let mut args = vec!["-shared".to_string()];
+    args.extend(
+        obj_files
+            .iter()
+            .map(|path| path.to_string_lossy().to_string()),
+    );
+    args.extend([
+        "-o".to_string(),
+        so_path.to_string_lossy().to_string(),
+        format!("-L{}", toolkit.root.join("lib64").display()),
+        "-lcudart".to_string(),
+        "-lcublas".to_string(),
+        "-lcublasLt".to_string(),
+        "-lnvrtc".to_string(),
+        "-lcuda".to_string(),
+        "-lstdc++".to_string(),
+    ]);
+    let status = time_phase("nvcc -shared libglm52_kernel_lab.so", || {
+        Command::new(nvcc)
+            .args(&args)
+            .status()
+            .expect("Failed to run nvcc for libglm52_kernel_lab.so")
+    });
+    assert!(status.success(), "kernel-lab shared link failed");
+
+    // Stable discovery path: OUT_DIR is target/<profile>/build/<pkg>-<hash>/out,
+    // so three parents up is target/<profile>.
+    if let Some(profile_dir) = out_dir
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+    {
+        let stable = profile_dir.join("libglm52_kernel_lab.so");
+        fs::copy(&so_path, &stable).unwrap_or_else(|err| {
+            panic!(
+                "Failed to copy kernel-lab .so to {}: {err}",
+                stable.display()
+            )
+        });
+        println!("cargo:warning=kernel_lab .so: {}", stable.display());
+    } else {
+        println!(
+            "cargo:warning=kernel_lab .so: {} (no stable target/<profile> copy)",
+            so_path.display()
+        );
+    }
+}
+
 fn cuda_object_name(csrc_dir: &Path, cu_file: &Path) -> String {
     let Some(relative) = cu_file.strip_prefix(csrc_dir).ok() else {
         return format!("{}_cuda.o", cu_file.file_stem().unwrap().to_string_lossy());
@@ -1671,6 +1734,10 @@ fn main() {
     });
     obj_files.sort();
 
+    // The optional kernel-lab .so (linked below) uses the same objects; the
+    // ar invocation consumes the vector.
+    let kernel_lab_objs = obj_files.clone();
+
     let cuda_lib = out_dir.join("libkernels_cuda.a");
     let _ = fs::remove_file(&cuda_lib);
     let mut ar_args = vec!["rcs".to_string(), cuda_lib.to_string_lossy().to_string()];
@@ -1688,6 +1755,15 @@ fn main() {
     });
 
     assert!(status.success(), "ar failed");
+
+    // Optional kernel-lab shared object for the Python bench harness
+    // (openinfer-glm52/benches/kernel_lab): the exact production objects —
+    // same sources, same nvcc flags — linked as a dlopen-able .so. Skipped
+    // entirely unless OPENINFER_KERNEL_LAB is set, so default builds run zero
+    // extra commands and zero extra link lines.
+    if std::env::var_os("OPENINFER_KERNEL_LAB").is_some() {
+        link_kernel_lab_shared(&nvcc, &toolkit, &out_dir, &kernel_lab_objs);
+    }
 
     if qwen35_enabled {
         compile_triton_aot_kernels(&cuda_include, &out_dir, &sm_targets);

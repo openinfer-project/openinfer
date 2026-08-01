@@ -62,6 +62,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 
 | Path | TL;DR |
 | --- | --- |
+| `models/glm52/decode-op-bench-harness.md` | Agent 调优流水线：`openinfer-glm52/benches/` Python harness（torch 参考 + 一键 check/bench/compare）调用 build.rs 生产 flags 编出的 kernel_lab .so；EP 无关 per-rank 内核（bucket/ctx 轴）19 单元在册（moe_ep_wo 单元组随 #798 DeepGEMM 替换退役，重建到 DeepGEMM 待做）；gemv 多子块 mma 由 KERNEL_LAB_GEMV_MMA_MULTI 门控，与生产 #812 register tile 的 A/B 待跑。 |
 | `models/glm52/cuda-graph-png.md` | `--dump-graph-png PATH` exports GLM5.2 rank 0's live EP whole-step graph (historical notes also cover retired TP8). |
 | `models/glm52/dp-scheduler-metrics.md` | GLM5.2 maps logical scheduler partitions onto vLLM EngineCore identities (EP multi-engine / historical TP8 single-engine). |
 | `models/glm52/moe-tp8-low-latency.md` | **Historical** Hopper TP8 LL decode record (path removed; not a launch contract). |

@@ -1,0 +1,22 @@
+unit = "bookend.argmax_split"
+phase = 1
+symbol = "argmax_batch_bf16_split_cuda"
+adapter = "bookend_argmax_split"
+# Generic reduction kernels (no arch gate). C ABI returns void — the adapter
+# pins restype=None; launch faults surface at the harness's synchronize.
+capability = { blackwell_only = false }
+[axes]
+rows = [1, 2, 4, 8, 16, 32, 64]
+[shape]
+n = 154880  # GLM52_VOCAB — logits row width
+k = 4096    # ARGMAX_BATCH_TILE_ELEMS (csrc/shared/argmax.cu:6); schema requires a k%128==0 field, this is the only k the kernel has
+[contract]
+inputs = "logits[rows, 154880] bf16 (lm_head output layout); caller scratch partial_values[rows*38] f32 + partial_indices[rows*38] i32 (ceil(154880/4096)=38 tiles/row, argmax_batch_bf16_split_partials_len)"
+outputs = "out = indices[rows] i32 — the gate keys on indices; values[rows] bf16 (winning logit per row) is also written and feeds the 6-byte D2H egress in production"
+accumulation = "none — compares on bf16->f32 widened values. argmax_better total order (csrc/shared/argmax.cu:14): val wins if greater, ties go to the LOWER GLOBAL index, NaN never wins (NaN compares false both ways and can never enter as -inf-seeded local max). Two stages: per-4096-tile partials (grid (38, rows)) then one 256-thread finalize block per row; partials carry global indices, so the result is bit-identical to the retired single-block scan per row (production comment openinfer-glm52/src/model/step_body.rs:208)."
+notes = "rows rides gridDim.y — any value <= 65535 is legal, no whitelist. Test data is adversarial by construction (adapter docstring): every row gets an exact bf16 tie (1024.0 at p and at (p+77440)%vocab, forcing cross-tile low-index tie-breaking) plus one NaN at (p+38720)%vocab. torch.argmax tie order is unspecified, so the reference is an explicit lowest-index-of-max reduction."
+[reference]
+mode = "torch_tolerance"
+[reference.tolerance]
+rel_l2 = 1e-07
+note = "Exact-match gate, not a numeric tolerance: correct indices give rel_l2 == 0.0; any single wrong index differs by >= 1 while ||want|| <= sqrt(64)*154879 ~= 1.239e6, so rel_l2 >= 8.1e-7 — the 1e-7 threshold sits 8x below the smallest detectable error. UNMEASURED by design (nothing numeric to measure)."

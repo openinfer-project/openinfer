@@ -1,0 +1,28 @@
+unit = "shared_expert.swiglu"
+# The shared expert is replicated per rank — EP-independent by construction.
+phase = 1
+# The chain's distinguishing entry (partials-producing gate|up GEMV); the
+# adapter resolves the other three production symbols itself.
+symbol = "glm52_fp8_weight_only_gemv_partials_cuda"
+adapter = "shared_expert_swiglu"
+# rows 16/32/64 route to the multi-subtile mma whose table entries are
+# Blackwell-only (opt-in via KERNEL_LAB_GEMV_MMA_MULTI, harness-set by
+# default) — off-Blackwell 16/32/48 fall back to the #812 register tiles and
+# 64 fails closed; this flag blocks rows>8 earlier with a clear message.
+# rows 1-8 run on Hopper.
+capability = { blackwell_only = true }
+[axes]
+rows = [1, 2, 4, 8, 16, 32, 64]
+[shape]
+n = 4096  # packed gate|up projection [2*intermediate, hidden], intermediate = 2048 (GLM52_EXPERT_INTERMEDIATE, config.rs:42)
+k = 6144  # GLM52_HIDDEN — gate|up k; the down projection is [6144, 2048] (see contract)
+[contract]
+inputs = "act[rows, 6144] bf16; gate_up e4m3 [4096, 6144] + scales f32 [32, 48]; down e4m3 [6144, 2048] + scales f32 [48, 16] (checkpoint weight_scale_inv block recipe); f32 scratch = max(ksplit_gu*rows*4096, ksplit_dn*rows*6144) with ksplit from glm52_gemv_mma_ksplit_cuda — one buffer, the Glm52MlpScratch.gemv_partial ownership pattern"
+outputs = "out[rows, 6144] bf16 = down(silu(gate(act)) * up(act))"
+accumulation = "f32 GEMV partials both stages; gate/up each rounded to bf16 BEFORE the SiLU (the fused reduce+SiLU is bit-identical to the standalone reduce->silu pair by construction), silu_out stored bf16 (the down GEMV's real input)"
+notes = "The three-production-launch chain of fp8_mlp_into (openinfer-glm52/src/fp8.rs) at the shared-expert shape (Glm52MoeSharedExpert, moe_decode.rs): glm52_fp8_weight_only_gemv_partials_cuda(rows, n=4096, k=6144) -> ksplit==0 ? glm52_silu_and_mul_bf16_cuda : glm52_gemv_reduce_silu_mul_cuda(rows, inter=2048) -> glm52_fp8_weight_only_gemv_batched_cuda(rows, n=6144, k=2048). rows routing follows the shared mma_config: 1 CUDA-core GEMV, 2 register tile, 4/8 tensor-core mma (Blackwell {16,2} both shapes), 16/32/64 multi-subtile mma with measured GB300 {8,2} entries (both legs, 2026-07-29) behind KERNEL_LAB_GEMV_MMA_MULTI — set by default inside the harness (loader.py); production keeps the #812 register tiles at 16/32/48 pending the A/B. off-table/knob-unset rows>8 fail closed INVALID_VALUE. rows are deterministic per value, NOT bit-identical across values."
+[reference]
+mode = "torch_tolerance"
+[reference.tolerance]
+rel_l2 = 0.02
+note = "Reference mirrors both bf16 roundings (g,u -> bf16 pre-SiLU; silu_out -> bf16 pre-down), so the residual is f32 accumulation-order + expf/sigmoid ULP noise (~1e-3 worst) over the bf16 store floor (~4e-3). 0.02 covers it with margin — measured GB300 residuals in baselines/shared_expert.swiglu.json."
