@@ -263,6 +263,10 @@ fn gemv_batched_launch(
         out.len(),
         rows * n
     );
+    ensure!(
+        ksplit_out.is_none() || rows <= 48,
+        "GLM5.2 linear GEMV partials path is not token-split past 48 rows (got {rows})"
+    );
     let (act_ptr, _a) = activation.device_ptr(&ctx.stream);
     let (w_ptr, _w) = weight.device_ptr(&ctx.stream);
     let (s_ptr, _s) = scale_bytes.device_ptr(&ctx.stream);
@@ -280,20 +284,38 @@ fn gemv_batched_launch(
     // bucket, not bit-identical to m=1). The CUDA side whitelists the
     // supported batches — a drifted GLM52_DECODE_BUCKETS crashes here.
     match ksplit_out {
-        None => unsafe {
-            ffi::glm52_fp8_weight_only_gemv_batched_cuda(
-                act_ptr as *const ffi::Half,
-                w_ptr as *const u8,
-                s_ptr as *const f32,
-                out_ptr as *mut ffi::Half,
-                scr_ptr,
-                scr_floats,
-                rows as i32,
-                n as i32,
-                k as i32,
-                ctx.stream.cu_stream(),
-            )
-        },
+        None => {
+            // 64/96-row buckets (#817) split on the token axis into two
+            // whitelisted sub-batches — the register tile at those widths
+            // would spill (the #813 lesson), and the activation/out layouts
+            // are token-major so the split is a pointer offset.
+            let halves: &[(usize, usize)] = match rows {
+                64 => &[(32, 0), (32, 32)],
+                96 => &[(48, 0), (48, 48)],
+                _ => &[(rows, 0)],
+            };
+            let mut result = cudarc::driver::sys::CUresult::CUDA_SUCCESS;
+            for &(sub, off) in halves {
+                result = unsafe {
+                    ffi::glm52_fp8_weight_only_gemv_batched_cuda(
+                        (act_ptr as *const ffi::Half).add(off * k),
+                        w_ptr as *const u8,
+                        s_ptr as *const f32,
+                        (out_ptr as *mut ffi::Half).add(off * n),
+                        scr_ptr,
+                        scr_floats,
+                        sub as i32,
+                        n as i32,
+                        k as i32,
+                        ctx.stream.cu_stream(),
+                    )
+                };
+                if result != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                    break;
+                }
+            }
+            result
+        }
         Some(ksplit) => unsafe {
             ffi::glm52_fp8_weight_only_gemv_partials_cuda(
                 act_ptr as *const ffi::Half,
