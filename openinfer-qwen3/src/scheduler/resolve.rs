@@ -29,12 +29,16 @@ pub(super) fn resolve_step(
             prompt_echoes: Vec::new(),
             pending: Vec::new(),
             decode: resolve_decode_outputs(executor, active, &result.requests),
+            prefix_queries: 0,
+            prefix_hits: 0,
         },
         ExecutionArtifacts::SpeculativeDecode { verify } => StepEffects {
             scheduled: Vec::new(),
             prompt_echoes: Vec::new(),
             pending: Vec::new(),
             decode: resolve_speculative_outputs(executor, active, &verify.requests),
+            prefix_queries: 0,
+            prefix_hits: 0,
         },
         ExecutionArtifacts::Unified {
             pending,
@@ -126,6 +130,10 @@ fn resolve_prefill_outputs(
                 prompt_tokens: prompt_len,
                 cached_tokens: result.cached_tokens,
             });
+            // First chunk is the only place a request counts toward the
+            // prefix-cache query total; its cached token span is the hit total.
+            effects.prefix_queries += 1;
+            effects.prefix_hits += result.cached_tokens as u64;
         }
 
         if !result.completed {

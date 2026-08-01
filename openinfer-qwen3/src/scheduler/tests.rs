@@ -969,6 +969,8 @@ fn retiring_multiple_active_requests_tolerates_unsorted_indices() {
             scheduled: Vec::new(),
             prompt_echoes: Vec::new(),
             pending: Vec::new(),
+            prefix_queries: 0,
+            prefix_hits: 0,
             decode: vec![
                 effects::DecodeEffect::EmitAndFinish {
                     request_id: RequestId(1),
