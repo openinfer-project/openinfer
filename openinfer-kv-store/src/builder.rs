@@ -5,34 +5,34 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
-use openinfer_kv_cache::BlockPool;
-
-use crate::HostTier;
+use crate::BlockPool;
 use crate::KvStore;
 use crate::KvStoreStats;
+use crate::host::PegaflowHost;
 use crate::store::RankState;
+use crate::tier::HostTier;
+use crate::tier::PegaflowTier;
 
 /// One declared rank, held until [`KvStoreBuilder::build`] resolves the
 /// derived values.
 type RankDecl = (usize, Arc<BlockPool>, Option<Arc<dyn HostTier>>);
 
-/// The qwen3 remote-fetch re-query cadence this store generalizes.
+/// A healthy host restore settles within a handful of polls, so this
+/// interval adds no visible latency to one — it only paces how often the
+/// tier (and the pool) is re-asked while waiting.
 const DEFAULT_REQUERY_INTERVAL: Duration = Duration::from_millis(5);
-/// The qwen3 handoff deadline this store generalizes.
+/// A safety net for a hung tier, not a latency target: set far above any
+/// healthy restore, so the failure mode is a degraded resolve instead of a
+/// request stranded on the tier.
 const DEFAULT_RESOLVE_DEADLINE: Duration = Duration::from_secs(15);
-/// Pending bench calibration (#824).
-const DEFAULT_CACHEABLE_PIN_PERCENT: usize = 25;
 
 /// Builds a [`KvStore`]. The rank table freezes at [`Self::build`] — the
-/// store's read paths take no lock — and derived values (per-rank pin
-/// budgets) are computed there, never in setters. A `BlockPool` is a pure
-/// CPU object with no thread affinity: construct pools before engine
-/// threads spawn.
+/// store's read paths take no lock. A `BlockPool` is a pure CPU object with
+/// no thread affinity: construct pools before engine threads spawn.
 pub struct KvStoreBuilder {
     runtime: tokio::runtime::Handle,
     requery_interval: Duration,
     resolve_deadline: Duration,
-    cacheable_pin_percent: usize,
     ranks: Vec<RankDecl>,
 }
 
@@ -43,7 +43,6 @@ impl KvStoreBuilder {
             runtime,
             requery_interval: DEFAULT_REQUERY_INTERVAL,
             resolve_deadline: DEFAULT_RESOLVE_DEADLINE,
-            cacheable_pin_percent: DEFAULT_CACHEABLE_PIN_PERCENT,
             ranks: Vec::new(),
         }
     }
@@ -66,17 +65,6 @@ impl KvStoreBuilder {
         self
     }
 
-    /// Ceiling on the pool share `Cacheable` saves may pin, as a percent of
-    /// each rank's total blocks. Past it, cacheable saves shed (a forfeited
-    /// future hit) instead of pinning admission out of the pool. `Handoff`
-    /// saves are exempt — their backpressure is admission reading
-    /// [`KvStore::pinned_blocks`].
-    #[must_use]
-    pub fn with_cacheable_pin_percent(mut self, percent: usize) -> Self {
-        self.cacheable_pin_percent = percent;
-        self
-    }
-
     /// Declare a rank with only its GPU pool: resolves serve radix hits and
     /// seals are no-ops — the tier-less mode behind the same API.
     #[must_use]
@@ -85,16 +73,26 @@ impl KvStoreBuilder {
         self
     }
 
-    /// Declare a rank with its GPU pool and host tier.
-    #[must_use]
-    pub fn rank_with_tier(
+    /// Declare a rank backed by a real pegaflow offload: registers `spec`'s
+    /// GPU arenas with `host`'s shared engine as one pegaflow *instance* and
+    /// wires the rank's tier to it. Fails on invalid arena geometry or a
+    /// registration error — a half-registered rank must never reach the
+    /// frozen rank table.
+    ///
+    /// Every arena's device allocation must stay live and pointer-stable for
+    /// the host's lifetime (the registration bakes raw device addresses), and
+    /// all arenas are indexed by the same pool block ids — keep `pool`'s
+    /// block count within `num_blocks`.
+    pub fn rank_with_offload(
         mut self,
         rank: usize,
         pool: Arc<BlockPool>,
-        tier: Arc<dyn HostTier>,
-    ) -> Self {
+        host: &Arc<PegaflowHost>,
+        spec: OffloadRankSpec,
+    ) -> anyhow::Result<Self> {
+        let tier = Arc::new(PegaflowTier::register(host, spec).map_err(anyhow::Error::new)?);
         self.ranks.push((rank, pool, Some(tier)));
-        self
+        Ok(self)
     }
 
     #[must_use]
@@ -103,16 +101,12 @@ impl KvStoreBuilder {
             .ranks
             .into_iter()
             .map(|(rank, pool, tier)| {
-                let cacheable_pin_budget = pool.total_blocks() * self.cacheable_pin_percent / 100;
                 (
                     rank,
                     RankState {
                         pool,
                         tier,
-                        floor: AtomicUsize::new(0),
                         pinned: Arc::new(AtomicUsize::new(0)),
-                        cacheable_pinned: Arc::new(AtomicUsize::new(0)),
-                        cacheable_pin_budget,
                     },
                 )
             })
@@ -125,4 +119,78 @@ impl KvStoreBuilder {
             stats: Arc::new(KvStoreStats::default()),
         }
     }
+}
+
+/// One strided GPU arena registered with pegaflow as one "layer" of a rank.
+///
+/// A fused KV buffer (qwen3-style) contributes one arena per model layer; a
+/// model with sidecar caches (GLM5.2: MLA latent + index-K per layer, two
+/// separate allocations sharing pool block ids) contributes several arenas
+/// per model layer — pegaflow moves whatever arenas are registered under one
+/// block id together, keeping sidecars in lockstep with their main cache.
+///
+/// The registration parameter names are pegaflow's historical traps; read
+/// these field docs before filling them in:
+///
+/// - pegaflow's `bytes_per_block` argument is the **per-segment** byte count,
+///   so [`segment_bytes`](Self::segment_bytes) is one segment's span, not the
+///   whole block's;
+/// - with `segments == 2` (K/V split), the V copy starts `kv_stride_bytes`
+///   into the block, so `kv_stride_bytes >= segment_bytes` must hold;
+/// - `block_stride_bytes >= (segments - 1) * kv_stride_bytes + segment_bytes`
+///   (one block's whole strided extent), and
+///   `size_bytes >= (num_blocks - 1) * block_stride_bytes + extent` (the last
+///   block's reach is what pegaflow validates copies against).
+///
+/// All of these are checked by [`KvStoreBuilder::rank_with_offload`] before
+/// the engine sees them.
+pub struct ArenaSpec {
+    /// Keys the arena for the engine's lifetime (save/load fan out across
+    /// every registered name); unique within the rank's registration.
+    pub name: String,
+    /// Base device address of the arena. The allocation behind it must stay
+    /// live and pointer-stable for the host's lifetime.
+    pub base_device_ptr: u64,
+    /// Total bytes of the arena allocation (must cover the last block's
+    /// strided reach — see the struct docs).
+    pub size_bytes: usize,
+    /// Copy units in this arena; identical across all of a rank's arenas
+    /// (they share the pool's block-id space).
+    pub num_blocks: usize,
+    /// Bytes of one segment of one block — this is what pegaflow's register
+    /// call misleadingly names `bytes_per_block`.
+    pub segment_bytes: usize,
+    /// Segments per block: 1 for a contiguous copy unit, 2 for a K/V split.
+    pub segments: usize,
+    /// Byte offset of segment k+1 from segment k within one block. 0 for
+    /// single-segment arenas.
+    pub kv_stride_bytes: usize,
+    /// Byte distance between consecutive blocks in the arena (≥ one block's
+    /// extent; larger expresses page-interleaved layouts like qwen3's).
+    pub block_stride_bytes: usize,
+}
+
+/// The per-rank half of a pegaflow offload registration (the process-wide
+/// half is [`PegaflowHost`]).
+pub struct OffloadRankSpec {
+    /// Stable identifier of this rank's pegaflow instance for the host's
+    /// lifetime, so prefix blocks saved by one request are query-visible to
+    /// the next.
+    pub instance_id: String,
+    /// Content-addressing domain shared with peers: two instances see each
+    /// other's blocks iff their namespaces match. Derive it from whatever
+    /// makes KV layouts interchange-safe (model, dtype, block geometry).
+    /// Single-node offload can use any constant.
+    pub namespace: String,
+    /// CUDA device ordinal whose arenas these are.
+    pub device_id: i32,
+    /// The rank's GPU arenas, one pegaflow "layer" each (see [`ArenaSpec`]).
+    pub arenas: Vec<ArenaSpec>,
+    /// `false` = layer-first (one pegaflow layer per arena, interleave in
+    /// `block_stride_bytes`) — the native openinfer layout. `true` =
+    /// page-first: each block stored as one host page holding every layer at
+    /// its name-sorted offset; only to join a namespace whose writer (the
+    /// vLLM connector on MLA models) stores blocks that way — with layer
+    /// names and per-layer block bytes identical to the writer's.
+    pub page_first: bool,
 }

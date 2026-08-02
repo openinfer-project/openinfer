@@ -18,9 +18,9 @@ pub enum DegradeReason {
     DeadlineExceeded,
     /// The tier query or load failed.
     TierError,
-    /// GPU pages for the host hit stayed below the admission floor for the
-    /// whole resolve deadline (the resolve waits for the pool before
-    /// degrading — pressure that clears in time is not a degrade).
+    /// The host hit's destination pages never fit the pool within the whole
+    /// resolve deadline (the resolve waits for the pool before degrading —
+    /// pressure that clears in time is not a degrade).
     PoolPressure,
 }
 
@@ -38,9 +38,6 @@ pub struct KvStoreStats {
     pub loads_abandoned: AtomicU64,
     pub saves_submitted: AtomicU64,
     pub saves_failed: AtomicU64,
-    /// Cacheable saves dropped under pin pressure — forfeited future hits,
-    /// never correctness.
-    pub saves_shed: AtomicU64,
     /// Handoff-class saves that settled with an error: the checkpoint the
     /// consuming peer expects is missing, observable there as a short hit.
     pub handoff_failed: AtomicU64,

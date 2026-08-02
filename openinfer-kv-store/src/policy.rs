@@ -37,7 +37,9 @@ pub struct CacheScope<'a> {
 }
 
 impl<'a> CacheScope<'a> {
-    /// Extra cache identity beyond the tokens (glm52's native-MTP page salt).
+    /// Extra cache identity beyond the tokens, for a model that mixes
+    /// per-request state into its KV pages: identical tokens under different
+    /// salts must never hit each other's blocks.
     #[must_use]
     pub fn cache_salt(mut self, salt: &'a str) -> Self {
         self.cache_salt = Some(salt);
@@ -60,12 +62,13 @@ pub struct ResolvePolicy {
 }
 
 impl ResolvePolicy {
-    /// The caller cannot recompute a miss (P/D decode: admission asserts the
-    /// hit covers the handoff's committed length), so both halves of that
-    /// intent apply: the tier query is all-or-nothing (a partial hit is
-    /// worthless — pegaflow's `wait_for_full_prefix`), and a `Miss` means
-    /// the producer's registration has not landed yet — keep waiting under
-    /// the deadline instead of concluding the cache is cold.
+    /// For a caller that cannot recompute a miss: on the decode side of a
+    /// disaggregated prefill/decode pair, admission requires the hit to
+    /// cover the length the handoff committed to, and a partial hit is
+    /// worthless. The tier query therefore becomes all-or-nothing, and a
+    /// `Miss` is read as "the producing prefill's registration has not
+    /// landed yet" — keep waiting under the deadline instead of concluding
+    /// the cache is cold.
     #[must_use]
     pub fn wait_for_full_hit(mut self) -> Self {
         self.wait_for_full_hit = true;
@@ -77,11 +80,12 @@ impl ResolvePolicy {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SaveClass {
     /// Fire-and-forget cacheability: a lost save forfeits a future hit, never
-    /// correctness. Sheddable under pressure.
+    /// correctness.
     Cacheable,
-    /// Must-complete (P/D handoff): [`crate::KvStore::retire`] parks the request's KV
-    /// until these saves settle. Lease semantics against the consuming peer
-    /// land with the glm52 P/D migration.
+    /// Must-complete saves for a disaggregated prefill/decode handoff:
+    /// [`crate::KvStore::retire`] parks the request's KV until these settle,
+    /// so the consuming peer's checkpoint exists before the KV goes away.
+    /// Lease semantics against that peer are future work.
     Handoff,
 }
 

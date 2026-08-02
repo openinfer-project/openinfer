@@ -8,42 +8,33 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use openinfer_engine::engine::KvPrefix;
-use openinfer_kv_cache::BlockPool;
-use openinfer_kv_cache::RequestKv;
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 
+use crate::BlockPool;
 use crate::CacheScope;
 use crate::CancelProbe;
 use crate::DegradeReason;
-use crate::HostTier;
 use crate::KvStoreStats;
+use crate::PrefixProbe;
+use crate::RequestKv;
 use crate::ResolvePolicy;
 use crate::SaveClass;
 use crate::SaveCursor;
-use crate::TierQuery;
+use crate::tier::HostTier;
+use crate::tier::TierQuery;
 
-/// One rank's KV surfaces. The pool is the same logical pool the rank's
-/// scheduler allocates from — kvbm's `BlockManager` is internally
-/// synchronized (save guards already cross threads today), so the resolve
-/// task allocating from it is an arbitration question, answered by the floor.
+/// One rank's KV surfaces. `pool` is the same logical pool the rank's
+/// scheduler allocates from; `BlockPool` is internally synchronized, so the
+/// resolve task may allocate concurrently with the scheduler without a lock.
 pub(crate) struct RankState {
     pub(crate) pool: Arc<BlockPool>,
     pub(crate) tier: Option<Arc<dyn HostTier>>,
-    /// Blocks admission has promised to admitted requests; resolve-side
-    /// allocation yields to it (fail-soft to a smaller hit).
-    pub(crate) floor: AtomicUsize,
     /// Blocks pinned by in-flight saves (both classes) — physically
     /// unallocatable until their D2H lands. Admission subtracts this from
     /// its budget. `Arc`: the per-save watcher tasks decrement it after the
     /// store's borrow ends.
     pub(crate) pinned: Arc<AtomicUsize>,
-    /// The `Cacheable` subset of `pinned` — the shed budget gates on this
-    /// alone, so Handoff traffic cannot starve cacheable saves.
-    pub(crate) cacheable_pinned: Arc<AtomicUsize>,
-    /// Pin ceiling for `Cacheable` saves (from
-    /// [`crate::KvStoreBuilder::with_cacheable_pin_percent`] of the pool).
-    pub(crate) cacheable_pin_budget: usize,
 }
 
 /// The process-wide KV store: one instance, `Arc`-shared. Knows token
@@ -58,15 +49,9 @@ pub struct KvStore {
 }
 
 impl KvStore {
-    /// Blocks admission has promised on `rank`; resolve-side allocations
-    /// yield to this watermark. The scheduler updates it as it admits and
-    /// retires.
-    pub fn set_admission_floor(&self, rank: usize, blocks: usize) {
-        self.rank(rank).floor.store(blocks, Ordering::Release);
-    }
-
     /// Blocks pinned by `rank`'s in-flight saves; admission subtracts this
-    /// from its usable budget (the glm52 `pinned_blocks` discipline).
+    /// from its usable budget, so it never admits a request against pages a
+    /// pending D2H copy still needs.
     pub fn pinned_blocks(&self, rank: usize) -> usize {
         self.rank(rank).pinned.load(Ordering::Acquire)
     }
@@ -77,9 +62,9 @@ impl KvStore {
 
     /// The whole read path. Resolves `prompt_tokens`' cached prefix on
     /// `rank`: GPU radix probe, host-tier query (re-query while a deeper tier
-    /// fetches, bounded by the resolve deadline), floor-gated page
-    /// reservation, load, and registration into the radix — so the eventual
-    /// `match_and_add_prefix` on the scheduler thread reuses the full prefix.
+    /// fetches, bounded by the resolve deadline), page reservation, load, and
+    /// registration into the radix — so the eventual `match_and_add_prefix`
+    /// on the scheduler thread reuses the full prefix.
     ///
     /// One terminal type: a [`KvPrefix`] whose hold keeps the resolved blocks
     /// resident until the scheduler's match consumes them. Degraded outcomes
@@ -105,7 +90,7 @@ impl KvStore {
         // outside the reusable prefix.
         let cacheable_blocks = prompt_tokens.len().saturating_sub(1) / block_size;
 
-        let finish = |probe: openinfer_kv_cache::PrefixProbe| {
+        let finish = |probe: PrefixProbe| {
             let hit_blocks = probe.held_blocks().min(cacheable_blocks);
             if hit_blocks == 0 {
                 return KvPrefix::none();
@@ -182,16 +167,11 @@ impl KvStore {
                     tokio::time::sleep(self.requery_interval).await;
                 }
                 Ok(Ok(TierQuery::Hit(hit))) => {
-                    // Floor gate: resolve-side allocation yields to
-                    // admission's promises. The lease is all-or-nothing, so
-                    // an unplaceable hit is declined (release, not TTL-parked)
+                    // The lease is all-or-nothing, so a hit that doesn't fit
+                    // the pool right now is declined (release, not TTL-parked)
                     // and retried after a pause.
-                    let available = pool.available_blocks();
-                    let floor = state.floor.load(Ordering::Acquire);
-                    if available.saturating_sub(floor) >= hit.blocks {
-                        if let Some(reservation) = pool.reserve_loaded_blocks(hit.blocks) {
-                            break (hit, reservation);
-                        }
+                    if let Some(reservation) = pool.reserve_loaded_blocks(hit.blocks) {
+                        break (hit, reservation);
                     }
                     tier.release(hit);
                     if Instant::now() >= deadline {
@@ -273,25 +253,6 @@ impl KvStore {
         }
         let count = pairs.len() - cursor.saved_blocks;
 
-        // Cacheable saves shed under pin pressure instead of pinning
-        // admission out of the pool — a shed save is a forfeited future hit,
-        // never a correctness loss. The cursor does NOT advance, so a later
-        // seal (or the retire) retries once pressure clears. The gate reads
-        // the cacheable-only counter: Handoff traffic neither sheds nor
-        // consumes this budget (its backpressure is admission reading
-        // `pinned_blocks`, which counts both classes).
-        if class == SaveClass::Cacheable
-            && state.cacheable_pinned.load(Ordering::Acquire) + count > state.cacheable_pin_budget
-        {
-            self.stats.saves_shed.fetch_add(1, Ordering::Relaxed);
-            log::debug!(
-                "kv-store: shed cacheable save of {count} blocks (pin budget \
-                 {} exceeded)",
-                state.cacheable_pin_budget
-            );
-            return;
-        }
-
         // Guards align 1:1 with `assigned_block_hashes`.
         let guards: Vec<_> = kv
             .assigned_block_guards()
@@ -305,11 +266,8 @@ impl KvStore {
         cursor.saved_blocks = pairs.len();
 
         state.pinned.fetch_add(count, Ordering::AcqRel);
-        if class == SaveClass::Cacheable {
-            state.cacheable_pinned.fetch_add(count, Ordering::AcqRel);
-        }
         self.stats.saves_submitted.fetch_add(1, Ordering::Relaxed);
-        let save = tier.save(ids, hashes, Box::new(guards));
+        let save = tier.save(ids, hashes, guards);
 
         let done_tx = if class == SaveClass::Handoff {
             let (tx, rx) = oneshot::channel();
@@ -319,15 +277,10 @@ impl KvStore {
             None
         };
         let pinned = Arc::clone(&state.pinned);
-        let cacheable_pinned =
-            (class == SaveClass::Cacheable).then(|| Arc::clone(&state.cacheable_pinned));
         let stats = Arc::clone(&self.stats);
         self.runtime.spawn(async move {
             let result = save.await;
             pinned.fetch_sub(count, Ordering::AcqRel);
-            if let Some(cacheable_pinned) = cacheable_pinned {
-                cacheable_pinned.fetch_sub(count, Ordering::AcqRel);
-            }
             let outcome = match result {
                 Ok(()) => Ok(()),
                 Err(err) => {
@@ -343,11 +296,10 @@ impl KvStore {
     }
 
     /// Final seal + release. With no must-complete saves outstanding the KV
-    /// releases immediately (fire-and-forget D2H stays safe: the guards pin
-    /// the pages independently of the release — the qwen3 save-then-drop
-    /// pattern). With `Handoff` saves pending, the whole KV parks with them
-    /// and releases when they settle — the glm52 `detach_tail_save` pattern,
-    /// generalized. Never blocks the caller.
+    /// releases immediately; fire-and-forget D2H stays safe because the save
+    /// guards pin the source pages independently of the release. With
+    /// `Handoff` saves pending, the KV instead stays parked — registered and
+    /// resident — until they settle. Never blocks the caller.
     pub fn retire(&self, rank: usize, mut kv: RequestKv, mut cursor: SaveCursor, class: SaveClass) {
         self.seal(rank, &kv, &mut cursor, class);
         if cursor.pending.is_empty() {
@@ -364,17 +316,30 @@ impl KvStore {
                 }
             }
             if failed {
-                // The checkpoint the consuming peer expects is missing; the
-                // peer observes it as a short hit and rejects the handoff.
-                // The producing scheduler withholds its KV-ready response
-                // until these saves confirm (glm52 flush-on-finish) — that
-                // wiring lands with the P/D migration; until then the failure
-                // is counted and logged loudly.
+                // The checkpoint the consuming peer expects is missing; it
+                // sees this handoff as a short hit and rejects it. The
+                // producing scheduler should eventually withhold its
+                // KV-ready response until these saves confirm — that wiring
+                // is not in place yet, so for now the failure is counted and
+                // logged loudly.
                 stats.handoff_failed.fetch_add(1, Ordering::Relaxed);
                 log::error!("kv-store retire: handoff save failed; peer will miss this checkpoint");
             }
             release_logged(&mut kv);
         });
+    }
+
+    /// Write-pipeline visibility barrier for `rank`: on return, every
+    /// [`Self::seal`]/[`Self::retire`] save submitted before this call is
+    /// query-visible to this tier (and, with P2P, MetaServer-registered for
+    /// peers). The `Handoff` save completion callback answers "data landed";
+    /// this barrier answers "findable by hash". A rank without a tier has
+    /// nothing to flush.
+    pub async fn flush_saves(&self, rank: usize) -> anyhow::Result<()> {
+        match self.rank(rank).tier.as_ref() {
+            Some(tier) => tier.flush().await,
+            None => Ok(()),
+        }
     }
 
     /// The rank table is frozen at build, so an unknown rank is a wiring

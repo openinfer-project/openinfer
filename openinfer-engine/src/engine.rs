@@ -206,8 +206,9 @@ pub type RequestTag = Arc<str>;
 ///
 /// Degraded resolutions (timeout, pool pressure) are not a distinct state:
 /// they surface as a smaller `hit_tokens` — the number alone carries all
-/// downstream semantics (a P/D decode admission asserts it against the
-/// handoff's committed length; everyone else just prefills from `hit_tokens`).
+/// downstream semantics (disaggregated-decode admission asserts it against
+/// the handoff's committed length; everyone else just prefills from
+/// `hit_tokens`).
 pub struct KvPrefix {
     hit_tokens: usize,
     hold: Option<Box<dyn Any + Send>>,

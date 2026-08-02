@@ -3310,11 +3310,16 @@ name = "openinfer-kv-store"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cudarc",
+ "dynamo-kv-hashing",
+ "kvbm-logical",
+ "libc",
  "log",
  "openinfer-engine",
- "openinfer-kv-cache",
- "openinfer-kv-offload",
+ "pegaflow-core",
+ "tempfile",
  "tokio",
+ "tokio-stream",
 ]
 
 [[package]]

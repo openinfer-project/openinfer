@@ -1,6 +1,6 @@
 # KV cache 统一设计：openinfer-kv-store
 
-**TL;DR**: 异构 KV（full attn / MLA / SWA / linear state）统一为「组 + checkpoint」模型；`openinfer-kv-store` 收编 qwen3/glm52 各自手写的 offload 编排（resolve/seal/retire 三动词 + 单一 KvPrefix 终态），模型侧只声明 `KvModel`（spec/arenas/repack）。骨架已落地，qwen3 首迁验证接口，glm52 验证 P/D，qwen35 验证 bounded 组。
+**TL;DR**: 异构 KV（full attn / MLA / SWA / linear state）统一为「组 + checkpoint」模型；`openinfer-kv-store` 收编 qwen3/glm52 各自手写的 offload 编排（resolve/seal/retire 三动词 + 单一 KvPrefix 终态），模型侧只声明 `KvModel`（spec/arenas/repack）。骨架已落地且**自包含**（直连 `kvbm-logical` + `pegaflow-core`，不再依赖 `openinfer-kv-cache`/`openinfer-kv-offload`；测试为真 GPU/SSD 引擎套件，无 mock）。qwen3 首迁验证接口，glm52 验证 P/D，qwen35 验证 bounded 组。
 
 Last touched: 2026-08
 
@@ -90,11 +90,13 @@ pub struct GroupSpec {
 pub trait KvModel {
     fn spec(&self) -> KvSpec;
     /// 物理登记：(组, arena) 对——一层可有多个 arena，一组可跨多层。
-    /// KvArena 直接复用 `openinfer-kv-offload::KvArena`
-    /// { name, base_ptr, num_blocks, bytes_per_block, block_stride_bytes }
-    /// （glm52 `kv_arenas()` 的现有形状）；Bounded 组同样表达：
-    /// num_blocks = slot 数、bytes_per_block = slot 字节、stride = slot 步长。
-    fn arenas(&self, rank: usize) -> Vec<(GroupId, KvArena)>;
+    /// Arena 描述用 `openinfer-kv-store::ArenaSpec`
+    /// { name, base_device_ptr, size_bytes, num_blocks, segment_bytes,
+    ///   segments, kv_stride_bytes, block_stride_bytes }（glm52 `kv_arenas()`
+    /// 与 qwen3 fused-buffer 逐层视图都是其真子集；`segments`/`kv_stride`
+    /// 覆盖 K/V 分段布局）。Bounded 组同样表达：num_blocks = slot 数、
+    /// segment_bytes = slot 字节、stride = slot 步长。
+    fn arenas(&self, rank: usize) -> Vec<(GroupId, ArenaSpec)>;
     /// 仅当 store schema ≠ 执行 layout（glm52 TP4 生产侧 576B→656B wire）。
     fn repack(&self, group: GroupId, dir: RepackDir, io: RepackIo<'_>) -> anyhow::Result<()>;
 }
@@ -116,8 +118,9 @@ KvSpec { page_tokens: 16, groups: vec![
     GroupSpec { name: "kv", kind: Paged, sharding: PerRank, checkpointable: true, optional: false },
 ]}
 // arenas(rank)：fused KvBuffer 的 36 个逐层视图（今天 Registration::from_buffer 产物原样）：
-//   ("kv", KvArena { name: "qwen3.L{n}", base_ptr: buf + n·layer_bytes,
-//                    num_blocks, bytes_per_block: layer_stride·2B, block_stride_bytes: page_stride·2B })
+//   ("kv", ArenaSpec { name: "qwen3.L{n}", base_device_ptr: buf + n·layer_bytes, size_bytes,
+//                      num_blocks, segment_bytes: layer_stride·2B, segments: 1,
+//                      kv_stride_bytes: 0, block_stride_bytes: page_stride·2B })
 
 // glm52 —— 多组 + optional + 非 checkpointable。
 KvSpec { page_tokens: 64, groups: vec![
@@ -145,8 +148,10 @@ KvSpec { page_tokens: 16, groups: vec![
 let store = KvStoreBuilder::new(runtime_handle)   // 旋钮全链式,无 options 结构体可 churn
     .with_resolve_deadline(Duration::from_secs(15))
     .rank(0, pool_only_rank)                       // 无 tier:同一 API 的纯 GPU 模式
-    .rank_with_tier(1, pool1, tier1)
-    .build();                                      // 派生值(pin 预算)在 build 结算,setter 顺序无关
+    .rank_with_offload(1, pool1, &host, offload_spec)  // Err 于几何非法,rank 表永不半成品
+    .expect("rank registration")
+    .build();                                      // rank 表冻结,读路径免锁
+// host 一手: `PegaflowHost::builder(pinned_pool_bytes).ssd_cache(..).p2p(..)`。
 // glm52 迁移时把 BlockPool 构建从 engine 线程提到 spawn 之前：pool_blocks 在
 // Glm52EngineSpec 里本就先于 spawn 已知，BlockPool::new 是纯 CPU 对象，无线程亲和。
 
@@ -160,7 +165,8 @@ impl KvStore {
     // 加字段不 churn 调用点（分期契约）。
     fn seal(&self, rank, kv: &RequestKv, cursor: &mut SaveCursor, class: SaveClass);
     fn retire(&self, rank, kv: RequestKv, cursor: SaveCursor, class: SaveClass);
-    fn set_admission_floor(&self, rank, blocks) / fn pinned_blocks(&self, rank) -> usize;
+    fn pinned_blocks(&self, rank) -> usize;   // admission 预算的扣项(在飞 save 钉住的页)
+    async fn flush_saves(&self, rank);        // 可见性 barrier:返回即先于它提交的 save 全部可查询
 }
 ```
 
@@ -175,7 +181,7 @@ flowchart TD
     Q -- "Loading 且未超时\nsleep 5ms 重查" --> Q
     Q -- "Miss(默认策略) / 错误 / 超时" --> T
     Q -- "Miss(expect_remote, 未超时)\nsleep 重查" --> Q
-    Q -- "Hit(n)" --> F{"水位: available − floor ≥ n\n且 reserve 成功?"}
+    Q -- "Hit(n)" --> F{"reserve_loaded_blocks(n)\n立即成功?"}
     F -- "否: release lease,\nsleep 后重查(未超时)" --> Q
     F -- "否且超时" --> T
     F -- 是 --> R["reserve_loaded_blocks(n)"]
@@ -186,8 +192,8 @@ flowchart TD
 ```
 
 任意 op 之间观察到取消（`token_tx` 的 abort 原子）→ 释放已持租约、返回 `KvPrefix::none()`，死请求死在 admission 现有的 `is_closed` 检查处。
-- **`seal`/`retire` 是写链路**：`SaveClass::Cacheable` fire-and-forget 可 shed（丢的只是未来命中）；`SaveClass::Handoff` 必达带租约（P 存的 entry 在 D 取走前不可逐出——eviction 在 store-based P/D 下是正确性问题，8 GiB 打穿 + 15s deadline 事故的教训）。retire 收编三处手写变奏（qwen3 flush barrier、glm52 `save_sealed_on_release` 先存后放、`detach_tail_save` 停放）：seal 尾部 → 有未决 save 则整个 KV 随 save 停放，settle 后 RAII 归还。
-- **背压恒等式**：飞行中 save 钉住的页从 admission 预算里扣（`pinned_blocks`，glm52 现状收编）；Cacheable 超预算即 shed（`cacheable_pin_percent`，默认池的 25%，cursor 不前进、压力解除后重试），Handoff 只 backpressure admission，**永不 block decode**。Handoff save 失败：计数 + 大声报错、块照常归还——对端以 hit 短缺观察到缺失并拒绝 handoff；P 侧"扣住 KV-ready 响应直到 save 确认"（glm52 flush-on-finish 语义）的接线随 P/D 迁移落地。
+- **`seal`/`retire` 是写链路**：`SaveClass::Cacheable` fire-and-forget（丢的只是未来命中）；`SaveClass::Handoff` 必达带租约（P 存的 entry 在 D 取走前不可逐出——eviction 在 store-based P/D 下是正确性问题，8 GiB 打穿 + 15s deadline 事故的教训）。retire 收编三处手写变奏（qwen3 flush barrier、glm52 `save_sealed_on_release` 先存后放、`detach_tail_save` 停放）：seal 尾部 → 有未决 save 则整个 KV 随 save 停放，settle 后 RAII 归还。
+- **背压恒等式**：飞行中 save 钉住的页从 admission 预算里扣（`pinned_blocks`，glm52 现状收编），两类 save 同一口径背压，**永不 block decode**。Handoff save 失败：计数 + 大声报错、块照常归还——对端以 hit 短缺观察到缺失并拒绝 handoff；P 侧"扣住 KV-ready 响应直到 save 确认"（glm52 flush-on-finish 语义）的接线随 P/D 迁移落地。
 
 ### 请求管线：线性所有权链
 
@@ -222,7 +228,7 @@ while let Ok((req, kv_prefix)) = submit_rx.try_recv() {
 - store 不认识 engine/收件箱/`GenerateRequest`——它的词汇只有 token 前缀进、`KvPrefix` 出；路由留在 `EngineHandle`（已有职责）。
 - **消灭队头停车**：今天 glm52 的 `HostRestoreState::poll_front` / `NativePdState` Park 是 push_front + break，一个请求等 restore 堵死整 rank FIFO。resolve 前置后 scheduler 收件箱里只有就绪请求。
 - **取消 = 已有的共享原子**（`TokenSink::is_closed`，`abort_reason: Arc<AtomicU8>`），不新增机制。resolve task 在 op 之间观察；**已提交的 DMA 是不可取消区段**（guard 陪 op 走到 settle，即 `handle.rs` 现有的 detach 语义）。取消的请求返回空 KvPrefix，死在 admission 现有的 `is_closed` 检查处。
-- **池的并发事实**：kvbm `BlockManager` 内部同步（save guard 已跨线程 drop），跨线程分配不是安全问题而是仲裁问题。存在**两个分配器，权限不同**：admission 的 lifetime 预留是权威（honor-or-reject）；resolve 的 reservation 是机会主义（买一段更便宜的 prefill），且分配必然晚于 query——目标页数 n 只有 `Hit(n)` 返回后才可知，而 GPU probe 本身零分配（命中块已驻留，仅加引用）。仲裁协议即水位：scheduler 每次录取/退出更新 `set_admission_floor`，resolve 在水位之下捡剩余。**池装不下时等待而非即刻降级**：装不下前缀的池同样过不了该请求的 admission——横竖要等，等待买到廉价 prefill，降级买到全量重算。等待期间释放租约（host pin 与 TTL 不陪等），deadline 兜底活锁，超时才降级。对偶义务：**admission 须把 resolve 已命中的块记为该请求已持有、从 need 抵扣**（qwen3 `prefetched_blocks` 先例）——否则压力下双重计数（available 已因 hold 减少、need 又全额计）导致错误 defer。
+- **池的并发事实**：kvbm `BlockManager` 内部同步（save guard 已跨线程 drop），跨线程分配不是安全问题而是仲裁问题。存在**两个分配器，权限不同**：admission 的 lifetime 预留是权威（honor-or-reject）；resolve 的 reservation 是机会主义（买一段更便宜的 prefill），且分配必然晚于 query——目标页数 n 只有 `Hit(n)` 返回后才可知，而 GPU probe 本身零分配（命中块已驻留，仅加引用）。骨架期仲裁被有意拿掉：resolve 与调度器在池上平等竞争，拿不到即释放租约重试（不构成饿死风险，因为 prefix 恢复零义务、可以让步）；resolve 向 admission 让步的仲裁机制推迟到模型迁移期回归，形态见「未决」。**池装不下时等待而非即刻降级**：装不下前缀的池同样过不了该请求的 admission——横竖要等，等待买到廉价 prefill，降级买到全量重算。等待期间释放租约（host pin 与 TTL 不陪等），deadline 兜底活锁，超时才降级。对偶义务：**admission 须把 resolve 已命中的块记为该请求已持有、从 need 抵扣**（qwen3 `prefetched_blocks` 先例）——否则压力下双重计数（available 已因 hold 减少、need 又全额计）导致错误 defer。
 
 ### Scheduler 的接触面（全同步，共四处）
 
@@ -230,20 +236,22 @@ while let Ok((req, kv_prefix)) = submit_rx.try_recv() {
 
 ## 可观测性纪律
 
-所有异步任务带 request id + 阶段，**终态（成功/降级/失败/shed）必须汇报 sink，禁止 silent drop**。logging 是打印 sink、metrics 是聚合 sink、tracing 是阶段换 span——皮后补，骨架现在定型。「ttft > 50s 是哪段慢」= resolve 各阶段终态有记录。
+所有异步任务带 request id + 阶段，**终态（成功/降级/失败）必须汇报 sink，禁止 silent drop**。logging 是打印 sink、metrics 是聚合 sink、tracing 是阶段换 span——皮后补，骨架现在定型。「ttft > 50s 是哪段慢」= resolve 各阶段终态有记录。
 
 ## 迁移计划（绞杀式，每步合 main、bench 全绿、删旧码）
 
-1. ✅ 本骨架 PR：文档 + `openinfer-kv-store`（resolve/seal/retire，paged only，CPU 契约测试）+ 分发层 `(GenerateRequest, KvPrefix)`（未迁移模型收 `KvPrefix::none()`，行为零变化）。
+1. ✅ 本骨架 PR：文档 + `openinfer-kv-store`（resolve/seal/retire + `PegaflowHost`/`ArenaSpec` pegaflow 接线 + SSD/P2P，paged only；测试为真 GPU/SSD 引擎套件，无 mock）+ 分发层 `(GenerateRequest, KvPrefix)`（未迁移模型收 `KvPrefix::none()`，行为零变化）。
 2. qwen3 首迁：`resolve_prefix` 替换 `remote_fetch_action` 状态机（executor.rs ~2000 行 prefetch 编排），旧路径留开关至 bench 对齐。
 3. glm52 D 侧：收件箱替换 `HostRestoreState`；随后 P/D `Handoff` 租约（对齐 pegaflow `QueryLeaseId` 语义后定稿）。#812（EP32 生产设计点）仍 open、阶段性 PR 持续落 main 且常动 scheduler/offload 邻域——迁移分支以 main 为基准高频 rebase，避免累积大 diff。
 4. qwen35：`core::kv_pool` → `BlockPool` 迁移（独立，可并行开工）；然后 Bounded 组 slab + seal-by-copy 首发（唯一的新物理能力，由从零接入的模型验证）。gemma4 照抄。
 
 ## 未决
 
-- `Handoff` 租约的超时回收与释放时机（D fetch 完成即释放 vs admission 断言通过才释放）——防腐层里对 pegaflow lease 语义定。
-- miss-breaker（连续冷 miss 停止 park）是跨请求策略，qwen3 迁移时决定放 store 还是 scheduler。
-- 水位下推进池锁内（彻底闭合 TOCTOU）是 hardening 项，骨架先用 store 侧原子。同族 hardening：resolve 的池等待目前是轮询（与租约重建的 re-query 天然同拍，损失 ≤ requery_interval 的唤醒延迟）；理想形态是把异步等待下推进分配器（池内 `async reserve_blocks(n)`，waiters 挂在唯一真相旁）——外挂信号量镜像可用量会造第二本账。信号量类比的适用边界：块非同质 permit（free vs warm-evictable，分配顺序影响命中率）、双权限等级（动态水位）、admission 的等待队列是显式调度策略（顺序/拒绝/观测）而非锁的匿名 waiter list——故信号量语义只属于分配器内部，不是分配的全部模型。
-- pegaflow fork 与否：防腐层（`HostTier`）稳定运行后再议；`QueryOutcome::Loading` 的轮询套轮询是第一改造对象。
+- `Handoff` 租约的超时回收与释放时机（D fetch 完成即释放 vs admission 断言通过才释放）——防腐层里对 pegaflow lease 语义定。同族未定项（均随 glm52 P/D 迁移落地）：mutable tail page 的保存动词——tail 页未封存、以 SHA-256(committed prompt + anchor) 为 key、携 draft tokens 的 `KvTransfer` 信封；store 的 seal/retire 只认已注册块，尚无「按任意 key 保存一块」的 API。
+- miss-breaker（连续冷 miss 停止 park）是跨请求策略，qwen3 迁移时决定放 store 还是 scheduler。同日归属待定：运行时 prefix_cache 开关的收编（resolve 短路 / admission 不 match / release 标记不进 inactive cache）。
+- 仲裁机制归位：骨架期的 `set_admission_floor`（store 侧原子水位）已删——无人消费的水位是臆造接口。回归时建议形态是「admission 自管预算」：resolve 已命中块的抵扣（`prefetched_blocks`）与 reserve 记在 admission 同一本账（qwen3 `reserve_floor` 先例），不恢复独立水位 API。TOCTOU 收口（池内 `async reserve_blocks(n)`，waiters 挂在唯一真相旁）随此一并议——外挂信号量镜像可用量会造第二本账，且块非同质 permit（free vs warm-evictable、分配顺序影响命中率），信号量语义只属于分配器内部。
+- resolve 的 key 方案：**vLLM P/D 互通将整体移除**（独立后续 PR；清单：`vllm_compat` 状态机、`VllmBlockHasher`（xxh3_128 CBOR 链）、`miss_wait` 窗口、`page_first` 注册模式及其测试），故不为外部 hasher 抽可插拔 seam；glm52 的 SHA-256 tail key 随 native P/D 迁移以单一消费者定形。
+- repack 钩子（`KvModel::repack`）设计保留、骨架不落：唯一消费者是 glm52 TP4（FlashInfer 576B 执行态 ↔ 656B wire），待 TP4 P/D 互通有真实对端时随消费落地。
+- pegaflow fork 与否：防腐层（crate 内 `HostTier`）稳定运行后再议；`Loading` 的轮询套轮询是第一改造对象。
 
 **Next**: qwen3 首迁 PR（迁移计划第 2 步）。
