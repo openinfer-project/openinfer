@@ -39,55 +39,155 @@ seal-by-copy 的**频率归策略、对齐归机制**，别混淆：拷贝必须
 
 ### Checkpointable 属性
 
-组内容必须是 token 前缀的确定函数、hit-resume 时可恢复或跳过，才能参与 checkpoint。反例：DSpark/DFlash 的 aux-hidden 捕获（命中时目标模型不重算 hidden，无从恢复）→ `checkpointable: false`，存在该组时强制关 prefix cache（今天的隐式全局开关变成描述符上的显式属性）。
+判据：**hit 时该组状态可获得 = 已存储（恢复）∨ 可从 token 重算（跳过后重建）**。paged KV 可重算（forward 一跑即有）；native MTP KV 已存储（L78 镜像主池 page id，命中页上的 MTP 行就是当年一起写的——它同样吃 hidden state，却因"已存储"而与 prefix cache 共存）。反例：DSpark/DFlash 的 aux-hidden 捕获**两者皆非**——不可重算（输入 h_i 是被 hit 跳过的 target forward 的产物，从未存在），也没存（池外 dense scratch，无 page id 无 hash 身份）→ `checkpointable: false`，存在该组时强制关 prefix cache（今天的隐式全局开关变成描述符上的显式属性）。远期：把草稿 KV 改造成对齐 paged 组（照抄 native MTP）即可翻转为 true，消掉"开投机丢 prefix cache"的互斥税。
 
 ## 架构
 
-### 模型侧：`KvModel` trait（声明为主，随 qwen3 首迁定稿）
+### 模型侧：`KvModel` 契约
 
 ```rust
-pub trait KvModel {
-    fn spec(&self) -> KvSpec;                          // 组结构，build 后不变
-    fn arenas(&self, rank: usize) -> Vec<KvArena>;     // 物理登记（glm52 kv_arenas() 的推广）
-    fn repack(&self, group, dir, io) -> Result<()> { io.memcpy() }  // 仅 store schema ≠ 执行 layout 时覆写
+/// 组结构：build 时声明一次，之后不变。
+pub struct KvSpec {
+    /// 池粒度（token）。v1 不变量：所有 Paged 组共享同一 page_tokens 与同一套
+    /// block id（对齐组）；需要第二种页粒度 = 需要第二个池，是显式的未来扩展。
+    pub page_tokens: usize,
+    pub groups: Vec<GroupSpec>,
 }
 
 pub struct GroupSpec {
-    name: &'static str,
-    kind: GroupKind,               // Paged { bytes_per_token } | Bounded { bytes_per_slot }
-    sharding: Sharding,            // Replicated | HeadSharded { heads } —— Replicated 推导「rank0 存、恢复广播」（MLA TP 去重、qwen35 linear state 同一属性解决）
-    checkpointable: bool,
-    aligned_with: Option<GroupId>,
-    optional: bool,                // P/D 两侧配置不对称时可缺省（MTP）
+    /// 身份：store schema 命名空间与 arena 归属的连接点。
+    pub name: &'static str,
+    /// Paged（页写满原地封存）| Bounded（seal-by-copy）。三个消费者：
+    /// 分配器（pool/slab）、封存路径、checkpoint 索引（bounded 定义快照边界）。
+    pub kind: GroupKind,
+    /// Replicated：rank0 存、任意 rank 恢复（MLA latent、qwen35 GDN——glm52
+    /// 今天的共享 namespace 就是此语义）；PerRank：各 rank 存取自己的分片。
+    pub sharding: Sharding,
+    /// 见「Checkpointable 属性」。false ⇒ 该模型 prefix cache 强制关。
+    pub checkpointable: bool,
+    /// 恢复完整性：非 optional 组的 artifact 缺失 ⇒ 整个 checkpoint 无效
+    /// （idxk 缺失即静默腐坏 ⇒ false）；optional 组缺失不影响其余命中
+    /// （MTP，P/D 两侧配置可不对称）。
+    pub optional: bool,
+}
+
+pub trait KvModel {
+    fn spec(&self) -> KvSpec;
+    /// 物理登记：(组, arena) 对——一层可有多个 arena，一组可跨多层。
+    /// KvArena 直接复用 `openinfer-kv-offload::KvArena`
+    /// { name, base_ptr, num_blocks, bytes_per_block, block_stride_bytes }
+    /// （glm52 `kv_arenas()` 的现有形状）；Bounded 组同样表达：
+    /// num_blocks = slot 数、bytes_per_block = slot 字节、stride = slot 步长。
+    fn arenas(&self, rank: usize) -> Vec<(GroupId, KvArena)>;
+    /// 仅当 store schema ≠ 执行 layout（glm52 TP4 生产侧 576B→656B wire）。
+    fn repack(&self, group: GroupId, dir: RepackDir, io: RepackIo<'_>) -> anyhow::Result<()>;
 }
 ```
 
-三条模型线的落点：qwen3 = 1 个 Paged 组（head-sharded，page 16）；glm52 = mla+idxk 对齐组 + MTP 对齐组（optional）+ DSpark non-checkpointable slab（全 Replicated，page 64），repack 仅 TP4 生产侧 576B→656B wire（今天 MTP `transfer_cache` 手写的就是它）；qwen35 = Paged 组（8 full 层）+ Bounded 组（49.125 MiB/slot，Replicated）。
+**字段审计**（判据：谁消费、改变什么决策；无消费者即删）——被砍掉的三个：
+
+| 被砍字段 | 为什么 |
+|---|---|
+| `Paged{bytes_per_token}` / `Bounded{bytes_per_slot}` | 与 `arenas()` 的 `bytes_per_block` 重复——物理字节的唯一真相在 arena，spec 复写一份就是漂移源 |
+| `aligned_with: Option<GroupId>` | v1 不变量「所有 Paged 组皆对齐（共享池 id）」使其恒为真 → 零信息；降级为文档不变量 |
+| `HeadSharded { heads }` | 唯一消费者是异构 TP 重分片，v1 无此消费者；重分片落地时再加，先二值化为 `Replicated \| PerRank` |
+
+**实例化**：
+
+```rust
+// qwen3 —— 最小 case：单组。
+KvSpec { page_tokens: 16, groups: vec![
+    GroupSpec { name: "kv", kind: Paged, sharding: PerRank, checkpointable: true, optional: false },
+]}
+// arenas(rank)：fused KvBuffer 的 36 个逐层视图（今天 Registration::from_buffer 产物原样）：
+//   ("kv", KvArena { name: "qwen3.L{n}", base_ptr: buf + n·layer_bytes,
+//                    num_blocks, bytes_per_block: layer_stride·2B, block_stride_bytes: page_stride·2B })
+
+// glm52 —— 多组 + optional + 非 checkpointable。
+KvSpec { page_tokens: 64, groups: vec![
+    GroupSpec { name: "mla",    kind: Paged,   sharding: Replicated, checkpointable: true,  optional: false },
+    GroupSpec { name: "idxk",   kind: Paged,   sharding: Replicated, checkpointable: true,  optional: false }, // 缺失即腐坏
+    GroupSpec { name: "mtp",    kind: Paged,   sharding: Replicated, checkpointable: true,  optional: true  }, // D 可无 MTP
+    GroupSpec { name: "dspark", kind: Bounded, sharding: Replicated, checkpointable: false, optional: true  },
+]}
+// arenas：78×("mla",·) + 21×("idxk",·) + 2×("mtp",·)——今天 kv_arenas() 原样加组标签。
+// repack：TP4 生产侧 FlashInfer 576B → wire 656B（今天 MTP transfer_cache 手写的就是此钩子）。
+
+// qwen35（未来）—— Bounded 组首发；state + conv_state 同组两 arena。
+KvSpec { page_tokens: 16, groups: vec![
+    GroupSpec { name: "kv",  kind: Paged,   sharding: PerRank,    checkpointable: true, optional: false }, // 8 full 层
+    GroupSpec { name: "gdn", kind: Bounded, sharding: Replicated, checkpointable: true, optional: false }, // 49.125 MiB/slot
+]}
+// gemma4：kv(Paged, full 层) + swa(Bounded ring, W·bytes/slot)——照抄 qwen35 形状。
+```
 
 ### Store 侧：`KvStore` 具体类型（不是 trait）
 
-进程内一个，`Arc` 共享；持有 pegaflow client + I/O runtime + checkpoint 索引 + 每 rank 的 `{ Arc<BlockPool>, host tier }`。五个方法：
+进程内一个，`Arc` 共享；持有 pegaflow client + I/O runtime + checkpoint 索引 + 每 rank 的 `{ Arc<BlockPool>, host tier }`。**rank 注册在构建期**，build 后 rank 表冻结（读路径免锁）：
 
 ```rust
+let store = KvStoreBuilder::new(runtime_handle, KvStoreConfig::default())
+    .rank(0, pool0, Some(tier0))
+    .rank(1, pool1, Some(tier1))
+    .build();
+// glm52 迁移时把 BlockPool 构建从 engine 线程提到 spawn 之前：pool_blocks 在
+// Glm52EngineSpec 里本就先于 spawn 已知，BlockPool::new 是纯 CPU 对象，无线程亲和。
+
 impl KvStore {
-    fn register_rank(&self, rank, pool: Arc<BlockPool>, tier: Option<Arc<dyn HostTier>>);
-    async fn resolve_prefix(&self, rank, tokens, scope, cancel: &dyn CancelProbe) -> KvPrefix;
+    async fn resolve_prefix(&self, rank, req_id, tokens, scope, cancel: &dyn CancelProbe) -> KvPrefix;
     fn seal(&self, rank, kv: &RequestKv, cursor: &mut SaveCursor, class: SaveClass);
     fn retire(&self, rank, kv: RequestKv, cursor: SaveCursor, class: SaveClass);
     fn set_admission_floor(&self, rank, blocks) / fn pinned_blocks(&self, rank) -> usize;
 }
 ```
 
-- **`resolve_prefix` 是整条读链路**：probe radix → host tier query（重查询间隔/deadline 内置）→ 水位门控的 `reserve_loaded_blocks` → H2D → `commit_loaded_blocks`（恢复即入 radix，后续 `match_and_add_prefix` 自然命中——qwen3 已验证的模式）。**终态恰好一种**：`KvPrefix { hit_tokens, hold }`。降级（超时/熔断/池压力）只进 stats，不进类型——不改变调用方控制流的信息不配进返回类型。P/D 侧 `hit_tokens < committed_len` 这个数字即全部信息。
+- **`resolve_prefix` 是整条读链路**，**终态恰好一种**：`KvPrefix { hit_tokens, hold }`。降级（超时/悬死/池压力）只进 stats，不进类型——不改变调用方控制流的信息不配进返回类型。P/D 侧 `hit_tokens < committed_len` 这个数字即全部信息。恢复走"装回 radix 再自然 match"（qwen3 已验证的模式）。
+
+```mermaid
+flowchart TD
+    A["resolve_prefix(rank, req_id, tokens)"] --> B["probe radix\nPrefixProbe 持住 GPU 命中块"]
+    B --> C{"有 tier 且\ncpu_query_hashes 非空?"}
+    C -- 否 --> T["KvPrefix { GPU 命中, hold }"]
+    C -- 是 --> Q["tier.query\n(timeout_at deadline)"]
+    Q -- "Loading 且未超时\nsleep 5ms 重查" --> Q
+    Q -- "Miss / 错误 / 超时" --> T
+    Q -- "Hit(n)" --> F{"水位: available − floor ≥ n?"}
+    F -- "否 → release lease" --> T
+    F -- 是 --> R["reserve_loaded_blocks(n)"]
+    R --> L["tier.load —— 不可取消区段\nreservation 随 detached task,\n超时只弃等待不弃块"]
+    L -- "失败 / 超时" --> T
+    L -- 成功 --> M["commit_loaded_blocks\n恢复即入 radix"]
+    M --> U["KvPrefix { GPU+host 命中, hold }"]
+```
+
+任意 op 之间观察到取消（`token_tx` 的 abort 原子）→ 释放已持租约、返回 `KvPrefix::none()`，死请求死在 admission 现有的 `is_closed` 检查处。
 - **`seal`/`retire` 是写链路**：`SaveClass::Cacheable` fire-and-forget 可 shed（丢的只是未来命中）；`SaveClass::Handoff` 必达带租约（P 存的 entry 在 D 取走前不可逐出——eviction 在 store-based P/D 下是正确性问题，8 GiB 打穿 + 15s deadline 事故的教训）。retire 收编三处手写变奏（qwen3 flush barrier、glm52 `save_sealed_on_release` 先存后放、`detach_tail_save` 停放）：seal 尾部 → 有未决 save 则整个 KV 随 save 停放，settle 后 RAII 归还。
 - **背压恒等式**：飞行中 save 钉住的页从 admission 预算里扣（`pinned_blocks`，glm52 现状收编）；Cacheable 超预算即 shed（`cacheable_pin_percent`，默认池的 25%，cursor 不前进、压力解除后重试），Handoff 只 backpressure admission，**永不 block decode**。Handoff save 失败：计数 + 大声报错、块照常归还——对端以 hit 短缺观察到缺失并拒绝 handoff；P 侧"扣住 KV-ready 响应直到 save 确认"（glm52 flush-on-finish 语义）的接线随 P/D 迁移落地。
 
 ### 请求管线：线性所有权链
 
-```
-bridge(收 EngineCoreRequest) → tokio task: store.resolve_prefix(...).await
-                             → submit_tx.send((GenerateRequest, KvPrefix))   ← rank 收件箱
-                             → scheduler admission: match_and_add_prefix、drop hold
+请求整体 move：bridge → resolve task → rank 收件箱 → scheduler，无一段共享：
+
+```rust
+// bridge：收到 EngineCoreRequest，组装 GenerateRequest。req 自此线性 move。
+let rank = req.data_parallel_rank.unwrap_or_else(|| handle.least_loaded_partition());
+tokio::spawn(async move {
+    // 本任务独占 req；取消 = req.token_tx 上的共享 abort 原子，没有消息追靶。
+    let prefix = store
+        .resolve_prefix(rank, req_id, &req.prompt_tokens, scope_of(&req), &req.token_tx)
+        .await;                                    // 终态唯一；降级只进 stats
+    let _ = handle.submit_resolved(req, prefix);   // move 进 rank 收件箱
+});
+
+// scheduler（同步线程，per-rank）：收件箱里只有就绪请求，之后无异步。
+while let Ok((req, kv_prefix)) = submit_rx.try_recv() {
+    if req.token_tx.is_closed() { continue; }      // 死请求死在原地，hold 随 drop 释放
+    let mut kv = pool.new_request(req.prompt_tokens.clone(), req.max_tokens, salt);
+    let cached = kv.match_and_add_prefix(&pool)?;  // 自然吃到 resolve 恢复的块
+    drop(kv_prefix);                               // hold 使命完成：防逐出窗口闭合
+    // ... admission 预算（usable −= store.pinned_blocks(rank)）、占 slot、
+    //     TokenEvent::Scheduled { cached_tokens: cached }
+}
 ```
 
 - store 不认识 engine/收件箱/`GenerateRequest`——它的词汇只有 token 前缀进、`KvPrefix` 出；路由留在 `EngineHandle`（已有职责）。
@@ -107,7 +207,7 @@ bridge(收 EngineCoreRequest) → tokio task: store.resolve_prefix(...).await
 
 1. ✅ 本骨架 PR：文档 + `openinfer-kv-store`（resolve/seal/retire，paged only，CPU 契约测试）+ 分发层 `(GenerateRequest, KvPrefix)`（未迁移模型收 `KvPrefix::none()`，行为零变化）。
 2. qwen3 首迁：`resolve_prefix` 替换 `remote_fetch_action` 状态机（executor.rs ~2000 行 prefetch 编排），旧路径留开关至 bench 对齐。
-3. glm52 D 侧：收件箱替换 `HostRestoreState`；随后 P/D `Handoff` 租约（对齐 pegaflow `QueryLeaseId` 语义后定稿）。注意与 #812 perf 线的 offload.rs 冲突，约好 rebase 节奏。
+3. glm52 D 侧：收件箱替换 `HostRestoreState`；随后 P/D `Handoff` 租约（对齐 pegaflow `QueryLeaseId` 语义后定稿）。#812（EP32 生产设计点）仍 open、阶段性 PR 持续落 main 且常动 scheduler/offload 邻域——迁移分支以 main 为基准高频 rebase，别攒大 diff。
 4. qwen35：`core::kv_pool` → `BlockPool` 迁移（独立，可并行开工）；然后 Bounded 组 slab + seal-by-copy 首发（唯一的新物理能力，由从零接入的模型验证）。gemma4 照抄。
 
 ## 未决

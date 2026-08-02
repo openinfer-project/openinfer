@@ -29,7 +29,6 @@ mod tier;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::RwLock;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -146,69 +145,81 @@ struct RankState {
     tier: Option<Arc<dyn HostTier>>,
     /// Blocks admission has promised to admitted requests; resolve-side
     /// allocation yields to it (fail-soft to a smaller hit).
-    floor: Arc<AtomicUsize>,
+    floor: AtomicUsize,
     /// Blocks pinned by in-flight saves — physically unallocatable until
-    /// their D2H lands. Admission subtracts this from its budget.
+    /// their D2H lands. Admission subtracts this from its budget. `Arc`: the
+    /// per-save watcher tasks decrement it after the store's borrow ends.
     pinned: Arc<AtomicUsize>,
     /// Pin ceiling for `Cacheable` saves (from
     /// [`KvStoreConfig::cacheable_pin_percent`] of the pool).
     cacheable_pin_budget: usize,
 }
 
-impl Clone for RankState {
-    fn clone(&self) -> Self {
-        Self {
-            pool: Arc::clone(&self.pool),
-            tier: self.tier.clone(),
-            floor: Arc::clone(&self.floor),
-            pinned: Arc::clone(&self.pinned),
-            cacheable_pin_budget: self.cacheable_pin_budget,
-        }
-    }
-}
-
-/// The process-wide KV store: one instance, `Arc`-shared. Knows token
-/// prefixes, pools, and tiers — not engines, inboxes, or requests.
-pub struct KvStore {
+/// Builds a [`KvStore`]: every rank's pool and host tier is declared here,
+/// and the rank table freezes at [`Self::build`] — the store's read paths
+/// take no lock. Models whose pools are currently constructed inside engine
+/// threads hoist that construction to before spawn (a `BlockPool` is a pure
+/// CPU object with no thread affinity).
+pub struct KvStoreBuilder {
     runtime: tokio::runtime::Handle,
     config: KvStoreConfig,
-    ranks: RwLock<HashMap<usize, RankState>>,
-    stats: Arc<KvStoreStats>,
+    ranks: HashMap<usize, RankState>,
 }
 
-impl KvStore {
+impl KvStoreBuilder {
     #[must_use]
     pub fn new(runtime: tokio::runtime::Handle, config: KvStoreConfig) -> Self {
         Self {
             runtime,
             config,
-            ranks: RwLock::new(HashMap::new()),
-            stats: Arc::new(KvStoreStats::default()),
+            ranks: HashMap::new(),
         }
     }
 
-    /// Register one rank's pool and (optionally) its host tier. Call once per
-    /// rank at build; re-registering a rank replaces its surfaces.
-    pub fn register_rank(
-        &self,
+    /// Declare one rank's pool and (optionally) its host tier.
+    #[must_use]
+    pub fn rank(
+        mut self,
         rank: usize,
         pool: Arc<BlockPool>,
         tier: Option<Arc<dyn HostTier>>,
-    ) {
+    ) -> Self {
         let cacheable_pin_budget = pool.total_blocks() * self.config.cacheable_pin_percent / 100;
-        let state = RankState {
-            pool,
-            tier,
-            floor: Arc::new(AtomicUsize::new(0)),
-            pinned: Arc::new(AtomicUsize::new(0)),
-            cacheable_pin_budget,
-        };
-        self.ranks
-            .write()
-            .expect("kv-store rank map poisoned")
-            .insert(rank, state);
+        self.ranks.insert(
+            rank,
+            RankState {
+                pool,
+                tier,
+                floor: AtomicUsize::new(0),
+                pinned: Arc::new(AtomicUsize::new(0)),
+                cacheable_pin_budget,
+            },
+        );
+        self
     }
 
+    #[must_use]
+    pub fn build(self) -> KvStore {
+        KvStore {
+            runtime: self.runtime,
+            config: self.config,
+            ranks: self.ranks,
+            stats: Arc::new(KvStoreStats::default()),
+        }
+    }
+}
+
+/// The process-wide KV store: one instance, `Arc`-shared. Knows token
+/// prefixes, pools, and tiers — not engines, inboxes, or requests. Built by
+/// [`KvStoreBuilder`]; the rank table is immutable after build.
+pub struct KvStore {
+    runtime: tokio::runtime::Handle,
+    config: KvStoreConfig,
+    ranks: HashMap<usize, RankState>,
+    stats: Arc<KvStoreStats>,
+}
+
+impl KvStore {
     /// Blocks admission has promised on `rank`; resolve-side allocations
     /// yield to this watermark. The scheduler updates it as it admits and
     /// retires.
@@ -252,7 +263,7 @@ impl KvStore {
         let Some(state) = self.rank(rank) else {
             return KvPrefix::none();
         };
-        let pool = state.pool;
+        let pool = &state.pool;
         let block_size = pool.block_size();
         let cacheable_blocks = prompt_tokens.len().saturating_sub(1) / block_size;
 
@@ -275,8 +286,9 @@ impl KvStore {
             scope.lora_name,
         );
         let host_hashes = probe.cpu_query_hashes();
-        let (Some(tier), false) = (state.tier, host_hashes.is_empty()) else {
-            return finish(probe);
+        let tier = match state.tier.as_ref() {
+            Some(tier) if !host_hashes.is_empty() => tier,
+            _ => return finish(probe),
         };
 
         // Host-tier query, re-queried while a deeper tier fetches. The
@@ -392,7 +404,7 @@ impl KvStore {
         let Some(state) = self.rank(rank) else {
             return;
         };
-        let Some(tier) = state.tier else {
+        let Some(tier) = state.tier.as_ref() else {
             return;
         };
         if cursor.saved_blocks == 0 {
@@ -499,12 +511,8 @@ impl KvStore {
         });
     }
 
-    fn rank(&self, rank: usize) -> Option<RankState> {
-        self.ranks
-            .read()
-            .expect("kv-store rank map poisoned")
-            .get(&rank)
-            .cloned()
+    fn rank(&self, rank: usize) -> Option<&RankState> {
+        self.ranks.get(&rank)
     }
 }
 

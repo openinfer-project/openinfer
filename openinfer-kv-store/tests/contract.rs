@@ -12,7 +12,7 @@ use std::time::Duration;
 use openinfer_kv_cache::BlockPool;
 use openinfer_kv_store::CacheScope;
 use openinfer_kv_store::CancelProbe;
-use openinfer_kv_store::KvStore;
+use openinfer_kv_store::KvStoreBuilder;
 use openinfer_kv_store::KvStoreConfig;
 use openinfer_kv_store::NeverCancelled;
 use openinfer_kv_store::SaveClass;
@@ -23,8 +23,8 @@ use openinfer_kv_store::testkit::MockTier;
 const BLOCK_SIZE: usize = 16;
 const RANK: usize = 0;
 
-fn store() -> KvStore {
-    KvStore::new(tokio::runtime::Handle::current(), KvStoreConfig::default())
+fn builder() -> KvStoreBuilder {
+    KvStoreBuilder::new(tokio::runtime::Handle::current(), KvStoreConfig::default())
 }
 
 fn pool(blocks: usize) -> Arc<BlockPool> {
@@ -69,11 +69,11 @@ async fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn resolve_without_tier_returns_gpu_hit_with_hold() {
-    let store = store();
+    let b = builder();
     let pool = pool(64);
     let prompt = prompt(4);
     seed_gpu_prefix(&pool, &prompt, 4);
-    store.register_rank(RANK, Arc::clone(&pool), None);
+    let store = b.rank(RANK, Arc::clone(&pool), None).build();
 
     let prefix = store
         .resolve_prefix(RANK, "r1", &prompt, CacheScope::default(), &NeverCancelled)
@@ -95,12 +95,12 @@ async fn resolve_without_tier_returns_gpu_hit_with_hold() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn resolve_extends_gpu_hit_with_host_tier_load() {
-    let store = store();
+    let b = builder();
     let pool = pool(64);
     let prompt = prompt(8);
     seed_gpu_prefix(&pool, &prompt, 3);
     let tier = Arc::new(MockTier::scripted([MockQuery::Hit(5)]));
-    store.register_rank(RANK, Arc::clone(&pool), Some(tier.clone()));
+    let store = b.rank(RANK, Arc::clone(&pool), Some(tier.clone())).build();
 
     let prefix = store
         .resolve_prefix(RANK, "r1", &prompt, CacheScope::default(), &NeverCancelled)
@@ -123,7 +123,7 @@ async fn resolve_extends_gpu_hit_with_host_tier_load() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn resolve_requeries_through_loading_until_ready() {
-    let store = store();
+    let b = builder();
     let pool = pool(64);
     let prompt = prompt(4);
     let tier = Arc::new(MockTier::scripted([
@@ -131,7 +131,7 @@ async fn resolve_requeries_through_loading_until_ready() {
         MockQuery::Loading,
         MockQuery::Hit(4),
     ]));
-    store.register_rank(RANK, Arc::clone(&pool), Some(tier.clone()));
+    let store = b.rank(RANK, Arc::clone(&pool), Some(tier.clone())).build();
 
     let prefix = store
         .resolve_prefix(RANK, "r1", &prompt, CacheScope::default(), &NeverCancelled)
@@ -147,7 +147,7 @@ async fn resolve_deadline_degrades_to_gpu_hit_alone() {
         resolve_deadline: Duration::from_millis(20),
         ..KvStoreConfig::default()
     };
-    let store = KvStore::new(tokio::runtime::Handle::current(), config);
+    let b = KvStoreBuilder::new(tokio::runtime::Handle::current(), config);
     let pool = pool(64);
     let prompt = prompt(6);
     seed_gpu_prefix(&pool, &prompt, 2);
@@ -156,7 +156,7 @@ async fn resolve_deadline_degrades_to_gpu_hit_alone() {
         MockQuery::Loading,
         1000,
     )));
-    store.register_rank(RANK, Arc::clone(&pool), Some(tier.clone()));
+    let store = b.rank(RANK, Arc::clone(&pool), Some(tier.clone())).build();
 
     let prefix = store
         .resolve_prefix(RANK, "r1", &prompt, CacheScope::default(), &NeverCancelled)
@@ -169,13 +169,13 @@ async fn resolve_deadline_degrades_to_gpu_hit_alone() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn resolve_yields_to_admission_floor_and_releases_the_lease() {
-    let store = store();
+    let b = builder();
     // 16 usable blocks; the floor promises 14 of them to admission, so a
     // 5-block host hit must be declined.
     let pool = pool(17);
     let prompt = prompt(5);
     let tier = Arc::new(MockTier::scripted([MockQuery::Hit(5)]));
-    store.register_rank(RANK, Arc::clone(&pool), Some(tier.clone()));
+    let store = b.rank(RANK, Arc::clone(&pool), Some(tier.clone())).build();
     store.set_admission_floor(RANK, 14);
 
     let prefix = store
@@ -190,12 +190,12 @@ async fn resolve_yields_to_admission_floor_and_releases_the_lease() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn cancelled_resolve_skips_io_and_returns_none() {
-    let store = store();
+    let b = builder();
     let pool = pool(64);
     let prompt = prompt(4);
     seed_gpu_prefix(&pool, &prompt, 4);
     let tier = Arc::new(MockTier::scripted([MockQuery::Hit(4)]));
-    store.register_rank(RANK, Arc::clone(&pool), Some(tier.clone()));
+    let store = b.rank(RANK, Arc::clone(&pool), Some(tier.clone())).build();
 
     let prefix = store
         .resolve_prefix(RANK, "r1", &prompt, CacheScope::default(), &Cancelled)
@@ -250,7 +250,7 @@ async fn cancellation_after_query_releases_the_lease() {
         }
     }
 
-    let store = store();
+    let b = builder();
     let pool = pool(64);
     let prompt = prompt(4);
     let mock = Arc::new(MockTier::scripted([MockQuery::Hit(4)]));
@@ -259,7 +259,7 @@ async fn cancellation_after_query_releases_the_lease() {
         inner: Arc::clone(&mock),
         flag: Arc::clone(&flag),
     });
-    store.register_rank(RANK, Arc::clone(&pool), Some(tier));
+    let store = b.rank(RANK, Arc::clone(&pool), Some(tier)).build();
 
     let prefix = store
         .resolve_prefix(RANK, "r1", &prompt, CacheScope::default(), &Flagged(flag))
@@ -279,12 +279,12 @@ async fn hung_query_degrades_by_deadline() {
         resolve_deadline: Duration::from_millis(20),
         ..KvStoreConfig::default()
     };
-    let store = KvStore::new(tokio::runtime::Handle::current(), config);
+    let b = KvStoreBuilder::new(tokio::runtime::Handle::current(), config);
     let pool = pool(64);
     let prompt = prompt(5);
     seed_gpu_prefix(&pool, &prompt, 2);
     let tier = Arc::new(MockTier::scripted([MockQuery::Hang]));
-    store.register_rank(RANK, Arc::clone(&pool), Some(tier));
+    let store = b.rank(RANK, Arc::clone(&pool), Some(tier)).build();
 
     let prefix = store
         .resolve_prefix(RANK, "r1", &prompt, CacheScope::default(), &NeverCancelled)
@@ -299,11 +299,11 @@ async fn hung_load_degrades_but_never_frees_the_reservation() {
         resolve_deadline: Duration::from_millis(30),
         ..KvStoreConfig::default()
     };
-    let store = KvStore::new(tokio::runtime::Handle::current(), config);
+    let b = KvStoreBuilder::new(tokio::runtime::Handle::current(), config);
     let pool = pool(64);
     let prompt = prompt(3);
     let tier = Arc::new(MockTier::scripted([MockQuery::Hit(3)]).with_hung_loads());
-    store.register_rank(RANK, Arc::clone(&pool), Some(tier));
+    let store = b.rank(RANK, Arc::clone(&pool), Some(tier)).build();
 
     let usable_before = pool.available_blocks();
     let prefix = store
@@ -329,11 +329,11 @@ fn sealed_request(pool: &BlockPool, prompt: &[u32]) -> openinfer_kv_cache::Reque
 
 #[tokio::test(flavor = "multi_thread")]
 async fn seal_pins_blocks_until_the_save_lands() {
-    let store = store();
+    let b = builder();
     let pool = pool(64);
     let prompt = prompt(3);
     let tier = Arc::new(MockTier::default().with_manual_saves());
-    store.register_rank(RANK, Arc::clone(&pool), Some(tier.clone()));
+    let store = b.rank(RANK, Arc::clone(&pool), Some(tier.clone())).build();
 
     let kv = sealed_request(&pool, &prompt);
     let mut cursor = SaveCursor::new();
@@ -354,11 +354,11 @@ async fn seal_pins_blocks_until_the_save_lands() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn retire_cacheable_releases_immediately_into_the_prefix_cache() {
-    let store = store();
+    let b = builder();
     let pool = pool(64);
     let prompt = prompt(3);
     let tier = Arc::new(MockTier::default());
-    store.register_rank(RANK, Arc::clone(&pool), Some(tier.clone()));
+    let store = b.rank(RANK, Arc::clone(&pool), Some(tier.clone())).build();
 
     let kv = sealed_request(&pool, &prompt);
     store.retire(RANK, kv, SaveCursor::new(), SaveClass::Cacheable);
@@ -374,11 +374,11 @@ async fn retire_cacheable_releases_immediately_into_the_prefix_cache() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn retire_handoff_parks_the_kv_until_saves_settle() {
-    let store = store();
+    let b = builder();
     let pool = pool(16);
     let prompt = prompt(3);
     let tier = Arc::new(MockTier::default().with_manual_saves());
-    store.register_rank(RANK, Arc::clone(&pool), Some(tier.clone()));
+    let store = b.rank(RANK, Arc::clone(&pool), Some(tier.clone())).build();
 
     let available_before = pool.available_blocks();
     let kv = sealed_request(&pool, &prompt);
@@ -409,10 +409,10 @@ async fn cacheable_saves_shed_under_pin_pressure_and_retry_after() {
         cacheable_pin_percent: 10,
         ..KvStoreConfig::default()
     };
-    let store = KvStore::new(tokio::runtime::Handle::current(), config);
+    let b = KvStoreBuilder::new(tokio::runtime::Handle::current(), config);
     let pool = pool(64);
     let tier = Arc::new(MockTier::default().with_manual_saves());
-    store.register_rank(RANK, Arc::clone(&pool), Some(tier.clone()));
+    let store = b.rank(RANK, Arc::clone(&pool), Some(tier.clone())).build();
 
     let prompt_a: Vec<u32> = (0..=(4 * BLOCK_SIZE) as u32).map(|i| i % 241).collect();
     let prompt_b: Vec<u32> = (0..=(4 * BLOCK_SIZE) as u32).map(|i| 1 + i % 239).collect();
@@ -439,11 +439,11 @@ async fn cacheable_saves_shed_under_pin_pressure_and_retry_after() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn failed_handoff_save_is_counted_and_still_releases() {
-    let store = store();
+    let b = builder();
     let pool = pool(64);
     let prompt = prompt(3);
     let tier = Arc::new(MockTier::default().with_manual_saves());
-    store.register_rank(RANK, Arc::clone(&pool), Some(tier.clone()));
+    let store = b.rank(RANK, Arc::clone(&pool), Some(tier.clone())).build();
 
     let usable_before = pool.available_blocks();
     let kv = sealed_request(&pool, &prompt);
@@ -464,12 +464,12 @@ async fn failed_handoff_save_is_counted_and_still_releases() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn seal_skips_prefix_hit_blocks() {
-    let store = store();
+    let b = builder();
     let pool = pool(64);
     let prompt = prompt(6);
     seed_gpu_prefix(&pool, &prompt, 3);
     let tier = Arc::new(MockTier::default());
-    store.register_rank(RANK, Arc::clone(&pool), Some(tier.clone()));
+    let store = b.rank(RANK, Arc::clone(&pool), Some(tier.clone())).build();
 
     let mut kv = pool.new_request(prompt.to_vec(), 4, None);
     assert_eq!(
