@@ -14,6 +14,7 @@ use openinfer_core::engine::GenerateRequest;
 use openinfer_core::engine::TokenEvent;
 use openinfer_core::engine::unix_now_s;
 use openinfer_kv_store::BlockPool;
+use openinfer_kv_store::KvPrefix;
 use openinfer_kv_store::KvStore;
 use openinfer_kv_store::SaveCursor;
 
@@ -220,6 +221,30 @@ pub(super) fn admit_from_queue(
             .saturating_add(active_resident)
             .saturating_add(front_held);
         if committed + need_blocks > usable.min(physical_usable) {
+            // The budget credits only the FRONT's hold; holds pinned by
+            // requests queued BEHIND it shrink the free pool without any
+            // release path of their own (they release at their admission,
+            // which the stuck front blocks) — with enough concurrent
+            // large-hit resolutions that's a permanent stall. A hold is an
+            // anti-eviction pin, not correctness: shed the rearmost queued
+            // one and retry — its blocks fall to the inactive (evictable,
+            // still matchable) pool, which `available_blocks` counts.
+            // Bounded: each shed permanently clears one hold. Built Native
+            // KVs cannot shed (the pages are the request's own assignment);
+            // a queue of only those can still stall until slots retire.
+            let mut shed = false;
+            for entry in pending.iter_mut().skip(1).rev() {
+                if let Resolved::Plain { prefix, .. } = entry {
+                    if prefix.hit_tokens() > 0 {
+                        *prefix = KvPrefix::none();
+                        shed = true;
+                        break;
+                    }
+                }
+            }
+            if shed {
+                continue;
+            }
             break;
         }
 

@@ -35,6 +35,21 @@ pub(crate) struct RankState {
     /// its budget. `Arc`: the per-save watcher tasks decrement it after the
     /// store's borrow ends.
     pub(crate) pinned: Arc<AtomicUsize>,
+    /// Restore H2D tasks still in flight (including loads whose awaiter
+    /// abandoned them at the deadline — the detached task owns the
+    /// reservation until the DMA settles). Teardown must drain this to zero
+    /// before the GPU arenas are freed.
+    pub(crate) loads_pending: Arc<AtomicUsize>,
+}
+
+/// Decrements a counter when dropped — tied to the load task's future so the
+/// count falls even for abandoned (timeout-detached) tasks.
+struct DecOnDrop(Arc<AtomicUsize>);
+
+impl Drop for DecOnDrop {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// The process-wide KV store: one instance, `Arc`-shared. Knows token
@@ -197,7 +212,10 @@ impl KvStore {
         let loaded = hit.blocks;
         let page_ids = reservation.page_ids();
         let load = tier.load(hit, page_ids);
+        state.loads_pending.fetch_add(1, Ordering::AcqRel);
+        let dec = DecOnDrop(Arc::clone(&state.loads_pending));
         let join = self.runtime.spawn(async move {
+            let _dec = dec;
             let result = load.await;
             (result, reservation)
         });
@@ -422,6 +440,18 @@ impl KvStore {
             }
         };
         tier.load(hit, vec![dst_page_id]).await
+    }
+
+    /// Wait until every restore H2D on `rank` has settled — including loads
+    /// whose resolve abandoned the wait at its deadline (their detached
+    /// tasks own the destination reservations). Call before freeing the GPU
+    /// arenas at teardown; bound it with a caller-side timeout, since a load
+    /// against a hung tier never settles.
+    pub async fn flush_loads(&self, rank: usize) {
+        let pending = Arc::clone(&self.rank(rank).loads_pending);
+        while pending.load(Ordering::Acquire) > 0 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
     }
 
     /// The rank table is frozen at build, so an unknown rank is a wiring

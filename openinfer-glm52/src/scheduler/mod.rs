@@ -1470,16 +1470,23 @@ impl Glm52Engine {
         // Bounded: a stuck host tier cannot hang teardown. In-flight
         // resolves settle inside the store (their holds and reservations
         // ride detached tasks); the store outlives this engine via its Arc.
-        let flush = self.store.flush_saves(self.rank);
-        if self
-            .runtime
-            .block_on(async { tokio::time::timeout(Duration::from_secs(5), flush).await })
-            .is_err()
-        {
-            log::warn!(
-                "GLM5.2 rank {} teardown: save flush exceeded its deadline",
-                self.rank
-            );
+        // Loads first: a resolve abandoned at its deadline leaves a detached
+        // H2D still writing arena memory; the workers must not free the
+        // arenas under it. Then saves (D2H reads the same arenas). Both
+        // barriers deadline-bounded so a hung tier cannot hang teardown.
+        let rank = self.rank;
+        let drained = self.runtime.block_on(async {
+            let loads =
+                tokio::time::timeout(Duration::from_secs(5), self.store.flush_loads(rank)).await;
+            let saves =
+                tokio::time::timeout(Duration::from_secs(5), self.store.flush_saves(rank)).await;
+            (loads.is_ok(), saves.is_ok())
+        });
+        if !drained.0 {
+            log::warn!("GLM5.2 rank {rank} teardown: restore-load drain exceeded its deadline");
+        }
+        if !drained.1 {
+            log::warn!("GLM5.2 rank {rank} teardown: save flush exceeded its deadline");
         }
         self.shutdown_workers();
     }

@@ -107,6 +107,7 @@ impl KvStoreBuilder {
                         pool,
                         tier,
                         pinned: Arc::new(AtomicUsize::new(0)),
+                        loads_pending: Arc::new(AtomicUsize::new(0)),
                     },
                 )
             })

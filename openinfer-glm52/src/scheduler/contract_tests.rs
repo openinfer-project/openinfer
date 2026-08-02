@@ -205,6 +205,65 @@ fn admission_defers_while_physical_pages_are_temporarily_held() {
     assert_eq!(slots.iter().flatten().count(), 1);
 }
 
+#[test]
+fn admission_sheds_rear_prefix_holds_when_the_front_cannot_fit() {
+    // The stall shape: the front's lifetime budget cannot fit because pages
+    // are pinned by a hold owned by a request QUEUED BEHIND it — a hold that
+    // only releases at its owner's admission, which the front blocks. The
+    // budget defer must shed that rear hold within the same call, not park
+    // the queue forever.
+    let pool = Arc::new(BlockPool::new(PAGE, 6));
+    let held = {
+        let mut kv = pool.new_request(vec![1; 2 * PAGE], 1, None);
+        kv.schedule_prefill(2 * PAGE, &pool)
+            .expect("rear hold pins two physical pages");
+        kv
+    };
+
+    let mut slots: RankSlots = std::array::from_fn(|_| None);
+    let mut pending = VecDeque::new();
+    let mut front = request(vec![2; 3 * PAGE], SamplingParams::default(), 1);
+    let (front_tx, _front_rx) = TokenSink::standalone();
+    front.token_tx = front_tx;
+    pending.push_back(plain(front));
+    let mut rear = request(vec![9], SamplingParams::default(), 1);
+    let (rear_tx, _rear_rx) = TokenSink::standalone();
+    rear.token_tx = rear_tx;
+    pending.push_back(Resolved::Plain {
+        req: rear,
+        prefix: KvPrefix::resolved(2 * PAGE, 0, Box::new(held)),
+    });
+    let mut pending_resets = Vec::new();
+
+    let (store, _rt) = test_store(&pool);
+    admit_from_queue(
+        0,
+        &mut pending,
+        &mut slots,
+        &pool,
+        5,
+        &store,
+        true,
+        false,
+        true,
+        &mut pending_resets,
+    )
+    .expect("shedding the rear hold is not an admission error");
+
+    assert!(
+        slots
+            .iter()
+            .flatten()
+            .any(|active| active.req.prompt_tokens.len() == 3 * PAGE),
+        "front admits once the rear hold is shed"
+    );
+    for entry in &pending {
+        if let Resolved::Plain { prefix, .. } = entry {
+            assert_eq!(prefix.hit_tokens(), 0, "queued holds were shed, not kept");
+        }
+    }
+}
+
 /// Drive one request end to end through the engine's exact schedule/apply
 /// sequence against `pool` — the offline replica of the two engine-fatal
 /// submit-walk assertions (span start == `kv_position`, schedule never fails
