@@ -26,6 +26,7 @@ use openinfer_core::engine::EngineHandle;
 use openinfer_core::engine::GenerateRequest;
 use openinfer_core::engine::KvCapacity;
 use openinfer_core::engine::LoadSnapshot;
+use openinfer_core::engine::SubmittedRequest;
 use openinfer_core::engine::TokenEvent;
 use openinfer_core::engine::TokenSink;
 use openinfer_core::sampler::SamplingParams;
@@ -526,7 +527,7 @@ fn publish_load<E: ModelExecutor>(
 
 fn scheduler_loop<E>(
     mut executor: E,
-    mut submit_rx: mpsc::UnboundedReceiver<GenerateRequest>,
+    mut submit_rx: mpsc::UnboundedReceiver<SubmittedRequest>,
     seed: u64,
     max_prefill_tokens: usize,
     kv_total: u64,
@@ -601,7 +602,7 @@ fn scheduler_loop<E>(
         }
 
         // 1. Drain all incoming requests into deferred.
-        while let Ok(req) = submit_rx.try_recv() {
+        while let Ok((req, _kv_prefix)) = submit_rx.try_recv() {
             admit_new_request(&mut deferred, &mut tracker, &mut next_request_id, req);
         }
 
@@ -619,13 +620,13 @@ fn scheduler_loop<E>(
                 block_on_loading(&mut executor, &mut deferred, &mut loading, reserve_floor);
                 continue;
             }
-            if let Some(req) = submit_rx.blocking_recv() {
+            if let Some((req, _kv_prefix)) = submit_rx.blocking_recv() {
                 admit_new_request(&mut deferred, &mut tracker, &mut next_request_id, req);
             } else {
                 info!("Scheduler: all handles dropped, exiting");
                 return;
             }
-            while let Ok(req) = submit_rx.try_recv() {
+            while let Ok((req, _kv_prefix)) = submit_rx.try_recv() {
                 admit_new_request(&mut deferred, &mut tracker, &mut next_request_id, req);
             }
             continue;

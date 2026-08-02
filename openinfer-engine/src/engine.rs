@@ -193,6 +193,72 @@ pub enum TokenEvent {
 /// keeps per-event tagging to a refcount bump instead of a string copy.
 pub type RequestTag = Arc<str>;
 
+/// A request's KV-prefix resolution, produced by the KV store *before* the
+/// request reaches a scheduler: how many leading prompt tokens are already
+/// materialized in the target rank's GPU prefix cache, plus an opaque RAII
+/// hold keeping those blocks resident until the scheduler's prefix match
+/// consumes them.
+///
+/// The engine contract deliberately does not know KV internals (this crate is
+/// CUDA-free): the hold is minted by `openinfer-kv-store`, carried opaquely,
+/// and only ever *dropped* — after the scheduler's `match_and_add_prefix`, or
+/// with the request if it dies first. Dropping releases the anti-eviction pin.
+///
+/// Degraded resolutions (timeout, pool pressure) are not a distinct state:
+/// they surface as a smaller `hit_tokens` — the number alone carries all
+/// downstream semantics (a P/D decode admission asserts it against the
+/// handoff's committed length; everyone else just prefills from `hit_tokens`).
+pub struct KvPrefix {
+    hit_tokens: usize,
+    hold: Option<Box<dyn Any + Send>>,
+}
+
+impl KvPrefix {
+    /// No resolution ran (or it degraded to nothing): prefill from scratch.
+    /// The scheduler's own GPU prefix match still applies as usual.
+    #[must_use]
+    pub fn none() -> Self {
+        Self {
+            hit_tokens: 0,
+            hold: None,
+        }
+    }
+
+    /// A resolved prefix: `hit_tokens` are materialized on the target rank,
+    /// pinned by `hold` until this value is dropped.
+    #[must_use]
+    pub fn resolved(hit_tokens: usize, hold: Box<dyn Any + Send>) -> Self {
+        Self {
+            hit_tokens,
+            hold: Some(hold),
+        }
+    }
+
+    pub fn hit_tokens(&self) -> usize {
+        self.hit_tokens
+    }
+
+    /// Whether a hold is still pinning resolved blocks.
+    pub fn has_hold(&self) -> bool {
+        self.hold.is_some()
+    }
+}
+
+impl fmt::Debug for KvPrefix {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KvPrefix")
+            .field("hit_tokens", &self.hit_tokens)
+            .field("hold", &self.hold.as_ref().map(|_| "<opaque>"))
+            .finish()
+    }
+}
+
+/// What a scheduler partition's submit channel carries: the request plus its
+/// KV-prefix resolution. Unresolved paths submit [`KvPrefix::none`]; the
+/// tuple (rather than a wrapper struct) states the fact plainly — the store's
+/// output is a prefix resolution, not a new kind of request.
+pub type SubmittedRequest = (GenerateRequest, KvPrefix);
+
 /// The single output channel an engine dispatches *all* requests' token events
 /// into, each tagged with its [`RequestTag`]. One receiver (the frontend demux
 /// loop) drains it, replacing the former per-request fan-out of N channels and
@@ -422,13 +488,13 @@ pub struct EngineHandle {
 struct EngineInner {
     /// One submit channel per scheduler partition (logical DP rank). A
     /// single-partition engine holds exactly one sender.
-    submit_txs: Vec<mpsc::UnboundedSender<GenerateRequest>>,
+    submit_txs: Vec<mpsc::UnboundedSender<SubmittedRequest>>,
     command_tx: Option<mpsc::UnboundedSender<EngineCommand>>,
     join_handles: Vec<JoinHandle<()>>,
 }
 
 impl EngineHandle {
-    pub fn new(submit_tx: mpsc::UnboundedSender<GenerateRequest>) -> Self {
+    pub fn new(submit_tx: mpsc::UnboundedSender<SubmittedRequest>) -> Self {
         Self::from_parts(vec![submit_tx], None, Vec::new())
     }
 
@@ -449,7 +515,7 @@ impl EngineHandle {
     /// for the thread to return. That final drop may block until in-flight
     /// generation and backend teardown finish.
     pub fn new_with_join_handle(
-        submit_tx: mpsc::UnboundedSender<GenerateRequest>,
+        submit_tx: mpsc::UnboundedSender<SubmittedRequest>,
         join_handle: JoinHandle<()>,
     ) -> Self {
         Self::from_parts(vec![submit_tx], None, vec![join_handle])
@@ -464,7 +530,7 @@ impl EngineHandle {
     /// Dropping the last handle clone closes every channel and joins every
     /// thread in partition order.
     pub fn new_with_join_handles(
-        submit_txs: Vec<mpsc::UnboundedSender<GenerateRequest>>,
+        submit_txs: Vec<mpsc::UnboundedSender<SubmittedRequest>>,
         join_handles: Vec<JoinHandle<()>>,
     ) -> Self {
         assert!(
@@ -475,7 +541,7 @@ impl EngineHandle {
     }
 
     fn from_parts(
-        submit_txs: Vec<mpsc::UnboundedSender<GenerateRequest>>,
+        submit_txs: Vec<mpsc::UnboundedSender<SubmittedRequest>>,
         command_tx: Option<mpsc::UnboundedSender<EngineCommand>>,
         join_handles: Vec<JoinHandle<()>>,
     ) -> Self {
@@ -572,17 +638,39 @@ impl EngineHandle {
             .take()
     }
 
+    /// Submit an unresolved request: no KV-prefix resolution ran for it, so
+    /// the scheduler receives [`KvPrefix::none`] and prefills from its own
+    /// GPU prefix match alone. See [`Self::submit_resolved`].
     #[allow(clippy::result_large_err)]
     pub fn submit(
         &self,
         req: GenerateRequest,
+    ) -> std::result::Result<(), mpsc::error::SendError<GenerateRequest>> {
+        self.submit_resolved(req, KvPrefix::none())
+    }
+
+    /// Submit a request together with its KV-prefix resolution. Routing is by
+    /// the request's `data_parallel_rank` (unbound requests go to the
+    /// least-loaded partition), so the caller that resolved the prefix must
+    /// have bound the request to the rank it resolved against.
+    ///
+    /// On the legacy command path (an engine wired with only a command
+    /// channel) the prefix is dropped: those engines never resolve prefixes,
+    /// and dropping releases the (necessarily absent) hold.
+    #[allow(clippy::result_large_err)]
+    pub fn submit_resolved(
+        &self,
+        req: GenerateRequest,
+        kv_prefix: KvPrefix,
     ) -> std::result::Result<(), mpsc::error::SendError<GenerateRequest>> {
         if !self.inner.submit_txs.is_empty() {
             let partition = req
                 .data_parallel_rank
                 .unwrap_or_else(|| self.least_loaded_partition());
             if let Some(submit_tx) = self.inner.submit_txs.get(partition) {
-                return submit_tx.send(req);
+                return submit_tx
+                    .send((req, kv_prefix))
+                    .map_err(|err| mpsc::error::SendError(err.0.0));
             }
             // An out-of-range rank is a caller error, not an engine
             // failure: answer the request with the standard
@@ -758,7 +846,7 @@ mod tests {
 
     #[test]
     fn joins_owned_thread_after_last_handle_drop() {
-        let (submit_tx, mut submit_rx) = mpsc::unbounded_channel::<GenerateRequest>();
+        let (submit_tx, mut submit_rx) = mpsc::unbounded_channel::<SubmittedRequest>();
         let exited = Arc::new(AtomicBool::new(false));
         let thread_exited = Arc::clone(&exited);
         let join_handle = thread::spawn(move || {
@@ -798,20 +886,22 @@ mod tests {
 
     #[test]
     fn multi_partition_submit_routes_by_bound_rank() {
-        let (tx0, mut rx0) = mpsc::unbounded_channel::<GenerateRequest>();
-        let (tx1, mut rx1) = mpsc::unbounded_channel::<GenerateRequest>();
+        let (tx0, mut rx0) = mpsc::unbounded_channel::<SubmittedRequest>();
+        let (tx1, mut rx1) = mpsc::unbounded_channel::<SubmittedRequest>();
         let handle = EngineHandle::new_with_join_handles(vec![tx0, tx1], Vec::new());
 
         let (req, _events) = routed_request(Some(1));
         handle.submit(req).expect("submit");
         assert!(rx0.try_recv().is_err());
-        assert_eq!(rx1.try_recv().expect("routed to rank 1").prompt_tokens, [1]);
+        let (routed, kv_prefix) = rx1.try_recv().expect("routed to rank 1");
+        assert_eq!(routed.prompt_tokens, [1]);
+        assert_eq!(kv_prefix.hit_tokens(), 0);
     }
 
     #[test]
     fn multi_partition_submit_places_unbound_on_the_least_loaded() {
-        let (tx0, mut rx0) = mpsc::unbounded_channel::<GenerateRequest>();
-        let (tx1, mut rx1) = mpsc::unbounded_channel::<GenerateRequest>();
+        let (tx0, mut rx0) = mpsc::unbounded_channel::<SubmittedRequest>();
+        let (tx1, mut rx1) = mpsc::unbounded_channel::<SubmittedRequest>();
         let (load_tx0, load_rx0) = watch::channel(LoadSnapshot {
             num_running_reqs: 2,
             ..LoadSnapshot::default()
@@ -842,7 +932,7 @@ mod tests {
 
     #[test]
     fn multi_partition_out_of_range_rank_is_rejected_not_dropped() {
-        let (tx0, _rx0) = mpsc::unbounded_channel::<GenerateRequest>();
+        let (tx0, _rx0) = mpsc::unbounded_channel::<SubmittedRequest>();
         let handle = EngineHandle::new_with_join_handles(vec![tx0], Vec::new());
 
         let (req, mut events) = routed_request(Some(7));
@@ -865,7 +955,7 @@ mod tests {
         let (txs, joins): (Vec<_>, Vec<_>) = exited
             .iter()
             .map(|flag| {
-                let (tx, mut rx) = mpsc::unbounded_channel::<GenerateRequest>();
+                let (tx, mut rx) = mpsc::unbounded_channel::<SubmittedRequest>();
                 let flag = Arc::clone(flag);
                 let join = thread::spawn(move || {
                     while rx.blocking_recv().is_some() {}
@@ -883,7 +973,7 @@ mod tests {
 
     #[test]
     fn lora_control_support_is_opt_in() {
-        let (submit_tx, _submit_rx) = mpsc::unbounded_channel::<GenerateRequest>();
+        let (submit_tx, _submit_rx) = mpsc::unbounded_channel::<SubmittedRequest>();
         let handle = EngineHandle::new(submit_tx);
         assert!(!handle.supports_lora_control());
 
@@ -894,7 +984,7 @@ mod tests {
 
     #[test]
     fn load_watches_define_scheduler_partitions() {
-        let (submit_tx, _submit_rx) = mpsc::unbounded_channel::<GenerateRequest>();
+        let (submit_tx, _submit_rx) = mpsc::unbounded_channel::<SubmittedRequest>();
         let (_load_tx0, load_rx0) = watch::channel(LoadSnapshot {
             num_running_reqs: 1,
             ..LoadSnapshot::default()
@@ -1063,7 +1153,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_lora_adapter_reports_unsupported_without_control() {
-        let (submit_tx, _submit_rx) = mpsc::unbounded_channel::<GenerateRequest>();
+        let (submit_tx, _submit_rx) = mpsc::unbounded_channel::<SubmittedRequest>();
         let handle = EngineHandle::new(submit_tx);
         let error = handle
             .load_lora_adapter(LoadLoraAdapterRequest {

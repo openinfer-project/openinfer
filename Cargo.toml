@@ -19,6 +19,7 @@ members = [
   "openinfer-sample",
   "openinfer-kv-cache",
   "openinfer-kv-offload",
+  "openinfer-kv-store",
   # ---- dynamo kvbm (forked from upstream, Apache-2.0) ----
   "kvbm/kvbm-logical",
 ]
@@ -131,6 +132,7 @@ openinfer-kernels = { path = "openinfer-kernels" }
 openinfer-kimi-k2 = { path = "openinfer-kimi-k2" }
 openinfer-kv-cache = { path = "openinfer-kv-cache" }
 openinfer-kv-offload = { path = "openinfer-kv-offload" }
+openinfer-kv-store = { path = "openinfer-kv-store" }
 openinfer-qwen3 = { path = "openinfer-qwen3" }
 openinfer-qwen35 = { path = "openinfer-qwen35" }
 openinfer-sample = { path = "openinfer-sample" }

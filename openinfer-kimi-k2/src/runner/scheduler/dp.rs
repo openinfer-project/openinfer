@@ -5,6 +5,7 @@ use crossbeam_channel::bounded;
 use log::error;
 use openinfer_core::engine::FinishReason;
 use openinfer_core::engine::GenerateRequest;
+use openinfer_core::engine::SubmittedRequest;
 use openinfer_core::engine::TokenEvent;
 use openinfer_core::engine::TokenSink;
 use openinfer_kv_cache::BlockPool;
@@ -227,7 +228,7 @@ impl DpCoordinator {
     /// This consumes self and blocks until shutdown.
     pub(in crate::runner) fn run(
         mut self,
-        mut submit_rx: mpsc::UnboundedReceiver<GenerateRequest>,
+        mut submit_rx: mpsc::UnboundedReceiver<SubmittedRequest>,
         lb: DpLoadBalancer,
     ) {
         let mut step_txs = Vec::with_capacity(self.dp_world);
@@ -258,11 +259,11 @@ impl DpCoordinator {
             // 1. Drain new requests from submit channel
             if self.global_active_count() == 0 && pending_reqs.is_empty() {
                 match submit_rx.blocking_recv() {
-                    Some(req) => pending_reqs.push(req),
+                    Some((req, _kv_prefix)) => pending_reqs.push(req),
                     None => break,
                 }
             }
-            while let Ok(req) = submit_rx.try_recv() {
+            while let Ok((req, _kv_prefix)) = submit_rx.try_recv() {
                 pending_reqs.push(req);
             }
 

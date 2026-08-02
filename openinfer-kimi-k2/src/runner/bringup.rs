@@ -16,7 +16,7 @@ use log::info;
 use openinfer_core::engine::EngineHandle;
 use openinfer_core::engine::EngineLoadOptions;
 use openinfer_core::engine::EpBackend;
-use openinfer_core::engine::GenerateRequest;
+use openinfer_core::engine::SubmittedRequest;
 use openinfer_core::parallel::ParallelConfig;
 use openinfer_kv_cache::BlockPool;
 use tokio::sync::mpsc;
@@ -154,7 +154,7 @@ fn start_engine_tp8_dp1(
     let executor = build_tp8_dp1_executor(&config)?;
     let pool = BlockPool::new(KIMI_KV_PAGE_SIZE, config.kv_pool_pages)?;
 
-    let (submit_tx, submit_rx) = mpsc::unbounded_channel::<GenerateRequest>();
+    let (submit_tx, submit_rx) = mpsc::unbounded_channel::<SubmittedRequest>();
     let (init_tx, init_rx) = bounded::<Result<()>>(1);
     let scheduler_handle = thread::Builder::new()
         .name("kimi-k2-scheduler".into())
@@ -206,7 +206,7 @@ fn start_engine_tp1_dp8(
     let coordinator = DpCoordinator::new(executors, stop_token_ids, options.seed, pools);
     let lb = DpLoadBalancer::new(dp_world);
 
-    let (submit_tx, submit_rx) = mpsc::unbounded_channel::<GenerateRequest>();
+    let (submit_tx, submit_rx) = mpsc::unbounded_channel::<SubmittedRequest>();
     let (init_tx, init_rx) = bounded::<Result<()>>(1);
     let coord_handle = thread::Builder::new()
         .name("kimi-k2-dp-coord".into())

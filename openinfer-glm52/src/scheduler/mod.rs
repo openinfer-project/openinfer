@@ -57,6 +57,7 @@ use load::publish_load;
 use mtp::run_mtp_round;
 use openinfer_core::engine::GenerateRequest;
 use openinfer_core::engine::LoadSnapshot;
+use openinfer_core::engine::SubmittedRequest;
 use openinfer_core::engine::TokenEvent;
 use openinfer_kv_cache::BlockPool;
 use openinfer_kv_cache::RequestKv;
@@ -174,7 +175,7 @@ enum SpanKind {
 /// failure tears this rank's workers down concurrently with its siblings'.
 pub(crate) struct Glm52EngineSpec {
     pub(crate) rank: usize,
-    pub(crate) submit_rx: mpsc::UnboundedReceiver<GenerateRequest>,
+    pub(crate) submit_rx: mpsc::UnboundedReceiver<SubmittedRequest>,
     /// This rank's executors: exactly one under EP, every mirrored worker
     /// under the tensor-replicated topologies.
     pub(crate) workers: Vec<Glm52Worker>,
@@ -208,7 +209,7 @@ pub(crate) struct Glm52EngineSpec {
 /// every in-flight save and dies with the engine.
 pub(crate) struct Glm52Engine {
     rank: usize,
-    submit_rx: mpsc::UnboundedReceiver<GenerateRequest>,
+    submit_rx: mpsc::UnboundedReceiver<SubmittedRequest>,
     workers: Vec<Glm52Worker>,
     eos_token_ids: Vec<u32>,
     drafter: crate::Glm52Drafter,
@@ -409,14 +410,14 @@ impl Glm52Engine {
                 self.publish();
                 if self.mirrored {
                     match self.submit_rx.blocking_recv() {
-                        Some(req) => self.intake(req),
+                        Some((req, _kv_prefix)) => self.intake(req),
                         None => self.channel_open = false,
                     }
                 }
             }
             while self.channel_open {
                 match self.submit_rx.try_recv() {
-                    Ok(req) => self.intake(req),
+                    Ok((req, _kv_prefix)) => self.intake(req),
                     Err(mpsc::error::TryRecvError::Empty) => break,
                     Err(mpsc::error::TryRecvError::Disconnected) => self.channel_open = false,
                 }

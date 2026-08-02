@@ -114,6 +114,12 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | `models/kimi-k2/source-layout.md` | Kimi-K2 source files over 1k lines were split by responsibility; the largest Rust file under `openinfer-kimi-k2/src` is now `layers/attention.rs` at 950 lines. |
 | `models/kimi-k2/dp-design.md` | TP×DP 可配置并行：每 DP rank 是独立 decode engine，EP all-to-all 天然 sync，轻量 load balancer 做 request 路由。首批 TP1×DP8 + TP8×DP1。 |
 
+## subsystems / kv-cache
+
+| Path | TL;DR |
+| --- | --- |
+| `subsystems/kv-cache/design.md` | 异构 KV（full attn / MLA / SWA / linear state）统一为「组 + checkpoint」模型：两类封存语义（paged 原地封 / bounded seal-by-copy）、对齐组、单索引以最稀疏 checkpointer 为准。`openinfer-kv-store` 收编 qwen3/glm52 手写 offload 编排（resolve/seal/retire），模型侧只声明 `KvModel`。迁移：qwen3 → glm52 D → P/D 租约 → qwen35 bounded。 |
+
 ## subsystems / runtime
 
 | Path | TL;DR |

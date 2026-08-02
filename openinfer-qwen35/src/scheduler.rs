@@ -22,6 +22,7 @@ use openinfer_core::engine::FinishReason;
 use openinfer_core::engine::GenerateRequest as SchedulerRequest;
 use openinfer_core::engine::KvCapacity;
 use openinfer_core::engine::LoadSnapshot;
+use openinfer_core::engine::SubmittedRequest;
 use openinfer_core::engine::TokenEvent;
 use openinfer_core::engine::TokenLogprob;
 use openinfer_core::engine::TokenSink;
@@ -847,7 +848,7 @@ fn publish_load(
 #[allow(clippy::needless_pass_by_value)]
 fn scheduler_loop(
     mut backend: SchedulerBackend,
-    mut submit_rx: mpsc::UnboundedReceiver<SchedulerRequest>,
+    mut submit_rx: mpsc::UnboundedReceiver<SubmittedRequest>,
     seed: u64,
     prefill_budget: usize,
     scheduler_policy: Qwen35SchedulerPolicy,
@@ -869,20 +870,20 @@ fn scheduler_loop(
 
         // 1. Drain all pending requests (deferred from last iteration + channel)
         let mut pending = std::mem::take(&mut deferred);
-        while let Ok(req) = submit_rx.try_recv() {
+        while let Ok((req, _kv_prefix)) = submit_rx.try_recv() {
             pending.push(req);
         }
 
         // 2. Nothing in flight (no decode, no in-progress prefill) and nothing
         //    pending → block until a request arrives.
         if active.is_empty() && prefilling.is_empty() && pending.is_empty() {
-            if let Some(req) = submit_rx.blocking_recv() {
+            if let Some((req, _kv_prefix)) = submit_rx.blocking_recv() {
                 pending.push(req);
             } else {
                 info!("scheduler: all handles dropped, exiting");
                 return;
             }
-            while let Ok(req) = submit_rx.try_recv() {
+            while let Ok((req, _kv_prefix)) = submit_rx.try_recv() {
                 pending.push(req);
             }
         }

@@ -3306,6 +3306,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "openinfer-kv-store"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "log",
+ "openinfer-engine",
+ "openinfer-kv-cache",
+ "openinfer-kv-offload",
+ "tokio",
+]
+
+[[package]]
 name = "openinfer-qwen3"
 version = "0.1.0"
 dependencies = [

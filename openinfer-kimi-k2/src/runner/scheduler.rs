@@ -14,6 +14,7 @@ use lifecycle::validate_kv_capacity;
 use log::error;
 use openinfer_core::engine::FinishReason;
 use openinfer_core::engine::GenerateRequest;
+use openinfer_core::engine::SubmittedRequest;
 use openinfer_core::engine::TokenEvent;
 use openinfer_core::engine::TokenSink;
 use openinfer_kv_cache::BlockPool;
@@ -100,24 +101,24 @@ impl KimiK2Scheduler {
 
     pub(in crate::runner) fn run(
         &mut self,
-        mut submit_rx: mpsc::UnboundedReceiver<GenerateRequest>,
+        mut submit_rx: mpsc::UnboundedReceiver<SubmittedRequest>,
     ) {
         let mut pending = VecDeque::new();
         loop {
             if pending.is_empty() {
                 match submit_rx.blocking_recv() {
-                    Some(req) => pending.push_back(req),
+                    Some((req, _kv_prefix)) => pending.push_back(req),
                     None => return,
                 }
             }
 
-            while let Ok(req) = submit_rx.try_recv() {
+            while let Ok((req, _kv_prefix)) = submit_rx.try_recv() {
                 pending.push_back(req);
             }
             let deadline = Instant::now() + KIMI_PREFILL_BATCH_COALESCE;
             while pending.len() < KIMI_RUNNER_MAX_BATCH && Instant::now() < deadline {
                 match submit_rx.try_recv() {
-                    Ok(req) => pending.push_back(req),
+                    Ok((req, _kv_prefix)) => pending.push_back(req),
                     Err(mpsc::error::TryRecvError::Empty) => {
                         thread::sleep(KIMI_PREFILL_BATCH_POLL);
                     }

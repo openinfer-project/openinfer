@@ -20,6 +20,7 @@ use grouping::take_decode_position_groups;
 use log::info;
 use openinfer_engine::engine::FinishReason;
 use openinfer_engine::engine::GenerateRequest;
+use openinfer_engine::engine::SubmittedRequest;
 use openinfer_engine::engine::TokenEvent;
 use openinfer_engine::engine::TokenSink;
 use openinfer_engine::engine::unix_now_s;
@@ -39,7 +40,7 @@ const DEFAULT_MAX_ACTIVE_REQUESTS: usize = 8;
 
 pub(crate) struct MixedRequestScheduler {
     generator: DeepSeekV2LiteEp2Generator,
-    submit_rx: mpsc::UnboundedReceiver<GenerateRequest>,
+    submit_rx: mpsc::UnboundedReceiver<SubmittedRequest>,
     pending: VecDeque<PendingRequest>,
     active: Vec<ActiveRequestState>,
     max_active_requests: usize,
@@ -92,7 +93,7 @@ enum AdmissionDecision {
 impl MixedRequestScheduler {
     pub(crate) fn new(
         generator: DeepSeekV2LiteEp2Generator,
-        submit_rx: mpsc::UnboundedReceiver<GenerateRequest>,
+        submit_rx: mpsc::UnboundedReceiver<SubmittedRequest>,
     ) -> Self {
         Self {
             generator,
@@ -119,7 +120,7 @@ impl MixedRequestScheduler {
         }
 
         match self.submit_rx.blocking_recv() {
-            Some(req) => {
+            Some((req, _kv_prefix)) => {
                 self.pending.push_back(PendingRequest::from(req));
                 true
             }
@@ -128,7 +129,7 @@ impl MixedRequestScheduler {
     }
 
     fn drain_pending_submissions(&mut self) {
-        while let Ok(req) = self.submit_rx.try_recv() {
+        while let Ok((req, _kv_prefix)) = self.submit_rx.try_recv() {
             self.pending.push_back(PendingRequest::from(req));
         }
     }

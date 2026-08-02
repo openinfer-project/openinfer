@@ -366,7 +366,7 @@ async fn lora_models_response(
 
 #[cfg(test)]
 mod tests {
-    use openinfer_engine::engine::GenerateRequest;
+    use openinfer_engine::engine::SubmittedRequest;
     use tokio::sync::mpsc;
 
     use super::*;
@@ -380,7 +380,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_lora_adapter_route_reports_unsupported_engine() {
-        let (submit_tx, _submit_rx) = mpsc::unbounded_channel::<GenerateRequest>();
+        let (submit_tx, _submit_rx) = mpsc::unbounded_channel::<SubmittedRequest>();
         let state = route_state(EngineHandle::new(submit_tx));
         let response = load_lora_adapter(
             axum::extract::State(state),
@@ -398,7 +398,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_lora_adapter_route_rejects_pr1_unsupported_fields() {
-        let (submit_tx, _submit_rx) = mpsc::unbounded_channel::<GenerateRequest>();
+        let (submit_tx, _submit_rx) = mpsc::unbounded_channel::<SubmittedRequest>();
         let state = route_state(EngineHandle::new(submit_tx));
         let response = load_lora_adapter(
             axum::extract::State(state),
@@ -416,7 +416,7 @@ mod tests {
 
     #[tokio::test]
     async fn unload_lora_adapter_route_reports_unsupported_engine() {
-        let (submit_tx, _submit_rx) = mpsc::unbounded_channel::<GenerateRequest>();
+        let (submit_tx, _submit_rx) = mpsc::unbounded_channel::<SubmittedRequest>();
         let state = route_state(EngineHandle::new(submit_tx));
         let response = unload_lora_adapter(
             axum::extract::State(state),

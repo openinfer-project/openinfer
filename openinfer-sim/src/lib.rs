@@ -82,7 +82,7 @@ impl Default for SimulatedEngineConfig {
 pub fn start_engine(config: SimulatedEngineConfig) -> EngineHandle {
     let (submit_tx, mut submit_rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
-        while let Some(req) = submit_rx.recv().await {
+        while let Some((req, _kv_prefix)) = submit_rx.recv().await {
             tokio::spawn(run_simulated_request(req, config.clone()));
         }
     });

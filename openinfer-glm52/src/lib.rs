@@ -1129,7 +1129,7 @@ fn start_engine(
     // healthy engines exit their loops and shut their workers down
     // concurrently, then join them.
     let abort_engines =
-        |submit_txs: Vec<mpsc::UnboundedSender<openinfer_core::engine::GenerateRequest>>,
+        |submit_txs: Vec<mpsc::UnboundedSender<openinfer_core::engine::SubmittedRequest>>,
          join_handles: Vec<std::thread::JoinHandle<()>>| {
             drop(submit_txs);
             for handle in join_handles {

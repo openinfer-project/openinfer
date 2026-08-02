@@ -53,6 +53,14 @@ impl<T> OffloadHandle<T> {
             .unwrap_or_else(|_| Err(EngineError::Storage("offload worker dropped reply".into())))
     }
 
+    /// Await settlement from an async context ([`Self::poll`]/[`Self::wait`]
+    /// are the duals for the synchronous scheduler thread).
+    pub async fn settle(self) -> Result<T, EngineError> {
+        self.rx
+            .await
+            .unwrap_or_else(|_| Err(EngineError::Storage("offload worker dropped reply".into())))
+    }
+
     /// A handle that is already settled with `result` — lets scheduler tests
     /// drive their admission poll path without a pegaflow worker.
     pub fn settled(result: Result<T, EngineError>) -> Self {

@@ -1,0 +1,19 @@
+[package]
+edition = "2024"
+license = "Apache-2.0"
+name = "openinfer-kv-store"
+version = "0.1.0"
+
+[dependencies]
+anyhow = { workspace = true }
+log = { workspace = true }
+openinfer-engine = { workspace = true }
+openinfer-kv-cache = { workspace = true }
+openinfer-kv-offload = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time", "rt"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true
