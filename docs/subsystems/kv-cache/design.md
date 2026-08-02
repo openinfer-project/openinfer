@@ -142,10 +142,11 @@ KvSpec { page_tokens: 16, groups: vec![
 进程内一个，`Arc` 共享；持有 pegaflow client + I/O runtime + checkpoint 索引 + 每 rank 的 `{ Arc<BlockPool>, host tier }`。**rank 注册在构建期**，build 后 rank 表冻结（读路径免锁）：
 
 ```rust
-let store = KvStoreBuilder::new(runtime_handle, KvStoreConfig::default())
-    .rank(0, pool0, Some(tier0))
-    .rank(1, pool1, Some(tier1))
-    .build();
+let store = KvStoreBuilder::new(runtime_handle)   // 旋钮全链式,无 options 结构体可 churn
+    .with_resolve_deadline(Duration::from_secs(15))
+    .rank(0, pool_only_rank)                       // 无 tier:同一 API 的纯 GPU 模式
+    .rank_with_tier(1, pool1, tier1)
+    .build();                                      // 派生值(pin 预算)在 build 结算,setter 顺序无关
 // glm52 迁移时把 BlockPool 构建从 engine 线程提到 spawn 之前：pool_blocks 在
 // Glm52EngineSpec 里本就先于 spawn 已知，BlockPool::new 是纯 CPU 对象，无线程亲和。
 

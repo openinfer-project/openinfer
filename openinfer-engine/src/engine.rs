@@ -259,6 +259,7 @@ impl fmt::Debug for KvPrefix {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("KvPrefix")
             .field("hit_tokens", &self.hit_tokens)
+            .field("rank", &self.rank)
             .field("hold", &self.hold.as_ref().map(|_| "<opaque>"))
             .finish()
     }
