@@ -215,6 +215,7 @@ pub(super) async fn native_pd_resolve(
     let cache_salt = super::native_mtp_cache_salt();
     let full_len = handoff.committed_len - handoff.tail_len;
     let req_id = req.request_id.as_deref().unwrap_or("native-pd");
+    let t_start = std::time::Instant::now();
 
     // Full pages: all-or-nothing against the producer's checkpoint. The
     // store waits out registration lag and pool pressure under its deadline;
@@ -230,6 +231,7 @@ pub(super) async fn native_pd_resolve(
             &req.token_tx,
         )
         .await;
+    let t_full = t_start.elapsed();
     anyhow::ensure!(
         prefix.hit_tokens() >= full_len,
         "full-page restore resolved {} of {} tokens before the deadline",
@@ -289,6 +291,15 @@ pub(super) async fn native_pd_resolve(
         kv.apply_prefill_chunk(pool)?;
         cached_tokens += handoff.tail_len;
     }
+    let t_total = t_start.elapsed();
+    log::info!(
+        "native P/D resolve timing: full_pages={}ms tail_and_match={}ms total={}ms \
+         (committed_len={}, full_len={full_len})",
+        t_full.as_millis(),
+        (t_total - t_full).as_millis(),
+        t_total.as_millis(),
+        handoff.committed_len,
+    );
 
     anyhow::ensure!(
         cached_tokens == handoff.committed_len && logical_prompt_len - kv.kv_position() == 1,
