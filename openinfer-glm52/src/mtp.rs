@@ -38,7 +38,6 @@ use crate::config::GLM52_INDEX_HEAD_DIM;
 use crate::config::GLM52_RMS_EPS;
 use crate::model::GLM52_DECODE_BUCKETS;
 use crate::model::GLM52_MODEL_LEN_ALIGN;
-use crate::model::glm52_pool_blocks;
 use crate::rows::Rows;
 
 const MTP_FUSED_INPUT: usize = 2 * GLM52_HIDDEN;
@@ -69,13 +68,13 @@ pub(crate) fn glm52_mtp_draft_len() -> usize {
 /// derive the context cap before those arenas are allocated.
 pub(crate) fn glm52_mtp_arena_bytes(
     max_model_len: usize,
+    pool_blocks: usize,
     topology: crate::Glm52MoeTopo,
 ) -> Result<usize> {
     // Two private pages per slot hold unverified proposal KV. Committed
     // layer-78 rows use the target BlockPool page IDs and are transferable;
     // scratch pages sit beyond that registered range.
-    let blocks = glm52_pool_blocks(max_model_len, crate::model::glm52_decode_slots())
-        + 2 * crate::model::glm52_decode_slots();
+    let blocks = pool_blocks + 2 * crate::model::glm52_decode_slots();
     let execution_bytes_per_token = if topology == crate::Glm52MoeTopo::Tp4 {
         openinfer_kernels::ops::GLM52_FLASHINFER_SPARSE_BYTES_PER_TOKEN
     } else {

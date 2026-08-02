@@ -89,7 +89,6 @@ use crate::model::GLM52_MAX_STEP_ROWS;
 use crate::model::GLM52_MODEL_LEN_ALIGN;
 use crate::model::Glm52StepKv;
 use crate::model::Glm52StepShape;
-use crate::model::glm52_pool_blocks;
 use crate::model::glm52_table_width;
 use crate::runner::Glm52MtpAppend;
 use crate::runner::Glm52PrefillBatch;
@@ -306,7 +305,7 @@ impl Glm52Engine {
         // keeps this cheap (~54 KB/token/rank -> a few GiB at 16K x 8).
         let pool = BlockPool::new(
             PAGE,
-            glm52_pool_blocks(spec.max_model_len, crate::model::glm52_decode_slots()),
+            crate::model::glm52_configured_pool_blocks(spec.max_model_len),
         )?;
         let table_width = glm52_table_width(spec.max_model_len);
         // Prefix matching policy lives in `prefix_cache_enabled`: DSpark is

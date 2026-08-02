@@ -140,18 +140,36 @@ pub(crate) fn glm52_table_width(max_model_len: usize) -> usize {
 /// launch-time VRAM probe sizes `max_model_len` against this, so a new
 /// len-scaled allocation in `build` MUST be added here or the probe
 /// under-charges.
+/// The rank's pool block count, decided ONCE at launch from the free-VRAM
+/// budget (#818): the servable cap no longer multiplies into the pool, so a
+/// 200K cap does not force 32 x 200K of KV provisioning — admission's
+/// lifetime reservation is the per-request guard, and the pool is simply as
+/// large as the budget allows. Unset (unit tests, direct builders) falls
+/// back to the legacy `slots x cap` sizing.
+static POOL_BLOCKS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+pub(crate) fn glm52_set_pool_blocks(blocks: usize) {
+    let _ = POOL_BLOCKS.set(blocks);
+}
+
+pub(crate) fn glm52_configured_pool_blocks(max_model_len: usize) -> usize {
+    POOL_BLOCKS
+        .get()
+        .copied()
+        .unwrap_or_else(|| glm52_pool_blocks(max_model_len, glm52_decode_slots()))
+}
+
 pub(crate) fn glm52_arena_bytes(
     max_model_len: usize,
-    pool_slots: usize,
+    num_blocks: usize,
     prefill_only: bool,
 ) -> Result<usize> {
-    let num_blocks = glm52_pool_blocks(max_model_len, pool_slots);
     // Prefill-only is a P/D producer: persist the same fp8_ds_mla row the EP
     // decode consumer reads, even though TP4's local attention execution uses
     // a different backend.
     let cache_bytes_per_token = GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN;
     let mla = GLM52_LAYERS * num_blocks * GLM52_FLASHMLA_SPARSE_PAGE_SIZE * cache_bytes_per_token;
-    let (table_width, index_layout) = glm52_index_cache_layout(max_model_len, pool_slots);
+    let (table_width, index_layout) = glm52_index_cache_layout(max_model_len, num_blocks);
     let index_k = (0..GLM52_LAYERS)
         .filter(|&layer| glm52_layer_has_full_indexer(layer))
         .count()
@@ -182,12 +200,12 @@ pub(crate) fn glm52_arena_bytes(
 /// ([`glm52_arena_bytes`]), so a layout change cannot drift between them.
 fn glm52_index_cache_layout(
     max_model_len: usize,
-    pool_slots: usize,
+    num_blocks: usize,
 ) -> (usize, Glm52IndexerCacheLayout) {
     // The index-K cache is indexed by the same pool block ids as the MLA
     // cache, so it holds the same block count.
     let layout = Glm52IndexerCacheLayout {
-        cache_blocks: glm52_pool_blocks(max_model_len, pool_slots),
+        cache_blocks: num_blocks,
         cache_block_size: INDEX_CACHE_BLOCK,
         cache_block_stride_bytes: INDEX_CACHE_BLOCK * (GLM52_INDEX_HEAD_DIM + 4),
     };
@@ -614,11 +632,10 @@ impl Glm52RankModel {
         } else {
             glm52_flashmla_sparse_decode_num_sm_parts()?
         };
-        // Prefill-only allocates the full slot count too — the scheduler pool
-        // is sized to match, and the prefix cache retains released prefixes
-        // in the headroom.
-        let pool_slots = glm52_decode_slots();
-        let pool_blocks = glm52_pool_blocks(max_model_len, pool_slots);
+        // The launch-time budget decides the pool size (prefix cache included
+        // — released prefixes retain in whatever headroom the pool carries);
+        // the scheduler pool and every cache slab here share the ONE number.
+        let pool_blocks = glm52_configured_pool_blocks(max_model_len);
         let contract = Glm52FlashMlaSparseDecode {
             batch_size: batch,
             num_blocks: pool_blocks,
@@ -626,7 +643,8 @@ impl Glm52RankModel {
             num_sm_parts,
             sm_scale: GLM52_SM_SCALE,
         };
-        let (table_width, index_cache_layout) = glm52_index_cache_layout(max_model_len, pool_slots);
+        let (table_width, index_cache_layout) =
+            glm52_index_cache_layout(max_model_len, pool_blocks);
 
         let mut layers = Vec::with_capacity(GLM52_LAYERS);
         let mut caches = Vec::with_capacity(GLM52_LAYERS);

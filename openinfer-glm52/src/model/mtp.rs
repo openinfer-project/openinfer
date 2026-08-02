@@ -35,6 +35,7 @@ use super::GLM52_MAX_STEP_ROWS;
 use super::INDEX_CACHE_BLOCK;
 use super::NUM_SMS;
 use super::build;
+#[cfg(test)]
 use super::glm52_pool_blocks;
 use super::glm52_table_width;
 use super::step_body::glm52_moe_ep_layer;
@@ -133,9 +134,10 @@ mod tests {
             * GLM52_FLASHMLA_SPARSE_PAGE_SIZE
             * openinfer_kernels::ops::GLM52_FLASHINFER_SPARSE_BYTES_PER_TOKEN;
         let extra_index_k = blocks * INDEX_CACHE_BLOCK * (GLM52_INDEX_HEAD_DIM + size_of::<f32>());
-        let tp4 = crate::mtp::glm52_mtp_arena_bytes(cap, crate::Glm52MoeTopo::Tp4)
+        let pool = glm52_pool_blocks(cap, slots);
+        let tp4 = crate::mtp::glm52_mtp_arena_bytes(cap, pool, crate::Glm52MoeTopo::Tp4)
             .expect("TP4 arena bytes");
-        let ep4 = crate::mtp::glm52_mtp_arena_bytes(cap, crate::Glm52MoeTopo::Ep4)
+        let ep4 = crate::mtp::glm52_mtp_arena_bytes(cap, pool, crate::Glm52MoeTopo::Ep4)
             .expect("EP4 arena bytes");
         assert_eq!(tp4 - ep4, extra_execution_mla + extra_index_k);
     }
@@ -274,13 +276,13 @@ impl Glm52NativeMtp {
             build::build_decoder_layer(ctx, weights, GLM52_MTP_LAYER, moe_topo, attn_shard)?;
 
         // The committed region mirrors the main pool's page ids 1:1 (radix
-        // hits reuse L78 KV by page id), so it must be sized from the SAME
-        // runtime slot count as the pool — the scratch pair pages sit
-        // directly after it. Ceiling-sizing here would both waste VRAM and
-        // desync the ledger in `glm52_mtp_arena_bytes`.
-        let slots = crate::model::glm52_decode_slots();
-        let committed_blocks = glm52_pool_blocks(max_model_len, slots);
-        let num_blocks = committed_blocks + slots * MTP_SCRATCH_PAGES_PER_SLOT;
+        // hits reuse L78 KV by page id), so it must be the SAME launch-time
+        // block count as the pool — the scratch pair pages sit directly
+        // after it. Any other sizing desyncs the `glm52_mtp_arena_bytes`
+        // ledger.
+        let committed_blocks = crate::model::glm52_configured_pool_blocks(max_model_len);
+        let num_blocks =
+            committed_blocks + crate::model::glm52_decode_slots() * MTP_SCRATCH_PAGES_PER_SLOT;
         let table_width = glm52_table_width(max_model_len);
         let index_layout = Glm52IndexerCacheLayout {
             cache_blocks: num_blocks,
