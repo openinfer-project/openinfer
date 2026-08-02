@@ -772,12 +772,17 @@ fn derive_max_model_len(
             prefill_only,
             moe_topo,
         )?;
+        // The graph reserve must survive the fill: without it a cap in the
+        // band (budget - reserve, budget] passes here, the measured fill
+        // floors at the one-request pool anyway, and FinishKv or the lazy
+        // graph capture OOMs raw instead of failing at this door.
         ensure!(
-            required <= budget_bytes,
+            required + glm52_graph_reserve_bytes() <= budget_bytes,
             "GLM5.2 --max-model-len {requested} needs {} of cache per rank (fixed arenas + a \
-             one-request pool) but only {} fits (min rank free VRAM {} - reserve {}); lower it \
-             or free VRAM",
+             one-request pool + {} graph reserve) but only {} fits (min rank free VRAM {} - \
+             reserve {}); lower it or free VRAM",
             ByteSize(required as u64),
+            ByteSize(glm52_graph_reserve_bytes() as u64),
             ByteSize(budget_bytes as u64),
             ByteSize(min_free_vram_bytes as u64),
             ByteSize(reserve_bytes as u64),
@@ -1335,7 +1340,18 @@ fn build_rank_models(
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
     {
-        Some(pinned) => pinned.max(2),
+        Some(pinned) => {
+            // A pin below the one-request floor would advertise a cap no
+            // request can ever fit — admission then parks the impossible
+            // request at the FIFO head forever. Refuse loudly instead.
+            let one_request = glm52_one_request_pool_blocks(max_model_len);
+            ensure!(
+                pinned >= one_request,
+                "GLM52_KV_POOL_BLOCKS={pinned} is below the {one_request}-block one-request \
+                 floor for max_model_len {max_model_len}"
+            );
+            pinned
+        }
         None => glm52_measured_pool_blocks(
             min_free_bytes,
             post_finish_reserve_bytes,
@@ -1760,6 +1776,7 @@ mod max_model_len_tests {
         let free = GLM52_VRAM_RESERVE_BYTES
             + glm52_cap_bytes(cap, one_request, &Glm52Drafter::None, false, TEST_TOPO)
                 .expect("cap bytes")
+            + glm52_graph_reserve_bytes()
             + (64 << 20);
         let budget =
             derive_max_model_len(Some(cap), free, &Glm52Drafter::None, 0, false, TEST_TOPO)
