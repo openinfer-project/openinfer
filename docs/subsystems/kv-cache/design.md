@@ -209,7 +209,7 @@ while let Ok((req, kv_prefix)) = submit_rx.try_recv() {
 - store 不认识 engine/收件箱/`GenerateRequest`——它的词汇只有 token 前缀进、`KvPrefix` 出；路由留在 `EngineHandle`（已有职责）。
 - **消灭队头停车**：今天 glm52 的 `HostRestoreState::poll_front` / `NativePdState` Park 是 push_front + break，一个请求等 restore 堵死整 rank FIFO。resolve 前置后 scheduler 收件箱里只有就绪请求。
 - **取消 = 已有的共享原子**（`TokenSink::is_closed`，`abort_reason: Arc<AtomicU8>`），不新增机制。resolve task 在 op 之间观察；**已提交的 DMA 是不可取消区段**（guard 陪 op 走到 settle，即 `handle.rs` 现有的 detach 语义）。取消的请求返回空 KvPrefix，死在 admission 现有的 `is_closed` 检查处。
-- **池的并发事实**：kvbm `BlockManager` 内部同步（save guard 已跨线程 drop），跨线程分配不是安全问题而是仲裁问题——`set_admission_floor` 水位由 scheduler 维护，resolve 的分配让位于它，不足即降级（fail-soft）。
+- **池的并发事实**：kvbm `BlockManager` 内部同步（save guard 已跨线程 drop），跨线程分配不是安全问题而是仲裁问题。存在**两个分配器，权限不同**：admission 的 lifetime 预留是权威（honor-or-reject）；resolve 的 reservation 是机会主义（买一段更便宜的 prefill），且分配必然晚于 query——目标页数 n 只有 `Hit(n)` 返回后才可知，而 GPU probe 本身零分配（命中块已驻留，仅加引用）。仲裁协议即水位：scheduler 每次录取/退出更新 `set_admission_floor`，resolve 在水位之下捡剩余，不足即降级（fail-soft，请求照常跑）。对偶义务：**admission 须把 resolve 已命中的块记为该请求已持有、从 need 抵扣**（qwen3 `prefetched_blocks` 先例）——否则压力下双重计数（available 已因 hold 减少、need 又全额计）导致错误 defer。
 
 ### Scheduler 的接触面（全同步，共四处）
 
