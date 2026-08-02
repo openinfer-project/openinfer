@@ -986,7 +986,7 @@ fn start_engine(
     // down, and the launch error surfaces only after the ~100 s DeepEP
     // device timeout. The TP LL rendezvous rejecting a topology (poison
     // pill, NVLink probe) is a real failure landing exactly in this window.
-    let rank_arenas = match build_rank_models(
+    let (rank_arenas, pool_blocks) = match build_rank_models(
         &loaded.workers,
         max_model_len,
         moe_topo,
@@ -1029,7 +1029,7 @@ fn start_engine(
         }
     };
     let logical_ranks = moe_topo.logical_rank_count();
-    let kv_total_blocks = model::glm52_configured_pool_blocks(max_model_len) - 1;
+    let kv_total_blocks = pool_blocks - 1;
     // One autonomous engine per LOCAL logical rank (a mirrored topology
     // collapses to a single engine driving every worker). Each engine owns
     // its submit queue and load feed, so the frontend sees one scheduler
@@ -1092,6 +1092,7 @@ fn start_engine(
             eos_token_ids: eos_token_ids.clone(),
             drafter: drafter.clone(),
             prefill_chunk_size: prefill_only.map(|prefill| prefill.chunk_size),
+            pool_blocks,
             max_model_len,
             no_prefix_cache,
             offload: engine_offload,
@@ -1292,7 +1293,7 @@ fn build_rank_models(
     rendezvous: Option<&str>,
     floor_blocks: usize,
     post_finish_reserve_bytes: usize,
-) -> Result<Vec<Vec<KvArena>>> {
+) -> Result<(Vec<Vec<KvArena>>, usize)> {
     let build_started = Instant::now();
     let prefill_only = prefill_chunk_size.is_some();
     let responses = workers
@@ -1359,10 +1360,6 @@ fn build_rank_models(
             floor_blocks,
         ),
     };
-    // Publish the measured pool size before any FinishKv dispatch and before
-    // the engines spawn (the schedulers' BlockPool reads the global) — from
-    // here on there is ONE block count in the process.
-    model::glm52_set_pool_blocks(pool_blocks);
     log::info!(
         "GLM5.2 KV pool: {} blocks ({} tokens, {} past the {}-slot nominal) — the measured \
          free-VRAM fill (min rank free {} after the fixed build, graph reserve {}, post-finish \
@@ -1430,7 +1427,7 @@ fn build_rank_models(
         build_started.elapsed().as_secs_f64(),
         moe_topo
     );
-    Ok(rank_arenas)
+    Ok((rank_arenas, pool_blocks))
 }
 
 /// One shared pegaflow host (one pinned pool) with each rank's arenas

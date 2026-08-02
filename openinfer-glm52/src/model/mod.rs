@@ -133,36 +133,6 @@ pub(crate) fn glm52_table_width(max_model_len: usize) -> usize {
     max_model_len.div_ceil(GLM52_FLASHMLA_SPARSE_PAGE_SIZE)
 }
 
-/// The rank's pool block count, decided ONCE at launch (#818) — since the
-/// two-phase build, from each rank's MEASURED free VRAM after the fixed
-/// build: the servable cap no longer multiplies into the pool, so a 200K cap
-/// does not force 32 x 200K of KV provisioning — admission's lifetime
-/// reservation is the per-request guard, and the pool is simply as large as
-/// the measured budget allows. The scheduler's `BlockPool` reads this;
-/// worker builds take the count explicitly through
-/// [`Glm52RankModel::finish_kv`]. Unset (unit tests, direct builders) falls
-/// back to the legacy `slots x cap` sizing.
-static POOL_BLOCKS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-
-pub(crate) fn glm52_set_pool_blocks(blocks: usize) {
-    let _ = POOL_BLOCKS.set(blocks);
-}
-
-pub(crate) fn glm52_configured_pool_blocks(max_model_len: usize) -> usize {
-    POOL_BLOCKS
-        .get()
-        .copied()
-        .unwrap_or_else(|| glm52_pool_blocks(max_model_len, glm52_decode_slots()))
-}
-
-/// Exact GPU bytes the two-phase build allocates on a rank for a given cap
-/// and pool block count — every `max_model_len`- and pool-scaled term,
-/// computed from the same layout formulas the allocations use (the FlashMLA
-/// packed cache and index-K layouts, the device rope tables, the per-bucket
-/// indexer logits scratch with its 256-rounded stride, and the block
-/// tables). Linear in `num_blocks`: the launch fill derives the exact
-/// per-block slab cost as `bytes(N+1) - bytes(N)`, so a new pool-scaled
-/// allocation in `finish_kv` MUST be added here or the fill over-commits.
 pub(crate) fn glm52_arena_bytes(
     max_model_len: usize,
     num_blocks: usize,

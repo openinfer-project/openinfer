@@ -25,20 +25,34 @@ was static:
 
 ### One pool, two arenas, shared ids
 
-Each rank's `BlockPool(page=64, blocks = 8*ceil((cap+1)/64) + 1)` hands out
-block ids; the rank's per-layer MLA packed caches (656 B/token) and index-K
-caches (full-indexer layers) are both indexed by those ids
-(`glm52_pool_blocks` is the single sizing formula shared by the pool,
-`Glm52RankModel::build`, and the `glm52_arena_bytes` VRAM ledger). The
-trailing `+1` is the reserved **padding page**: padding rows and graph
-pre-capture write there, nobody reads it meaningfully (Kimi's benign-garbage
-argument). The per-slot `cap+1` (not `cap`) keeps 8 concurrent max-shape
-requests (`prompt + max_tokens = cap + 1`) admissible: each really draws
-`ceil((cap+1)/64)` pages including its dangling-token page — a toxic-review
-finding; the naive `8*ceil(cap/64)` pool silently degraded max-shape
-concurrency to 7.
+Each rank's `BlockPool(page=64)` hands out block ids; the rank's per-layer
+MLA packed caches (656 B/token) and index-K caches (full-indexer layers) are
+both indexed by those ids, and the pool, `Glm52RankModel::finish_kv`, and the
+scheduler all share the ONE launch-decided block count.
 
-Total KV VRAM is the per-slot design's capacity + 9 pages (~30 MB); the win
+**Pool sizing is a measured launch decision, not a formula (#823).** The old
+`slots*ceil((cap+1)/64) + 1` provisioning multiplied the servable cap into
+the pool (a 200K cap forced slots×200K of KV — unaffordable — and the derived
+cap shrank as slots grew). Now the workers build everything except the
+pool-scaled slabs, report measured free VRAM, and launch min-reduces and
+fills the pool from fact at the exact per-block slab cost: the legacy
+`slots x cap` count remains the FLOOR where it fits (defaults unchanged, the
+fill only adds), an explicit big cap falls back to a one-request floor
+(`ceil((cap+1)/64) + 2`), and `GLM52_KV_POOL_BLOCKS` pins the count for A/B
+runs (rejected below the one-request floor — a smaller pool would advertise a
+cap no request can fit). The only estimate left is `GLM52_GRAPH_RESERVE_GIB`
+(default 3) for lazy graph instantiation + runtime workspaces. One page is
+the reserved **padding page**: padding rows and graph pre-capture write
+there, nobody reads it meaningfully (Kimi's benign-garbage argument). The
+`cap+1` (not `cap`) in the floors keeps max-shape requests
+(`prompt + max_tokens = cap + 1`) admissible including the dangling-token
+page — a toxic-review finding; the naive `ceil(cap/64)` variant silently
+degraded max-shape concurrency.
+
+Measured on GB300 (EP4, 16K cap): the fill lands ~1.35-1.44M pool tokens per
+rank (2.6x the old 32-slot nominal), and admission's lifetime reservation
+arbitrates mixed loads — 12 concurrent ~118K requests totalling 1.42M tokens
+against a 1.35M pool queue the overflow and all complete. The win
 is *sharing* — released requests' sealed blocks stay matchable as the prefix
 cache instead of dying with a slot.
 

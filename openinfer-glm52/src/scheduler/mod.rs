@@ -182,6 +182,11 @@ pub(crate) struct Glm52EngineSpec {
     pub(crate) drafter: crate::Glm52Drafter,
     pub(crate) prefill_chunk_size: Option<usize>,
     pub(crate) max_model_len: usize,
+    /// The launch-measured pool block count — the scheduler's BlockPool and
+    /// the executor slabs (FinishKv) share this ONE number; carrying it in
+    /// the spec keeps a second launch in the same process from reading a
+    /// stale value through a global.
+    pub(crate) pool_blocks: usize,
     pub(crate) no_prefix_cache: bool,
     /// This rank's offload engines (several only under a mirrored topology,
     /// which uses the first — the historical layout); they hold the shared
@@ -303,10 +308,7 @@ impl Glm52Engine {
         // blocks to RETAIN released prefixes across turns, and the headroom
         // lets admission overlap prefills instead of serializing them. MLA
         // keeps this cheap (~54 KB/token/rank -> a few GiB at 16K x 8).
-        let pool = BlockPool::new(
-            PAGE,
-            crate::model::glm52_configured_pool_blocks(spec.max_model_len),
-        )?;
+        let pool = BlockPool::new(PAGE, spec.pool_blocks)?;
         let table_width = glm52_table_width(spec.max_model_len);
         // Prefix matching policy lives in `prefix_cache_enabled`: DSpark is
         // the only drafter that forces it off (aux-hidden captures cannot be
