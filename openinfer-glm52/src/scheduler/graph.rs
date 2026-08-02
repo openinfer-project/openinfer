@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::Context as _;
 use openinfer_core::cuda_graph::CudaGraphDumpSummary;
-use openinfer_kv_cache::BlockPool;
+use openinfer_kv_store::BlockPool;
 
 use super::plan::padding_step_kv;
 use super::slot::GLM52_PADDING_STEP;

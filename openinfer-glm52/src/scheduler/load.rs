@@ -2,9 +2,8 @@
 
 use std::collections::VecDeque;
 
-use openinfer_core::engine::GenerateRequest;
 use openinfer_core::engine::LoadSnapshot;
-use openinfer_kv_cache::BlockPool;
+use openinfer_kv_store::BlockPool;
 use tokio::sync::watch;
 
 use super::RankSlots;
@@ -18,7 +17,7 @@ pub(super) fn publish_load(
     load_tx: &watch::Sender<LoadSnapshot>,
     pool: &BlockPool,
     slots: &RankSlots,
-    pending: &VecDeque<GenerateRequest>,
+    pending: &VecDeque<super::offload::Resolved>,
 ) {
     let kv_total_blocks = pool.total_blocks() - 1;
     load_tx.send_replace(LoadSnapshot {

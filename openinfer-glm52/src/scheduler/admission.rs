@@ -8,16 +8,19 @@
 //! request and metrics/KV ownership agree with the frontend's engine index.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use openinfer_core::engine::GenerateRequest;
 use openinfer_core::engine::TokenEvent;
 use openinfer_core::engine::unix_now_s;
-use openinfer_kv_cache::BlockPool;
+use openinfer_kv_store::BlockPool;
+use openinfer_kv_store::KvStore;
+use openinfer_kv_store::SaveCursor;
 
 use super::ActiveRequest;
 use super::PAGE;
 use super::RankSlots;
-use super::offload::NativeAdmitOutcome;
+use super::offload::Resolved;
 use super::offload::{self};
 use super::slot::Glm52SlotState;
 
@@ -133,51 +136,18 @@ pub(super) fn reject(req: &GenerateRequest, message: String) {
     });
 }
 
-fn reject_native_pd_error(
-    state: &mut offload::NativePdState,
-    rank: usize,
-    req: &GenerateRequest,
-    err: &anyhow::Error,
-) {
-    state.clear(rank);
-    reject(
-        req,
-        format!("GLM5.2 native-MTP P/D restore failed ({err:#}); retry via P"),
-    );
-}
-
-/// Admission: fill this rank's free slots from its own FIFO queue while its
-/// full-lifetime KV budget permits. New requests join the step cadence at
-/// the next step boundary. An `Err` is a kvbm invariant break — the caller
-/// treats it as engine-fatal (the affected request was already answered
-/// here).
-#[allow(clippy::too_many_arguments)]
 pub(super) fn admit_from_queue(
     rank: usize,
-    pending: &mut VecDeque<GenerateRequest>,
+    pending: &mut VecDeque<Resolved>,
     slots: &mut RankSlots,
-    pool: &BlockPool,
+    pool: &Arc<BlockPool>,
     usable_blocks: usize,
-    offload: Option<&offload::RankOffload>,
-    native_pd: &mut Option<offload::NativePdState>,
-    host_restore: &mut Option<offload::HostRestoreState>,
+    store: &KvStore,
     prefix_cache_enabled: bool,
     drafter_enabled: bool,
     native_mtp_prefill: bool,
     pending_resets: &mut Vec<usize>,
 ) -> anyhow::Result<()> {
-    // Release what settled since the last attempt: abandoned loads' page
-    // holds, abandoned queries' stray leases, and finished tail saves' KVs.
-    let engine = offload.map(|o| &o.engine);
-    if let Some(state) = host_restore.as_mut() {
-        state.reap(engine);
-    }
-    if let Some(state) = native_pd.as_mut() {
-        state.reap(engine);
-    }
-    if let Some(offload) = offload {
-        offload.reap_tail_saves();
-    }
     let mut committed: usize = slots
         .iter()
         .flatten()
@@ -187,11 +157,12 @@ pub(super) fn admit_from_queue(
     // until their D2H lands. Hide them from the rank's full-lifetime budget
     // so admission defers instead of promising pages a later schedule cannot
     // get (which would fail the whole engine).
-    let usable =
-        usable_blocks.saturating_sub(offload.map_or(0, offload::RankOffload::pinned_blocks));
+    let usable = usable_blocks.saturating_sub(store.pinned_blocks(rank));
 
     // Admission fills only the configured slot count; the fixed array's tail
-    // beyond `glm52_decode_slots()` stays permanently empty.
+    // beyond `glm52_decode_slots()` stays permanently empty. The queue holds
+    // only RESOLVED intakes — restore waiting happened off-thread, so a
+    // front here is never parked on storage.
     while let Some(slot) = slots[..crate::model::glm52_decode_slots()]
         .iter()
         .position(Option::is_none)
@@ -200,239 +171,212 @@ pub(super) fn admit_from_queue(
             break;
         };
         // Drop a disconnected FIFO front before it can block valid work
-        // behind an admission budget it will never consume.
-        if front.token_tx.is_closed() {
-            pending.pop_front();
-            if let Some(pd) = native_pd.as_mut() {
-                pd.clear(rank);
-            }
-            if let Some(state) = host_restore.as_mut() {
-                state.abandon_front();
-            }
+        // behind an admission budget it will never consume (any resolved
+        // state — a built KV, a prefix hold — releases via RAII).
+        let front_req = match front {
+            Resolved::Plain { req, .. }
+            | Resolved::Native { req, .. }
+            | Resolved::Failed { req, .. } => req,
+        };
+        if front_req.token_tx.is_closed() {
+            drop(pending.pop_front());
             continue;
         }
-        // Parse the native contract before budgeting: it changes the
-        // logical input/output capacity of the RequestKv created below.
-        // Invalid metadata must be rejected, not left at the FIFO head.
-        let native_handoff = match offload::native_mtp_handoff(front) {
-            Ok(handoff) => handoff,
-            Err(err) => {
-                let req = pending.pop_front().expect("checked non-empty");
-                reject(&req, format!("{err:#}"));
-                continue;
-            }
+        if matches!(front, Resolved::Failed { .. }) {
+            let Some(Resolved::Failed { req, message }) = pending.pop_front() else {
+                unreachable!("front matched Failed");
+            };
+            reject(&req, message);
+            continue;
+        }
+
+        // Full-lifetime budget, honor-or-reject. `usable` accounts for the
+        // block classes the scheduler knows about; the allocator is the
+        // final authority, so add back pages held by active requests and by
+        // the front's own resolution (its restored blocks / built KV are
+        // already out of the free pool) and defer if the physical lifetime
+        // budget is smaller.
+        let (need_blocks, front_held) = match front {
+            Resolved::Plain { req, prefix } => match admission_lifetime_blocks(req, None) {
+                Ok(blocks) => (blocks, prefix.hit_tokens() / PAGE),
+                Err(err) => {
+                    let Some(resolved) = pending.pop_front() else {
+                        unreachable!("front exists");
+                    };
+                    reject(&resolved.into_request(), format!("{err:#}"));
+                    continue;
+                }
+            },
+            Resolved::Native { kv, .. } => (kv.lifetime_blocks(), kv.resident_blocks()),
+            Resolved::Failed { .. } => unreachable!("handled above"),
         };
-        let native_anchor = match native_handoff
-            .as_ref()
-            .map(|handoff| offload::native_anchor_plan(front, handoff))
-            .transpose()
-        {
-            Ok(plan) => plan,
-            Err(err) => {
-                let req = pending.pop_front().expect("checked non-empty");
-                reject(&req, format!("{err:#}"));
-                continue;
-            }
-        };
-        let need_blocks = match admission_lifetime_blocks(front, native_anchor) {
-            Ok(blocks) => blocks,
-            Err(err) => {
-                let req = pending.pop_front().expect("checked non-empty");
-                reject(&req, format!("{err:#}"));
-                continue;
-            }
-        };
-        // `usable` accounts for the block classes the scheduler knows
-        // about. The allocator is the final authority: duplicate
-        // primaries, restore probes, or another guard lifetime can make
-        // fewer pages physically allocatable than that bookkeeping
-        // predicts. Add back only pages held by active requests (already
-        // represented in `committed`) and defer the FIFO front if the
-        // resulting physical lifetime budget is smaller.
         let active_resident: usize = slots
             .iter()
             .flatten()
             .map(|active| active.kv.resident_blocks())
             .sum();
-        // The parked front's own restore holds are already inside
-        // `need_blocks`; credit them back or the front wedges forever.
-        let front_restore_held = host_restore
-            .as_ref()
-            .map_or(0, offload::HostRestoreState::front_held_blocks)
-            + native_pd
-                .as_ref()
-                .map_or(0, |pd| pd.front_held_blocks(rank));
         let physical_usable = pool
             .available_blocks()
             .saturating_add(active_resident)
-            .saturating_add(front_restore_held);
+            .saturating_add(front_held);
         if committed + need_blocks > usable.min(physical_usable) {
             break;
         }
 
-        let mut req = pending.pop_front().expect("checked non-empty");
-        let client_prompt_tokens = req.prompt_tokens.len();
-        let native_admitted = if let Some(handoff) = native_handoff.as_ref() {
-            let Some(state) = native_pd.as_mut() else {
-                reject(
-                    &req,
-                    "native-MTP P/D metadata reached a decode engine without native P/D offload"
-                        .to_string(),
-                );
-                continue;
-            };
-            let offload = offload.expect("native P/D state requires offload");
-            let outcome =
-                match offload::admit_native_mtp_pd(state, rank, offload, pool, &req, handoff) {
-                    Ok(outcome) => outcome,
-                    Err(err) => {
-                        reject_native_pd_error(state, rank, &req, &err);
-                        continue;
-                    }
+        match pending.pop_front().expect("checked non-empty") {
+            Resolved::Failed { .. } => unreachable!("handled above"),
+            Resolved::Plain { mut req, prefix } => {
+                let client_prompt_tokens = req.prompt_tokens.len();
+                let mut kv = if native_mtp_prefill {
+                    pool.new_request_with_cache_salt(
+                        req.prompt_tokens.clone(),
+                        req.max_tokens,
+                        Some(super::native_mtp_cache_salt()),
+                        None,
+                    )
+                } else {
+                    pool.new_request(req.prompt_tokens.clone(), req.max_tokens, None)
                 };
-            match outcome {
-                NativeAdmitOutcome::Admit { kv, cached_tokens } => Some((*kv, cached_tokens)),
-                NativeAdmitOutcome::Park => {
-                    pending.push_front(req);
-                    break; // head-of-line wait: retry next step boundary
-                }
-                NativeAdmitOutcome::Reject { message } => {
-                    reject(&req, message);
-                    continue;
-                }
-            }
-        } else {
-            None
-        };
-        let (mut kv, cached_tokens) = if let Some(admitted) = native_admitted {
-            admitted
-        } else {
-            // Host-tier restore before the prefix match; the H2D is polled
-            // at step boundaries, never awaited (#799). The probe must
-            // outlive the match (eviction window).
-            let _restored_hold = match host_restore.as_mut() {
-                Some(state) if prefix_cache_enabled => {
-                    match state.poll_front(offload.map(|o| &o.engine), pool, &req) {
-                        offload::HostRestoreOutcome::Ready(probe) => probe,
-                        offload::HostRestoreOutcome::Park => {
-                            pending.push_front(req);
-                            break; // head-of-line wait: retry next step boundary
+                let cached_tokens = if prefix_cache_enabled {
+                    match kv.match_and_add_prefix(pool) {
+                        Ok(cached) => cached,
+                        Err(err) => {
+                            let err = err.context("GLM5.2 prefix match at admission");
+                            let _ = req.token_tx.send(TokenEvent::Error {
+                                message: format!("{err:#}"),
+                                prompt_tokens: req.prompt_tokens.len(),
+                                completion_tokens: 0,
+                            });
+                            return Err(err);
                         }
                     }
-                }
-                _ => None,
-            };
-            let mut kv = if native_mtp_prefill {
-                pool.new_request_with_cache_salt(
+                } else {
+                    0
+                };
+                // The resolve's anti-eviction hold has served its purpose:
+                // the match above re-pinned whatever it restored.
+                drop(prefix);
+                let queued_at_unix_s = req.queued_at_unix_s.unwrap_or_else(unix_now_s);
+                let _ = req.token_tx.send(TokenEvent::Scheduled {
+                    queued_at_unix_s,
+                    scheduled_at_unix_s: unix_now_s(),
+                    prompt_tokens: client_prompt_tokens,
+                    cached_tokens,
+                });
+                let state = Glm52SlotState::new(
                     req.prompt_tokens.clone(),
                     req.max_tokens,
-                    Some(super::native_mtp_cache_salt()),
-                    None,
-                )
-            } else {
-                pool.new_request(req.prompt_tokens.clone(), req.max_tokens, None)
-            };
-            let cached_tokens = if prefix_cache_enabled {
-                match kv.match_and_add_prefix(pool) {
-                    Ok(cached) => cached,
-                    Err(err) => {
-                        // The request is already out of `pending` and never
-                        // reaches a slot, so fail it explicitly before the
-                        // engine-fatal invariant error propagates.
-                        let err = err.context("GLM5.2 prefix match at admission");
-                        let _ = req.token_tx.send(TokenEvent::Error {
-                            message: format!("{err:#}"),
-                            prompt_tokens: req.prompt_tokens.len(),
-                            completion_tokens: 0,
-                        });
-                        return Err(err);
-                    }
+                    req.params.ignore_eos,
+                    cached_tokens,
+                );
+                if drafter_enabled {
+                    pending_resets.push(slot);
                 }
-            } else {
-                0
-            };
-            (kv, cached_tokens)
-        };
-        let queued_at_unix_s = req.queued_at_unix_s.unwrap_or_else(unix_now_s);
-        if let Some(plan) = native_anchor.filter(|plan| plan.replay_to_client) {
-            req.prompt_tokens.push(plan.token);
-        }
-        let _ = req.token_tx.send(TokenEvent::Scheduled {
-            queued_at_unix_s,
-            scheduled_at_unix_s: unix_now_s(),
-            prompt_tokens: client_prompt_tokens,
-            cached_tokens,
-        });
-        if let Some(plan) = native_anchor {
-            let replay_failed = plan.replay_to_client
-                && plan.emitted_by_prefill
-                && req
-                    .token_tx
-                    .send(TokenEvent::Token {
-                        id: plan.token,
-                        logprob: None,
-                    })
-                    .is_err();
-            let finish_reason = native_anchor_finish_reason(plan, req.max_tokens);
-            if replay_failed || finish_reason.is_some() {
-                if let Some(finish_reason) = finish_reason
-                    && !req.token_tx.is_closed()
-                {
-                    let _ = req.token_tx.send(TokenEvent::Finished {
-                        finish_reason,
-                        prompt_tokens: client_prompt_tokens,
-                        completion_tokens: 1,
-                    });
-                }
-                kv.release()?;
-                continue;
+                anyhow::ensure!(
+                    kv.lifetime_blocks() == need_blocks,
+                    "GLM5.2 admission budget drift: planned {need_blocks} blocks, RequestKv \
+                     owns lifetime capacity for {}",
+                    kv.lifetime_blocks()
+                );
+                let _ = &mut req;
+                slots[slot] = Some(ActiveRequest {
+                    req,
+                    state,
+                    client_prompt_tokens,
+                    kv,
+                    save_cursor: SaveCursor::new(),
+                });
+                committed += need_blocks;
             }
-        }
-        let mut state = Glm52SlotState::new(
-            req.prompt_tokens.clone(),
-            req.max_tokens,
-            req.params.ignore_eos,
-            cached_tokens,
-        );
-        if let Some(handoff) = native_handoff {
-            anyhow::ensure!(
-                cached_tokens == handoff.committed_len,
-                "native-MTP P/D admitted {} cached tokens, expected {}",
+            Resolved::Native {
+                mut req,
+                kv,
                 cached_tokens,
-                handoff.committed_len
-            );
-            if native_anchor.is_some_and(|plan| plan.replay_to_client) {
-                state.seed_native_pd_replayed_anchor();
-            } else {
-                state.seed_native_pd_anchor();
+                handoff,
+                plan,
+            } => {
+                let client_prompt_tokens = req.prompt_tokens.len();
+                anyhow::ensure!(
+                    cached_tokens == handoff.committed_len,
+                    "native-MTP P/D admitted {} cached tokens, expected {}",
+                    cached_tokens,
+                    handoff.committed_len
+                );
+                if plan.replay_to_client {
+                    req.prompt_tokens.push(plan.token);
+                }
+                let queued_at_unix_s = req.queued_at_unix_s.unwrap_or_else(unix_now_s);
+                let _ = req.token_tx.send(TokenEvent::Scheduled {
+                    queued_at_unix_s,
+                    scheduled_at_unix_s: unix_now_s(),
+                    prompt_tokens: client_prompt_tokens,
+                    cached_tokens,
+                });
+                let replay_failed = plan.replay_to_client
+                    && plan.emitted_by_prefill
+                    && req
+                        .token_tx
+                        .send(TokenEvent::Token {
+                            id: plan.token,
+                            logprob: None,
+                        })
+                        .is_err();
+                let finish_reason = native_anchor_finish_reason(plan, req.max_tokens);
+                if replay_failed || finish_reason.is_some() {
+                    if let Some(finish_reason) = finish_reason
+                        && !req.token_tx.is_closed()
+                    {
+                        let _ = req.token_tx.send(TokenEvent::Finished {
+                            finish_reason,
+                            prompt_tokens: client_prompt_tokens,
+                            completion_tokens: 1,
+                        });
+                    }
+                    let mut kv = kv;
+                    if let Err(err) = kv.release() {
+                        log::warn!("GLM5.2 native P/D anchored-finish release: {err:#}");
+                    }
+                    continue;
+                }
+                let mut state = Glm52SlotState::new(
+                    req.prompt_tokens.clone(),
+                    req.max_tokens,
+                    req.params.ignore_eos,
+                    cached_tokens,
+                );
+                if plan.replay_to_client {
+                    state.seed_native_pd_replayed_anchor();
+                } else {
+                    state.seed_native_pd_anchor();
+                }
+                state.set_drafts(
+                    handoff.draft_tokens.to_vec(),
+                    crate::mtp::glm52_mtp_draft_len(),
+                );
+                log::info!(
+                    "GLM5.2 native P/D admitted: rank={rank} slot={slot} \
+                     committed_len={} drafts={} first_step=verify",
+                    handoff.committed_len,
+                    handoff.draft_tokens.len()
+                );
+                if drafter_enabled {
+                    pending_resets.push(slot);
+                }
+                anyhow::ensure!(
+                    kv.lifetime_blocks() == need_blocks,
+                    "GLM5.2 native admission budget drift: planned {need_blocks}, KV owns {}",
+                    kv.lifetime_blocks()
+                );
+                slots[slot] = Some(ActiveRequest {
+                    req,
+                    state,
+                    client_prompt_tokens,
+                    kv: *kv,
+                    save_cursor: SaveCursor::new(),
+                });
+                committed += need_blocks;
             }
-            state.set_drafts(
-                handoff.draft_tokens.to_vec(),
-                crate::mtp::glm52_mtp_draft_len(),
-            );
-            log::info!(
-                "GLM5.2 native P/D admitted: rank={rank} slot={slot} \
-                 committed_len={} drafts={} first_step=verify",
-                handoff.committed_len,
-                handoff.draft_tokens.len()
-            );
         }
-        if drafter_enabled {
-            pending_resets.push(slot);
-        }
-        anyhow::ensure!(
-            kv.lifetime_blocks() == need_blocks,
-            "GLM5.2 admission budget drift: planned {need_blocks} blocks, RequestKv owns \
-             lifetime capacity for {}",
-            kv.lifetime_blocks()
-        );
-        slots[slot] = Some(ActiveRequest {
-            req,
-            state,
-            client_prompt_tokens,
-            kv,
-        });
-        committed += need_blocks;
     }
     Ok(())
 }
@@ -584,26 +528,6 @@ mod tests {
             validate_request(&overflows, 4096, true, false).is_ok(),
             "plain TP4 prefill does not execute the native-MTP proposal loop"
         );
-    }
-
-    #[test]
-    fn native_pd_restore_error_rejects_only_the_request() {
-        let mut req = request(vec![10], SamplingParams::default(), 1);
-        let (token_tx, mut token_rx) = openinfer_core::engine::TokenSink::standalone();
-        req.token_tx = token_tx;
-        let mut state = offload::NativePdState::new(1);
-
-        reject_native_pd_error(&mut state, 0, &req, &anyhow::anyhow!("invalid handoff"));
-
-        assert!(matches!(
-            token_rx.try_recv().map(|(_, event)| event),
-            Ok(TokenEvent::Scheduled { .. })
-        ));
-        assert!(matches!(
-            token_rx.try_recv().map(|(_, event)| event),
-            Ok(TokenEvent::Rejected { message, .. })
-                if message.contains("invalid handoff")
-        ));
     }
 
     #[test]

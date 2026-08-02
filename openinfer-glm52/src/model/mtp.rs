@@ -27,7 +27,7 @@ use openinfer_kernels::ops::glm52_flashmla_sparse_decode_num_sm_parts;
 use openinfer_kernels::ops::rms_norm_rows_into;
 use openinfer_kernels::tensor::DeviceContext;
 use openinfer_kernels::tensor::DeviceMatrix;
-use openinfer_kv_offload::KvArena;
+use openinfer_kv_store::ArenaSpec;
 
 use super::GLM52_DECODE_BUCKETS;
 use super::GLM52_MAX_BATCH_PER_RANK;
@@ -299,7 +299,7 @@ impl Glm52NativeMtp {
         (&self.bookend, &self.layer, transfer, &mut self.cache)
     }
 
-    pub(super) fn kv_arenas(&self, stream: &cudarc::driver::CudaStream) -> Result<[KvArena; 2]> {
+    pub(super) fn kv_arenas(&self, stream: &cudarc::driver::CudaStream) -> Result<[ArenaSpec; 2]> {
         let mla_bytes = GLM52_FLASHMLA_SPARSE_PAGE_SIZE * GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN;
         let idx_bytes = INDEX_CACHE_BLOCK * (GLM52_INDEX_HEAD_DIM + 4);
         let transfer = self.transfer_cache.as_ref().unwrap_or(&self.cache);
@@ -310,20 +310,18 @@ impl Glm52NativeMtp {
             .context("GLM5.2 MTP layer 78 has no index-K cache")?;
         let (idx_ptr, _) = index_k.device_ptr(stream);
         Ok([
-            KvArena {
-                name: format!("glm52.L{GLM52_MTP_LAYER}.mla"),
-                base_ptr: mla_ptr,
-                num_blocks: self.committed_blocks,
-                bytes_per_block: mla_bytes,
-                block_stride_bytes: mla_bytes,
-            },
-            KvArena {
-                name: format!("glm52.L{GLM52_MTP_LAYER}.idxk"),
-                base_ptr: idx_ptr,
-                num_blocks: self.committed_blocks,
-                bytes_per_block: idx_bytes,
-                block_stride_bytes: idx_bytes,
-            },
+            super::contiguous_arena(
+                format!("glm52.L{GLM52_MTP_LAYER}.mla"),
+                mla_ptr,
+                self.committed_blocks,
+                mla_bytes,
+            ),
+            super::contiguous_arena(
+                format!("glm52.L{GLM52_MTP_LAYER}.idxk"),
+                idx_ptr,
+                self.committed_blocks,
+                idx_bytes,
+            ),
         ])
     }
 

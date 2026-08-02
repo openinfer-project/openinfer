@@ -315,6 +315,7 @@ mod tests {
             state,
             client_prompt_tokens: 1,
             kv,
+            save_cursor: openinfer_kv_store::SaveCursor::new(),
         });
         slots
     }
@@ -386,6 +387,7 @@ mod tests {
             state: decode_state,
             client_prompt_tokens: 1,
             kv: test_kv(vec![10], 8),
+            save_cursor: openinfer_kv_store::SaveCursor::new(),
         });
 
         let mut boundary_state = state(vec![10, 11, 12, 13, 14], 8, false);
@@ -398,6 +400,7 @@ mod tests {
             state: boundary_state,
             client_prompt_tokens: 5,
             kv: test_kv(vec![10, 11, 12, 13, 14], 8),
+            save_cursor: openinfer_kv_store::SaveCursor::new(),
         });
 
         let mut greedy_state = state(vec![10], 8, false);
@@ -410,6 +413,7 @@ mod tests {
             state: greedy_state,
             client_prompt_tokens: 1,
             kv: test_kv(vec![10], 8),
+            save_cursor: openinfer_kv_store::SaveCursor::new(),
         });
 
         rank_slots[3] = Some(ActiveRequest {
@@ -417,6 +421,7 @@ mod tests {
             state: state(vec![30; 10], 8, false),
             client_prompt_tokens: 10,
             kv: test_kv(vec![30; 10], 8),
+            save_cursor: openinfer_kv_store::SaveCursor::new(),
         });
 
         let rows = collect_sampling_rows(&shape, &rank_slots);
@@ -455,6 +460,7 @@ mod tests {
             state,
             client_prompt_tokens: 1,
             kv: test_kv(vec![10], 8),
+            save_cursor: openinfer_kv_store::SaveCursor::new(),
         });
         assert!(collect_sampling_rows(&shape, &rank_slots).is_empty());
     }

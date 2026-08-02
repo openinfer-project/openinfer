@@ -17,8 +17,7 @@ log = { workspace = true }
 memmap2 = { workspace = true }
 openinfer-core = { workspace = true }
 openinfer-kernels = { workspace = true, features = ["glm52"] }
-openinfer-kv-cache = { workspace = true }
-openinfer-kv-offload = { workspace = true }
+openinfer-kv-store = { workspace = true }
 openinfer-sample = { workspace = true }
 rayon = { workspace = true }
 safetensors = { workspace = true }

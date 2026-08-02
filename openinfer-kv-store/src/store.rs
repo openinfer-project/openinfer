@@ -342,6 +342,88 @@ impl KvStore {
         }
     }
 
+    /// Save the request's LAST currently-held page under an explicit content
+    /// key — the disaggregated-prefill tail: a partial page that has no
+    /// lineage hash (it never sealed), keyed instead by a digest the handoff
+    /// envelope carries to the consuming peer.
+    ///
+    /// The save's completion joins `cursor.pending`, so the following
+    /// [`Self::retire`] with [`SaveClass::Handoff`] parks the KV until the
+    /// D2H lands — the parked KV itself is the reuse pin for the unsealed
+    /// page (it has no `KvBlockGuard`). Contract: call this only between the
+    /// step that wrote the tail and the retire; the KV must not release in
+    /// between.
+    pub fn seal_keyed(&self, rank: usize, kv: &RequestKv, key: [u8; 16], cursor: &mut SaveCursor) {
+        let state = self.rank(rank);
+        let Some(tier) = state.tier.as_ref() else {
+            return;
+        };
+        let Some(&tail_page) = kv.current_page_indices().last() else {
+            return;
+        };
+        self.stats.saves_submitted.fetch_add(1, Ordering::Relaxed);
+        let save = tier.save(vec![tail_page], vec![key.to_vec()], Vec::new());
+        let (tx, rx) = oneshot::channel();
+        cursor.pending.push(rx);
+        let stats = Arc::clone(&self.stats);
+        self.runtime.spawn(async move {
+            let outcome = match save.await {
+                Ok(()) => Ok(()),
+                Err(err) => {
+                    stats.saves_failed.fetch_add(1, Ordering::Relaxed);
+                    log::warn!("kv-store keyed save failed: {err:#}");
+                    Err(format!("{err:#}"))
+                }
+            };
+            let _ = tx.send(outcome);
+        });
+    }
+
+    /// Fetch one block stored under an explicit content key into the GPU
+    /// page `dst_page_id` — the decode side of the tail handoff. The
+    /// destination page belongs to the caller's scheduled `RequestKv`, so it
+    /// never enters the radix (no lineage hash to register under).
+    ///
+    /// The query phase re-queries under the resolve deadline (the producer's
+    /// registration may not have landed); the H2D itself is awaited without
+    /// a timeout — the caller owns the destination page and must keep it
+    /// alive until this returns (drop-on-timeout would race the DMA).
+    pub async fn resolve_keyed_block(
+        &self,
+        rank: usize,
+        req_id: &str,
+        key: [u8; 16],
+        dst_page_id: i32,
+    ) -> anyhow::Result<()> {
+        let state = self.rank(rank);
+        let tier = state
+            .tier
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("rank {rank} has no host tier for a keyed fetch"))?;
+        let deadline = Instant::now() + self.resolve_deadline;
+        let hit = loop {
+            let query =
+                tokio::time::timeout_at(deadline, tier.query(req_id, vec![key.to_vec()], true));
+            match query.await {
+                Err(_elapsed) => anyhow::bail!("keyed fetch deadline: key never became resident"),
+                Ok(Err(err)) => return Err(err.context("keyed fetch query")),
+                Ok(Ok(TierQuery::Hit(hit))) if hit.blocks == 1 => break hit,
+                Ok(Ok(TierQuery::Hit(hit))) => {
+                    let blocks = hit.blocks;
+                    tier.release(hit);
+                    anyhow::bail!("keyed fetch resolved {blocks} blocks for one key");
+                }
+                Ok(Ok(TierQuery::Miss | TierQuery::Loading)) => {
+                    if Instant::now() >= deadline {
+                        anyhow::bail!("keyed fetch deadline: key never became resident");
+                    }
+                    tokio::time::sleep(self.requery_interval).await;
+                }
+            }
+        };
+        tier.load(hit, vec![dst_page_id]).await
+    }
+
     /// The rank table is frozen at build, so an unknown rank is a wiring
     /// bug — masking it (e.g. silently no-op'ing a Handoff seal) would
     /// violate the no-silent-drop contract. Fail fast instead.

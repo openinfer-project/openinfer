@@ -4,11 +4,17 @@
 //! the full-lifetime reservation must be proven tight here.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use openinfer_core::engine::FinishReason;
+use openinfer_core::engine::GenerateRequest;
+use openinfer_core::engine::KvPrefix;
 use openinfer_core::engine::LoadSnapshot;
 use openinfer_core::engine::TokenSink;
-use openinfer_kv_cache::BlockPool;
+use openinfer_kv_store::BlockPool;
+use openinfer_kv_store::KvStore;
+use openinfer_kv_store::KvStoreBuilder;
+use openinfer_kv_store::SaveCursor;
 use openinfer_sample::SamplingParams;
 
 use super::ActiveRequest;
@@ -17,6 +23,7 @@ use super::RankSlots;
 use super::admission::lifetime_blocks;
 use super::admit_from_queue;
 use super::graph::graph_dump_bucket;
+use super::offload::Resolved;
 use super::publish_load;
 use super::slot::GLM52_DSPARK_EP8_SPAN_DRAFTS;
 use super::slot::Glm52SlotState;
@@ -25,6 +32,26 @@ use super::testkit::EOS;
 use super::testkit::request;
 use crate::model::GLM52_MAX_BATCH_PER_RANK;
 
+/// A tier-less store over `pool`, on a private runtime: admission consults
+/// only `pinned_blocks` (0 here), so any live handle serves.
+fn test_store(pool: &Arc<BlockPool>) -> (KvStore, tokio::runtime::Runtime) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    let store = KvStoreBuilder::new(rt.handle().clone())
+        .rank(0, Arc::clone(pool))
+        .build();
+    (store, rt)
+}
+
+fn plain(req: GenerateRequest) -> Resolved {
+    Resolved::Plain {
+        req,
+        prefix: KvPrefix::none(),
+    }
+}
+
 #[test]
 fn graph_dump_uses_bucket_one() {
     assert_eq!(graph_dump_bucket(), 1, "EP and TP4 export bucket-1 graphs");
@@ -32,7 +59,7 @@ fn graph_dump_uses_bucket_one() {
 
 #[test]
 fn load_snapshot_reports_the_ranks_own_state() {
-    let pool = BlockPool::new(PAGE, 8).expect("pool");
+    let pool = Arc::new(BlockPool::new(PAGE, 8));
     let mut slots: RankSlots = std::array::from_fn(|_| None);
 
     let req = request(vec![10, 11], SamplingParams::default(), 4);
@@ -44,11 +71,12 @@ fn load_snapshot_reports_the_ranks_own_state() {
         state,
         client_prompt_tokens: 2,
         kv,
+        save_cursor: SaveCursor::new(),
     });
 
     let mut pending = VecDeque::new();
-    pending.push_back(request(vec![20], SamplingParams::default(), 4));
-    pending.push_back(request(vec![21], SamplingParams::default(), 4));
+    pending.push_back(plain(request(vec![20], SamplingParams::default(), 4)));
+    pending.push_back(plain(request(vec![21], SamplingParams::default(), 4)));
 
     let (load_tx, load_rx) = tokio::sync::watch::channel(LoadSnapshot::default());
     publish_load(&load_tx, &pool, &slots, &pending);
@@ -62,25 +90,24 @@ fn load_snapshot_reports_the_ranks_own_state() {
 
 #[test]
 fn admission_fills_free_slots_from_the_local_queue() {
-    let pool = BlockPool::new(PAGE, 8).expect("pool");
+    let pool = Arc::new(BlockPool::new(PAGE, 8));
     let mut slots: RankSlots = std::array::from_fn(|_| None);
     let mut pending = VecDeque::new();
     let mut req = request(vec![10], SamplingParams::default(), 4);
     req.data_parallel_rank = Some(0);
     let (token_tx, _token_rx) = TokenSink::standalone();
     req.token_tx = token_tx;
-    pending.push_back(req);
+    pending.push_back(plain(req));
     let mut pending_resets = Vec::new();
 
+    let (store, _rt) = test_store(&pool);
     admit_from_queue(
         0,
         &mut pending,
         &mut slots,
         &pool,
         7,
-        None,
-        &mut None,
-        &mut None,
+        &store,
         false,
         false,
         false,
@@ -94,7 +121,7 @@ fn admission_fills_free_slots_from_the_local_queue() {
 
 #[test]
 fn prefill_only_admits_multiple_requests_within_pool_capacity() {
-    let pool = BlockPool::new(PAGE, 16).expect("pool");
+    let pool = Arc::new(BlockPool::new(PAGE, 16));
     let mut slots: RankSlots = std::array::from_fn(|_| None);
     let mut pending = VecDeque::new();
     let mut token_receivers = Vec::new();
@@ -103,19 +130,18 @@ fn prefill_only_admits_multiple_requests_within_pool_capacity() {
         let (token_tx, token_rx) = TokenSink::standalone();
         req.token_tx = token_tx;
         token_receivers.push(token_rx);
-        pending.push_back(req);
+        pending.push_back(plain(req));
     }
     let mut pending_resets = Vec::new();
 
+    let (store, _rt) = test_store(&pool);
     admit_from_queue(
         0,
         &mut pending,
         &mut slots,
         &pool,
         15,
-        None,
-        &mut None,
-        &mut None,
+        &store,
         true,
         false,
         true,
@@ -129,7 +155,7 @@ fn prefill_only_admits_multiple_requests_within_pool_capacity() {
 
 #[test]
 fn admission_defers_while_physical_pages_are_temporarily_held() {
-    let pool = BlockPool::new(PAGE, 6).expect("pool");
+    let pool = Arc::new(BlockPool::new(PAGE, 6));
     let mut held = pool.new_request(vec![1; 2 * PAGE], 1, None);
     held.schedule_prefill(2 * PAGE, &pool)
         .expect("temporarily hold two physical pages");
@@ -139,18 +165,17 @@ fn admission_defers_while_physical_pages_are_temporarily_held() {
     let mut req = request(vec![2; 3 * PAGE], SamplingParams::default(), 1);
     let (token_tx, _token_rx) = TokenSink::standalone();
     req.token_tx = token_tx;
-    pending.push_back(req);
+    pending.push_back(plain(req));
     let mut pending_resets = Vec::new();
 
+    let (store, _rt) = test_store(&pool);
     admit_from_queue(
         0,
         &mut pending,
         &mut slots,
         &pool,
         5,
-        None,
-        &mut None,
-        &mut None,
+        &store,
         true,
         false,
         true,
@@ -168,9 +193,7 @@ fn admission_defers_while_physical_pages_are_temporarily_held() {
         &mut slots,
         &pool,
         5,
-        None,
-        &mut None,
-        &mut None,
+        &store,
         true,
         false,
         true,
@@ -280,11 +303,11 @@ fn full_lifetime_reservation_covers_kvbm_peak_draw() {
     ] {
         for with_drafts in [false, true] {
             let lifetime = lifetime_blocks(prompt_len, max_tokens);
-            let pool = BlockPool::new(PAGE, lifetime + 1).expect("pool");
+            let pool = Arc::new(BlockPool::new(PAGE, lifetime + 1));
             drive_request(&pool, prompt_len, max_tokens, with_drafts).unwrap_or_else(|e| {
                 panic!("({prompt_len},{max_tokens},drafts={with_drafts}): {e}")
             });
-            let tight = BlockPool::new(PAGE, lifetime).expect("tight pool");
+            let tight = Arc::new(BlockPool::new(PAGE, lifetime));
             assert!(
                 drive_request(&tight, prompt_len, max_tokens, with_drafts).is_err(),
                 "({prompt_len},{max_tokens},drafts={with_drafts}): a budget below the \
@@ -299,7 +322,7 @@ fn eos_truncated_speculative_apply_stays_in_contract() {
     // EOS mid-verify-span truncates `committed` (the suppressed EOS is
     // its last entry); `apply_speculative` with the truncated run and
     // the release must both stay clean.
-    let pool = BlockPool::new(PAGE, 16).expect("pool");
+    let pool = Arc::new(BlockPool::new(PAGE, 16));
     let prompt: Vec<u32> = (0..70).collect();
     let mut state = Glm52SlotState::new(prompt.clone(), 32, false, 0);
     let mut kv = pool.new_request(prompt, 32, None);

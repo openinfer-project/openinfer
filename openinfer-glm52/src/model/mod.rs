@@ -41,7 +41,7 @@ use openinfer_kernels::tensor::DeviceContext;
 use openinfer_kernels::tensor::DeviceMatrix;
 use openinfer_kernels::tensor::DeviceVec;
 use openinfer_kernels::tensor::HiddenStatesRef;
-use openinfer_kv_offload::KvArena;
+use openinfer_kv_store::ArenaSpec;
 use openinfer_sample::BatchSamplingRow;
 use openinfer_sample::BatchSamplingScratch;
 use openinfer_sample::effectively_greedy;
@@ -540,7 +540,7 @@ impl Glm52RankModel {
     /// block's MLA page and its index-K slice together — an MLA page restored
     /// without its index-K would be silent corruption. The arenas are
     /// contiguous, so a block's stride equals its copy size.
-    pub(crate) fn kv_arenas(&self, stream: &CudaStream) -> Result<Vec<KvArena>> {
+    pub(crate) fn kv_arenas(&self, stream: &CudaStream) -> Result<Vec<ArenaSpec>> {
         let num_blocks = self.pool_blocks;
         let mla_block_bytes = GLM52_FLASHMLA_SPARSE_PAGE_SIZE * self.mla_cache_bytes_per_token;
         let idxk_block_bytes = INDEX_CACHE_BLOCK * (GLM52_INDEX_HEAD_DIM + 4);
@@ -553,13 +553,12 @@ impl Glm52RankModel {
                 caches.mla_cache.len(),
             );
             let (base_ptr, _sync) = caches.mla_cache.device_ptr(stream);
-            arenas.push(KvArena {
-                name: format!("glm52.L{layer}.mla"),
+            arenas.push(contiguous_arena(
+                format!("glm52.L{layer}.mla"),
                 base_ptr,
                 num_blocks,
-                bytes_per_block: mla_block_bytes,
-                block_stride_bytes: mla_block_bytes,
-            });
+                mla_block_bytes,
+            ));
             if let Some(index_k) = &caches.index_k_cache {
                 ensure!(
                     index_k.len() == num_blocks * idxk_block_bytes,
@@ -568,13 +567,12 @@ impl Glm52RankModel {
                     index_k.len(),
                 );
                 let (base_ptr, _sync) = index_k.device_ptr(stream);
-                arenas.push(KvArena {
-                    name: format!("glm52.L{layer}.idxk"),
+                arenas.push(contiguous_arena(
+                    format!("glm52.L{layer}.idxk"),
                     base_ptr,
                     num_blocks,
-                    bytes_per_block: idxk_block_bytes,
-                    block_stride_bytes: idxk_block_bytes,
-                });
+                    idxk_block_bytes,
+                ));
             }
         }
         if let Some(mtp) = &self.mtp {
@@ -1590,5 +1588,27 @@ mod cache_layout_tests {
         assert_eq!(tp4_prefill, ep_decode);
         assert_eq!(GLM52_FLASHMLA_SPARSE_PAGE_SIZE * tp4_prefill, 41_984);
         assert_eq!(INDEX_CACHE_BLOCK * (GLM52_INDEX_HEAD_DIM + 4), 8_448);
+    }
+}
+
+/// A contiguous cache arena (stride == copy size, one segment) — every
+/// GLM5.2 cache allocation is one flat per-layer buffer, so a block's
+/// strided extent is just its byte size and the arena length covers exactly
+/// `num_blocks` of them.
+pub(crate) fn contiguous_arena(
+    name: String,
+    base_device_ptr: u64,
+    num_blocks: usize,
+    block_bytes: usize,
+) -> ArenaSpec {
+    ArenaSpec {
+        name,
+        base_device_ptr,
+        size_bytes: num_blocks * block_bytes,
+        num_blocks,
+        segment_bytes: block_bytes,
+        segments: 1,
+        kv_stride_bytes: 0,
+        block_stride_bytes: block_bytes,
     }
 }
