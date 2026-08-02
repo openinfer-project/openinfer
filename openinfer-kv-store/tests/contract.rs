@@ -145,6 +145,7 @@ async fn resolve_deadline_degrades_to_gpu_hit_alone() {
     let config = KvStoreConfig {
         requery_interval: Duration::from_millis(1),
         resolve_deadline: Duration::from_millis(20),
+        ..KvStoreConfig::default()
     };
     let store = KvStore::new(tokio::runtime::Handle::current(), config);
     let pool = pool(64);
@@ -269,6 +270,53 @@ async fn cancellation_after_query_releases_the_lease() {
     assert_eq!(mock.loads.lock().unwrap().len(), 0);
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn hung_query_degrades_by_deadline() {
+    // A query future that never settles (hung storage worker) must degrade
+    // exactly like a slow one — the request cannot strand outside the
+    // scheduler (Codex review, PR #825).
+    let config = KvStoreConfig {
+        resolve_deadline: Duration::from_millis(20),
+        ..KvStoreConfig::default()
+    };
+    let store = KvStore::new(tokio::runtime::Handle::current(), config);
+    let pool = pool(64);
+    let prompt = prompt(5);
+    seed_gpu_prefix(&pool, &prompt, 2);
+    let tier = Arc::new(MockTier::scripted([MockQuery::Hang]));
+    store.register_rank(RANK, Arc::clone(&pool), Some(tier));
+
+    let prefix = store
+        .resolve_prefix(RANK, "r1", &prompt, CacheScope::default(), &NeverCancelled)
+        .await;
+    assert_eq!(prefix.hit_tokens(), 2 * BLOCK_SIZE);
+    assert_eq!(store.stats().resolve_degraded.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn hung_load_degrades_but_never_frees_the_reservation() {
+    let config = KvStoreConfig {
+        resolve_deadline: Duration::from_millis(30),
+        ..KvStoreConfig::default()
+    };
+    let store = KvStore::new(tokio::runtime::Handle::current(), config);
+    let pool = pool(64);
+    let prompt = prompt(3);
+    let tier = Arc::new(MockTier::scripted([MockQuery::Hit(3)]).with_hung_loads());
+    store.register_rank(RANK, Arc::clone(&pool), Some(tier));
+
+    let usable_before = pool.available_blocks();
+    let prefix = store
+        .resolve_prefix(RANK, "r1", &prompt, CacheScope::default(), &NeverCancelled)
+        .await;
+    // Degraded to no hit — but the DMA may still be writing: the abandoned
+    // reservation stays owned by the detached task, so its destination
+    // blocks must NOT have returned to the pool.
+    assert_eq!(prefix.hit_tokens(), 0);
+    assert_eq!(store.stats().resolve_degraded.load(Ordering::Relaxed), 1);
+    assert_eq!(pool.available_blocks(), usable_before - 3);
+}
+
 // ── seal / retire ──────────────────────────────────────────────────────
 
 /// Run a request through a 3-block prefill so it owns sealed blocks.
@@ -350,6 +398,68 @@ async fn retire_handoff_parks_the_kv_until_saves_settle() {
     })
     .await;
     wait_until("save pins released", || store.pinned_blocks(RANK) == 0).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cacheable_saves_shed_under_pin_pressure_and_retry_after() {
+    // Budget = 64 * 10% = 6 blocks. Two 4-block requests: the second must
+    // shed (4 + 4 > 6) instead of pinning admission out of the pool; once
+    // pressure clears, re-sealing submits it (the cursor did not advance).
+    let config = KvStoreConfig {
+        cacheable_pin_percent: 10,
+        ..KvStoreConfig::default()
+    };
+    let store = KvStore::new(tokio::runtime::Handle::current(), config);
+    let pool = pool(64);
+    let tier = Arc::new(MockTier::default().with_manual_saves());
+    store.register_rank(RANK, Arc::clone(&pool), Some(tier.clone()));
+
+    let prompt_a: Vec<u32> = (0..=(4 * BLOCK_SIZE) as u32).map(|i| i % 241).collect();
+    let prompt_b: Vec<u32> = (0..=(4 * BLOCK_SIZE) as u32).map(|i| 1 + i % 239).collect();
+    let kv_a = sealed_request(&pool, &prompt_a);
+    let kv_b = sealed_request(&pool, &prompt_b);
+
+    let mut cursor_a = SaveCursor::new();
+    let mut cursor_b = SaveCursor::new();
+    store.seal(RANK, &kv_a, &mut cursor_a, SaveClass::Cacheable);
+    assert_eq!(store.pinned_blocks(RANK), 4);
+    store.seal(RANK, &kv_b, &mut cursor_b, SaveClass::Cacheable);
+    assert_eq!(tier.saves.lock().unwrap().len(), 1);
+    assert_eq!(store.stats().saves_shed.load(Ordering::Relaxed), 1);
+    assert_eq!(store.pinned_blocks(RANK), 4);
+
+    tier.complete_saves();
+    wait_until("first save's pins released", || {
+        store.pinned_blocks(RANK) == 0
+    })
+    .await;
+    store.seal(RANK, &kv_b, &mut cursor_b, SaveClass::Cacheable);
+    assert_eq!(tier.saves.lock().unwrap().len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_handoff_save_is_counted_and_still_releases() {
+    let store = store();
+    let pool = pool(64);
+    let prompt = prompt(3);
+    let tier = Arc::new(MockTier::default().with_manual_saves());
+    store.register_rank(RANK, Arc::clone(&pool), Some(tier.clone()));
+
+    let usable_before = pool.available_blocks();
+    let kv = sealed_request(&pool, &prompt);
+    store.retire(RANK, kv, SaveCursor::new(), SaveClass::Handoff);
+
+    tier.fail_saves();
+    wait_until("handoff failure counted", || {
+        store.stats().handoff_failed.load(Ordering::Relaxed) == 1
+    })
+    .await;
+    // The blocks still return (no leak); the miss is the peer's to observe.
+    wait_until("parked KV released after failure", || {
+        pool.available_blocks() >= usable_before
+    })
+    .await;
+    assert_eq!(store.stats().saves_failed.load(Ordering::Relaxed), 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]

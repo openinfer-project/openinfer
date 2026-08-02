@@ -23,6 +23,8 @@ pub enum MockQuery {
     Miss,
     Loading,
     Hit(usize),
+    /// The query future never resolves — a hung storage worker.
+    Hang,
 }
 
 type PendingSave = (
@@ -44,6 +46,8 @@ pub struct MockTier {
     /// When true, saves stay in flight until [`Self::complete_saves`];
     /// their keep-alive payloads are held with them (the pin semantics).
     manual_saves: bool,
+    /// When true, load futures never resolve — a hung DMA.
+    hang_loads: bool,
     pending_saves: Mutex<Vec<PendingSave>>,
 }
 
@@ -63,6 +67,13 @@ impl MockTier {
         self
     }
 
+    /// A tier whose loads never settle (hung DMA).
+    #[must_use]
+    pub fn with_hung_loads(mut self) -> Self {
+        self.hang_loads = true;
+        self
+    }
+
     pub fn released(&self) -> usize {
         self.released.load(Ordering::Acquire)
     }
@@ -79,6 +90,16 @@ impl MockTier {
             drop(keep_alive);
         }
     }
+
+    /// Settle every in-flight save with a storage error.
+    pub fn fail_saves(&self) {
+        for (tx, keep_alive) in self.pending_saves.lock().expect("pending_saves").drain(..) {
+            let _ = tx.send(Err(openinfer_kv_offload::EngineError::Storage(
+                "mock save failure".into(),
+            )));
+            drop(keep_alive);
+        }
+    }
 }
 
 impl HostTier for MockTier {
@@ -89,17 +110,21 @@ impl HostTier for MockTier {
             .expect("script")
             .pop_front()
             .unwrap_or(MockQuery::Miss);
-        Box::pin(std::future::ready(Ok(match step {
-            MockQuery::Miss => TierQuery::Miss,
-            MockQuery::Loading => TierQuery::Loading,
-            MockQuery::Hit(blocks) => TierQuery::Hit(TierHit {
+        match step {
+            MockQuery::Miss => Box::pin(std::future::ready(Ok(TierQuery::Miss))),
+            MockQuery::Loading => Box::pin(std::future::ready(Ok(TierQuery::Loading))),
+            MockQuery::Hit(blocks) => Box::pin(std::future::ready(Ok(TierQuery::Hit(TierHit {
                 blocks,
                 token: Box::new(()),
-            }),
-        })))
+            })))),
+            MockQuery::Hang => Box::pin(std::future::pending()),
+        }
     }
 
     fn load(&self, _hit: TierHit, dst_page_ids: Vec<i32>) -> TierFuture<anyhow::Result<()>> {
+        if self.hang_loads {
+            return Box::pin(std::future::pending());
+        }
         self.loads.lock().expect("loads").push(dst_page_ids);
         Box::pin(std::future::ready(Ok(())))
     }

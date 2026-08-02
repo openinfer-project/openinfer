@@ -78,7 +78,7 @@ impl KvStore {
 
 - **`resolve_prefix` 是整条读链路**：probe radix → host tier query（重查询间隔/deadline 内置）→ 水位门控的 `reserve_loaded_blocks` → H2D → `commit_loaded_blocks`（恢复即入 radix，后续 `match_and_add_prefix` 自然命中——qwen3 已验证的模式）。**终态恰好一种**：`KvPrefix { hit_tokens, hold }`。降级（超时/熔断/池压力）只进 stats，不进类型——不改变调用方控制流的信息不配进返回类型。P/D 侧 `hit_tokens < committed_len` 这个数字即全部信息。
 - **`seal`/`retire` 是写链路**：`SaveClass::Cacheable` fire-and-forget 可 shed（丢的只是未来命中）；`SaveClass::Handoff` 必达带租约（P 存的 entry 在 D 取走前不可逐出——eviction 在 store-based P/D 下是正确性问题，8 GiB 打穿 + 15s deadline 事故的教训）。retire 收编三处手写变奏（qwen3 flush barrier、glm52 `save_sealed_on_release` 先存后放、`detach_tail_save` 停放）：seal 尾部 → 有未决 save 则整个 KV 随 save 停放，settle 后 RAII 归还。
-- **背压恒等式**：飞行中 save 钉住的页从 admission 预算里扣（`pinned_blocks`，glm52 现状收编）；Cacheable 超预算 shed，Handoff 只 backpressure admission，**永不 block decode**。
+- **背压恒等式**：飞行中 save 钉住的页从 admission 预算里扣（`pinned_blocks`，glm52 现状收编）；Cacheable 超预算即 shed（`cacheable_pin_percent`，默认池的 25%，cursor 不前进、压力解除后重试），Handoff 只 backpressure admission，**永不 block decode**。Handoff save 失败：计数 + 大声报错、块照常归还——对端以 hit 短缺观察到缺失并拒绝 handoff；P 侧"扣住 KV-ready 响应直到 save 确认"（glm52 flush-on-finish 语义）的接线随 P/D 迁移落地。
 
 ### 请求管线：线性所有权链
 

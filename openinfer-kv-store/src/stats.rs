@@ -32,6 +32,12 @@ pub struct KvStoreStats {
     pub resolve_degraded: AtomicU64,
     pub saves_submitted: AtomicU64,
     pub saves_failed: AtomicU64,
+    /// Cacheable saves dropped under pin pressure — forfeited future hits,
+    /// never correctness.
+    pub saves_shed: AtomicU64,
+    /// Handoff-class saves that settled with an error: the checkpoint the
+    /// consuming peer expects is missing, observable there as a short hit.
+    pub handoff_failed: AtomicU64,
     pub retires_parked: AtomicU64,
 }
 

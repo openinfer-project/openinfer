@@ -97,9 +97,9 @@ pub enum SaveClass {
 #[derive(Default)]
 pub struct SaveCursor {
     saved_blocks: usize,
-    /// Completion signals of this request's `Handoff`-class saves, awaited by
-    /// [`KvStore::retire`] before the KV releases.
-    pending: Vec<oneshot::Receiver<()>>,
+    /// Completion outcomes of this request's `Handoff`-class saves, awaited
+    /// by [`KvStore::retire`] before the KV releases.
+    pending: Vec<oneshot::Receiver<Result<(), String>>>,
 }
 
 impl SaveCursor {
@@ -113,9 +113,16 @@ impl SaveCursor {
 pub struct KvStoreConfig {
     /// Pause between host-tier re-queries while a deeper tier is fetching.
     pub requery_interval: Duration,
-    /// Ceiling on one resolve's host-tier wait before degrading to the GPU
-    /// hit alone.
+    /// Ceiling on one resolve's host-tier wait — bounds every tier await
+    /// (query and load alike), so a hung storage worker degrades the resolve
+    /// instead of stranding the request outside the scheduler.
     pub resolve_deadline: Duration,
+    /// Ceiling on the pool share `Cacheable` saves may pin, as a percent of
+    /// the rank's total blocks. Past it, cacheable saves shed (a forfeited
+    /// future hit) instead of pinning admission out of the pool. `Handoff`
+    /// saves are exempt — their backpressure is admission reading
+    /// [`KvStore::pinned_blocks`].
+    pub cacheable_pin_percent: usize,
 }
 
 impl Default for KvStoreConfig {
@@ -125,6 +132,7 @@ impl Default for KvStoreConfig {
             // 15s handoff deadline).
             requery_interval: Duration::from_millis(5),
             resolve_deadline: Duration::from_secs(15),
+            cacheable_pin_percent: 25,
         }
     }
 }
@@ -142,6 +150,9 @@ struct RankState {
     /// Blocks pinned by in-flight saves — physically unallocatable until
     /// their D2H lands. Admission subtracts this from its budget.
     pinned: Arc<AtomicUsize>,
+    /// Pin ceiling for `Cacheable` saves (from
+    /// [`KvStoreConfig::cacheable_pin_percent`] of the pool).
+    cacheable_pin_budget: usize,
 }
 
 impl Clone for RankState {
@@ -151,6 +162,7 @@ impl Clone for RankState {
             tier: self.tier.clone(),
             floor: Arc::clone(&self.floor),
             pinned: Arc::clone(&self.pinned),
+            cacheable_pin_budget: self.cacheable_pin_budget,
         }
     }
 }
@@ -183,11 +195,13 @@ impl KvStore {
         pool: Arc<BlockPool>,
         tier: Option<Arc<dyn HostTier>>,
     ) {
+        let cacheable_pin_budget = pool.total_blocks() * self.config.cacheable_pin_percent / 100;
         let state = RankState {
             pool,
             tier,
             floor: Arc::new(AtomicUsize::new(0)),
             pinned: Arc::new(AtomicUsize::new(0)),
+            cacheable_pin_budget,
         };
         self.ranks
             .write()
@@ -266,22 +280,30 @@ impl KvStore {
         };
 
         // Host-tier query, re-queried while a deeper tier fetches. The
-        // deadline degrades to the GPU hit alone — the request still runs.
+        // deadline bounds every await — a query future that never settles (a
+        // hung storage worker) degrades exactly like a slow one, instead of
+        // stranding the request outside the scheduler forever.
         let deadline = Instant::now() + self.config.resolve_deadline;
         let hit = loop {
             if cancel.is_cancelled() {
                 self.stats.record_degrade(req_id, DegradeReason::Cancelled);
                 return KvPrefix::none();
             }
-            match tier.query(req_id, host_hashes.clone()).await {
-                Err(err) => {
+            let query = tokio::time::timeout_at(deadline, tier.query(req_id, host_hashes.clone()));
+            match query.await {
+                Err(_elapsed) => {
+                    self.stats
+                        .record_degrade(req_id, DegradeReason::DeadlineExceeded);
+                    return finish(probe);
+                }
+                Ok(Err(err)) => {
                     log::warn!("kv-store resolve {req_id}: tier query failed: {err:#}");
                     self.stats.record_degrade(req_id, DegradeReason::TierError);
                     return finish(probe);
                 }
-                Ok(TierQuery::Miss) => return finish(probe),
-                Ok(TierQuery::Hit(hit)) => break hit,
-                Ok(TierQuery::Loading) => {
+                Ok(Ok(TierQuery::Miss)) => return finish(probe),
+                Ok(Ok(TierQuery::Hit(hit))) => break hit,
+                Ok(Ok(TierQuery::Loading)) => {
                     if Instant::now() >= deadline {
                         self.stats
                             .record_degrade(req_id, DegradeReason::DeadlineExceeded);
@@ -321,22 +343,41 @@ impl KvStore {
             return KvPrefix::none();
         }
 
-        // The DMA below is an uncancellable section: the reservation must
-        // outlive the copy, so we await settlement unconditionally.
+        // The DMA is an uncancellable section: the reservation must outlive
+        // the copy. A spawned task owns both the load future and the
+        // reservation, so the deadline below abandons only the *wait* — an
+        // abandoned reservation is dropped by the task once the tier settles,
+        // never while the DMA may still write into its blocks.
         let loaded = hit.blocks;
-        match tier.load(hit, reservation.page_ids()).await {
-            Ok(()) => {
+        let page_ids = reservation.page_ids();
+        let load = tier.load(hit, page_ids);
+        let join = self.runtime.spawn(async move {
+            let result = load.await;
+            (result, reservation)
+        });
+        match tokio::time::timeout_at(deadline, join).await {
+            Ok(Ok((Ok(()), reservation))) => {
                 pool.commit_loaded_blocks(&mut probe, reservation);
                 self.stats
                     .resolve_loaded_blocks
                     .fetch_add(loaded as u64, Ordering::Relaxed);
                 finish(probe)
             }
-            Err(err) => {
+            Ok(Ok((Err(err), _reservation))) => {
                 log::warn!("kv-store resolve {req_id}: tier load failed: {err:#}");
                 self.stats.record_degrade(req_id, DegradeReason::TierError);
-                // Reservation drops here: the destination blocks return to
-                // the pool untouched by any registered hash.
+                // The load settled; dropping the reservation here returns the
+                // destination blocks untouched by any registered hash.
+                finish(probe)
+            }
+            Ok(Err(join_err)) => {
+                log::warn!("kv-store resolve {req_id}: load task failed: {join_err}");
+                self.stats.record_degrade(req_id, DegradeReason::TierError);
+                finish(probe)
+            }
+            Err(_elapsed) => {
+                self.stats
+                    .record_degrade(req_id, DegradeReason::DeadlineExceeded);
                 finish(probe)
             }
         }
@@ -362,6 +403,25 @@ impl KvStore {
         if pairs.len() <= cursor.saved_blocks {
             return;
         }
+        let count = pairs.len() - cursor.saved_blocks;
+
+        // Cacheable saves shed under pin pressure instead of pinning
+        // admission out of the pool — a shed save is a forfeited future hit,
+        // never a correctness loss. The cursor does NOT advance, so a later
+        // seal (or the retire) retries once pressure clears. Handoff saves
+        // are exempt: their backpressure is admission via `pinned_blocks`.
+        if class == SaveClass::Cacheable
+            && state.pinned.load(Ordering::Acquire) + count > state.cacheable_pin_budget
+        {
+            self.stats.saves_shed.fetch_add(1, Ordering::Relaxed);
+            log::debug!(
+                "kv-store: shed cacheable save of {count} blocks (pin budget \
+                 {} exceeded)",
+                state.cacheable_pin_budget
+            );
+            return;
+        }
+
         // Guards align 1:1 with `assigned_block_hashes`.
         let guards: Vec<_> = kv
             .assigned_block_guards()
@@ -373,7 +433,6 @@ impl KvStore {
             .map(|(id, hash)| (*id, hash.to_vec()))
             .unzip();
         cursor.saved_blocks = pairs.len();
-        let count = ids.len();
 
         state.pinned.fetch_add(count, Ordering::AcqRel);
         self.stats.saves_submitted.fetch_add(1, Ordering::Relaxed);
@@ -391,12 +450,16 @@ impl KvStore {
         self.runtime.spawn(async move {
             let result = handle.settle().await;
             pinned.fetch_sub(count, Ordering::AcqRel);
-            if let Err(err) = result {
-                stats.saves_failed.fetch_add(1, Ordering::Relaxed);
-                log::warn!("kv-store save of {count} blocks failed: {err}");
-            }
+            let outcome = match result {
+                Ok(()) => Ok(()),
+                Err(err) => {
+                    stats.saves_failed.fetch_add(1, Ordering::Relaxed);
+                    log::warn!("kv-store save of {count} blocks failed: {err}");
+                    Err(err.to_string())
+                }
+            };
             if let Some(tx) = done_tx {
-                let _ = tx.send(());
+                let _ = tx.send(outcome);
             }
         });
     }
@@ -414,9 +477,23 @@ impl KvStore {
             return;
         }
         self.stats.retires_parked.fetch_add(1, Ordering::Relaxed);
+        let stats = Arc::clone(&self.stats);
         self.runtime.spawn(async move {
+            let mut failed = false;
             for rx in cursor.pending {
-                let _ = rx.await;
+                if !matches!(rx.await, Ok(Ok(()))) {
+                    failed = true;
+                }
+            }
+            if failed {
+                // The checkpoint the consuming peer expects is missing; the
+                // peer observes it as a short hit and rejects the handoff.
+                // The producing scheduler withholds its KV-ready response
+                // until these saves confirm (glm52 flush-on-finish) — that
+                // wiring lands with the P/D migration; until then the failure
+                // is counted and logged loudly.
+                stats.handoff_failed.fetch_add(1, Ordering::Relaxed);
+                log::error!("kv-store retire: handoff save failed; peer will miss this checkpoint");
             }
             release_logged(&mut kv);
         });
