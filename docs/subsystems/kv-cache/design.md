@@ -63,7 +63,12 @@ pub struct GroupSpec {
     /// Replicated：rank0 存、任意 rank 恢复（MLA latent、qwen35 GDN——glm52
     /// 今天的共享 namespace 就是此语义）；PerRank：各 rank 存取自己的分片。
     pub sharding: Sharding,
-    /// 见「Checkpointable 属性」。false ⇒ 该模型 prefix cache 强制关。
+    /// 见「Checkpointable 属性」。构建期判定一次、engine 生命周期常量：
+    /// enabled = !cli_no_prefix_cache && all(groups.checkpointable)。
+    /// KvSpec 反映启动配置而非模型线常量——glm52 只有 --drafter dspark 启动
+    /// 时 spec 里才有 dspark 组；native-mtp 启动时无此组、cache 保持开。
+    /// OFF 落在三处：resolve 短路、admission 不 match、release 标记 reset
+    /// （不进 inactive cache，存了也无人可 match）。
     pub checkpointable: bool,
     /// 恢复完整性：非 optional 组的 artifact 缺失 ⇒ 整个 checkpoint 无效
     /// （idxk 缺失即静默腐坏 ⇒ false）；optional 组缺失不影响其余命中
