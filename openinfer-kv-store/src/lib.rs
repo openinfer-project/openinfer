@@ -71,23 +71,51 @@ impl CancelProbe for NeverCancelled {
 
 /// Prefix-cache identity of a resolve, mirroring
 /// [`BlockPool::probe_prefix_with_cache_salt`]: the producer request and the
-/// resolve must derive identical block hashes or the query keys are unrelated.
+/// resolve must derive identical block hashes or the query keys are
+/// unrelated. Chainable setters over private fields — adding a scope never
+/// churns call sites.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CacheScope<'a> {
-    pub cache_salt: Option<&'a str>,
-    pub lora_name: Option<&'a str>,
+    cache_salt: Option<&'a str>,
+    lora_name: Option<&'a str>,
 }
 
-/// Per-request read policy for [`KvStore::resolve_prefix`]. The default is
-/// the plain host-restore mode; P/D decode admission (qwen3 `wait_on_miss`
-/// semantics) sets `expect_remote`.
+impl<'a> CacheScope<'a> {
+    /// Extra cache identity beyond the tokens (glm52's native-MTP page salt).
+    #[must_use]
+    pub fn cache_salt(mut self, salt: &'a str) -> Self {
+        self.cache_salt = Some(salt);
+        self
+    }
+
+    /// Weight identity: blocks computed under one adapter never match
+    /// another's.
+    #[must_use]
+    pub fn lora(mut self, name: &'a str) -> Self {
+        self.lora_name = Some(name);
+        self
+    }
+}
+
+/// Per-request read policy for [`KvStore::resolve_prefix`]. Chainable
+/// setters over private fields, so adding a policy never churns call sites.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ResolvePolicy {
-    /// The prefix is known to exist remotely (a completed prefill's
-    /// handoff): a tier `Miss` means the producer's registration has not
-    /// landed yet, so keep waiting under the deadline instead of concluding
-    /// the cache is cold.
-    pub expect_remote: bool,
+    wait_for_full_hit: bool,
+}
+
+impl ResolvePolicy {
+    /// The caller cannot recompute a miss (P/D decode: admission asserts the
+    /// hit covers the handoff's committed length), so both halves of that
+    /// intent apply: the tier query is all-or-nothing (a partial hit is
+    /// worthless — pegaflow's `wait_for_full_prefix`), and a `Miss` means
+    /// the producer's registration has not landed yet — keep waiting under
+    /// the deadline instead of concluding the cache is cold.
+    #[must_use]
+    pub fn wait_for_full_hit(mut self) -> Self {
+        self.wait_for_full_hit = true;
+        self
+    }
 }
 
 /// Save quality-of-service, from the design doc's QoS split.
@@ -323,7 +351,10 @@ impl KvStore {
                 self.stats.record_degrade(req_id, DegradeReason::Cancelled);
                 return KvPrefix::none();
             }
-            let query = tokio::time::timeout_at(deadline, tier.query(req_id, host_hashes.clone()));
+            let query = tokio::time::timeout_at(
+                deadline,
+                tier.query(req_id, host_hashes.clone(), policy.wait_for_full_hit),
+            );
             match query.await {
                 Err(_elapsed) => {
                     self.stats
@@ -336,10 +367,10 @@ impl KvStore {
                     return finish(probe);
                 }
                 Ok(Ok(TierQuery::Miss)) => {
-                    // Plain restore: a miss is a cold cache, conclude. P/D
-                    // (`expect_remote`): the producer's registration may not
-                    // have landed yet — keep waiting under the deadline.
-                    if !policy.expect_remote {
+                    // Plain restore: a miss is a cold cache, conclude. Full-
+                    // hit mode: the producer's registration may not have
+                    // landed yet — keep waiting under the deadline.
+                    if !policy.wait_for_full_hit {
                         return finish(probe);
                     }
                     if Instant::now() >= deadline {

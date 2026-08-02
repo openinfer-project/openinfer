@@ -271,9 +271,10 @@ async fn resolve_completes_when_pool_pressure_clears() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn expect_remote_waits_through_miss_until_registration_lands() {
+async fn full_hit_mode_waits_through_miss_until_registration_lands() {
     // P/D decode: the producer's save may not have registered yet — a Miss
-    // under expect_remote is "not yet", not "cold".
+    // under wait_for_full_hit is "not yet", not "cold"; and the tier query
+    // runs the all-or-nothing protocol.
     let b = builder();
     let pool = pool(64);
     let prompt = prompt(4);
@@ -290,9 +291,7 @@ async fn expect_remote_waits_through_miss_until_registration_lands() {
             "r1",
             &prompt,
             CacheScope::default(),
-            ResolvePolicy {
-                expect_remote: true,
-            },
+            ResolvePolicy::default().wait_for_full_hit(),
             &NeverCancelled,
         )
         .await;
@@ -339,9 +338,10 @@ async fn cancellation_after_query_releases_the_lease() {
             &self,
             req_id: &str,
             hashes: Vec<Vec<u8>>,
+            wait_full: bool,
         ) -> openinfer_kv_store::TierFuture<anyhow::Result<openinfer_kv_store::TierQuery>> {
             self.flag.store(true, Ordering::Release);
-            self.inner.query(req_id, hashes)
+            self.inner.query(req_id, hashes, wait_full)
         }
         fn load(
             &self,

@@ -151,8 +151,12 @@ let store = KvStoreBuilder::new(runtime_handle, KvStoreConfig::default())
 
 impl KvStore {
     async fn resolve_prefix(&self, rank, req_id, tokens, scope, policy: ResolvePolicy, cancel) -> KvPrefix;
-    // ResolvePolicy { expect_remote }：P/D decode 侧 Miss = 生产方注册未落地，
-    // deadline 内继续等（qwen3 wait_on_miss 语义的收编）；默认 Miss = 冷，即刻收束。
+    // ResolvePolicy::default().wait_for_full_hit()：调用方无法重算 miss（P/D
+    // decode，admission 断言 hit == committed_len）时的一体两面——tier query
+    // 走 all-or-nothing（pegaflow wait_for_full_prefix，部分命中无用），且
+    // Miss = 生产方注册未落地、deadline 内继续等（qwen3 wait_on_miss 收编）。
+    // 默认 Miss = 冷，即刻收束。Policy/Scope 均为链式 setter + 私有字段，
+    // 加字段不 churn 调用点（分期契约）。
     fn seal(&self, rank, kv: &RequestKv, cursor: &mut SaveCursor, class: SaveClass);
     fn retire(&self, rank, kv: RequestKv, cursor: SaveCursor, class: SaveClass);
     fn set_admission_floor(&self, rank, blocks) / fn pinned_blocks(&self, rank) -> usize;

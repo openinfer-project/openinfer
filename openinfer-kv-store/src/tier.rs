@@ -45,11 +45,15 @@ pub enum TierQuery {
 /// observer, never the I/O (the [`OffloadEngine`] handle contract).
 pub trait HostTier: Send + Sync {
     /// How long a prefix of `block_hashes` is host-resident. `req_id` scopes
-    /// an in-flight deeper-tier fetch across re-queries.
+    /// an in-flight deeper-tier fetch across re-queries. `wait_full` makes
+    /// the fetch all-or-nothing: stay `Loading` until the entire missing
+    /// prefix is resident instead of answering with a partial hit — for
+    /// callers that cannot recompute a miss (native P/D handoff).
     fn query(
         &self,
         req_id: &str,
         block_hashes: Vec<Vec<u8>>,
+        wait_full: bool,
     ) -> TierFuture<anyhow::Result<TierQuery>>;
 
     /// Copy the hit's blocks into the GPU pages `dst_page_ids` (one
@@ -78,8 +82,9 @@ impl HostTier for OffloadEngine {
         &self,
         req_id: &str,
         block_hashes: Vec<Vec<u8>>,
+        wait_full: bool,
     ) -> TierFuture<anyhow::Result<TierQuery>> {
-        let handle = self.submit_query(req_id, &block_hashes, false);
+        let handle = self.submit_query(req_id, &block_hashes, wait_full);
         Box::pin(async move {
             match handle.settle().await.map_err(anyhow::Error::msg)? {
                 QueryOutcome::Loading => Ok(TierQuery::Loading),

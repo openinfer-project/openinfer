@@ -35,6 +35,8 @@ pub struct MockTier {
     script: Mutex<VecDeque<MockQuery>>,
     /// Hits declined via `release`, i.e. lease returns without a load.
     pub released: AtomicUsize,
+    /// Queries that asked for the all-or-nothing (`wait_full`) protocol.
+    pub full_queries: AtomicUsize,
     /// Destination page ids of every completed load, in call order.
     pub loads: Mutex<Vec<Vec<i32>>>,
     /// `(block_ids, block_hashes)` of every submitted save, in call order.
@@ -97,7 +99,15 @@ impl MockTier {
 }
 
 impl HostTier for MockTier {
-    fn query(&self, _req_id: &str, _hashes: Vec<Vec<u8>>) -> TierFuture<anyhow::Result<TierQuery>> {
+    fn query(
+        &self,
+        _req_id: &str,
+        _hashes: Vec<Vec<u8>>,
+        wait_full: bool,
+    ) -> TierFuture<anyhow::Result<TierQuery>> {
+        if wait_full {
+            self.full_queries.fetch_add(1, Ordering::AcqRel);
+        }
         let step = self
             .script
             .lock()
