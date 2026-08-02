@@ -184,6 +184,25 @@ static cublasStatus_t lt_plan_create(LtGemmPlan &plan, int M, int N, int K) {
   return cublasLtMatrixLayoutCreate(&plan.c, CUDA_R_16BF, M, N, M);
 }
 
+// Repeats a tuning pass spends on one candidate. Timing noise is roughly a fixed
+// cost per launch, so a GEMM reading more weight bytes settles into a stable
+// ranking in fewer repeats.
+static const double LT_TUNE_BUDGET_BYTES = 1024.0 * 1024.0 * 1024.0;
+static const int LT_TUNE_MIN_ITERS = 5;
+static const int LT_TUNE_MAX_ITERS = 20;
+
+static int lt_tune_iters(int M, int K) {
+  const double weight_bytes = static_cast<double>(M) * static_cast<double>(K) * 2.0;
+  const long n = static_cast<long>(LT_TUNE_BUDGET_BYTES / weight_bytes + 0.5);
+  if (n < LT_TUNE_MIN_ITERS) {
+    return LT_TUNE_MIN_ITERS;
+  }
+  if (n > LT_TUNE_MAX_ITERS) {
+    return LT_TUNE_MAX_ITERS;
+  }
+  return static_cast<int>(n);
+}
+
 static cublasStatus_t lt_plan_heuristics(const LtGemmPlan &plan,
                                          cublasLtMatmulHeuristicResult_t *results,
                                          int max_results, int *returned) {
@@ -455,7 +474,7 @@ int gemm_lt_cuda(const __nv_bfloat16 *W, const __nv_bfloat16 *X, __nv_bfloat16 *
 // Must run on the executor thread before graph capture; not capture-safe.
 int gemm_lt_tune_cuda(const __nv_bfloat16 *const *Ws, int num_ws, int M, int N, int K,
                       cudaStream_t stream) {
-  if (num_ws <= 0) {
+  if (num_ws <= 0 || M <= 0 || N <= 0 || K <= 0) {
     return static_cast<int>(cudaErrorInvalidValue);
   }
   // Lt resources are created here rather than in cublas_init so only threads
@@ -548,7 +567,7 @@ int gemm_lt_tune_cuda(const __nv_bfloat16 *const *Ws, int num_ws, int M, int N, 
     const float h_alpha = 1.0f;
     const float h_beta = 0.0f;
     const int warmup = 3;
-    const int iters = 20;
+    const int iters = lt_tune_iters(M, K);
     for (int i = 0; i < returned; ++i) {
       bool ok = true;
       for (int j = 0; j < warmup + iters && ok; ++j) {
