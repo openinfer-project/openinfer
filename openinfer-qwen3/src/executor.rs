@@ -1609,10 +1609,7 @@ impl Qwen3Executor {
         let Some(rkv) = self.request_kvs.get(&request_id) else {
             return;
         };
-        let cursor = self
-            .save_cursors
-            .entry(request_id)
-            .or_insert_with(SaveCursor::new);
+        let cursor = self.save_cursors.entry(request_id).or_default();
         store.seal(KV_STORE_RANK, rkv, cursor, SaveClass::Cacheable);
     }
 
