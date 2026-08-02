@@ -17,11 +17,13 @@ Last touched: 2026-08
 | | 增长 | 封存方式 | 共享 | 代表 |
 |---|---|---|---|---|
 | **Paged append-only** | 随 token 线性增长 | 页写满原地即封，封后永不改写（免费） | `ImmutableBlock` Arc 共享、radix 前缀复用 | full attn、MLA latent |
-| **Bounded mutable** | 固定预算，每 token 原地改写 | **seal-by-copy**：step 边界 D2D 拷到 staging，副本即 sealed artifact（付一次拷贝） | 活状态永不可共享，只能拷 | linear state（KDA/GDN）、SWA ring、conv_state、DSpark aux |
+| **Bounded mutable** | 固定预算，每 token 原地改写 | **seal-by-copy**：D2D 拷到 staging，副本即 sealed artifact（付一次拷贝） | 活状态永不可共享，只能拷 | linear state（KDA/GDN）、SWA ring、conv_state、DSpark aux |
 
 SWA 与 linear state 是同一等价类（bounded mutable）：qwen35 的 `LayerRecurrentState` 里 `conv_state` 就是一个 W=k-1 的迷你滑窗，与稠密 state 同槽同生命周期。Gemma4 的 SWA 只是更大的同类。
 
 关键推论：**pin（防 reuse-after-free）对 paged 组足够，对 mutable 组不够**——异步 save 会与下一步的原地改写竞态，所以 mutable 组必须 seal-by-copy 后才可下存。
+
+seal-by-copy 的**频率归策略、对齐归机制**，别混淆：拷贝必须对齐在 step 边界（kernel 原地写 state 时不能快照），但**只在策略触发存储时才拷**，不是每步都拷。bounded 组的封存有拷贝成本，策略上天然比 paged 组稀（每数百 token / turn 边界 / retire / P 侧 handoff）——这与单索引"以最稀疏 checkpointer 为准"自洽：索引条目只存在于 bounded 快照点，paged 组封得更密对命中无贡献。成本量级：qwen35 state 49 MiB/请求，D2D 十几微秒；可走 copy-engine 侧流，用 event 保证"拷完才允许该 slot 下一步改写"，不停 step。
 
 ### Checkpoint
 
