@@ -347,6 +347,14 @@ impl Glm52IndexerScratch {
         })
     }
 
+    /// Rebind the MQA shape to the launch-decided pool block count. Every
+    /// buffer here is sized by batch/logits stride, never by the block count
+    /// — `num_kv_blocks` only feeds the forward-time cache layout — so a
+    /// scratch built before the measured KV fill needs exactly this rebind.
+    pub(crate) fn set_num_kv_blocks(&mut self, num_kv_blocks: usize) {
+        self.shape.num_kv_blocks = num_kv_blocks;
+    }
+
     /// Build the paged MQA shape for one query token per batch row.
     pub(crate) fn paged_mqa_shape(
         batch: usize,
@@ -699,12 +707,11 @@ impl Glm52IndexerPrefillScratch {
         ctx: &DeviceContext,
         chunk_rows: usize,
         attn_tile: usize,
-        kv_slots: usize,
         table_width: usize,
         cache_layout: Glm52IndexerCacheLayout,
     ) -> Result<Self> {
         ensure!(
-            chunk_rows > 0 && attn_tile > 0 && kv_slots > 0 && table_width > 0,
+            chunk_rows > 0 && attn_tile > 0 && table_width > 0,
             "GLM5.2 indexer prefill scratch shapes must be positive"
         );
         let chunk = chunk_rows.next_multiple_of(4);
@@ -714,7 +721,6 @@ impl Glm52IndexerPrefillScratch {
         // prefix pages therefore cannot overflow it: the physical pool
         // admits shared pages once, while each segment re-gathers its own
         // logical view into the same buffer.
-        let _ = kv_slots;
         let kv_cap = (table_width * 64).next_multiple_of(4);
         let logits_stride = kv_cap.next_multiple_of(256) + 256;
         let tile = attn_tile.next_multiple_of(4);
@@ -755,6 +761,14 @@ impl Glm52IndexerPrefillScratch {
             host_table: vec![0; GLM52_INDEXER_PREFILL_MAX_REQUESTS * table_width],
             host_lens: vec![0; GLM52_INDEXER_PREFILL_MAX_REQUESTS],
         })
+    }
+
+    /// Rebind to the launch-decided index-K cache layout. No buffer here is
+    /// sized by `cache_blocks` (see the compact-K comment in `new`), so a
+    /// scratch built before the measured KV fill only needs the layout the
+    /// forward-time insert/gather launches read.
+    pub(crate) fn set_cache_layout(&mut self, cache_layout: Glm52IndexerCacheLayout) {
+        self.cache_layout = cache_layout;
     }
 
     /// Stage the per-chunk request plan: segment ranges, per-query kv ends,

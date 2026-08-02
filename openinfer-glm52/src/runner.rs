@@ -22,6 +22,7 @@ use crate::dspark::Glm52DsparkSlotState;
 use crate::model::GLM52_MAX_BATCH_PER_RANK;
 use crate::model::GLM52_MAX_STEP_ROWS;
 use crate::model::Glm52RankModel;
+use crate::model::Glm52RankModelFixed;
 use crate::model::Glm52StepKv;
 use crate::model::Glm52StepShape;
 use crate::moe_ep::Glm52MoeEpRankState;
@@ -208,16 +209,26 @@ enum Glm52RankCommand {
         weight_staging: bool,
         resp: Sender<Result<Glm52RankWeightLoadReport>>,
     },
-    /// Non-collective: adopt the resident weights into the rank's model.
-    /// Every rank must report success BEFORE anyone enters SetupComm — a
-    /// build failure on one rank must never strand the others in NCCL init.
-    /// Replies with the rank's cache arena descriptors so launch can
-    /// register them with the shared KV offload host.
-    BuildModel {
+    /// Non-collective, phase 1 of the two-phase build: adopt the resident
+    /// weights into everything EXCEPT the pool-scaled KV slabs, then reply
+    /// with this rank's measured free device VRAM — launch min-reduces the
+    /// fleet's replies to size the KV pool from real headroom instead of a
+    /// ledger estimate.
+    BuildFixed {
         max_model_len: usize,
         moe_topo: crate::Glm52MoeTopo,
         drafter: crate::Glm52Drafter,
         prefill_chunk_size: Option<usize>,
+        resp: Sender<Result<u64>>,
+    },
+    /// Non-collective, phase 2: allocate the pool-scaled slabs for the
+    /// launch-decided block count and assemble the rank runtime. Every rank
+    /// must report success BEFORE anyone enters SetupComm — a build failure
+    /// on one rank must never strand the others in NCCL init. Replies with
+    /// the rank's cache arena descriptors so launch can register them with
+    /// the shared KV offload host.
+    FinishKv {
+        pool_blocks: usize,
         resp: Sender<Result<Vec<KvArena>>>,
     },
     /// Collective: create the DeepEP context (barriers across ranks). Issued
@@ -255,7 +266,7 @@ enum Glm52RankCommand {
         resp: Sender<Result<Glm52PrefillOutput>>,
     },
     /// Non-collective: load the DSpark draft model onto this rank. Issued to
-    /// every rank after BuildModel (the draft reuses the target's
+    /// every rank after FinishKv (the draft reuses the target's
     /// embed/lm_head at forward time).
     LoadDspark {
         path: PathBuf,
@@ -359,20 +370,34 @@ impl Glm52RankWorker {
         Ok(resp_rx)
     }
 
-    pub(crate) fn build_model_async(
+    pub(crate) fn build_fixed_async(
         &self,
         max_model_len: usize,
         moe_topo: crate::Glm52MoeTopo,
         drafter: crate::Glm52Drafter,
         prefill_chunk_size: Option<usize>,
-    ) -> Result<Receiver<Result<Vec<KvArena>>>> {
+    ) -> Result<Receiver<Result<u64>>> {
         let (resp_tx, resp_rx) = bounded(1);
         self.tx
-            .send(Glm52RankCommand::BuildModel {
+            .send(Glm52RankCommand::BuildFixed {
                 max_model_len,
                 moe_topo,
                 drafter,
                 prefill_chunk_size,
+                resp: resp_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("GLM5.2 rank worker channel closed"))?;
+        Ok(resp_rx)
+    }
+
+    pub(crate) fn finish_kv_async(
+        &self,
+        pool_blocks: usize,
+    ) -> Result<Receiver<Result<Vec<KvArena>>>> {
+        let (resp_tx, resp_rx) = bounded(1);
+        self.tx
+            .send(Glm52RankCommand::FinishKv {
+                pool_blocks,
                 resp: resp_tx,
             })
             .map_err(|_| anyhow::anyhow!("GLM5.2 rank worker channel closed"))?;
@@ -584,6 +609,9 @@ struct Glm52RankThreadState {
     /// TP-topology slice banks (loaded with the weights), waiting for the
     /// SetupComm rendezvous to assemble the runtime `Glm52MoeTpRank`.
     tp_slices: BTreeMap<usize, Glm52MoeTpSliceBank>,
+    /// The fixed half of the two-phase model build, parked between
+    /// BuildFixed's VRAM measurement and FinishKv's pool allocation.
+    fixed: Option<Box<Glm52RankModelFixed>>,
     runtime: Option<Glm52RankRuntime>,
 }
 
@@ -599,6 +627,7 @@ impl Glm52RankThreadState {
             bundle,
             loaded: None,
             tp_slices: BTreeMap::new(),
+            fixed: None,
             runtime: None,
         }
     }
@@ -682,19 +711,22 @@ impl Glm52RankThreadState {
         Ok(report)
     }
 
-    fn build_model(
+    /// Phase 1: build everything except the pool-scaled KV slabs, then
+    /// report this device's measured free VRAM — the number launch sizes the
+    /// fleet's pool from (same probe as the FreeVram command).
+    fn build_fixed(
         &mut self,
         max_model_len: usize,
         moe_topo: crate::Glm52MoeTopo,
         drafter: crate::Glm52Drafter,
         prefill_chunk_size: Option<usize>,
-    ) -> Result<Vec<KvArena>> {
+    ) -> Result<u64> {
         let mut weights = self
             .loaded
             .take()
-            .context("GLM5.2 build_model called before weights were loaded")?;
+            .context("GLM5.2 build_fixed called before weights were loaded")?;
         let dev_ctx = self.ctx.device_context()?;
-        let model = Box::new(Glm52RankModel::build(
+        self.fixed = Some(Box::new(Glm52RankModel::build_fixed(
             &dev_ctx,
             &mut weights,
             max_model_len,
@@ -704,7 +736,19 @@ impl Glm52RankThreadState {
                 .then_some(self.placement.rank),
             &drafter,
             prefill_chunk_size,
-        )?);
+        )?));
+        Ok(self.ctx.free_vram_bytes()? as u64)
+    }
+
+    /// Phase 2: allocate the pool-scaled slabs for the launch-decided count
+    /// and assemble the rank runtime.
+    fn finish_kv(&mut self, pool_blocks: usize) -> Result<Vec<KvArena>> {
+        let fixed = self
+            .fixed
+            .take()
+            .context("GLM5.2 finish_kv called before build_fixed")?;
+        let dev_ctx = self.ctx.device_context()?;
+        let model = Box::new(Glm52RankModel::finish_kv(&dev_ctx, *fixed, pool_blocks)?);
         let arenas = model.kv_arenas(&dev_ctx.stream)?;
         let aux_ctx = self.ctx.auxiliary_device_context("decode aux")?;
         self.runtime = Some(Glm52RankRuntime {
@@ -1007,19 +1051,22 @@ fn rank_worker_loop(rx: &Receiver<Glm52RankCommand>, mut state: Glm52RankThreadS
             } => {
                 let _ = resp.send(state.load_weights(&model_path, moe_topo, weight_staging));
             }
-            Glm52RankCommand::BuildModel {
+            Glm52RankCommand::BuildFixed {
                 max_model_len,
                 moe_topo,
                 drafter,
                 prefill_chunk_size,
                 resp,
             } => {
-                let _ = resp.send(state.build_model(
+                let _ = resp.send(state.build_fixed(
                     max_model_len,
                     moe_topo,
                     drafter,
                     prefill_chunk_size,
                 ));
+            }
+            Glm52RankCommand::FinishKv { pool_blocks, resp } => {
+                let _ = resp.send(state.finish_kv(pool_blocks));
             }
             Glm52RankCommand::SetupComm {
                 unique_id,

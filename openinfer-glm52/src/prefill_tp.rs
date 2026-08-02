@@ -129,13 +129,16 @@ struct Glm52TpPrefillLayout {
 }
 
 impl Glm52TpPrefillLayout {
-    fn new(kv_slots: usize, table_width: usize, chunk_rows: usize) -> Result<Self> {
+    /// `kv_slots` starts at 0: the pool size is decided by the measured
+    /// launch fill AFTER the fixed buffers are built, and
+    /// [`Glm52TpPrefillExecutor::attach_kv_pool`] fills it in.
+    fn new(table_width: usize, chunk_rows: usize) -> Result<Self> {
         ensure!(
-            kv_slots > 0 && table_width > 0 && chunk_rows > 0,
+            table_width > 0 && chunk_rows > 0,
             "prefill capacities must be positive"
         );
         Ok(Self {
-            kv_slots,
+            kv_slots: 0,
             table_width,
             chunk_rows: chunk_rows.next_multiple_of(4),
         })
@@ -232,8 +235,11 @@ pub(crate) struct Glm52TpPrefillExecutor {
     ckv_fp8: CudaSlice<u8>,
     ckv_scales: CudaSlice<f32>,
     slot_mapping: CudaSlice<i64>,
-    block_ids: CudaSlice<i32>,
-    unpacked_kv: CudaSlice<bf16>,
+    // ---- pool-scaled buffers, attached by `attach_kv_pool` once the
+    // measured fill decides the block count (None only between build_fixed
+    // and finish_kv — never during serving) ----
+    block_ids: Option<CudaSlice<i32>>,
+    unpacked_kv: Option<CudaSlice<bf16>>,
     fp8_gemm: Glm52Fp8GemmScratch,
     attention_v: CudaSlice<bf16>,
     attention_partial: CudaSlice<bf16>,
@@ -317,15 +323,18 @@ pub(crate) struct Glm52TpPrefillModelView<'a> {
 }
 
 impl Glm52TpPrefillExecutor {
+    /// Build everything EXCEPT the pool-scaled buffers: the KV pool size is
+    /// measured after this returns, so `index_cache_layout` here may carry a
+    /// placeholder block count — [`Self::attach_kv_pool`] installs the real
+    /// one before any forward.
     pub(crate) fn new(
         ctx: &DeviceContext,
-        kv_slots: usize,
         table_width: usize,
         index_cache_layout: Glm52IndexerCacheLayout,
         chunk_rows: usize,
         topology: openinfer_kernels::ops::Glm52TpTopology,
     ) -> Result<Self> {
-        let layout = Glm52TpPrefillLayout::new(kv_slots, table_width, chunk_rows)?;
+        let layout = Glm52TpPrefillLayout::new(table_width, chunk_rows)?;
         let chunk = layout.chunk_rows;
         let attn = PREFILL_ATTN_TILE_ROWS;
         let dense = PREFILL_DENSE_TILE_ROWS.min(chunk);
@@ -344,12 +353,8 @@ impl Glm52TpPrefillExecutor {
             ckv_fp8: ctx.stream.alloc_zeros::<u8>(chunk * GLM52_KV_LORA_RANK)?,
             ckv_scales: ctx.stream.alloc_zeros::<f32>(chunk * 4)?,
             slot_mapping: ctx.stream.alloc_zeros::<i64>(chunk)?,
-            block_ids: ctx
-                .stream
-                .alloc_zeros::<i32>(layout.kv_slots.div_ceil(64))?,
-            unpacked_kv: ctx
-                .stream
-                .alloc_zeros::<bf16>(layout.kv_slots * GLM52_KV_A_OUT)?,
+            block_ids: None,
+            unpacked_kv: None,
             fp8_gemm: Glm52Fp8GemmScratch::new(ctx, chunk, GLM52_HIDDEN)?,
             attention_v: ctx.stream.alloc_zeros::<bf16>(chunk * 16 * 256)?,
             attention_partial: ctx.stream.alloc_zeros::<bf16>(chunk * GLM52_HIDDEN)?,
@@ -361,7 +366,6 @@ impl Glm52TpPrefillExecutor {
                 ctx,
                 chunk,
                 PREFILL_ATTN_TILE_ROWS,
-                kv_slots,
                 table_width,
                 index_cache_layout,
             )?,
@@ -406,6 +410,29 @@ impl Glm52TpPrefillExecutor {
             mtp_proposal_boundary: Rows::zeros(ctx, GLM52_MAX_BATCH_PER_RANK)?,
             layout,
         })
+    }
+
+    /// Allocate the two pool-scaled buffers (the page-id upload scratch and
+    /// the unpacked bf16 KV pool) and bind the launch-decided index-K layout,
+    /// once the measured fill has fixed the pool block count. Must run before
+    /// the first forward; the executor's other buffers are len/chunk-scaled
+    /// and were already allocated by [`Self::new`].
+    pub(crate) fn attach_kv_pool(
+        &mut self,
+        ctx: &DeviceContext,
+        kv_slots: usize,
+        index_cache_layout: Glm52IndexerCacheLayout,
+    ) -> Result<()> {
+        ensure!(
+            self.layout.kv_slots == 0 && self.block_ids.is_none() && self.unpacked_kv.is_none(),
+            "GLM5.2 prefill KV pool attached twice"
+        );
+        ensure!(kv_slots > 0, "GLM5.2 prefill KV pool must be non-empty");
+        self.layout.kv_slots = kv_slots;
+        self.block_ids = Some(ctx.stream.alloc_zeros::<i32>(kv_slots.div_ceil(64))?);
+        self.unpacked_kv = Some(ctx.stream.alloc_zeros::<bf16>(kv_slots * GLM52_KV_A_OUT)?);
+        self.indexer.set_cache_layout(index_cache_layout);
+        Ok(())
     }
 
     pub(crate) fn mtp_target_boundary(&self) -> &Rows<GLM52_HIDDEN> {
@@ -481,9 +508,13 @@ impl Glm52TpPrefillExecutor {
                     ctx,
                     &cache.mla_cache,
                     cache.mla_cache.len() / self.layout.kv_slots,
-                    &self.block_ids,
+                    self.block_ids
+                        .as_ref()
+                        .context("GLM5.2 prefill KV pool is not attached")?,
                     batch.block_ids.len(),
-                    &mut self.unpacked_kv,
+                    self.unpacked_kv
+                        .as_mut()
+                        .context("GLM5.2 prefill KV pool is not attached")?,
                 )?;
                 self.profiler.stop(ctx, "kv_page_unpack", mark)?;
             }
@@ -746,9 +777,13 @@ impl Glm52TpPrefillExecutor {
                 ctx,
                 &mtp.transfer_cache.mla_cache,
                 openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN,
-                &self.block_ids,
+                self.block_ids
+                    .as_ref()
+                    .context("GLM5.2 prefill KV pool is not attached")?,
                 batch.block_ids.len(),
-                &mut self.unpacked_kv,
+                self.unpacked_kv
+                    .as_mut()
+                    .context("GLM5.2 prefill KV pool is not attached")?,
             )?;
         }
         let Glm52LayerIndexer::Full(indexer) = &mtp.layer.indexer else {
@@ -892,13 +927,17 @@ impl Glm52TpPrefillExecutor {
             &mut self.slot_mapping.slice_mut(..rows),
         )?;
         if !batch.block_ids.is_empty() {
+            let block_ids = self
+                .block_ids
+                .as_mut()
+                .context("GLM5.2 prefill KV pool is not attached")?;
             ensure!(
-                batch.block_ids.len() <= self.block_ids.len(),
+                batch.block_ids.len() <= block_ids.len(),
                 "prefill block list exceeds scratch capacity"
             );
             ctx.stream.memcpy_htod(
                 &batch.block_ids,
-                &mut self.block_ids.slice_mut(..batch.block_ids.len()),
+                &mut block_ids.slice_mut(..batch.block_ids.len()),
             )?;
         }
         embedding_rows_into(ctx, embed, &self.token_ids, rows, &mut self.hidden)?;
@@ -978,6 +1017,10 @@ impl Glm52TpPrefillExecutor {
         weights: &Glm52MlaLayerWeights,
         rows: usize,
     ) -> Result<()> {
+        let unpacked_kv = self
+            .unpacked_kv
+            .as_ref()
+            .context("GLM5.2 prefill KV pool is not attached")?;
         let mut sub = 0usize;
         while sub < rows {
             let t = (rows - sub).min(PREFILL_ATTN_TILE_ROWS);
@@ -1002,7 +1045,7 @@ impl Glm52TpPrefillExecutor {
                 GLM52_INDEXER_TOPK,
                 0.0625,
                 &self.query_bf16,
-                &self.unpacked_kv,
+                unpacked_kv,
                 &carry,
                 Some(&lens),
                 &mut self.attention_out,

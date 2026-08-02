@@ -191,6 +191,98 @@ pub(super) struct Glm52NativeMtp {
     tp_moe: Option<Glm52MoeTpPrefillScratch>,
 }
 
+/// [`Glm52NativeMtp`] minus everything sized by the pool block count: the
+/// two-phase build measures free VRAM after this exists, then
+/// [`Self::attach_cache`] allocates the cache slabs with the decided count.
+pub(super) struct Glm52NativeMtpFixed {
+    bookend: Glm52MtpBookendWeights,
+    layer: Glm52DecoderLayerWeights,
+    cache_bytes_per_token: usize,
+    transfer_bytes_per_token: Option<usize>,
+    buckets: [Glm52MtpBucket; GLM52_DECODE_BUCKETS.len()],
+    max_model_len: usize,
+    table_width: usize,
+    ep_ranks: usize,
+    positions: CudaSlice<u32>,
+    cos: CudaSlice<bf16>,
+    sin: CudaSlice<bf16>,
+    token_ids: CudaSlice<u32>,
+    slot_mapping: CudaSlice<i64>,
+    seq_lens: CudaSlice<i32>,
+    tp_moe: Option<Glm52MoeTpPrefillScratch>,
+}
+
+impl Glm52NativeMtpFixed {
+    /// Allocate the L78 cache slabs for the launch-decided pool block count.
+    /// The committed region mirrors the main pool's page ids 1:1 (radix hits
+    /// reuse L78 KV by page id), so it must be the SAME block count as the
+    /// pool — the per-slot scratch pair pages sit directly after it. Any
+    /// other sizing desyncs the `glm52_mtp_arena_bytes` ledger.
+    pub(super) fn attach_cache(
+        mut self,
+        ctx: &DeviceContext,
+        pool_blocks: usize,
+    ) -> Result<Glm52NativeMtp> {
+        let committed_blocks = pool_blocks;
+        let num_blocks =
+            committed_blocks + crate::model::glm52_decode_slots() * MTP_SCRATCH_PAGES_PER_SLOT;
+        let index_layout = Glm52IndexerCacheLayout {
+            cache_blocks: num_blocks,
+            cache_block_size: INDEX_CACHE_BLOCK,
+            cache_block_stride_bytes: INDEX_CACHE_BLOCK * (GLM52_INDEX_HEAD_DIM + 4),
+        };
+        // The bucket sched/scratch were built against a placeholder count;
+        // rebind them to the real cache geometry before anything launches.
+        for bucket in &mut self.buckets {
+            bucket.sched.set_num_blocks(num_blocks);
+            bucket.scratch.idx.set_num_kv_blocks(num_blocks);
+        }
+        let cache = Glm52LayerCaches {
+            mla_cache: ctx.stream.alloc_zeros::<u8>(
+                num_blocks * GLM52_FLASHMLA_SPARSE_PAGE_SIZE * self.cache_bytes_per_token,
+            )?,
+            index_k_cache: Some(
+                ctx.stream
+                    .alloc_zeros::<u8>(index_layout.min_cache_bytes()?)?,
+            ),
+        };
+        let transfer_cache = self
+            .transfer_bytes_per_token
+            .map(|bytes_per_token| -> Result<_> {
+                Ok(Glm52LayerCaches {
+                    mla_cache: ctx.stream.alloc_zeros::<u8>(
+                        num_blocks * GLM52_FLASHMLA_SPARSE_PAGE_SIZE * bytes_per_token,
+                    )?,
+                    index_k_cache: Some(
+                        ctx.stream
+                            .alloc_zeros::<u8>(index_layout.min_cache_bytes()?)?,
+                    ),
+                })
+            })
+            .transpose()?;
+        Ok(Glm52NativeMtp {
+            bookend: self.bookend,
+            layer: self.layer,
+            cache,
+            transfer_cache,
+            cache_bytes_per_token: self.cache_bytes_per_token,
+            buckets: self.buckets,
+            max_model_len: self.max_model_len,
+            table_width: self.table_width,
+            committed_blocks,
+            ep_ranks: self.ep_ranks,
+            positions: self.positions,
+            cos: self.cos,
+            sin: self.sin,
+            token_ids: self.token_ids,
+            slot_mapping: self.slot_mapping,
+            seq_lens: self.seq_lens,
+            committed_lens: [0; GLM52_MAX_BATCH_PER_RANK],
+            tp_moe: self.tp_moe,
+        })
+    }
+}
+
 impl Glm52NativeMtp {
     pub(super) fn prefill_parts(
         &mut self,
@@ -235,13 +327,17 @@ impl Glm52NativeMtp {
         ])
     }
 
-    pub(super) fn build(
+    /// Everything not sized by the pool block count: weights, per-bucket
+    /// sched/scratch (len-scaled), and the fixed step-row buffers. The cache
+    /// slabs follow in [`Glm52NativeMtpFixed::attach_cache`] once the
+    /// measured launch fill decides the count.
+    pub(super) fn build_fixed(
         ctx: &DeviceContext,
         weights: &mut Glm52RankGpuWeights,
         max_model_len: usize,
         moe_topo: crate::Glm52MoeTopo,
         attn_shard: Option<usize>,
-    ) -> Result<Self> {
+    ) -> Result<Glm52NativeMtpFixed> {
         let prefix = format!("model.layers.{GLM52_MTP_LAYER}");
         let enorm = build::take_bf16_vec(
             ctx,
@@ -275,17 +371,13 @@ impl Glm52NativeMtp {
         let layer =
             build::build_decoder_layer(ctx, weights, GLM52_MTP_LAYER, moe_topo, attn_shard)?;
 
-        // The committed region mirrors the main pool's page ids 1:1 (radix
-        // hits reuse L78 KV by page id), so it must be the SAME launch-time
-        // block count as the pool — the scratch pair pages sit directly
-        // after it. Any other sizing desyncs the `glm52_mtp_arena_bytes`
-        // ledger.
-        let committed_blocks = crate::model::glm52_configured_pool_blocks(max_model_len);
-        let num_blocks =
-            committed_blocks + crate::model::glm52_decode_slots() * MTP_SCRATCH_PAGES_PER_SLOT;
         let table_width = glm52_table_width(max_model_len);
+        // The pool block count is measured after this build; the bucket
+        // sched/scratch below carry the count only as launch metadata, so
+        // they are built against a 1-block placeholder that `attach_cache`
+        // rebinds to the real geometry.
         let index_layout = Glm52IndexerCacheLayout {
-            cache_blocks: num_blocks,
+            cache_blocks: 1,
             cache_block_size: INDEX_CACHE_BLOCK,
             cache_block_stride_bytes: INDEX_CACHE_BLOCK * (GLM52_INDEX_HEAD_DIM + 4),
         };
@@ -294,47 +386,21 @@ impl Glm52NativeMtp {
         let (cache_bytes_per_token, transfer_bytes_per_token) = mtp_cache_bytes(moe_topo, backend);
         let contract = Glm52FlashMlaSparseDecode {
             batch_size: GLM52_MAX_BATCH_PER_RANK,
-            num_blocks,
+            num_blocks: 1,
             topk: GLM52_FLASHMLA_SPARSE_TOPK,
             num_sm_parts: glm52_flashmla_sparse_decode_num_sm_parts()?,
             sm_scale: GLM52_SM_SCALE,
         };
-        let cache = Glm52LayerCaches {
-            mla_cache: ctx.stream.alloc_zeros::<u8>(
-                num_blocks * GLM52_FLASHMLA_SPARSE_PAGE_SIZE * cache_bytes_per_token,
-            )?,
-            index_k_cache: Some(
-                ctx.stream
-                    .alloc_zeros::<u8>(index_layout.min_cache_bytes()?)?,
-            ),
-        };
-        let transfer_cache = transfer_bytes_per_token
-            .map(|bytes_per_token| -> Result<_> {
-                Ok(Glm52LayerCaches {
-                    mla_cache: ctx.stream.alloc_zeros::<u8>(
-                        num_blocks * GLM52_FLASHMLA_SPARSE_PAGE_SIZE * bytes_per_token,
-                    )?,
-                    index_k_cache: Some(
-                        ctx.stream
-                            .alloc_zeros::<u8>(index_layout.min_cache_bytes()?)?,
-                    ),
-                })
-            })
-            .transpose()?;
         log::info!(
             "GLM5.2 native MTP cache: topology={moe_topo:?} \
              execution_backend={backend:?} execution_bytes/token={cache_bytes_per_token} \
              wire_layout={} wire_bytes/token={}",
-            if transfer_cache.is_some() {
+            if transfer_bytes_per_token.is_some() {
                 "fp8_ds_mla"
             } else {
                 "execution-native"
             },
-            if transfer_cache.is_some() {
-                transfer_bytes_per_token.expect("transfer cache has a wire layout")
-            } else {
-                cache_bytes_per_token
-            },
+            transfer_bytes_per_token.unwrap_or(cache_bytes_per_token),
         );
 
         let tp_moe = match moe_topo {
@@ -383,18 +449,16 @@ impl Glm52NativeMtp {
                 compute_graph: CudaGraphState::new(),
             });
         }
-        Ok(Self {
+        Ok(Glm52NativeMtpFixed {
             bookend,
             layer,
-            cache,
-            transfer_cache,
             cache_bytes_per_token,
+            transfer_bytes_per_token,
             buckets: buckets
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("GLM5.2 MTP bucket count drifted"))?,
             max_model_len,
             table_width,
-            committed_blocks,
             ep_ranks: moe_topo.expected_ep_size(),
             positions: ctx.stream.alloc_zeros(GLM52_MAX_STEP_ROWS)?,
             cos: ctx
@@ -406,7 +470,6 @@ impl Glm52NativeMtp {
             token_ids: ctx.stream.alloc_zeros(GLM52_MAX_STEP_ROWS)?,
             slot_mapping: ctx.stream.alloc_zeros(GLM52_MAX_STEP_ROWS)?,
             seq_lens: ctx.stream.alloc_zeros(GLM52_MAX_STEP_ROWS)?,
-            committed_lens: [0; GLM52_MAX_BATCH_PER_RANK],
             tp_moe,
         })
     }

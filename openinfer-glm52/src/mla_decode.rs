@@ -310,6 +310,14 @@ impl Glm52MlaSchedMetadata {
         Ok(Self { contract, backend })
     }
 
+    /// Rebind the plan to the launch-decided pool block count. The tile
+    /// scheduler plan depends only on `batch_size`/`topk`/`num_sm_parts`, so
+    /// the plan built before the measured KV fill stays valid — only the
+    /// cache-geometry field the attend launches read needs the real count.
+    pub(crate) fn set_num_blocks(&mut self, num_blocks: usize) {
+        self.contract.num_blocks = num_blocks;
+    }
+
     /// The sparse index-list length this plan was built for. The DSA indexer
     /// must produce its top-k with the same k — reading it from the plan makes
     /// an indexer/attend mismatch unrepresentable.

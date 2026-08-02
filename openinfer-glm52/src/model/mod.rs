@@ -79,6 +79,7 @@ mod mtp;
 mod step_body;
 use launch_ahead::Glm52SpeculatedStep;
 use mtp::Glm52NativeMtp;
+use mtp::Glm52NativeMtpFixed;
 use step_body::run_step_body;
 
 /// The compile-time slot-count CEILING: fixed arrays (`RankSlots`,
@@ -119,8 +120,8 @@ pub(crate) const GLM52_MODEL_LEN_ALIGN: usize = GLM52_FLASHMLA_SPARSE_PAGE_SIZE;
 /// more than its KV ever writes, because kvbm appends the final generated
 /// token and eagerly provisions its page (the dangling-token contract). The
 /// engine's `BlockPool` and the rank arenas
-/// ([`Glm52RankModel::build`]) MUST agree on this count: pool block ids index
-/// the arenas directly.
+/// ([`Glm52RankModel::finish_kv`]) MUST agree on this count: pool block ids
+/// index the arenas directly.
 pub(crate) fn glm52_pool_blocks(max_model_len: usize, pool_slots: usize) -> usize {
     pool_slots * (max_model_len + 1).div_ceil(GLM52_FLASHMLA_SPARSE_PAGE_SIZE) + 1
 }
@@ -132,19 +133,14 @@ pub(crate) fn glm52_table_width(max_model_len: usize) -> usize {
     max_model_len.div_ceil(GLM52_FLASHMLA_SPARSE_PAGE_SIZE)
 }
 
-/// Exact GPU bytes [`Glm52RankModel::build`] allocates on a rank for a given
-/// context cap — every `max_model_len`-scaled term of the build, computed
-/// from the same layout formulas the allocations use (the FlashMLA packed
-/// cache and index-K layouts, the device rope tables, the per-bucket indexer
-/// logits scratch with its 256-rounded stride, and the block tables). The
-/// launch-time VRAM probe sizes `max_model_len` against this, so a new
-/// len-scaled allocation in `build` MUST be added here or the probe
-/// under-charges.
-/// The rank's pool block count, decided ONCE at launch from the free-VRAM
-/// budget (#818): the servable cap no longer multiplies into the pool, so a
-/// 200K cap does not force 32 x 200K of KV provisioning — admission's
-/// lifetime reservation is the per-request guard, and the pool is simply as
-/// large as the budget allows. Unset (unit tests, direct builders) falls
+/// The rank's pool block count, decided ONCE at launch (#818) — since the
+/// two-phase build, from each rank's MEASURED free VRAM after the fixed
+/// build: the servable cap no longer multiplies into the pool, so a 200K cap
+/// does not force 32 x 200K of KV provisioning — admission's lifetime
+/// reservation is the per-request guard, and the pool is simply as large as
+/// the measured budget allows. The scheduler's `BlockPool` reads this;
+/// worker builds take the count explicitly through
+/// [`Glm52RankModel::finish_kv`]. Unset (unit tests, direct builders) falls
 /// back to the legacy `slots x cap` sizing.
 static POOL_BLOCKS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
@@ -159,6 +155,14 @@ pub(crate) fn glm52_configured_pool_blocks(max_model_len: usize) -> usize {
         .unwrap_or_else(|| glm52_pool_blocks(max_model_len, glm52_decode_slots()))
 }
 
+/// Exact GPU bytes the two-phase build allocates on a rank for a given cap
+/// and pool block count — every `max_model_len`- and pool-scaled term,
+/// computed from the same layout formulas the allocations use (the FlashMLA
+/// packed cache and index-K layouts, the device rope tables, the per-bucket
+/// indexer logits scratch with its 256-rounded stride, and the block
+/// tables). Linear in `num_blocks`: the launch fill derives the exact
+/// per-block slab cost as `bytes(N+1) - bytes(N)`, so a new pool-scaled
+/// allocation in `finish_kv` MUST be added here or the fill over-commits.
 pub(crate) fn glm52_arena_bytes(
     max_model_len: usize,
     num_blocks: usize,
@@ -196,7 +200,7 @@ pub(crate) fn glm52_arena_bytes(
 }
 
 /// The page-table width and index-K cache layout for a given cap — the ONE
-/// construction shared by [`Glm52RankModel::build`] and the arena ledger
+/// construction shared by the two-phase build and the arena ledger
 /// ([`glm52_arena_bytes`]), so a layout change cannot drift between them.
 fn glm52_index_cache_layout(
     max_model_len: usize,
@@ -453,6 +457,42 @@ struct Glm52BucketState {
     argmax_indices_host: PinnedHostSlice<i32>,
 }
 
+/// The output of [`Glm52RankModel::build_fixed`]: every len/chunk-scaled
+/// piece of a rank model, built BEFORE the pool block count exists so launch
+/// can measure the fixed footprint and size the pool from real free VRAM.
+/// [`Glm52RankModel::finish_kv`] consumes it. Field meanings match the
+/// [`Glm52RankModel`] fields of the same name.
+pub(crate) struct Glm52RankModelFixed {
+    layers: Vec<Glm52DecoderLayerWeights>,
+    mtp: Option<Glm52NativeMtpFixed>,
+    embed: DeviceMatrix,
+    final_norm: DeviceVec,
+    lm_head: DeviceMatrix,
+    decode_lm_head: Option<DeviceMatrix>,
+    decode_vocab_start: usize,
+    /// Built against a 1-block placeholder cache geometry (nothing in a
+    /// bucket's allocations scales with the pool); finish_kv rebinds the
+    /// sched contract and MQA shape to the decided count.
+    buckets: Vec<Glm52BucketState>,
+    table_width: usize,
+    max_model_len: usize,
+    mla_backend: crate::mla_decode::Glm52MlaBackend,
+    mla_cache_bytes_per_token: usize,
+    ep_ranks: usize,
+    slot_mapping: CudaSlice<i64>,
+    seq_lens: CudaSlice<i32>,
+    cos_table: DeviceMatrix,
+    sin_table: DeviceMatrix,
+    positions: CudaSlice<u32>,
+    cos: CudaSlice<bf16>,
+    sin: CudaSlice<bf16>,
+    token_ids: CudaSlice<u32>,
+    sampling_scratch: Option<BatchSamplingScratch>,
+    /// Chunk-scaled workspace only; its pool-scaled unpacked-KV buffers are
+    /// attached in finish_kv.
+    prefill: Option<Glm52TpPrefillExecutor>,
+}
+
 /// Attention layers occupy AR slots `0..GLM52_LAYERS`; the tail reuses the
 /// same fixed-order transport to gather vocabulary-shard top-1 candidates.
 const VOCAB_AR_SLOT: usize = GLM52_LAYERS;
@@ -573,7 +613,13 @@ impl Glm52RankModel {
         Ok(arenas)
     }
 
-    pub(crate) fn build(
+    /// Phase 1 of the two-phase build: everything NOT sized by the pool
+    /// block count — weights, rope tables, per-bucket sched/scratch/logits/
+    /// block tables (all len-scaled via [`glm52_table_width`]), and the
+    /// chunk-scaled prefill workspace. Launch measures each rank's free VRAM
+    /// after this returns and decides the pool size from it;
+    /// [`Self::finish_kv`] then allocates every pool-scaled slab.
+    pub(crate) fn build_fixed(
         ctx: &DeviceContext,
         w: &mut Glm52RankGpuWeights,
         max_model_len: usize,
@@ -581,7 +627,7 @@ impl Glm52RankModel {
         attn_shard: Option<usize>,
         drafter: &crate::Glm52Drafter,
         prefill_chunk_size: Option<usize>,
-    ) -> Result<Self> {
+    ) -> Result<Glm52RankModelFixed> {
         ensure!(
             moe_topo.uses_tensor_replicated_moe() == attn_shard.is_some(),
             "GLM5.2 attention-TP shard must ride a tensor-replicated topology (topo {moe_topo:?}, \
@@ -632,45 +678,29 @@ impl Glm52RankModel {
         } else {
             glm52_flashmla_sparse_decode_num_sm_parts()?
         };
-        // The launch-time budget decides the pool size (prefix cache included
-        // — released prefixes retain in whatever headroom the pool carries);
-        // the scheduler pool and every cache slab here share the ONE number.
-        let pool_blocks = glm52_configured_pool_blocks(max_model_len);
+        // The pool block count is decided by the measured launch fill AFTER
+        // this build; the per-bucket sched/scratch below carry the count only
+        // as launch metadata (nothing they allocate scales with it), so they
+        // are built against a 1-block placeholder that `finish_kv` rebinds.
         let contract = Glm52FlashMlaSparseDecode {
             batch_size: batch,
-            num_blocks: pool_blocks,
+            num_blocks: 1,
             topk: GLM52_FLASHMLA_SPARSE_TOPK,
             num_sm_parts,
             sm_scale: GLM52_SM_SCALE,
         };
-        let (table_width, index_cache_layout) =
-            glm52_index_cache_layout(max_model_len, pool_blocks);
+        let (table_width, index_cache_layout) = glm52_index_cache_layout(max_model_len, 1);
 
         let mut layers = Vec::with_capacity(GLM52_LAYERS);
-        let mut caches = Vec::with_capacity(GLM52_LAYERS);
         for layer in 0..GLM52_LAYERS {
             layers.push(
                 build::build_decoder_layer(ctx, w, layer, moe_topo, attn_shard)
                     .with_context(|| format!("build GLM5.2 decoder layer {layer}"))?,
             );
-            caches.push(Glm52LayerCaches {
-                mla_cache: ctx.stream.alloc_zeros::<u8>(
-                    contract.num_blocks
-                        * GLM52_FLASHMLA_SPARSE_PAGE_SIZE
-                        * mla_cache_bytes_per_token,
-                )?,
-                index_k_cache: glm52_layer_has_full_indexer(layer)
-                    .then(|| {
-                        ctx.stream
-                            .alloc_zeros::<u8>(index_cache_layout.min_cache_bytes()?)
-                            .map_err(anyhow::Error::from)
-                    })
-                    .transpose()?,
-            });
         }
         let mtp = drafter
             .is_mtp()
-            .then(|| Glm52NativeMtp::build(ctx, w, max_model_len, moe_topo, attn_shard))
+            .then(|| Glm52NativeMtp::build_fixed(ctx, w, max_model_len, moe_topo, attn_shard))
             .transpose()?;
 
         let embed_raw = w.take_tensor("model.embed_tokens.weight")?;
@@ -789,20 +819,6 @@ impl Glm52RankModel {
                 argmax_indices_host: unsafe { ctx.ctx.alloc_pinned::<i32>(rows)? },
             });
         }
-        if prefill_chunk_size.is_none()
-            && mla_backend == crate::mla_decode::Glm52MlaBackend::FlashInferFp8
-        {
-            for bucket in &mut buckets {
-                glm52_mla_backend_preflight(
-                    ctx,
-                    &bucket.sched,
-                    &mut bucket.scratch.mla_attend,
-                    &caches[0].mla_cache,
-                )?;
-            }
-            ctx.sync()?;
-        }
-
         // Crash-early pre-flight: launch the batched weight-only GEMV once
         // per bucket, so a GLM52_DECODE_BUCKETS entry without a matching CUDA
         // template instantiation (`kBatchedGemvBatch*` in glm52_moe_gemv.cu)
@@ -852,7 +868,6 @@ impl Glm52RankModel {
                 };
                 Glm52TpPrefillExecutor::new(
                     ctx,
-                    pool_blocks * GLM52_FLASHMLA_SPARSE_PAGE_SIZE,
                     table_width,
                     index_cache_layout,
                     chunk_rows,
@@ -861,9 +876,8 @@ impl Glm52RankModel {
             })
             .transpose()?;
 
-        Ok(Self {
+        Ok(Glm52RankModelFixed {
             layers,
-            caches,
             mtp,
             embed,
             final_norm,
@@ -873,7 +887,7 @@ impl Glm52RankModel {
             buckets,
             table_width,
             max_model_len,
-            pool_blocks,
+            mla_backend,
             mla_cache_bytes_per_token,
             ep_ranks: moe_topo.expected_ep_size(),
             slot_mapping: ctx.stream.alloc_zeros::<i64>(batch)?,
@@ -893,6 +907,120 @@ impl Glm52RankModel {
             sin: ctx.stream.alloc_zeros::<bf16>(batch * GLM52_ROPE_HALF)?,
             token_ids: ctx.stream.alloc_zeros::<u32>(batch)?,
             sampling_scratch: Some(BatchSamplingScratch::new(ctx, batch, GLM52_VOCAB)?),
+            prefill,
+        })
+    }
+
+    /// Phase 2 of the two-phase build: allocate every pool-scaled slab for
+    /// the launch-decided `pool_blocks` — the per-layer MLA/index-K arenas,
+    /// the native-MTP cache, and the prefill unpacked-KV pool — and rebind
+    /// the placeholder cache geometry the fixed buckets carry. The engine's
+    /// `BlockPool` and the arenas here MUST agree on this count: pool block
+    /// ids index the arenas directly.
+    pub(crate) fn finish_kv(
+        ctx: &DeviceContext,
+        fixed: Glm52RankModelFixed,
+        pool_blocks: usize,
+    ) -> Result<Self> {
+        let Glm52RankModelFixed {
+            layers,
+            mtp,
+            embed,
+            final_norm,
+            lm_head,
+            decode_lm_head,
+            decode_vocab_start,
+            mut buckets,
+            table_width,
+            max_model_len,
+            mla_backend,
+            mla_cache_bytes_per_token,
+            ep_ranks,
+            slot_mapping,
+            seq_lens,
+            cos_table,
+            sin_table,
+            positions,
+            cos,
+            sin,
+            token_ids,
+            sampling_scratch,
+            mut prefill,
+        } = fixed;
+        ensure!(pool_blocks > 0, "GLM5.2 KV pool must be non-empty");
+        let (layout_width, index_cache_layout) =
+            glm52_index_cache_layout(max_model_len, pool_blocks);
+        ensure!(
+            layout_width == table_width,
+            "GLM5.2 table width drifted between build_fixed and finish_kv"
+        );
+        for bucket in &mut buckets {
+            bucket.sched.set_num_blocks(pool_blocks);
+            bucket.scratch.idx.set_num_kv_blocks(pool_blocks);
+        }
+        let mut caches = Vec::with_capacity(layers.len());
+        for layer in 0..layers.len() {
+            caches.push(Glm52LayerCaches {
+                mla_cache: ctx.stream.alloc_zeros::<u8>(
+                    pool_blocks * GLM52_FLASHMLA_SPARSE_PAGE_SIZE * mla_cache_bytes_per_token,
+                )?,
+                index_k_cache: glm52_layer_has_full_indexer(layer)
+                    .then(|| {
+                        ctx.stream
+                            .alloc_zeros::<u8>(index_cache_layout.min_cache_bytes()?)
+                            .map_err(anyhow::Error::from)
+                    })
+                    .transpose()?,
+            });
+        }
+        let mtp = mtp
+            .map(|fixed| fixed.attach_cache(ctx, pool_blocks))
+            .transpose()?;
+        if let Some(prefill) = prefill.as_mut() {
+            prefill.attach_kv_pool(
+                ctx,
+                pool_blocks * GLM52_FLASHMLA_SPARSE_PAGE_SIZE,
+                index_cache_layout,
+            )?;
+        }
+        // The FlashInfer preflight needs a real cache arena, so it runs here
+        // rather than in build_fixed (decode-only: TP4 prefill has no decode
+        // buckets to warm).
+        if prefill.is_none() && mla_backend == crate::mla_decode::Glm52MlaBackend::FlashInferFp8 {
+            for bucket in &mut buckets {
+                glm52_mla_backend_preflight(
+                    ctx,
+                    &bucket.sched,
+                    &mut bucket.scratch.mla_attend,
+                    &caches[0].mla_cache,
+                )?;
+            }
+            ctx.sync()?;
+        }
+        Ok(Self {
+            layers,
+            caches,
+            mtp,
+            embed,
+            final_norm,
+            lm_head,
+            decode_lm_head,
+            decode_vocab_start,
+            buckets,
+            table_width,
+            max_model_len,
+            pool_blocks,
+            mla_cache_bytes_per_token,
+            ep_ranks,
+            slot_mapping,
+            seq_lens,
+            cos_table,
+            sin_table,
+            positions,
+            cos,
+            sin,
+            token_ids,
+            sampling_scratch,
             prefill,
             speculated: None,
             device_positions: [0; GLM52_MAX_STEP_ROWS],
