@@ -58,6 +58,12 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | `models/qwen35/mixed-load-itl-470.md` | Issue #470: full cold `--max-batch 8/bg=4` matrix on RTX 4090 (24/24 valid) + starvation negative control. Qwen3.5 is not immune; chunking bounds max/per-step stall but raises p99 at low QPS (~14→~80–92ms) and pulls p99/max back from the prefill wall to the chunk wall at high load; `qps·prefill_s≳1` is a throughput wall (chunking can't fix it, and ON's +15% TTFT can trip it earlier). The old "p99 immunity" was a slot-starvation artifact. |
 | `models/qwen35/adaptive-scheduler-policy.md` | Issue #727 adaptive scheduler policy record: default `off`, opt-in `auto`, hard `--max-prefill-tokens` cap, TP `auto` rejection, and pre-review whole-prefill benchmark tradeoff retained as non-default evidence. |
 
+## models / gemma4
+
+| Path | TL;DR |
+| --- | --- |
+| `models/gemma4/kv-cache.md` | Gemma 4's two KV groups (head_dim 256 sliding, 512 full attention) differ in lifetime, not just geometry. Two attention backends are prerequisites for correct serving — a sliding-window instantiation, entered as `sliding_window - 1` because the two sides count the window differently, and paged attention at head_dim 512. After those, one pool is correct while nothing is reclaimed; reclaiming sliding pages needs two pools, since a request holds one assignment list and a block is held or released for both groups at once. Reclamation splits `positions`, one array carrying both the absolute RoPE position and a view-relative append slot. Unreclaimed, one 12B request at the declared context wants 84 GiB. `attention_k_eq_v` means no `v_proj` on full-attention layers; K and V still diverge after the shared projection and both are cached. |
+
 ## models / glm52
 
 | Path | TL;DR |
