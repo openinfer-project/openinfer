@@ -1390,19 +1390,25 @@ impl Glm52Engine {
                 // save (and any sealed-page saves) pending, retire parks the
                 // whole KV until they settle — the un-guarded tail page's
                 // reuse pin is the parked KV itself.
-                let finished = slot.take().expect("freed slot was active");
-                let mut finished = finished;
+                let mut finished = slot.take().expect("freed slot was active");
+                // Sealed full pages go fire-and-forget: their KvBlockGuards
+                // pin the pages through the D2H independently of the
+                // release, so the KV must NOT park on them — parking would
+                // keep every page out of the reusable pool for the whole
+                // 101-arena save and starve admission under bursts. Only the
+                // keyed tail save (already in the cursor, pinned by the
+                // parked KV itself) holds the retire.
                 self.store.seal(
                     self.rank,
                     &finished.kv,
                     &mut finished.save_cursor,
-                    SaveClass::Handoff,
+                    SaveClass::Cacheable,
                 );
                 self.store.retire(
                     self.rank,
                     finished.kv,
                     finished.save_cursor,
-                    SaveClass::Handoff,
+                    SaveClass::Cacheable,
                 );
             }
         }
