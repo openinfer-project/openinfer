@@ -1,9 +1,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Barrier;
+use std::sync::Condvar;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
+use anyhow::Context;
 use anyhow::Result;
 use openinfer_core::engine::EngineControlError;
 use openinfer_core::engine::LoadLoraAdapterRequest;
@@ -20,10 +26,54 @@ use crate::executor::PrefillStepItem;
 use crate::executor::UnifiedPlan;
 use crate::executor::UnifiedResult;
 
+struct DecodePause {
+    started: Barrier,
+    release: Barrier,
+}
+
+impl DecodePause {
+    fn new() -> Self {
+        Self {
+            started: Barrier::new(2),
+            release: Barrier::new(2),
+        }
+    }
+}
+
+struct AsyncPrefillGate {
+    ready: Mutex<bool>,
+    wake: Condvar,
+    wait_calls: AtomicUsize,
+}
+
+impl AsyncPrefillGate {
+    fn new() -> Self {
+        Self {
+            ready: Mutex::new(false),
+            wake: Condvar::new(),
+            wait_calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn wait(&self) {
+        self.wait_calls.fetch_add(1, Ordering::SeqCst);
+        let mut ready = self.ready.lock().unwrap();
+        while !*ready {
+            ready = self.wake.wait(ready).unwrap();
+        }
+    }
+
+    fn release(&self) {
+        *self.ready.lock().unwrap() = true;
+        self.wake.notify_all();
+    }
+}
+
 struct FakeExecutor {
     block_size: usize,
     max_request_blocks: usize,
     max_context_tokens: usize,
+    max_decode_batch_size: usize,
     available_blocks: usize,
     held_tokens: HashMap<RequestId, usize>,
     // Prompt progress of requests mid-chunked-prefill (mirrors the real
@@ -35,6 +85,11 @@ struct FakeExecutor {
     dropped: Arc<Mutex<Vec<u64>>>,
     prefetch_offers: Arc<Mutex<Vec<u64>>>,
     stop_token: Option<u32>,
+    decode_overlap: bool,
+    decode_pause: Option<Arc<DecodePause>>,
+    async_prefill_gate: Option<Arc<AsyncPrefillGate>>,
+    async_prefill: Option<PrefillResult>,
+    lose_async_prefill_result: bool,
 }
 
 impl FakeExecutor {
@@ -43,6 +98,7 @@ impl FakeExecutor {
             block_size: 16,
             max_request_blocks,
             max_context_tokens: usize::MAX,
+            max_decode_batch_size: 64,
             available_blocks: max_request_blocks,
             held_tokens: HashMap::new(),
             prefill_positions: HashMap::new(),
@@ -52,11 +108,37 @@ impl FakeExecutor {
             dropped,
             prefetch_offers: Arc::new(Mutex::new(Vec::new())),
             stop_token: None,
+            decode_overlap: false,
+            decode_pause: None,
+            async_prefill_gate: None,
+            async_prefill: None,
+            lose_async_prefill_result: false,
         }
+    }
+
+    fn with_decode_overlap(
+        mut self,
+        decode_pause: Arc<DecodePause>,
+        async_prefill_gate: Arc<AsyncPrefillGate>,
+    ) -> Self {
+        self.decode_overlap = true;
+        self.decode_pause = Some(decode_pause);
+        self.async_prefill_gate = Some(async_prefill_gate);
+        self
     }
 
     fn with_stop_token(mut self, token: u32) -> Self {
         self.stop_token = Some(token);
+        self
+    }
+
+    fn with_missing_async_prefill_result(mut self) -> Self {
+        self.lose_async_prefill_result = true;
+        self
+    }
+
+    fn with_max_decode_batch_size(mut self, max_decode_batch_size: usize) -> Self {
+        self.max_decode_batch_size = max_decode_batch_size;
         self
     }
 
@@ -131,7 +213,7 @@ impl ModelExecutor for FakeExecutor {
     }
 
     fn max_decode_batch_size(&self) -> usize {
-        64
+        self.max_decode_batch_size
     }
 
     fn available_blocks(&self) -> usize {
@@ -192,6 +274,10 @@ impl ModelExecutor for FakeExecutor {
     }
 
     fn execute_decode(&mut self, plan: DecodePlan<'_>) -> Result<crate::executor::DecodeResult> {
+        if let Some(pause) = &self.decode_pause {
+            pause.started.wait();
+            pause.release.wait();
+        }
         if !self.decode_delay.is_zero() {
             std::thread::sleep(self.decode_delay);
         }
@@ -235,22 +321,63 @@ impl ModelExecutor for FakeExecutor {
             self.ensure_request_tokens(req.request_id, current_tokens + 1)?;
         }
 
+        let prefill_requests: Vec<_> = plan
+            .prefill_requests
+            .iter()
+            .map(|req| self.fake_prefill_result(req))
+            .collect();
+        let decode_requests = plan
+            .decode_requests
+            .iter()
+            .map(|req| DecodeRequestResult {
+                request_id: req.request_id,
+                token: 200 + req.request_id.get() as u32,
+                logprob: None,
+            })
+            .collect();
+        if self.decode_overlap {
+            self.async_prefill = Some(PrefillResult {
+                requests: prefill_requests.clone(),
+                dflash_context_captured_requests: Vec::new(),
+            });
+        }
         Ok(UnifiedResult {
-            prefill_requests: plan
-                .prefill_requests
-                .iter()
-                .map(|req| self.fake_prefill_result(req))
-                .collect(),
-            decode_requests: plan
-                .decode_requests
-                .iter()
-                .map(|req| DecodeRequestResult {
-                    request_id: req.request_id,
-                    token: 200 + req.request_id.get() as u32,
-                    logprob: None,
-                })
-                .collect(),
+            prefill_requests: if self.decode_overlap {
+                Vec::new()
+            } else {
+                prefill_requests
+            },
+            decode_requests,
         })
+    }
+
+    fn has_decode_overlap(&self) -> bool {
+        self.decode_overlap
+    }
+
+    fn poll_async_prefill(&mut self) -> Option<PrefillResult> {
+        let gate = self.async_prefill_gate.as_ref()?;
+        if !*gate.ready.lock().unwrap() {
+            return None;
+        }
+        self.async_prefill.take()
+    }
+
+    fn wait_async_prefill(&mut self) -> Result<PrefillResult> {
+        let gate = self
+            .async_prefill_gate
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("fake async prefill is not enabled"))?;
+        gate.wait();
+        if self.lose_async_prefill_result {
+            self.async_prefill.take();
+            let missing: Result<PrefillResult> =
+                Err(anyhow::anyhow!("fake worker response missing"));
+            return missing.context("async prefill completed without a result");
+        }
+        self.async_prefill
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("fake async prefill result was lost"))
     }
 }
 
@@ -438,6 +565,82 @@ fn admission_respects_decode_batch_capacity() {
         RequestId(64),
         "capacity-starved request should stay deferred"
     );
+    assert!(outcome.rejected.is_empty());
+}
+
+#[test]
+fn admission_counts_inflight_prefill_decode_slot() {
+    let (token_tx, _rx) = TokenSink::standalone();
+    let active = [ActiveRequestState {
+        request_id: RequestId(0),
+        lora_adapter: None,
+        token_tx,
+        last_token: 1,
+        generated_count: 1,
+        max_tokens: 8,
+        prompt_len: 16,
+        params: SamplingParams::default(),
+        logprobs: 0,
+    }];
+    let mk = |id: u64, prompt_len, max_tokens| {
+        PendingRequest::from_scheduler_request(RequestId(id), request(prompt_len, max_tokens).0)
+    };
+    let mut inflight = mk(1, 16, 1);
+    inflight.step_chunk = 16;
+    let deferred = mk(2, 16, 1);
+
+    let outcome = admit_deferred_requests_with_inflight(
+        vec![deferred],
+        &active,
+        &[],
+        &[inflight],
+        16,
+        1024,
+        1024,
+        usize::MAX,
+        2,
+        32,
+        |_| 0,
+    );
+
+    assert!(
+        outcome.pending.is_empty(),
+        "active decode plus in-flight prefill already fill decode capacity"
+    );
+    assert_eq!(outcome.deferred[0].request_id, RequestId(2));
+    assert!(outcome.rejected.is_empty());
+}
+
+#[test]
+fn admission_charges_inflight_prefill_only_for_unscheduled_kv_tail() {
+    let active: [ActiveRequestState; 0] = [];
+    let mk = |id: u64, prompt_len, max_tokens| {
+        PendingRequest::from_scheduler_request(RequestId(id), request(prompt_len, max_tokens).0)
+    };
+    let mut inflight = mk(1, 16, 17);
+    inflight.step_chunk = 16;
+    let deferred = mk(2, 16, 1);
+
+    let outcome = admit_deferred_requests_with_inflight(
+        vec![deferred],
+        &active,
+        &[],
+        &[inflight],
+        16,
+        3,
+        1024,
+        usize::MAX,
+        64,
+        32,
+        |_| 0,
+    );
+
+    assert_eq!(
+        outcome.pending[0].request_id,
+        RequestId(2),
+        "the in-flight request's current chunk is already out of available_blocks"
+    );
+    assert!(outcome.deferred.is_empty());
     assert!(outcome.rejected.is_empty());
 }
 
@@ -838,6 +1041,223 @@ fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
         std::thread::sleep(Duration::from_millis(10));
     }
     false
+}
+
+fn try_recv_event_with_timeout(
+    rx: &mut openinfer_core::engine::TokenStreamReceiver,
+    timeout: Duration,
+) -> Option<TokenEvent> {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        match rx.try_recv() {
+            Ok((_, TokenEvent::Scheduled { .. })) => {}
+            Ok((_, event)) => return Some(event),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return None,
+        }
+    }
+    None
+}
+
+#[test]
+fn decode_overlap_idle_wait_resolves_prefill_before_final_handle_drop() {
+    let dropped = Arc::new(Mutex::new(Vec::new()));
+    let decode_pause = Arc::new(DecodePause::new());
+    let async_prefill_gate = Arc::new(AsyncPrefillGate::new());
+    let executor = FakeExecutor::new(8, Arc::clone(&dropped))
+        .with_decode_overlap(Arc::clone(&decode_pause), Arc::clone(&async_prefill_gate));
+    let handle = start_with_executor(executor, 42, DEFAULT_MAX_PREFILL_TOKENS);
+
+    // Keep the first request active after its first decode so the next request
+    // enters a unified decode + async-prefill step.
+    let (active_request, mut active_rx) = request(16, 3);
+    handle
+        .submit(active_request)
+        .expect("submit active request");
+    assert!(matches!(
+        recv_skipping_scheduled(&mut active_rx),
+        Some(TokenEvent::Token { id: 100, .. })
+    ));
+
+    // Submit the pending request while the first decode is paused. This makes
+    // the next scheduler step deterministic: the active request finishes while
+    // the pending request's prefill is launched asynchronously.
+    decode_pause.started.wait();
+    let (overlap_request, mut overlap_rx) = request(16, 1);
+    handle
+        .submit(overlap_request)
+        .expect("submit overlap request");
+    decode_pause.release.wait();
+
+    // The fixed scheduler must wait on the async prefill event once all other
+    // queues are empty. The old scheduler parks on submit_rx instead, so this
+    // condition stays false and the test fails without the fix.
+    let entered_prefill_wait = wait_until(Duration::from_secs(1), || {
+        async_prefill_gate.wait_calls.load(Ordering::SeqCst) > 0
+    });
+
+    let drop_finished = Arc::new(AtomicBool::new(false));
+    let drop_finished_for_thread = Arc::clone(&drop_finished);
+    let drop_thread = std::thread::spawn(move || {
+        drop(handle);
+        drop_finished_for_thread.store(true, Ordering::SeqCst);
+    });
+    let finished_before_prefill_release = wait_until(Duration::from_millis(100), || {
+        drop_finished.load(Ordering::SeqCst)
+    });
+
+    // Releasing the event lets the scheduler resolve the result before the
+    // final EngineHandle drop joins its thread.
+    async_prefill_gate.release();
+    drop_thread.join().expect("scheduler thread should join");
+
+    assert!(
+        entered_prefill_wait,
+        "idle scheduler must wait on in-flight prefill instead of blocking only on submissions"
+    );
+    assert!(
+        !finished_before_prefill_release,
+        "final EngineHandle drop must not abandon an in-flight prefill"
+    );
+    assert!(matches!(
+        try_recv_event_with_timeout(&mut overlap_rx, Duration::from_secs(1)),
+        Some(TokenEvent::Token { id: 101, .. })
+    ));
+    assert!(matches!(
+        try_recv_event_with_timeout(&mut overlap_rx, Duration::from_secs(1)),
+        Some(TokenEvent::Finished { .. })
+    ));
+    assert!(dropped.lock().unwrap().contains(&0));
+    assert!(dropped.lock().unwrap().contains(&1));
+}
+
+#[test]
+fn decode_overlap_admission_counts_inflight_prefill_capacity() {
+    let dropped = Arc::new(Mutex::new(Vec::new()));
+    let decode_pause = Arc::new(DecodePause::new());
+    let async_prefill_gate = Arc::new(AsyncPrefillGate::new());
+    let executor = FakeExecutor::new(8, Arc::clone(&dropped))
+        .with_decode_overlap(Arc::clone(&decode_pause), Arc::clone(&async_prefill_gate))
+        .with_max_decode_batch_size(2);
+    let handle = start_with_executor(executor, 42, DEFAULT_MAX_PREFILL_TOKENS);
+    let load_watch = handle.load_watch().expect("scheduler exposes load watch");
+
+    let (active_request, mut active_rx) = request(16, 6);
+    handle
+        .submit(active_request)
+        .expect("submit active request");
+    assert!(matches!(
+        recv_skipping_scheduled(&mut active_rx),
+        Some(TokenEvent::Token { id: 100, .. })
+    ));
+
+    // First decode-only step: hold the active request runnable while queuing a
+    // second request. The following scheduler iteration will run unified
+    // decode+prefill and leave that prefill in flight.
+    decode_pause.started.wait();
+    let (overlap_request, mut overlap_rx) = request(16, 2);
+    handle
+        .submit(overlap_request)
+        .expect("submit overlap request");
+    decode_pause.release.wait();
+
+    // Second decode-only step: the overlap prefill is in flight but the active
+    // request can still make progress, so the scheduler is not blocked in
+    // wait_async_prefill(). Submit the third request for admission during these
+    // in-flight iterations.
+    decode_pause.started.wait();
+    let (deferred_request, mut deferred_rx) = request(16, 1);
+    handle
+        .submit(deferred_request)
+        .expect("submit request during async prefill");
+    decode_pause.release.wait();
+
+    // Third decode-only step: admission has seen the third request while
+    // active+in-flight already fill the two decode slots. Let one more decode
+    // finish so the next load snapshot exposes whether the request was wrongly
+    // counted as running.
+    decode_pause.started.wait();
+    decode_pause.release.wait();
+    let over_admitted = wait_until(Duration::from_secs(1), || {
+        load_watch.borrow().num_running_reqs > 2
+    });
+
+    // Release the fourth active decode and the async prefill so the scheduler
+    // can drain all requests before the handle is dropped.
+    decode_pause.started.wait();
+    async_prefill_gate.release();
+    decode_pause.release.wait();
+
+    assert!(matches!(
+        try_recv_event_with_timeout(&mut overlap_rx, Duration::from_secs(1)),
+        Some(TokenEvent::Token { id: 101, .. })
+    ));
+    assert!(matches!(
+        try_recv_event_with_timeout(&mut deferred_rx, Duration::from_secs(1)),
+        Some(TokenEvent::Token { id: 102, .. })
+    ));
+    assert!(matches!(
+        try_recv_event_with_timeout(&mut deferred_rx, Duration::from_secs(1)),
+        Some(TokenEvent::Finished { .. })
+    ));
+    drop(handle);
+
+    assert!(
+        !over_admitted,
+        "in-flight async prefill must reserve its scheduler slot before admitting new requests"
+    );
+}
+
+#[test]
+fn decode_overlap_missing_result_reports_chain_and_stops_scheduler() {
+    let dropped = Arc::new(Mutex::new(Vec::new()));
+    let decode_pause = Arc::new(DecodePause::new());
+    let async_prefill_gate = Arc::new(AsyncPrefillGate::new());
+    let executor = FakeExecutor::new(8, Arc::clone(&dropped))
+        .with_decode_overlap(Arc::clone(&decode_pause), Arc::clone(&async_prefill_gate))
+        .with_missing_async_prefill_result();
+    let handle = start_with_executor(executor, 42, DEFAULT_MAX_PREFILL_TOKENS);
+
+    let (active_request, mut active_rx) = request(16, 3);
+    handle
+        .submit(active_request)
+        .expect("submit active request");
+    assert!(matches!(
+        recv_skipping_scheduled(&mut active_rx),
+        Some(TokenEvent::Token { id: 100, .. })
+    ));
+
+    decode_pause.started.wait();
+    let (overlap_request, mut overlap_rx) = request(16, 1);
+    handle
+        .submit(overlap_request)
+        .expect("submit overlap request");
+    decode_pause.release.wait();
+
+    assert!(wait_until(Duration::from_secs(1), || {
+        async_prefill_gate.wait_calls.load(Ordering::SeqCst) > 0
+    }));
+    async_prefill_gate.release();
+
+    let message = match try_recv_event_with_timeout(&mut overlap_rx, Duration::from_secs(1)) {
+        Some(TokenEvent::Error { message, .. }) => message,
+        other => panic!("expected async prefill result error, got {other:?}"),
+    };
+    assert!(message.contains("async prefill completed without a result"));
+    assert!(message.contains("fake worker response missing"));
+    drop(handle);
+
+    let dropped = dropped.lock().unwrap();
+    assert!(
+        dropped.contains(&0),
+        "the completed decode request is retired"
+    );
+    assert!(
+        !dropped.contains(&1),
+        "a request without a resolved prefill result must not be retired normally"
+    );
 }
 
 #[test]

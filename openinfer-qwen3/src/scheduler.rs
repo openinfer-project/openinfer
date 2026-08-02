@@ -48,6 +48,7 @@ use self::resolve::resolve_step;
 use crate::Qwen3LoraOptions;
 use crate::Qwen3OffloadOptions;
 use crate::executor::ModelExecutor;
+use crate::executor::PrefillResult;
 use crate::executor::Qwen3Executor;
 use crate::executor::RequestId;
 use crate::weights::Qwen3MemoryOptions;
@@ -525,6 +526,34 @@ fn publish_load<E: ModelExecutor>(
     });
 }
 
+/// Apply a completed decode-overlap prefill. The pending requests are kept in
+/// the scheduler until this point because their first token and KV state are
+/// produced by the async prefill stream.
+fn apply_async_prefill_result<E: ModelExecutor>(
+    executor: &mut E,
+    active: &mut Vec<ActiveRequestState>,
+    prefilling: &mut Vec<PendingRequest>,
+    tracker: &mut phase_trace::PhaseTracker,
+    inflight: &mut Option<Vec<PendingRequest>>,
+    result: PrefillResult,
+) {
+    let pending = inflight
+        .take()
+        .expect("async prefill result without pending requests");
+    info!(
+        "decode-overlap: async prefill completed ({} reqs)",
+        pending.len()
+    );
+    let scheduled_at_unix_s = openinfer_core::engine::unix_now_s();
+    let artifacts = ExecutionArtifacts::Prefill {
+        pending,
+        result,
+        scheduled_at_unix_s,
+    };
+    let effects = resolve_step(&*executor, active, artifacts);
+    apply_effects(executor, active, prefilling, tracker, effects);
+}
+
 fn scheduler_loop<E>(
     mut executor: E,
     mut submit_rx: mpsc::UnboundedReceiver<SubmittedRequest>,
@@ -579,24 +608,13 @@ fn scheduler_loop<E>(
         // 0. Poll in-flight async prefill (decode-overlap mode).
         if inflight_prefill_pending.is_some() {
             if let Some(prefill_result) = executor.poll_async_prefill() {
-                let pending = inflight_prefill_pending.take().unwrap();
-                info!(
-                    "decode-overlap: async prefill completed ({} reqs)",
-                    pending.len()
-                );
-                let scheduled_at_unix_s = openinfer_core::engine::unix_now_s();
-                let artifacts = ExecutionArtifacts::Prefill {
-                    pending,
-                    result: prefill_result,
-                    scheduled_at_unix_s,
-                };
-                let effects = resolve_step(&executor, &active, artifacts);
-                apply_effects(
+                apply_async_prefill_result(
                     &mut executor,
                     &mut active,
                     &mut prefilling,
                     &mut tracker,
-                    effects,
+                    &mut inflight_prefill_pending,
+                    prefill_result,
                 );
             }
         }
@@ -607,14 +625,50 @@ fn scheduler_loop<E>(
         }
 
         // 2. Reclaim settled prefetches, then offer fresh requests to prefetch.
-        let reserve_floor = admitted_future_blocks(&executor, &active, &prefilling);
+        let reserve_floor = admitted_future_blocks_with_inflight(
+            &executor,
+            &active,
+            &prefilling,
+            inflight_prefill_pending.as_deref().unwrap_or(&[]),
+        );
         reclaim_ready_prefetch(&mut executor, &mut deferred, &mut loading, reserve_floor);
         offer_prefetch(&mut executor, &mut deferred, &mut loading, reserve_floor);
 
         // 3. Nothing active and nothing admittable → block. Prefer blocking on
         // an in-flight load (so its request prefills next) over a new submit;
-        // only truly idle (no loads either) do we block on the channel.
+        // an in-flight decode-overlap prefill over a new submit; only truly
+        // idle (no loads or GPU work) do we block on the channel.
         if active.is_empty() && deferred.is_empty() && prefilling.is_empty() {
+            if inflight_prefill_pending.is_some() {
+                match executor.wait_async_prefill() {
+                    Ok(prefill_result) => apply_async_prefill_result(
+                        &mut executor,
+                        &mut active,
+                        &mut prefilling,
+                        &mut tracker,
+                        &mut inflight_prefill_pending,
+                        prefill_result,
+                    ),
+                    Err(error) => {
+                        warn!("decode-overlap: async prefill wait failed: {error:#}");
+                        // CUDA event synchronization failures abort inside the
+                        // real executor. A returned error is a post-wait state
+                        // or result mismatch, so report it and stop this broken
+                        // scheduler instance; executor teardown owns the
+                        // remaining request resources.
+                        let message = format!("{error:#}");
+                        for req in inflight_prefill_pending.as_ref().unwrap() {
+                            let _ = req.token_tx.send(TokenEvent::Error {
+                                message: message.clone(),
+                                prompt_tokens: req.prompt_tokens.len(),
+                                completion_tokens: 0,
+                            });
+                        }
+                        return;
+                    }
+                }
+                continue;
+            }
             if !loading.is_empty() {
                 let reserve_floor = admitted_future_blocks(&executor, &active, &prefilling);
                 block_on_loading(&mut executor, &mut deferred, &mut loading, reserve_floor);
@@ -638,10 +692,11 @@ fn scheduler_loop<E>(
             release_rejected(&mut executor, &mut tracker, rejected);
         }
 
-        let admission = admit_deferred_requests(
+        let admission = admit_deferred_requests_with_inflight(
             lora_validation.accepted,
             &active,
             &prefilling,
+            inflight_prefill_pending.as_deref().unwrap_or(&[]),
             executor.block_size(),
             executor.available_blocks(),
             executor.max_request_blocks(),
@@ -1130,9 +1185,21 @@ fn admitted_future_blocks<E: ModelExecutor>(
     active: &[ActiveRequestState],
     prefilling: &[PendingRequest],
 ) -> usize {
+    admitted_future_blocks_with_inflight(executor, active, prefilling, &[])
+}
+
+fn admitted_future_blocks_with_inflight<E: ModelExecutor>(
+    executor: &E,
+    active: &[ActiveRequestState],
+    prefilling: &[PendingRequest],
+    inflight_prefilling: &[PendingRequest],
+) -> usize {
     let block_size = executor.block_size();
     active_future_blocks(active, block_size)
         + prefilling_future_blocks(prefilling, block_size, |id| executor.prefetched_blocks(id))
+        + inflight_prefilling_future_blocks(inflight_prefilling, block_size, |id| {
+            executor.prefetched_blocks(id)
+        })
 }
 
 fn prefilling_future_blocks(
@@ -1148,6 +1215,25 @@ fn prefilling_future_blocks(
         .map(|req| {
             pending_lifetime_blocks(req, block_size)
                 .saturating_sub(blocks_needed(req.prefill_pos, block_size))
+                .saturating_sub(prefetch_credit(req.request_id))
+        })
+        .sum()
+}
+
+fn inflight_prefilling_future_blocks(
+    prefilling: &[PendingRequest],
+    block_size: usize,
+    prefetch_credit: impl Fn(RequestId) -> usize,
+) -> usize {
+    prefilling
+        .iter()
+        .map(|req| {
+            let scheduled_prompt_tokens = req
+                .prefill_pos
+                .saturating_add(req.step_chunk)
+                .min(req.prompt_tokens.len());
+            pending_lifetime_blocks(req, block_size)
+                .saturating_sub(blocks_needed(scheduled_prompt_tokens, block_size))
                 .saturating_sub(prefetch_credit(req.request_id))
         })
         .sum()
@@ -1172,10 +1258,42 @@ pub const DEFAULT_MAX_PREFILL_TOKENS: usize = 1024;
 fn admit_deferred_requests(
     deferred: Vec<PendingRequest>,
     active: &[ActiveRequestState],
+    prefilling: &[PendingRequest],
+    block_size: usize,
+    available_blocks: usize,
+    max_request_blocks: usize,
+    max_context_tokens: usize,
+    max_decode_batch_size: usize,
+    max_prefill_tokens: usize,
+    prefetch_credit: impl Fn(RequestId) -> usize,
+) -> AdmissionOutcome {
+    admit_deferred_requests_with_inflight(
+        deferred,
+        active,
+        prefilling,
+        &[],
+        block_size,
+        available_blocks,
+        max_request_blocks,
+        max_context_tokens,
+        max_decode_batch_size,
+        max_prefill_tokens,
+        prefetch_credit,
+    )
+}
+
+fn admit_deferred_requests_with_inflight(
+    deferred: Vec<PendingRequest>,
+    active: &[ActiveRequestState],
     // Admitted requests still mid-prefill: they hold KV for their applied
     // chunks and will take a decode slot when they promote, so admission
     // must reserve both or completing chunks can overshoot capacity.
     prefilling: &[PendingRequest],
+    // A decode-overlap prefill is temporarily removed from `prefilling` while
+    // its GPU work is in flight, but it still owns the same KV blocks and
+    // eventual decode slot. Keep it in the accounting view until its result
+    // is applied.
+    inflight_prefilling: &[PendingRequest],
     block_size: usize,
     available_blocks: usize,
     max_request_blocks: usize,
@@ -1194,10 +1312,16 @@ fn admit_deferred_requests(
             prefilling,
             block_size,
             &prefetch_credit,
+        ))
+        .saturating_sub(inflight_prefilling_future_blocks(
+            inflight_prefilling,
+            block_size,
+            &prefetch_credit,
         ));
     let mut decode_slots = max_decode_batch_size
         .saturating_sub(active.len())
-        .saturating_sub(prefilling.len());
+        .saturating_sub(prefilling.len())
+        .saturating_sub(inflight_prefilling.len());
     let mut pending = Vec::new();
     let mut still_deferred = Vec::new();
     let mut rejected = Vec::new();
