@@ -113,6 +113,15 @@ impl ModelLine for Qwen35Line {
                 )));
             }
         }
+        if decode_overlap != Qwen35DecodeOverlap::Off {
+            let max_batch = cli.max_batch.unwrap_or(crate::MAX_DECODE_BATCH);
+            if max_batch > crate::MAX_SHARED_SM_DECODE_BATCH {
+                return Err(CliError::rule(format!(
+                    "Qwen3.5 --decode-overlap=stream requires --max-batch <= {}; got {max_batch}",
+                    crate::MAX_SHARED_SM_DECODE_BATCH
+                )));
+            }
+        }
         if decode_overlap != Qwen35DecodeOverlap::Off
             && matches!(cli.qwen35_scheduler_policy, CliQwen35SchedulerPolicy::Auto)
         {
@@ -201,8 +210,27 @@ mod tests {
 
     #[test]
     fn accepts_shared_stream_overlap() {
-        validate_argv(&["pegainfer", "--decode-overlap", "stream"])
-            .expect("Qwen3.5 should accept shared-stream overlap");
+        let max_batch = crate::MAX_SHARED_SM_DECODE_BATCH.to_string();
+        validate_argv(&[
+            "pegainfer",
+            "--decode-overlap",
+            "stream",
+            "--max-batch",
+            &max_batch,
+        ])
+        .expect("Qwen3.5 should accept shared-stream overlap");
+    }
+
+    #[test]
+    fn rejects_stream_overlap_default_max_batch() {
+        let error = validate_argv(&["pegainfer", "--decode-overlap", "stream"])
+            .expect_err("Qwen3.5 should reject stream overlap at the default max_batch");
+        assert!(error.to_string().contains("max-batch"));
+        assert!(
+            error
+                .to_string()
+                .contains(&crate::MAX_SHARED_SM_DECODE_BATCH.to_string())
+        );
     }
 
     #[test]

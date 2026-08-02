@@ -668,12 +668,6 @@ fn run_full_scheduler_e2e(
     info!("All Qwen3.5 scheduler tests passed for {label}!");
 }
 
-fn context_limit_for(handle: &EngineHandle, model_path: &str) -> usize {
-    handle
-        .servable_len()
-        .map_or_else(|| max_position_embeddings(model_path), |len| len as usize)
-}
-
 #[test]
 fn test_e2e_qwen35_scheduler() {
     let model_path = get_model_path();
@@ -694,7 +688,7 @@ fn test_e2e_qwen35_scheduler() {
     .expect("Failed to start Qwen3.5 scheduler");
     info!("scheduler loaded in {:.2?}", start.elapsed());
 
-    let max_context_tokens = context_limit_for(&handle, &model_path);
+    let max_context_tokens = max_position_embeddings(&model_path);
     run_full_scheduler_e2e(&handle, &tokenizer, max_context_tokens, "TP1");
 }
 
@@ -703,6 +697,49 @@ fn test_e2e_qwen35_shared_sm_last_decoder() {
     pegainfer_core::logging::init_default();
     let model_path = get_model_path();
     let tokenizer = common::load_tokenizer(&model_path);
+    let seed_token = tokenizer
+        .encode("Hello", false)
+        .expect("encode failed")
+        .into_iter()
+        .next()
+        .expect("test prompt must contain a token");
+
+    let off_reference_tokens = {
+        let off_handle = pegainfer_qwen35::start_engine_with_capacity_policy_and_overlap(
+            Path::new(&model_path),
+            EngineLoadOptions {
+                enable_cuda_graph: true,
+                device_ordinals: vec![0],
+                seed: 42,
+                ..EngineLoadOptions::default()
+            },
+            4,
+            8192,
+            pegainfer_qwen35::Qwen35SchedulerPolicy::Off,
+            pegainfer_qwen35::Qwen35DecodeOverlap::Off,
+        )
+        .expect("Failed to start Qwen3.5 default-Off scheduler");
+        let mut off_rx = submit_repeated_token_request(
+            &off_handle,
+            "overlap-off-reference",
+            seed_token,
+            8192,
+            2,
+        );
+        let off = collect_generation_with_timeout(
+            &mut off_rx,
+            "overlap-off-reference",
+            0,
+            std::time::Duration::from_secs(30),
+        );
+        assert_eq!(
+            off.tokens.len(),
+            2,
+            "default-Off reference request must finish before Shared-SM parity"
+        );
+        off.tokens
+    };
+
     let handle = pegainfer_qwen35::start_engine_with_capacity_policy_and_overlap(
         Path::new(&model_path),
         EngineLoadOptions {
@@ -719,12 +756,6 @@ fn test_e2e_qwen35_shared_sm_last_decoder() {
     .expect("Failed to start Qwen3.5 shared-SM scheduler");
     let mut load = handle.load_watch().expect("scheduler must expose load");
 
-    let seed_token = tokenizer
-        .encode("Hello", false)
-        .expect("encode failed")
-        .into_iter()
-        .next()
-        .expect("test prompt must contain a token");
     let mut active_rx =
         submit_repeated_token_request(&handle, "overlap-last-decoder", seed_token, 512, 128);
     wait_for_first_token(&mut active_rx, "overlap-last-decoder");
@@ -749,6 +780,10 @@ fn test_e2e_qwen35_shared_sm_last_decoder() {
         prefill.tokens.len(),
         2,
         "in-flight prefill must finish after the last decoder is cancelled"
+    );
+    assert_eq!(
+        prefill.tokens, off_reference_tokens,
+        "Shared-SM overlapped prefill must match the greedy default-Off reference"
     );
 
     let (tokens, finish_reason) = generate_tokens(&handle, &tokenizer, "Hello again", 2);
@@ -804,6 +839,6 @@ fn test_e2e_qwen35_scheduler_tp2() {
     .expect("Failed to start Qwen3.5 TP2 scheduler");
     info!("TP2 scheduler loaded in {:.2?}", start.elapsed());
 
-    let max_context_tokens = context_limit_for(&handle, &model_path);
+    let max_context_tokens = max_position_embeddings(&model_path);
     run_full_scheduler_e2e(&handle, &tokenizer, max_context_tokens, "TP2");
 }

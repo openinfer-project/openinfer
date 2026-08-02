@@ -35,6 +35,14 @@ pub use scheduler::DEFAULT_MAX_PREFILL_TOKENS;
 /// Maximum supported Qwen3.5 decode scheduler slots.
 pub const MAX_DECODE_BATCH: usize = batch_decode_graph::MAX_BATCH;
 
+/// Current safe Qwen3.5 Shared-SM overlap admission cap.
+///
+/// Decode buckets above this value fall back to the workspace-backed prefill
+/// cuBLAS handle today; running them while async prefill is in flight would make
+/// two streams share that handle/workspace. Keep overlap opt-in below that
+/// boundary until the larger decode buckets have an independent GEMM route.
+pub const MAX_SHARED_SM_DECODE_BATCH: usize = ops::GEMM_LT_MAX_N;
+
 /// Low-level Qwen3.5 execution interface.
 ///
 /// This is for model-local tests, debugging, and benchmarks. The root server
@@ -213,6 +221,12 @@ pub fn start_engine_with_capacity_policy_and_overlap(
             || decode_overlap == Qwen35DecodeOverlap::Off,
         "Qwen3.5 --decode-overlap=stream requires --qwen35-scheduler-policy=off"
     );
+    if decode_overlap == Qwen35DecodeOverlap::SharedSm {
+        anyhow::ensure!(
+            max_batch <= MAX_SHARED_SM_DECODE_BATCH,
+            "Qwen3.5 --decode-overlap=stream currently requires --max-batch <= {MAX_SHARED_SM_DECODE_BATCH}; decode bucket 64 still falls back to the workspace-backed prefill GEMM handle"
+        );
+    }
     if device_ordinals.len() > 1 {
         anyhow::ensure!(
             decode_overlap == Qwen35DecodeOverlap::Off,
@@ -275,6 +289,7 @@ mod tests {
     use pegainfer_frontend::engine::EngineLoadOptions;
     use pegainfer_frontend::engine::EpBackend;
 
+    use super::MAX_SHARED_SM_DECODE_BATCH;
     use super::Qwen35DecodeOverlap;
     use super::Qwen35LaunchOptions;
     use super::Qwen35SchedulerPolicy;
@@ -367,5 +382,29 @@ mod tests {
         .to_string();
 
         assert!(err.contains("scheduler-policy=off"));
+    }
+
+    #[test]
+    fn shared_sm_rejects_unsafe_decode_bucket_before_loading_model() {
+        let err = start_engine_with_capacity_policy_and_overlap(
+            Path::new("unused-model-path"),
+            EngineLoadOptions {
+                enable_cuda_graph: true,
+                device_ordinals: vec![0],
+                parallel_config: None,
+                ep_backend: EpBackend::Nccl,
+                seed: 42,
+            },
+            MAX_SHARED_SM_DECODE_BATCH + 1,
+            1,
+            Qwen35SchedulerPolicy::Off,
+            Qwen35DecodeOverlap::SharedSm,
+        )
+        .err()
+        .expect("decode-overlap validation should reject unsafe decode bucket")
+        .to_string();
+
+        assert!(err.contains("max-batch"));
+        assert!(err.contains(&MAX_SHARED_SM_DECODE_BATCH.to_string()));
     }
 }

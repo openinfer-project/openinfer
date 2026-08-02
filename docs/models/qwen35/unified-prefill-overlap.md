@@ -4,9 +4,11 @@
 > Qwen3.5. One prefill chunk may run on a second CUDA stream while active decode
 > continues. On one RTX 5090, three-run HTTP c16 mean TPOT improved 3.04% and
 > QPS 8/12/16 mean TPOT improved 6.68%/7.74%/8.05%; c1 regressed 1.20%, so the
-> default remains serial `off`.
+> default remains serial `off`. Stream mode is currently limited to
+> `--max-batch <= 32` until the bucket-64 decode GEMMs have an independent
+> non-prefill cuBLAS route.
 >
-> **Last touched:** 2026-07
+> **Last touched:** 2026-08
 
 ## Preparation
 
@@ -51,7 +53,8 @@ Unsupported combinations fail before model loading:
 
 - Qwen3.5 TP plus overlap;
 - `--qwen35-scheduler-policy auto --decode-overlap stream`;
-- Qwen3.5 `--decode-overlap green-ctx`.
+- Qwen3.5 `--decode-overlap green-ctx`;
+- Qwen3.5 `--decode-overlap stream` with `--max-batch > 32`.
 
 ### Review Fixes
 
