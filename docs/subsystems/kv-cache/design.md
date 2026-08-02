@@ -23,14 +23,14 @@ SWA 与 linear state 是同一等价类（bounded mutable）：qwen35 的 `Layer
 
 关键推论：**pin（防 reuse-after-free）对 paged 组足够，对 mutable 组不够**——异步 save 会与下一步的原地改写竞态，所以 mutable 组必须 seal-by-copy 后才可下存。
 
-seal-by-copy 的**频率归策略、对齐归机制**，别混淆：拷贝必须对齐在 step 边界（kernel 原地写 state 时不能快照），但**只在策略触发存储时才拷**，不是每步都拷。bounded 组的封存有拷贝成本，策略上天然比 paged 组稀（每数百 token / turn 边界 / retire / P 侧 handoff）——这与单索引"以最稀疏 checkpointer 为准"自洽：索引条目只存在于 bounded 快照点，paged 组封得更密对命中无贡献。成本量级：qwen35 state 49 MiB/请求，D2D 十几微秒；可走 copy-engine 侧流，用 event 保证"拷完才允许该 slot 下一步改写"，不停 step。
+seal-by-copy 有两个正交维度。**对齐是机制约束**：拷贝必须落在 step 边界之间——kernel 原地写 state 期间不可快照。**频率是策略**：只在策略触发存储时才拷（每数百 token / turn 边界 / retire / P 侧 handoff），并非每个 step 边界都拷。bounded 组的封存有拷贝成本，触发频率因此天然比 paged 组稀——这与单索引「以最稀疏 checkpointer 为准」自洽：索引条目只存在于 bounded 快照点，paged 组封得更密对命中无贡献。成本量级：qwen35 state 49 MiB/请求，D2D 十几微秒；可走 copy-engine 侧流，用 event 保证「拷完才允许该 slot 下一步改写」，不阻塞 step。
 
 ### Checkpoint
 
 > 在 token 边界 t，物化「该请求所有组的 sealed artifacts 集合」，以前缀 hash 索引。
 
 - prefix cache 命中 = checkpoint 恢复；offload = checkpoint 换存储层级；**P/D handoff = P 在请求末尾强制打 checkpoint、D 从它恢复**（store-based P/D，非 transfer-based）。
-- **单索引，以最稀疏的 checkpointer 为准**（混合模型即 linear 边界）。显式 trade-off：放弃 full 层独立细粒度命中——恢复必须从 linear 边界重算，forward 一跑所有层 KV 重生成，超出边界的 full 页保存是纯浪费。不要「优化」回去。
+- **单索引，以最稀疏的 checkpointer 为准**（混合模型即 linear 边界）。显式 trade-off：放弃 full 层独立细粒度命中——恢复必须从 linear 边界重算，forward 一跑所有层 KV 重生成，超出边界的 full 页保存是纯浪费。此为有意决策，记录在案以防后续被当作缺失的「优化」重新引入。
 - 何时打 checkpoint 是**策略**（每 N 页 / turn 边界前端 hint / P 角色请求末尾）；机制只提供 `seal(at)`。
 
 ### 对齐组（aligned groups）
@@ -207,7 +207,7 @@ while let Ok((req, kv_prefix)) = submit_rx.try_recv() {
 
 1. ✅ 本骨架 PR：文档 + `openinfer-kv-store`（resolve/seal/retire，paged only，CPU 契约测试）+ 分发层 `(GenerateRequest, KvPrefix)`（未迁移模型收 `KvPrefix::none()`，行为零变化）。
 2. qwen3 首迁：`resolve_prefix` 替换 `remote_fetch_action` 状态机（executor.rs ~2000 行 prefetch 编排），旧路径留开关至 bench 对齐。
-3. glm52 D 侧：收件箱替换 `HostRestoreState`；随后 P/D `Handoff` 租约（对齐 pegaflow `QueryLeaseId` 语义后定稿）。#812（EP32 生产设计点）仍 open、阶段性 PR 持续落 main 且常动 scheduler/offload 邻域——迁移分支以 main 为基准高频 rebase，别攒大 diff。
+3. glm52 D 侧：收件箱替换 `HostRestoreState`；随后 P/D `Handoff` 租约（对齐 pegaflow `QueryLeaseId` 语义后定稿）。#812（EP32 生产设计点）仍 open、阶段性 PR 持续落 main 且常动 scheduler/offload 邻域——迁移分支以 main 为基准高频 rebase，避免累积大 diff。
 4. qwen35：`core::kv_pool` → `BlockPool` 迁移（独立，可并行开工）；然后 Bounded 组 slab + seal-by-copy 首发（唯一的新物理能力，由从零接入的模型验证）。gemma4 照抄。
 
 ## 未决
