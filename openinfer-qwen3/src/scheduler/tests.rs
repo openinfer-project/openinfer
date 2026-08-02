@@ -8,7 +8,8 @@ use anyhow::Result;
 use openinfer_core::engine::EngineControlError;
 use openinfer_core::engine::LoadLoraAdapterRequest;
 use openinfer_core::engine::UnloadLoraAdapterRequest;
-use openinfer_kv_cache::BlockPool;
+use openinfer_kv_store::BlockPool;
+use openinfer_kv_store::KvStoreBuilder;
 
 use super::*;
 use crate::executor::DecodePlan;
@@ -33,7 +34,6 @@ struct FakeExecutor {
     decode_delay: Duration,
     loaded_lora_adapters: HashSet<String>,
     dropped: Arc<Mutex<Vec<u64>>>,
-    prefetch_offers: Arc<Mutex<Vec<u64>>>,
     stop_token: Option<u32>,
 }
 
@@ -50,7 +50,6 @@ impl FakeExecutor {
             decode_delay: Duration::ZERO,
             loaded_lora_adapters: HashSet::new(),
             dropped,
-            prefetch_offers: Arc::new(Mutex::new(Vec::new())),
             stop_token: None,
         }
     }
@@ -149,17 +148,6 @@ impl ModelExecutor for FakeExecutor {
         self.prefill_positions.remove(&request_id);
         self.dropped.lock().unwrap().push(request_id.get());
         Ok(())
-    }
-
-    fn begin_kv_prefetch(
-        &mut self,
-        request_id: RequestId,
-        _prompt_tokens: &[u32],
-        _lora_adapter: Option<&str>,
-        _reserve_floor: usize,
-    ) -> bool {
-        self.prefetch_offers.lock().unwrap().push(request_id.get());
-        false
     }
 
     fn list_lora_adapters(&self) -> Vec<String> {
@@ -330,8 +318,7 @@ fn admission_splits_deferred_into_pending_deferred_and_rejected() {
     ];
 
     // available 4 blocks - 2 reserved for active growth = budget of 2.
-    let outcome =
-        admit_deferred_requests(deferred, &active, &[], 16, 4, 4, usize::MAX, 64, 32, |_| 0);
+    let outcome = admit_deferred_requests(deferred, &active, &[], 16, 4, 4, usize::MAX, 64, 32);
 
     let ids = |reqs: &[PendingRequest]| reqs.iter().map(|r| r.request_id.get()).collect::<Vec<_>>();
     assert_eq!(
@@ -369,8 +356,7 @@ fn requests_exceeding_context_window_are_rejected() {
         mk(3, 40, 1),  // request 3: 40 prompt + 1 max = 41 total: overflows by 9 tokens → rejected
     ];
 
-    let outcome =
-        admit_deferred_requests(deferred, &active, &[], 16, 1000, 1000, 32, 64, 64, |_| 0);
+    let outcome = admit_deferred_requests(deferred, &active, &[], 16, 1000, 1000, 32, 64, 64);
 
     let pending_ids = outcome
         .pending
@@ -426,7 +412,6 @@ fn admission_respects_decode_batch_capacity() {
         usize::MAX,
         64,
         32,
-        |_| 0,
     );
 
     assert!(
@@ -588,7 +573,6 @@ fn oversized_echo_request_is_rejected_at_admission() {
         usize::MAX,
         64,
         32,
-        |_| 0,
     );
 
     assert_eq!(
@@ -628,7 +612,6 @@ fn page_boundary_lifetime_blocks_gate_admission() {
         usize::MAX,
         64,
         32,
-        |_| 0,
     );
     assert!(
         under_reserved.pending.is_empty(),
@@ -650,7 +633,6 @@ fn page_boundary_lifetime_blocks_gate_admission() {
         usize::MAX,
         64,
         32,
-        |_| 0,
     );
     assert_eq!(
         exactly_reserved.pending[0].request_id,
@@ -661,7 +643,7 @@ fn page_boundary_lifetime_blocks_gate_admission() {
 }
 
 fn kvbm_peak_draw(prompt_len: usize, max_tokens: usize, block_size: usize) -> usize {
-    let pool = BlockPool::new(block_size, 512).expect("test block pool");
+    let pool = BlockPool::new(block_size, 512);
     let base = pool.available_blocks();
     let mut peak = 0usize;
     let mut kv = pool.new_request(vec![1; prompt_len], max_tokens, None);
@@ -766,7 +748,7 @@ fn pending(request_id: u64, echo: bool) -> PendingRequest {
         logprobs: 0,
         echo,
         queued_at_unix_s: None,
-        prefetch_offered: false,
+        kv_prefix: None,
         prefill_pos: 0,
         step_chunk: 0,
         cached_tokens: 0,
@@ -774,25 +756,41 @@ fn pending(request_id: u64, echo: bool) -> PendingRequest {
 }
 
 #[test]
-fn echo_requests_are_never_offered_to_prefetch() {
-    let dropped = Arc::new(Mutex::new(Vec::new()));
-    let mut executor = FakeExecutor::new(64, dropped);
-    let offers = Arc::clone(&executor.prefetch_offers);
+fn echo_requests_are_never_resolved_against_the_store() {
+    // Multi-thread runtime so tasks spawned through its handle progress while
+    // this thread blocks on the hub's return channel (a current-thread runtime
+    // would deadlock: it only polls inside block_on).
+    let runtime = tokio::runtime::Runtime::new().expect("build runtime");
+    let store = KvStoreBuilder::new(runtime.handle().clone())
+        .rank(0, Arc::new(BlockPool::new(16, 64)))
+        .build();
+    let mut hub = ResolveHub::new(Some(Arc::new(store)));
+    let mut deferred = Vec::new();
 
-    let mut deferred = vec![pending(1, true), pending(2, false)];
-    let mut loading = Vec::new();
-    offer_prefetch(&mut executor, &mut deferred, &mut loading, 0);
+    hub.route(pending(1, true), &mut deferred);
+    hub.route(pending(2, false), &mut deferred);
 
-    // The plain request is probed; the echo request is skipped entirely, so
-    // its prefill forwards the whole prompt without parking unspendable KV.
-    assert_eq!(*offers.lock().unwrap(), vec![2]);
-    let echo = deferred.iter().find(|r| r.request_id.get() == 1).unwrap();
-    assert!(!echo.prefetch_offered, "echo request must stay un-probed");
-    let plain = deferred.iter().find(|r| r.request_id.get() == 2).unwrap();
-    assert!(
-        plain.prefetch_offered,
-        "plain request must be marked probed"
+    assert_eq!(
+        deferred
+            .iter()
+            .map(|r| r.request_id.get())
+            .collect::<Vec<_>>(),
+        vec![1],
+        "echo request skips resolution entirely — its prefill forwards the \
+         whole prompt and could never spend resolved blocks"
     );
+    assert_eq!(
+        hub.in_flight(),
+        1,
+        "plain request resolves on the store runtime"
+    );
+
+    let resolved = hub.rx.blocking_recv().expect("resolve settles");
+    assert_eq!(resolved.request_id.get(), 2);
+    let prefix = resolved
+        .kv_prefix
+        .expect("resolved request carries its prefix hold");
+    assert_eq!(prefix.hit_tokens(), 0, "empty pool has nothing to hit");
 }
 
 fn request(

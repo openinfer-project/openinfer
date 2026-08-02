@@ -28,35 +28,11 @@ use openinfer_kv_store::SaveCursor;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn seal_flush_resolve_roundtrip() {
-    roundtrip(false).await;
-}
-
-/// Same roundtrip in the vLLM-connector host packing (`page_first`): each
-/// block is stored as one host page holding every layer at its name-sorted
-/// offset. glm52's MLA layout interop with a vLLM writer relies on this
-/// packing agreeing byte-for-byte with the native one.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn seal_flush_resolve_roundtrip_page_first() {
-    roundtrip(true).await;
-}
-
-async fn roundtrip(page_first: bool) {
     let _gpu = gpu_lock().lock().await;
     let host = PegaflowHost::builder(HOST_POOL_BYTES)
         .build()
         .expect("host");
-    // Distinct namespaces per layout: the packing is part of the content
-    // domain (two instances exchange blocks only if they agree on it).
-    let mut rig = Rig::new_with_layout(
-        if page_first {
-            "roundtrip_page_first"
-        } else {
-            "roundtrip_native"
-        },
-        host,
-        None,
-        page_first,
-    );
+    let mut rig = Rig::new("roundtrip_native", host, None);
     let prompt = prompt(4);
 
     // Producer side: prefill seals the 4 full blocks; stage recognizable

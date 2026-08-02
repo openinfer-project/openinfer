@@ -94,6 +94,14 @@ impl PegaflowHost {
         &self.engine
     }
 
+    /// Handle to the host-owned tokio runtime that drives the tier's async
+    /// work. Embedders pass it to [`crate::KvStoreBuilder::new`] so the
+    /// store's load/save/retire tasks ride the same runtime as the tier they
+    /// await on.
+    pub fn runtime_handle(&self) -> tokio::runtime::Handle {
+        self.runtime().handle().clone()
+    }
+
     pub(crate) fn runtime(&self) -> &Runtime {
         self.runtime
             .as_ref()

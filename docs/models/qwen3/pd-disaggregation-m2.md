@@ -2,7 +2,9 @@
 
 > **TL;DR**: Qwen3-8B 1P+1D 双 openinfer 实例 P/D 分离**已在单机 2×H200（每卡 1 块 400G IB NIC）端到端验证**：KV 经 pegaflow 内容寻址 P2P 从 P 流向 D（metaserver 发现 + 单边 RDMA READ + H2D restore），greedy 输出与单实例 baseline 逐 token 一致（3 档 prompt 长度），33/33 块 74.2 MiB 拉取 rdma_wait 仅 2.6ms，杀 metaserver / 杀 P 均优雅退化为本地 prefill。无 handle 协议——D 从同一 prompt 推出同一组 kvbm lineage hash 直接查询。**多轮并发压测已过**：turn2+ TTFT 恒定 ~107ms、TPOT p99 全轮 <10.1ms，与 mixed 部署的完整 A/B 见 `../../benchmarks/qwen3-8b-pd-vs-mix-h200.md`；先修掉 §4 的 `max_completion_tokens` 坑。openinfer 分支 `feat/pd-pegaflow-p2p`，pegaflow 侧 PR [#381](https://github.com/novitalabs/pegaflow/pull/381)。
 >
-> Last touched: 2026-07
+> **已 supersede（2026-08）**：本文描述的 openinfer 侧机制——prefetch 三相状态机（`RemoteFetch`/`Loading`/`Committed`）/ `begin_kv_prefetch`、vLLM hash 兼容（`VllmBlockHasher`）、`page_first` 注册模式、`--kv-pd-*` 三 flag——已随 qwen3 → `openinfer-kv-store` 迁移（`feat/qwen3-kv-store-migration`）整体删除，vLLM P/D 互通不再支持；native P/D 后继走 kv-store 路径（`resolve_prefix` 读路径 + `Handoff` save + `flush_saves_then` 屏障；`--kv-offload` / `--kv-p2p-*` 仍在）。本文作为 M2 验收记录保留。
+>
+> Last touched: 2026-08
 
 ## 1. 架构
 

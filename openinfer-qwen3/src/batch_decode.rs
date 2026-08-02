@@ -7,7 +7,7 @@ use openinfer_core::kv_pool::KvLayout;
 use openinfer_core::ops;
 use openinfer_kernels::tensor::KvDim;
 use openinfer_kernels::tensor::QDim;
-use openinfer_kv_cache::KvView;
+use openinfer_kv_store::KvView;
 
 use super::batch_decode_buffers::BATCH_BUCKETS;
 use super::batch_decode_buffers::BatchDecodeBuffers;

@@ -1507,7 +1507,6 @@ fn build_offload_engines(
                 &namespace,
                 device_ordinal as i32,
                 &arenas,
-                false,
             )
             .map_err(|err| anyhow::anyhow!("GLM5.2 KV offload rank {rank} registration: {err}"))
         })

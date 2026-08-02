@@ -173,7 +173,7 @@ impl PegaflowTier {
             &segments,
             Some(block_stride_bytes.as_slice()),
             transfer_mode(),
-            spec.page_first,
+            false,
         )?;
 
         Ok(Self {

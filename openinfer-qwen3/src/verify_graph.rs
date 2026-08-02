@@ -30,7 +30,7 @@ use openinfer_core::ops::PrefillPagedPlan;
 use openinfer_core::tensor::HiddenStates;
 use openinfer_kernels::ops::NumericPolicy;
 use openinfer_kernels::ops::numeric_policy;
-use openinfer_kv_cache::KvView;
+use openinfer_kv_store::KvView;
 
 use crate::batch_decode_buffers::BATCH_BUCKETS;
 use crate::config::PREFILL_ATTENTION_CTA_TILE_Q;
@@ -245,7 +245,7 @@ impl Qwen3Model {
             kv_views.iter().map(|v| v.page_indices().to_vec()).collect();
         let last_page_lens: Vec<usize> = kv_views
             .iter()
-            .map(openinfer_kv_cache::KvView::last_page_len)
+            .map(openinfer_kv_store::KvView::last_page_len)
             .collect();
         bufs.plan.update_batch_with_cta_tile_q(
             ctx,

@@ -16,8 +16,8 @@ use std::collections::HashMap;
 use log::warn;
 use openinfer_core::engine::KvBlockEvent;
 use openinfer_core::engine::KvStoredBlock;
-use openinfer_kv_cache::KvCacheEvent;
-use openinfer_kv_cache::RegisteredBlock;
+use openinfer_kv_store::KvCacheEvent;
+use openinfer_kv_store::RegisteredBlock;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 

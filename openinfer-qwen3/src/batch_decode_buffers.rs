@@ -9,7 +9,7 @@ use openinfer_core::tensor::HiddenStates;
 use openinfer_kernels::ops::NumericPolicy;
 use openinfer_kernels::ops::gemm_lt_pin_warmup;
 use openinfer_kernels::ops::numeric_policy;
-use openinfer_kv_cache::KvView;
+use openinfer_kv_store::KvView;
 
 use crate::split_kv::SplitKvConfig;
 
@@ -527,7 +527,7 @@ impl BatchDecodeBuffers {
 #[cfg(test)]
 mod tests {
     use openinfer_core::tensor::DeviceContext;
-    use openinfer_kv_cache::KvView;
+    use openinfer_kv_store::KvView;
 
     use super::BatchDecodeBuffers;
     use super::build_split_kv_csr;

@@ -14,6 +14,7 @@ mod resolve;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::path::Path;
+use std::sync::Arc;
 use std::thread;
 
 use anyhow::Result;
@@ -25,6 +26,7 @@ use openinfer_core::engine::EngineControlRequest;
 use openinfer_core::engine::EngineHandle;
 use openinfer_core::engine::GenerateRequest;
 use openinfer_core::engine::KvCapacity;
+use openinfer_core::engine::KvPrefix;
 use openinfer_core::engine::LoadSnapshot;
 use openinfer_core::engine::SubmittedRequest;
 use openinfer_core::engine::TokenEvent;
@@ -32,6 +34,9 @@ use openinfer_core::engine::TokenSink;
 use openinfer_core::sampler::SamplingParams;
 use openinfer_kernels::ops::NumericPolicy;
 use openinfer_kernels::ops::numeric_policy;
+use openinfer_kv_store::CacheScope;
+use openinfer_kv_store::KvStore;
+use openinfer_kv_store::ResolvePolicy;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use tokio::sync::mpsc;
@@ -47,6 +52,7 @@ use self::plan::should_speculative_decode;
 use self::resolve::resolve_step;
 use crate::Qwen3LoraOptions;
 use crate::Qwen3OffloadOptions;
+use crate::executor::KV_STORE_RANK;
 use crate::executor::ModelExecutor;
 use crate::executor::Qwen3Executor;
 use crate::executor::RequestId;
@@ -68,7 +74,6 @@ pub(super) struct ActiveRequestState {
     logprobs: usize,
 }
 
-#[derive(Clone)]
 pub(super) struct PendingRequest {
     request_id: RequestId,
     lora_adapter: Option<String>,
@@ -79,10 +84,12 @@ pub(super) struct PendingRequest {
     logprobs: usize,
     echo: bool,
     queued_at_unix_s: Option<f64>,
-    /// Whether this request has already been offered to async KV prefetch.
-    /// Offered at most once; a no-hit offer leaves the request in the normal
-    /// admission flow with this set so it isn't re-probed every tick.
-    prefetch_offered: bool,
+    /// This request's resolved prefix, holding its hit blocks resident
+    /// (anti-eviction pin) across the queue wait. Set when the store's resolve
+    /// hands the request back; the executor's first-chunk
+    /// `match_and_add_prefix` re-pins the same blocks into the request itself,
+    /// so the hold is dropped when that chunk's result lands.
+    kv_prefix: Option<KvPrefix>,
     /// Prompt tokens whose KV is already computed (prefix-cache hits plus
     /// chunks applied in earlier steps). Updated from the executor's
     /// authoritative position after every chunk.
@@ -107,7 +114,7 @@ impl PendingRequest {
             logprobs: req.logprobs,
             echo: req.echo,
             queued_at_unix_s: req.queued_at_unix_s,
-            prefetch_offered: false,
+            kv_prefix: None,
             prefill_pos: 0,
             step_chunk: 0,
             cached_tokens: 0,
@@ -117,21 +124,219 @@ impl PendingRequest {
     fn remaining_prompt_tokens(&self) -> usize {
         self.prompt_tokens.len() - self.prefill_pos
     }
+
+    /// Copy every scheduler-visible field. The resolve hold (`kv_prefix`) is
+    /// not clonable and comes out `None` — move it over explicitly when the
+    /// copy is the one meant to carry it.
+    fn clone_without_prefix(&self) -> Self {
+        Self {
+            request_id: self.request_id,
+            lora_adapter: self.lora_adapter.clone(),
+            prompt_tokens: self.prompt_tokens.clone(),
+            params: self.params,
+            max_tokens: self.max_tokens,
+            token_tx: self.token_tx.clone(),
+            logprobs: self.logprobs,
+            echo: self.echo,
+            queued_at_unix_s: self.queued_at_unix_s,
+            kv_prefix: None,
+            prefill_pos: self.prefill_pos,
+            step_chunk: self.step_chunk,
+            cached_tokens: self.cached_tokens,
+        }
+    }
+}
+
+/// Scheduler-side prefix resolution intake. With a store wired, every fresh
+/// non-echo request resolves its prefix asynchronously on the store's runtime
+/// and returns through the hub's channel with its [`KvPrefix`] hold; without
+/// one, requests route straight to the admission queue. Owns the wiring the
+/// intake sites share: store handle, return channel, in-flight count.
+pub(super) struct ResolveHub {
+    store: Option<Arc<KvStore>>,
+    tx: mpsc::UnboundedSender<PendingRequest>,
+    rx: mpsc::UnboundedReceiver<PendingRequest>,
+    in_flight: usize,
+}
+
+/// Cadence of the idle poll in [`ResolveHub::park`]: how often an
+/// otherwise-idle scheduler re-checks its channels while resolves are in
+/// flight. The old load-wait used the same pace; it only ever throttles a
+/// thread with nothing else to do.
+const RESOLVE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// Why [`ResolveHub::park`] woke up.
+pub(super) enum ParkOutcome<M> {
+    /// The first queued message off the parked channel (a fresh submission or
+    /// an engine command the caller then routes).
+    Message(M),
+    /// In-flight resolves landed back into `deferred`; admit them.
+    Resolved,
+    /// Every upstream handle is gone and nothing is in flight: shut down.
+    Shutdown,
+}
+
+impl ResolveHub {
+    fn new(store: Option<Arc<KvStore>>) -> Self {
+        let (tx, rx) = mpsc::unbounded_channel();
+        Self {
+            store,
+            tx,
+            rx,
+            in_flight: 0,
+        }
+    }
+
+    /// In-flight resolves — requests owned by store-runtime tasks right now.
+    /// Folded into the waiting-request count; also what [`Self::park`] waits
+    /// on besides new submissions.
+    fn in_flight(&self) -> usize {
+        self.in_flight
+    }
+
+    /// Blocks pinned by in-flight offload saves; admission subtracts them
+    /// from the usable pool so it never admits against pages a pending D2H
+    /// still needs.
+    fn pinned_blocks(&self) -> usize {
+        self.store
+            .as_ref()
+            .map_or(0, |store| store.pinned_blocks(KV_STORE_RANK))
+    }
+
+    /// Route a fresh request: through prefix resolution when a store is wired
+    /// (the async resolve moves it back through [`Self::drain`] with its
+    /// `KvPrefix` set), or straight onto `deferred`. Echo requests never
+    /// resolve — their prefill forwards every prompt position to recover
+    /// prompt logits and skips `match_and_add_prefix`, so resolved blocks
+    /// could never be spent; an already-resolved submit (a `KvPrefix` with a
+    /// live hold) likewise goes straight on.
+    fn route(&mut self, mut req: PendingRequest, deferred: &mut Vec<PendingRequest>) {
+        let Some(store) = &self.store else {
+            deferred.push(req);
+            return;
+        };
+        if req.echo || req.kv_prefix.is_some() {
+            deferred.push(req);
+            return;
+        }
+        let tx = self.tx.clone();
+        let store = Arc::clone(store);
+        // Clone the handle up front: the async block below moves `store`,
+        // and borrowing it for `.runtime()` at the spawn call would not
+        // outlive the move.
+        let runtime = store.runtime().clone();
+        self.in_flight += 1;
+        runtime.spawn(async move {
+            let prefix = {
+                let mut scope = CacheScope::default();
+                if let Some(name) = req.lora_adapter.as_deref() {
+                    scope = scope.lora(name);
+                }
+                store
+                    .resolve_prefix(
+                        KV_STORE_RANK,
+                        &req.request_id.0.to_string(),
+                        &req.prompt_tokens,
+                        scope,
+                        ResolvePolicy::default(),
+                        &req.token_tx,
+                    )
+                    .await
+            };
+            req.kv_prefix = Some(prefix);
+            // A dropped receiver means the scheduler (and engine) is going
+            // away; dropping the request here releases the prefix hold.
+            let _ = tx.send(req);
+        });
+    }
+
+    /// Fold settled resolves back into the admission queue. Their holds pin
+    /// real pool blocks, so they deserve prompt admission (see the budget
+    /// credit in `admit_deferred_requests`).
+    fn drain(&mut self, deferred: &mut Vec<PendingRequest>) {
+        while let Ok(req) = self.rx.try_recv() {
+            self.in_flight -= 1;
+            deferred.push(req);
+        }
+    }
+
+    /// Block until there is scheduler-visible work again. With no resolves in
+    /// flight this is a plain blocking read on `rx`. With resolves in flight
+    /// that read alone could sleep through their completion (nothing on `rx`
+    /// signals it), so both channels are polled at [`RESOLVE_POLL_INTERVAL`]
+    /// — a cadence paid only by an otherwise-idle thread.
+    fn park<M>(
+        &mut self,
+        rx: &mut mpsc::UnboundedReceiver<M>,
+        deferred: &mut Vec<PendingRequest>,
+    ) -> ParkOutcome<M> {
+        if self.in_flight == 0 {
+            return match rx.blocking_recv() {
+                Some(msg) => ParkOutcome::Message(msg),
+                None => ParkOutcome::Shutdown,
+            };
+        }
+        loop {
+            self.drain(deferred);
+            if !deferred.is_empty() {
+                return ParkOutcome::Resolved;
+            }
+            match rx.try_recv() {
+                Ok(msg) => return ParkOutcome::Message(msg),
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    thread::sleep(RESOLVE_POLL_INTERVAL);
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    // Upstream is gone: drain the last in-flight resolves
+                    // (their cancel probes fire with the sinks dropped, so
+                    // they settle promptly) so the caller can retire them,
+                    // then shut down.
+                    while self.in_flight > 0 {
+                        match self.rx.blocking_recv() {
+                            Some(req) => {
+                                self.in_flight -= 1;
+                                deferred.push(req);
+                            }
+                            // `self.tx` outlives `self.rx` — unreachable, but
+                            // never spin on it.
+                            None => self.in_flight = 0,
+                        }
+                    }
+                    return if deferred.is_empty() {
+                        ParkOutcome::Shutdown
+                    } else {
+                        ParkOutcome::Resolved
+                    };
+                }
+            }
+        }
+    }
 }
 
 /// Assign a fresh id to an incoming request, open its `queue` phase span, and
-/// push it onto `deferred`. Centralizes the three drain sites so the queue span
-/// always opens exactly when the request enters the scheduler's backlog.
+/// route it through the resolve intake. Centralizes the intake sites so the
+/// queue span always opens exactly when the request enters the scheduler's
+/// backlog.
 fn admit_new_request(
+    resolve: &mut ResolveHub,
     deferred: &mut Vec<PendingRequest>,
     tracker: &mut phase_trace::PhaseTracker,
     next_request_id: &mut u64,
     req: GenerateRequest,
+    kv_prefix: KvPrefix,
 ) {
     let id = RequestId(*next_request_id);
     *next_request_id += 1;
     tracker.enter_queue(id, req.trace_parent);
-    deferred.push(PendingRequest::from_scheduler_request(id, req));
+    let mut pending = PendingRequest::from_scheduler_request(id, req);
+    // An upstream resolution (submit_resolved) carries its hold through; a
+    // bare `submit()` is `KvPrefix::none` and resolves here instead.
+    pending.kv_prefix = if kv_prefix.has_hold() {
+        Some(kv_prefix)
+    } else {
+        None
+    };
+    resolve.route(pending, deferred);
 }
 
 /// Pull the next prefill step set off the front of `prefilling`, capping the
@@ -386,97 +591,12 @@ where
         .with_load_watch(load_rx)
 }
 
-// ── KV-offload prefetch admission helpers ────────────────────────────────
-
-/// Move requests whose async CPU-tier prefetch just settled from `loading`
-/// back to the front of `deferred` — their KV is hot, so admit them first.
-fn reclaim_ready_prefetch<E: ModelExecutor>(
-    executor: &mut E,
-    deferred: &mut Vec<PendingRequest>,
-    loading: &mut Vec<PendingRequest>,
-    // Free blocks already promised to admitted requests; a remote fetch that
-    // resolves during this sweep must not reserve into them.
-    reserve_floor: usize,
-) {
-    promote_ready(
-        executor.drain_ready_prefetch(reserve_floor),
-        deferred,
-        loading,
-    );
-}
-
-/// Offer each not-yet-offered `deferred` request to async CPU-tier prefetch,
-/// moving the ones that start loading out of `deferred` into `loading`. A
-/// request that doesn't start a load (pure GPU hit, miss, or block pressure)
-/// stays in `deferred`, flagged so it isn't re-probed next tick.
-///
-/// Echo requests are never offered: their prefill forwards the whole prompt to
-/// recover prompt logprobs and so skips `match_and_add_prefix` (see
-/// `execute_prefill`). Prefetched blocks would never be matched/reused — they
-/// would only park restored KV that admission credits but prefill can't spend,
-/// starving the request under tight budgets. Leaving `prefetch_offered` unset
-/// for echo is harmless: the `!req.echo` guard keeps them from being probed.
-fn offer_prefetch<E: ModelExecutor>(
-    executor: &mut E,
-    deferred: &mut Vec<PendingRequest>,
-    loading: &mut Vec<PendingRequest>,
-    // Free blocks already promised to admitted requests; the prefetch must
-    // leave them untouched (see `ModelExecutor::begin_kv_prefetch`).
-    reserve_floor: usize,
-) {
-    let mut keep = Vec::with_capacity(deferred.len());
-    for mut req in deferred.drain(..) {
-        if !req.prefetch_offered && !req.echo {
-            req.prefetch_offered = true;
-            if executor.begin_kv_prefetch(
-                req.request_id,
-                &req.prompt_tokens,
-                req.lora_adapter.as_deref(),
-                reserve_floor,
-            ) {
-                loading.push(req);
-                continue;
-            }
-        }
-        keep.push(req);
-    }
-    *deferred = keep;
-}
-
-/// Block until at least one in-flight prefetch settles, then promote the
-/// settled requests to `deferred`. Called only when the scheduler is otherwise
-/// idle, so blocking on the DMA costs nothing.
-fn block_on_loading<E: ModelExecutor>(
-    executor: &mut E,
-    deferred: &mut Vec<PendingRequest>,
-    loading: &mut Vec<PendingRequest>,
-    reserve_floor: usize,
-) {
-    promote_ready(
-        executor.wait_ready_prefetch(reserve_floor),
-        deferred,
-        loading,
-    );
-}
-
-fn promote_ready(
-    ready: Vec<RequestId>,
-    deferred: &mut Vec<PendingRequest>,
-    loading: &mut Vec<PendingRequest>,
-) {
-    for id in ready {
-        if let Some(pos) = loading.iter().position(|p| p.request_id == id) {
-            deferred.insert(0, loading.remove(pos));
-        }
-    }
-}
+// ── Rejection cleanup ─────────────────────────────────────────────────────
 
 /// Release any executor-side state a request accumulated before it was rejected
-/// at admission. A rejected request never prefills, so the only state it can
-/// hold is a settled KV prefetch — committed prefix blocks parked in the
-/// executor while the request waited in `deferred`. Without this they would
-/// leak (blocks pinned, map entry stranded) for the engine's lifetime. Idempotent
-/// and harmless for requests that were never prefetched.
+/// at admission and close its queue span — a rejected request never reaches
+/// prefill/decode, so this is its only cleanup point. Its resolve hold, if any,
+/// releases with the `PendingRequest` drop that follows.
 fn release_rejected<E: ModelExecutor>(
     executor: &mut E,
     tracker: &mut phase_trace::PhaseTracker,
@@ -505,7 +625,7 @@ fn release_rejected<E: ModelExecutor>(
 /// reads the latest); `send_replace` ignores a dropped receiver, so the
 /// scheduler runs whether or not anyone is watching.
 /// `num_waiting_reqs` folds every not-yet-running queue (KV-deferred,
-/// prefetch-loading, post-control) into one number; the vLLM frontend exports
+/// in-flight prefix resolves, post-control) into one number; the vLLM frontend exports
 /// it as `num_requests_waiting` and attributes all of it to
 /// `reason="capacity"` — the `reason="deferred"` gauge is driven by a separate
 /// skipped-requests counter this scheduler does not report, so it reads 0 by
@@ -542,11 +662,12 @@ fn scheduler_loop<E>(
     // Host-side phase tracer (queue/prefill/decode spans). No-op when tracing
     // is off — requests then carry no trace parent.
     let mut tracker = phase_trace::PhaseTracker::default();
+    // Prefix resolution runs out of the scheduler thread, on the store's
+    // runtime; resolved requests land back in `deferred` with their holds.
+    let mut resolve_hub = ResolveHub::new(executor.kv_store());
     // Requests that could not be admitted due to KV budget pressure.
     // Held here so they aren't lost; re-evaluated every loop iteration.
     let mut deferred: Vec<PendingRequest> = Vec::new();
-    // Requests parked while their async CPU-tier KV prefetch loads.
-    let mut loading: Vec<PendingRequest> = Vec::new();
     // Admitted requests whose prompts are not fully prefilled yet (chunked
     // prefill). FIFO by request id; each step takes chunks off the front.
     let mut prefilling: Vec<PendingRequest> = Vec::new();
@@ -564,7 +685,7 @@ fn scheduler_loop<E>(
             (active.len()
                 + prefilling.len()
                 + inflight_prefill_pending.as_ref().map_or(0, Vec::len)) as u64,
-            (deferred.len() + loading.len()) as u64,
+            (deferred.len() + resolve_hub.in_flight()) as u64,
         );
         // Flush the prior step's cache changes to a router (no-op unless the
         // event feed is on). Top-of-loop, like `publish_load`: one pass per
@@ -601,33 +722,37 @@ fn scheduler_loop<E>(
             }
         }
 
-        // 1. Drain all incoming requests into deferred.
-        while let Ok((req, _kv_prefix)) = submit_rx.try_recv() {
-            admit_new_request(&mut deferred, &mut tracker, &mut next_request_id, req);
+        // 1. Drain all incoming requests; fresh non-echo ones resolve their
+        // prefix asynchronously and rejoin `deferred` via the hub.
+        while let Ok((req, kv_prefix)) = submit_rx.try_recv() {
+            admit_new_request(
+                &mut resolve_hub,
+                &mut deferred,
+                &mut tracker,
+                &mut next_request_id,
+                req,
+                kv_prefix,
+            );
         }
+        resolve_hub.drain(&mut deferred);
 
-        // 2. Reclaim settled prefetches, then offer fresh requests to prefetch.
-        let reserve_floor = admitted_future_blocks(&executor, &active, &prefilling);
-        reclaim_ready_prefetch(&mut executor, &mut deferred, &mut loading, reserve_floor);
-        offer_prefetch(&mut executor, &mut deferred, &mut loading, reserve_floor);
-
-        // 3. Nothing active and nothing admittable → block. Prefer blocking on
-        // an in-flight load (so its request prefills next) over a new submit;
-        // only truly idle (no loads either) do we block on the channel.
+        // 2. Nothing active and nothing admittable → block until a submission,
+        // a resolve completion, or shutdown.
         if active.is_empty() && deferred.is_empty() && prefilling.is_empty() {
-            if !loading.is_empty() {
-                let reserve_floor = admitted_future_blocks(&executor, &active, &prefilling);
-                block_on_loading(&mut executor, &mut deferred, &mut loading, reserve_floor);
-                continue;
-            }
-            if let Some((req, _kv_prefix)) = submit_rx.blocking_recv() {
-                admit_new_request(&mut deferred, &mut tracker, &mut next_request_id, req);
-            } else {
-                info!("Scheduler: all handles dropped, exiting");
-                return;
-            }
-            while let Ok((req, _kv_prefix)) = submit_rx.try_recv() {
-                admit_new_request(&mut deferred, &mut tracker, &mut next_request_id, req);
+            match resolve_hub.park(&mut submit_rx, &mut deferred) {
+                ParkOutcome::Message((req, kv_prefix)) => admit_new_request(
+                    &mut resolve_hub,
+                    &mut deferred,
+                    &mut tracker,
+                    &mut next_request_id,
+                    req,
+                    kv_prefix,
+                ),
+                ParkOutcome::Resolved => {}
+                ParkOutcome::Shutdown => {
+                    info!("Scheduler: all handles dropped, exiting");
+                    return;
+                }
             }
             continue;
         }
@@ -643,12 +768,13 @@ fn scheduler_loop<E>(
             &active,
             &prefilling,
             executor.block_size(),
-            executor.available_blocks(),
+            executor
+                .available_blocks()
+                .saturating_sub(resolve_hub.pinned_blocks()),
             executor.max_request_blocks(),
             executor.max_context_tokens(),
             executor.max_decode_batch_size(),
             max_prefill_tokens,
-            |id| executor.prefetched_blocks(id),
         );
         for (rejected, reason) in &admission.rejected {
             send_rejection(rejected, *reason);
@@ -690,7 +816,7 @@ fn scheduler_loop<E>(
             && inflight_prefill_pending.is_none()
             && matches!(plan, ExecutionPlan::Unified { .. })
         {
-            if let ExecutionPlan::Unified { pending } = plan {
+            if let ExecutionPlan::Unified { mut pending } = plan {
                 let prefill_tokens: usize = pending.iter().map(|r| r.step_chunk).sum();
                 info!(
                     "decode-overlap: unified step with async prefill ({} reqs, ~{} tokens)",
@@ -698,8 +824,20 @@ fn scheduler_loop<E>(
                     prefill_tokens
                 );
 
-                // Save pending for later poll resolution.
-                let pending_for_poll = pending.clone();
+                // Save pending for later poll resolution. The resolve hold
+                // (kv_prefix) rides with THIS copy: the one moved into the plan
+                // ends at this step's resolve with the prefill still in flight,
+                // while chunk 1's match_and_add_prefix (run synchronously inside
+                // execute_unified) has already re-pinned the resolved blocks into
+                // the request — the hold's remaining job is exactly the poll gap.
+                let pending_for_poll = pending
+                    .iter_mut()
+                    .map(|req| {
+                        let mut copy = req.clone_without_prefix();
+                        copy.kv_prefix = req.kv_prefix.take();
+                        copy
+                    })
+                    .collect();
 
                 // execute_plan(Unified) will internally SplitConcurrent:
                 // - sync decode immediately
@@ -779,11 +917,13 @@ fn scheduler_loop_with_lora_control<E>(
     let mut active: Vec<ActiveRequestState> = Vec::new();
     let mut next_request_id = 0u64;
     let mut deferred: Vec<PendingRequest> = Vec::new();
-    let mut loading: Vec<PendingRequest> = Vec::new();
     let mut prefilling: Vec<PendingRequest> = Vec::new();
     let mut pending_control: VecDeque<EngineControlRequest> = VecDeque::new();
     let mut post_control_deferred: Vec<PendingRequest> = Vec::new();
     let mut tracker = phase_trace::PhaseTracker::default();
+    // Same resolve intake as the plain loop: the legacy command channel can't
+    // carry a KvPrefix, which is exactly why resolve happens scheduler-side.
+    let mut resolve_hub = ResolveHub::new(executor.kv_store());
 
     info!("Scheduler ready with LoRA control");
 
@@ -793,7 +933,7 @@ fn scheduler_loop_with_lora_control<E>(
             kv_total,
             &executor,
             (active.len() + prefilling.len()) as u64,
-            (deferred.len() + loading.len() + post_control_deferred.len()) as u64,
+            (deferred.len() + resolve_hub.in_flight() + post_control_deferred.len()) as u64,
         );
 
         // 1. Drain incoming commands. Generation submitted after a pending
@@ -801,6 +941,7 @@ fn scheduler_loop_with_lora_control<E>(
         while let Ok(command) = command_rx.try_recv() {
             enqueue_engine_command(
                 command,
+                &mut resolve_hub,
                 &mut deferred,
                 &mut pending_control,
                 &mut post_control_deferred,
@@ -808,50 +949,48 @@ fn scheduler_loop_with_lora_control<E>(
                 &mut tracker,
             );
         }
-
-        // 1b. Reclaim settled prefetches and offer fresh requests. Control
-        // commands gate generation, so only offer once no control is pending
-        // (a prefetch must not race ahead of an adapter load it depends on).
-        let reserve_floor = admitted_future_blocks(&executor, &active, &prefilling);
-        reclaim_ready_prefetch(&mut executor, &mut deferred, &mut loading, reserve_floor);
-        if pending_control.is_empty() {
-            offer_prefetch(&mut executor, &mut deferred, &mut loading, reserve_floor);
-        }
+        resolve_hub.drain(&mut deferred);
 
         // 2. Once idle, apply pending control commands before admitting newer
         // generation requests that arrived behind them.
         if active.is_empty() && deferred.is_empty() && prefilling.is_empty() {
             drain_idle_control(&mut executor, &mut pending_control);
             if pending_control.is_empty() && !post_control_deferred.is_empty() {
-                deferred.append(&mut post_control_deferred);
+                // Held back behind the control commands: only now do they
+                // resolve — a probe must not race ahead of an adapter load it
+                // depends on.
+                for pending in post_control_deferred.drain(..) {
+                    resolve_hub.route(pending, &mut deferred);
+                }
             }
         }
 
-        // 3. Nothing active and no deferred generation → block. An in-flight
-        // load takes priority over waiting on a new command.
+        // 3. Nothing active and no deferred generation → block until a
+        // command, a resolve completion, or shutdown.
         if active.is_empty() && deferred.is_empty() && prefilling.is_empty() {
-            if !loading.is_empty() {
-                let reserve_floor = admitted_future_blocks(&executor, &active, &prefilling);
-                block_on_loading(&mut executor, &mut deferred, &mut loading, reserve_floor);
-                continue;
+            match resolve_hub.park(&mut command_rx, &mut deferred) {
+                ParkOutcome::Message(command) => {
+                    enqueue_engine_command(
+                        command,
+                        &mut resolve_hub,
+                        &mut deferred,
+                        &mut pending_control,
+                        &mut post_control_deferred,
+                        &mut next_request_id,
+                        &mut tracker,
+                    );
+                    // Back to the top: republish the load snapshot (the new
+                    // request must show as waiting before its prefill runs)
+                    // and let steps 1–2 drain the burst and any idle-control
+                    // work instead of repeating them here.
+                }
+                ParkOutcome::Resolved => {}
+                ParkOutcome::Shutdown => {
+                    info!("Scheduler: all handles dropped, exiting");
+                    return;
+                }
             }
-            if let Some(command) = command_rx.blocking_recv() {
-                enqueue_engine_command(
-                    command,
-                    &mut deferred,
-                    &mut pending_control,
-                    &mut post_control_deferred,
-                    &mut next_request_id,
-                    &mut tracker,
-                );
-                // Back to the top like the non-LoRA loop: republish the load
-                // snapshot (the new request must show as waiting before its
-                // prefill runs) and let steps 1–2 drain the burst and any
-                // idle-control work instead of repeating them here.
-                continue;
-            }
-            info!("Scheduler: all handles dropped, exiting");
-            return;
+            continue;
         }
 
         let lora_validation = reject_unknown_lora_requests(deferred, &executor);
@@ -865,12 +1004,13 @@ fn scheduler_loop_with_lora_control<E>(
             &active,
             &prefilling,
             executor.block_size(),
-            executor.available_blocks(),
+            executor
+                .available_blocks()
+                .saturating_sub(resolve_hub.pinned_blocks()),
             executor.max_request_blocks(),
             executor.max_context_tokens(),
             executor.max_decode_batch_size(),
             max_prefill_tokens,
-            |id| executor.prefetched_blocks(id),
         );
         for (rejected, reason) in &admission.rejected {
             send_rejection(rejected, *reason);
@@ -885,24 +1025,21 @@ fn scheduler_loop_with_lora_control<E>(
         }
 
         if active.is_empty() && pending.is_empty() {
-            // A parked load must still be polled to completion before we block.
-            if !loading.is_empty() {
-                let reserve_floor = admitted_future_blocks(&executor, &active, &prefilling);
-                block_on_loading(&mut executor, &mut deferred, &mut loading, reserve_floor);
-                continue;
-            }
-            if let Some(command) = command_rx.blocking_recv() {
-                enqueue_engine_command(
+            match resolve_hub.park(&mut command_rx, &mut deferred) {
+                ParkOutcome::Message(command) => enqueue_engine_command(
                     command,
+                    &mut resolve_hub,
                     &mut deferred,
                     &mut pending_control,
                     &mut post_control_deferred,
                     &mut next_request_id,
                     &mut tracker,
-                );
-            } else {
-                info!("Scheduler: all handles dropped, exiting");
-                return;
+                ),
+                ParkOutcome::Resolved => {}
+                ParkOutcome::Shutdown => {
+                    info!("Scheduler: all handles dropped, exiting");
+                    return;
+                }
             }
             continue;
         }
@@ -938,6 +1075,7 @@ fn scheduler_loop_with_lora_control<E>(
 
 fn enqueue_engine_command(
     command: EngineCommand,
+    resolve_hub: &mut ResolveHub,
     deferred: &mut Vec<PendingRequest>,
     pending_control: &mut VecDeque<EngineControlRequest>,
     post_control_deferred: &mut Vec<PendingRequest>,
@@ -951,7 +1089,7 @@ fn enqueue_engine_command(
             tracker.enter_queue(id, req.trace_parent);
             let pending = PendingRequest::from_scheduler_request(id, *req);
             if pending_control.is_empty() {
-                deferred.push(pending);
+                resolve_hub.route(pending, deferred);
             } else {
                 post_control_deferred.push(pending);
             }
@@ -1122,33 +1260,23 @@ fn echo_exceeds_prefill_bound(req: &PendingRequest, max_prefill_tokens: usize) -
     req.echo && req.prompt_tokens.len() > max_prefill_tokens
 }
 
-/// Free blocks already promised to admitted requests (active decode growth +
-/// remaining prefill chunks). A KV prefetch reservation must stay out of this
-/// floor or a later chunk/decode fails allocation and kills the whole step.
-fn admitted_future_blocks<E: ModelExecutor>(
-    executor: &E,
-    active: &[ActiveRequestState],
-    prefilling: &[PendingRequest],
-) -> usize {
-    let block_size = executor.block_size();
-    active_future_blocks(active, block_size)
-        + prefilling_future_blocks(prefilling, block_size, |id| executor.prefetched_blocks(id))
+/// Blocks of `req`'s footprint already held by its resolve hold. Those blocks
+/// left the free pool when the prefix resolved, so counting them as future
+/// need would double-charge the budget (and could wedge a near-budget CPU-hit
+/// request forever: never admitted, hold never released).
+fn resolved_prefix_blocks(req: &PendingRequest, block_size: usize) -> usize {
+    req.kv_prefix
+        .as_ref()
+        .map_or(0, |prefix| prefix.hit_tokens() / block_size)
 }
 
-fn prefilling_future_blocks(
-    prefilling: &[PendingRequest],
-    block_size: usize,
-    // Blocks a request already holds via a settled prefetch (zero once its
-    // first chunk absorbs them). They are out of the free pool, so counting
-    // them as future need would double-charge the budget.
-    prefetch_credit: impl Fn(RequestId) -> usize,
-) -> usize {
+fn prefilling_future_blocks(prefilling: &[PendingRequest], block_size: usize) -> usize {
     prefilling
         .iter()
         .map(|req| {
             pending_lifetime_blocks(req, block_size)
                 .saturating_sub(blocks_needed(req.prefill_pos, block_size))
-                .saturating_sub(prefetch_credit(req.request_id))
+                .saturating_sub(resolved_prefix_blocks(req, block_size))
         })
         .sum()
 }
@@ -1182,19 +1310,10 @@ fn admit_deferred_requests(
     max_context_tokens: usize,
     max_decode_batch_size: usize,
     max_prefill_tokens: usize,
-    // Blocks a request already holds from a settled prefetch. These are already
-    // out of `available_blocks`, so they must be credited against the request's
-    // need or admission double-counts them and can wedge a near-budget CPU-hit
-    // request forever (never admitted, prefetch never released).
-    prefetch_credit: impl Fn(RequestId) -> usize,
 ) -> AdmissionOutcome {
     let mut budget = available_blocks
         .saturating_sub(active_future_blocks(active, block_size))
-        .saturating_sub(prefilling_future_blocks(
-            prefilling,
-            block_size,
-            &prefetch_credit,
-        ));
+        .saturating_sub(prefilling_future_blocks(prefilling, block_size));
     let mut decode_slots = max_decode_batch_size
         .saturating_sub(active.len())
         .saturating_sub(prefilling.len());
@@ -1225,16 +1344,16 @@ fn admit_deferred_requests(
         }
 
         // Full physical footprint gates the per-request cap (a request occupies
-        // all of it, prefetched or not)…
+        // all of it, resolve-credited or not)…
         let footprint = pending_lifetime_blocks(&req, block_size);
         if footprint > max_request_blocks {
             rejected.push((req, RejectReason::KvBudget));
             continue;
         }
 
-        // …but only the blocks not already held by this request's prefetch must
-        // come from the free-pool budget.
-        let fresh_needed = footprint.saturating_sub(prefetch_credit(req.request_id));
+        // …but only the blocks not already held by this request's resolve hold
+        // must come from the free-pool budget.
+        let fresh_needed = footprint.saturating_sub(resolved_prefix_blocks(&req, block_size));
         if fresh_needed <= budget && decode_slots > 0 {
             budget -= fresh_needed;
             decode_slots -= 1;

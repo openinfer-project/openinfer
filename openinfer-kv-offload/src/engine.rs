@@ -111,7 +111,6 @@ impl OffloadEngine {
             &config.namespace,
             config.device_id,
             reg,
-            false,
         )
     }
 
@@ -122,18 +121,12 @@ impl OffloadEngine {
     /// arena's device allocation must stay live and pointer-stable for the
     /// engine's lifetime (the registration bakes raw device addresses), and
     /// all arenas must be indexed by the same pool block ids.
-    /// `page_first` must match how the namespace's writer stores blocks: the
-    /// vLLM connector stores MLA-model blocks page-first (all layers of a
-    /// block concatenated into one host page, offsets by lexicographic layer
-    /// name), so joining a vLLM MLA namespace requires `true` — with layer
-    /// names and per-layer block bytes identical to the writer's.
     pub fn with_arenas_on(
         host: Arc<OffloadHost>,
         instance_id: impl Into<String>,
         namespace: &str,
         device_id: i32,
         arenas: &[KvArena],
-        page_first: bool,
     ) -> Result<Self, EngineError> {
         Self::register(
             host,
@@ -141,7 +134,6 @@ impl OffloadEngine {
             namespace,
             device_id,
             Registration::from_arenas(arenas),
-            page_first,
         )
     }
 
@@ -151,7 +143,6 @@ impl OffloadEngine {
         namespace: &str,
         device_id: i32,
         reg: Registration,
-        page_first: bool,
     ) -> Result<Self, EngineError> {
         host.engine.register_context_layer_batch_strided(
             &instance_id,
@@ -181,13 +172,10 @@ impl OffloadEngine {
                 Ok("kernel") => pegaflow_core::TransferMode::Kernel,
                 _ => pegaflow_core::TransferMode::Direct,
             },
-            // Layer-first (false): one pegaflow layer per model layer, the
+            // Layer-first: one pegaflow layer per model layer, the
             // page-interleaved gap expressed via `block_stride_bytes` — the
-            // native openinfer layout. Page-first (true) instead stores each
-            // block as one host page holding every layer at its
-            // name-sorted offset; used only to join a namespace whose writer
-            // (the vLLM connector on MLA models) stores blocks that way.
-            page_first,
+            // only layout openinfer stores.
+            false,
         )?;
 
         Ok(Self {

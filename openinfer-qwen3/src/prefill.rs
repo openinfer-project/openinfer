@@ -76,7 +76,7 @@ impl Drop for PrefillTempBin {
 }
 use openinfer_core::tensor::DeviceContext;
 use openinfer_core::tensor::HiddenStates;
-use openinfer_kv_cache::KvView;
+use openinfer_kv_store::KvView;
 
 /// Pre-allocated scratch buffers for one prefill forward pass.
 /// Created once per prefill pass, eliminating
@@ -520,7 +520,7 @@ impl Qwen3Model {
             kv_views.iter().map(|v| v.page_indices().to_vec()).collect();
         let last_page_lens: Vec<usize> = kv_views
             .iter()
-            .map(openinfer_kv_cache::KvView::last_page_len)
+            .map(openinfer_kv_store::KvView::last_page_len)
             .collect();
         let plan = PrefillPagedPlan::from_raw_batch_with_cta_tile_q(
             &self.ctx,

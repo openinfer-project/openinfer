@@ -19,8 +19,7 @@ openinfer-bench = { workspace = true, optional = true }
 openinfer-core = { workspace = true }
 openinfer-cupti = { workspace = true, optional = true }
 openinfer-kernels = { workspace = true }
-openinfer-kv-cache = { workspace = true }
-openinfer-kv-offload = { workspace = true }
+openinfer-kv-store = { workspace = true }
 openinfer-sample = { workspace = true }
 rand = { workspace = true }
 safetensors = { workspace = true }

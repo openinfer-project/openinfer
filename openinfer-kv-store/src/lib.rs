@@ -82,22 +82,30 @@
 //!   over `TokenSink::is_closed`) observed between operations; a submitted
 //!   DMA is an uncancellable section.
 
+mod buffer;
 mod builder;
 mod host;
+mod layout;
+mod manager;
 mod policy;
 pub mod pool;
 mod stats;
 mod store;
 mod tier;
+mod view;
 
+pub use kvbm_logical::events::KvCacheEvent;
 pub use openinfer_engine::engine::KvPrefix;
 
+pub use crate::buffer::KvBuffer;
 pub use crate::builder::ArenaSpec;
 pub use crate::builder::KvStoreBuilder;
 pub use crate::builder::OffloadRankSpec;
 pub use crate::host::P2pConfig;
 pub use crate::host::PegaflowHost;
 pub use crate::host::PegaflowHostBuilder;
+pub use crate::layout::KvLayout;
+pub use crate::manager::KvCacheManager;
 pub use crate::policy::CacheScope;
 pub use crate::policy::CancelProbe;
 pub use crate::policy::NeverCancelled;
@@ -113,3 +121,5 @@ pub use crate::pool::RequestKv;
 pub use crate::stats::DegradeReason;
 pub use crate::stats::KvStoreStats;
 pub use crate::store::KvStore;
+pub use crate::view::KvView;
+pub use crate::view::KvViewDesc;

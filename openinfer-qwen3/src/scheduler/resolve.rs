@@ -119,6 +119,11 @@ fn resolve_prefill_outputs(
         // when prompt work first reaches the GPU, and the prefix-cache hit
         // count is determined there. Later chunks must not re-send the event.
         if req.prefill_pos == 0 {
+            // The first chunk's `match_and_add_prefix` re-pinned the resolved
+            // blocks into the request's own state, so the resolve hold has done
+            // its job (guarding the queue wait). Drop it now rather than at
+            // finish so the anti-eviction pin doesn't outlive its purpose.
+            req.kv_prefix = None;
             effects.scheduled.push(ScheduledEffect {
                 token_tx: req.token_tx.clone(),
                 queued_at_unix_s: req.queued_at_unix_s,

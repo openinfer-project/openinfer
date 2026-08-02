@@ -1,24 +1,34 @@
 //! Logical KV block pool, moved here from `openinfer_kv_cache::pool` as a
-//! strangler migration: `openinfer-kv-store` is becoming the single owner of
-//! the logical-layer contract, so new wiring imports it from this crate and
-//! talks to kvbm-logical directly instead of going through
-//! `openinfer-kv-cache`. The original stays in place for its existing
-//! consumers until they migrate. Two parts were dropped in the move because
-//! the store never calls them: the model-forward `KvView` constructors
-//! (`prefill_view`/`decode_view`/`speculative_view`) and the opt-in KV-event
-//! feed (`with_events`); Reservation/Probe do not depend on either.
+//! strangler migration: `openinfer-kv-store` is now the single owner of the
+//! logical-layer contract, so new wiring imports it from this crate and talks
+//! to kvbm-logical directly instead of going through `openinfer-kv-cache`.
+//! The original stays in place for its remaining consumers (glm52, kimi-k2)
+//! until they migrate.
+
+use std::sync::Arc;
 
 use dynamo_kv_hashing::compute_salt_hash;
 use kvbm_logical::KvbmSequenceHashProvider;
 use kvbm_logical::SequenceHash;
 use kvbm_logical::blocks::ImmutableBlock;
 use kvbm_logical::blocks::MutableBlock;
+use kvbm_logical::events::EventsManager;
+use kvbm_logical::events::KvCacheEvent;
 use kvbm_logical::integrations::DecodeOutcome;
 use kvbm_logical::integrations::SchedulableSequence;
 use kvbm_logical::integrations::ScheduleError;
 use kvbm_logical::manager::BlockManager;
 use kvbm_logical::pools::BlockDuplicationPolicy;
 use kvbm_logical::registry::BlockRegistry;
+use tokio::sync::broadcast;
+
+use crate::view::KvView;
+
+/// Broadcast capacity for the opt-in KV-event feed. Generous: the scheduler
+/// drains it every step, but a step can register/evict many blocks, and a
+/// dropped event silently desyncs the router's prefix tree. Only allocated on
+/// the [`BlockPool::with_events`] path.
+const KV_EVENT_CHANNEL_CAPACITY: usize = 65_536;
 
 /// Logical KV block pool: a `BlockManager` plus the reserved padding block.
 ///
@@ -33,6 +43,33 @@ pub struct BlockPool {
 
 impl BlockPool {
     pub fn new(block_size: usize, num_blocks: usize) -> Self {
+        Self::build(block_size, num_blocks, BlockRegistry::builder().build())
+    }
+
+    /// Like [`new`](Self::new), but the pool also emits block store/remove
+    /// events for an out-of-band cache-aware router, returned as a raw broadcast
+    /// receiver to drain synchronously. The stream carries `Create` events too
+    /// (the emission policy can't separate them) — the consumer ignores `Create`
+    /// and sources richer store events from the seal site, and maps the lineage
+    /// hash in each `Remove` back to the router's `sequence_hash`. OFF by
+    /// default: plain single-machine serving uses [`new`](Self::new) and pays
+    /// neither the per-block event attachment nor the channel.
+    pub(crate) fn with_events(
+        block_size: usize,
+        num_blocks: usize,
+    ) -> (Self, broadcast::Receiver<KvCacheEvent>) {
+        // Default emission policy is AllEventsPolicy (every block tracked).
+        let events = Arc::new(
+            EventsManager::builder()
+                .channel_capacity(KV_EVENT_CHANNEL_CAPACITY)
+                .build(),
+        );
+        let rx = events.subscribe_receiver();
+        let registry = BlockRegistry::builder().event_manager(events).build();
+        (Self::build(block_size, num_blocks, registry), rx)
+    }
+
+    fn build(block_size: usize, num_blocks: usize, registry: BlockRegistry) -> Self {
         // kvbm validates the same two things three levels down; state them at
         // the argument boundary instead.
         assert!(num_blocks >= 2, "need at least 2 blocks (1 for padding)");
@@ -44,7 +81,7 @@ impl BlockPool {
         let block_manager = BlockManager::builder()
             .block_count(num_blocks)
             .block_size(block_size)
-            .registry(BlockRegistry::builder().build())
+            .registry(registry)
             .duplication_policy(BlockDuplicationPolicy::Allow)
             .with_lru_backend()
             .build()
@@ -366,6 +403,48 @@ impl RequestKv {
     ) -> Result<(), ScheduleError> {
         self.seq
             .schedule_speculative(num_draft_tokens, &pool.block_manager)
+    }
+
+    // ── Views (for forward pass) ───────────────────────────────────────
+
+    /// Build an immutable `KvView` for prefill.
+    ///
+    /// `prompt_len` tokens will be appended starting at `kv_position()`.
+    /// The view's seq_len = kv_position + prompt_len (post-advance state
+    /// that FlashInfer attention metadata expects). The page row is exact
+    /// (`step_page_indices`), never the raw block holdings — the raw list
+    /// can carry an eagerly-allocated next block the kernel must not see.
+    pub fn prefill_view(&self, prompt_len: usize) -> KvView {
+        let target_seq_len = self.seq.kv_position() + prompt_len;
+        KvView::new(
+            self.step_page_indices(prompt_len),
+            target_seq_len,
+            self.seq.block_size(),
+        )
+    }
+
+    /// Build an immutable `KvView` for decode (one new token). Same exact
+    /// page-row contract as `prefill_view`.
+    pub fn decode_view(&self) -> KvView {
+        KvView::new(
+            self.step_page_indices(1),
+            self.seq.kv_position() + 1,
+            self.seq.block_size(),
+        )
+    }
+
+    /// Build an immutable `KvView` for speculative verification: the verifier
+    /// forwards `num_draft_tokens` consecutive positions (current dangling token
+    /// followed by draft candidates). The view covers the post-step KV extent;
+    /// [`Self::apply_speculative`] later commits only the accepted prefix and
+    /// releases excess draft capacity. Same exact page-row contract as
+    /// [`Self::prefill_view`].
+    pub fn speculative_view(&self, num_draft_tokens: usize) -> KvView {
+        KvView::new(
+            self.step_page_indices(num_draft_tokens),
+            self.seq.kv_position() + num_draft_tokens,
+            self.seq.block_size(),
+        )
     }
 
     // ── Apply (register blocks, advance position) ──────────────────────
@@ -791,7 +870,8 @@ mod tests {
     /// exact page row at every step — this deadlocked Kimi DP8 on H200 when
     /// the raw list reached the worker's exact-match page-table check, and
     /// made qwen3's FlashInfer metadata read one garbage page past the
-    /// sequence at every block boundary (#291).
+    /// sequence at every block boundary (#291). `prefill_view`/`decode_view`
+    /// must carry the same exact row.
     #[test]
     fn step_page_indices_exact_at_block_boundaries() {
         let mut raw_overshoots = 0usize;
@@ -805,6 +885,11 @@ mod tests {
                 prompt_len.div_ceil(16),
                 "prefill page row P={prompt_len}"
             );
+            assert_eq!(
+                kv.prefill_view(prompt_len).num_pages(),
+                prompt_len.div_ceil(16),
+                "prefill view P={prompt_len}"
+            );
             kv.apply_prefill(1000, &pool).unwrap();
             for step in 0..23u32 {
                 kv.schedule_decode(&pool).unwrap();
@@ -813,6 +898,17 @@ mod tests {
                     kv.step_page_indices(1).len(),
                     need,
                     "decode page row P={prompt_len} step={step}"
+                );
+                let view = kv.decode_view();
+                assert_eq!(
+                    view.num_pages(),
+                    need,
+                    "decode view P={prompt_len} step={step}"
+                );
+                assert_eq!(
+                    (view.num_pages() - 1) * 16 + view.last_page_len(),
+                    kv.kv_position() + 1,
+                    "kernel-derived length P={prompt_len} step={step}"
                 );
                 raw_overshoots += usize::from(kv.page_indices().len() > need);
                 kv.apply_decode(2000 + step, &pool).unwrap();

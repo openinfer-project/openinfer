@@ -2,11 +2,11 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::thread;
 
 use anyhow::Context;
 use anyhow::Result;
-use anyhow::ensure;
 use crossbeam_channel as channel;
 use openinfer_core::cuda_graph::CudaGraphDumpSummary;
 use openinfer_core::engine::LoadLoraAdapterRequest;
@@ -22,17 +22,20 @@ use openinfer_core::tensor::DeviceContext;
 use openinfer_core::tensor::HiddenStates;
 use openinfer_core::weight_loader::WeightPrefetch;
 use openinfer_core::weight_loader::load_shard_info;
-use openinfer_kv_cache::KvBlockGuard;
-use openinfer_kv_cache::KvBuffer;
-use openinfer_kv_cache::KvCacheEvent;
-use openinfer_kv_cache::KvCacheManager;
-use openinfer_kv_cache::KvView;
-use openinfer_kv_cache::LoadReservation;
-use openinfer_kv_cache::PrefixProbe;
-use openinfer_kv_cache::RegisteredBlock;
-use openinfer_kv_offload::LoadHandle;
-use openinfer_kv_offload::OffloadConfig;
-use openinfer_kv_offload::OffloadEngine;
+use openinfer_kv_store::ArenaSpec;
+use openinfer_kv_store::KvBuffer;
+use openinfer_kv_store::KvCacheEvent;
+use openinfer_kv_store::KvCacheManager;
+use openinfer_kv_store::KvStore;
+use openinfer_kv_store::KvStoreBuilder;
+use openinfer_kv_store::KvView;
+use openinfer_kv_store::OffloadRankSpec;
+use openinfer_kv_store::P2pConfig;
+use openinfer_kv_store::PegaflowHost;
+use openinfer_kv_store::RegisteredBlock;
+use openinfer_kv_store::RequestKv;
+use openinfer_kv_store::SaveClass;
+use openinfer_kv_store::SaveCursor;
 use tokio::sync::broadcast;
 
 use crate::Qwen3LoraOptions;
@@ -49,10 +52,6 @@ use crate::weights::Qwen3Model;
 
 mod dflash_lane;
 mod dflash_prefill;
-mod remote_fetch;
-use remote_fetch::QueryView;
-use remote_fetch::RemoteFetchAction;
-use remote_fetch::remote_fetch_action;
 mod spec;
 
 use dflash_lane::DFlashLaneState;
@@ -888,48 +887,14 @@ pub(crate) trait ModelExecutor: Send {
         Vec::new()
     }
 
-    // ── KV-offload prefetch hooks (no-op unless offload is enabled) ─────
+    // ── KV store (None on the plain path) ──────────────────────────────
 
-    /// Offer a freshly-submitted request for async CPU-tier KV prefetch.
-    /// Returns `true` if a load is now in flight and the scheduler must park
-    /// the request until [`Self::drain_ready_prefetch`] reports it ready.
-    ///
-    /// `reserve_floor` is the number of free blocks already promised to
-    /// admitted requests (active decode growth + remaining prefill chunks);
-    /// the prefetch must not reserve into it, or a mid-prefill request's next
-    /// chunk fails allocation and the whole step errors out.
-    fn begin_kv_prefetch(
-        &mut self,
-        _request_id: RequestId,
-        _prompt_tokens: &[u32],
-        _lora_adapter: Option<&str>,
-        _reserve_floor: usize,
-    ) -> bool {
-        false
-    }
-
-    /// Non-blocking sweep: request ids whose prefetch just settled (now
-    /// prefill-eligible). `reserve_floor` guards the remote-fetch re-query
-    /// path the same way it guards `begin_kv_prefetch`: a fetch that resolves
-    /// this tick must not reserve into blocks already promised to admitted
-    /// requests.
-    fn drain_ready_prefetch(&mut self, _reserve_floor: usize) -> Vec<RequestId> {
-        Vec::new()
-    }
-
-    /// Block until at least one in-flight prefetch settles (idle-only), then
-    /// sweep the rest.
-    fn wait_ready_prefetch(&mut self, _reserve_floor: usize) -> Vec<RequestId> {
-        Vec::new()
-    }
-
-    /// Blocks `request_id` already holds via a settled prefetch (its restored
-    /// prefix). These were taken out of the free pool for this request and
-    /// become its cached prefill prefix, so admission credits them against the
-    /// request's block need to avoid double-counting. Zero unless a prefetch
-    /// has committed for `request_id`.
-    fn prefetched_blocks(&self, _request_id: RequestId) -> usize {
-        0
+    /// The KV store this executor serves, when built with offload: the
+    /// scheduler resolves fresh requests against it and budgets admission
+    /// around its in-flight save pins. `None` on the plain path, where the
+    /// executor's own GPU prefix match is the whole cache.
+    fn kv_store(&self) -> Option<Arc<KvStore>> {
+        None
     }
 
     /// Deliver this step's withheld `Finished` events. The default sends them
@@ -988,39 +953,31 @@ struct Qwen3ExecutorMetadata {
 pub struct Qwen3Executor {
     metadata: Qwen3ExecutorMetadata,
     kv_mgr: KvCacheManager,
-    request_kvs: HashMap<RequestId, openinfer_kv_cache::RequestKv>,
+    request_kvs: HashMap<RequestId, RequestKv>,
     primary: RankWorker,
     workers: Vec<RankWorker>,
     loaded_lora_adapters: HashSet<String>,
     prefix_cache_enabled: bool,
     lora_options: Qwen3LoraOptions,
-    /// pegaflow KV-offload bridge; `None` unless offload is opted in on the
-    /// single-GPU path. Drives both the SAVE hook and the async LOAD prefetch.
-    offload: Option<OffloadEngine>,
-    /// Per-request count of sealed blocks already saved to the host tier, so
-    /// each step only saves blocks that newly sealed. Initialized to the
-    /// GPU-hit prefix (already resident) on first save.
-    saved_cursor: HashMap<RequestId, usize>,
-    /// In-flight CPU→GPU prefetches keyed by request, parked until their load
-    /// settles and the blocks register into the prefix cache.
-    prefetch: HashMap<RequestId, PrefetchState>,
-    /// Offload pure-L2 mode. When set, completed blocks are not kept for
-    /// cross-request HBM reuse: the prefetch probe drains the inactive pool
-    /// first, so every probe sees `gpu_hit == 0` and the whole cacheable prefix
-    /// is restored from the host tier. This is what `--no-prefix-cache` means
-    /// once offload is on (the L2 restore still rides on `match_and_add_prefix`,
-    /// so prefix matching itself stays enabled). Set via
-    /// [`Self::set_no_prefix_cache`].
+    /// The process KV store (pegaflow host tier under the GPU pool); `None`
+    /// unless offload is opted in on the single-GPU path. Drives the resolve
+    /// intake (scheduler side) and the seal/retire write path (here).
+    store: Option<Arc<KvStore>>,
+    /// Per-request save bookkeeping for the store's write path: how far this
+    /// request's blocks have already sealed to the host tier, so each step
+    /// only saves blocks that newly sealed.
+    save_cursors: HashMap<RequestId, SaveCursor>,
+    /// Offload pure-L2 mode (mirrored into the store's resolve gate). When
+    /// set, completed blocks are not kept for cross-request HBM reuse: every
+    /// resolve drains the inactive pool first, so prefixes always restore from
+    /// the host tier. This is what `--no-prefix-cache` means once offload is
+    /// on (the L2 restore still rides on `match_and_add_prefix`, so prefix
+    /// matching itself stays enabled). Set via [`Self::set_no_prefix_cache`].
     l1_retention_disabled: bool,
     /// P/D prefill role: withhold each step's `Finished` events until offload
     /// saves + MetaServer registrations are peer-visible, so the HTTP response
     /// doubles as the KV-ready signal (see `Qwen3P2pOptions::flush_on_finish`).
     flush_offload_on_finish: bool,
-    /// P/D decode role with a vLLM prefill peer: offload query keys derive
-    /// with vLLM's hash scheme, a zero hit waits out the producer's
-    /// registration tail, and self-saves are skipped (this node's kvbm keys
-    /// would be unfindable in the vLLM-keyed content domain).
-    vllm_compat: Option<VllmCompatState>,
     /// Overlap streams (`--decode-overlap`); `None` when off.
     overlap: Option<crate::green_ctx::OverlapStreams>,
     /// In-flight async prefill state. Populated by the SplitConcurrent step,
@@ -1056,74 +1013,9 @@ struct ExecutorKvEvents {
     pending_dropped: Vec<Vec<RegisteredBlock>>,
 }
 
-/// One request's in-flight CPU-tier KV prefetch.
-///
-/// `probe` holds the GPU-hit prefix resident for the request's whole parked
-/// life; `phase` tracks where the missing prefix currently is.
-struct PrefetchState {
-    probe: PrefixProbe,
-    phase: PrefetchPhase,
-}
-
-enum PrefetchPhase {
-    /// pegaflow is pulling the missing prefix from a remote peer (P2P RDMA)
-    /// into the local host tier; the executor re-queries each scheduler tick
-    /// until the fetch resolves or `deadline` passes (then: prefill from
-    /// scratch). Only entered with P2P configured.
-    RemoteFetch {
-        query_hashes: Vec<Vec<u8>>,
-        deadline: std::time::Instant,
-        /// vLLM-compat P/D handoff race guard: until this instant a zero hit
-        /// keeps the request parked (the producer's registration hasn't
-        /// landed yet) instead of degrading to prefill-from-scratch. Set to
-        /// the park time (i.e. already expired) outside vLLM-compat mode.
-        miss_deadline: std::time::Instant,
-        /// When the request was parked — for the degradation warning.
-        parked_at: std::time::Instant,
-        /// Last re-query instant: ticks inside [`REMOTE_REQUERY_INTERVAL`]
-        /// skip the RPC so N parked requests cannot turn every scheduler
-        /// tick into N serial MetaServer round-trips.
-        last_query: std::time::Instant,
-    },
-    /// Host→GPU DMA into reserved local blocks is in flight.
-    Loading {
-        reservation: LoadReservation,
-        handle: LoadHandle,
-    },
-    /// Load landed and blocks are committed; `probe` keeps the GPU+CPU prefix
-    /// resident until the request prefills.
-    Committed,
-}
-
-/// How long a parked request waits on a remote (P2P) prefix fetch before
-/// giving up and prefilling from scratch. A safety net for a hung peer — the
-/// normal failure path (peer evicted the blocks, RDMA error) resolves through
-/// pegaflow's own fetch timeout into a plain local hit count well before this.
-const REMOTE_FETCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
-
-/// Minimum spacing between re-query RPCs for one parked request. The idle
-/// scheduler loop already throttles at ~5ms; this bounds the busy path too,
-/// where decode ticks can come faster than the RPC is worth repeating.
-const REMOTE_REQUERY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
-
-/// vLLM-compat miss breaker: after this many consecutive requests each
-/// exhausted the whole zero-hit wait window, new requests skip the wait (the
-/// prefill peer is evidently not publishing — misconfig or down) instead of
-/// taxing every cold request the full window. Any remote hit re-arms waiting.
-const MISS_BREAKER_THRESHOLD: u32 = 3;
-
-/// vLLM-compat P/D mode, derived from [`crate::Qwen3VllmCompatOptions`] at
-/// executor build time (the hasher needs the resolved KV block size).
-struct VllmCompatState {
-    hasher: openinfer_kv_offload::VllmBlockHasher,
-    /// Zero-hit wait window: how long a cold request re-queries before
-    /// giving up on the expected remote KV (see `RemoteFetch::miss_deadline`).
-    miss_wait: std::time::Duration,
-    /// Requests in a row that exhausted the whole wait window with zero hits.
-    /// At [`MISS_BREAKER_THRESHOLD`] the breaker opens and new requests skip
-    /// the wait; any remote hit resets it.
-    consecutive_miss_windows: u32,
-}
+/// The store rank every seal/retire/flush call addresses: offload is
+/// single-GPU only, so the rank table holds exactly one entry.
+pub(crate) const KV_STORE_RANK: usize = 0;
 
 impl Qwen3Executor {
     pub(crate) fn dump_decode_graph_png(&self, png_path: &Path) -> Result<CudaGraphDumpSummary> {
@@ -1178,48 +1070,12 @@ impl Qwen3Executor {
             config: model.config().clone(),
         };
         let kv_buffer = kv_mgr.buffer().clone();
-        // Build the offload engine while the model's stream is still in hand
-        // (it moves into the RankWorker below). Registers the fused KV buffer.
-        let offload = build_offload(offload_opts, &kv_mgr, model.config(), model.device_ctx())?;
+        // Build the KV store while the model's stream is still in hand (it
+        // moves into the RankWorker below). Registers the fused KV buffer's
+        // per-layer arenas with the store's pegaflow host.
+        let store = build_kv_store(offload_opts, &kv_mgr, model.config(), model.device_ctx())?;
         let total_blocks = kv_mgr.pool().total_blocks();
         let padding_block_id = kv_mgr.pool().padding_block_id();
-        let vllm_compat = match offload_opts.vllm_compat.as_ref() {
-            None => None,
-            Some(c) => {
-                ensure!(
-                    c.miss_wait < REMOTE_FETCH_DEADLINE,
-                    "kv-pd miss wait ({:?}) must stay below the {:?} remote-fetch \
-                     deadline, which would otherwise silently cap it",
-                    c.miss_wait,
-                    REMOTE_FETCH_DEADLINE,
-                );
-                let hasher = openinfer_kv_offload::VllmBlockHasher::new(
-                    &c.python_hash_seed,
-                    budget.block_size,
-                );
-                // Cross-engine fingerprint. Every P/D mismatch (seed,
-                // namespace, block size, geometry) otherwise presents as
-                // nothing but slow cold requests — this line is what an
-                // operator diffs against the vLLM peer's startup config.
-                log::info!(
-                    "vLLM-compat P/D active: seed={} namespace={} block_size={} \
-                     none_hash={:032x} layers={} kv_heads={} head_dim={} miss_wait={:?}",
-                    c.python_hash_seed,
-                    c.namespace,
-                    budget.block_size,
-                    u128::from_be_bytes(hasher.none_hash()),
-                    budget.num_layers,
-                    budget.num_kv_heads,
-                    budget.head_dim,
-                    c.miss_wait,
-                );
-                Some(VllmCompatState {
-                    hasher,
-                    miss_wait: c.miss_wait,
-                    consecutive_miss_windows: 0,
-                })
-            }
-        };
         Ok(Self {
             metadata,
             kv_mgr,
@@ -1238,9 +1094,8 @@ impl Qwen3Executor {
             loaded_lora_adapters: HashSet::new(),
             prefix_cache_enabled: true,
             lora_options: Qwen3LoraOptions::default(),
-            offload,
-            saved_cursor: HashMap::new(),
-            prefetch: HashMap::new(),
+            store,
+            save_cursors: HashMap::new(),
             l1_retention_disabled: false,
             // Derived here, not via a post-construction setter, so every
             // launch path (plain and LoRA alike) honors the P/D contract.
@@ -1248,7 +1103,6 @@ impl Qwen3Executor {
                 .p2p
                 .as_ref()
                 .is_some_and(|p2p| p2p.flush_on_finish),
-            vllm_compat,
             overlap: None,
             async_prefill: None,
             speculative: None,
@@ -1567,12 +1421,10 @@ impl Qwen3Executor {
             prefix_cache_enabled: true,
             lora_options,
             // Offload is single-GPU only (asserted above); never built here.
-            offload: None,
-            saved_cursor: HashMap::new(),
-            prefetch: HashMap::new(),
+            store: None,
+            save_cursors: HashMap::new(),
             l1_retention_disabled: false,
             flush_offload_on_finish: false,
-            vllm_compat: None,
             overlap: None,
             async_prefill: None,
             speculative: None,
@@ -1609,6 +1461,9 @@ impl Qwen3Executor {
     /// completed request blocks: retaining blocks that can never be matched
     /// creates duplicate primaries outside request-level capacity accounting.
     pub fn set_prefix_cache_enabled(&mut self, enabled: bool) {
+        if let Some(store) = &self.store {
+            store.set_resolve_enabled(enabled);
+        }
         let retained_before = self.retains_completed_kv_blocks();
         self.prefix_cache_enabled = enabled;
         self.finish_retention_transition(retained_before);
@@ -1676,7 +1531,8 @@ impl Qwen3Executor {
     /// the cache cannot be told to prefer L2 for a block still in HBM — the only
     /// way to force the bytes from L2 is to not keep the HBM copy around.
     pub(crate) fn set_no_prefix_cache(&mut self, on: bool) {
-        if self.offload.is_some() {
+        if let Some(store) = self.store.clone() {
+            store.set_l1_retention_disabled(on);
             let retained_before = self.retains_completed_kv_blocks();
             self.l1_retention_disabled = on;
             self.finish_retention_transition(retained_before);
@@ -1699,7 +1555,7 @@ impl Qwen3Executor {
             self.workers.len()
         );
         anyhow::ensure!(
-            self.offload.is_none(),
+            self.store.is_none(),
             "speculative decoding is not supported together with KV offload"
         );
         let meta = self.primary.load_dflash(draft_path.to_string())?;
@@ -1714,15 +1570,21 @@ impl Qwen3Executor {
 
     /// Whether KV offload is active on this executor.
     pub fn offload_enabled(&self) -> bool {
-        self.offload.is_some()
+        self.store.is_some()
+    }
+
+    /// The KV store this executor was built with (offload opt-in only); the
+    /// scheduler resolves fresh requests against it.
+    pub fn kv_store(&self) -> Option<Arc<KvStore>> {
+        self.store.clone()
     }
 
     /// Flush pending offload saves into the host read cache so a following
     /// query can see them. A persistence barrier for handoff and tests; no-op
     /// without offload.
     pub fn flush_offload_saves(&self) {
-        if let Some(offload) = &self.offload {
-            offload.flush_saves();
+        if let Some(store) = &self.store {
+            let _ = store.flush_saves_blocking(KV_STORE_RANK);
         }
     }
 
@@ -1733,78 +1595,22 @@ impl Qwen3Executor {
         self.kv_mgr.pool().evict_inactive();
     }
 
-    /// Begin an async CPU-tier KV prefetch for `request_id`; see the
-    /// [`ModelExecutor`] hook. Public so admission drivers and tests can park a
-    /// request on its load. Returns `true` when a load is in flight.
-    pub fn begin_kv_prefetch(
-        &mut self,
-        request_id: RequestId,
-        prompt_tokens: &[u32],
-        lora_adapter: Option<&str>,
-        reserve_floor: usize,
-    ) -> bool {
-        <Self as ModelExecutor>::begin_kv_prefetch(
-            self,
-            request_id,
-            prompt_tokens,
-            lora_adapter,
-            reserve_floor,
-        )
-    }
-
-    /// Block until at least one in-flight prefetch settles, then sweep the
-    /// rest; returns the settled request ids (now prefill-eligible).
-    pub fn wait_ready_prefetch(&mut self, reserve_floor: usize) -> Vec<RequestId> {
-        <Self as ModelExecutor>::wait_ready_prefetch(self, reserve_floor)
-    }
-
     // ── KV-offload SAVE ────────────────────────────────────────────────
 
     /// Save every block that sealed since this request's last save to the host
     /// tier (fire-and-forget). Safe to call right after `apply_prefill`/
     /// `apply_decode`: the producing step's token read-back has already
-    /// synchronized the compute stream, so the sealed KV is fully written.
+    /// synchronized the compute stream, so the sealed KV is fully written. The
+    /// store pins the saved source pages itself until each async D2H lands.
     fn save_sealed_blocks(&mut self, request_id: RequestId) {
-        if self.offload.is_none() {
+        let Some(store) = self.store.clone() else {
             return;
-        }
-        if self.vllm_compat.is_some() {
-            // The content domain is keyed with vLLM's hash scheme; this node's
-            // kvbm-keyed self-saves would be unfindable there. Remote blocks
-            // it fetched are already host-cached (under the vLLM keys) by
-            // pegaflow's read path, so multi-turn reuse doesn't need them.
-            return;
-        }
+        };
         let Some(rkv) = self.request_kvs.get(&request_id) else {
             return;
         };
-        // `assigned_block_hashes` lists only sealed (registered) blocks; the
-        // partial tail block has no hash and never appears here.
-        let assigned = rkv.assigned_block_hashes();
-        let prefix_matched = rkv.prefix_matched_blocks();
-        let cursor = self
-            .saved_cursor
-            .entry(request_id)
-            .or_insert(prefix_matched);
-        if assigned.len() <= *cursor {
-            return;
-        }
-        let fresh = &assigned[*cursor..];
-        let block_ids: Vec<i32> = fresh.iter().map(|(id, _)| *id).collect();
-        let block_hashes: Vec<Vec<u8>> = fresh.iter().map(|(_, h)| h.to_vec()).collect();
-        // Pin exactly the blocks being saved (aligned 1:1 with `assigned`) for
-        // the duration of the async D2H, so a finished request can't hand the
-        // slot to a new request that overwrites it before the copy lands.
-        let pins: Vec<KvBlockGuard> = rkv
-            .assigned_block_guards()
-            .into_iter()
-            .skip(*cursor)
-            .collect();
-        *cursor = assigned.len();
-        self.offload
-            .as_ref()
-            .expect("offload present")
-            .save(&block_ids, &block_hashes, pins);
+        let cursor = self.save_cursors.entry(request_id).or_default();
+        store.seal(KV_STORE_RANK, rkv, cursor, SaveClass::Cacheable);
     }
 
     // ── Chunked prefill ────────────────────────────────────────────────
@@ -1826,10 +1632,6 @@ impl Qwen3Executor {
                 req.cached_tokens = rkv.match_and_add_prefix(self.kv_mgr.pool())?;
             }
             self.request_kvs.insert(req.request_id, rkv);
-            // match_and_add_prefix above already absorbed any CPU-prefetched
-            // blocks (now held by the request's sequence), so release the
-            // prefetch's separate hold.
-            self.prefetch.remove(&req.request_id);
         }
         let rkv = self
             .request_kvs
@@ -1866,226 +1668,6 @@ impl Qwen3Executor {
             rkv.apply_prefill(result.first_token, self.kv_mgr.pool())
         } else {
             rkv.apply_prefill_chunk(self.kv_mgr.pool())
-        }
-    }
-
-    // ── KV-offload LOAD (async CPU-tier prefetch) ──────────────────────
-    // The trait-facing prefetch hooks (`begin_kv_prefetch`,
-    // `drain_ready_prefetch`, `wait_ready_prefetch`, `has_pending_prefetch`)
-    // live in the `ModelExecutor` impl below; `settle_prefetch` is their shared
-    // helper.
-
-    /// Finalize one prefetch whose load returned `result`. On success the
-    /// reserved blocks are staged + registered (held by the probe until the
-    /// request prefills); on failure the state is dropped so the request
-    /// prefills from scratch.
-    fn settle_prefetch(
-        &mut self,
-        id: RequestId,
-        reservation: LoadReservation,
-        result: Result<(), openinfer_kv_offload::EngineError>,
-    ) {
-        match result {
-            Ok(()) => {
-                let st = self.prefetch.get_mut(&id).expect("prefetch present");
-                st.phase = PrefetchPhase::Committed;
-                self.kv_mgr
-                    .pool()
-                    .commit_loaded_blocks(&mut st.probe, reservation);
-            }
-            Err(e) => {
-                log::warn!("KV offload load failed for {id:?} (prefill from scratch): {e}");
-                self.prefetch.remove(&id);
-            }
-        }
-    }
-
-    /// Re-query a request parked on a remote (P2P) prefix fetch. Terminal
-    /// transitions return `true` (request is prefill-eligible): a `Ready`
-    /// answer either starts the H2D load (probe → Loading, still parked → and
-    /// so returns `false`) or, on zero hit / reservation pressure / deadline,
-    /// drops the prefetch so the request prefills from scratch.
-    fn poll_remote_fetch(&mut self, id: RequestId, reserve_floor: usize) -> bool {
-        let Some(st) = self.prefetch.get(&id) else {
-            return true;
-        };
-        let PrefetchPhase::RemoteFetch {
-            query_hashes,
-            deadline,
-            miss_deadline,
-            parked_at,
-            last_query,
-        } = &st.phase
-        else {
-            return false;
-        };
-        let now = std::time::Instant::now();
-        let timed_out = now > *deadline;
-        if timed_out {
-            log::warn!("remote KV fetch timed out for {id:?}; prefill from scratch");
-        }
-        if !timed_out && now.duration_since(*last_query) < REMOTE_REQUERY_INTERVAL {
-            return false; // stay parked; too soon for another MetaServer RPC
-        }
-        // The breaker cuts already-parked waiters short too: a request can
-        // enter this phase past the breaker via a transient Loading answer,
-        // and "the peer is evidently not publishing" applies to it as well.
-        let breaker_closed = self
-            .vllm_compat
-            .as_ref()
-            .is_none_or(|c| c.consecutive_miss_windows < MISS_BREAKER_THRESHOLD);
-        let wait_on_miss = self.vllm_compat.is_some() && breaker_closed && now <= *miss_deadline;
-        let miss_deadline = *miss_deadline;
-        let parked_for = now.duration_since(*parked_at);
-        let queried_blocks = query_hashes.len();
-        let query_hashes = query_hashes.clone();
-        if let Some(st) = self.prefetch.get_mut(&id)
-            && let PrefetchPhase::RemoteFetch { last_query, .. } = &mut st.phase
-        {
-            *last_query = now;
-        }
-        let available_blocks = self.kv_mgr.pool().available_blocks();
-        let mut query_errored = false;
-        let action = {
-            let offload = self.offload.as_ref().expect("offload present in prefetch");
-            remote_fetch_action(
-                timed_out,
-                wait_on_miss,
-                breaker_closed,
-                || {
-                    offload
-                        // Partial remote hits are a win here: the miss is
-                        // recomputed locally, so never hold out for the
-                        // full prefix.
-                        .query(&id.0.to_string(), &query_hashes, false)
-                        .map(QueryView::from)
-                        .map_err(|e| {
-                            query_errored = true;
-                            log::warn!(
-                                "remote KV re-query failed for {id:?} (prefill from scratch): {e}"
-                            );
-                        })
-                },
-                available_blocks,
-                reserve_floor,
-            )
-        };
-        match action {
-            RemoteFetchAction::Wait => false,
-            RemoteFetchAction::Scratch => {
-                // A vLLM-compat request that waited out the whole miss window
-                // is the sole symptom of every P/D misconfiguration (seed,
-                // namespace, block size, peer down) — never degrade silently.
-                // The 15s hard timeout (a Loading-stuck peer) counts toward
-                // the breaker too, with its own warning already emitted.
-                // Requests cut short by an open breaker (now before the
-                // deadline) scratch quietly: the breaker warning already
-                // announced the mode.
-                let window_exhausted = self.vllm_compat.is_some()
-                    && (timed_out || (!query_errored && now > miss_deadline));
-                if window_exhausted {
-                    if !timed_out {
-                        log::warn!(
-                            "expected remote KV never appeared for {id:?} \
-                             ({queried_blocks} blocks, waited {parked_for:?}); prefill from \
-                             scratch — check P/D seed/namespace/block-size alignment"
-                        );
-                    }
-                    self.note_miss_window_exhausted();
-                }
-                self.prefetch.remove(&id);
-                true
-            }
-            RemoteFetchAction::Release(lease) => {
-                self.note_remote_hit();
-                let offload = self.offload.as_ref().expect("offload present in prefetch");
-                offload.release_query_lease(lease);
-                self.prefetch.remove(&id);
-                true
-            }
-            RemoteFetchAction::Load(lease, num_blocks) => {
-                self.note_remote_hit();
-                let probe = self
-                    .prefetch
-                    .remove(&id)
-                    .expect("prefetch present in RemoteFetch")
-                    .probe;
-                match self.start_prefetch_load(id, probe, lease, num_blocks) {
-                    Ok(()) => false,
-                    Err(()) => true,
-                }
-            }
-        }
-    }
-
-    /// Miss-breaker bookkeeping: one more request exhausted the whole
-    /// zero-hit wait window. At the threshold the breaker opens and
-    /// [`Self::begin_kv_prefetch`] stops parking new requests.
-    fn note_miss_window_exhausted(&mut self) {
-        let Some(compat) = self.vllm_compat.as_mut() else {
-            return;
-        };
-        compat.consecutive_miss_windows = compat.consecutive_miss_windows.saturating_add(1);
-        if compat.consecutive_miss_windows == MISS_BREAKER_THRESHOLD {
-            log::warn!(
-                "P/D miss breaker open: {MISS_BREAKER_THRESHOLD} consecutive requests \
-                 exhausted the remote-KV wait window; new requests prefill from scratch \
-                 immediately until a remote hit lands"
-            );
-        }
-    }
-
-    /// Miss-breaker bookkeeping: remote content is visible again (leased
-    /// hit), so cold requests may wait on the P/D handoff race once more.
-    fn note_remote_hit(&mut self) {
-        if let Some(compat) = self.vllm_compat.as_mut() {
-            compat.consecutive_miss_windows = 0;
-        }
-    }
-
-    /// Reserve GPU destination blocks for a leased host-tier hit, submit the
-    /// H2D load, and park the request as a `Loading` prefetch (taking ownership
-    /// of `probe`, which keeps the GPU-hit prefix resident meanwhile).
-    /// `Err(())` means the prefetch was abandoned (lease released, no state
-    /// kept) and the request should prefill from scratch.
-    fn start_prefetch_load(
-        &mut self,
-        id: RequestId,
-        probe: PrefixProbe,
-        lease: openinfer_kv_offload::QueryLeaseId,
-        num_blocks: usize,
-    ) -> Result<(), ()> {
-        let offload = self.offload.as_ref().expect("offload present in prefetch");
-        let Some(reservation) = self.kv_mgr.pool().reserve_loaded_blocks(num_blocks) else {
-            // Block pressure: release the lease so its pinned host blocks
-            // aren't held for the full lease TTL, and prefill from scratch
-            // rather than stall.
-            offload.release_query_lease(lease);
-            return Err(());
-        };
-        let page_ids = reservation.page_ids();
-        match offload.load(lease, page_ids) {
-            Ok(handle) => {
-                self.prefetch.insert(
-                    id,
-                    PrefetchState {
-                        probe,
-                        phase: PrefetchPhase::Loading {
-                            reservation,
-                            handle,
-                        },
-                    },
-                );
-                Ok(())
-            }
-            Err(e) => {
-                log::warn!("KV offload load submit failed for {id:?} (skipping): {e}");
-                // `load` consumes the lease only past its early validation; a
-                // submit error may leave it pinned, so release it (no-op if it
-                // was already consumed).
-                offload.release_query_lease(lease);
-                Err(())
-            }
         }
     }
 
@@ -2153,16 +1735,16 @@ fn profile_kv_budget_on_worker(
         .map_err(|_| anyhow::anyhow!("Qwen3 memory profile worker panicked"))?
 }
 
-/// Build the KV-offload engine for the single-GPU path, or `None` when offload
-/// is disabled. Registers the fused KV buffer with pegaflow against the model's
-/// device/stream — must be called while that stream is still owned by the model
-/// (before it moves into the `RankWorker`).
-fn build_offload(
+/// Build the KV store for the single-GPU path, or `None` when offload is
+/// disabled. Registers the fused KV buffer's per-layer arenas with the store's
+/// pegaflow host against the model's device/stream — must be called while that
+/// stream is still owned by the model (before it moves into the `RankWorker`).
+fn build_kv_store(
     opts: &Qwen3OffloadOptions,
     kv_mgr: &KvCacheManager,
     config: &Config,
     ctx: &DeviceContext,
-) -> Result<Option<OffloadEngine>> {
+) -> Result<Option<Arc<KvStore>>> {
     if !opts.enabled {
         return Ok(None);
     }
@@ -2175,45 +1757,69 @@ fn build_offload(
     // mixed mesh silently feed one model the other's KV. hidden_size +
     // intermediate_size + vocab_size discriminate the model line's sizes;
     // the layout fields pin the block geometry the transfer relies on.
-    // vLLM-compat mode joins the *P side's* content domain instead: the
-    // pegaflow connector derives an 8-hex namespace from vLLM config (and logs
-    // it at startup); reproducing that derivation would mean chasing Python
-    // repr of vLLM internals, so the operator passes it through explicitly.
-    let namespace = match &opts.vllm_compat {
-        Some(compat) => compat.namespace.clone(),
-        None => format!(
-            "openinfer-qwen3-hs{}-is{}-v{}-l{}h{}d{}p{}",
-            config.hidden_size,
-            config.intermediate_size,
-            config.vocab_size,
-            layout.num_layers,
-            layout.num_kv_heads,
-            layout.head_dim,
-            layout.page_size
-        ),
-    };
-    let mut config = OffloadConfig::new(
-        format!("qwen3-dev{device_id}"),
-        device_id,
-        opts.pinned_pool_bytes,
-    )
-    .with_namespace(namespace);
-    config.use_hugepages = opts.use_hugepages;
+    let namespace = format!(
+        "openinfer-qwen3-hs{}-is{}-v{}-l{}h{}d{}p{}",
+        config.hidden_size,
+        config.intermediate_size,
+        config.vocab_size,
+        layout.num_layers,
+        layout.num_kv_heads,
+        layout.head_dim,
+        layout.page_size
+    );
+    let mut host_builder =
+        PegaflowHost::builder(opts.pinned_pool_bytes).use_hugepages(opts.use_hugepages);
     if let Some(p2p) = &opts.p2p {
-        config = config.with_p2p(openinfer_kv_offload::P2pConfig {
+        host_builder = host_builder.p2p(P2pConfig {
             metaserver_addr: p2p.metaserver_addr.clone(),
             advertise_addr: p2p.advertise_addr.clone(),
             rdma_nics: p2p.rdma_nics.clone(),
         });
     }
-    let engine = OffloadEngine::new(config, kv_mgr.buffer(), &ctx.stream)
-        .map_err(|e| anyhow::anyhow!("KV offload engine init failed: {e}"))?;
+    let host = host_builder
+        .build()
+        .map_err(|e| anyhow::anyhow!("KV store host init failed: {e}"))?;
+
+    // Arena geometry: within a page the layout is K then V back-to-back, so
+    // one layer's whole [K|V] span is a single copy unit of `layer_bytes`;
+    // consecutive blocks of one layer sit a full page apart because the fused
+    // buffer interleaves all layers within a page. (Same derivation the old
+    // kv-offload bridge computed in `Registration::from_buffer`.)
+    let elem_bytes = std::mem::size_of::<half::bf16>();
+    let layer_bytes = layout.layer_stride * elem_bytes;
+    let block_stride_bytes = layout.page_stride * elem_bytes;
+    let num_blocks = kv_mgr.buffer().num_blocks();
+    let base_ptr = kv_mgr.buffer().device_ptr(&ctx.stream);
+    let arenas = (0..layout.num_layers)
+        .map(|layer| ArenaSpec {
+            name: layer.to_string(),
+            base_device_ptr: base_ptr + (layer * layer_bytes) as u64,
+            // Cover the strided reach of the last block — pegaflow validates
+            // copies against this bound.
+            size_bytes: (num_blocks - 1) * block_stride_bytes + layer_bytes,
+            num_blocks,
+            segment_bytes: layer_bytes,
+            segments: 1,
+            kv_stride_bytes: 0,
+            block_stride_bytes,
+        })
+        .collect();
+    let spec = OffloadRankSpec {
+        instance_id: format!("qwen3-dev{device_id}"),
+        namespace,
+        device_id,
+        arenas,
+    };
+    let store = KvStoreBuilder::new(host.runtime_handle())
+        .rank_with_offload(KV_STORE_RANK, kv_mgr.pool_arc(), &host, spec)
+        .map_err(|e| anyhow::anyhow!("KV store rank registration failed: {e:#}"))?
+        .build();
     log::info!(
         "KV offload enabled on device {device_id} ({} MiB host tier, p2p={})",
         opts.pinned_pool_bytes >> 20,
         opts.p2p.is_some(),
     );
-    Ok(Some(engine))
+    Ok(Some(Arc::new(store)))
 }
 
 fn ensure_lora_capacity(
@@ -2272,29 +1878,24 @@ impl ModelExecutor for Qwen3Executor {
         self.metadata.stop_token_ids.contains(&token_id)
     }
 
-    fn prefetched_blocks(&self, request_id: RequestId) -> usize {
-        self.prefetch
-            .get(&request_id)
-            .map_or(0, |st| st.probe.held_blocks())
+    fn kv_store(&self) -> Option<Arc<KvStore>> {
+        Qwen3Executor::kv_store(self)
     }
 
     fn release_finished_events(&self, finishes: Vec<(TokenSink, TokenEvent)>) {
-        match &self.offload {
+        match &self.store {
             // P/D prefill role: the peer treats our HTTP response as the
             // KV-ready signal, so `Finished` may leave only after this step's
             // saves + MetaServer registrations are peer-visible. The barrier
-            // runs on the offload runtime; the scheduler thread never waits.
-            Some(offload) if self.flush_offload_on_finish => {
-                offload.flush_saves_then(move || send_finished_events(finishes));
+            // runs on the store's runtime; the scheduler thread never waits.
+            Some(store) if self.flush_offload_on_finish => {
+                store.flush_saves_then(KV_STORE_RANK, move || send_finished_events(finishes));
             }
             _ => send_finished_events(finishes),
         }
     }
 
     fn drop_request(&mut self, request_id: RequestId) -> Result<()> {
-        // Remove and drop — RAII on SchedulableSequence's block guards
-        // returns all allocated blocks regardless of lifecycle state. The same
-        // RAII frees any parked prefetch's reserved/held blocks.
         let retain_completed_kv = self.retains_completed_kv_blocks();
         let mut removed = self.request_kvs.remove(&request_id);
         // With the event feed on, capture this request's still-unflushed store
@@ -2311,23 +1912,23 @@ impl ModelExecutor for Qwen3Executor {
                 rkv.mark_blocks_reset_on_release();
             }
         }
-        drop(removed);
-        // A parked prefetch may still have a load in flight: pegaflow's worker
-        // is writing the reserved GPU blocks (H2D). Dropping the reservation now
-        // frees those physical pages for immediate reuse while the DMA keeps
-        // landing on them — silent KV corruption, the load-side mirror of the
-        // SAVE keep-alive pin. Block until the copy finishes before the
-        // reservation drops. The scheduler is a dedicated synchronous thread, so
-        // this brief wait costs nothing it could spend elsewhere. (A RemoteFetch
-        // phase has no local reservation yet — pegaflow owns that fetch and its
-        // pinned-pool destination; dropping the state simply orphans the query,
-        // which pegaflow's own req-scoped prefetch GC cleans up.)
-        if let Some(state) = self.prefetch.remove(&request_id) {
-            if let PrefetchPhase::Loading { handle, .. } = state.phase {
-                let _ = handle.wait();
+        // With a store wired, retire is the final seal + release: `Cacheable`
+        // saves are fire-and-forget (their guards pin the source pages across
+        // the async D2H); `Handoff` saves (P/D prefill role) park the KV until
+        // they settle. Without a store the plain drop returns the blocks via
+        // RAII on SchedulableSequence's block guards.
+        let cursor = self.save_cursors.remove(&request_id).unwrap_or_default();
+        match (self.store.clone(), removed) {
+            (Some(store), Some(rkv)) => {
+                let class = if self.flush_offload_on_finish {
+                    SaveClass::Handoff
+                } else {
+                    SaveClass::Cacheable
+                };
+                store.retire(KV_STORE_RANK, rkv, cursor, class);
             }
+            (_, removed) => drop(removed),
         }
-        self.saved_cursor.remove(&request_id);
         if self.speculative.is_some() {
             self.dflash_ready_requests.remove(&request_id);
             self.primary.drop_dflash_request(request_id)?;
@@ -2352,198 +1953,6 @@ impl ModelExecutor for Qwen3Executor {
             }
         }
         runs
-    }
-
-    fn begin_kv_prefetch(
-        &mut self,
-        request_id: RequestId,
-        prompt_tokens: &[u32],
-        lora_adapter: Option<&str>,
-        reserve_floor: usize,
-    ) -> bool {
-        let Some(offload) = self.offload.as_ref() else {
-            return false;
-        };
-        if !self.prefix_cache_enabled {
-            return false;
-        }
-        if self.l1_retention_disabled {
-            // Pure-L2 mode: drop any cross-request HBM retention so the probe
-            // sees gpu_hit == 0 and queries the whole cacheable prefix from the
-            // host tier. Only inactive (completed, unheld) blocks are drained —
-            // the current request holds nothing yet, and in-flight prefetches
-            // keep their reserved blocks, so this never touches live KV.
-            self.kv_mgr.pool().evict_inactive();
-        }
-        if self.vllm_compat.is_some() && lora_adapter.is_some() {
-            // vLLM salts LoRA block hashes via extra_keys; that derivation is
-            // not replicated, so LoRA requests skip the cross-engine lookup.
-            return false;
-        }
-        let probe = self
-            .kv_mgr
-            .pool()
-            .probe_prefix(prompt_tokens.to_vec(), lora_adapter);
-        let query_hashes = match &self.vllm_compat {
-            None => probe.cpu_query_hashes(),
-            // Same query window ([gpu_hit .. cacheable) blocks of the prompt),
-            // keyed with vLLM's hash scheme so the lookup can find what the
-            // vLLM prefill peer registered. Local GPU-tier naming stays kvbm:
-            // the loaded bytes are committed under the probe's own hashes.
-            Some(compat) => {
-                let window = probe.cpu_query_window();
-                let start = probe.gpu_hit_blocks();
-                // In bounds by construction: the probe's reuse cap leaves the
-                // prompt's final token out, so start + window ≤ ⌊len/bs⌋ =
-                // chain.len() even for block-aligned prompts.
-                let chain = compat.hasher.key_chain(prompt_tokens);
-                chain[start..start + window].to_vec()
-            }
-        };
-        if query_hashes.is_empty() {
-            return false;
-        }
-        // Breaker open: the peer demonstrably isn't publishing, so treat a
-        // zero hit as a plain miss instead of parking for the whole window,
-        // and don't park on `Loading` either — in compat mode the first shot
-        // is always `Loading` (the query only starts the async fetch), so
-        // parking would stall every cold request for the full fetch deadline.
-        // The first-shot query below still runs — a hit re-arms waiting.
-        let expect_remote = self
-            .vllm_compat
-            .as_ref()
-            .is_some_and(|c| c.consecutive_miss_windows < MISS_BREAKER_THRESHOLD);
-        let park_on_loading = self.vllm_compat.is_none() || expect_remote;
-        let available_blocks = self.kv_mgr.pool().available_blocks();
-        let action = remote_fetch_action(
-            false,
-            expect_remote,
-            park_on_loading,
-            || {
-                offload
-                    // As in the re-query: partial hits shorten the local
-                    // prefill, so don't wait for the full prefix.
-                    .query(&request_id.0.to_string(), &query_hashes, false)
-                    .map(QueryView::from)
-                    .map_err(|e| {
-                        log::warn!("KV offload query failed for {request_id:?} (skipping): {e}");
-                    })
-            },
-            available_blocks,
-            reserve_floor,
-        );
-        match action {
-            RemoteFetchAction::Wait => {
-                // pegaflow is pulling the missing prefix from a P2P peer (or
-                // SSD) into the local host tier — or, in vLLM-compat mode, the
-                // producer's registration hasn't landed yet. Park the request
-                // and re-query each tick; the probe keeps the GPU-hit prefix
-                // resident.
-                let now = std::time::Instant::now();
-                let miss_wait = self
-                    .vllm_compat
-                    .as_ref()
-                    .map_or(std::time::Duration::ZERO, |c| c.miss_wait);
-                self.prefetch.insert(
-                    request_id,
-                    PrefetchState {
-                        probe,
-                        phase: PrefetchPhase::RemoteFetch {
-                            query_hashes,
-                            deadline: now + REMOTE_FETCH_DEADLINE,
-                            miss_deadline: now + miss_wait,
-                            parked_at: now,
-                            last_query: now,
-                        },
-                    },
-                );
-                true
-            }
-            RemoteFetchAction::Scratch => false, // miss or query error
-            RemoteFetchAction::Release(lease) => {
-                self.note_remote_hit();
-                let offload = self.offload.as_ref().expect("offload checked above");
-                offload.release_query_lease(lease);
-                false
-            }
-            RemoteFetchAction::Load(lease, num_blocks) => {
-                self.note_remote_hit();
-                match self.start_prefetch_load(request_id, probe, lease, num_blocks) {
-                    Ok(()) => true,
-                    Err(()) => false,
-                }
-            }
-        }
-    }
-
-    fn drain_ready_prefetch(&mut self, reserve_floor: usize) -> Vec<RequestId> {
-        let ids: Vec<RequestId> = self.prefetch.keys().copied().collect();
-        let mut done = Vec::new();
-        for id in ids {
-            match self.prefetch.get_mut(&id).map(|st| &mut st.phase) {
-                Some(PrefetchPhase::Loading { handle, .. }) => {
-                    let Some(result) = handle.poll() else {
-                        continue;
-                    };
-                    let st = self.prefetch.get_mut(&id).expect("prefetch present");
-                    let PrefetchPhase::Loading { reservation, .. } =
-                        std::mem::replace(&mut st.phase, PrefetchPhase::Committed)
-                    else {
-                        unreachable!("phase matched Loading above");
-                    };
-                    self.settle_prefetch(id, reservation, result);
-                    done.push(id);
-                }
-                Some(PrefetchPhase::RemoteFetch { .. }) => {
-                    if self.poll_remote_fetch(id, reserve_floor) {
-                        done.push(id);
-                    }
-                }
-                Some(PrefetchPhase::Committed) | None => {} // awaiting prefill
-            }
-        }
-        done
-    }
-
-    fn wait_ready_prefetch(&mut self, reserve_floor: usize) -> Vec<RequestId> {
-        let mut done = Vec::new();
-        if let Some(id) = self
-            .prefetch
-            .iter()
-            .find(|(_, st)| matches!(st.phase, PrefetchPhase::Loading { .. }))
-            .map(|(id, _)| *id)
-        {
-            let st = self.prefetch.get_mut(&id).expect("prefetch present");
-            let PrefetchPhase::Loading {
-                reservation,
-                handle,
-            } = std::mem::replace(&mut st.phase, PrefetchPhase::Committed)
-            else {
-                unreachable!("phase matched Loading above");
-            };
-            let result = handle.wait();
-            self.settle_prefetch(id, reservation, result);
-            done.push(id);
-        } else if let Some(id) = self
-            .prefetch
-            .iter()
-            .find(|(_, st)| matches!(st.phase, PrefetchPhase::RemoteFetch { .. }))
-            .map(|(id, _)| *id)
-        {
-            // Nothing locally in flight but a remote fetch is: there is no
-            // completion handle to block on (pegaflow owns the fetch), so
-            // sleep one poll interval to avoid a busy idle loop, then fall
-            // through to the sweep, which re-queries it.
-            std::thread::sleep(std::time::Duration::from_millis(5));
-            let _ = id;
-        }
-        // Sweep any others that completed concurrently.
-        for id in self.drain_ready_prefetch(reserve_floor) {
-            if !done.contains(&id) {
-                done.push(id);
-            }
-        }
-        done
     }
 
     fn execute_prefill(&mut self, plan: PrefillPlan<'_>) -> Result<PrefillResult> {
