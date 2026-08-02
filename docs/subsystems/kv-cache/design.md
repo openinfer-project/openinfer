@@ -242,7 +242,7 @@ while let Ok((req, kv_prefix)) = submit_rx.try_recv() {
 
 1. ✅ 本骨架 PR：文档 + `openinfer-kv-store`（resolve/seal/retire + `PegaflowHost`/`ArenaSpec` pegaflow 接线 + SSD/P2P，paged only；测试为真 GPU/SSD 引擎套件，无 mock）+ 分发层 `(GenerateRequest, KvPrefix)`（未迁移模型收 `KvPrefix::none()`，行为零变化）。
 2. qwen3 首迁：`resolve_prefix` 替换 `remote_fetch_action` 状态机（executor.rs ~2000 行 prefetch 编排），旧路径留开关至 bench 对齐。
-3. glm52 D 侧：收件箱替换 `HostRestoreState`；随后 P/D `Handoff` 租约（对齐 pegaflow `QueryLeaseId` 语义后定稿）。#812（EP32 生产设计点）仍 open、阶段性 PR 持续落 main 且常动 scheduler/offload 邻域——迁移分支以 main 为基准高频 rebase，避免累积大 diff。
+3. ✅ glm52 全量迁移（2026-08-02，一步到位）：offload.rs 1654→~290 行——resolver 管线替换 `HostRestoreState`/`NativePdState` 五态机（收件箱只收就绪请求，队头停车消失）；P 侧 sealed 页 Cacheable fire-and-forget + tail `seal_keyed`、retire 只停放 tail（全页停放会在 burst 下饿死 admission，实测教训）；D 侧 `wait_for_full_hit` + `resolve_keyed_block`。1P1D+router 验收：GSM8K n200 strict 0.99（=老栈基线）；multi-turn c16 头对头 757-769 tok/s / TTFT p50 258-260ms / TPOT 16-18ms vs 老栈 564 / 751ms / 20.3ms，240/240 零失败（冷/warm 双确认）。运维教训：pegaflow pinned pool 在裸机 NUMA 慢路径上会把 TTFT 拖到秒级（老 binary 直接拒启，新 binary 静默慢 3.7x）——P/D 都跑容器。`Handoff` 对端租约仍在未决。
 4. qwen35：`core::kv_pool` → `BlockPool` 迁移（独立，可并行开工）；然后 Bounded 组 slab + seal-by-copy 首发（唯一的新物理能力，由从零接入的模型验证）。gemma4 照抄。
 
 ## 未决
