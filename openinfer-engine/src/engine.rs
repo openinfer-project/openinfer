@@ -211,6 +211,10 @@ pub type RequestTag = Arc<str>;
 pub struct KvPrefix {
     hit_tokens: usize,
     hold: Option<Box<dyn Any + Send>>,
+    /// The scheduler partition the resolution ran against. The hold pins
+    /// blocks on THIS rank, so routing anywhere else silently loses the hit
+    /// and wastes the pin — [`EngineHandle::submit_resolved`] routes by it.
+    rank: Option<usize>,
 }
 
 impl KvPrefix {
@@ -221,21 +225,28 @@ impl KvPrefix {
         Self {
             hit_tokens: 0,
             hold: None,
+            rank: None,
         }
     }
 
-    /// A resolved prefix: `hit_tokens` are materialized on the target rank,
+    /// A resolved prefix: `hit_tokens` are materialized on partition `rank`,
     /// pinned by `hold` until this value is dropped.
     #[must_use]
-    pub fn resolved(hit_tokens: usize, hold: Box<dyn Any + Send>) -> Self {
+    pub fn resolved(hit_tokens: usize, rank: usize, hold: Box<dyn Any + Send>) -> Self {
         Self {
             hit_tokens,
             hold: Some(hold),
+            rank: Some(rank),
         }
     }
 
     pub fn hit_tokens(&self) -> usize {
         self.hit_tokens
+    }
+
+    /// The partition the resolution is bound to, if one ran.
+    pub fn rank(&self) -> Option<usize> {
+        self.rank
     }
 
     /// Whether a hold is still pinning resolved blocks.
@@ -664,9 +675,20 @@ impl EngineHandle {
         kv_prefix: KvPrefix,
     ) -> std::result::Result<(), mpsc::error::SendError<GenerateRequest>> {
         if !self.inner.submit_txs.is_empty() {
-            let partition = req
-                .data_parallel_rank
-                .unwrap_or_else(|| self.least_loaded_partition());
+            // A resolved prefix binds the request: its hold pins blocks on
+            // the rank it resolved against, so that rank wins the routing.
+            // A caller-bound rank that disagrees is a caller bug.
+            let partition = match (kv_prefix.rank(), req.data_parallel_rank) {
+                (Some(resolved), bound) => {
+                    debug_assert!(
+                        bound.is_none_or(|b| b == resolved),
+                        "request bound to rank {bound:?} but its prefix resolved on rank {resolved}"
+                    );
+                    resolved
+                }
+                (None, Some(bound)) => bound,
+                (None, None) => self.least_loaded_partition(),
+            };
             if let Some(submit_tx) = self.inner.submit_txs.get(partition) {
                 return submit_tx
                     .send((req, kv_prefix))

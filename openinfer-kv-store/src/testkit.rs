@@ -9,7 +9,6 @@ use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
-use openinfer_kv_offload::SaveHandle;
 use tokio::sync::oneshot;
 
 use crate::HostTier;
@@ -27,10 +26,7 @@ pub enum MockQuery {
     Hang,
 }
 
-type PendingSave = (
-    oneshot::Sender<Result<(), openinfer_kv_offload::EngineError>>,
-    Box<dyn Any + Send>,
-);
+type PendingSave = (oneshot::Sender<anyhow::Result<()>>, Box<dyn Any + Send>);
 
 /// Scripted [`HostTier`]: queries pop from a script (an exhausted script
 /// answers `Miss`), loads/saves/releases are recorded for assertions.
@@ -94,9 +90,7 @@ impl MockTier {
     /// Settle every in-flight save with a storage error.
     pub fn fail_saves(&self) {
         for (tx, keep_alive) in self.pending_saves.lock().expect("pending_saves").drain(..) {
-            let _ = tx.send(Err(openinfer_kv_offload::EngineError::Storage(
-                "mock save failure".into(),
-            )));
+            let _ = tx.send(Err(anyhow::anyhow!("mock save failure")));
             drop(keep_alive);
         }
     }
@@ -138,21 +132,24 @@ impl HostTier for MockTier {
         block_ids: Vec<i32>,
         block_hashes: Vec<Vec<u8>>,
         keep_alive: Box<dyn Any + Send>,
-    ) -> SaveHandle {
+    ) -> TierFuture<anyhow::Result<()>> {
         self.saves
             .lock()
             .expect("saves")
             .push((block_ids, block_hashes));
         if self.manual_saves {
-            let (handle, tx) = SaveHandle::in_flight();
+            let (tx, rx) = oneshot::channel();
             self.pending_saves
                 .lock()
                 .expect("pending_saves")
                 .push((tx, keep_alive));
-            handle
+            Box::pin(async move {
+                rx.await
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("mock save sender dropped")))
+            })
         } else {
             drop(keep_alive);
-            SaveHandle::settled(Ok(()))
+            Box::pin(std::future::ready(Ok(())))
         }
     }
 }

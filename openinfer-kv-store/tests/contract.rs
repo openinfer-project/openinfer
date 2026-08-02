@@ -15,6 +15,7 @@ use openinfer_kv_store::CancelProbe;
 use openinfer_kv_store::KvStoreBuilder;
 use openinfer_kv_store::KvStoreConfig;
 use openinfer_kv_store::NeverCancelled;
+use openinfer_kv_store::ResolvePolicy;
 use openinfer_kv_store::SaveClass;
 use openinfer_kv_store::SaveCursor;
 use openinfer_kv_store::testkit::MockQuery;
@@ -76,7 +77,14 @@ async fn resolve_without_tier_returns_gpu_hit_with_hold() {
     let store = b.rank(RANK, Arc::clone(&pool), None).build();
 
     let prefix = store
-        .resolve_prefix(RANK, "r1", &prompt, CacheScope::default(), &NeverCancelled)
+        .resolve_prefix(
+            RANK,
+            "r1",
+            &prompt,
+            CacheScope::default(),
+            ResolvePolicy::default(),
+            &NeverCancelled,
+        )
         .await;
     assert_eq!(prefix.hit_tokens(), 4 * BLOCK_SIZE);
     assert!(prefix.has_hold());
@@ -103,7 +111,14 @@ async fn resolve_extends_gpu_hit_with_host_tier_load() {
     let store = b.rank(RANK, Arc::clone(&pool), Some(tier.clone())).build();
 
     let prefix = store
-        .resolve_prefix(RANK, "r1", &prompt, CacheScope::default(), &NeverCancelled)
+        .resolve_prefix(
+            RANK,
+            "r1",
+            &prompt,
+            CacheScope::default(),
+            ResolvePolicy::default(),
+            &NeverCancelled,
+        )
         .await;
     assert_eq!(prefix.hit_tokens(), 8 * BLOCK_SIZE);
     assert_eq!(tier.loads.lock().unwrap().len(), 1);
@@ -134,7 +149,14 @@ async fn resolve_requeries_through_loading_until_ready() {
     let store = b.rank(RANK, Arc::clone(&pool), Some(tier.clone())).build();
 
     let prefix = store
-        .resolve_prefix(RANK, "r1", &prompt, CacheScope::default(), &NeverCancelled)
+        .resolve_prefix(
+            RANK,
+            "r1",
+            &prompt,
+            CacheScope::default(),
+            ResolvePolicy::default(),
+            &NeverCancelled,
+        )
         .await;
     assert_eq!(prefix.hit_tokens(), 4 * BLOCK_SIZE);
     assert_eq!(tier.loads.lock().unwrap().len(), 1);
@@ -159,7 +181,14 @@ async fn resolve_deadline_degrades_to_gpu_hit_alone() {
     let store = b.rank(RANK, Arc::clone(&pool), Some(tier.clone())).build();
 
     let prefix = store
-        .resolve_prefix(RANK, "r1", &prompt, CacheScope::default(), &NeverCancelled)
+        .resolve_prefix(
+            RANK,
+            "r1",
+            &prompt,
+            CacheScope::default(),
+            ResolvePolicy::default(),
+            &NeverCancelled,
+        )
         .await;
     // Degraded is not a distinct state: just the smaller (GPU-only) hit.
     assert_eq!(prefix.hit_tokens(), 2 * BLOCK_SIZE);
@@ -168,24 +197,107 @@ async fn resolve_deadline_degrades_to_gpu_hit_alone() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn resolve_yields_to_admission_floor_and_releases_the_lease() {
-    let b = builder();
-    // 16 usable blocks; the floor promises 14 of them to admission, so a
-    // 5-block host hit must be declined.
+async fn resolve_waits_out_pool_pressure_then_degrades_at_deadline() {
+    // Floor never clears: the resolve retries (releasing the lease before
+    // every pause — never TTL-stranded) and degrades only at the deadline.
+    let config = KvStoreConfig {
+        requery_interval: Duration::from_millis(1),
+        resolve_deadline: Duration::from_millis(25),
+        ..KvStoreConfig::default()
+    };
+    let b = KvStoreBuilder::new(tokio::runtime::Handle::current(), config);
     let pool = pool(17);
     let prompt = prompt(5);
-    let tier = Arc::new(MockTier::scripted([MockQuery::Hit(5)]));
+    let tier = Arc::new(MockTier::scripted(std::iter::repeat_n(
+        MockQuery::Hit(5),
+        1000,
+    )));
     let store = b.rank(RANK, Arc::clone(&pool), Some(tier.clone())).build();
     store.set_admission_floor(RANK, 14);
 
     let prefix = store
-        .resolve_prefix(RANK, "r1", &prompt, CacheScope::default(), &NeverCancelled)
+        .resolve_prefix(
+            RANK,
+            "r1",
+            &prompt,
+            CacheScope::default(),
+            ResolvePolicy::default(),
+            &NeverCancelled,
+        )
         .await;
     assert_eq!(prefix.hit_tokens(), 0);
-    // Declined hit = released lease, not a TTL-stranded one.
-    assert_eq!(tier.released(), 1);
+    assert!(tier.released() >= 1);
     assert_eq!(tier.loads.lock().unwrap().len(), 0);
     assert_eq!(store.stats().resolve_degraded.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resolve_completes_when_pool_pressure_clears() {
+    // The point of waiting: pressure that clears within the deadline costs
+    // latency, never the hit.
+    let config = KvStoreConfig {
+        requery_interval: Duration::from_millis(1),
+        resolve_deadline: Duration::from_millis(500),
+        ..KvStoreConfig::default()
+    };
+    let b = KvStoreBuilder::new(tokio::runtime::Handle::current(), config);
+    let pool = pool(17);
+    let prompt = prompt(5);
+    let tier = Arc::new(MockTier::scripted(std::iter::repeat_n(
+        MockQuery::Hit(5),
+        1000,
+    )));
+    let store = Arc::new(b.rank(RANK, Arc::clone(&pool), Some(tier.clone())).build());
+    store.set_admission_floor(RANK, 14);
+
+    let unblocker = Arc::clone(&store);
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        unblocker.set_admission_floor(RANK, 0);
+    });
+    let prefix = store
+        .resolve_prefix(
+            RANK,
+            "r1",
+            &prompt,
+            CacheScope::default(),
+            ResolvePolicy::default(),
+            &NeverCancelled,
+        )
+        .await;
+    assert_eq!(prefix.hit_tokens(), 5 * BLOCK_SIZE);
+    assert_eq!(tier.loads.lock().unwrap().len(), 1);
+    assert_eq!(store.stats().resolve_degraded.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn expect_remote_waits_through_miss_until_registration_lands() {
+    // P/D decode: the producer's save may not have registered yet — a Miss
+    // under expect_remote is "not yet", not "cold".
+    let b = builder();
+    let pool = pool(64);
+    let prompt = prompt(4);
+    let tier = Arc::new(MockTier::scripted([
+        MockQuery::Miss,
+        MockQuery::Miss,
+        MockQuery::Hit(4),
+    ]));
+    let store = b.rank(RANK, Arc::clone(&pool), Some(tier.clone())).build();
+
+    let prefix = store
+        .resolve_prefix(
+            RANK,
+            "r1",
+            &prompt,
+            CacheScope::default(),
+            ResolvePolicy {
+                expect_remote: true,
+            },
+            &NeverCancelled,
+        )
+        .await;
+    assert_eq!(prefix.hit_tokens(), 4 * BLOCK_SIZE);
+    assert_eq!(tier.loads.lock().unwrap().len(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -198,7 +310,14 @@ async fn cancelled_resolve_skips_io_and_returns_none() {
     let store = b.rank(RANK, Arc::clone(&pool), Some(tier.clone())).build();
 
     let prefix = store
-        .resolve_prefix(RANK, "r1", &prompt, CacheScope::default(), &Cancelled)
+        .resolve_prefix(
+            RANK,
+            "r1",
+            &prompt,
+            CacheScope::default(),
+            ResolvePolicy::default(),
+            &Cancelled,
+        )
         .await;
     assert_eq!(prefix.hit_tokens(), 0);
     assert!(!prefix.has_hold());
@@ -239,7 +358,7 @@ async fn cancellation_after_query_releases_the_lease() {
             ids: Vec<i32>,
             hashes: Vec<Vec<u8>>,
             keep_alive: Box<dyn std::any::Any + Send>,
-        ) -> openinfer_kv_offload::SaveHandle {
+        ) -> openinfer_kv_store::TierFuture<anyhow::Result<()>> {
             self.inner.save(ids, hashes, keep_alive)
         }
     }
@@ -262,7 +381,14 @@ async fn cancellation_after_query_releases_the_lease() {
     let store = b.rank(RANK, Arc::clone(&pool), Some(tier)).build();
 
     let prefix = store
-        .resolve_prefix(RANK, "r1", &prompt, CacheScope::default(), &Flagged(flag))
+        .resolve_prefix(
+            RANK,
+            "r1",
+            &prompt,
+            CacheScope::default(),
+            ResolvePolicy::default(),
+            &Flagged(flag),
+        )
         .await;
     assert_eq!(prefix.hit_tokens(), 0);
     assert!(!prefix.has_hold());
@@ -287,7 +413,14 @@ async fn hung_query_degrades_by_deadline() {
     let store = b.rank(RANK, Arc::clone(&pool), Some(tier)).build();
 
     let prefix = store
-        .resolve_prefix(RANK, "r1", &prompt, CacheScope::default(), &NeverCancelled)
+        .resolve_prefix(
+            RANK,
+            "r1",
+            &prompt,
+            CacheScope::default(),
+            ResolvePolicy::default(),
+            &NeverCancelled,
+        )
         .await;
     assert_eq!(prefix.hit_tokens(), 2 * BLOCK_SIZE);
     assert_eq!(store.stats().resolve_degraded.load(Ordering::Relaxed), 1);
@@ -307,13 +440,21 @@ async fn hung_load_degrades_but_never_frees_the_reservation() {
 
     let usable_before = pool.available_blocks();
     let prefix = store
-        .resolve_prefix(RANK, "r1", &prompt, CacheScope::default(), &NeverCancelled)
+        .resolve_prefix(
+            RANK,
+            "r1",
+            &prompt,
+            CacheScope::default(),
+            ResolvePolicy::default(),
+            &NeverCancelled,
+        )
         .await;
     // Degraded to no hit — but the DMA may still be writing: the abandoned
     // reservation stays owned by the detached task, so its destination
     // blocks must NOT have returned to the pool.
     assert_eq!(prefix.hit_tokens(), 0);
     assert_eq!(store.stats().resolve_degraded.load(Ordering::Relaxed), 1);
+    assert_eq!(store.stats().loads_abandoned.load(Ordering::Relaxed), 1);
     assert_eq!(pool.available_blocks(), usable_before - 3);
 }
 
@@ -460,6 +601,41 @@ async fn failed_handoff_save_is_counted_and_still_releases() {
     })
     .await;
     assert_eq!(store.stats().saves_failed.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn handoff_pins_do_not_consume_the_cacheable_shed_budget() {
+    // Budget = 64 * 10% = 6. A 4-block Handoff save is in flight (pinned=4);
+    // a 4-block Cacheable seal must still submit — the shed gate reads the
+    // cacheable-only counter.
+    let config = KvStoreConfig {
+        cacheable_pin_percent: 10,
+        ..KvStoreConfig::default()
+    };
+    let b = KvStoreBuilder::new(tokio::runtime::Handle::current(), config);
+    let pool = pool(64);
+    let tier = Arc::new(MockTier::default().with_manual_saves());
+    let store = b.rank(RANK, Arc::clone(&pool), Some(tier.clone())).build();
+
+    let prompt_a: Vec<u32> = (0..=(4 * BLOCK_SIZE) as u32).map(|i| i % 241).collect();
+    let prompt_b: Vec<u32> = (0..=(4 * BLOCK_SIZE) as u32).map(|i| 1 + i % 239).collect();
+    let kv_a = sealed_request(&pool, &prompt_a);
+    let kv_b = sealed_request(&pool, &prompt_b);
+
+    let mut cursor_a = SaveCursor::new();
+    store.seal(RANK, &kv_a, &mut cursor_a, SaveClass::Handoff);
+    assert_eq!(store.pinned_blocks(RANK), 4);
+
+    let mut cursor_b = SaveCursor::new();
+    store.seal(RANK, &kv_b, &mut cursor_b, SaveClass::Cacheable);
+    assert_eq!(tier.saves.lock().unwrap().len(), 2);
+    assert_eq!(store.stats().saves_shed.load(Ordering::Relaxed), 0);
+    assert_eq!(store.pinned_blocks(RANK), 8);
+
+    tier.complete_saves();
+    wait_until("all pins released", || store.pinned_blocks(RANK) == 0).await;
+    store.retire(RANK, kv_a, cursor_a, SaveClass::Cacheable);
+    store.retire(RANK, kv_b, cursor_b, SaveClass::Cacheable);
 }
 
 #[tokio::test(flavor = "multi_thread")]

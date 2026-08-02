@@ -150,7 +150,9 @@ let store = KvStoreBuilder::new(runtime_handle, KvStoreConfig::default())
 // Glm52EngineSpec 里本就先于 spawn 已知，BlockPool::new 是纯 CPU 对象，无线程亲和。
 
 impl KvStore {
-    async fn resolve_prefix(&self, rank, req_id, tokens, scope, cancel: &dyn CancelProbe) -> KvPrefix;
+    async fn resolve_prefix(&self, rank, req_id, tokens, scope, policy: ResolvePolicy, cancel) -> KvPrefix;
+    // ResolvePolicy { expect_remote }：P/D decode 侧 Miss = 生产方注册未落地，
+    // deadline 内继续等（qwen3 wait_on_miss 语义的收编）；默认 Miss = 冷，即刻收束。
     fn seal(&self, rank, kv: &RequestKv, cursor: &mut SaveCursor, class: SaveClass);
     fn retire(&self, rank, kv: RequestKv, cursor: SaveCursor, class: SaveClass);
     fn set_admission_floor(&self, rank, blocks) / fn pinned_blocks(&self, rank) -> usize;
@@ -166,9 +168,11 @@ flowchart TD
     C -- 否 --> T["KvPrefix { GPU 命中, hold }"]
     C -- 是 --> Q["tier.query\n(timeout_at deadline)"]
     Q -- "Loading 且未超时\nsleep 5ms 重查" --> Q
-    Q -- "Miss / 错误 / 超时" --> T
-    Q -- "Hit(n)" --> F{"水位: available − floor ≥ n?"}
-    F -- "否 → release lease" --> T
+    Q -- "Miss(默认策略) / 错误 / 超时" --> T
+    Q -- "Miss(expect_remote, 未超时)\nsleep 重查" --> Q
+    Q -- "Hit(n)" --> F{"水位: available − floor ≥ n\n且 reserve 成功?"}
+    F -- "否: release lease,\nsleep 后重查(未超时)" --> Q
+    F -- "否且超时" --> T
     F -- 是 --> R["reserve_loaded_blocks(n)"]
     R --> L["tier.load —— 不可取消区段\nreservation 随 detached task,\n超时只弃等待不弃块"]
     L -- "失败 / 超时" --> T
@@ -187,12 +191,16 @@ flowchart TD
 ```rust
 // bridge：收到 EngineCoreRequest，组装 GenerateRequest。req 自此线性 move。
 let rank = req.data_parallel_rank.unwrap_or_else(|| handle.least_loaded_partition());
+req.data_parallel_rank = Some(rank);               // 先绑定：hold 钉的是 rank 上的块，
+                                                   // resolve 与路由必须同 rank（KvPrefix
+                                                   // 携带 rank，submit_resolved 按它路由，
+                                                   // 与绑定不一致触发 debug_assert）
 tokio::spawn(async move {
     // 本任务独占 req；取消 = req.token_tx 上的共享 abort 原子，没有消息追靶。
     let prefix = store
-        .resolve_prefix(rank, req_id, &req.prompt_tokens, scope_of(&req), &req.token_tx)
+        .resolve_prefix(rank, req_id, &req.prompt_tokens, scope_of(&req), policy, &req.token_tx)
         .await;                                    // 终态唯一；降级只进 stats
-    let _ = handle.submit_resolved(req, prefix);   // move 进 rank 收件箱
+    let _ = handle.submit_resolved(req, prefix);   // move 进 rank 收件箱（按 prefix.rank 路由）
 });
 
 // scheduler（同步线程，per-rank）：收件箱里只有就绪请求，之后无异步。
@@ -209,7 +217,7 @@ while let Ok((req, kv_prefix)) = submit_rx.try_recv() {
 - store 不认识 engine/收件箱/`GenerateRequest`——它的词汇只有 token 前缀进、`KvPrefix` 出；路由留在 `EngineHandle`（已有职责）。
 - **消灭队头停车**：今天 glm52 的 `HostRestoreState::poll_front` / `NativePdState` Park 是 push_front + break，一个请求等 restore 堵死整 rank FIFO。resolve 前置后 scheduler 收件箱里只有就绪请求。
 - **取消 = 已有的共享原子**（`TokenSink::is_closed`，`abort_reason: Arc<AtomicU8>`），不新增机制。resolve task 在 op 之间观察；**已提交的 DMA 是不可取消区段**（guard 陪 op 走到 settle，即 `handle.rs` 现有的 detach 语义）。取消的请求返回空 KvPrefix，死在 admission 现有的 `is_closed` 检查处。
-- **池的并发事实**：kvbm `BlockManager` 内部同步（save guard 已跨线程 drop），跨线程分配不是安全问题而是仲裁问题。存在**两个分配器，权限不同**：admission 的 lifetime 预留是权威（honor-or-reject）；resolve 的 reservation 是机会主义（买一段更便宜的 prefill），且分配必然晚于 query——目标页数 n 只有 `Hit(n)` 返回后才可知，而 GPU probe 本身零分配（命中块已驻留，仅加引用）。仲裁协议即水位：scheduler 每次录取/退出更新 `set_admission_floor`，resolve 在水位之下捡剩余，不足即降级（fail-soft，请求照常跑）。对偶义务：**admission 须把 resolve 已命中的块记为该请求已持有、从 need 抵扣**（qwen3 `prefetched_blocks` 先例）——否则压力下双重计数（available 已因 hold 减少、need 又全额计）导致错误 defer。
+- **池的并发事实**：kvbm `BlockManager` 内部同步（save guard 已跨线程 drop），跨线程分配不是安全问题而是仲裁问题。存在**两个分配器，权限不同**：admission 的 lifetime 预留是权威（honor-or-reject）；resolve 的 reservation 是机会主义（买一段更便宜的 prefill），且分配必然晚于 query——目标页数 n 只有 `Hit(n)` 返回后才可知，而 GPU probe 本身零分配（命中块已驻留，仅加引用）。仲裁协议即水位：scheduler 每次录取/退出更新 `set_admission_floor`，resolve 在水位之下捡剩余。**池装不下时等待而非即刻降级**：装不下前缀的池同样过不了该请求的 admission——横竖要等，等待买到廉价 prefill，降级买到全量重算。等待期间释放租约（host pin 与 TTL 不陪等），deadline 兜底活锁，超时才降级。对偶义务：**admission 须把 resolve 已命中的块记为该请求已持有、从 need 抵扣**（qwen3 `prefetched_blocks` 先例）——否则压力下双重计数（available 已因 hold 减少、need 又全额计）导致错误 defer。
 
 ### Scheduler 的接触面（全同步，共四处）
 

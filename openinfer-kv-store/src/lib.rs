@@ -78,6 +78,18 @@ pub struct CacheScope<'a> {
     pub lora_name: Option<&'a str>,
 }
 
+/// Per-request read policy for [`KvStore::resolve_prefix`]. The default is
+/// the plain host-restore mode; P/D decode admission (qwen3 `wait_on_miss`
+/// semantics) sets `expect_remote`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ResolvePolicy {
+    /// The prefix is known to exist remotely (a completed prefill's
+    /// handoff): a tier `Miss` means the producer's registration has not
+    /// landed yet, so keep waiting under the deadline instead of concluding
+    /// the cache is cold.
+    pub expect_remote: bool,
+}
+
 /// Save quality-of-service, from the design doc's QoS split.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SaveClass {
@@ -146,10 +158,14 @@ struct RankState {
     /// Blocks admission has promised to admitted requests; resolve-side
     /// allocation yields to it (fail-soft to a smaller hit).
     floor: AtomicUsize,
-    /// Blocks pinned by in-flight saves — physically unallocatable until
-    /// their D2H lands. Admission subtracts this from its budget. `Arc`: the
-    /// per-save watcher tasks decrement it after the store's borrow ends.
+    /// Blocks pinned by in-flight saves (both classes) — physically
+    /// unallocatable until their D2H lands. Admission subtracts this from
+    /// its budget. `Arc`: the per-save watcher tasks decrement it after the
+    /// store's borrow ends.
     pinned: Arc<AtomicUsize>,
+    /// The `Cacheable` subset of `pinned` — the shed budget gates on this
+    /// alone, so Handoff traffic cannot starve cacheable saves.
+    cacheable_pinned: Arc<AtomicUsize>,
     /// Pin ceiling for `Cacheable` saves (from
     /// [`KvStoreConfig::cacheable_pin_percent`] of the pool).
     cacheable_pin_budget: usize,
@@ -192,6 +208,7 @@ impl KvStoreBuilder {
                 tier,
                 floor: AtomicUsize::new(0),
                 pinned: Arc::new(AtomicUsize::new(0)),
+                cacheable_pinned: Arc::new(AtomicUsize::new(0)),
                 cacheable_pin_budget,
             },
         );
@@ -224,16 +241,13 @@ impl KvStore {
     /// yield to this watermark. The scheduler updates it as it admits and
     /// retires.
     pub fn set_admission_floor(&self, rank: usize, blocks: usize) {
-        if let Some(state) = self.rank(rank) {
-            state.floor.store(blocks, Ordering::Release);
-        }
+        self.rank(rank).floor.store(blocks, Ordering::Release);
     }
 
     /// Blocks pinned by `rank`'s in-flight saves; admission subtracts this
     /// from its usable budget (the glm52 `pinned_blocks` discipline).
     pub fn pinned_blocks(&self, rank: usize) -> usize {
-        self.rank(rank)
-            .map_or(0, |state| state.pinned.load(Ordering::Acquire))
+        self.rank(rank).pinned.load(Ordering::Acquire)
     }
 
     pub fn stats(&self) -> &KvStoreStats {
@@ -257,14 +271,17 @@ impl KvStore {
         req_id: &str,
         prompt_tokens: &[u32],
         scope: CacheScope<'_>,
+        policy: ResolvePolicy,
         cancel: &dyn CancelProbe,
     ) -> KvPrefix {
         self.stats.resolves.fetch_add(1, Ordering::Relaxed);
-        let Some(state) = self.rank(rank) else {
-            return KvPrefix::none();
-        };
+        let state = self.rank(rank);
         let pool = &state.pool;
         let block_size = pool.block_size();
+        // The `-1`: matching always leaves at least one prompt token uncached
+        // (the final chunk must forward to emit the first token), so a
+        // full-prompt hit is never usable and the last partial/full block is
+        // outside the reusable prefix.
         let cacheable_blocks = prompt_tokens.len().saturating_sub(1) / block_size;
 
         let finish = |probe: openinfer_kv_cache::PrefixProbe| {
@@ -273,7 +290,7 @@ impl KvStore {
                 return KvPrefix::none();
             }
             self.stats.resolve_hits.fetch_add(1, Ordering::Relaxed);
-            KvPrefix::resolved(hit_blocks * block_size, Box::new(probe))
+            KvPrefix::resolved(hit_blocks * block_size, rank, Box::new(probe))
         };
 
         if cancel.is_cancelled() {
@@ -291,12 +308,17 @@ impl KvStore {
             _ => return finish(probe),
         };
 
-        // Host-tier query, re-queried while a deeper tier fetches. The
-        // deadline bounds every await — a query future that never settles (a
-        // hung storage worker) degrades exactly like a slow one, instead of
-        // stranding the request outside the scheduler forever.
+        // Host-tier query, re-queried until the hit is BOTH host-ready and
+        // pool-admittable, bounded by one deadline. Waiting on pool pressure
+        // (instead of instantly degrading) is deliberate: if the pool cannot
+        // spare the prefix's blocks now, admission could not take the request
+        // now either — it waits regardless, and waiting here buys the cheap
+        // prefill while degrading would buy a full recompute for the same
+        // wait. The lease is released before every pause (host pins + TTL
+        // must not ride out a pool wait; a re-query re-establishes it
+        // instantly from the host tier).
         let deadline = Instant::now() + self.config.resolve_deadline;
-        let hit = loop {
+        let (hit, reservation) = loop {
             if cancel.is_cancelled() {
                 self.stats.record_degrade(req_id, DegradeReason::Cancelled);
                 return KvPrefix::none();
@@ -313,8 +335,20 @@ impl KvStore {
                     self.stats.record_degrade(req_id, DegradeReason::TierError);
                     return finish(probe);
                 }
-                Ok(Ok(TierQuery::Miss)) => return finish(probe),
-                Ok(Ok(TierQuery::Hit(hit))) => break hit,
+                Ok(Ok(TierQuery::Miss)) => {
+                    // Plain restore: a miss is a cold cache, conclude. P/D
+                    // (`expect_remote`): the producer's registration may not
+                    // have landed yet — keep waiting under the deadline.
+                    if !policy.expect_remote {
+                        return finish(probe);
+                    }
+                    if Instant::now() >= deadline {
+                        self.stats
+                            .record_degrade(req_id, DegradeReason::DeadlineExceeded);
+                        return finish(probe);
+                    }
+                    tokio::time::sleep(self.config.requery_interval).await;
+                }
                 Ok(Ok(TierQuery::Loading)) => {
                     if Instant::now() >= deadline {
                         self.stats
@@ -323,31 +357,27 @@ impl KvStore {
                     }
                     tokio::time::sleep(self.config.requery_interval).await;
                 }
+                Ok(Ok(TierQuery::Hit(hit))) => {
+                    // Floor gate: resolve-side allocation yields to
+                    // admission's promises. The lease is all-or-nothing, so
+                    // an unplaceable hit is declined (release, not TTL-parked)
+                    // and retried after a pause.
+                    let available = pool.available_blocks();
+                    let floor = state.floor.load(Ordering::Acquire);
+                    if available.saturating_sub(floor) >= hit.blocks {
+                        if let Some(reservation) = pool.reserve_loaded_blocks(hit.blocks) {
+                            break (hit, reservation);
+                        }
+                    }
+                    tier.release(hit);
+                    if Instant::now() >= deadline {
+                        self.stats
+                            .record_degrade(req_id, DegradeReason::PoolPressure);
+                        return finish(probe);
+                    }
+                    tokio::time::sleep(self.config.requery_interval).await;
+                }
             }
-        };
-
-        if cancel.is_cancelled() {
-            tier.release(hit);
-            self.stats.record_degrade(req_id, DegradeReason::Cancelled);
-            return KvPrefix::none();
-        }
-
-        // Floor gate: resolve-side allocation yields to admission's promises.
-        // The tier lease is all-or-nothing, so a clamped hit is a declined
-        // hit — release it now instead of waiting out its TTL.
-        let available = pool.available_blocks();
-        let floor = state.floor.load(Ordering::Acquire);
-        if available.saturating_sub(floor) < hit.blocks {
-            tier.release(hit);
-            self.stats
-                .record_degrade(req_id, DegradeReason::PoolPressure);
-            return finish(probe);
-        }
-        let Some(reservation) = pool.reserve_loaded_blocks(hit.blocks) else {
-            tier.release(hit);
-            self.stats
-                .record_degrade(req_id, DegradeReason::PoolPressure);
-            return finish(probe);
         };
         if cancel.is_cancelled() {
             tier.release(hit);
@@ -388,6 +418,10 @@ impl KvStore {
                 finish(probe)
             }
             Err(_elapsed) => {
+                // The reservation now lives with the detached task until the
+                // DMA settles; if it never does, those blocks are gone for
+                // good — count it so pool-drain from hung DMAs is visible.
+                self.stats.loads_abandoned.fetch_add(1, Ordering::Relaxed);
                 self.stats
                     .record_degrade(req_id, DegradeReason::DeadlineExceeded);
                 finish(probe)
@@ -401,9 +435,7 @@ impl KvStore {
     /// source pages until the D2H lands; the pinned pages are visible to
     /// admission via [`Self::pinned_blocks`].
     pub fn seal(&self, rank: usize, kv: &RequestKv, cursor: &mut SaveCursor, class: SaveClass) {
-        let Some(state) = self.rank(rank) else {
-            return;
-        };
+        let state = self.rank(rank);
         let Some(tier) = state.tier.as_ref() else {
             return;
         };
@@ -420,10 +452,12 @@ impl KvStore {
         // Cacheable saves shed under pin pressure instead of pinning
         // admission out of the pool — a shed save is a forfeited future hit,
         // never a correctness loss. The cursor does NOT advance, so a later
-        // seal (or the retire) retries once pressure clears. Handoff saves
-        // are exempt: their backpressure is admission via `pinned_blocks`.
+        // seal (or the retire) retries once pressure clears. The gate reads
+        // the cacheable-only counter: Handoff traffic neither sheds nor
+        // consumes this budget (its backpressure is admission reading
+        // `pinned_blocks`, which counts both classes).
         if class == SaveClass::Cacheable
-            && state.pinned.load(Ordering::Acquire) + count > state.cacheable_pin_budget
+            && state.cacheable_pinned.load(Ordering::Acquire) + count > state.cacheable_pin_budget
         {
             self.stats.saves_shed.fetch_add(1, Ordering::Relaxed);
             log::debug!(
@@ -447,8 +481,11 @@ impl KvStore {
         cursor.saved_blocks = pairs.len();
 
         state.pinned.fetch_add(count, Ordering::AcqRel);
+        if class == SaveClass::Cacheable {
+            state.cacheable_pinned.fetch_add(count, Ordering::AcqRel);
+        }
         self.stats.saves_submitted.fetch_add(1, Ordering::Relaxed);
-        let handle = tier.save(ids, hashes, Box::new(guards));
+        let save = tier.save(ids, hashes, Box::new(guards));
 
         let done_tx = if class == SaveClass::Handoff {
             let (tx, rx) = oneshot::channel();
@@ -458,16 +495,21 @@ impl KvStore {
             None
         };
         let pinned = Arc::clone(&state.pinned);
+        let cacheable_pinned =
+            (class == SaveClass::Cacheable).then(|| Arc::clone(&state.cacheable_pinned));
         let stats = Arc::clone(&self.stats);
         self.runtime.spawn(async move {
-            let result = handle.settle().await;
+            let result = save.await;
             pinned.fetch_sub(count, Ordering::AcqRel);
+            if let Some(cacheable_pinned) = cacheable_pinned {
+                cacheable_pinned.fetch_sub(count, Ordering::AcqRel);
+            }
             let outcome = match result {
                 Ok(()) => Ok(()),
                 Err(err) => {
                     stats.saves_failed.fetch_add(1, Ordering::Relaxed);
-                    log::warn!("kv-store save of {count} blocks failed: {err}");
-                    Err(err.to_string())
+                    log::warn!("kv-store save of {count} blocks failed: {err:#}");
+                    Err(format!("{err:#}"))
                 }
             };
             if let Some(tx) = done_tx {
@@ -511,8 +553,13 @@ impl KvStore {
         });
     }
 
-    fn rank(&self, rank: usize) -> Option<&RankState> {
-        self.ranks.get(&rank)
+    /// The rank table is frozen at build, so an unknown rank is a wiring
+    /// bug — masking it (e.g. silently no-op'ing a Handoff seal) would
+    /// violate the no-silent-drop contract. Fail fast instead.
+    fn rank(&self, rank: usize) -> &RankState {
+        self.ranks.get(&rank).unwrap_or_else(|| {
+            panic!("kv-store: rank {rank} not registered (rank table is frozen at build)")
+        })
     }
 }
 

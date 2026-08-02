@@ -18,7 +18,9 @@ pub enum DegradeReason {
     DeadlineExceeded,
     /// The tier query or load failed.
     TierError,
-    /// GPU pages for the host hit would dip below the admission floor.
+    /// GPU pages for the host hit stayed below the admission floor for the
+    /// whole resolve deadline (the resolve waits for the pool before
+    /// degrading — pressure that clears in time is not a degrade).
     PoolPressure,
 }
 
@@ -30,6 +32,10 @@ pub struct KvStoreStats {
     /// Host-tier blocks actually loaded onto the GPU.
     pub resolve_loaded_blocks: AtomicU64,
     pub resolve_degraded: AtomicU64,
+    /// Load waits abandoned at the deadline: the reservation stays with the
+    /// detached task, and if the DMA never settles those blocks never return
+    /// — this counter is how pool-drain from hung DMAs stays visible.
+    pub loads_abandoned: AtomicU64,
     pub saves_submitted: AtomicU64,
     pub saves_failed: AtomicU64,
     /// Cacheable saves dropped under pin pressure — forfeited future hits,

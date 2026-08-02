@@ -2,10 +2,14 @@
 //! below it (pegaflow today), expressed as a dyn-compatible trait.
 //!
 //! This is the anti-corruption boundary from
-//! `docs/subsystems/kv-cache/design.md`: pegaflow's interface quirks (the
-//! re-query-to-poll `Loading` outcome, lease lifetimes) are absorbed here,
-//! and the contract tests run against [`crate::testkit::MockTier`] with no
-//! GPU or pegaflow at all.
+//! `docs/subsystems/kv-cache/design.md`: lease lifetimes and the tier's
+//! native types stay behind it — no method leaks a pegaflow type, so
+//! [`crate::testkit::MockTier`] and the contract tests need no GPU and no
+//! pegaflow. One protocol deliberately passes through: [`TierQuery::Loading`]
+//! (a deeper tier is fetching; ask again later). The store owns that
+//! re-query loop today; replacing poll-by-requery with a settle-on-ready
+//! future is the first candidate for a pegaflow interface change
+//! (design doc, 未决).
 
 use std::any::Any;
 use std::future::Future;
@@ -14,7 +18,6 @@ use std::pin::Pin;
 use openinfer_kv_offload::OffloadEngine;
 use openinfer_kv_offload::QueryLeaseId;
 use openinfer_kv_offload::QueryOutcome;
-use openinfer_kv_offload::SaveHandle;
 
 pub type TierFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
@@ -58,15 +61,16 @@ pub trait HostTier: Send + Sync {
     /// instead of waiting out the lease TTL.
     fn release(&self, hit: TierHit);
 
-    /// Submit an async GPU→host save of sealed blocks. Returns an
-    /// already-in-flight handle; `keep_alive` is dropped only once the D2H
-    /// lands (the reuse contract — pass the source blocks' guards).
+    /// Submit an async GPU→host save of sealed blocks. The returned future
+    /// observes an already-submitted operation (same contract as the
+    /// siblings); `keep_alive` is dropped only once the D2H lands (the reuse
+    /// contract — pass the source blocks' guards).
     fn save(
         &self,
         block_ids: Vec<i32>,
         block_hashes: Vec<Vec<u8>>,
         keep_alive: Box<dyn Any + Send>,
-    ) -> SaveHandle;
+    ) -> TierFuture<anyhow::Result<()>>;
 }
 
 impl HostTier for OffloadEngine {
@@ -116,7 +120,8 @@ impl HostTier for OffloadEngine {
         block_ids: Vec<i32>,
         block_hashes: Vec<Vec<u8>>,
         keep_alive: Box<dyn Any + Send>,
-    ) -> SaveHandle {
-        self.submit_save(&block_ids, &block_hashes, keep_alive)
+    ) -> TierFuture<anyhow::Result<()>> {
+        let handle = self.submit_save(&block_ids, &block_hashes, keep_alive);
+        Box::pin(async move { handle.settle().await.map_err(anyhow::Error::msg) })
     }
 }
