@@ -77,9 +77,13 @@ pub struct GroupSpec {
     /// OFF 落在三处：resolve 短路、admission 不 match、release 标记 reset
     /// （不进 inactive cache，存了也无人可 match）。
     pub checkpointable: bool,
-    /// 恢复完整性：非 optional 组的 artifact 缺失 ⇒ 整个 checkpoint 无效
-    /// （idxk 缺失即静默腐坏 ⇒ false）；optional 组缺失不影响其余命中
-    /// （MTP，P/D 两侧配置可不对称）。
+    /// checkpoint 的原子性边界：本组 artifact 缺失时，用剩余部分是正确性
+    /// 问题（false，如 idxk——执行期被主路径读取，缺失即静默腐坏，组与
+    /// 主缓存构成 all-or-nothing 单元）还是性能问题（true，如 MTP——只被
+    /// 可缺省的辅路径消费，缺失仅退化）。跨组数据依赖是执行期事实、仅模型
+    /// 可知，故为显式声明。消费者：恢复端完整性谓词
+    /// hit_valid = ∀ 非 optional 组均在场；P/D 两侧组集合按名求交的合法性
+    /// 亦由它保证（差集必须全 optional）。
     pub optional: bool,
 }
 
