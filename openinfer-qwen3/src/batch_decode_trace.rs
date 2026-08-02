@@ -44,7 +44,7 @@ pub fn trace_decode_kernel_calls(
         },
     )?;
     let budget = model.kv_budget();
-    let kv_mgr = openinfer_kv_cache::KvCacheManager::new(
+    let kv_mgr = openinfer_kv_store::KvCacheManager::new(
         &model.device_ctx().stream,
         budget.num_layers,
         budget.num_kv_heads,

@@ -19,7 +19,6 @@ mod engine;
 mod handle;
 mod host;
 mod layout;
-mod vllm_hash;
 
 pub use config::HostConfig;
 pub use config::OffloadConfig;
@@ -35,5 +34,3 @@ pub use host::OffloadHost;
 pub use layout::KvArena;
 // Re-exported so callers name pegaflow's engine types through this bridge.
 pub use pegaflow_core::{EngineError, PegaEngine, QueryLeaseId};
-pub use vllm_hash::VLLM_HASH_BYTES;
-pub use vllm_hash::VllmBlockHasher;

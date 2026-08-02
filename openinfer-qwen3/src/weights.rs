@@ -12,7 +12,7 @@ use openinfer_core::tensor::DeviceContext;
 use openinfer_core::tensor::DeviceMatrix;
 use openinfer_core::tensor::DeviceVec;
 use openinfer_core::tensor::HiddenStates;
-use openinfer_kv_cache::KvBuffer;
+use openinfer_kv_store::KvBuffer;
 
 use super::config::Config;
 use super::config::TensorParallelConfig;
@@ -805,7 +805,7 @@ impl Qwen3Model {
     }
 
     fn kv_bytes_per_block(geometry: &KvBudget) -> usize {
-        let layout = openinfer_kv_cache::KvLayout::new(
+        let layout = openinfer_kv_store::KvLayout::new(
             geometry.num_layers,
             geometry.num_kv_heads,
             geometry.head_dim,

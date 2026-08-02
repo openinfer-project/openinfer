@@ -3302,7 +3302,6 @@ dependencies = [
  "pegaflow-core",
  "tokio",
  "tokio-stream",
- "xxhash-rust",
 ]
 
 [[package]]
@@ -3312,6 +3311,7 @@ dependencies = [
  "anyhow",
  "cudarc",
  "dynamo-kv-hashing",
+ "half",
  "kvbm-logical",
  "libc",
  "log",
@@ -3339,8 +3339,7 @@ dependencies = [
  "openinfer-core",
  "openinfer-cupti",
  "openinfer-kernels",
- "openinfer-kv-cache",
- "openinfer-kv-offload",
+ "openinfer-kv-store",
  "openinfer-qwen3",
  "openinfer-sample",
  "rand 0.10.1",

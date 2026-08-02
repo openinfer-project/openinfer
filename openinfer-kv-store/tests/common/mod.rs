@@ -115,18 +115,6 @@ impl Rig {
         host: Arc<PegaflowHost>,
         resolve_deadline: Option<Duration>,
     ) -> Self {
-        Self::new_with_layout(test_name, host, resolve_deadline, false)
-    }
-
-    /// `page_first = true` registers the rank in the vLLM-connector packing
-    /// (one host page per block holding every layer at its name-sorted
-    /// offset) instead of the native layer-first interleave.
-    pub(crate) fn new_with_layout(
-        test_name: &str,
-        host: Arc<PegaflowHost>,
-        resolve_deadline: Option<Duration>,
-        page_first: bool,
-    ) -> Self {
         let ctx = CudaContext::new(0).expect("CUDA device 0");
         let stream = ctx.default_stream();
         let arenas: Vec<CudaSlice<u8>> = (0..NUM_LAYERS)
@@ -174,7 +162,6 @@ impl Rig {
                         namespace: format!("openinfer-kv-store-test-{test_name}"),
                         device_id: 0,
                         arenas: arena_specs,
-                        page_first,
                     },
                 )
                 .expect("rank registration")

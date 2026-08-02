@@ -276,7 +276,7 @@ mod tests {
             logprobs: 0,
             echo: false,
             queued_at_unix_s: None,
-            prefetch_offered: false,
+            kv_prefix: None,
             prefill_pos: 0,
             step_chunk: 3,
             cached_tokens: 0,

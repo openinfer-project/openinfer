@@ -13,6 +13,7 @@ anyhow = { workspace = true }
 # graph happens to select one.
 cudarc = { workspace = true }
 dynamo-kv-hashing = { workspace = true }
+half = { workspace = true }
 kvbm-logical = { workspace = true }
 log = { workspace = true }
 openinfer-engine = { workspace = true }

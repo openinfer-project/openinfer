@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -46,6 +47,15 @@ pub struct KvStore {
     pub(crate) resolve_deadline: Duration,
     pub(crate) ranks: HashMap<usize, RankState>,
     pub(crate) stats: Arc<KvStoreStats>,
+    /// Master gate for [`Self::resolve_prefix`]: off means every resolve
+    /// short-circuits to an empty prefix (the embedder's prefix cache is
+    /// disabled). On by default; embedders flip it from their runtime prefix
+    /// toggle.
+    pub(crate) resolve_enabled: AtomicBool,
+    /// Pure-L2 serving mode: every resolve first drains the GPU radix's
+    /// inactive blocks, so prefixes are always restored from the host tier
+    /// instead of hitting resident HBM pages. Off by default.
+    pub(crate) l1_retention_disabled: AtomicBool,
 }
 
 impl KvStore {
@@ -58,6 +68,26 @@ impl KvStore {
 
     pub fn stats(&self) -> &KvStoreStats {
         &self.stats
+    }
+
+    /// The runtime resolve/load/save tasks spawn onto. Embedding schedulers
+    /// (sync threads) use it to launch [`Self::resolve_prefix`] without
+    /// owning async context.
+    pub fn runtime(&self) -> &tokio::runtime::Handle {
+        &self.runtime
+    }
+
+    /// Master gate for the read path (see the field doc). Off: every resolve
+    /// returns an empty prefix immediately.
+    pub fn set_resolve_enabled(&self, enabled: bool) {
+        self.resolve_enabled.store(enabled, Ordering::Release);
+    }
+
+    /// Pure-L2 serving mode (see the field doc): resolves drain resident GPU
+    /// prefix blocks first, forcing every hit to restore from the host tier.
+    pub fn set_l1_retention_disabled(&self, disabled: bool) {
+        self.l1_retention_disabled
+            .store(disabled, Ordering::Release);
     }
 
     /// The whole read path. Resolves `prompt_tokens`' cached prefix on
@@ -80,9 +110,18 @@ impl KvStore {
         policy: ResolvePolicy,
         cancel: &dyn CancelProbe,
     ) -> KvPrefix {
+        if !self.resolve_enabled.load(Ordering::Acquire) {
+            return KvPrefix::none();
+        }
         self.stats.resolves.fetch_add(1, Ordering::Relaxed);
         let state = self.rank(rank);
         let pool = &state.pool;
+        if self.l1_retention_disabled.load(Ordering::Acquire) {
+            // Pure-L2 mode: drain cross-request HBM retention so the probe
+            // below sees gpu_hit == 0 and restores the whole cacheable prefix
+            // from the host tier.
+            pool.evict_inactive();
+        }
         let block_size = pool.block_size();
         // The `-1`: matching always leaves at least one prompt token uncached
         // (the final chunk must forward to emit the first token), so a
@@ -340,6 +379,32 @@ impl KvStore {
             Some(tier) => tier.flush().await,
             None => Ok(()),
         }
+    }
+
+    /// Like [`Self::flush_saves`] for a caller on a plain synchronous thread
+    /// (an engine executor/scheduler): blocks on the store's runtime. Never
+    /// call this from a task on that runtime — `Handle::block_on` panics
+    /// there.
+    pub fn flush_saves_blocking(&self, rank: usize) -> anyhow::Result<()> {
+        self.runtime.block_on(self.flush_saves(rank))
+    }
+
+    /// Run `then` after every save submitted so far is query-visible to peers
+    /// (the [`Self::flush_saves`] barrier), scheduled on the store's runtime so
+    /// the caller's thread never waits. `then` ALWAYS runs — a flush failure is
+    /// logged, not allowed to strand the callback's payload. A rank without a
+    /// tier runs `then` inline.
+    pub fn flush_saves_then(&self, rank: usize, then: impl FnOnce() + Send + 'static) {
+        let Some(tier) = self.rank(rank).tier.clone() else {
+            then();
+            return;
+        };
+        self.runtime.spawn(async move {
+            if let Err(err) = tier.flush().await {
+                log::warn!("kv-store flush before callback failed: {err:#}");
+            }
+            then();
+        });
     }
 
     /// The rank table is frozen at build, so an unknown rank is a wiring

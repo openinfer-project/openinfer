@@ -1,18 +1,24 @@
-//! Live GPU+CPU prefix-hit gate for the pegaflow KV-offload integration.
+//! Live GPU+CPU prefix-hit gate for the kv-store (pegaflow host tier).
 //!
 //! Drives a real Qwen3-4B [`Qwen3Executor`] with offload enabled to prove the
 //! end-to-end wiring on actual model weights:
-//!   * a cold prefill SAVEs its sealed KV blocks to pegaflow's host tier;
-//!   * after the GPU prefix cache is flushed, a second identical request finds
-//!     the prefix only on the CPU tier (a genuine CPU-only hit) and the async
-//!     prefetch RESTOREs it into HBM;
+//!   * a cold prefill seals its KV blocks to the store's host tier (write path:
+//!     per-step `save_sealed_blocks`, plus the final seal when the request
+//!     retires at `drop_request`);
+//!   * after `flush_offload_saves` (D2H + query-visibility barrier) and
+//!     `evict_cached_blocks` (L1 drain), the prefix survives only on the host
+//!     tier;
+//!   * a scheduler-style `KvStore::resolve_prefix` then finds it there and
+//!     restores it into HBM (query → reserve → load → radix commit), so the
+//!     following prefill's `match_and_add_prefix` reuses the restored blocks
+//!     instead of recomputing them;
 //!   * the restored KV reproduces the original first-token logits.
 //!
-//! This is the one test that exercises save → host-tier persistence → query →
-//! async load → register → prefill-rematch through the executor, not a unit
-//! harness. `tests/cpu_roundtrip.rs` (in `openinfer-kv-offload`) covers the raw
-//! byte path; this covers the live executor wiring. If the load landed in the
-//! wrong layer/segment/block the warm logits would be whole nats off.
+//! This is the one test that exercises save → host-tier persistence → resolve →
+//! load → radix commit → prefill-rematch through the live executor, not a unit
+//! harness. `openinfer-kv-store/tests/` covers the raw store byte path; this
+//! covers the executor wiring. If a load landed in the wrong
+//! layer/segment/block the warm logits would be whole nats off.
 //!
 //! Requires a CUDA GPU and Qwen3-4B weights; skips cleanly when absent
 //! (point `OPENINFER_TEST_MODEL_PATH` at the weights to run it).
@@ -21,6 +27,11 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use openinfer_core::sampler::SamplingParams;
+use openinfer_kv_store::CacheScope;
+use openinfer_kv_store::KvPrefix;
+use openinfer_kv_store::KvStore;
+use openinfer_kv_store::NeverCancelled;
+use openinfer_kv_store::ResolvePolicy;
 use openinfer_qwen3::Qwen3LoraOptions;
 use openinfer_qwen3::Qwen3OffloadOptions;
 use openinfer_qwen3::runtime::PrefillPlan;
@@ -35,8 +46,10 @@ const MAX_OUTPUT: usize = 8;
 /// 512 MiB host tier — comfortably more than the handful of dense Qwen3-4B
 /// blocks this test offloads (~2.25 MiB/block).
 const HOST_TIER_BYTES: usize = 512 << 20;
+/// The single-GPU executor registers exactly one store rank: 0.
+const STORE_RANK: usize = 0;
 
-/// Warm-vs-cold bounds, following the prefix-cache methodology: the CPU-restored
+/// Warm-vs-cold bounds, following the prefix-cache methodology: the restored
 /// KV is byte-identical to the original GPU compute, so the only legitimate
 /// drift is the prefill GEMM shrinking to the uncached tail (bf16 reduction
 /// order). The warm argmax must sit within `REGRET_TOL` of cold; the mean head
@@ -124,6 +137,26 @@ fn assert_close(cold: &[(u32, f32)], warm: &[(u32, f32)]) {
     );
 }
 
+/// Play the scheduler's read-path part by hand (the test drives the executor
+/// directly, so there is no scheduler to do it): run the store's async
+/// `resolve_prefix` on the store's own runtime — the same pattern as
+/// `KvStore::flush_saves_blocking` — and return the hold. Keep it alive across
+/// the following `execute_prefill`: it pin-protects the resolved blocks until
+/// the prefill's `match_and_add_prefix` has consumed them (the production
+/// scheduler drops it at the first `PrefillRequestResult`).
+///
+/// `CacheScope::default()` is qwen3's serving scope: no cache salt, no LoRA.
+fn resolve(store: &KvStore, req_id: &str, tokens: &[u32]) -> KvPrefix {
+    store.runtime().block_on(store.resolve_prefix(
+        STORE_RANK,
+        req_id,
+        tokens,
+        CacheScope::default(),
+        ResolvePolicy::default(),
+        &NeverCancelled,
+    ))
+}
+
 /// One executor, two scenarios, run sequentially. cargo runs `#[test]`
 /// functions on parallel threads; two Qwen3-4B executors sharing device 0 and
 /// the same pegaflow instance id ("qwen3-dev0") would collide on the host
@@ -153,13 +186,14 @@ fn live_gpu_and_cpu_prefix_hits() {
     gpu_and_cpu_combined_hit(&mut ex);
 }
 
-/// A prefix that is evicted from HBM and restored entirely from the CPU tier
-/// (`gpu_hit == 0`): the baseline CPU round-trip through the live executor.
+/// A prefix that is evicted from HBM and restored entirely from the host tier
+/// (GPU radix hit == 0): the baseline CPU round-trip through the live executor.
 fn cpu_tier_restores_evicted_prefix(ex: &mut Qwen3Executor) {
     let p = prompt(7, 50); // 3 full blocks (48 tok) + 2-token tail
 
-    // ── Cold: first sight of P. Computes all of P on GPU and offloads the 3
-    // sealed blocks to the host tier. ──
+    // ── Cold: first sight of P. Computes all of P on GPU; the per-step save
+    // plus the retire-time final seal put the 3 sealed blocks on the host
+    // tier. ──
     let cold = ex
         .execute_prefill(PrefillPlan {
             sample_seed: 0,
@@ -174,22 +208,27 @@ fn cpu_tier_restores_evicted_prefix(ex: &mut Qwen3Executor) {
     let cold_first = first_token_top(&cold);
     ex.drop_request(RequestId::new(1)).expect("drop req1");
 
-    // ── Persist the saves, then evict P from HBM so it lives only on CPU. ──
+    // ── Persist the saves (D2H landed + query-visible), then evict P from
+    // HBM so it lives only on the host tier. ──
     ex.flush_offload_saves();
     ex.evict_cached_blocks();
 
-    // ── A GPU miss now: the prefetch must restore P from the CPU tier. ──
-    let hit = ex.begin_kv_prefetch(RequestId::new(2), &p, None, 0);
-    assert!(hit, "P must hit the CPU tier after GPU eviction");
-    let ready = ex.wait_ready_prefetch(0);
+    // ── A GPU miss now: resolve must find P on the host tier and restore all
+    // 3 blocks into HBM (radix commit included). The cacheable cap leaves the
+    // 2-token tail out, so the hit is exactly 3 blocks = 48 tokens. ──
+    let store = ex.kv_store().expect("offload store wired");
+    let prefix = resolve(&store, "kv-cpu-hit-req2", &p);
     assert!(
-        ready.contains(&RequestId::new(2)),
-        "prefetch load must settle ready, got {ready:?}"
+        prefix.hit_tokens() >= 3 * BLOCK,
+        "host tier must hold P after GPU eviction; resolve hit {} tokens, expected {}",
+        prefix.hit_tokens(),
+        3 * BLOCK
     );
 
-    // ── Warm: the restored CPU prefix is matched, only the 2-token tail
-    // recomputes (the full-block cap keeps the 3rd block's last token off the
-    // match the same way the GPU prefix cache does). ──
+    // ── Warm: the restored blocks are matched (the hold above pins them
+    // across the match), only the 2-token tail recomputes — the full-block
+    // cap keeps the 3rd block's last token off the match the same way the GPU
+    // prefix cache does. ──
     let warm = ex
         .execute_prefill(PrefillPlan {
             sample_seed: 0,
@@ -197,6 +236,9 @@ fn cpu_tier_restores_evicted_prefix(ex: &mut Qwen3Executor) {
             echo: false,
         })
         .expect("warm prefill");
+    // The match consumed the resolved blocks; release the hold the way the
+    // scheduler does at the first PrefillRequestResult.
+    drop(prefix);
     assert_eq!(
         warm.requests[0].cached_tokens,
         3 * BLOCK,
@@ -209,10 +251,10 @@ fn cpu_tier_restores_evicted_prefix(ex: &mut Qwen3Executor) {
     assert_close(&cold_first, &warm_first);
 }
 
-/// A single prefix that is part GPU-resident, part CPU-only: the prefetch must
-/// stack the CPU continuation onto the GPU hit and the re-match must see one
+/// A single prefix that is part GPU-resident, part host-only: the resolve must
+/// stack the host continuation onto the GPU hit and the re-match must see one
 /// contiguous prefix. This is the case that catches an off-by-`gpu_hit` bug in
-/// the query/commit offset math — the pure-CPU test (`gpu_hit == 0`) cannot.
+/// the query/commit offset math — the pure-host test (GPU hit == 0) cannot.
 fn gpu_and_cpu_combined_hit(ex: &mut Qwen3Executor) {
     let full = prompt(9, 100); // 6 full blocks (96 tok) + 4-token tail
     let short = full[..50].to_vec(); // a 3-block prefix of `full`
@@ -233,9 +275,9 @@ fn gpu_and_cpu_combined_hit(ex: &mut Qwen3Executor) {
     ex.drop_request(RequestId::new(1)).expect("drop req1");
     ex.flush_offload_saves();
 
-    // ── Drop the whole prefix from HBM (CPU keeps all 6 blocks), then
+    // ── Drop the whole prefix from HBM (host keeps all 6 blocks), then
     // re-establish ONLY the first 3 blocks in HBM by cold-prefilling `short`.
-    // GPU now holds blocks 0..3; CPU holds blocks 0..6. ──
+    // GPU radix now holds blocks 0..3; the host tier holds blocks 0..6. ──
     ex.evict_cached_blocks();
     let s = ex
         .execute_prefill(PrefillPlan {
@@ -250,21 +292,20 @@ fn gpu_and_cpu_combined_hit(ex: &mut Qwen3Executor) {
     );
     ex.drop_request(RequestId::new(2)).expect("drop req2");
 
-    // ── Prefetch `full`: GPU hits blocks 0..3, the host tier must supply the
-    // continuation 3..6. A pure GPU hit would not start a load. ──
-    let hit = ex.begin_kv_prefetch(RequestId::new(3), &full, None, 0);
+    // ── Resolve `full`: the GPU probe hits blocks 0..3, the host tier must
+    // supply the continuation 3..6, and the resolve reports the combined
+    // prefix (6 blocks = 96 tokens; the 4-token tail stays uncacheable).
+    // Without the host continuation this would stop at 3. ──
+    let store = ex.kv_store().expect("offload store wired");
+    let prefix = resolve(&store, "kv-combined-hit-req3", &full);
     assert!(
-        hit,
-        "blocks 3..6 must be fetched from the CPU tier beyond the GPU hit"
-    );
-    let ready = ex.wait_ready_prefetch(0);
-    assert!(
-        ready.contains(&RequestId::new(3)),
-        "prefetch must settle, got {ready:?}"
+        prefix.hit_tokens() >= 6 * BLOCK,
+        "resolve must stack host blocks 3..6 onto the GPU hit; got {} tokens, expected {}",
+        prefix.hit_tokens(),
+        6 * BLOCK
     );
 
-    // ── Warm prefill `full`: all 6 blocks match (3 GPU + 3 CPU). Without the
-    // CPU continuation this would be 3. ──
+    // ── Warm prefill `full`: all 6 blocks match (3 GPU + 3 host). ──
     let warm = ex
         .execute_prefill(PrefillPlan {
             sample_seed: 0,
@@ -272,10 +313,11 @@ fn gpu_and_cpu_combined_hit(ex: &mut Qwen3Executor) {
             echo: false,
         })
         .expect("warm full prefill");
+    drop(prefix);
     assert_eq!(
         warm.requests[0].cached_tokens,
         6 * BLOCK,
-        "combined hit: 3 GPU-resident + 3 CPU-restored blocks match as one prefix"
+        "combined hit: 3 GPU-resident + 3 host-restored blocks match as one prefix"
     );
     let warm_first = first_token_top(&warm);
     ex.drop_request(RequestId::new(3)).expect("drop req3");

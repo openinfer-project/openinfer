@@ -27,7 +27,6 @@ pegaflow-core = { git = "https://github.com/novitalabs/pegaflow.git", rev = "141
 ] }
 tokio = { workspace = true }
 tokio-stream = { workspace = true, features = ["net"] }
-xxhash-rust = { workspace = true }
 
 [lints]
 workspace = true

@@ -1,23 +1,23 @@
 # pegaflow KV 卸载接入 Spec
 
-> **TL;DR**: 把 `pegaflow-core` 当**进程内 Rust 库**做 KV 卸载的物理后端（HBM→DRAM/SSD/RDMA），补上 kvbm 留着没写的卸载层。connector 大脑（决定 load/save 哪些 block）用 kvbm logical/physical 分层思想自建，pegaflow 退为语义无关的 raw block transfer 后端。**路线已调整为 Qwen3-4B full-attn 首发**（原计划 Kimi 首发）：page-first 单 buffer 经 pegaflow `block_stride_bytes`（PR #331）适配。**端到端已在真实 GPU 上跑通并验证**：async SAVE + async LOAD 接进 `Qwen3Executor` + scheduler，`tests/kv_offload_cpu_hit.rs` 覆盖纯 CPU-hit 与 GPU+CPU 组合 hit，恢复后 logits 与冷算一致；连接层 `OffloadEngine` + `tests/cpu_roundtrip.rs` 字节级一致。默认关（builder flag opt-in）；**server CLI 已接**（#316：`--kv-offload` / `--kv-offload-host-gib` / `--no-prefix-cache`，plain 与 `--enable-lora` 两条启动路径都透传）。纯-L2 基准实测 Qwen3-4B mean TTFT 195→40ms（−79%，evict-before-probe → `gpu_hit=0`，全前缀从 host tier 恢复）。**Qwen3.5 linear/SSM state 明确排除**；**DeepSeek sparse 暂缓**。
+> **TL;DR**: 把 `pegaflow-core` 当**进程内 Rust 库**做 KV 卸载的物理后端（HBM→DRAM/SSD/RDMA），补上 kvbm 留着没写的卸载层。connector 大脑（决定 load/save 哪些 block）用 kvbm logical/physical 分层思想自建，pegaflow 退为语义无关的 raw block transfer 后端。**路线已调整为 Qwen3-4B full-attn 首发**（原计划 Kimi 首发）：page-first 单 buffer 经 pegaflow `block_stride_bytes`（PR #331）适配。**端到端已在真实 GPU 上跑通并验证**：async SAVE + 前缀恢复接进 `Qwen3Executor` + scheduler，`tests/kv_offload_cpu_hit.rs` 覆盖纯 CPU-hit 与 GPU+CPU 组合 hit，恢复后 logits 与冷算一致；连接层 `OffloadEngine` + `tests/cpu_roundtrip.rs` 字节级一致。**2026-08 qwen3 已迁到 `openinfer-kv-store` 承载**（写路径 seal/retire、读路径 scheduler 侧 `resolve_prefix`，见 §0/§9；`openinfer-kv-offload` 连接层此后仅 glm52 在用）。默认关（builder flag opt-in）；**server CLI 已接**（#316：`--kv-offload` / `--kv-offload-host-gib` / `--no-prefix-cache`，plain 与 `--enable-lora` 两条启动路径都透传）。纯-L2 基准实测 Qwen3-4B mean TTFT 195→40ms（−79%，evict-before-probe → `gpu_hit=0`，全前缀从 host tier 恢复）。**Qwen3.5 linear/SSM state 明确排除**；**DeepSeek sparse 暂缓**。
 >
-> Last touched: 2026-06
+> Last touched: 2026-08
 
-## 0. 实现状态（2026-06）
+## 0. 实现状态（2026-08）
 
 已落地并验证：
 
 - **pegaflow `block_stride_bytes`**（PR #331 → novitalabs/pegaflow，`feat/inproc-load` 基于其上）：解耦"块间步长"与"每块拷贝大小"，让 page-first fused buffer 能注册。**已合入 master**。
 - **pegaflow 进程内 load API**（PR #333，**已合入**，squash 进 #331 的 `07cac7e`）：`LoadCompletion::{Shm,Channel}` + `batch_load_kv_blocks_multi_layer_inproc` → `oneshot::Receiver`，去掉 in-process 调用方对 shm `LoadState` 的依赖（Rust 进程内不需要），非阻塞 poll。
-- **`openinfer-kv-offload::OffloadEngine`**：拥有 `PegaEngine` + 内嵌 tokio runtime；`Registration::from_buffer` 把 fused page-first buffer 映射成 per-layer 注册（**单段 `[K|V]`**：fused layout 里 K/V 本就连续 = `layer_stride` 一段，`block_stride = page_stride`，`segments=1`——不是 K/V split，那条路需要 `kv_stride > bytes_per_block`，此处不成立）。crate 已按 `config`/`host`/`layout`/`handle`/`engine` 分模块（#799/#802 重构）；所有操作统一为 `OffloadHandle<T>` 可轮询句柄：`submit_save`/`submit_query`/`load` 提交到 pegaflow runtime 后立即返回 handle，`save`（fire-and-forget）/`save_blocking`/`query` 是其薄包装（qwen3 调用方尚未迁移）。`query` 透传 pegaflow 0.23.5 的 `wait_for_full_prefix`（glm52 native handoff 传 `true`：D 无法重算 miss，partial 命中无用）。
-- **`KvBuffer::device_ptr`**（kv-cache）：注册用的稳定基址。
-- **kvbm↔bytes 桥**（kv-cache `RequestKv`）：`prompt_block_hashes` / `assigned_block_hashes` / `prefix_matched_blocks`，`SequenceHash::as_u128()` → 16B content key。
+- **`openinfer-kv-offload::OffloadEngine`**：拥有 `PegaEngine` + 内嵌 tokio runtime；`Registration::from_buffer` 把 fused page-first buffer 映射成 per-layer 注册（**单段 `[K|V]`**：fused layout 里 K/V 本就连续 = `layer_stride` 一段，`block_stride = page_stride`，`segments=1`——不是 K/V split，那条路需要 `kv_stride > bytes_per_block`，此处不成立）。crate 已按 `config`/`host`/`layout`/`handle`/`engine` 分模块（#799/#802 重构）；所有操作统一为 `OffloadHandle<T>` 可轮询句柄：`submit_save`/`submit_query`/`load` 提交到 pegaflow runtime 后立即返回 handle，`save`（fire-and-forget）/`save_blocking`/`query` 是其薄包装（glm52 在用；qwen3 已迁往 `openinfer-kv-store`，见下）。`query` 透传 pegaflow 0.23.5 的 `wait_for_full_prefix`（glm52 native handoff 传 `true`：D 无法重算 miss，partial 命中无用）。
+- **`KvBuffer::device_ptr`**（原 kv-cache，物理 KV 层已随 qwen3 首迁搬入 `openinfer-kv-store` 自包含）：注册用的稳定基址。
+- **kvbm↔bytes 桥**（`RequestKv`，同在 kv-store）：`assigned_block_hashes` / `prefix_matched_blocks` / `assigned_block_guards`，kvbm `SequenceHash` → 16B content key。
 - **`tests/cpu_roundtrip.rs`**：真实 `KvBuffer` 上写已知 pattern → save → query → load 到**另一组** block → 字节级比对 + 零块负向控制。**通过**。
-- **live 接线（§9，已落地）**：`Qwen3Executor` 持 `Option<OffloadEngine>`（`Qwen3OffloadOptions` opt-in，默认关）；SAVE hook（`save_sealed_blocks`，async fire-and-forget）+ 非阻塞 prefetch admission（`begin_kv_prefetch`/`drain_ready_prefetch`/`wait_ready_prefetch`，scheduler `loading` 态）。`tests/kv_offload_cpu_hit.rs` 单测序跑两幕——纯 CPU restore（`gpu_hit==0`）与 GPU+CPU 组合 hit（G=3+C=3 拼成一段连续前缀）——恢复后 first-token logits 与冷算一致（mean Δ≈0.03 nat，bf16 floor）。
-- **三处正确性加固**（toxic-review 后）：① query lease 在 `reserve_loaded_blocks` 失败 / `load` 提交失败时显式 `release_query_lease`，不再泄漏到 600s TTL；② admission 拒绝（context/KV budget/未知 LoRA）时 `drop_request` 释放已 settle 的 prefetch 状态，不再泄漏已 commit 的 block；③ async SAVE 把被保存 block 的 `ImmutableBlock` 强引用（`KvBlockGuard`）随 spawn 持到 D2H 落地才 drop——封死"请求结束→slot 重分配→D2H 抓到错 KV 写进旧 hash"的静默腐蚀窗口。
+- **live 接线（§9，已落地；2026-08 起由 `openinfer-kv-store` 承载）**：`Qwen3Executor` 持 `Option<Arc<KvStore>>`（`Qwen3OffloadOptions` opt-in，默认关，不变）；写路径在封块边界与请求退休时自动 `store.seal` / `store.retire`（`Cacheable` fire-and-forget，`flush_on_finish` 时 `Handoff`）；读路径为 scheduler 侧 `ResolveHub`——submit 时对非 echo 请求在 store 自己的 runtime 上 spawn `resolve_prefix`，带 `KvPrefix` RAII hold 经 mpsc 回主循环再 admit，hold 护住排队期，首个 prefill chunk 的 `match_and_add_prefix` 重 pin 后即放（executor 侧的 `begin_kv_prefetch` 状态机已整体删除）。`tests/kv_offload_cpu_hit.rs` 单测序跑两幕——纯 host tier 恢复（radix GPU hit == 0；act1 prefill + `drop_request` 自动 seal → `flush_offload_saves` → `evict_cached_blocks`，act2 手动 `store.resolve_prefix` 恢复后 match）与 GPU+host 组合 hit（3+3 块拼成一段连续前缀）——恢复后 first-token logits 与冷算一致的容差不变（argmax regret ≤0.20 / head mean ≤0.06 nat，bf16 floor）。
+- **三处正确性加固（toxic-review 后）的现归属**：① query lease 显式释放收编进 kv-store——`resolve_prefix` 在 `reserve_loaded_blocks` 失败（池装不下时不当 TTL-park，释放租约后 sleep 重查）与取消路径上调 `tier.release`（`PegaflowTier::release` → `release_query_lease`；`openinfer-kv-store/src/store.rs`、`tier.rs`），依旧不泄漏到 600s TTL；② admission 拒绝（context/KV budget/未知 LoRA）的清理对应 `PendingRequest.kv_prefix` 的 RAII——hold 随请求析构释放，已 commit 的 block 自然归还，不再有"已 settle prefetch 状态"这条专门泄漏路径；③ async SAVE 的防腐蚀 guard 收编进 `KvStore::seal`——按 `assigned_block_guards` 收集 `KvBlockGuard`（与被存 block 1:1）随 save task 走，`PegaflowTier::save` 在 D2H 落地后才 drop，"请求结束→slot 重分配→在途 D2H 抓到新 KV 写进旧 hash"的静默腐蚀窗口依旧封死，且钉住页计入 `pinned_blocks` 从 admission 预算扣除。
 
-**server CLI 已接（#316）**：`--kv-offload`（bool）/ `--kv-offload-host-gib`（f64，默认 8.0，pegaflow 启动即整块 `cudaHostAlloc`，RSS 立即反映）/ `--no-prefix-cache`（vLLM 风格；不带 offload = 关前缀匹配，带 offload = 纯-L2 模式，evict-before-probe 使每个前缀从 host tier 恢复）。plain 与 `--enable-lora` 两条路径都透传 `offload_options` + `no_prefix_cache`；LoRA 下安全，因前缀 block hash 以 adapter 名加 salt（`compute_salt_hash`），恢复的 KV（HBM 或 host tier）永不跨 adapter。三处 #316 review 加固：echo 请求不 offer prefetch（其 prefill 跳过 `match_and_add_prefix`，prefetch 块用不上）、admission 按 `prefetched_blocks` 抵扣已 settle 前缀块、`drop_request` 等在途 H2D 落地再放 reservation。**依赖已从 fork 摘除**：PR #331+#333 均合入上游 master（squash 进 `07cac7e`），`third_party/pegaflow` 已删，`pegaflow-core` 改为 pin 到该 rev 的 **git 依赖**（见 §5.2），GPU 测试在 git-dep 下行为不变（delta 一致）。
+**server CLI 已接（#316，迁移后不变）**：`--kv-offload`（bool）/ `--kv-offload-host-gib`（f64，默认 8.0，pegaflow 启动即整块 `cudaHostAlloc`，RSS 立即反映）/ `--no-prefix-cache`（vLLM 风格；不带 offload = 关前缀匹配，带 offload = 纯-L2 模式，resolve 前的 evict-before-probe 使每个前缀从 host tier 恢复）。plain 与 `--enable-lora` 两条路径都透传 `offload_options` + `no_prefix_cache`；LoRA 下安全，因 resolve/probe 的 scope 以 adapter 名作 salt（qwen3 scheduler 填 `CacheScope.lora`，`compute_salt_hash` 照旧把它揉进 block hash），恢复的 KV（HBM 或 host tier）永不跨 adapter。三处 #316 review 加固的现行形态：echo 请求不进 resolve（其 prefill 跳过 `match_and_add_prefix`，恢复的块用不上）、admission 按 `resolved_prefix_blocks`（`hit_tokens / block_size`）抵扣 resolve hold 已钉住的块、拒收时 hold 随 `PendingRequest` 析构释放。**依赖已从 fork 摘除**：PR #331+#333 均合入上游 master（squash 进 `07cac7e`），`third_party/pegaflow` 已删，`pegaflow-core` 改为 pin 到上游 rev 的 **git 依赖**（机制见 §5.2，pin 的 rev 此后随 #381/#395 等推进），GPU 测试在 git-dep 下行为不变（delta 一致）。
 
 相关：[kv-cache-design.md](kv-cache-design.md)（logical/physical 分层，已把 pegaflow 列为设计调研）· [qwen3-kvbm-integration-spec.md](qwen3-kvbm-integration-spec.md)（kvbm-logical 已接入）· `models/kimi-k2/kv-cache-design.md`（Kimi 已用 `BlockPool`）· `models/qwen3/prefix-cache.md`（HBM 内前缀复用已落地）。
 
@@ -55,7 +55,7 @@ openinfer 仓里 vendored 的 `kvbm-physical` / `kvbm-engine` 设计目标就是
 
 ## 4. 路线
 
-1. **Qwen full-attn 已首发（#316）** —— 给 pegaflow 加了 `block_stride_bytes`（R1）解掉 page-first ABI 冲突，async SAVE + 非阻塞 prefetch admission 接进 `Qwen3Executor` + scheduler，server CLI 已接。
+1. **Qwen full-attn 已首发（#316），本轮迁接 kv-store** —— 给 pegaflow 加了 `block_stride_bytes`（R1）解掉 page-first ABI 冲突，async SAVE + 前缀恢复经 `Qwen3Executor` + scheduler 端到端跑通；2026-08 qwen3 从 `openinfer-kv-offload` 迁到 `openinfer-kv-store` 承载（seal/retire 写路径 + scheduler 侧 `resolve_prefix` 读路径），server CLI 不变。
 2. **Kimi MLA 下一候选** —— pegaflow 做 `BlockPool` 下的 host/SSD tier；block evict 时 demote 到 host，前缀 query 命中时从 host restore。带宽便宜（latent 小），layout 零阻抗，直接复用 Qwen3-4B 的 connector 模式。
 3. **linear 排除、sparse 暂缓**。
 
@@ -126,31 +126,29 @@ trait KvResidencyPolicy {
 
 ## 9. live 接线设计（Qwen3-4B，**已落地**）
 
-> 状态：已实现并在真实 GPU 上验证（§0）。下文是设计与实现一致的记录；落地时相对原设计的偏差与加固见末尾「实现注记」。
+> 状态：已实现并在真实 GPU 上验证（§0）。2026-08 随 qwen3 → `openinfer-kv-store` 迁移重写过一轮：executor 侧 prefetch 状态机（`begin_kv_prefetch`/`drain_ready_prefetch`/`wait_ready_prefetch` + scheduler `loading` 队列、`executor/remote_fetch.rs`）整体删除；下文记录迁移后的现行接线，迁移删项收进末尾「实现注记」。
 
-连接层已就绪（§0），把它接进 `Qwen3Executor` + `scheduler.rs` 的真实推理路径。`Qwen3Executor` 持 `kv_mgr`（`BlockPool`+`KvBuffer`）与 `request_kvs`；在构造（`from_runtime`/`single`，model 移入 RankWorker 之前，此时 `KvBuffer` + `device_ctx().stream` 都在手）建一个 `Option<OffloadEngine>`，opt-in（builder flag，**不加 env**），默认关，保现有路径不动。
+连接层已就绪（§0），把它接进 `Qwen3Executor` + `scheduler.rs` 的真实推理路径。`Qwen3Executor` 持 `kv_mgr`（`BlockPool`+`KvBuffer`，物理 KV 层已随迁搬入 kv-store 自包含）与 `request_kvs`；在构造（`from_runtime`/`single`，model 移入 RankWorker 之前，此时 `KvBuffer` + `device_ctx().stream` 都在手）经 `build_kv_store` 建一个 `Option<Arc<KvStore>>`（`KvStoreBuilder::rank_with_offload` 把 fused buffer 的逐层 arena 注册进 store 的 pegaflow host），opt-in（`Qwen3OffloadOptions`，**不加 env**），默认关，保现有路径不动。scheduler 经 `executor.kv_store()` 拿到同一个 store 驱动读路径。
 
-**SAVE（async，best-effort）**：`apply_prefill`/`apply_decode` 封块后（此刻 compute stream 已随 `run_step` 同步 → 满足 §0 的跨 stream ordering 约束），取 `rkv.assigned_block_hashes()`，按 per-request `saved_cursor`（初值 = `prefix_matched_blocks()`，GPU-hit 前缀已 resident，跳过）保存新封的 `(page_id, hash)`，`offload.save(...)` fire-and-forget，推进 cursor。
+**SAVE（async，best-effort）**：prefill/decode step 封块后（此刻 compute stream 已随 `run_step` 同步 → 满足 §0 的跨 stream ordering 约束），`save_sealed_blocks` 调 `store.seal(KV_STORE_RANK, rkv, cursor, SaveClass::Cacheable)`，按 per-request `SaveCursor`（初值 = `prefix_matched_blocks()`，GPU-hit 前缀已 resident，跳过）只存新封的 `(page_id, hash)`，fire-and-forget 推进 cursor。请求结束的 `drop_request` 是 final seal + release：先 drain 该请求尚未 flush 的 store 注册事件，再 `store.retire(...)`——`Cacheable` 照常 fire-and-forget（guard 钉住源页，见实现注记）；`--kv-p2p-flush-on-finish`（P/D prefill 角色）下为 `SaveClass::Handoff`，KV 停放到 save settle，且该 step 的 `Finished` 事件经 `store.flush_saves_then` 屏障（save 对 tier 与 MetaServer 可见后）才放行——P 的 HTTP 响应即 KV-ready 信号。
 
-**LOAD（async，GPU+CPU hit，非阻塞 admission）**：admission 把 `match_and_add_prefix` 拆成"建 RequestKv → 算 GPU hit G → query CPU [G..F] → 异步 load → LoadingKv 轮询"：
+**LOAD（scheduler 侧 resolve intake，`ResolveHub`）**：不再有 executor 内的 prefetch 状态机；编排整体在 scheduler 线程 + store runtime 之间：
 
-1. `rkv = pool.new_request(...)`；`hashes = rkv.prompt_block_hashes()`（F 块）。
-2. `manager.match_blocks(&seq_hashes)` 数出 GPU 命中前缀 G（**持其 `ImmutableBlock` 不 drop**，防 load 期间被 evict）。
-3. `offload.query(req_id, &hashes[G..F])` → CPU 命中 C（连续）+ lease。
-4. `manager.allocate_blocks(C)` 拿 C 个 `MutableBlock`（DMA 落点），取 `block_id()` 列表；`offload.load(lease, page_ids)` → `LoadHandle`。请求进 `LoadingKv{rkv, handle, muts, hashes[G..G+C], gpu_imms}` holding 态，**不 prefill**。
-5. 每 tick `handle.poll()`：`Ready` → 对每个 `mut` `.stage(hash, bs)` + `manager.register_block(..)` 注册进 registry（用的就是 `BlockPool::new` 给 padding 块用的同一套公开 API，**无需改 kvbm**）；随后 `rkv.match_and_add_prefix()` 自然命中 G+C 连续前缀，`kv_position=(G+C)*bs`；drop holding 的 imms（sequence 自持）。请求转入正常 prefill（suffix = 剩余 token）。
-6. `C==0` → 直接 prefill（纯 GPU hit，与今日行为一致）。
+1. submit 入口对每个非 echo 新请求，spawn `store.resolve_prefix(rank 0, tokens, CacheScope{lora: adapter 名, salt: None}, ResolvePolicy::default(), &req.token_tx)` 到 store 自己的 runtime。echo 请求不 resolve（其 prefill 跳过 `match_and_add_prefix`，恢复的块用不上）。plain `submit_rx` 与 LoRA-control 的 legacy command channel 统一在此——legacy channel 丢不了 `KvPrefix`，这正是 resolve 做在 scheduler 侧的原因。
+2. `resolve_prefix` 一条读链路：radix probe 持住 GPU 命中块 → host tier query（`Loading` 与 full-hit 策略下的 `Miss` 在 deadline 内重查，默认冷 miss 即刻收束）→ `Hit` 后 `reserve_loaded_blocks`（池装不下则释放租约、sleep 重查，deadline 兜底）→ load H2D（不可取消区段：spawn 的 task 持有 load future + reservation，超时只弃等待不弃块）→ `commit_loaded_blocks` 恢复即入 radix。终态唯一 `KvPrefix { hit_tokens, hold }`；取消（`TokenSink` 实现 `CancelProbe`，客户端断开即安全取消）返回 `KvPrefix::none`，死在 admission 现有的 `is_closed` 检查处。
+3. settled 请求带 `KvPrefix` 经 hub 的 mpsc 折回主循环进 `deferred` 再 admit。hold 是 RAII：钉住已恢复块防逐出，在 chunk1 的 `match_and_add_prefix` 重 pin 进请求自己的状态后（第一个 `PrefillRequestResult`）drop；请求被拒（context/KV budget/未知 LoRA）或断开时随 `PendingRequest` 析构释放。
+4. admission 预算同一本账：available = `available_blocks() − store.pinned_blocks()`（in-flight save 未落地的页不进预算），per-request `fresh_needed = footprint − resolved_prefix_blocks`（`hit_tokens / block_size`；hold 钉住的页已离池，不重复计）。
 
-**为何 register→rematch 而非直接注入 sequence**：复用现成的 `match_and_add_prefix`（GPU+CPU 在它眼里就是一段连续前缀），零 kvbm 改动；register 与 rematch 同 tick、且 holding 了 G 的 imms，eviction 窗口为零。最坏（真被 evict）只是少命中、退化为多 prefill，不损正确性。
+**为何 register→rematch 而非直接注入 sequence**：恢复即入 radix，现成的 `match_and_add_prefix`（GPU+host 在它眼里就是一段连续前缀）自然命中；hold 跨 match 钉住，eviction 窗口为零。最坏（真被 evict）只是少命中、退化为多 prefill，不损正确性。
 
-**scheduler 状态机**：`scheduler_loop` 新增 `loading: Vec<PendingRequest>`，每 tick `reclaim_ready_prefetch`（settle 完的回 `deferred` 队首）+ `offer_prefetch`（未 offer 的 deferred 试 prefetch，起 load 的移入 `loading`）；空闲且有 `loading` 时 `block_on_loading` 阻塞等一个 DMA。`OffloadEngine` 的 `block_on`（query/flush）只在 scheduler 这个**纯 OS 线程**调用，`debug_assert` 护住误用。
+**scheduler 侧队列**：`ResolveHub` 持 store 句柄 + 回流 channel + in-flight 计数（计入等待请求数）；主循环每轮把 settled resolve `drain` 回 `deferred`，空转时 `park` 在无 in-flight 时是普通 blocking recv、有 in-flight 时按 5ms（`RESOLVE_POLL_INTERVAL`）节奏兼顾 submit 与 resolve 回包两个 channel——scheduler 仍是纯 OS 线程，等的对象从"DMA 完成"变成"resolve 回包"。LoRA-control 变体里排在 pending control 之后的生成请求，等 control 落定后才进 resolve（probe 不抢跑它依赖的 adapter load）。
 
-风险：preemption/release 时须 drop holding 的 mutable/immutable（RAII 已覆盖）；admission KV 预算要把 loading 占用的 C 块计入 in-flight。
+风险：resolve 恢复的块离池即占预算（hold 存续期 available 变小由 `resolved_prefix_blocks` 抵扣对冲，防双计停摆）；`KvPrefix` 的 RAII 覆盖拒收/断开/关停各出口。
 
-**实现注记（相对原设计的偏差 + toxic-review 加固）**：
+**实现注记（三处 toxic-review 加固的收编 + 迁移删项）**：
 
-- **prefetch 状态落在 executor 而非 scheduler**：`PrefixProbe`（持 G 的 imms + commit 后的 C 块）、`LoadReservation`（C 个 MutableBlock DMA 落点）、`LoadHandle` 都封进 `Qwen3Executor.prefetch: HashMap<RequestId, PrefetchState>`，scheduler 只跟 `RequestId`。commit 在 `seq_hashes[gpu_hit + i]`（GPU+CPU 偏移对齐，组合 hit 测试守这条）。
-- **lease 泄漏修复**：`query` 创建的 pegaflow lease 在 `reserve_loaded_blocks` 失败 / `load` 提交失败时 `OffloadEngine::release_query_lease` 显式释放（`QueryLeaseId` 是 `Copy` 裸 token、无 Drop，丢掉只会挂到 600s TTL）。
-- **拒绝清理**：admission（context/KV budget）与未知 LoRA 拒绝路径补 `drop_request`——否则一个已 settle prefetch 的请求被拒后，commit 的 block + map entry 永久泄漏。
-- **SAVE 防 slot 复用腐蚀**：async `save()` 把被存 block 的 `ImmutableBlock` 强引用（`KvBlockGuard`，与 `block_ids` 1:1）随 spawn 持到 pegaflow D2H 落地才 drop。否则短请求结束 → slot 回收重分配 → 新请求覆写 → 在途 D2H 抓到新 KV 写进旧 hash = 静默腐蚀。guard 在 offload 线程并发 drop 是安全的（kvbm `BlockStore` 单 Mutex、有并发 drop race 处理）；`flush_saves` await 各 save 任务后 guard 才落，故 evict 前先 flush 仍能把 block 排空。
-- **测试**：`tests/kv_offload_cpu_hit.rs` 合一个顺序 `#[test]`（避免两 executor 撞同一 device + pegaflow instance_id），先纯 CPU 后组合 hit。
+- **prefetch 状态机整体删除**：`Qwen3Executor.prefetch: HashMap<RequestId, PrefetchState>`（`PrefixProbe` 持 GPU 命中块、`LoadReservation` DMA 落点、`LoadHandle`）连同 `executor/remote_fetch.rs`、`REMOTE_FETCH_DEADLINE`/`REMOTE_REQUERY_INTERVAL` 全部移除；等价职责收编——GPU 命中块由 store 内 `PrefixProbe` 持住，DMA 落点由 `reserve_loaded_blocks` 的 reservation 撑过 H2D，终态只有 `KvPrefix`。miss-breaker 随之删除：resolve 在 store runtime 上异步跑、无 park 语义，breaker 失去作用对象；若冷 miss 压力再现，以 store policy（`ResolvePolicy`）重议。
+- **lease 泄漏修复（收编进 kv-store）**：`resolve_prefix` 在 `reserve_loaded_blocks` 失败 / 取消路径上显式 `tier.release`（`PegaflowTier::release` → `release_query_lease`），不当 TTL-park（`QueryLeaseId` 是 `Copy` 裸 token、无 Drop，丢掉只会挂到 600s TTL）。
+- **拒绝清理**：不再需要专门回调——`KvPrefix` hold 随 `PendingRequest` 析构释放，commit 的块自然归还池（admission 的 context/KV budget 拒绝与未知 LoRA 拒绝同此）。
+- **SAVE 防 slot 复用腐蚀**：`KvStore::seal` 把被存 block 的 `KvBlockGuard`（与 `block_ids` 1:1）随 save task 持到 pegaflow D2H 落地才 `drop(guards)`（`PegaflowTier::save`）——短请求结束 → slot 回收重分配 → 在途 D2H 抓到新 KV 写进旧 hash 的静默腐蚀窗口依旧封死；guard 在 store runtime 上并发 drop 安全（`BlockPool` 内部同步）。钉住页计入 `pinned_blocks` 供 admission 扣除；`flush` 屏障先 drain 各 save task 再 `flush_saves`（带 P2P 时 `flush_saves_and_registrations`，含 MetaServer 注册），故 evict 前先 flush 仍能把 block 排空，`release_finished_events` 的 `Finished` 延迟释放即 `flush_saves_then`。
+- **测试**：`tests/kv_offload_cpu_hit.rs` 合一个顺序 `#[test]`（避免两 executor 撞同一 device + pegaflow instance_id），两幕——纯 host tier 恢复（act1：`execute_prefill` + `drop_request` 自动 seal → `flush_offload_saves` → `evict_cached_blocks`；act2：手动 `store.resolve_prefix(…, &NeverCancelled)` 拿 `KvPrefix`（`hit_tokens ≥` 期望下界），hold 存续过 `execute_prefill` 的 match 后 drop）与 GPU+host 组合 hit（3+3 块接成一段连续前缀）；两幕都对冷/暖 first-token logits（argmax regret ≤0.20 / head mean ≤0.06 nat，bf16 floor）。

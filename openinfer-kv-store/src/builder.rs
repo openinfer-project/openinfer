@@ -2,6 +2,7 @@
 //! [`KvStoreBuilder::build`].
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
@@ -117,6 +118,8 @@ impl KvStoreBuilder {
             resolve_deadline: self.resolve_deadline,
             ranks,
             stats: Arc::new(KvStoreStats::default()),
+            resolve_enabled: AtomicBool::new(true),
+            l1_retention_disabled: AtomicBool::new(false),
         }
     }
 }
@@ -186,11 +189,4 @@ pub struct OffloadRankSpec {
     pub device_id: i32,
     /// The rank's GPU arenas, one pegaflow "layer" each (see [`ArenaSpec`]).
     pub arenas: Vec<ArenaSpec>,
-    /// `false` = layer-first (one pegaflow layer per arena, interleave in
-    /// `block_stride_bytes`) — the native openinfer layout. `true` =
-    /// page-first: each block stored as one host page holding every layer at
-    /// its name-sorted offset; only to join a namespace whose writer (the
-    /// vLLM connector on MLA models) stores blocks that way — with layer
-    /// names and per-layer block bytes identical to the writer's.
-    pub page_first: bool,
 }

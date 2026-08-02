@@ -14,8 +14,8 @@ use openinfer_core::sampler::SamplingParams;
 use openinfer_core::tensor::HiddenStates;
 use openinfer_kernels::ops::NumericPolicy;
 use openinfer_kernels::ops::numeric_policy;
-use openinfer_kv_cache::KvBuffer;
-use openinfer_kv_cache::KvView;
+use openinfer_kv_store::KvBuffer;
+use openinfer_kv_store::KvView;
 
 use super::batch_decode_buffers::BatchDecodeBuffers;
 use super::config::PREFILL_ATTENTION_CTA_TILE_Q;
@@ -251,7 +251,7 @@ impl Qwen3Model {
                     .collect();
                 let last_page_lens: Vec<usize> = prefill_views
                     .iter()
-                    .map(openinfer_kv_cache::KvView::last_page_len)
+                    .map(openinfer_kv_store::KvView::last_page_len)
                     .collect();
                 Some(PrefillPagedPlan::from_raw_batch_with_cta_tile_q(
                     &self.ctx,
@@ -278,7 +278,7 @@ impl Qwen3Model {
             let last_page_lens: Vec<usize> = prefill_views
                 .iter()
                 .chain(decode_views.iter())
-                .map(openinfer_kv_cache::KvView::last_page_len)
+                .map(openinfer_kv_store::KvView::last_page_len)
                 .collect();
             let mut start_positions = prefill_start_positions;
             start_positions.extend_from_slice(&decode_positions);
