@@ -1043,6 +1043,11 @@ fn start_engine(
             store_arenas,
             &device_ordinals[..local_ranks_early],
             &pools,
+            if mirrored_early {
+                0
+            } else {
+                startup.ranks.start
+            },
             &store_runtime,
         )
     };
@@ -1477,12 +1482,15 @@ fn build_kv_store(
     rank_arenas: Vec<Vec<ArenaSpec>>,
     device_ordinals: &[usize],
     pools: &[Arc<BlockPool>],
+    ranks_start: usize,
     runtime: &tokio::runtime::Handle,
 ) -> Result<Arc<KvStore>> {
+    // The store's rank table is keyed by GLOBAL logical rank — the engines
+    // query it with `ranks.start + local_index` on a multi-process fleet.
     let mut builder = KvStoreBuilder::new(runtime.clone());
     let Some(opts) = opts else {
-        for (rank, pool) in pools.iter().enumerate() {
-            builder = builder.rank(rank, Arc::clone(pool));
+        for (local, pool) in pools.iter().enumerate() {
+            builder = builder.rank(ranks_start + local, Arc::clone(pool));
         }
         return Ok(Arc::new(builder.build()));
     };
@@ -1533,13 +1541,14 @@ fn build_kv_store(
     );
     let ranks = rank_arenas.len();
     let arenas_per_rank = rank_arenas.first().map_or(0, Vec::len);
-    for (rank, (arenas, &device_ordinal)) in
+    for (local, (arenas, &device_ordinal)) in
         rank_arenas.into_iter().zip(device_ordinals).enumerate()
     {
+        let rank = ranks_start + local;
         builder = builder
             .rank_with_offload(
                 rank,
-                Arc::clone(&pools[rank]),
+                Arc::clone(&pools[local]),
                 &host,
                 OffloadRankSpec {
                     instance_id: format!("glm52-rank{rank}"),
