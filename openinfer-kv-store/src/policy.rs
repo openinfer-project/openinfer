@@ -29,8 +29,7 @@ impl CancelProbe for NeverCancelled {
 /// Prefix-cache identity of a resolve, mirroring
 /// `BlockPool::probe_prefix_with_cache_salt`: the producer request and the
 /// resolve must derive identical block hashes or the query keys are
-/// unrelated. Chainable setters over private fields — adding a scope never
-/// churns call sites.
+/// unrelated.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CacheScope<'a> {
     pub(crate) cache_salt: Option<&'a str>,
@@ -54,8 +53,7 @@ impl<'a> CacheScope<'a> {
     }
 }
 
-/// Per-request read policy for [`crate::KvStore::resolve_prefix`]. Chainable
-/// setters over private fields, so adding a policy never churns call sites.
+/// Per-request read policy for [`crate::KvStore::resolve_prefix`].
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ResolvePolicy {
     pub(crate) wait_for_full_hit: bool,

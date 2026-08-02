@@ -16,13 +16,18 @@ use crate::store::RankState;
 /// derived values.
 type RankDecl = (usize, Arc<BlockPool>, Option<Arc<dyn HostTier>>);
 
-/// Builds a [`KvStore`]: all knobs are chainable setters (no options struct
-/// to churn), every rank's surfaces are declared here, and the rank table
-/// freezes at [`Self::build`] — the store's read paths take no lock. Derived
-/// values (per-rank pin budgets) are computed at `build`, so setter order
-/// never matters. Models whose pools are currently constructed inside engine
-/// threads hoist that construction to before spawn (a `BlockPool` is a pure
-/// CPU object with no thread affinity).
+/// The qwen3 remote-fetch re-query cadence this store generalizes.
+const DEFAULT_REQUERY_INTERVAL: Duration = Duration::from_millis(5);
+/// The qwen3 handoff deadline this store generalizes.
+const DEFAULT_RESOLVE_DEADLINE: Duration = Duration::from_secs(15);
+/// Pending bench calibration (#824).
+const DEFAULT_CACHEABLE_PIN_PERCENT: usize = 25;
+
+/// Builds a [`KvStore`]. The rank table freezes at [`Self::build`] — the
+/// store's read paths take no lock — and derived values (per-rank pin
+/// budgets) are computed there, never in setters. A `BlockPool` is a pure
+/// CPU object with no thread affinity: construct pools before engine
+/// threads spawn.
 pub struct KvStoreBuilder {
     runtime: tokio::runtime::Handle,
     requery_interval: Duration,
@@ -36,11 +41,9 @@ impl KvStoreBuilder {
     pub fn new(runtime: tokio::runtime::Handle) -> Self {
         Self {
             runtime,
-            // The qwen3 remote-fetch cadence this generalizes (5ms re-query,
-            // 15s handoff deadline).
-            requery_interval: Duration::from_millis(5),
-            resolve_deadline: Duration::from_secs(15),
-            cacheable_pin_percent: 25,
+            requery_interval: DEFAULT_REQUERY_INTERVAL,
+            resolve_deadline: DEFAULT_RESOLVE_DEADLINE,
+            cacheable_pin_percent: DEFAULT_CACHEABLE_PIN_PERCENT,
             ranks: Vec::new(),
         }
     }
