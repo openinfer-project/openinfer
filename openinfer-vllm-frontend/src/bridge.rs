@@ -44,7 +44,9 @@ use vllm_engine_core_client::protocol::output::StopReason;
 use vllm_engine_core_client::protocol::output::UtilityCallOutput;
 use vllm_engine_core_client::protocol::request::EngineCoreRequest;
 use vllm_engine_core_client::protocol::request::EngineCoreRequestType;
+use vllm_engine_core_client::protocol::stats::BaseCacheStats;
 use vllm_engine_core_client::protocol::stats::PrefillStats;
+use vllm_engine_core_client::protocol::stats::PrefixCacheStats;
 use vllm_engine_core_client::protocol::stats::SchedulerStats;
 use vllm_engine_core_client::protocol::utility::UtilityCallId;
 use vllm_engine_core_client::protocol::utility::UtilityOutput;
@@ -680,6 +682,18 @@ async fn publish_scheduler_stats(
                 0.0
             } else {
                 snapshot.kv_used_blocks as f64 / snapshot.kv_total_blocks as f64
+            },
+            // Wire prefix-cache counters through to the upstream
+            // `prefix_cache_queries_total` / `prefix_cache_hits_total` gauges.
+            // Schedulers that do not yet track these leave them at 0, so the
+            // pipeline stays correct (metrics read 0) rather than silent.
+            prefix_cache_stats: PrefixCacheStats {
+                base: BaseCacheStats {
+                    queries: snapshot.prefix_cache_queries,
+                    hits: snapshot.prefix_cache_hits,
+                    ..BaseCacheStats::default()
+                },
+                ..PrefixCacheStats::default()
             },
             ..SchedulerStats::default()
         };

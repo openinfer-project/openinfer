@@ -570,6 +570,8 @@ async fn load_snapshots_become_stats_only_batches() {
         kv_total_blocks: 100,
         num_running_reqs: 2,
         num_waiting_reqs: 1,
+        prefix_cache_queries: 80,
+        prefix_cache_hits: 64,
     });
     let (output_tx, mut output_rx) = mpsc::unbounded_channel();
     let shutdown = CancellationToken::new();
@@ -591,6 +593,11 @@ async fn load_snapshots_become_stats_only_batches() {
     assert_eq!(stats.num_running_reqs, 2);
     assert_eq!(stats.num_waiting_reqs, 1);
     assert!((stats.kv_cache_usage - 0.25).abs() < 1e-9);
+    // Prefix-cache counters must be wired through to SchedulerStats so the
+    // upstream `prefix_cache_queries_total` / `prefix_cache_hits_total`
+    // gauges reflect real hits instead of staying 0.
+    assert_eq!(stats.prefix_cache_stats.base.queries, 80);
+    assert_eq!(stats.prefix_cache_stats.base.hits, 64);
 
     load_tx.send_replace(LoadSnapshot::default());
     let batch = match output_rx.recv().await.expect("drained stats batch") {

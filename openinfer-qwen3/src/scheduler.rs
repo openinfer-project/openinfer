@@ -515,12 +515,17 @@ fn publish_load<E: ModelExecutor>(
     executor: &E,
     num_running_reqs: u64,
     num_waiting_reqs: u64,
+    prefix_cache_queries: u64,
+    prefix_cache_hits: u64,
 ) {
     load_tx.send_replace(LoadSnapshot {
         kv_used_blocks: kv_total.saturating_sub(executor.available_blocks() as u64),
         kv_total_blocks: kv_total,
         num_running_reqs,
         num_waiting_reqs,
+        prefix_cache_queries,
+        prefix_cache_hits,
+        ..Default::default()
     });
 }
 
@@ -552,6 +557,10 @@ fn scheduler_loop<E>(
     // Decode-overlap async prefill: pending requests whose prefill is in-flight
     // on the prefill overlap stream. `None` when no async prefill is running.
     let mut inflight_prefill_pending: Option<Vec<PendingRequest>> = None;
+    // Prefix-cache counters surfaced to the vLLM frontend metrics. Accumulated
+    // across the scheduler's lifetime from each step's first-chunk queries/hits.
+    let mut prefix_cache_queries: u64 = 0;
+    let mut prefix_cache_hits: u64 = 0;
 
     info!("Scheduler ready");
 
@@ -564,6 +573,8 @@ fn scheduler_loop<E>(
                 + prefilling.len()
                 + inflight_prefill_pending.as_ref().map_or(0, Vec::len)) as u64,
             (deferred.len() + loading.len()) as u64,
+            prefix_cache_queries,
+            prefix_cache_hits,
         );
         // Flush the prior step's cache changes to a router (no-op unless the
         // event feed is on). Top-of-loop, like `publish_load`: one pass per
@@ -590,6 +601,8 @@ fn scheduler_loop<E>(
                     scheduled_at_unix_s,
                 };
                 let effects = resolve_step(&executor, &active, artifacts);
+                prefix_cache_queries += effects.prefix_queries;
+                prefix_cache_hits += effects.prefix_hits;
                 apply_effects(
                     &mut executor,
                     &mut active,
@@ -724,6 +737,8 @@ fn scheduler_loop<E>(
 
                 // Only apply decode effects from the unified result.
                 let effects = resolve_step(&executor, &active, artifacts);
+                prefix_cache_queries += effects.prefix_queries;
+                prefix_cache_hits += effects.prefix_hits;
                 apply_effects(
                     &mut executor,
                     &mut active,
@@ -754,6 +769,8 @@ fn scheduler_loop<E>(
             }
         };
         let effects = resolve_step(&executor, &active, artifacts);
+        prefix_cache_queries += effects.prefix_queries;
+        prefix_cache_hits += effects.prefix_hits;
         apply_effects(
             &mut executor,
             &mut active,
@@ -783,6 +800,10 @@ fn scheduler_loop_with_lora_control<E>(
     let mut pending_control: VecDeque<EngineControlRequest> = VecDeque::new();
     let mut post_control_deferred: Vec<PendingRequest> = Vec::new();
     let mut tracker = phase_trace::PhaseTracker::default();
+    // Prefix-cache counters surfaced to the vLLM frontend metrics. Accumulated
+    // across the scheduler's lifetime from each step's first-chunk queries/hits.
+    let mut prefix_cache_queries: u64 = 0;
+    let mut prefix_cache_hits: u64 = 0;
 
     info!("Scheduler ready with LoRA control");
 
@@ -793,6 +814,8 @@ fn scheduler_loop_with_lora_control<E>(
             &executor,
             (active.len() + prefilling.len()) as u64,
             (deferred.len() + loading.len() + post_control_deferred.len()) as u64,
+            prefix_cache_queries,
+            prefix_cache_hits,
         );
 
         // 1. Drain incoming commands. Generation submitted after a pending
@@ -925,6 +948,8 @@ fn scheduler_loop_with_lora_control<E>(
             }
         };
         let effects = resolve_step(&executor, &active, artifacts);
+        prefix_cache_queries += effects.prefix_queries;
+        prefix_cache_hits += effects.prefix_hits;
         apply_effects(
             &mut executor,
             &mut active,

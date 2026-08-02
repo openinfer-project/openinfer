@@ -93,6 +93,15 @@ pub(super) struct StepEffects {
     pub(super) prompt_echoes: Vec<PromptEchoEffect>,
     pub(super) pending: Vec<PendingEffect>,
     pub(super) decode: Vec<DecodeEffect>,
+    /// Prefix-cache queries counted this step: one per request whose first
+    /// prefill chunk ran (a `queries` increment in vLLM terms). Carried into
+    /// `LoadSnapshot.prefix_cache_queries` for the vLLM frontend metrics.
+    pub(super) prefix_queries: u64,
+    /// Prefix-cache hit tokens counted this step: the sum of `cached_tokens`
+    /// across first-chunk requests (a `hits` increment in vLLM terms, token
+    /// granularity rather than block). Carried into
+    /// `LoadSnapshot.prefix_cache_hits` for the vLLM frontend metrics.
+    pub(super) prefix_hits: u64,
 }
 
 impl StepEffects {
@@ -102,6 +111,8 @@ impl StepEffects {
             prompt_echoes: Vec::new(),
             pending: Vec::new(),
             decode: Vec::new(),
+            prefix_queries: 0,
+            prefix_hits: 0,
         }
     }
 }
