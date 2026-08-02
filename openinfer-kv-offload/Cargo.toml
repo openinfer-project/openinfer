@@ -25,6 +25,9 @@ openinfer-kv-cache = { workspace = true }
 pegaflow-core = { git = "https://github.com/novitalabs/pegaflow.git", rev = "14112403bc1d0ed5b44717c0a93743fb0de66fee", default-features = false, features = [
   "rdma",
 ] }
+# pegaflow accepts rdma-mummy-sys 0.2.4, whose bindgen version emits opaque
+# ibverbs structs with LLVM 22. Require 0.2.5 until pegaflow raises its floor.
+rdma-mummy-sys = "0.2.5"
 tokio = { workspace = true }
 tokio-stream = { workspace = true, features = ["net"] }
 xxhash-rust = { workspace = true }
