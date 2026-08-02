@@ -169,12 +169,18 @@ impl OffloadEngine {
             &reg.kv_stride_bytes,
             &reg.segments,
             Some(reg.block_stride_bytes.as_slice()),
-            // Direct (cuMemcpyAsync on the DMA engines). The Kernel backend
-            // was A/B'd for the fragmented bulk-restore batches (#704) and
-            // measured WORSE for co-resident decode: its grid-strided copy
-            // kernels compete for SMs with decode kernels, stretching the
-            // stall (two ~110ms waves vs Direct's one).
-            pegaflow_core::TransferMode::Direct,
+            // Direct (cuMemcpyAsync on the DMA engines) by default: the
+            // Kernel backend was A/B'd for the fragmented bulk-restore
+            // batches (#704) and measured WORSE for co-resident decode (its
+            // grid-strided copy kernels compete for SMs with decode
+            // kernels). On a prefill-only rank there is no decode to
+            // protect, and Direct's per-fragment cuMemcpyAsync serializes
+            // badly on host-restore storms — OPENINFER_KV_TRANSFER_MODE
+            // selects per deployment.
+            match std::env::var("OPENINFER_KV_TRANSFER_MODE").as_deref() {
+                Ok("kernel") => pegaflow_core::TransferMode::Kernel,
+                _ => pegaflow_core::TransferMode::Direct,
+            },
             // Layer-first (false): one pegaflow layer per model layer, the
             // page-interleaved gap expressed via `block_stride_bytes` — the
             // native openinfer layout. Page-first (true) instead stores each

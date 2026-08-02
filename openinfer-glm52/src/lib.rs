@@ -1344,12 +1344,28 @@ fn build_rank_models(
         Some(pinned) => {
             // A pin below the one-request floor would advertise a cap no
             // request can ever fit — admission then parks the impossible
-            // request at the FIFO head forever. Refuse loudly instead.
+            // request at the FIFO head forever. And a pin above the measured
+            // affordable count would either fail slab allocation outright or
+            // eat into the graph reserve and die at pre-capture — the A/B
+            // knob must stay inside both fences. Refuse loudly either way.
             let one_request = glm52_one_request_pool_blocks(max_model_len);
             ensure!(
                 pinned >= one_request,
                 "GLM52_KV_POOL_BLOCKS={pinned} is below the {one_request}-block one-request \
                  floor for max_model_len {max_model_len}"
+            );
+            let affordable = glm52_measured_pool_blocks(
+                min_free_bytes,
+                post_finish_reserve_bytes,
+                slab_bytes_per_block,
+                one_request,
+            );
+            ensure!(
+                pinned <= affordable,
+                "GLM52_KV_POOL_BLOCKS={pinned} exceeds the {affordable}-block measured \
+                 affordable count (min rank free {} - reserves at {} per block)",
+                ByteSize(min_free_bytes as u64),
+                ByteSize(slab_bytes_per_block as u64),
             );
             pinned
         }
