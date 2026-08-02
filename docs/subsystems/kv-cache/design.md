@@ -238,7 +238,7 @@ while let Ok((req, kv_prefix)) = submit_rx.try_recv() {
 
 - `Handoff` 租约的超时回收与释放时机（D fetch 完成即释放 vs admission 断言通过才释放）——防腐层里对 pegaflow lease 语义定。
 - miss-breaker（连续冷 miss 停止 park）是跨请求策略，qwen3 迁移时决定放 store 还是 scheduler。
-- 水位下推进池锁内（彻底闭合 TOCTOU）是 hardening 项，骨架先用 store 侧原子。
+- 水位下推进池锁内（彻底闭合 TOCTOU）是 hardening 项，骨架先用 store 侧原子。同族 hardening：resolve 的池等待目前是轮询（与租约重建的 re-query 天然同拍，损失 ≤ requery_interval 的唤醒延迟）；理想形态是把异步等待下推进分配器（池内 `async reserve_blocks(n)`，waiters 挂在唯一真相旁）——外挂信号量镜像可用量会造第二本账。信号量类比的适用边界：块非同质 permit（free vs warm-evictable，分配顺序影响命中率）、双权限等级（动态水位）、admission 的等待队列是显式调度策略（顺序/拒绝/观测）而非锁的匿名 waiter list——故信号量语义只属于分配器内部，不是分配的全部模型。
 - pegaflow fork 与否：防腐层（`HostTier`）稳定运行后再议；`QueryOutcome::Loading` 的轮询套轮询是第一改造对象。
 
 **Next**: qwen3 首迁 PR（迁移计划第 2 步）。
