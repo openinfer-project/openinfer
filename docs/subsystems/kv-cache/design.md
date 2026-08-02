@@ -55,13 +55,20 @@ pub struct KvSpec {
 }
 
 pub struct GroupSpec {
+    // 分期契约：字段随首个消费者落地，此处为完整目标形态。
+    // name/checkpointable/optional @ qwen3 首迁；sharding @ glm52 D 侧；
+    // kind @ qwen35（首个 Bounded 消费者）。trait 只有模型 crate 实现，
+    // 后加字段是一次性机械改动——无人消费的字段不提前进代码。
+
     /// 身份：store schema 命名空间与 arena 归属的连接点。
     pub name: &'static str,
     /// Paged（页写满原地封存）| Bounded（seal-by-copy）。三个消费者：
-    /// 分配器（pool/slab）、封存路径、checkpoint 索引（bounded 定义快照边界）。
+    /// 分配器（pool/slab）、封存路径、checkpoint 索引（bounded 定义快照
+    /// 边界）——全部随 qwen35 迁移出现，字段届时才落地。
     pub kind: GroupKind,
     /// Replicated：rank0 存、任意 rank 恢复（MLA latent、qwen35 GDN——glm52
     /// 今天的共享 namespace 就是此语义）；PerRank：各 rank 存取自己的分片。
+    /// 首个消费者是 glm52 D 侧的存储去重，字段届时落地。
     pub sharding: Sharding,
     /// 见「Checkpointable 属性」。构建期判定一次、engine 生命周期常量：
     /// enabled = !cli_no_prefix_cache && all(groups.checkpointable)。
