@@ -6,6 +6,7 @@ adapter = "fp8_gemm_groupwise"
 # SM100 CUTLASS template — instantiates only on sm_100a-family builds; other
 # targets return NOT_SUPPORTED at runtime.
 capability = { blackwell_only = true }
+scratch = "32 MiB CUTLASS grouped-scheduler/tensormap workspace carved inside the FFI (fp8.rs FP8_GEMM_WORKSPACE_BYTES); allocated as bench warmup material, never timed"
 [axes]
 # 4/8 straddle the GEMV<->GEMM crossover; 16/32/48 are the verify-span
 # buckets; 64 is the span-8 x bucket-8 upper probe. All satisfy m%4==0.

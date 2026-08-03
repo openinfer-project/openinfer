@@ -44,6 +44,9 @@ def test_manifest_metadata():
         # Per-rank projection shapes — EP-independent by construction.
         assert m.phase == 1
         assert m.capability.get("blackwell_only") is True
+        # Scratch is manifest-declared: these units carve the fixed CUTLASS
+        # workspace inside the FFI (fp8.rs FP8_GEMM_WORKSPACE_BYTES).
+        assert "FP8_GEMM_WORKSPACE_BYTES" in m.scratch
         assert list(m.rows) == EXPECTED_ROWS
         assert m.shape == {"n": n, "k": k}
         assert m.tolerance["rel_l2"] == 0.02

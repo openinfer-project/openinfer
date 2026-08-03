@@ -70,8 +70,9 @@ def test_shape_derivation():
 def test_mtp_verify_rows_derivation():
     # rows 16/32/64 = MTP span-mapped verify rows (span-8 x bucket-8 = 64):
     # buffers scale linearly with rows, scale/weight are rows-independent.
-    # The fp8_gemm scratch is the fixed 32 MiB workspace (fp8.rs
-    # FP8_GEMM_WORKSPACE_BYTES), not the GEMV ksplit surface.
+    # scratch is declared per-unit by the manifest `scratch` key (fp8_gemm =
+    # the 32 MiB workspace carved inside the FFI, fp8.rs
+    # FP8_GEMM_WORKSPACE_BYTES); derive_shapes just passes it through.
     m = manifest.load_manifest(MANIFESTS / "fp8_gemm.q_b.toml")
     shapes = {v.rows: v for v in m.derive_shapes()}
     for rows in (16, 32, 64):
@@ -126,3 +127,37 @@ def test_demo_symbol_resolvable_when_so_present():
         assert getattr(lib, unit.manifest.symbol, None) is not None, (
             f"{unit.manifest.symbol} not exported by {so}"
         )
+
+
+
+def test_dsl_tc_scratch_matches_tile_cfg():
+    """Manifest `scratch` must agree with the TILE_CFG split_k source of truth."""
+    from kernel_lab.units.fp8_gemm_dsl_tc import TILE_CFG
+
+    by_unit = {m.unit: m for m in manifest.load_dir(MANIFESTS) if m.unit.startswith("fp8_gemm_dsl_tc.")}
+    assert len(by_unit) == 4
+    shape_of = {
+        "fp8_gemm_dsl_tc.q_b": (16384, 2048),
+        "fp8_gemm_dsl_tc.o_proj": (6144, 16384),
+        "fp8_gemm_dsl_tc.shared_gate_up": (4096, 6144),
+        "fp8_gemm_dsl_tc.shared_down": (6144, 2048),
+    }
+    for unit, (n, k) in shape_of.items():
+        _, split_k = TILE_CFG[(n, k)]
+        text = by_unit[unit].scratch
+        if split_k == 1:
+            assert text.startswith("none"), (unit, split_k, text)
+        else:
+            assert f"({split_k}, rows, n)" in text, (unit, split_k, text)
+
+
+def test_scratch_default_when_key_absent(tmp_path):
+    """Manifests without a `scratch` key load with the explicit default."""
+    src = (MANIFESTS / "fp8_gemm.q_b.toml").read_text(encoding="utf-8")
+    scrubbed = "\n".join(line for line in src.splitlines() if not line.startswith("scratch ="))
+    assert scrubbed != src  # the on-disk manifest really has the key
+    legacy = tmp_path / "fp8_gemm.q_b.toml"
+    legacy.write_text(scrubbed, encoding="utf-8")
+    m = manifest.load_manifest(legacy)
+    assert m.scratch == "unit-managed (see notes)"
+    assert all(v.scratch_rule == "unit-managed (see notes)" for v in m.derive_shapes())

@@ -37,7 +37,7 @@ class ShapeVariant:
     weight_bytes: int     # e4m3 [n, k]
     scale_len_bytes: int  # f32 [ceil(n/128), ceil(k/128)] as raw bytes
     out_elems: int        # bf16 [rows, n]
-    scratch_rule: str     # human-readable f32 scratch sizing rule
+    scratch_rule: str     # human-readable scratch sizing rule (manifest `scratch` key)
 
 
 @dataclass(frozen=True)
@@ -51,6 +51,7 @@ class Manifest:
     shape: dict = field(default_factory=dict)
     contract: dict = field(default_factory=dict)
     reference: dict = field(default_factory=dict)
+    scratch: str = "unit-managed (see notes)"
     path: Path | None = field(default=None, compare=False)
 
     @property
@@ -76,11 +77,7 @@ class Manifest:
                 weight_bytes=n * k,
                 scale_len_bytes=scale_len,
                 out_elems=r * n,
-                scratch_rule=(
-                    "f32 scratch floats = ksplit * rows * n, ksplit from "
-                    "glm52_gemv_mma_ksplit_cuda(rows, n, k); ksplit == 0 "
-                    "(register-tile route) means no scratch"
-                ),
+                scratch_rule=self.scratch,
             )
             for r in self.rows
         ]
@@ -162,6 +159,10 @@ def load_manifest(path: str | Path) -> Manifest:
         if not isinstance(tol, dict) or not isinstance(tol.get("rel_l2"), (int, float)) or tol["rel_l2"] <= 0:
             raise _fail(path, "[reference.tolerance] needs a positive rel_l2")
 
+    scratch = raw.get("scratch", "unit-managed (see notes)")
+    if not isinstance(scratch, str) or not scratch:
+        raise _fail(path, "scratch must be a non-empty string when present")
+
     return Manifest(
         unit=unit,
         phase=phase,
@@ -172,6 +173,7 @@ def load_manifest(path: str | Path) -> Manifest:
         shape=shape,
         contract=contract,
         reference=reference,
+        scratch=scratch,
         path=path,
     )
 

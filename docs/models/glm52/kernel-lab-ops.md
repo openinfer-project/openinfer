@@ -64,7 +64,9 @@ Facts worth memorizing before touching anything:
    `^[a-z][a-z0-9_]*(\.[a-z0-9_]+)+$`. Fill: `phase`, `symbol` (the extern "C"
    name), `adapter` (snake_case module), `capability`, `[axes].rows` (subset
    of `manifest.DECODE_ROWS`), `[shape].n/k` (k % 128 == 0), `[contract]`,
-   `[reference]` tolerance (`rel_l2 > 0`).
+   `[reference]` tolerance (`rel_l2 > 0`). Optional top-level `scratch`: the
+   human-readable scratch sizing rule surfaced in stats/ledger rows; omit it
+   and the default is "unit-managed (see notes)".
 3. **Adapter** `kernel_lab/units/<adapter>.py`: implement exactly
    `make_inputs(shape, seed)` / `run(lib, tensors, shape, stream)` /
    `reference(tensors, shape)` and set module-level `SYMBOL` equal to the
