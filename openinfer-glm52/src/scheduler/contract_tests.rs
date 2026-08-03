@@ -12,8 +12,11 @@ use openinfer_core::engine::KvPrefix;
 use openinfer_core::engine::LoadSnapshot;
 use openinfer_core::engine::TokenSink;
 use openinfer_kv_store::BlockPool;
+use openinfer_kv_store::CacheScope;
 use openinfer_kv_store::KvStore;
 use openinfer_kv_store::KvStoreBuilder;
+use openinfer_kv_store::NeverCancelled;
+use openinfer_kv_store::ResolvePolicy;
 use openinfer_kv_store::SaveCursor;
 use openinfer_sample::SamplingParams;
 
@@ -23,7 +26,10 @@ use super::RankSlots;
 use super::admission::lifetime_blocks;
 use super::admit_from_queue;
 use super::graph::graph_dump_bucket;
+use super::offload::NativeAnchorPlan;
+use super::offload::NativeMtpHandoff;
 use super::offload::Resolved;
+use super::offload::native_pd_tail_len;
 use super::publish_load;
 use super::slot::GLM52_DSPARK_EP8_SPAN_DRAFTS;
 use super::slot::Glm52SlotState;
@@ -262,6 +268,178 @@ fn admission_sheds_rear_prefix_holds_when_the_front_cannot_fit() {
             assert_eq!(prefix.hit_tokens(), 0, "queued holds were shed, not kept");
         }
     }
+}
+
+#[test]
+fn admission_admits_a_page_aligned_full_hit_at_exact_pool_capacity() {
+    // A page-aligned prompt fully cached: the GPU probe matches every prompt
+    // block, but the resolve caps the hit one block short (the final chunk
+    // must recompute to emit the first token). The returned hold must pin
+    // exactly hit_tokens/PAGE blocks — a hold that kept the capped block
+    // pinned would, at exact pool capacity, make the front wait forever on
+    // the very block its own hold withholds from the budget.
+    let pool = Arc::new(BlockPool::new(PAGE, 4));
+    let (store, rt) = test_store(&pool);
+
+    let prompt: Vec<u32> = (0..2 * PAGE as u32).map(|t| 40_000 + t).collect();
+    let mut producer = pool.new_request(prompt.clone(), 1, None);
+    producer
+        .schedule_prefill(2 * PAGE, &pool)
+        .expect("producer prefill");
+    producer
+        .apply_prefill(50_000, &pool)
+        .expect("producer apply");
+    producer.release().expect("producer release");
+
+    let prefix = rt.block_on(store.resolve_prefix(
+        0,
+        "aligned",
+        &prompt,
+        CacheScope::default(),
+        ResolvePolicy::default(),
+        &NeverCancelled,
+    ));
+    assert_eq!(
+        prefix.hit_tokens(),
+        PAGE,
+        "the cap leaves the final block uncached"
+    );
+    assert_eq!(
+        pool.available_blocks(),
+        2,
+        "the hold pins exactly hit_tokens/PAGE blocks"
+    );
+
+    let mut slots: RankSlots = std::array::from_fn(|_| None);
+    let mut pending = VecDeque::new();
+    let mut req = request(prompt, SamplingParams::default(), 1);
+    let (token_tx, _token_rx) = TokenSink::standalone();
+    req.token_tx = token_tx;
+    pending.push_back(Resolved::Plain { req, prefix });
+    let mut pending_resets = Vec::new();
+
+    admit_from_queue(
+        0,
+        &mut pending,
+        &mut slots,
+        &pool,
+        3,
+        &store,
+        true,
+        false,
+        false,
+        &mut pending_resets,
+    )
+    .expect("a fully-cached page-aligned prompt at exact capacity must admit");
+
+    assert!(pending.is_empty(), "front admitted, not deferred");
+    assert_eq!(slots.iter().flatten().count(), 1);
+}
+
+#[test]
+fn budget_stalled_front_lets_a_fitting_resident_native_bypass() {
+    // The FIFO deadlock shape: the front's lifetime cannot fit the pool, the
+    // queue behind it holds a resident Native (its pages are the request's
+    // own assignment — unsheddable, un-re-resolvable), and no slot is active
+    // to retire. Admitting the fitting Native out of order is the only
+    // transition that ever frees its pages.
+    let pool = Arc::new(BlockPool::new(PAGE, 8));
+    let (store, _rt) = test_store(&pool);
+
+    let mut slots: RankSlots = std::array::from_fn(|_| None);
+    let mut pending = VecDeque::new();
+
+    let mut front = request(vec![2; 6 * PAGE], SamplingParams::default(), 1);
+    let (front_tx, _front_rx) = TokenSink::standalone();
+    front.token_tx = front_tx;
+    pending.push_back(plain(front));
+
+    // A resolver-built native restore: resident full pages plus the adopted
+    // anchor, exactly what `native_pd_resolve` hands admission.
+    let native_prompt: Vec<u32> = (0..(3 * PAGE + 1) as u32).map(|t| 80_000 + t).collect();
+    let mut kv = pool.new_request(native_prompt.clone(), 2, None);
+    kv.schedule_prefill(3 * PAGE, &pool)
+        .expect("native restore chunk");
+    kv.apply_prefill_chunk(&pool).expect("native restore apply");
+    kv.adopt_external_prefill_anchor()
+        .expect("native anchor adoption");
+    let anchor = *native_prompt.last().expect("anchor token");
+    let handoff = NativeMtpHandoff {
+        draft_tokens: [90_001; crate::mtp::GLM52_MTP_DRAFTS],
+        committed_len: 3 * PAGE,
+        arena_count: 101,
+        tail_len: native_pd_tail_len(3 * PAGE),
+        tail_key: Some("00".repeat(16)),
+        anchor_token_id: anchor,
+        anchor_emitted: true,
+    };
+    let plan = NativeAnchorPlan {
+        token: anchor,
+        replay_to_client: false,
+        emitted_by_prefill: true,
+    };
+    let mut native_req = request(native_prompt, SamplingParams::default(), 1);
+    let (native_tx, _native_rx) = TokenSink::standalone();
+    native_req.token_tx = native_tx;
+    pending.push_back(Resolved::Native {
+        req: native_req,
+        kv: Box::new(kv),
+        cached_tokens: 3 * PAGE,
+        handoff,
+        plan,
+    });
+    let mut pending_resets = Vec::new();
+
+    admit_from_queue(
+        0,
+        &mut pending,
+        &mut slots,
+        &pool,
+        7,
+        &store,
+        true,
+        false,
+        false,
+        &mut pending_resets,
+    )
+    .expect("bypassing a budget-stalled front is not an admission error");
+
+    assert_eq!(
+        slots.iter().flatten().count(),
+        1,
+        "the resident Native admitted"
+    );
+    assert!(
+        slots
+            .iter()
+            .flatten()
+            .any(|active| active.client_prompt_tokens == 3 * PAGE + 1),
+        "the admitted slot is the Native, not the front"
+    );
+    assert_eq!(pending.len(), 1, "the too-big front stays queued in order");
+
+    // Once the Native retires, its pages return and the front admits.
+    let mut released = slots
+        .iter_mut()
+        .find_map(Option::take)
+        .expect("admitted native");
+    released.kv.release().expect("native release");
+    drop(released);
+    admit_from_queue(
+        0,
+        &mut pending,
+        &mut slots,
+        &pool,
+        7,
+        &store,
+        true,
+        false,
+        false,
+        &mut pending_resets,
+    )
+    .expect("front admits after the native retires");
+    assert!(pending.is_empty());
+    assert_eq!(slots.iter().flatten().count(), 1);
 }
 
 /// Drive one request end to end through the engine's exact schedule/apply

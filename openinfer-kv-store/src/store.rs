@@ -1,6 +1,7 @@
 //! [`KvStore`] itself: the resolve/seal/retire orchestration over the
 //! per-rank surfaces frozen by [`crate::KvStoreBuilder`].
 
+use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -40,6 +41,38 @@ pub(crate) struct RankState {
     /// reservation until the DMA settles). Teardown must drain this to zero
     /// before the GPU arenas are freed.
     pub(crate) loads_pending: Arc<AtomicUsize>,
+}
+
+/// Terminal failure of [`KvStore::resolve_keyed_block`]. The variants differ
+/// in exactly one contract: whether the H2D into the caller's destination
+/// page may still be in flight.
+pub enum KeyedFetchError {
+    /// The tier settled (or the load was never submitted): no DMA targets
+    /// the destination page, so the caller may free it immediately.
+    Settled(anyhow::Error),
+    /// The resolve deadline passed with the load unsettled: a detached task
+    /// still owns a DMA targeting the caller's destination page. The caller
+    /// must move whatever pins that page into `parking` before releasing the
+    /// KV it belongs to.
+    Abandoned {
+        error: anyhow::Error,
+        parking: KeyedLoadParking,
+    },
+}
+
+/// One-shot slot for the destination pin of an abandoned keyed-tail load.
+/// The detached load task holds the other end and drops whatever is parked
+/// here only after the tier settles — the invariant this carries: an
+/// abandoned keyed-tail DMA never writes a freed page.
+pub struct KeyedLoadParking(oneshot::Sender<Box<dyn Any + Send>>);
+
+impl KeyedLoadParking {
+    /// Hand the destination pin to the detached load task. If the load
+    /// settled between the timeout and this call, the pin comes straight
+    /// back and drops here — safe either way, the DMA is over.
+    pub fn park(self, pin: Box<dyn Any + Send>) {
+        let _ = self.0.send(pin);
+    }
 }
 
 /// Decrements a counter when dropped — tied to the load task's future so the
@@ -105,11 +138,17 @@ impl KvStore {
         // outside the reusable prefix.
         let cacheable_blocks = prompt_tokens.len().saturating_sub(1) / block_size;
 
-        let finish = |probe: PrefixProbe| {
+        let finish = |mut probe: PrefixProbe| {
             let hit_blocks = probe.held_blocks().min(cacheable_blocks);
             if hit_blocks == 0 {
                 return KvPrefix::none();
             }
+            // Credit/pin parity: admission credits the hold with exactly
+            // `hit_tokens / block_size` blocks, so the hold must pin exactly
+            // that many. A page-aligned full match holds one block past the
+            // cacheable cap; keeping it pinned would let a front at exact
+            // pool capacity wait forever on the very block its own hold pins.
+            probe.truncate_held(hit_blocks);
             self.stats.resolve_hits.fetch_add(1, Ordering::Relaxed);
             KvPrefix::resolved(hit_blocks * block_size, rank, Box::new(probe))
         };
@@ -403,43 +442,86 @@ impl KvStore {
     /// never enters the radix (no lineage hash to register under).
     ///
     /// The query phase re-queries under the resolve deadline (the producer's
-    /// registration may not have landed); the H2D itself is awaited without
-    /// a timeout — the caller owns the destination page and must keep it
-    /// alive until this returns (drop-on-timeout would race the DMA).
+    /// registration may not have landed); the H2D wait is bounded by the
+    /// same deadline. Past it the wait is abandoned — the DMA is not — and
+    /// the error carries a [`KeyedLoadParking`] the caller must move the
+    /// destination's pin into, because the destination page belongs to the
+    /// caller's scheduled `RequestKv` and the store holds no handle to it.
     pub async fn resolve_keyed_block(
         &self,
         rank: usize,
         req_id: &str,
         key: [u8; 16],
         dst_page_id: i32,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), KeyedFetchError> {
         let state = self.rank(rank);
-        let tier = state
-            .tier
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("rank {rank} has no host tier for a keyed fetch"))?;
+        let tier = state.tier.as_ref().ok_or_else(|| {
+            KeyedFetchError::Settled(anyhow::anyhow!(
+                "rank {rank} has no host tier for a keyed fetch"
+            ))
+        })?;
         let deadline = Instant::now() + self.resolve_deadline;
+        let expired = || {
+            KeyedFetchError::Settled(anyhow::anyhow!(
+                "keyed fetch deadline: key never became resident"
+            ))
+        };
         let hit = loop {
             let query =
                 tokio::time::timeout_at(deadline, tier.query(req_id, vec![key.to_vec()], true));
             match query.await {
-                Err(_elapsed) => anyhow::bail!("keyed fetch deadline: key never became resident"),
-                Ok(Err(err)) => return Err(err.context("keyed fetch query")),
+                Err(_elapsed) => return Err(expired()),
+                Ok(Err(err)) => {
+                    return Err(KeyedFetchError::Settled(err.context("keyed fetch query")));
+                }
                 Ok(Ok(TierQuery::Hit(hit))) if hit.blocks == 1 => break hit,
                 Ok(Ok(TierQuery::Hit(hit))) => {
                     let blocks = hit.blocks;
                     tier.release(hit);
-                    anyhow::bail!("keyed fetch resolved {blocks} blocks for one key");
+                    return Err(KeyedFetchError::Settled(anyhow::anyhow!(
+                        "keyed fetch resolved {blocks} blocks for one key"
+                    )));
                 }
                 Ok(Ok(TierQuery::Miss | TierQuery::Loading)) => {
                     if Instant::now() >= deadline {
-                        anyhow::bail!("keyed fetch deadline: key never became resident");
+                        return Err(expired());
                     }
                     tokio::time::sleep(self.requery_interval).await;
                 }
             }
         };
-        tier.load(hit, vec![dst_page_id]).await
+
+        // Same bounded-abandonment shape as `resolve_prefix`: a spawned task
+        // owns the load future (counted in `loads_pending` for the teardown
+        // barrier), and the deadline abandons only the wait. The task drops
+        // whatever the abandoning caller parks only after the tier settles.
+        let load = tier.load(hit, vec![dst_page_id]);
+        state.loads_pending.fetch_add(1, Ordering::AcqRel);
+        let dec = DecOnDrop(Arc::clone(&state.loads_pending));
+        let (park_tx, park_rx) = oneshot::channel::<Box<dyn Any + Send>>();
+        let join = self.runtime.spawn(async move {
+            let _dec = dec;
+            let result = load.await;
+            // The DMA has settled: releasing the parking end now frees any
+            // parked destination pin, and makes a not-yet-sent park bounce
+            // back to its caller — either way the page outlived the copy.
+            drop(park_rx);
+            result
+        });
+        match tokio::time::timeout_at(deadline, join).await {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(err))) => Err(KeyedFetchError::Settled(err.context("keyed fetch load"))),
+            Ok(Err(join_err)) => Err(KeyedFetchError::Settled(anyhow::anyhow!(
+                "keyed fetch load task failed: {join_err}"
+            ))),
+            Err(_elapsed) => {
+                self.stats.loads_abandoned.fetch_add(1, Ordering::Relaxed);
+                Err(KeyedFetchError::Abandoned {
+                    error: anyhow::anyhow!("keyed fetch deadline: tail load did not settle"),
+                    parking: KeyedLoadParking(park_tx),
+                })
+            }
+        }
     }
 
     /// Wait until every restore H2D on `rank` has settled — including loads
@@ -478,3 +560,131 @@ const _: () = {
     const fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<KvStore>();
 };
+
+#[cfg(test)]
+mod tests {
+    use pegaflow_core::QueryLeaseId;
+    use tokio::sync::Notify;
+
+    use super::*;
+    use crate::BlockPool;
+    use crate::KvBlockGuard;
+    use crate::tier::HostTier;
+    use crate::tier::LeasedBlocks;
+    use crate::tier::TierFuture;
+    use crate::tier::TierQuery;
+
+    /// A tier whose query always hits but whose load stalls until the test
+    /// fires `release_load` — the hung-storage-worker shape the keyed-tail
+    /// deadline exists for.
+    struct StallLoadTier {
+        release_load: Arc<Notify>,
+    }
+
+    impl HostTier for StallLoadTier {
+        fn query(
+            &self,
+            _req_id: &str,
+            block_hashes: Vec<Vec<u8>>,
+            _wait_full: bool,
+        ) -> TierFuture<anyhow::Result<TierQuery>> {
+            let blocks = block_hashes.len();
+            Box::pin(std::future::ready(Ok(TierQuery::Hit(LeasedBlocks {
+                blocks,
+                lease: QueryLeaseId::fresh(),
+            }))))
+        }
+
+        fn load(
+            &self,
+            _hit: LeasedBlocks,
+            _dst_page_ids: Vec<i32>,
+        ) -> TierFuture<anyhow::Result<()>> {
+            let release = Arc::clone(&self.release_load);
+            Box::pin(async move {
+                release.notified().await;
+                Ok(())
+            })
+        }
+
+        fn release(&self, _hit: LeasedBlocks) {}
+
+        fn save(
+            &self,
+            _block_ids: Vec<i32>,
+            _block_hashes: Vec<Vec<u8>>,
+            _guards: Vec<KvBlockGuard>,
+        ) -> TierFuture<anyhow::Result<()>> {
+            Box::pin(std::future::ready(Ok(())))
+        }
+
+        fn flush(&self) -> TierFuture<anyhow::Result<()>> {
+            Box::pin(std::future::ready(Ok(())))
+        }
+    }
+
+    fn stalled_store(runtime: tokio::runtime::Handle, release_load: Arc<Notify>) -> KvStore {
+        let mut ranks = HashMap::new();
+        ranks.insert(
+            0,
+            RankState {
+                pool: Arc::new(BlockPool::new(16, 8)),
+                tier: Some(Arc::new(StallLoadTier { release_load })),
+                pinned: Arc::new(AtomicUsize::new(0)),
+                loads_pending: Arc::new(AtomicUsize::new(0)),
+            },
+        );
+        KvStore {
+            runtime,
+            requery_interval: Duration::from_millis(1),
+            resolve_deadline: Duration::from_millis(50),
+            ranks,
+            stats: Arc::new(KvStoreStats::default()),
+        }
+    }
+
+    /// The keyed-tail invariant: a stalled load abandons the WAIT at the
+    /// deadline (the resolver task is never wedged), and a pin parked with
+    /// the abandoned load is dropped only after the tier settles — an
+    /// abandoned keyed-tail DMA never writes a freed page.
+    #[test]
+    fn keyed_tail_timeout_parks_the_destination_pin_until_the_load_settles() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let release_load = Arc::new(Notify::new());
+        let store = stalled_store(rt.handle().clone(), Arc::clone(&release_load));
+
+        let outcome = rt.block_on(store.resolve_keyed_block(0, "tail", [7u8; 16], 3));
+        let Err(KeyedFetchError::Abandoned { parking, .. }) = outcome else {
+            panic!("a stalled tail load must abandon at the deadline");
+        };
+        assert_eq!(
+            store.rank(0).loads_pending.load(Ordering::Acquire),
+            1,
+            "the detached task still owns the load"
+        );
+        assert_eq!(store.stats.loads_abandoned.load(Ordering::Relaxed), 1);
+
+        let pin = Arc::new(());
+        let watch = Arc::clone(&pin);
+        parking.park(Box::new(pin));
+        assert_eq!(
+            Arc::strong_count(&watch),
+            2,
+            "the parked pin stays alive while the load is unsettled"
+        );
+
+        release_load.notify_one();
+        rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), store.flush_loads(0)).await
+        })
+        .expect("the load settles once the tier releases it");
+        assert_eq!(
+            Arc::strong_count(&watch),
+            1,
+            "the settled load released the parked pin"
+        );
+    }
+}

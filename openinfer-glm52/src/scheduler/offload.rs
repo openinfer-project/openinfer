@@ -281,11 +281,19 @@ pub(super) async fn native_pd_resolve(
             .await
         {
             Ok(()) => {}
-            Err(err) => {
-                // The keyed load settles before returning, so reverting the
-                // schedule here cannot race a DMA into the reverted page.
+            Err(openinfer_kv_store::KeyedFetchError::Settled(err)) => {
+                // The keyed load has settled, so reverting the schedule here
+                // cannot race a DMA into the reverted page.
                 let _ = kv.revert_schedule();
                 return Err(err.context("native P/D tail install"));
+            }
+            Err(openinfer_kv_store::KeyedFetchError::Abandoned { error, parking }) => {
+                // The abandoned DMA still targets the scheduled tail page,
+                // and the KV is the only thing keeping that page allocated.
+                // Park the whole KV with the detached load: its blocks
+                // release only after the tier settles, never under the copy.
+                parking.park(Box::new(kv));
+                return Err(error.context("native P/D tail install"));
             }
         }
         kv.apply_prefill_chunk(pool)?;

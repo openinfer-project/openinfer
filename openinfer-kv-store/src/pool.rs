@@ -261,6 +261,14 @@ impl PrefixProbe {
     pub fn cpu_query_window(&self) -> usize {
         self.cacheable.saturating_sub(self.gpu_hit)
     }
+
+    /// Drop the anti-eviction pins on every held block past the first
+    /// `blocks` (they fall to the inactive — evictable, still matchable —
+    /// pool). `held` is in prefix order, so the surviving pins cover exactly
+    /// the leading `blocks` blocks of the prefix.
+    pub fn truncate_held(&mut self, blocks: usize) {
+        self.held.truncate(blocks);
+    }
 }
 
 /// An opaque strong pin on one registered KV block. While held it keeps the

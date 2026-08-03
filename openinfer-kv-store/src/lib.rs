@@ -112,4 +112,6 @@ pub use crate::pool::RegisteredBlock;
 pub use crate::pool::RequestKv;
 pub use crate::stats::DegradeReason;
 pub use crate::stats::KvStoreStats;
+pub use crate::store::KeyedFetchError;
+pub use crate::store::KeyedLoadParking;
 pub use crate::store::KvStore;
