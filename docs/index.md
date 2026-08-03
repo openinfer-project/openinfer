@@ -143,6 +143,12 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | --- | --- |
 | `subsystems/sampling/openinfer-sample.md` | `openinfer-sample` is the one crate every model routes through for batched token selection (`select_batch`) and host logprobs (`token_logprob_from_row`, generic over f32/bf16). Replaces `core::ops::select_batch_tokens_into` + three copies of the logprob math. Kimi keeps its sharded-vocab greedy argmax (a DP concern the whole-vocab `select_batch` can't express) but shares the non-greedy sampler and the logprob math. |
 
+## subsystems / tracing
+
+| Path | TL;DR |
+| --- | --- |
+| `subsystems/tracing/e2e-router-tracing.md` | Single trace for client → vllm-router → openinfer → prefill/decode verified: the router injects traceparent with OTel on; openinfer's axum middleware stashes it and the bridge joins via `external_req_id` (incl. the `cmpl-`/`chatcmpl-` prefix pitfall). After upstream vllm#50370 merges, migrate per #790 and delete the middleware. |
+
 ## subsystems / frontend
 
 | Path | TL;DR |
