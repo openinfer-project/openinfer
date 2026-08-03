@@ -13,6 +13,10 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
 
+pub use crate::metrics::LoadSnapshot;
+pub use crate::metrics::MAX_SPEC_TOKENS;
+pub use crate::metrics::SpecDecodeCounters;
+pub use crate::metrics::SpecWidthUnsupported;
 use crate::parallel::ParallelConfig;
 use crate::sampler::SamplingParams;
 
@@ -434,106 +438,6 @@ impl KvCapacity {
     pub fn blocks_for(self, tokens: usize) -> usize {
         tokens.div_ceil(self.block_size.max(1))
     }
-}
-
-/// Upper bound on a drafter's `K`, fixing the width of
-/// [`SpecDecodeCounters::num_accepted_tokens_per_pos`].
-///
-/// `K` is checkpoint data, not a compile-time property: `K = verify_span - 1`,
-/// so it is `block_size - 1` on an anchor-drop checkpoint and `block_size` on an
-/// anchor-first one. Nothing validates an upper bound at load, so this is a
-/// headroom cap rather than an exact fit — the drafters we ship today need 15
-/// (`Qwen3-4B-DFlash-b16`, anchor-drop) and 7 (`dspark_qwen3_4b_block7`,
-/// anchor-first). A wider drafter is clamped, not rejected: every
-/// total stays exact and only the per-position curve truncates, and
-/// `load_speculative` warns so the truncation is never silent.
-///
-/// Fixed width is what lets [`LoadSnapshot`] stay `Copy`. That keeps the
-/// scheduler's top-of-loop publish a bitwise copy, and it keeps the `*guard`
-/// watch reads in `openinfer-dynamo-backend` (its own workspace) and the glm52
-/// scheduler contract tests compiling — neither is covered by CI's package
-/// matrix.
-pub const MAX_SPEC_TOKENS: usize = 32;
-
-/// Cumulative speculative-decode acceptance counters, monotone since the draft
-/// model was loaded.
-///
-/// Carried on [`LoadSnapshot`] as running totals, *not* per-step deltas, because
-/// two constraints meet here and point opposite ways:
-///
-/// * the load [`watch`] channel coalesces (`send_replace` keeps only the latest
-///   value), so per-step deltas published here would be lost whenever a reader
-///   misses a step — running totals are idempotent under that loss;
-/// * the frontend's `vllm:spec_decode_*` are monotonic counters fed with
-///   `inc_by`, so the *wire* value must be a per-interval delta or every publish
-///   re-adds the whole history.
-///
-/// The bridge is the only place that knows both sides, so it does the
-/// conversion: it diffs each snapshot against the totals it last forwarded.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct SpecDecodeCounters {
-    /// Configured max draft tokens proposed per verify step (`K`), and the
-    /// number of leading [`Self::num_accepted_tokens_per_pos`] entries that
-    /// carry meaning. Never exceeds [`MAX_SPEC_TOKENS`].
-    pub num_spec_tokens: u64,
-    /// Draft proposals — one per request per verify step.
-    pub num_drafts: u64,
-    /// Draft tokens proposed for verification (pre-acceptance) in total.
-    pub num_draft_tokens: u64,
-    /// Draft tokens accepted in total, excluding the bonus token.
-    pub num_accepted_tokens: u64,
-    /// Accepted-token count indexed by draft position: `[i]` is how often the
-    /// `i`-th draft was accepted. Only `[..num_spec_tokens]` is meaningful; the
-    /// tail stays zero so the array width can be a constant.
-    pub num_accepted_tokens_per_pos: [u64; MAX_SPEC_TOKENS],
-}
-
-impl SpecDecodeCounters {
-    pub fn new(num_spec_tokens: usize) -> Self {
-        if num_spec_tokens > MAX_SPEC_TOKENS {
-            log::warn!(
-                "drafter proposes K={num_spec_tokens} per step, above \
-                 MAX_SPEC_TOKENS={MAX_SPEC_TOKENS}: per-position acceptance is \
-                 reported for the first {MAX_SPEC_TOKENS} positions only \
-                 (draft/accept totals are unaffected)"
-            );
-        }
-        Self {
-            num_spec_tokens: num_spec_tokens.min(MAX_SPEC_TOKENS) as u64,
-            ..Self::default()
-        }
-    }
-
-    /// Fold one request's verify outcome into the totals
-    pub fn observe_draft(&mut self, num_draft_tokens: usize, num_accepted: usize) {
-        self.num_drafts += 1;
-        self.num_draft_tokens += num_draft_tokens as u64;
-        self.num_accepted_tokens += num_accepted as u64;
-        let tallied = num_accepted.min(self.num_spec_tokens as usize);
-        for slot in self.num_accepted_tokens_per_pos.iter_mut().take(tallied) {
-            *slot += 1;
-        }
-    }
-}
-
-/// Live KV-cache occupancy the scheduler republishes after every step.
-///
-/// `kv_used_blocks` is the load signal an out-of-band consumer (e.g. a Dynamo
-/// KV router) scores against; `kv_total_blocks` is the engine's whole-pool
-/// capacity (the same number advertised as the servable ceiling), so the
-/// consumer can derive fractional usage without a second query. Carried over a
-/// [`watch`] channel: the scheduler is the sole writer and never blocks on a
-/// reader, and a reader only ever sees the latest snapshot.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct LoadSnapshot {
-    pub kv_used_blocks: u64,
-    pub kv_total_blocks: u64,
-    /// Requests currently occupying a decode/prefill slot.
-    pub num_running_reqs: u64,
-    /// Requests admitted but not yet running (KV pressure, prefetch wait).
-    pub num_waiting_reqs: u64,
-    /// Cumulative spec-decode counters, or `None` when no draft model is loaded.
-    pub spec_decode: Option<SpecDecodeCounters>,
 }
 
 /// One full KV block that just became reusable from this engine's prefix cache.
@@ -1081,52 +985,6 @@ mod tests {
         for flag in &exited {
             assert!(flag.load(Ordering::SeqCst));
         }
-    }
-
-    #[test]
-    fn spec_counters_observe_draft_tallies_positions() {
-        let mut counters = SpecDecodeCounters::new(3);
-        // Two drafts proposed, both accepted; then three proposed, one accepted.
-        counters.observe_draft(2, 2);
-        counters.observe_draft(3, 1);
-        assert_eq!(counters.num_drafts, 2);
-        assert_eq!(counters.num_draft_tokens, 5);
-        assert_eq!(counters.num_accepted_tokens, 3);
-        // Position 0 accepted twice, position 1 once, position 2 never.
-        assert_eq!(&counters.num_accepted_tokens_per_pos[..3], &[2, 1, 0]);
-        // The tail past K stays zero, so the array width is not observable.
-        assert!(
-            counters.num_accepted_tokens_per_pos[3..]
-                .iter()
-                .all(|&n| n == 0)
-        );
-        // Per-position accepts always sum to the accepted total.
-        assert_eq!(
-            counters.num_accepted_tokens_per_pos.iter().sum::<u64>(),
-            counters.num_accepted_tokens
-        );
-        // Acceptance is prefix-shaped, so the curve never rises.
-        assert!(
-            counters
-                .num_accepted_tokens_per_pos
-                .windows(2)
-                .all(|w| w[0] >= w[1])
-        );
-    }
-
-    #[test]
-    fn spec_counters_clamp_oversized_k() {
-        // A drafter wider than the array is clamped at construction (and warns), so
-        // the bridge's `[..num_spec_tokens]` slice stays in bounds. The contract the
-        // warning promises: totals stay exact, only the per-position curve truncates.
-        let mut counters = SpecDecodeCounters::new(MAX_SPEC_TOKENS + 8);
-        assert_eq!(counters.num_spec_tokens, MAX_SPEC_TOKENS as u64);
-
-        counters.observe_draft(MAX_SPEC_TOKENS + 8, MAX_SPEC_TOKENS + 8);
-        assert_eq!(counters.num_drafts, 1);
-        assert_eq!(counters.num_draft_tokens, (MAX_SPEC_TOKENS + 8) as u64);
-        assert_eq!(counters.num_accepted_tokens, (MAX_SPEC_TOKENS + 8) as u64);
-        assert!(counters.num_accepted_tokens_per_pos.iter().all(|&n| n == 1));
     }
 
     #[test]

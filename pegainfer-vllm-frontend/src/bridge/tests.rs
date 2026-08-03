@@ -618,50 +618,13 @@ async fn next_scheduler_stats(
     }
 }
 
-/// `spec_decode_delta` reconstructs per-interval deltas from cumulative totals.
-/// The scheduler only ever ships growing totals over a coalescing watch, so the
-/// consumer's job is to diff — and a chain of diffs must telescope back to the
-/// final cumulative regardless of where the interval boundaries fall.
-#[test]
-fn spec_delta_telescopes_to_cumulative() {
-    let mut totals = SpecDecodeCounters::new(3);
-    let mut last = SpecDecodeCounters::default();
-    let mut summed = SpecDecodingStats::default();
-    // Three "steps" of activity, snapshotted at arbitrary (coalesced) points.
-    for (draft, accept) in [(3usize, 3usize), (3, 0), (2, 1)] {
-        totals.observe_draft(draft, accept);
-        let delta = spec_decode_delta(&last, &totals);
-        summed.num_drafts += delta.num_drafts;
-        summed.num_draft_tokens += delta.num_draft_tokens;
-        summed.num_accepted_tokens += delta.num_accepted_tokens;
-        last = totals;
-    }
-    // Sum of the deltas the frontend `.inc()`s equals the final cumulative.
-    assert_eq!(summed.num_drafts, totals.num_drafts);
-    assert_eq!(summed.num_draft_tokens, totals.num_draft_tokens);
-    assert_eq!(summed.num_accepted_tokens, totals.num_accepted_tokens);
-    assert_eq!(totals.num_accepted_tokens, 4);
-
-    // A snapshot that skips an interval (coalescing) still yields the whole gap.
-    let big = spec_decode_delta(&SpecDecodeCounters::new(3), &totals);
-    assert_eq!(big.num_drafts, 3);
-    assert_eq!(big.num_draft_tokens, 8);
-    assert_eq!(big.num_accepted_tokens, 4);
-    // Per-position vector length is carried through as the drafter's K.
-    assert_eq!(big.num_spec_tokens, 3);
-    assert_eq!(big.num_accepted_tokens_per_pos.len(), 3);
-    assert_eq!(
-        big.num_accepted_tokens_per_pos.iter().sum::<u64>(),
-        big.num_accepted_tokens
-    );
-}
-
-/// The publisher attaches `spec_decoding_stats` only on intervals that actually
-/// ran a draft step; an idle interval (totals unchanged) leaves it `None` so the
-/// frontend never logs a NaN acceptance rate over a zero-draft window.
+/// The publisher diffs the scheduler's cumulative totals into the per-interval
+/// deltas the frontend `inc_by`s, and attaches `spec_decoding_stats` only on
+/// intervals that actually ran a draft step — an idle interval would divide by
+/// a zero `num_drafts` in the frontend's acceptance-rate log.
 #[tokio::test]
-async fn idle_intervals_omit_spec_decoding_stats() {
-    let mut totals = SpecDecodeCounters::new(2);
+async fn spec_stats_are_per_interval_deltas_that_skip_idle_intervals() {
+    let mut totals = SpecDecodeCounters::new(2).expect("K within bounds");
     totals.observe_draft(2, 1);
     let (load_tx, load_rx) = tokio::sync::watch::channel(LoadSnapshot {
         spec_decode: Some(totals),
@@ -676,13 +639,16 @@ async fn idle_intervals_omit_spec_decoding_stats() {
         shutdown.clone(),
     ));
 
-    // First publish carries the whole cumulative as its delta.
+    // First publish diffs against zero, so it carries the whole cumulative.
     let first = next_scheduler_stats(&mut output_rx).await;
     let spec = first
         .spec_decoding_stats
         .expect("first interval has a draft");
+    assert_eq!(spec.num_spec_tokens, 2);
     assert_eq!(spec.num_drafts, 1);
     assert_eq!(spec.num_accepted_tokens, 1);
+    // Widened to the drafter's K, not the array's.
+    assert_eq!(spec.num_accepted_tokens_per_pos, vec![1, 0]);
 
     // A no-op republish (same totals) is an idle interval: no spec stats.
     load_tx.send_replace(LoadSnapshot {
@@ -693,7 +659,10 @@ async fn idle_intervals_omit_spec_decoding_stats() {
     let idle = next_scheduler_stats(&mut output_rx).await;
     assert!(idle.spec_decoding_stats.is_none());
 
-    // More drafting resumes the counters with just that interval's delta.
+    // Two verify steps land in one snapshot — the watch coalesced them. The
+    // delta has to cover the whole gap, per position as well as in total,
+    // which is the reason the transport carries totals instead of deltas.
+    totals.observe_draft(2, 2);
     totals.observe_draft(2, 2);
     load_tx.send_replace(LoadSnapshot {
         spec_decode: Some(totals),
@@ -701,8 +670,10 @@ async fn idle_intervals_omit_spec_decoding_stats() {
     });
     let resumed = next_scheduler_stats(&mut output_rx).await;
     let spec = resumed.spec_decoding_stats.expect("second draft interval");
-    assert_eq!(spec.num_drafts, 1);
-    assert_eq!(spec.num_accepted_tokens, 2);
+    assert_eq!(spec.num_drafts, 2);
+    assert_eq!(spec.num_draft_tokens, 4);
+    assert_eq!(spec.num_accepted_tokens, 4);
+    assert_eq!(spec.num_accepted_tokens_per_pos, vec![2, 2]);
 
     shutdown.cancel();
     task.await
