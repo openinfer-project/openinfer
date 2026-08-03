@@ -182,12 +182,12 @@ impl SimServer {
         })
     }
 
-    fn publish_load(&self, partition: usize, snapshot: LoadSnapshot) -> Result<()> {
+    fn publish_load(&self, partition: usize, snapshot: &LoadSnapshot) -> Result<()> {
         let sender = self
             .load_txs
             .get(partition)
             .ok_or_else(|| anyhow!("sim frontend has no load feed for partition {partition}"))?;
-        let _ = sender.send_replace(snapshot);
+        let _ = sender.send_replace(*snapshot);
         Ok(())
     }
 
@@ -268,7 +268,7 @@ async fn one_http_endpoint_exports_per_engine_scheduler_metrics() -> Result<()> 
 
     server.publish_load(
         0,
-        LoadSnapshot {
+        &LoadSnapshot {
             kv_used_blocks: 25,
             kv_total_blocks: 100,
             num_running_reqs: 1,
@@ -278,7 +278,7 @@ async fn one_http_endpoint_exports_per_engine_scheduler_metrics() -> Result<()> 
     )?;
     server.publish_load(
         1,
-        LoadSnapshot {
+        &LoadSnapshot {
             kv_used_blocks: 50,
             kv_total_blocks: 100,
             num_running_reqs: 0,
@@ -301,7 +301,7 @@ async fn one_http_endpoint_exports_per_engine_scheduler_metrics() -> Result<()> 
 
     server.publish_load(
         0,
-        LoadSnapshot {
+        &LoadSnapshot {
             kv_used_blocks: 75,
             kv_total_blocks: 100,
             num_running_reqs: 3,
@@ -311,7 +311,7 @@ async fn one_http_endpoint_exports_per_engine_scheduler_metrics() -> Result<()> 
     )?;
     server.publish_load(
         1,
-        LoadSnapshot {
+        &LoadSnapshot {
             kv_used_blocks: 25,
             kv_total_blocks: 100,
             num_running_reqs: 5,
@@ -334,8 +334,8 @@ async fn one_http_endpoint_exports_per_engine_scheduler_metrics() -> Result<()> 
     )
     .await?;
 
-    server.publish_load(0, LoadSnapshot::default())?;
-    server.publish_load(1, LoadSnapshot::default())?;
+    server.publish_load(0, &LoadSnapshot::default())?;
+    server.publish_load(1, &LoadSnapshot::default())?;
     wait_for_metrics(
         &client,
         &server.base_url,
