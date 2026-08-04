@@ -39,7 +39,9 @@ pub fn glm52_fp8_dsl_preload() {
         let rc = unsafe { ffi::glm52_fp8_dsl_gemm_load_cuda() };
         if rc == 0 {
             DSL_GEMM_READY.store(true, Ordering::Release);
-            log::info!("GLM5.2 CuTe DSL fp8 GEMM AOT loaded; wide-route buckets 16-64 dispatch to tcgen05");
+            log::info!(
+                "GLM5.2 CuTe DSL fp8 GEMM AOT loaded; wide-route buckets 16-64 dispatch to tcgen05"
+            );
         } else {
             log::warn!("GLM5.2 CuTe DSL fp8 GEMM module load failed (rc={rc}); staying on CUTLASS");
         }

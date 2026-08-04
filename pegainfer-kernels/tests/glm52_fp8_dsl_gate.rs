@@ -12,9 +12,9 @@
 #![cfg(feature = "glm52")]
 
 use half::bf16;
+use pegainfer_kernels::ops::glm52_flashinfer_sparse_mla_supported;
 use pegainfer_kernels::ops::glm52_fp8_dsl_gemm_ready;
 use pegainfer_kernels::ops::glm52_fp8_dsl_preload;
-use pegainfer_kernels::ops::glm52_flashinfer_sparse_mla_supported;
 use pegainfer_kernels::ops::glm52_fp8_groupwise_gemm_sm100_bank_launch;
 use pegainfer_kernels::ops::glm52_fp8_groupwise_gemm_sm100_offset_launch;
 use pegainfer_kernels::tensor::DeviceContext;
@@ -23,7 +23,9 @@ use pegainfer_kernels::tensor::DeviceContext;
 fn e4m3_bytes(len: usize, seed: &mut u64) -> Vec<u8> {
     (0..len)
         .map(|_| {
-            *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            *seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let magnitude = ((*seed >> 33) % 127) as u8;
             let sign = ((*seed >> 17) & 1) as u8;
             magnitude | (sign << 7)
@@ -34,7 +36,9 @@ fn e4m3_bytes(len: usize, seed: &mut u64) -> Vec<u8> {
 fn scales(len: usize, seed: &mut u64) -> Vec<f32> {
     (0..len)
         .map(|_| {
-            *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            *seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             0.5 + ((*seed >> 40) as f32 / (1u64 << 24) as f32)
         })
         .collect()
@@ -57,7 +61,12 @@ fn dsl_route_matches_cutlass_on_every_wide_route_shape() {
     }
 
     let mut seed = 0x5EEDu64;
-    for (n, k) in [(16384usize, 2048usize), (6144, 16384), (4096, 6144), (6144, 2048)] {
+    for (n, k) in [
+        (16384usize, 2048usize),
+        (6144, 16384),
+        (4096, 6144),
+        (6144, 2048),
+    ] {
         for m in [16usize, 64] {
             let act = e4m3_bytes(m * k, &mut seed);
             let act_s = scales(m * (k / 128), &mut seed);
@@ -84,13 +93,33 @@ fn dsl_route_matches_cutlass_on_every_wide_route_shape() {
                 .expect("alloc workspace");
 
             glm52_fp8_groupwise_gemm_sm100_offset_launch(
-                &ctx, m, n, k, &act_dev, &act_s_dev, &weight_dev, 0, &w_s_u8_dev, 0,
-                &mut out_dsl, &mut workspace,
+                &ctx,
+                m,
+                n,
+                k,
+                &act_dev,
+                &act_s_dev,
+                &weight_dev,
+                0,
+                &w_s_u8_dev,
+                0,
+                &mut out_dsl,
+                &mut workspace,
             )
             .expect("DSL-dispatched launch");
             glm52_fp8_groupwise_gemm_sm100_bank_launch(
-                &ctx, m, n, k, &act_dev, &act_s_dev, &weight_dev, 0, &w_s_f32_dev, 0,
-                &mut out_cut, &mut workspace,
+                &ctx,
+                m,
+                n,
+                k,
+                &act_dev,
+                &act_s_dev,
+                &weight_dev,
+                0,
+                &w_s_f32_dev,
+                0,
+                &mut out_cut,
+                &mut workspace,
             )
             .expect("CUTLASS launch");
 
