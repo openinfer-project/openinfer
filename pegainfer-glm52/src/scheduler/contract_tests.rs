@@ -169,6 +169,12 @@ fn admission_fills_free_slots_from_the_local_queue() {
 
     assert!(slots[0].is_some());
     assert!(pending.is_empty());
+    let active = slots[0].as_ref().expect("admitted");
+    assert_eq!(
+        pool.entitled_blocks(),
+        active.kv.lifetime_blocks() - active.kv.resident_blocks(),
+        "admission entitles the un-drawn lifetime remainder"
+    );
 }
 
 #[test]

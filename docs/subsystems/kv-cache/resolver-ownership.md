@@ -36,10 +36,17 @@ resolve task 线性持有 req:probe hold(RAII,零分配)→ guarded tier query(l
 - 失败语义:padded 页缺失 = 命中短缺 = **admission 拒绝,发生在占 slot 之前**,router 兜底。(对比曾考虑的"admission 后再取 tail":取回失败发生在 slot 已占之后,15s deadline × slot 数是存储抖动即冻结整 rank 的 DoS 面;及"D 重算尾巴":每请求 ≤63 行 context 挤进 decode 步流,c64 突发时 ~2000 行,违背 PD 分离的 decode 纯度——均否决。)
 - turn-2 prefix 复用终止在最后一个真 full 页,与现状一致,无损失。
 
-### 2.3 仲裁归位(design.md 未决 252 行的预定形态)
+### 2.3 仲裁归位(已落地:池内 entitlement)
 
-- 池内 `async reserve_blocks(n)`:waiters 挂在唯一真相旁,TOCTOU 在分配器内部收口;
-- admission 自管预算:resolve 已命中块按 `prefetched_blocks` 抵扣(qwen3 先例),不设独立水位 API,**不建第二本账**。
+phase-2 首版有意只带了 prefetched 抵扣,赌"互饿类结构性消失后仲裁可以再等"——Codex 在 #843 评审抓住了赌输的另一半:后台 resolve 的物理预留能吃掉 active 请求账面承诺的未取页,decode 跨页分配失败即 engine-fatal(49152 上限下池富余 36k 块碰不到;131K 旗舰配置下 committed 逼近池容量,随时触发)。落地形态:
+
+- **`RequestKv::admit()`**:admission 的 honor-or-reject 之后声明权威身份;`entitled` 计数器(池内)= Σ 已 admit 请求的 `lifetime − resident`。
+- **`EntitledSeq` 唯一门**:`&mut SchedulableSequence` 只能经私有模块的 `with_draw` 取得,块增减在同一调用里按 resident 差值结算——新增取块路径无法绕过记账,编译器背书;release/Drop 退还余量(RAII 兜底)。
+- **reserve 门**:`reserve_loaded_blocks` 改为 `available ≥ count + entitled` 才拿,拿不到走既有 PoolPressure 让步(重试→deadline→拒绝给 router)。零义务原则不变。
+- **不是第二本账**:HeadroomLedger 是 store 外的影子记账靠补丁缝合;`entitled` 在分配器 crate 内、与块移动同步结算、数据源是 RequestKv 自身字段,消费者唯一(reserve 门)。qwen3 scheduler 侧手搓的 `reserve_floor` 是同一不变式的先例,后续可退役到该机制。
+- 残余 TOCTOU:reserve 之间由池内 mutex 串行;admission-vs-reserve 剩单请求级窗口(方向保守),池内 `async reserve_blocks(n)` waiters 仍是终局解、继续推迟。
+
+契约测试:`entitlement_tracks_the_undrained_remainder_through_the_lifecycle`(维护值对重算值逐阶段对账,含 revert 回涨)、`reserve_loaded_blocks_declines_into_the_entitled_floor`、`entitlement_refunds_on_drop_without_release`、`unadmitted_requests_never_move_the_counter`(kv-store);glm52 侧 admission 断言进 `admission_fills_free_slots_from_the_local_queue`。
 
 ### 2.4 handoff 信封 v3(评审已决)
 
@@ -113,7 +120,7 @@ scheduler 不设 `state: RequestState` 枚举字段。每个状态就是"请求�
 
 - `ResolvePolicy` 加 full-pages 开关:现 `resolve_prefix` 的「最后一页不缓存」上限会掐掉 padded 边界页,native 臂需全页解析。phase-2 第一刀,消费者随行。
 - `Resolved::Native` 瘦身为纯元数据(committed_len 等),不再携带任何分配。
-- 池内 async `reserve_blocks` waiters 推迟:resolver 零义务可让步后,原**互饿**死锁类(claim 对 claim)不存在,admission 侧 prefetched 抵扣已够;design.md 未决条目保持原状。
+- 池内 async `reserve_blocks` waiters 推迟:resolver 零义务可让步后,原**互饿**死锁类(claim 对 claim)不存在。~~admission 侧 prefetched 抵扣已够~~ **"已够"被 #843 评审证伪**——resolve 反向饿死 active decode 的类还在,由池内 entitlement 关闭(§2.3);waiters 作为 TOCTOU 终局解继续推迟。
 - **FIFO 卡死类未随 ledger 消失,bypass 以后继形态保留**(实现期发现):队列后方 native 的 prefix hold 钉住 restored 页,唯一释放路径是它自己的 admission——被预算卡死的 front 挡住即永久 stall。Plain hold 可 shed(掉到 inactive 仍可匹配),native hold 不 shed(驱逐 restored 页 = 终局 reject);shed 无果后,预算内能装下的 native 允许有界越过 front(admission.rs bypass 块,契约测试 `budget_stalled_front_lets_a_fitting_native_bypass`)。
 - P 侧 pad-and-seal 落 prefill_tp 封存路径;信封定形见 §2.4,P/D 同 PR 切换。
 

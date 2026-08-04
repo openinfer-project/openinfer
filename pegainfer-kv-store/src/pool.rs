@@ -8,6 +8,11 @@
 //! (`prefill_view`/`decode_view`/`speculative_view`) and the opt-in KV-event
 //! feed (`with_events`); Reservation/Probe do not depend on either.
 
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicI64;
+use std::sync::atomic::Ordering;
+
 use dynamo_kv_hashing::compute_salt_hash;
 use kvbm_logical::KvbmSequenceHashProvider;
 use kvbm_logical::SequenceHash;
@@ -30,6 +35,15 @@ pub struct BlockPool {
     block_manager: BlockManager<()>,
     block_size: usize,
     padding_block_id: usize,
+    /// Blocks promised to admitted requests but not yet drawn
+    /// (Σ admitted `lifetime_blocks - resident_blocks`); maintained by
+    /// [`entitlement::EntitledSeq`], consumed by the
+    /// [`Self::reserve_loaded_blocks`] floor.
+    entitled: Arc<AtomicI64>,
+    /// Serializes opportunistic reserves so two concurrent
+    /// [`Self::reserve_loaded_blocks`] calls cannot jointly dip into the
+    /// entitled floor. Admitted draws never wait on this lock.
+    reserve_gate: Mutex<()>,
 }
 
 impl BlockPool {
@@ -70,6 +84,8 @@ impl BlockPool {
             block_manager,
             block_size,
             padding_block_id,
+            entitled: Arc::new(AtomicI64::new(0)),
+            reserve_gate: Mutex::new(()),
         }
     }
 
@@ -79,6 +95,14 @@ impl BlockPool {
 
     pub fn available_blocks(&self) -> usize {
         self.block_manager.available_blocks()
+    }
+
+    /// Blocks promised to admitted requests ([`RequestKv::admit`]) but not
+    /// yet drawn. [`Self::reserve_loaded_blocks`] keeps this many out of
+    /// opportunistic reach so an admitted request's page-crossing draw can
+    /// never fail.
+    pub fn entitled_blocks(&self) -> usize {
+        self.entitled.load(Ordering::Acquire).max(0) as usize
     }
 
     pub fn total_blocks(&self) -> usize {
@@ -139,9 +163,8 @@ impl BlockPool {
             Some(salt_hash),
         );
         RequestKv {
-            seq,
+            inner: entitlement::EntitledSeq::new(seq, Arc::clone(&self.entitled), lifetime_blocks),
             emitted_blocks: 0,
-            lifetime_blocks,
         }
     }
 
@@ -171,7 +194,7 @@ impl BlockPool {
     ) -> PrefixProbe {
         let num_input = prompt_tokens.len();
         let rkv = self.new_request_with_cache_salt(prompt_tokens, 0, cache_salt, lora_name);
-        let seq_hashes = rkv.seq.inner().sequence().all_sequence_hashes();
+        let seq_hashes = rkv.inner.seq().inner().sequence().all_sequence_hashes();
         // match_and_add_prefix leaves >=1 prompt token uncached, so a request
         // can reuse at most this many leading blocks — the CPU load must not
         // exceed it, or the trailing loaded block would never be re-matched.
@@ -188,10 +211,19 @@ impl BlockPool {
 
     /// Reserve `count` mutable blocks as the GPU destinations for a CPU→GPU
     /// load. Returns `None` under block pressure (the caller then skips the
-    /// prefetch and prefills from scratch). The reservation's
-    /// [`LoadReservation::page_ids`] feed the connector's load; on completion
-    /// hand it to [`commit_loaded_blocks`](Self::commit_loaded_blocks).
+    /// prefetch and prefills from scratch, or retries under its deadline).
+    /// The reservation's [`LoadReservation::page_ids`] feed the connector's
+    /// load; on completion hand it to
+    /// [`commit_loaded_blocks`](Self::commit_loaded_blocks).
+    ///
+    /// Opportunistic by contract: the reserve stays above the entitled floor
+    /// ([`Self::entitled_blocks`]) — blocks promised to admitted requests are
+    /// out of reach even while they sit in the free/inactive pools.
     pub fn reserve_loaded_blocks(&self, count: usize) -> Option<LoadReservation> {
+        let _gate = self.reserve_gate.lock().expect("reserve gate poisoned");
+        if self.available_blocks() < count + self.entitled_blocks() {
+            return None;
+        }
         let blocks = self.block_manager.allocate_blocks(count)?;
         Some(LoadReservation { blocks })
     }
@@ -337,6 +369,108 @@ pub fn resolved_page_ids(prefix: &KvPrefix) -> Vec<i32> {
         .unwrap_or_default()
 }
 
+/// The only door to `&mut SchedulableSequence`. Every mutation settles the
+/// resident-block delta against the pool's entitled counter in the same
+/// call, so a block-drawing path added later cannot skip the accounting —
+/// the raw field is private to this module and the compiler is the enforcer.
+mod entitlement {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicI64;
+    use std::sync::atomic::Ordering;
+
+    use kvbm_logical::integrations::SchedulableSequence;
+
+    pub(super) struct EntitledSeq {
+        seq: SchedulableSequence<()>,
+        /// The owning pool's entitled counter (`BlockPool::entitled`).
+        counter: Arc<AtomicI64>,
+        /// Set by [`Self::admit`]; only admitted requests move the counter.
+        admitted: bool,
+        /// Input-plus-output page capacity, frozen at construction. The
+        /// sequence may later reclassify an input token as generated
+        /// (external-prefill anchor adoption), which must not shrink the
+        /// reservation: the promoted token still occupies its sequence
+        /// position and the dangling token at the end of the sequence still
+        /// provisions a page beyond it.
+        lifetime_blocks: usize,
+    }
+
+    impl EntitledSeq {
+        pub(super) fn new(
+            seq: SchedulableSequence<()>,
+            counter: Arc<AtomicI64>,
+            lifetime_blocks: usize,
+        ) -> Self {
+            Self {
+                seq,
+                counter,
+                admitted: false,
+                lifetime_blocks,
+            }
+        }
+
+        fn resident(&self) -> i64 {
+            (self.seq.assigned_blocks() + self.seq.staged_blocks() + self.seq.unassigned_blocks())
+                as i64
+        }
+
+        /// The un-drawn lifetime remainder this request is owed.
+        fn remaining(&self) -> i64 {
+            self.lifetime_blocks as i64 - self.resident()
+        }
+
+        /// Declare this request authoritative: from now until retire, the
+        /// pool keeps its remainder out of opportunistic reach. Idempotent.
+        pub(super) fn admit(&mut self) {
+            if self.admitted {
+                return;
+            }
+            self.admitted = true;
+            self.counter.fetch_add(self.remaining(), Ordering::AcqRel);
+        }
+
+        /// Run a sequence mutation; the resident delta settles against the
+        /// counter (draws shrink it, returned blocks grow it back).
+        pub(super) fn with_draw<T>(
+            &mut self,
+            f: impl FnOnce(&mut SchedulableSequence<()>) -> T,
+        ) -> T {
+            let before = self.resident();
+            let out = f(&mut self.seq);
+            if self.admitted {
+                self.counter
+                    .fetch_add(before - self.resident(), Ordering::AcqRel);
+            }
+            out
+        }
+
+        /// Terminal refund of the remainder, BEFORE the blocks themselves
+        /// return: while resident they were never entitled, and afterwards
+        /// they are plain availability. Idempotent; `Drop` is the backstop.
+        pub(super) fn retire(&mut self) {
+            if !self.admitted {
+                return;
+            }
+            self.admitted = false;
+            self.counter.fetch_sub(self.remaining(), Ordering::AcqRel);
+        }
+
+        pub(super) fn seq(&self) -> &SchedulableSequence<()> {
+            &self.seq
+        }
+
+        pub(super) fn lifetime_blocks(&self) -> usize {
+            self.lifetime_blocks
+        }
+    }
+
+    impl Drop for EntitledSeq {
+        fn drop(&mut self) {
+            self.retire();
+        }
+    }
+}
+
 /// Per-request KV state wrapping `SchedulableSequence`.
 ///
 /// Lifecycle: `schedule_prefill → forward over step_page_indices →
@@ -346,7 +480,7 @@ pub fn resolved_page_ids(prefix: &KvPrefix) -> Vec<i32> {
 /// pass and its page-table view belong to the model, not to the logical
 /// store.
 pub struct RequestKv {
-    seq: SchedulableSequence<()>,
+    inner: entitlement::EntitledSeq,
     /// Cursor for [`Self::take_newly_registered_blocks`]: how many of this
     /// request's sequence blocks have already been surfaced as KV-router store
     /// events. Starts past the prefix-cache hit (those were stored by whoever
@@ -354,15 +488,19 @@ pub struct RequestKv {
     /// off, which holds wherever a router feed consumes the diffs). Untouched
     /// on the plain path, where nothing consumes them.
     emitted_blocks: usize,
-    /// Input-plus-output page capacity, frozen at construction. The sequence
-    /// may later reclassify an input token as generated (external-prefill
-    /// anchor adoption), which must not shrink the reservation: the promoted
-    /// token still occupies its sequence position and the dangling token at
-    /// the end of the sequence still provisions a page beyond it.
-    lifetime_blocks: usize,
 }
 
 impl RequestKv {
+    /// Declare this request admission-authoritative: from now until
+    /// release/drop the pool keeps its un-drawn lifetime remainder
+    /// (`lifetime_blocks - resident_blocks`) out of opportunistic
+    /// [`BlockPool::reserve_loaded_blocks`] reach, so a mid-flight
+    /// page-crossing draw can never fail. Admission's honor-or-reject
+    /// budget check must precede this call. Idempotent.
+    pub fn admit(&mut self) {
+        self.inner.admit();
+    }
+
     // ── Prefix cache ───────────────────────────────────────────────────
 
     /// Match the prompt's full blocks against registered blocks and skip
@@ -374,14 +512,14 @@ impl RequestKv {
     /// final prefill chunk can emit the first generated token.
     pub fn match_and_add_prefix(&mut self, pool: &BlockPool) -> anyhow::Result<usize> {
         let blocks = self
-            .seq
-            .match_and_add_prefix(&pool.block_manager)
+            .inner
+            .with_draw(|seq| seq.match_and_add_prefix(&pool.block_manager))
             .map_err(|e| anyhow::anyhow!("match_and_add_prefix: {e}"))?;
         // Prefix-hit blocks are already in the router's tree (whoever first
         // sealed them stored them, and a GPU hit means they were never evicted),
         // so the store-event cursor skips them.
-        self.emitted_blocks = self.seq.assigned_blocks();
-        Ok(blocks * self.seq.block_size())
+        self.emitted_blocks = self.inner.seq().assigned_blocks();
+        Ok(blocks * self.inner.seq().block_size())
     }
 
     // ── Scheduling (allocates blocks) ──────────────────────────────────
@@ -391,11 +529,13 @@ impl RequestKv {
         num_tokens: usize,
         pool: &BlockPool,
     ) -> Result<(), ScheduleError> {
-        self.seq.schedule_prefill(num_tokens, &pool.block_manager)
+        self.inner
+            .with_draw(|seq| seq.schedule_prefill(num_tokens, &pool.block_manager))
     }
 
     pub fn schedule_decode(&mut self, pool: &BlockPool) -> Result<(), ScheduleError> {
-        self.seq.schedule_decode(&pool.block_manager)
+        self.inner
+            .with_draw(|seq| seq.schedule_decode(&pool.block_manager))
     }
 
     /// Reserve KV for a speculative verify step covering `num_draft_tokens`
@@ -407,15 +547,15 @@ impl RequestKv {
         num_draft_tokens: usize,
         pool: &BlockPool,
     ) -> Result<(), ScheduleError> {
-        self.seq
-            .schedule_speculative(num_draft_tokens, &pool.block_manager)
+        self.inner
+            .with_draw(|seq| seq.schedule_speculative(num_draft_tokens, &pool.block_manager))
     }
 
     // ── Apply (register blocks, advance position) ──────────────────────
 
     pub fn apply_prefill(&mut self, token: u32, pool: &BlockPool) -> anyhow::Result<()> {
-        self.seq
-            .apply_prefill(Some(token), &pool.block_manager)
+        self.inner
+            .with_draw(|seq| seq.apply_prefill(Some(token), &pool.block_manager))
             .map_err(|e| anyhow::anyhow!("apply_prefill: {e}"))
     }
 
@@ -423,8 +563,8 @@ impl RequestKv {
     /// advances `kv_position` without emitting a generated token. The final
     /// chunk must go through [`Self::apply_prefill`] instead.
     pub fn apply_prefill_chunk(&mut self, pool: &BlockPool) -> anyhow::Result<()> {
-        self.seq
-            .apply_prefill(None, &pool.block_manager)
+        self.inner
+            .with_draw(|seq| seq.apply_prefill(None, &pool.block_manager))
             .map_err(|e| anyhow::anyhow!("apply_prefill_chunk: {e}"))
     }
 
@@ -433,8 +573,8 @@ impl RequestKv {
     /// no compute, no allocation, `kv_position` untouched. No-op when
     /// `kv_position` sits on a page boundary. Returns the pads appended.
     pub fn pad_to_boundary(&mut self, pool: &BlockPool) -> anyhow::Result<usize> {
-        self.seq
-            .pad_tail_block(PAD_TOKEN_ID, &pool.block_manager)
+        self.inner
+            .with_draw(|seq| seq.pad_tail_block(PAD_TOKEN_ID, &pool.block_manager))
             .map_err(|e| anyhow::anyhow!("pad_to_boundary: {e}"))
     }
 
@@ -442,14 +582,14 @@ impl RequestKv {
     /// prefill restore into the normal dangling-token state expected by
     /// decode/speculative scheduling. Does not advance `kv_position`.
     pub fn adopt_external_prefill_anchor(&mut self) -> anyhow::Result<()> {
-        self.seq
-            .adopt_external_prefill_anchor()
+        self.inner
+            .with_draw(|seq| seq.adopt_external_prefill_anchor())
             .map_err(|e| anyhow::anyhow!("adopt_external_prefill_anchor: {e}"))
     }
 
     pub fn apply_decode(&mut self, token: u32, pool: &BlockPool) -> anyhow::Result<DecodeOutcome> {
-        self.seq
-            .apply_decode(token, &pool.block_manager)
+        self.inner
+            .with_draw(|seq| seq.apply_decode(token, &pool.block_manager))
             .map_err(|e| anyhow::anyhow!("apply_decode: {e}"))
     }
 
@@ -460,22 +600,26 @@ impl RequestKv {
         accepted_tokens: &[u32],
         pool: &BlockPool,
     ) -> anyhow::Result<DecodeOutcome> {
-        self.seq
-            .apply_speculative(accepted_tokens, &pool.block_manager)
+        self.inner
+            .with_draw(|seq| seq.apply_speculative(accepted_tokens, &pool.block_manager))
             .map_err(|e| anyhow::anyhow!("apply_speculative: {e}"))
     }
 
     /// Undo a scheduled-but-unapplied KV reservation (e.g. a speculative
     /// schedule whose forward or apply failed) and return its blocks to the pool.
     pub fn revert_schedule(&mut self) -> anyhow::Result<()> {
-        self.seq
-            .revert_schedule()
+        self.inner
+            .with_draw(|seq| seq.revert_schedule())
             .map_err(|e| anyhow::anyhow!("revert_schedule: {e}"))
     }
 
     pub fn release(&mut self) -> anyhow::Result<()> {
-        self.seq
-            .release()
+        // Refund the entitlement remainder before the blocks return: while
+        // resident they were never entitled, afterwards they are plain
+        // availability.
+        self.inner.retire();
+        self.inner
+            .with_draw(|seq| seq.release())
             .map_err(|e| anyhow::anyhow!("release: {e}"))
     }
 
@@ -485,7 +629,7 @@ impl RequestKv {
     /// primary prevents that hidden block from entering the inactive cache on
     /// final drop.
     pub fn mark_blocks_reset_on_release(&self) {
-        for (_, block) in self.seq.inner().assignments().assigned_iter() {
+        for (_, block) in self.inner.seq().inner().assignments().assigned_iter() {
             block.set_primary_reset_on_release(true);
         }
     }
@@ -494,35 +638,37 @@ impl RequestKv {
 
     /// Tokens with KV already computed.
     pub fn kv_position(&self) -> usize {
-        self.seq.kv_position()
+        self.inner.seq().kv_position()
     }
 
     pub fn is_complete(&self) -> bool {
-        self.seq.is_complete()
+        self.inner.seq().is_complete()
     }
 
     pub fn generated_tokens(&self) -> usize {
-        self.seq.generated_tokens()
+        self.inner.seq().generated_tokens()
     }
 
     /// Full input-plus-output page capacity fixed when this request was
     /// created. Admission uses this value for already-active requests so any
     /// internal tokens added by a protocol remain accounted for.
     pub fn lifetime_blocks(&self) -> usize {
-        self.lifetime_blocks
+        self.inner.lifetime_blocks()
     }
 
     /// Physical blocks currently held by this request, including registered,
     /// staged, and eagerly allocated dangling blocks.
     pub fn resident_blocks(&self) -> usize {
-        self.seq.assigned_blocks() + self.seq.staged_blocks() + self.seq.unassigned_blocks()
+        let seq = self.inner.seq();
+        seq.assigned_blocks() + seq.staged_blocks() + seq.unassigned_blocks()
     }
 
     /// Physical page IDs assigned to this request, in sequence order.
     /// Includes every block the request currently holds — which can be one
     /// more than the KV tokens need (see `step_page_indices`).
     fn page_indices(&self) -> Vec<i32> {
-        self.seq
+        self.inner
+            .seq()
             .inner()
             .assignments()
             .all_block_ids()
@@ -534,7 +680,7 @@ impl RequestKv {
     /// request, in logical sequence order.
     pub fn current_page_indices(&self) -> Vec<i32> {
         let mut pages = self.page_indices();
-        pages.truncate(self.seq.kv_position().div_ceil(self.seq.block_size()));
+        pages.truncate(self.inner.seq().kv_position().div_ceil(self.inner.seq().block_size()));
         pages
     }
 
@@ -547,9 +693,9 @@ impl RequestKv {
     /// per-step page row handed to a forward pass.
     pub fn step_page_indices(&self, new_tokens: usize) -> Vec<i32> {
         assert!(new_tokens > 0, "a forward step appends at least one token");
-        let kv_tokens = self.seq.kv_position() + new_tokens;
+        let kv_tokens = self.inner.seq().kv_position() + new_tokens;
         let mut pages = self.page_indices();
-        pages.truncate(kv_tokens.div_ceil(self.seq.block_size()));
+        pages.truncate(kv_tokens.div_ceil(self.inner.seq().block_size()));
         pages
     }
 
@@ -564,7 +710,8 @@ impl RequestKv {
     /// the same no matter which request computed it.
     #[cfg(test)]
     fn prompt_block_hashes(&self) -> Vec<[u8; 16]> {
-        self.seq
+        self.inner
+            .seq()
             .inner()
             .sequence()
             .all_sequence_hashes()
@@ -578,7 +725,8 @@ impl RequestKv {
     /// the first [`prefix_matched_blocks`](Self::prefix_matched_blocks) entries
     /// are GPU-hit reuse (already resident) and are normally skipped.
     pub fn assigned_block_hashes(&self) -> Vec<(i32, [u8; 16])> {
-        self.seq
+        self.inner
+            .seq()
             .inner()
             .assignments()
             .assigned_iter()
@@ -595,7 +743,8 @@ impl RequestKv {
     /// allocated the same slot and overwrite it mid-copy. Drop the guard once
     /// the save reports done.
     pub fn assigned_block_guards(&self) -> Vec<KvBlockGuard> {
-        self.seq
+        self.inner
+            .seq()
             .inner()
             .assignments()
             .assigned_iter()
@@ -605,7 +754,7 @@ impl RequestKv {
 
     /// Number of leading blocks reused from the GPU prefix cache.
     pub fn prefix_matched_blocks(&self) -> usize {
-        self.seq.inner().prefix_matched_blocks()
+        self.inner.seq().inner().prefix_matched_blocks()
     }
 
     /// Blocks this request has registered (made cacheable) since the last call,
@@ -617,11 +766,11 @@ impl RequestKv {
     /// the new run in sequence order; prefix-cache hits are skipped (see
     /// [`Self::emitted_blocks`]). Empty when nothing new registered this step.
     pub fn take_newly_registered_blocks(&mut self) -> Vec<RegisteredBlock> {
-        let registered = self.seq.assigned_blocks();
+        let registered = self.inner.seq().assigned_blocks();
         if registered <= self.emitted_blocks {
             return Vec::new();
         }
-        let blocks = self.seq.inner().sequence().blocks();
+        let blocks = self.inner.seq().inner().sequence().blocks();
         debug_assert!(
             registered <= blocks.len(),
             "registered blocks ({registered}) exceed sealed token blocks ({})",
@@ -875,6 +1024,115 @@ mod tests {
             raw_overshoots > 0,
             "kvbm no longer over-allocates the generation block; \
              step_page_indices and this test can be retired"
+        );
+    }
+
+    /// The maintained counter audited against recomputation from request
+    /// truth at every lifecycle stage — draws shrink it, returned blocks
+    /// (revert) grow it back, release refunds the remainder exactly.
+    #[test]
+    fn entitlement_tracks_the_undrained_remainder_through_the_lifecycle() {
+        let pool = BlockPool::new(16, 64);
+        let audit = |pool: &BlockPool, kv: &RequestKv, stage: &str| {
+            assert_eq!(
+                pool.entitled_blocks(),
+                kv.lifetime_blocks() - kv.resident_blocks(),
+                "counter vs recomputed remainder at {stage}"
+            );
+        };
+
+        // 32-token prompt + 33 outputs: lifetime = ceil(65/16) = 5.
+        let mut kv = pool.new_request((0..32).map(|i| 100 + i).collect(), 33, None);
+        assert_eq!(pool.entitled_blocks(), 0, "construction entitles nothing");
+        kv.admit();
+        audit(&pool, &kv, "admit");
+
+        kv.schedule_prefill(32, &pool).unwrap();
+        audit(&pool, &kv, "schedule_prefill");
+        kv.apply_prefill(1000, &pool).unwrap();
+        audit(&pool, &kv, "apply_prefill");
+
+        for step in 0..16u32 {
+            kv.schedule_decode(&pool).unwrap();
+            audit(&pool, &kv, "schedule_decode");
+            kv.apply_decode(2000 + step, &pool).unwrap();
+            audit(&pool, &kv, "apply_decode");
+        }
+
+        // The shrink path: a reverted reservation returns its blocks while
+        // the request lives on, so the entitlement grows back.
+        kv.schedule_speculative(8, &pool).unwrap();
+        audit(&pool, &kv, "schedule_speculative");
+        kv.revert_schedule().unwrap();
+        audit(&pool, &kv, "revert_schedule");
+
+        kv.release().unwrap();
+        assert_eq!(pool.entitled_blocks(), 0, "release refunds the remainder");
+    }
+
+    #[test]
+    fn entitlement_refunds_on_drop_without_release() {
+        let pool = BlockPool::new(16, 64);
+        let mut kv = pool.new_request(vec![1; 16], 16, None);
+        kv.admit();
+        kv.schedule_prefill(16, &pool).unwrap();
+        assert!(pool.entitled_blocks() > 0);
+        drop(kv);
+        assert_eq!(pool.entitled_blocks(), 0, "Drop is the retire backstop");
+    }
+
+    #[test]
+    fn unadmitted_requests_never_move_the_counter() {
+        let pool = BlockPool::new(16, 64);
+        let mut kv = pool.new_request(vec![1; 16], 16, None);
+        kv.schedule_prefill(16, &pool).unwrap();
+        kv.apply_prefill(1000, &pool).unwrap();
+        assert_eq!(pool.entitled_blocks(), 0);
+        kv.release().unwrap();
+        let probe = pool.probe_prefix(vec![1; 16], None);
+        assert_eq!(pool.entitled_blocks(), 0, "probe requests entitle nothing");
+        drop(probe);
+        assert_eq!(pool.entitled_blocks(), 0);
+    }
+
+    /// The floor itself: an opportunistic reserve may only take what is left
+    /// above every admitted request's un-drawn remainder — even though those
+    /// blocks sit in the free pool.
+    #[test]
+    fn reserve_loaded_blocks_declines_into_the_entitled_floor() {
+        // 8 blocks minus padding = 7 available.
+        let pool = BlockPool::new(16, 8);
+        assert_eq!(pool.available_blocks(), 7);
+
+        // 16-token prompt + 65 outputs: lifetime = ceil(81/16) = 6.
+        let mut kv = pool.new_request(vec![1; 16], 65, None);
+        kv.admit();
+        assert_eq!(pool.entitled_blocks(), 6);
+
+        assert!(
+            pool.reserve_loaded_blocks(2).is_none(),
+            "2 + entitled 6 exceeds available 7"
+        );
+        let held = pool
+            .reserve_loaded_blocks(1)
+            .expect("1 + entitled 6 fits available 7");
+
+        // The entitled party draws past the floor without contention.
+        kv.schedule_prefill(16, &pool).unwrap();
+        assert_eq!(pool.entitled_blocks(), 5);
+        assert!(
+            pool.reserve_loaded_blocks(1).is_none(),
+            "the draw shrank available and entitlement together"
+        );
+
+        kv.revert_schedule().unwrap();
+        assert_eq!(pool.entitled_blocks(), 6, "the reverted draw grows it back");
+        kv.release().unwrap();
+        assert_eq!(pool.entitled_blocks(), 0);
+        drop(held);
+        assert!(
+            pool.reserve_loaded_blocks(7).is_some(),
+            "with no admitted requests the whole pool is reservable"
         );
     }
 }

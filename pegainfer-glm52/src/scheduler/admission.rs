@@ -331,6 +331,9 @@ pub(super) fn admit_from_queue(
                 } else {
                     pool.new_request(req.prompt_tokens.clone(), req.max_tokens, None)
                 };
+                // The budget check above honored the full lifetime; entitle it
+                // so background resolves can't reserve into the remainder.
+                kv.admit();
                 let cached_tokens = if prefix_cache_enabled {
                     match kv.match_and_add_prefix(pool) {
                         Ok(cached) => cached,
@@ -462,6 +465,9 @@ fn admit_native(
         Some(super::native_mtp_cache_salt()),
         None,
     );
+    // The budget check honored the full lifetime; entitle it so background
+    // resolves can't reserve into the remainder.
+    kv.admit();
     let boundary_copy = match restore_native_kv(&mut kv, prefix, &handoff, pool) {
         Ok(copy) => copy,
         Err(err) => {
