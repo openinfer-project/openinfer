@@ -107,6 +107,7 @@ impl KvStoreBuilder {
                         pool,
                         tier,
                         pinned: Arc::new(AtomicUsize::new(0)),
+                        loads: tokio_util::task::TaskTracker::new(),
                     },
                 )
             })

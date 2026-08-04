@@ -28,6 +28,7 @@ pegaflow-core = { git = "https://github.com/novitalabs/pegaflow.git", rev = "141
 tokio = { workspace = true, features = ["sync", "time", "rt", "rt-multi-thread", "net"] }
 # net: wraps the P2P gRPC listener into the stream `serve_with_incoming` takes.
 tokio-stream = { workspace = true, features = ["net"] }
+tokio-util = { workspace = true, features = ["rt"] }
 
 [dev-dependencies]
 libc = { workspace = true }
