@@ -688,6 +688,9 @@ impl Qwen35Model {
         for &n in super::batch_decode_graph::BATCH_BUCKETS
             .iter()
             .filter(|&&bucket| {
+                // Keep in sync with MAX_SHARED_SM_DECODE_BATCH: buckets above
+                // GEMM_LT_MAX_N do not have an independent tuned decode GEMM
+                // route today, so Shared-SM overlap rejects them at startup.
                 bucket <= crate::ops::GEMM_LT_MAX_N && bucket <= self.reserved_decode_slots
             })
         {

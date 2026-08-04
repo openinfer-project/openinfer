@@ -37,11 +37,13 @@ pub const MAX_DECODE_BATCH: usize = batch_decode_graph::MAX_BATCH;
 
 /// Current safe Qwen3.5 Shared-SM overlap admission cap.
 ///
-/// Decode buckets above this value fall back to the workspace-backed prefill
-/// cuBLAS handle today; running them while async prefill is in flight would make
-/// two streams share that handle/workspace. Keep overlap opt-in below that
-/// boundary until the larger decode buckets have an independent GEMM route.
+/// Decode buckets above this value fall back to the prefill cuBLAS handle today.
+/// Replaying decode while async prefill concurrently calls that same handle from
+/// another stream relies on undocumented single-handle multi-stream behavior.
+/// Keep overlap opt-in below this boundary until the larger decode buckets have
+/// an independent per-stream handle/workspace route.
 pub const MAX_SHARED_SM_DECODE_BATCH: usize = ops::GEMM_LT_MAX_N;
+const _: () = assert!(MAX_SHARED_SM_DECODE_BATCH <= ops::GEMM_LT_MAX_N);
 
 /// Low-level Qwen3.5 execution interface.
 ///
@@ -224,7 +226,7 @@ pub fn start_engine_with_capacity_policy_and_overlap(
     if decode_overlap == Qwen35DecodeOverlap::SharedSm {
         anyhow::ensure!(
             max_batch <= MAX_SHARED_SM_DECODE_BATCH,
-            "Qwen3.5 --decode-overlap=stream currently requires --max-batch <= {MAX_SHARED_SM_DECODE_BATCH}; decode bucket 64 still falls back to the workspace-backed prefill GEMM handle"
+            "Qwen3.5 --decode-overlap=stream currently requires --max-batch <= {MAX_SHARED_SM_DECODE_BATCH}; larger decode buckets still fall back to the prefill GEMM handle"
         );
     }
     if device_ordinals.len() > 1 {

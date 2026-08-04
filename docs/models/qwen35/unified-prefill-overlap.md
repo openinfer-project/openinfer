@@ -2,11 +2,11 @@
 
 > **TL;DR:** Issue #715 adds opt-in, single-GPU `--decode-overlap stream` for
 > Qwen3.5. One prefill chunk may run on a second CUDA stream while active decode
-> continues. On one RTX 5090, three-run HTTP c16 mean TPOT improved 3.04% and
-> QPS 8/12/16 mean TPOT improved 6.68%/7.74%/8.05%; c1 regressed 1.20%, so the
-> default remains serial `off`. Stream mode is currently limited to
-> `--max-batch <= 32` until the bucket-64 decode GEMMs have an independent
-> non-prefill cuBLAS route.
+> continues. The default remains serial `off`. Stream mode is currently limited
+> to `--max-batch <= 32` until the bucket-64 decode GEMMs have an independent
+> per-stream cuBLAS route. The original HTTP table below predates that cap and
+> used the server's implicit Qwen3.5 max-batch default, so treat it as pre-cap
+> evidence until the HTTP cells are re-run with an explicit safe max batch.
 >
 > **Last touched:** 2026-08
 
@@ -98,6 +98,17 @@ Unsupported combinations fail before model loading:
   nested, RAII-restored prefill marker now narrows that routing rule to Qwen3.5
   async prefill. Its unit test and affected Qwen3/Qwen3.5 builds passed, and the
   Shared-SM lifecycle gate still observed two `overlap_wait` actions.
+- Follow-up review after the PegaInfer rename fixed the `bench_serving` Qwen3.5
+  crate path, made the `MAX_SHARED_SM_DECODE_BATCH <= GEMM_LT_MAX_N` relationship
+  a compile-time assertion, and added a back-reference at the decode GEMM tuning
+  filter. It also removed the dead prefill cuBLAS workspace allocation: cuBLAS
+  resets a handle's workspace when `cublasSetStream()` is called, so the safe
+  bucket cap is about avoiding undocumented concurrent use of one cuBLAS handle
+  across decode replay and async prefill until bucket-64 has a per-stream route.
+- The HTTP A/B table is now explicitly marked pre-cap evidence. The archived
+  server launch command was not retained, and the old source defaulted omitted
+  Qwen3.5 `--max-batch` to 64. Current `stream` mode rejects that default, so
+  cite the HTTP numbers only after a re-run with explicit `--max-batch <= 32`.
 
 ## Verification Contract
 
@@ -111,6 +122,7 @@ Unsupported combinations fail before model loading:
 | HTTP client | vLLM 0.25.1 `bench serve` only; no vLLM server was used |
 | Server binary sha256 | `5f19998277f4be7577846cf3e78bc3fef43151a5add0b0a56dd443a06d39b091` |
 | `bench_serving` sha256 | `cf5040aa4bbad60011a3fa3799f23d8aa2bae8ef399f35bd5a7872a7d98c1936` |
+| Current HTTP rerun requirement | Use `--decode-overlap stream --max-batch <= 32`; the server default is 64 for Qwen3.5 and is intentionally rejected in stream mode |
 
 Qwen3.5 does not expose product prefix reuse or accept
 `--no-prefix-cache`; the CLI rejects it as an unused option. The primary result
@@ -129,7 +141,7 @@ flag.
 - Release server and `bench_serving` builds passed. Startup rejection probes
   passed for TP, `Auto + SharedSm`, and Green Context.
 
-### HTTP A/B
+### HTTP A/B (pre-cap evidence; needs explicit max-batch rerun)
 
 The same release binary served both modes. Each round ran `off` then `stream`
 with a 15-second cooldown. Fixed-concurrency cells used request rate `inf`;
@@ -147,8 +159,27 @@ vllm bench serve \
   --save-result --save-detailed
 ```
 
-Median of three runs. `ok/fail` is the total across all three. TPOT is the
-median run's mean TPOT; the latency columns retain p50/p99 from the median run.
+The exact historical server launch command was not retained in the archived
+notes. Inspecting the benchmark source commit shows Qwen3.5 server startup
+filled an omitted `--max-batch` from Qwen3.5 `MAX_DECODE_BATCH`, so omitting
+`--max-batch` meant the HTTP table used the implicit 64-slot default.
+Current stream mode rejects that shape; use commands like these for a current
+HTTP rerun:
+
+```bash
+cargo build --release -p pegainfer-server --features qwen35
+
+target/release/pegainfer \
+  --model-path <model> --served-model-name qwen35-715 --port <port> \
+  --cuda-graph=true --qwen35-scheduler-policy off \
+  --max-batch 32 --max-prefill-tokens 1024 \
+  --decode-overlap <off|stream>
+```
+
+Median of three historical runs. `ok/fail` is the total across all three. TPOT is
+the median run's mean TPOT; the latency columns retain p50/p99 from the median
+run. These rows are retained to show the original direction and output sanity,
+not as the current post-cap HTTP result.
 
 | Cell | mode | ok/fail | observed avg in/out | TTFT p50/p99 ms | TPOT mean/p99 ms | ITL p50/p99 ms | output tok/s |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -180,11 +211,11 @@ An independent 128-token HTTP sanity request completed in every server block.
 Its two deterministic text variants had hashes `3a225a2290dd7ad1` and
 `480c2617c7ed462e` in both modes.
 
-The c16 improvement exceeded run-to-run noise: Stream improved mean TPOT in all
-three paired rounds. The three-run median was `11.48 -> 11.13 ms` (`-3.04%`).
-QPS 8/12/16 improved `6.68%/7.74%/8.05%`. c1 moved
-`6.99 -> 7.07 ms` (`+1.20%`), and QPS TTFT p50 increased by about 2-16 ms.
-These tradeoffs keep Stream opt-in.
+In this pre-cap table, Stream improved c16 mean TPOT in all three paired rounds:
+the three-run median was `11.48 -> 11.13 ms` (`-3.04%`). QPS 8/12/16 improved
+`6.68%/7.74%/8.05%`. c1 moved `6.99 -> 7.07 ms` (`+1.20%`), and QPS TTFT p50
+increased by about 2-16 ms. Re-run these cells with explicit `--max-batch <= 32`
+before citing them as current HTTP performance evidence.
 
 ### Serving plan trace and direct diagnostic
 

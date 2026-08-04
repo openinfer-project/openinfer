@@ -246,6 +246,8 @@ mod tests {
             "pegainfer",
             "--decode-overlap",
             "stream",
+            "--max-batch",
+            "32",
             "--qwen35-scheduler-policy",
             "auto",
         ])

@@ -223,9 +223,7 @@ impl SharedArgs {
                 "--device-ordinal is ignored under tensor parallelism; tp_size>1 uses devices 0..tp_size",
             ));
         }
-        if provided.contains("decode_sm_pct")
-            && self.decode_overlap != CliDecodeOverlap::GreenCtx
-        {
+        if provided.contains("decode_sm_pct") && self.decode_overlap != CliDecodeOverlap::GreenCtx {
             return Err(CliError::rule(
                 "--decode-sm-pct only applies with --decode-overlap=green-ctx",
             ));
