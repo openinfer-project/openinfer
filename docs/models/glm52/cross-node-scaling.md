@@ -51,7 +51,7 @@ assert holds across trays and the shim needs nothing new. Verified 2-tray EP8 re
 ```bash
 # remote tray: dumb rank-host, hosts ranks by the coordinator's instruction
 CUDA_VISIBLE_DEVICES=0,1,2,3 EP_DISABLE_GIN=1 \
-  openinfer --glm52-rank-host 0.0.0.0:19000
+  pegainfer --glm52-rank-host 0.0.0.0:19000
 
 # coordinator tray: 4 local ranks + 4 remote
 glm52_step_bench --model-path <GLM-5.2-FP8> --moe-topo ep8 \
@@ -74,7 +74,7 @@ Two open items: bucket-8 p99 has a reproducible ~2× bimodal tail at every width
 unexplained; and the context-cap ledger doesn't count width-scaled DeepEP buffers
 (`kNumRanks × kDecodeMaxTokens`), so wide-EP runs need an explicit `--max-model-len`
 until the ledger learns about comm buffers.
-`openinfer --rank-hosts ...` serves the same topology over HTTP (greedy prose + code checked).
+`pegainfer --rank-hosts ...` serves the same topology over HTTP (greedy prose + code checked).
 
 Operational contract:
 
@@ -110,7 +110,7 @@ same global row count, so every scheduling decision is global (see "Scheduler se
 
 ### What we actually run (correcting an easy misconception)
 
-The shim (`openinfer-kernels/csrc/deepep/deepep_shim_impl.cuh`) vendors the **DeepEP v2
+The shim (`pegainfer-kernels/csrc/deepep/deepep_shim_impl.cuh`) vendors the **DeepEP v2
 (elastic) kernel family** — `deep_ep/impls/dispatch.cuh` / `combine.cuh` — on the **NCCL
 device API** backend: `ncclDevComm`, symmetric windows (`ncclMemAlloc`), and GIN. v1's
 split into intranode (IPC/NVLink) and internode (NVSHMEM/IBGDA) kernel families does not
@@ -170,7 +170,7 @@ machines can host the microbench at all.
 
 ### One scheduler, not N
 
-The coordinator (`openinfer-glm52/src/scheduler/mod.rs`, `run_dp8_coordinator`) stays the
+The coordinator (`pegainfer-glm52/src/scheduler/mod.rs`, `run_dp8_coordinator`) stays the
 **single global scheduler**. DP shards *state* (each rank's KV, slots, requests); it does not
 shard *control*: the EP contract makes the step bucket, step/skip, and launch-ahead all
 global quantities, so a per-rank scheduler would retain zero local discretion. The

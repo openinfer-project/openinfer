@@ -21,7 +21,7 @@
 - **Plan**:
   1. Add a small Qwen3.5 scheduler policy enum with default `off` and explicit opt-in `auto`.
   2. Move the adaptive decision into pure scheduler-plan helpers with unit tests for fixed, hard-cap, final-chunk, and decode-finish protection cases.
-  3. Wire the policy through Qwen3.5 launch, the OpenInfer server CLI, and `bench_serving` so validation can compare opt-in `auto` vs default `off`.
+  3. Wire the policy through Qwen3.5 launch, the PegaInfer server CLI, and `bench_serving` so validation can compare opt-in `auto` vs default `off`.
   4. Run narrow Rust checks locally, then use the remote GPU host for Qwen3.5 build/test and representative benchmark cells.
 - **Risks / open questions**:
   - The local Mac is not a CUDA validation host, so runtime evidence must come from the provided remote GPU environment.
@@ -31,7 +31,7 @@
 
 ### Step 1: Scheduler policy and pure decision helper
 
-- Added `Qwen35SchedulerPolicy::{Auto, Off}` in `openinfer-qwen35`, defaulting existing Qwen3.5 launch paths to `Off`.
+- Added `Qwen35SchedulerPolicy::{Auto, Off}` in `pegainfer-qwen35`, defaulting existing Qwen3.5 launch paths to `Off`.
 - Added `choose_prefill_budget(...)` in `scheduler/plan.rs` so the adaptive decision is unit-testable outside the GPU loop.
 - Policy rules:
   - `Off` preserves the fixed base prefill budget.
@@ -42,7 +42,7 @@
 
 ### Step 2: Runtime and benchmark wiring
 
-- Threaded the policy through Qwen3.5 launch, `openinfer` server CLI, and `bench_serving`:
+- Threaded the policy through Qwen3.5 launch, `pegainfer` server CLI, and `bench_serving`:
   - `--qwen35-scheduler-policy auto|off` defaults to `off`.
   - Tensor-parallel Qwen3.5 rejects `auto` because TP Phase 1 does not run unified prefill+decode.
   - Qwen3.5 `--max-batch` now accepts `1..=MAX_DECODE_BATCH`; non-bucket requests such as `5` allocate the next graph bucket internally but admit only the requested slots.
@@ -74,19 +74,19 @@ Validation host contract:
 | Feature | `qwen35` |
 | Model | `Qwen/Qwen3.5-4B` downloaded through ModelScope on 2026-07-20 |
 | Model config | `model_type=qwen3_5`, `architectures=["Qwen3_5ForConditionalGeneration"]`, `config.json` sha256 `ddc63e1c717afa86c865bb5e01313d89d72bb53b97ad4a8a03ba8510c0621670` |
-| Build env | `OPENINFER_CUDA_SM=120`, `CUDA_HOME` set to CUDA 12.8, `OPENINFER_TRITON_PYTHON` set to a Triton 3.7.1 Python |
+| Build env | `PEGAINFER_CUDA_SM=120`, `CUDA_HOME` set to CUDA 12.8, `PEGAINFER_TRITON_PYTHON` set to a Triton 3.7.1 Python |
 
 Remote checks:
 
 ```bash
 cargo fmt --all -- --check
 git diff --check
-cargo test -p openinfer-qwen35 --features qwen35 adaptive_prefill_budget -- --nocapture
-cargo test -p openinfer-server --features qwen35 qwen35 -- --nocapture
-cargo build --release -p openinfer-server --features qwen35
+cargo test -p pegainfer-qwen35 --features qwen35 adaptive_prefill_budget -- --nocapture
+cargo test -p pegainfer-server --features qwen35 qwen35 -- --nocapture
+cargo build --release -p pegainfer-server --features qwen35
 cargo build --release --bin bench_serving --features qwen35
-OPENINFER_TEST_MODEL_PATH=<absolute model path> \
-  cargo test --release -p openinfer-qwen35 --features qwen35 --test e2e_scheduler -- --nocapture
+PEGAINFER_TEST_MODEL_PATH=<absolute model path> \
+  cargo test --release -p pegainfer-qwen35 --features qwen35 --test e2e_scheduler -- --nocapture
 ```
 
 Result: all checks passed. `e2e_scheduler` passed the single-GPU test; the TP2 test remained ignored on the one-GPU host.
@@ -97,7 +97,7 @@ These cells were gathered before review narrowed the PR to default-off, cap-pres
 
 Benchmark flags shared by those pre-review cells:
 
-- Engine: OpenInfer Qwen3.5 direct `bench_serving`, CUDA Graph enabled, feature `qwen35`.
+- Engine: PegaInfer Qwen3.5 direct `bench_serving`, CUDA Graph enabled, feature `qwen35`.
 - Source: upstream/main `8dd3953` plus this patch.
 - Hardware/toolchain/model: same as the remote GPU contract above.
 - Sampling: synthetic random prompts, greedy, fixed output.
@@ -138,7 +138,7 @@ The starvation negative control (`max_batch=4,bg=4`) emitted the expected warnin
 - **Pitfalls encountered**:
   - Triton 3.3.0 could not AOT for `cc120`; the validation host used Triton 3.7.1.
   - Hugging Face download was unavailable from the host; ModelScope provided the same public `Qwen/Qwen3.5-4B` model family, with config hash recorded above.
-  - A relative `OPENINFER_TEST_MODEL_PATH` failed for `e2e_scheduler` because the test process cwd differed; the rerun used an absolute path and passed.
+  - A relative `PEGAINFER_TEST_MODEL_PATH` failed for `e2e_scheduler` because the test process cwd differed; the rerun used an absolute path and passed.
   - `bench_serving mixed` still infers stall windows from request `[submit,last-token]`; the retained `max_batch=5,bg=4` capacity gate avoids the known starvation artifact, but this doc does not claim internal `decode_n` trace instrumentation.
 - **Lessons learned**:
   - The adaptive path should stay opt-in until wider active-decode/QPS evidence chooses an SLA objective.

@@ -1,6 +1,6 @@
-# KV cache 统一设计：openinfer-kv-store
+# KV cache 统一设计：pegainfer-kv-store
 
-**TL;DR**: 异构 KV（full attn / MLA / SWA / linear state）统一为「组 + checkpoint」模型；`openinfer-kv-store` 收编 qwen3/glm52 各自手写的 offload 编排（resolve/seal/retire 三动词 + 单一 KvPrefix 终态），模型侧只声明 `KvModel`（spec/arenas/repack）。骨架已落地且**自包含**（直连 `kvbm-logical` + `pegaflow-core`，不再依赖 `openinfer-kv-cache`/`openinfer-kv-offload`；测试为真 GPU/SSD 引擎套件，无 mock）。qwen3 首迁验证接口，glm52 验证 P/D，qwen35 验证 bounded 组。
+**TL;DR**: 异构 KV（full attn / MLA / SWA / linear state）统一为「组 + checkpoint」模型；`pegainfer-kv-store` 收编 qwen3/glm52 各自手写的 offload 编排（resolve/seal/retire 三动词 + 单一 KvPrefix 终态），模型侧只声明 `KvModel`（spec/arenas/repack）。骨架已落地且**自包含**（直连 `kvbm-logical` + `pegaflow-core`，不再依赖 `pegainfer-kv-cache`/`pegainfer-kv-offload`；测试为真 GPU/SSD 引擎套件，无 mock）。qwen3 首迁验证接口，glm52 验证 P/D，qwen35 验证 bounded 组。
 
 Last touched: 2026-08
 
@@ -90,7 +90,7 @@ pub struct GroupSpec {
 pub trait KvModel {
     fn spec(&self) -> KvSpec;
     /// 物理登记：(组, arena) 对——一层可有多个 arena，一组可跨多层。
-    /// Arena 描述用 `openinfer-kv-store::ArenaSpec`
+    /// Arena 描述用 `pegainfer-kv-store::ArenaSpec`
     /// { name, base_device_ptr, size_bytes, num_blocks, segment_bytes,
     ///   segments, kv_stride_bytes, block_stride_bytes }（glm52 `kv_arenas()`
     /// 与 qwen3 fused-buffer 逐层视图都是其真子集；`segments`/`kv_stride`
@@ -240,7 +240,7 @@ while let Ok((req, kv_prefix)) = submit_rx.try_recv() {
 
 ## 迁移计划（绞杀式，每步合 main、bench 全绿、删旧码）
 
-1. ✅ 本骨架 PR：文档 + `openinfer-kv-store`（resolve/seal/retire + `PegaflowHost`/`ArenaSpec` pegaflow 接线 + SSD/P2P，paged only；测试为真 GPU/SSD 引擎套件，无 mock）+ 分发层 `(GenerateRequest, KvPrefix)`（未迁移模型收 `KvPrefix::none()`，行为零变化）。
+1. ✅ 本骨架 PR：文档 + `pegainfer-kv-store`（resolve/seal/retire + `PegaflowHost`/`ArenaSpec` pegaflow 接线 + SSD/P2P，paged only；测试为真 GPU/SSD 引擎套件，无 mock）+ 分发层 `(GenerateRequest, KvPrefix)`（未迁移模型收 `KvPrefix::none()`，行为零变化）。
 2. qwen3 首迁：`resolve_prefix` 替换 `remote_fetch_action` 状态机（executor.rs ~2000 行 prefetch 编排），旧路径留开关至 bench 对齐。
 3. glm52 D 侧：收件箱替换 `HostRestoreState`；随后 P/D `Handoff` 租约（对齐 pegaflow `QueryLeaseId` 语义后定稿）。#812（EP32 生产设计点）仍 open、阶段性 PR 持续落 main 且常动 scheduler/offload 邻域——迁移分支以 main 为基准高频 rebase，避免累积大 diff。
 4. qwen35：`core::kv_pool` → `BlockPool` 迁移（独立，可并行开工）；然后 Bounded 组 slab + seal-by-copy 首发（唯一的新物理能力，由从零接入的模型验证）。gemma4 照抄。

@@ -1,7 +1,7 @@
-# OpenInfer development container
+# PegaInfer development container
 
 The development image contains the native toolchain required to build
-OpenInfer: CUDA, the Rust nightly pinned by `rust-toolchain.toml`, Python 3,
+PegaInfer: CUDA, the Rust nightly pinned by `rust-toolchain.toml`, Python 3,
 uv, Triton, TileLang, clang, OpenSSL, protoc, and NCCL 2.30.4 or newer.
 
 Build it once:
@@ -36,14 +36,14 @@ docker/dev.sh run cargo build --release --features qwen35
 GLM5.2 builds targeting Hopper use the same environment's pinned TileLang:
 
 ```bash
-OPENINFER_CUDA_SM=90 docker/dev.sh run \
+PEGAINFER_CUDA_SM=90 docker/dev.sh run \
   cargo build --release --features glm52
 ```
 
 Mount model weights read-only at their existing absolute path:
 
 ```bash
-OPENINFER_MODEL_DIR=/models/Qwen3-4B docker/dev.sh shell
+PEGAINFER_MODEL_DIR=/models/Qwen3-4B docker/dev.sh shell
 ```
 
 The default base is the pinned CUDA 13.2 development image, which is the
@@ -55,7 +55,7 @@ CUDA_IMAGE=nvidia/cuda:<version>-devel-ubuntu24.04 docker/dev.sh build
 ```
 
 The persistent native target cache is automatically namespaced by the CUDA
-base recorded in the image. Set `OPENINFER_DEV_CACHE_KEY` only when a custom
+base recorded in the image. Set `PEGAINFER_DEV_CACHE_KEY` only when a custom
 image needs a more specific namespace.
 
 On a tray without a GIN-capable NIC, pass `EP_DISABLE_GIN=1` when starting

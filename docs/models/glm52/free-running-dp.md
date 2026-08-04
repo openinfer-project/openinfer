@@ -197,14 +197,14 @@ Free-running 后 padding row 从"本地丢弃的废行"升级为**协议表面**
 ## 8. Go/no-go kernel gates(先于任何架构代码)
 
 **结果(2026-07-30,GB300 tray03 单 tray 4 GPU,`susun-dev`,commit `16d95344`):
-gate 1–3 全部 GO。** 前三个 gate 实现于 `openinfer-glm52/src/oracle/freerun_ep4.rs`,
+gate 1–3 全部 GO。** 前三个 gate 实现于 `pegainfer-glm52/src/oracle/freerun_ep4.rs`,
 按 EP4 形状写(一个 GB300 NVL72 tray = 4 GPU,走 weight-only 链——正是 NVL72 上的
 生产链)。运行(**每个 gate 必须单独一个进程**,见下面的 pitfall):
 
 ```bash
 for g in freerun_hetero_traffic_gate freerun_hetero_graph_gate freerun_bound_tax_probe; do
-  OPENINFER_TEST_MODEL_PATH=/mnt/shared/weights/GLM-5.2-FP8 EP_DISABLE_GIN=1 \
-    cargo test --release -p openinfer-glm52 --lib "$g" -- --ignored --nocapture
+  PEGAINFER_TEST_MODEL_PATH=/mnt/shared/weights/GLM-5.2-FP8 EP_DISABLE_GIN=1 \
+    cargo test --release -p pegainfer-glm52 --lib "$g" -- --ignored --nocapture
 done
 ```
 

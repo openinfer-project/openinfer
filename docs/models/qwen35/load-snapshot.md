@@ -11,7 +11,7 @@
   - `docs/models/qwen35/model-crate.md` — confirmed that the model crate owns the scheduler and exposes it through the generic `EngineHandle`.
   - `docs/models/qwen35/roadmap.md` — confirmed the serving and lifecycle observability context.
   - `docs/subsystems/frontend/prometheus-metrics.md` — confirmed the existing `LoadSnapshot` bridge contract.
-  - `openinfer-qwen35/src/scheduler.rs` before and after the metrics change — compared the wiring with the shared single-GPU/TP scheduler flow.
+  - `pegainfer-qwen35/src/scheduler.rs` before and after the metrics change — compared the wiring with the shared single-GPU/TP scheduler flow.
 - **Relevant history**:
   - Qwen3 established the `LoadSnapshot` watch path consumed by the frontend bridge.
   - Qwen3.5 shares one scheduler loop between single-GPU and TP backends, so KV accounting must come from `SchedulerBackend`, not directly from `Qwen35Model`.
@@ -65,12 +65,12 @@ The single-GPU NVIDIA run was captured at `a033258c1de1944469d6c6335d4a36d4a8019
 Build and existing scheduler E2E:
 
 ```bash
-export OPENINFER_CUDA_SM=120
-export OPENINFER_TRITON_PYTHON="$PWD/.venv/bin/python"
-export OPENINFER_TEST_MODEL_PATH="$PWD/models/Qwen3.5-4B"
+export PEGAINFER_CUDA_SM=120
+export PEGAINFER_TRITON_PYTHON="$PWD/.venv/bin/python"
+export PEGAINFER_TEST_MODEL_PATH="$PWD/models/Qwen3.5-4B"
 
-cargo build --release -p openinfer-server --features qwen35
-cargo test --release -p openinfer-qwen35 --features qwen35 \
+cargo build --release -p pegainfer-server --features qwen35
+cargo test --release -p pegainfer-qwen35 --features qwen35 \
   --test e2e_scheduler test_e2e_qwen35_scheduler -- --exact --nocapture
 ```
 
@@ -79,7 +79,7 @@ The release build passed and the existing E2E reported `1 passed; 0 failed`.
 Server and 100 ms metric sampler:
 
 ```bash
-RUST_LOG=info target/release/openinfer \
+RUST_LOG=info target/release/pegainfer \
   --model-path models/Qwen3.5-4B \
   --served-model-name qwen35-metrics \
   --port 18080 --device-ordinal 0 --tp-size 1 \
@@ -109,7 +109,7 @@ python3 scripts/bench_http_serving.py \
   --commit a033258c1de1944469d6c6335d4a36d4a80192cf \
   --source-revision a033258c1de1944469d6c6335d4a36d4a80192cf \
   --model-revision 851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a \
-  --server-binary target/release/openinfer \
+  --server-binary target/release/pegainfer \
   --claim-boundary "Qwen3.5 LoadSnapshot live metrics pressure and recovery only" \
   --out pressure.json
 ```

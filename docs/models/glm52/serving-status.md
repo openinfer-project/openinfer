@@ -1,6 +1,6 @@
 # GLM5.2 serving status
 
-> **TL;DR:** GLM5.2 is **Blackwell-only** (compute capability ≥ 10). Decode serving is EP4 / EP8 / one-domain EP-N with SM100 DeepGEMM masked grouped expert GEMMs; TP4 is **prefill-only** (NCCL). Hopper (SM9x), decode TP8/TP4 LL, and the old SM90 DeepGEMM path are removed. Continuous batching, whole-step CUDA Graphs, sampling, DSpark, paged KV, prefix caching, host offload, and target-only vLLM→OpenInfer P/D remain on the EP decode path. The line stays Bring-up until long-context indexer correctness and lifecycle reliability are closed.
+> **TL;DR:** GLM5.2 is **Blackwell-only** (compute capability ≥ 10). Decode serving is EP4 / EP8 / one-domain EP-N with SM100 DeepGEMM masked grouped expert GEMMs; TP4 is **prefill-only** (NCCL). Hopper (SM9x), decode TP8/TP4 LL, and the old SM90 DeepGEMM path are removed. Continuous batching, whole-step CUDA Graphs, sampling, DSpark, paged KV, prefix caching, host offload, and target-only vLLM→PegaInfer P/D remain on the EP decode path. The line stays Bring-up until long-context indexer correctness and lifecycle reliability are closed.
 >
 > **Last touched:** 2026-07
 
@@ -38,7 +38,7 @@ See `tp4-prefill-only.md`, `ep4-gb300.md`, `free-running-dp.md`, and `cross-node
 | Speculation | DSpark greedy and sampled verify on EP decode; span 4 default; verify spans reuse decode buckets |
 | KV | 64-token paged pool, full-lifetime admission, prefix cache on by default |
 | Offload | PegaFlow host-tier save/restore behind `--kv-offload` (EP; not TP4 prefill-only without native MTP) |
-| P/D | Native-MTP handoff: OpenInfer TP4 prefill-only → EP decode (`first_step=verify`); the vLLM-prefill compat path is removed |
+| P/D | Native-MTP handoff: PegaInfer TP4 prefill-only → EP decode (`first_step=verify`); the vLLM-prefill compat path is removed |
 | Observability | Per-logical-partition running/waiting/KV gauges and decode graph export (EP) |
 | Cross-node EP | One process per node hosting its own ranks (`--glm52-ranks` + `--glm52-rendezvous`); free-running per-rank engines; DeepEP is the only runtime coupling |
 

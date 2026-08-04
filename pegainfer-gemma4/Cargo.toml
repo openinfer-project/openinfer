@@ -1,0 +1,20 @@
+[package]
+autobenches = false
+autobins = false
+autotests = false
+edition = "2024"
+license = "Apache-2.0"
+name = "pegainfer-gemma4"
+version = "0.1.0"
+
+[features]
+gemma4 = []
+default = []
+
+[dependencies]
+anyhow = { workspace = true }
+pegainfer-engine = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

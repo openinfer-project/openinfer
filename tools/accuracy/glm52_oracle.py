@@ -40,7 +40,7 @@ Floating-point probes are asserted with tolerance (fp8 vs bf16 accumulation
 order makes bit-equality impossible); sha256 digests are provenance only —
 never assert a float digest across implementations.
 
-Usage (paste the emitted block into openinfer-glm52/tests/mla_decode_oracle.rs):
+Usage (paste the emitted block into pegainfer-glm52/tests/mla_decode_oracle.rs):
 
     uv run tools/accuracy/glm52_oracle.py \
         --model-path /data/models/GLM-5.2-FP8 --emit rust

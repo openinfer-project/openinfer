@@ -12,8 +12,8 @@
   - Maintainer RFC discussion for issue #257 - narrowed the first version to a GPU snapshot cache with one consistency rule for KV and recurrent state.
   - `docs/models/qwen3/prefix-cache.md` - provides the existing rules for block hashes, adapter isolation, final-token recompute, and keeping matched KV alive.
   - `docs/subsystems/runtime/qwen3-kvbm-integration-spec.md` - describes the content-hashed `BlockPool`/`RequestKv` cache that Qwen3.5 does not yet use.
-  - `openinfer-qwen35/src/{scheduler.rs,prefill.rs,prefill_buffers.rs,recurrent.rs,recurrent_state.rs,weights.rs}` - confirmed the current request state flow, valid prefill boundaries, snapshot layout, and GPU memory reservation.
-  - `openinfer-core/src/kv_pool.rs` and `openinfer-kv-cache/src/pool.rs` - confirmed that Qwen3.5 still uses anonymous RAII pages while Qwen3 can register, match, and pin content-hashed blocks.
+  - `pegainfer-qwen35/src/{scheduler.rs,prefill.rs,prefill_buffers.rs,recurrent.rs,recurrent_state.rs,weights.rs}` - confirmed the current request state flow, valid prefill boundaries, snapshot layout, and GPU memory reservation.
+  - `pegainfer-core/src/kv_pool.rs` and `pegainfer-kv-cache/src/pool.rs` - confirmed that Qwen3.5 still uses anonymous RAII pages while Qwen3 can register, match, and pin content-hashed blocks.
 - **Relevant history**:
   - The first draft focused on CPU offload but did not say clearly who keeps KV and snapshots consistent. Review narrowed the first version to GPU allocation, lookup, lifetime, and whole-model snapshot creation.
   - The first draft also treated the 64-token GDR tile as a correctness boundary. Current resumed-prefill coverage uses 16-token scheduler chunks successfully, so a completed whole-model chunk, not an internal GDR tile, is the state boundary.
@@ -61,7 +61,7 @@ kv.seq_len() == rec.seq_len == cursor + step_chunk
 
 If the prompt is incomplete, the scheduler keeps these states for the next step. If it is complete, it copies `rec` into a stable decode graph slot. Direct-paged prefill and scheduler chunking are therefore no longer blockers.
 
-The missing prerequisite is content-based KV reuse. Qwen3.5 still uses `openinfer_core::kv_pool::{KvPool, KvState}`: it allocates and returns pages, but it cannot identify their token content, register completed blocks, or match a new request against them. Qwen3 uses `openinfer_kv_cache::{BlockPool, RequestKv}`, which provides those operations and keeps matched blocks alive while they are being attached to a request.
+The missing prerequisite is content-based KV reuse. Qwen3.5 still uses `pegainfer_core::kv_pool::{KvPool, KvState}`: it allocates and returns pages, but it cannot identify their token content, register completed blocks, or match a new request against them. Qwen3 uses `pegainfer_kv_cache::{BlockPool, RequestKv}`, which provides those operations and keeps matched blocks alive while they are being attached to a request.
 
 Before prefix reuse can be implemented, Qwen3.5 full-attention KV must move to that cache API while preserving its current page-first memory layout and kernels. Most required operations already exist. Joint lookup adds these requirements:
 

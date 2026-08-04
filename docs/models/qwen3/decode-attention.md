@@ -28,7 +28,7 @@ bs=1 single-stream decode tpot "jittered with the dataset" — but it wasn't pre
 | gate=1024 (NonPartition <1024) | 5.95 | 6.15 | 6.44 | **6.95** | 6.43 | 5.98 | 5.99 |
 | no gate (SplitKv) | 5.78 | 5.78 | 5.80 | **5.84** | 5.86 | 5.86 | 5.87 |
 
-The hump climbs to a peak at ~ctx800 then drops off a cliff exactly at ctx1024 (where the old gate flipped to SplitKv). For reference, vLLM's FlashInfer decode is a flat ~6.0ms across this range — the fix puts openinfer below it everywhere.
+The hump climbs to a peak at ~ctx800 then drops off a cliff exactly at ctx1024 (where the old gate flipped to SplitKv). For reference, vLLM's FlashInfer decode is a flat ~6.0ms across this range — the fix puts pegainfer below it everywhere.
 
 **5070 Ti, bs=1, tpot (ms):**
 
@@ -86,7 +86,7 @@ Pinning the path above the cap is not free — past `SPLIT_KV_MAX_BATCH_SIZE` No
 Reproduce a curve:
 
 ```bash
-OPENINFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release -p openinfer-qwen3 --test hf_golden_gate
+PEGAINFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release -p pegainfer-qwen3 --test hf_golden_gate
 # tpot sweep against a running server:
 vllm bench serve --backend openai --base-url http://localhost:8001 --endpoint /v1/completions \
   --model models/Qwen3-4B --dataset-name random --random-input-len 800 --random-output-len 64 \

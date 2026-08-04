@@ -21,7 +21,7 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
-CONFIG_FILE=${GLM52_PD_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/openinfer/glm52-pd.env}
+CONFIG_FILE=${GLM52_PD_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/pegainfer/glm52-pd.env}
 
 # The jump host drops connections intermittently; bound each connect/banner
 # wait and retry it a few times so a transient blip does not abort the run.
@@ -36,7 +36,7 @@ required_vars=(
     P_IMAGE
     P_MODEL_PATH
     D_MODEL_PATH
-    OPENINFER_NCCL_ROOT
+    PEGAINFER_NCCL_ROOT
 )
 for var in "${required_vars[@]}"; do
     if [[ -z ${!var:-} ]]; then
@@ -45,8 +45,8 @@ for var in "${required_vars[@]}"; do
     fi
 done
 
-P_CONTAINER=${P_CONTAINER:-openinfer-pd-prefill}
-D_CONTAINER=${D_CONTAINER:-openinfer-pd-decode}
+P_CONTAINER=${P_CONTAINER:-pegainfer-pd-prefill}
+D_CONTAINER=${D_CONTAINER:-pegainfer-pd-decode}
 D_IMAGE=${D_IMAGE:-$P_IMAGE}
 D_TOPO=${D_TOPO:-ep4}
 D_HOSTS=${D_HOSTS:-${D_HOST:-}}
@@ -81,8 +81,8 @@ fi
 d_ranks_per_host=$(( d_fleet_ranks / d_host_count ))
 
 HOST_REPO=${HOST_REPO:-$REPO_ROOT}
-P_REPO=${P_REPO:-/workspace/openinfer}
-D_REPO=${D_REPO:-/workspace/openinfer}
+P_REPO=${P_REPO:-/workspace/pegainfer}
+D_REPO=${D_REPO:-/workspace/pegainfer}
 
 discover_ip() {
     # The RDMA device (mlx5_bond_0) is a bond of two links; the tray's
@@ -121,11 +121,11 @@ for d_ip_entry in "${d_ips[@]}"; do
 done
 
 role_pid_file() {
-    printf '/tmp/openinfer-glm52-pd-%s.pid' "$1"
+    printf '/tmp/pegainfer-glm52-pd-%s.pid' "$1"
 }
 
 role_log_file() {
-    printf '/tmp/openinfer-glm52-pd-%s.log' "$1"
+    printf '/tmp/pegainfer-glm52-pd-%s.log' "$1"
 }
 
 shell_join() {
@@ -275,10 +275,10 @@ ensure_nccl() {
 prepare() {
     local pegaflow_manifest
     ensure_containers
-    printf 'Building OpenInfer GLM5.2 release binary on %s...\n' "$P_HOST"
+    printf 'Building PegaInfer GLM5.2 release binary on %s...\n' "$P_HOST"
     ssh "$P_HOST" "docker exec \
-        -e OPENINFER_NCCL_ROOT=$OPENINFER_NCCL_ROOT \
-        -e OPENINFER_CUDA_SM=103 \
+        -e PEGAINFER_NCCL_ROOT=$PEGAINFER_NCCL_ROOT \
+        -e PEGAINFER_CUDA_SM=103 \
         $P_CONTAINER bash -lc \
         'cd $P_REPO && cargo build --release --no-default-features --features glm52'"
 
@@ -297,7 +297,7 @@ prepare() {
     for d_host_spec in "${d_hosts[@]}"; do
         ssh "$d_host_spec" "docker exec $D_CONTAINER bash -lc \
             'nm -D /usr/lib/aarch64-linux-gnu/libnccl.so.2 | grep -q ncclCommQueryProperties'"
-        ssh "$d_host_spec" "docker exec $D_CONTAINER test -x $D_REPO/target/release/openinfer"
+        ssh "$d_host_spec" "docker exec $D_CONTAINER test -x $D_REPO/target/release/pegainfer"
     done
     if [[ -n ${ROUTER_BIN:-} ]]; then
         ssh "$P_HOST" "test -x $ROUTER_BIN"
@@ -339,7 +339,7 @@ start_decode_fleet() {
         fi
         d_cmd="cd $(printf %q "$D_REPO") && exec env RUST_LOG=info \
 EP_DISABLE_GIN=1 \
-$(printf %q "$D_REPO/target/release/openinfer") \
+$(printf %q "$D_REPO/target/release/pegainfer") \
 --model-path $(printf %q "$D_MODEL_PATH") \
 --served-model-name $(printf %q "$SERVED_MODEL_NAME") \
 --port $D_HTTP_PORT --moe-topo $D_TOPO \
@@ -381,7 +381,7 @@ start() {
 
     p_cmd="cd $(printf %q "$P_REPO") && exec env RUST_LOG=info \
 EP_DISABLE_GIN=1 NCCL_MIN_NCHANNELS=16 NCCL_MAX_NCHANNELS=32 \
-$(printf %q "$P_REPO/target/release/openinfer") \
+$(printf %q "$P_REPO/target/release/pegainfer") \
 --model-path $(printf %q "$P_MODEL_PATH") \
 --served-model-name $(printf %q "$SERVED_MODEL_NAME") \
 --port $P_HTTP_PORT --tp-size 4 --moe-topo tp4 \

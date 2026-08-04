@@ -13,25 +13,25 @@
 
 ## Code Shape
 
-- `openinfer-qwen35/src/prefill.rs` returns each request's last hidden state and batches final `rms_norm_batch_offset_into` + `gemm`.
-- `openinfer-qwen35/src/unified_forward.rs` returns batched prefill logits and leaves decode logits in the graph buffer.
-- `openinfer-qwen35/src/batch_decode.rs`, `src/scheduler.rs`, and `src/executor.rs` sample from batched logits.
-- `openinfer-qwen35/src/logprobs.rs` is the single helper for requested-logprobs snapshots and CPU logprob formatting.
-- `openinfer-qwen35/tests/e2e_scheduler.rs` checks greedy `logprobs=0/1` token parity, logprob payload shape, and mixed concurrent logprob/no-logprob requests.
+- `pegainfer-qwen35/src/prefill.rs` returns each request's last hidden state and batches final `rms_norm_batch_offset_into` + `gemm`.
+- `pegainfer-qwen35/src/unified_forward.rs` returns batched prefill logits and leaves decode logits in the graph buffer.
+- `pegainfer-qwen35/src/batch_decode.rs`, `src/scheduler.rs`, and `src/executor.rs` sample from batched logits.
+- `pegainfer-qwen35/src/logprobs.rs` is the single helper for requested-logprobs snapshots and CPU logprob formatting.
+- `pegainfer-qwen35/tests/e2e_scheduler.rs` checks greedy `logprobs=0/1` token parity, logprob payload shape, and mixed concurrent logprob/no-logprob requests.
 
 ## Verification
 
 ```bash
 cargo fmt --all --check
 git diff --check
-OPENINFER_CUDA_SM=120 OPENINFER_TRITON_PYTHON=<python-with-triton> \
-  cargo check --release -p openinfer-qwen35 --features qwen35 --tests
-OPENINFER_CUDA_SM=120 OPENINFER_TRITON_PYTHON=<python-with-triton> \
-  OPENINFER_TEST_MODEL_PATH=<Qwen3.5-4B> \
-  cargo test --release -p openinfer-qwen35 --features qwen35 --test hf_golden_gate -- --nocapture
-OPENINFER_CUDA_SM=120 OPENINFER_TRITON_PYTHON=<python-with-triton> \
-  OPENINFER_TEST_MODEL_PATH=<Qwen3.5-4B> \
-  cargo test --release -p openinfer-qwen35 --features qwen35 --test e2e_scheduler -- --nocapture
+PEGAINFER_CUDA_SM=120 PEGAINFER_TRITON_PYTHON=<python-with-triton> \
+  cargo check --release -p pegainfer-qwen35 --features qwen35 --tests
+PEGAINFER_CUDA_SM=120 PEGAINFER_TRITON_PYTHON=<python-with-triton> \
+  PEGAINFER_TEST_MODEL_PATH=<Qwen3.5-4B> \
+  cargo test --release -p pegainfer-qwen35 --features qwen35 --test hf_golden_gate -- --nocapture
+PEGAINFER_CUDA_SM=120 PEGAINFER_TRITON_PYTHON=<python-with-triton> \
+  PEGAINFER_TEST_MODEL_PATH=<Qwen3.5-4B> \
+  cargo test --release -p pegainfer-qwen35 --features qwen35 --test e2e_scheduler -- --nocapture
 ```
 
 Results:

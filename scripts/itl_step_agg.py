@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Aggregate OPENINFER_ITL_DEBUG `ITL_STEP` scheduler logs (issue #470).
+"""Aggregate PEGAINFER_ITL_DEBUG `ITL_STEP` scheduler logs (issue #470).
 
-The Qwen3.5 scheduler, when run with `OPENINFER_ITL_DEBUG` set, emits one line
+The Qwen3.5 scheduler, when run with `PEGAINFER_ITL_DEBUG` set, emits one line
 per executed step:
 
     ITL_STEP mono_us=<u> epoch_us=<u> plan=unified|prefill|decode \

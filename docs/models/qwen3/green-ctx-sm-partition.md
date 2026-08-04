@@ -26,7 +26,7 @@ Before: the split path forced `enable_cuda_graph = false`, so decode ran eager w
 
 The fix rests on one CUDA rule (Programming Guide §4.6.5, mirrored in `docs/lessons/cuda-green-contexts.md`): **stream capture binds each kernel node to the execution context of the stream it is captured on.** A decode graph captured *on the green decode stream* therefore replays on the decode partition's SMs regardless of which stream launches it. So:
 
-- `CudaGraphState` (openinfer-core) now captures/replays on `active_cu_stream(ctx)` — the thread-local stream override, which is the green decode stream inside the split step and `ctx.stream` everywhere else. Rewritten on the raw driver API (`cuStreamBeginCapture_v2`/`cuStreamEndCapture`/`cuGraphInstantiateWithFlags`/`cuGraphLaunch`) because cudarc's `CudaGraph` is bound to a `CudaStream` object and the green stream is a bare `CUstream`. Behaviour with no override is identical to before, so qwen35 / kimi-k2 are unaffected.
+- `CudaGraphState` (pegainfer-core) now captures/replays on `active_cu_stream(ctx)` — the thread-local stream override, which is the green decode stream inside the split step and `ctx.stream` everywhere else. Rewritten on the raw driver API (`cuStreamBeginCapture_v2`/`cuStreamEndCapture`/`cuGraphInstantiateWithFlags`/`cuGraphLaunch`) because cudarc's `CudaGraph` is bound to a `CudaStream` object and the green stream is a bare `CUstream`. Behaviour with no override is identical to before, so qwen35 / kimi-k2 are unaffected.
 - A graph captured on `ctx.stream` (full-SM, primary ctx) and one captured on the green decode stream are different objects, so `BatchDecodeBuffers` keeps **two** caches — `graphs` and `graphs_split` — selected by `has_stream_override()`. Same decode buffers back both, so pointer stability holds for both.
 
 Why this is safe even though the per-step H2D (token_ids/positions/paged meta) lands on `ctx.stream` while the graph replays on the decode stream: a producer fence orders that H2D ahead of the decode stream's read (`fence_producers_before_override`, see Pitfalls). Graph replay submits the same kernels to the same stream, so it inherits the same ordering. The H2D sits outside the captured region (it runs before `run_or_capture`), so capture never sees a copy.
@@ -68,8 +68,8 @@ Power climbs with QPS: at QPS 8 the board still has headroom (draw oscillates ~5
 
 - **`gemm_lt` is still disabled under the stream override** (`5af4fd5`, to avoid the cuBLASLt workspace Xid-31 path). So split-path decode keeps its CUDA graph but loses the per-shape Lt tuning — a remaining decode-side lever, not yet re-measured under the partition.
 - **A single request never exercises the split path** — smoke-test with concurrent load or you are only testing the full-SM graph.
-- **`pkill` from an ssh one-liner matches its own command line** — use `pkill -f "[t]arget/release/openinfer"`, and kill/launch in separate ssh invocations.
-- Build on the 5090 with `CUDA_HOME=/usr/local/cuda-13.1` (stale `/usr/local/cuda` → cuBLAS 12.9 N=1025 cliff; see `serving-perf-5090.md`). Verify `ldd target/release/openinfer | grep cublas` shows `.so.13`.
+- **`pkill` from an ssh one-liner matches its own command line** — use `pkill -f "[t]arget/release/pegainfer"`, and kill/launch in separate ssh invocations.
+- Build on the 5090 with `CUDA_HOME=/usr/local/cuda-13.1` (stale `/usr/local/cuda` → cuBLAS 12.9 N=1025 cliff; see `serving-perf-5090.md`). Verify `ldd target/release/pegainfer | grep cublas` shows `.so.13`.
 
 ## Next
 

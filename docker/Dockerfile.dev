@@ -6,14 +6,14 @@ FROM ${CUDA_IMAGE}
 
 ARG CUDA_IMAGE
 ARG DEBIAN_FRONTEND=noninteractive
-ARG DEV_USER=openinfer
+ARG DEV_USER=pegainfer
 ARG DEV_UID=1000
 ARG DEV_GID=1000
 ARG TRITON_VERSION=3.7.1
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-LABEL org.openinfer.cuda-image="${CUDA_IMAGE}"
+LABEL org.pegainfer.cuda-image="${CUDA_IMAGE}"
 
 # Keep this list in sync with scripts/setup_dev.sh. libnccl-dev/libnccl2 come
 # from the NVIDIA apt repository already configured by the CUDA base image.
@@ -40,7 +40,7 @@ RUN apt-get update \
         sudo \
     && rm -rf /var/lib/apt/lists/*
 
-# Give OpenInfer one stable NCCL location on every architecture. This prevents
+# Give PegaInfer one stable NCCL location on every architecture. This prevents
 # the build from finding a new header while the runtime loader finds an older
 # libnccl.so from another Python or system environment.
 RUN multiarch="$(dpkg-architecture -qDEB_HOST_MULTIARCH)" \
@@ -55,7 +55,7 @@ RUN multiarch="$(dpkg-architecture -qDEB_HOST_MULTIARCH)" \
     && rm -f /tmp/check_nccl /tmp/check_nccl.c
 
 ENV CUDA_HOME=/usr/local/cuda
-ENV OPENINFER_NCCL_ROOT=/opt/nccl
+ENV PEGAINFER_NCCL_ROOT=/opt/nccl
 ENV LD_LIBRARY_PATH=/opt/nccl/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
 ENV TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
 ENV UV_LINK_MODE=copy
@@ -71,11 +71,11 @@ RUN if getent passwd "${DEV_UID}" >/dev/null; then userdel -f "$(getent passwd "
 ARG TILELANG_VERSION=0.1.12
 RUN curl -LsSf https://astral.sh/uv/install.sh \
         | env UV_INSTALL_DIR=/usr/local/bin sh \
-    && uv venv --python python3 /opt/openinfer-venv \
-    && uv pip install --python /opt/openinfer-venv/bin/python \
+    && uv venv --python python3 /opt/pegainfer-venv \
+    && uv pip install --python /opt/pegainfer-venv/bin/python \
         "triton==${TRITON_VERSION}" \
         "tilelang==${TILELANG_VERSION}" \
-    && /opt/openinfer-venv/bin/python -c \
+    && /opt/pegainfer-venv/bin/python -c \
         "import tilelang, triton; print(f'tilelang={tilelang.__version__} triton={triton.__version__}')" \
     && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
         | env RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo sh -s -- \
@@ -85,18 +85,18 @@ RUN curl -LsSf https://astral.sh/uv/install.sh \
 
 ENV RUSTUP_HOME=/opt/rustup
 ENV CARGO_HOME=/opt/cargo
-ENV OPENINFER_TRITON_PYTHON=/opt/openinfer-venv/bin/python
-ENV OPENINFER_TILELANG_PYTHON=/opt/openinfer-venv/bin/python
+ENV PEGAINFER_TRITON_PYTHON=/opt/pegainfer-venv/bin/python
+ENV PEGAINFER_TILELANG_PYTHON=/opt/pegainfer-venv/bin/python
 ENV PATH=/opt/cargo/bin:/usr/local/cuda/bin:/usr/local/bin:${PATH}
 
-WORKDIR /workspace/openinfer
-COPY rust-toolchain.toml /tmp/openinfer-rust-toolchain.toml
+WORKDIR /workspace/pegainfer
+COPY rust-toolchain.toml /tmp/pegainfer-rust-toolchain.toml
 RUN cd /tmp \
     && rustup toolchain install \
-        "$(sed -n 's/^channel = "\(.*\)"/\1/p' /tmp/openinfer-rust-toolchain.toml)" \
+        "$(sed -n 's/^channel = "\(.*\)"/\1/p' /tmp/pegainfer-rust-toolchain.toml)" \
         --component rustfmt \
         --component clippy \
-    && rm -f /tmp/openinfer-rust-toolchain.toml \
+    && rm -f /tmp/pegainfer-rust-toolchain.toml \
     && chown -R "${DEV_UID}:${DEV_GID}" /opt/cargo
 
 USER ${DEV_USER}

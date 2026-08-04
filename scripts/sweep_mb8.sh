@@ -7,7 +7,7 @@ set -u
 BIN=target/release/bench_serving
 DATA=datasets/mixed-load-itl-470-data-mb8
 mkdir -p "$DATA"
-export OPENINFER_ITL_DEBUG=1 RUST_LOG=info
+export PEGAINFER_ITL_DEBUG=1 RUST_LOG=info
 
 echo "=== sweep start $(date +%T)  (--max-batch 8 --bg-concurrency 4) ==="
 i=0

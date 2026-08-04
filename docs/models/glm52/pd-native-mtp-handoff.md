@@ -106,7 +106,7 @@
   - MTP MLA is logically replicated under TP4 even though query heads and MoE
     compute are sharded; this needs a byte-equality gate across producer ranks
     before registering only one copy.
-  - The existing external producer is vLLM TP8. Native OpenInfer TP4 producer
+  - The existing external producer is vLLM TP8. Native PegaInfer TP4 producer
     metadata must be a versioned extension, not an implicit reinterpretation
     of the merged target-only protocol.
   - EP16 requires multi-node collective and deployment validation beyond the
@@ -224,7 +224,7 @@ free; tray09–12 still held by the k3 job).
 **EP16 standalone decode fleet** (tray01/02/04/08, 4 trays × 4 ranks,
 rendezvous on tray01:19211, no P/metaserver/router — requests are served by
 local prefill on the decode ranks):
-`GLM52_PD_CONFIG=~/.config/openinfer/glm52-ep16-decode.env
+`GLM52_PD_CONFIG=~/.config/pegainfer/glm52-ep16-decode.env
 scripts/glm52_pd_stack.sh decode-only`.
 
 - Bring-up incidents worth knowing about: jump-host disconnects killed
@@ -341,7 +341,7 @@ endpoints), exercised end to end through the router.
   4-node k3 job took tray09–12 and other tenants took tray04/08 within
   minutes of the free-machine scan (decode2/3 died on
   `CUDA_ERROR_OUT_OF_MEMORY` at `W13Weight` alloc). EP16 fleet was torn
-  down; tray01/02/06 remain provisioned (`openinfer-ep32-decode`, NCCL
+  down; tray01/02/06 remain provisioned (`pegainfer-ep32-decode`, NCCL
   2.30.7 checked) for the next idle window. `scripts/glm52_pd_stack.sh`
   supports `D_TOPO=ep16/ep32` + `decode-only` for that rerun.
 
@@ -413,7 +413,7 @@ endpoints), exercised end to end through the router.
 
 - On the prefill node, TP4 prefill registered four rank-local PegaFlow
   instances with 101 arenas each under
-  `openinfer-glm52-l78-p64-mla656-idxk132-mtp1`. A five-token prompt returned
+  `pegainfer-glm52-l78-p64-mla656-idxk132-mtp1`. A five-token prompt returned
   target text ` Paris`, five draft IDs `[13, 576, 3283, 374, 1112]`,
   `committed_len=5`, `tail_len=5`, and a non-null 128-bit partial-page key.
 - On the decode node, EP4 decode restored that page over RDMA from the prefill
@@ -537,7 +537,7 @@ table:
   establish continuity.
 - Validation:
   - `cargo fmt --all -- --check` passed.
-  - `cargo test --release -p openinfer-glm52 --lib` passed in the development
+  - `cargo test --release -p pegainfer-glm52 --lib` passed in the development
     container
     with NCCL 2.30 from the installed Python wheel: 88 passed, 21
     GPU-dependent tests ignored.

@@ -1,10 +1,10 @@
 [[production]]
-package = "openinfer-server"
-bin = "openinfer"
+package = "pegainfer-server"
+bin = "pegainfer"
 reason = "shipped inference server binary"
 
 [[production]]
-package = "openinfer-server"
+package = "pegainfer-server"
 bin = "bench_serving"
 reason = "shipped serving benchmark tool binary"
 

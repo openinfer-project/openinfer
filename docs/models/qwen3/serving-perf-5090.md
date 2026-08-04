@@ -15,7 +15,7 @@ Last touched: 2026-06
 
 The unified (prefill+decode) step ran 60.8ms where pure prefill of the same tokens took 42.3ms. nsys attribution: +14.6ms was GEMM alone. Root cause: the unified step's GEMMs run at N=1024+decode_bs, and **cuBLAS 12.9's kernel selection collapses at N=1025** (standalone GemmEx microbench, bf16/COMPUTE_32F: gate 9728×2560 234→347µs, oproj 2560×4096 94→185µs, down 2560×9728 223→299µs going from N=1024 to N=1025; qproj immune). cuBLAS 13.2 has no cliff.
 
-The trap: `openinfer-kernels/build.rs` derives both nvcc and the cublas link path from `CUDA_HOME` → `CUDA_PATH` → `/usr/local/cuda`. On a box where `/usr/local/cuda` symlinks 12.9, PATH exports do nothing — the server silently links `libcublas.so.12`. **Build with `CUDA_HOME=/usr/local/cuda-13.x`** and verify with `ldd target/release/openinfer | grep cublas`.
+The trap: `pegainfer-kernels/build.rs` derives both nvcc and the cublas link path from `CUDA_HOME` → `CUDA_PATH` → `/usr/local/cuda`. On a box where `/usr/local/cuda` symlinks 12.9, PATH exports do nothing — the server silently links `libcublas.so.12`. **Build with `CUDA_HOME=/usr/local/cuda-13.x`** and verify with `ldd target/release/pegainfer | grep cublas`.
 
 After the CUDA 13.1 rebuild: unified step 60.8 → 47.1ms, QPS1 TTFT 64 → 50ms (arrivals landing mid-decode prefill faster). This also invalidated the doc's earlier claim that mid-band was "bounded by prefill near the bf16 roofline" — the measured 45ms prefill included the 12.9 cliff.
 
@@ -57,7 +57,7 @@ Step-phase attribution (PHASELOG, QPS10): host work is irrelevant — scheduler 
 
 ## Current sweep (all fixes, cuBLAS 13.1; TPOT mean / ITL p99 ms, TTFT mean ms)
 
-| QPS | openinfer | vLLM 0.22.1 | TTFT oi / vllm |
+| QPS | pegainfer | vLLM 0.22.1 | TTFT oi / vllm |
 |---|---|---|---|
 | 1 | **6.51** / 6.9 | 6.86 / 12 | **47** / 56 |
 | 8 | **10.70** / 46 | 12.09 / 47 | **57** / 68 |
@@ -75,4 +75,4 @@ QPS16 admission verdict (#345): no knee anymore — the old 90ms TPOT regression
 - Microbenching GEMMs with a single weight buffer measures L2-hot timings (96MB L2 on GB202 holds entire decode weights) — rotate ≥4 weight copies or the ranking is fiction. Same for algo tuning, hence the all-layer rotation in `gemm_lt_tune`.
 - `vllm bench serve` TPOT in overload follows the identity TPOT ≡ bs/throughput — admission policy changes TPOT without changing kernel speed. Compare out_tok/s alongside.
 - nsys `--cuda-graph-trace=node` inflates step times 30–60%; use it for composition only, never absolute TPOT.
-- pkill from an ssh one-liner matches its own command line — use `pkill -f "[t]arget/release/openinfer"`.
+- pkill from an ssh one-liner matches its own command line — use `pkill -f "[t]arget/release/pegainfer"`.

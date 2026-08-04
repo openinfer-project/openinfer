@@ -3119,343 +3119,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 
 [[package]]
-name = "openinfer-bench"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "cudarc",
- "openinfer-kernels",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "openinfer-build"
-version = "0.0.0"
-dependencies = [
- "tempfile",
-]
-
-[[package]]
-name = "openinfer-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "colored",
- "cudarc",
- "fastrace",
- "fastrace-opentelemetry",
- "half",
- "libc",
- "log",
- "logforth",
- "memmap2",
- "openinfer-engine",
- "openinfer-kernels",
- "opentelemetry",
- "opentelemetry-otlp",
- "opentelemetry_sdk",
- "parking_lot",
- "rayon",
- "safetensors",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "openinfer-cupti"
-version = "0.1.0"
-dependencies = [
- "cc",
- "openinfer-build",
-]
-
-[[package]]
-name = "openinfer-deepseek-v2-lite"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "cudarc",
- "half",
- "hex",
- "libloading 0.9.0",
- "log",
- "memmap2",
- "nvtx",
- "openinfer-core",
- "openinfer-engine",
- "openinfer-kernels",
- "safetensors",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "tempfile",
- "tokio",
- "vllm-text",
-]
-
-[[package]]
-name = "openinfer-engine"
-version = "0.1.0"
-dependencies = [
- "fastrace",
- "log",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "openinfer-gemma4"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "openinfer-engine",
- "serde_json",
-]
-
-[[package]]
-name = "openinfer-glm52"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bincode",
- "bytesize",
- "crossbeam-channel",
- "cudarc",
- "half",
- "hex",
- "log",
- "memmap2",
- "openinfer-core",
- "openinfer-kernels",
- "openinfer-kv-cache",
- "openinfer-kv-offload",
- "openinfer-sample",
- "rayon",
- "safetensors",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "tokio",
-]
-
-[[package]]
-name = "openinfer-kernels"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "cc",
- "cudarc",
- "half",
- "openinfer-build",
- "serde",
- "tvm-ffi",
-]
-
-[[package]]
-name = "openinfer-kimi-k2"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytesize",
- "clap",
- "crossbeam-channel",
- "cudarc",
- "half",
- "log",
- "memmap2",
- "openinfer-bench",
- "openinfer-core",
- "openinfer-kernels",
- "openinfer-kv-cache",
- "openinfer-sample",
- "rand 0.10.1",
- "safetensors",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "openinfer-kv-cache"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "cudarc",
- "dynamo-kv-hashing",
- "half",
- "kvbm-logical",
- "openinfer-kernels",
- "tokio",
-]
-
-[[package]]
-name = "openinfer-kv-offload"
-version = "0.1.0"
-dependencies = [
- "cudarc",
- "half",
- "log",
- "openinfer-kv-cache",
- "pegaflow-core",
- "tokio",
- "tokio-stream",
- "xxhash-rust",
-]
-
-[[package]]
-name = "openinfer-kv-store"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "cudarc",
- "dynamo-kv-hashing",
- "kvbm-logical",
- "libc",
- "log",
- "openinfer-engine",
- "pegaflow-core",
- "tempfile",
- "tokio",
- "tokio-stream",
-]
-
-[[package]]
-name = "openinfer-qwen3"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "comfy-table",
- "crossbeam-channel",
- "cudarc",
- "fastrace",
- "half",
- "hex",
- "log",
- "openinfer-bench",
- "openinfer-core",
- "openinfer-cupti",
- "openinfer-kernels",
- "openinfer-kv-cache",
- "openinfer-kv-offload",
- "openinfer-qwen3",
- "openinfer-sample",
- "rand 0.10.1",
- "safetensors",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "tempfile",
- "tokio",
- "toml",
- "vllm-text",
-]
-
-[[package]]
-name = "openinfer-qwen35"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "criterion 0.8.2",
- "cudarc",
- "half",
- "log",
- "openinfer-core",
- "openinfer-kernels",
- "openinfer-sample",
- "openinfer-vllm-frontend",
- "rand 0.10.1",
- "reqwest",
- "safetensors",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "tempfile",
- "tokio",
- "tokio-util",
- "vllm-text",
-]
-
-[[package]]
-name = "openinfer-sample"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "criterion 0.8.2",
- "cudarc",
- "half",
- "openinfer-engine",
- "openinfer-kernels",
-]
-
-[[package]]
-name = "openinfer-server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "comfy-table",
- "cudarc",
- "log",
- "openinfer-core",
- "openinfer-deepseek-v2-lite",
- "openinfer-gemma4",
- "openinfer-glm52",
- "openinfer-kimi-k2",
- "openinfer-qwen3",
- "openinfer-qwen35",
- "openinfer-vllm-frontend",
- "rand 0.10.1",
- "serde",
- "serde_json",
- "tempfile",
- "tikv-jemallocator",
- "tokio",
- "tokio-util",
- "vllm-text",
-]
-
-[[package]]
-name = "openinfer-sim"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "openinfer-engine",
- "openinfer-vllm-frontend",
- "reqwest",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
-name = "openinfer-vllm-frontend"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "fastrace",
- "log",
- "openinfer-engine",
- "rmp-serde",
- "rmpv",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
- "tower",
- "uuid",
- "vllm-engine-core-client",
- "vllm-server",
- "zeromq",
-]
-
-[[package]]
 name = "openssl"
 version = "0.10.79"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3771,6 +3434,343 @@ dependencies = [
  "syscalls",
  "thiserror 2.0.18",
  "tokio",
+]
+
+[[package]]
+name = "pegainfer-bench"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cudarc",
+ "pegainfer-kernels",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "pegainfer-build"
+version = "0.0.0"
+dependencies = [
+ "tempfile",
+]
+
+[[package]]
+name = "pegainfer-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "colored",
+ "cudarc",
+ "fastrace",
+ "fastrace-opentelemetry",
+ "half",
+ "libc",
+ "log",
+ "logforth",
+ "memmap2",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
+ "parking_lot",
+ "pegainfer-engine",
+ "pegainfer-kernels",
+ "rayon",
+ "safetensors",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "pegainfer-cupti"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "pegainfer-build",
+]
+
+[[package]]
+name = "pegainfer-deepseek-v2-lite"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cudarc",
+ "half",
+ "hex",
+ "libloading 0.9.0",
+ "log",
+ "memmap2",
+ "nvtx",
+ "pegainfer-core",
+ "pegainfer-engine",
+ "pegainfer-kernels",
+ "safetensors",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "tokio",
+ "vllm-text",
+]
+
+[[package]]
+name = "pegainfer-engine"
+version = "0.1.0"
+dependencies = [
+ "fastrace",
+ "log",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "pegainfer-gemma4"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "pegainfer-engine",
+ "serde_json",
+]
+
+[[package]]
+name = "pegainfer-glm52"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "bytesize",
+ "crossbeam-channel",
+ "cudarc",
+ "half",
+ "hex",
+ "log",
+ "memmap2",
+ "pegainfer-core",
+ "pegainfer-kernels",
+ "pegainfer-kv-cache",
+ "pegainfer-kv-offload",
+ "pegainfer-sample",
+ "rayon",
+ "safetensors",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tokio",
+]
+
+[[package]]
+name = "pegainfer-kernels"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cc",
+ "cudarc",
+ "half",
+ "pegainfer-build",
+ "serde",
+ "tvm-ffi",
+]
+
+[[package]]
+name = "pegainfer-kimi-k2"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytesize",
+ "clap",
+ "crossbeam-channel",
+ "cudarc",
+ "half",
+ "log",
+ "memmap2",
+ "pegainfer-bench",
+ "pegainfer-core",
+ "pegainfer-kernels",
+ "pegainfer-kv-cache",
+ "pegainfer-sample",
+ "rand 0.10.1",
+ "safetensors",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "pegainfer-kv-cache"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cudarc",
+ "dynamo-kv-hashing",
+ "half",
+ "kvbm-logical",
+ "pegainfer-kernels",
+ "tokio",
+]
+
+[[package]]
+name = "pegainfer-kv-offload"
+version = "0.1.0"
+dependencies = [
+ "cudarc",
+ "half",
+ "log",
+ "pegaflow-core",
+ "pegainfer-kv-cache",
+ "tokio",
+ "tokio-stream",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "pegainfer-kv-store"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cudarc",
+ "dynamo-kv-hashing",
+ "kvbm-logical",
+ "libc",
+ "log",
+ "pegaflow-core",
+ "pegainfer-engine",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+]
+
+[[package]]
+name = "pegainfer-qwen3"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "comfy-table",
+ "crossbeam-channel",
+ "cudarc",
+ "fastrace",
+ "half",
+ "hex",
+ "log",
+ "pegainfer-bench",
+ "pegainfer-core",
+ "pegainfer-cupti",
+ "pegainfer-kernels",
+ "pegainfer-kv-cache",
+ "pegainfer-kv-offload",
+ "pegainfer-qwen3",
+ "pegainfer-sample",
+ "rand 0.10.1",
+ "safetensors",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "tokio",
+ "toml",
+ "vllm-text",
+]
+
+[[package]]
+name = "pegainfer-qwen35"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "criterion 0.8.2",
+ "cudarc",
+ "half",
+ "log",
+ "pegainfer-core",
+ "pegainfer-kernels",
+ "pegainfer-sample",
+ "pegainfer-vllm-frontend",
+ "rand 0.10.1",
+ "reqwest",
+ "safetensors",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "vllm-text",
+]
+
+[[package]]
+name = "pegainfer-sample"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "criterion 0.8.2",
+ "cudarc",
+ "half",
+ "pegainfer-engine",
+ "pegainfer-kernels",
+]
+
+[[package]]
+name = "pegainfer-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "comfy-table",
+ "cudarc",
+ "log",
+ "pegainfer-core",
+ "pegainfer-deepseek-v2-lite",
+ "pegainfer-gemma4",
+ "pegainfer-glm52",
+ "pegainfer-kimi-k2",
+ "pegainfer-qwen3",
+ "pegainfer-qwen35",
+ "pegainfer-vllm-frontend",
+ "rand 0.10.1",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tikv-jemallocator",
+ "tokio",
+ "tokio-util",
+ "vllm-text",
+]
+
+[[package]]
+name = "pegainfer-sim"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "pegainfer-engine",
+ "pegainfer-vllm-frontend",
+ "reqwest",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "pegainfer-vllm-frontend"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "fastrace",
+ "log",
+ "pegainfer-engine",
+ "rmp-serde",
+ "rmpv",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "uuid",
+ "vllm-engine-core-client",
+ "vllm-server",
+ "zeromq",
 ]
 
 [[package]]

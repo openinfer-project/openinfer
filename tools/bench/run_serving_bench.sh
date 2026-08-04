@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# One-shot serving benchmark: launches a server (openinfer or vLLM), runs a QPS
-# sweep (and optional DSpark concurrency sweep, openinfer only), then summarizes.
+# One-shot serving benchmark: launches a server (pegainfer or vLLM), runs a QPS
+# sweep (and optional DSpark concurrency sweep, pegainfer only), then summarizes.
 #
 # The script launches the server, waits for readiness, runs all sweeps, and
 # kills the server on exit (trap). Results land in RESULT_DIR as JSON + a
@@ -11,8 +11,8 @@
 #
 # Optional env:
 #   MODEL            model path (required)
-#   ENGINE           openinfer | vllm [default: openinfer]
-#   DRAFT_MODEL      DSpark/DFlash draft model path (openinfer only, skip spec sweep if omitted)
+#   ENGINE           pegainfer | vllm [default: pegainfer]
+#   DRAFT_MODEL      DSpark/DFlash draft model path (pegainfer only, skip spec sweep if omitted)
 #   GPU              CUDA device ordinal [default: 0]
 #   PORT             server port [default: 8000]
 #   RESULT_DIR       output directory [default: ./bench-results]
@@ -29,10 +29,10 @@
 #   LABEL            engine label for result filenames [default: $ENGINE]
 #
 # Examples:
-#   # openinfer Qwen3-4B QPS sweep
+#   # pegainfer Qwen3-4B QPS sweep
 #   MODEL=/data/Qwen3-4B GPU=7 tools/bench/run_serving_bench.sh
 #
-#   # openinfer Qwen3-4B + DSpark concurrency sweep
+#   # pegainfer Qwen3-4B + DSpark concurrency sweep
 #   MODEL=/data/Qwen3-4B DRAFT_MODEL=/data/dspark_qwen3_4b_block7 GPU=7 \
 #     QPS_LIST="" CONCURRENCY_LIST="1 4 8" tools/bench/run_serving_bench.sh
 #
@@ -42,7 +42,7 @@
 set -euo pipefail
 
 MODEL=${MODEL:?MODEL (model path) is required}
-ENGINE=${ENGINE:-openinfer}
+ENGINE=${ENGINE:-pegainfer}
 DRAFT_MODEL=${DRAFT_MODEL:-}
 GPU=${GPU:-0}
 PORT=${PORT:-8000}
@@ -81,18 +81,18 @@ mkdir -p "$RESULT_DIR"
 
 # ---- launch server ----------------------------------------------------------
 case "$ENGINE" in
-  openinfer)
-    BINARY="$REPO_ROOT/target/release/openinfer"
+  pegainfer)
+    BINARY="$REPO_ROOT/target/release/pegainfer"
     if [[ "$SKIP_BUILD" != "1" ]]; then
-      echo "=== building openinfer (SKIP_BUILD=1 to skip) ==="
-      (cd "$REPO_ROOT" && CUDA_HOME=${CUDA_HOME:-/usr/local/cuda} cargo build --release -p openinfer-server)
+      echo "=== building pegainfer (SKIP_BUILD=1 to skip) ==="
+      (cd "$REPO_ROOT" && CUDA_HOME=${CUDA_HOME:-/usr/local/cuda} cargo build --release -p pegainfer-server)
     fi
     SERVER_EXTRA_ARGS=()
     if [[ -n "$DRAFT_MODEL" ]]; then
       SERVER_EXTRA_ARGS+=(--dflash-draft-model-path "$DRAFT_MODEL")
       MODEL_LABEL="${MODEL_LABEL}-dspark"
     fi
-    echo "=== launching openinfer: model=$MODEL gpu=$GPU port=$PORT draft=${DRAFT_MODEL:-none} ==="
+    echo "=== launching pegainfer: model=$MODEL gpu=$GPU port=$PORT draft=${DRAFT_MODEL:-none} ==="
     CUDA_VISIBLE_DEVICES=$GPU "$BINARY" \
       --model-path "$MODEL" \
       --port "$PORT" \
@@ -120,7 +120,7 @@ case "$ENGINE" in
     READY_TIMEOUT=300
     ;;
   *)
-    echo "FATAL: ENGINE must be 'openinfer' or 'vllm', got '$ENGINE'" >&2
+    echo "FATAL: ENGINE must be 'pegainfer' or 'vllm', got '$ENGINE'" >&2
     exit 1
     ;;
 esac
@@ -190,8 +190,8 @@ else
   echo "=== QPS sweep skipped (QPS_LIST is empty) ==="
 fi
 
-# ---- Concurrency sweep (openinfer only) ------------------------------------
-if [[ "${ENGINE}" == "openinfer" && -n "${CONCURRENCY_LIST// /}" ]]; then
+# ---- Concurrency sweep (pegainfer only) ------------------------------------
+if [[ "${ENGINE}" == "pegainfer" && -n "${CONCURRENCY_LIST// /}" ]]; then
   echo "=== spec concurrency sweep: c=[$CONCURRENCY_LIST] dataset=$DATASET ==="
   DATASET_ARGS=(--dataset-name "$DATASET")
   if [[ "$DATASET" == "random" ]]; then

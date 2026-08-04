@@ -96,13 +96,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - package: openinfer-build
+          - package: pegainfer-build
             needs_protobuf: false
-          - package: openinfer-engine
+          - package: pegainfer-engine
             needs_protobuf: false
-          - package: openinfer-vllm-frontend
+          - package: pegainfer-vllm-frontend
             needs_protobuf: true
-          - package: openinfer-sim
+          - package: pegainfer-sim
             needs_protobuf: true
           - package: kvbm-logical
             needs_protobuf: false
@@ -161,10 +161,10 @@ jobs:
       - name: Run CPU Clippy
         run: >-
           cargo clippy --release --locked
-          -p openinfer-build
-          -p openinfer-engine
-          -p openinfer-vllm-frontend
-          -p openinfer-sim
+          -p pegainfer-build
+          -p pegainfer-engine
+          -p pegainfer-vllm-frontend
+          -p pegainfer-sim
           -p kvbm-logical
           --all-targets -- -D warnings
 
@@ -196,7 +196,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
       - name: Run simulated frontend E2E tests
-        run: cargo test --release --locked -p openinfer-sim --test frontend_e2e
+        run: cargo test --release --locked -p pegainfer-sim --test frontend_e2e
 
   qwen3-cuda-compile:
     if: github.event_name == 'push' || github.event.pull_request.draft == false
@@ -237,11 +237,11 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libibverbs-dev
 
       - name: Compile default Qwen3 targets
-        run: cargo check --release --locked -p openinfer-server --all-targets
+        run: cargo check --release --locked -p pegainfer-server --all-targets
         env:
           CUDA_PATH: /usr/local/cuda
-          OPENINFER_CUDA_SM: "80"
-          OPENINFER_NVCC_JOBS: "2"
+          PEGAINFER_CUDA_SM: "80"
+          PEGAINFER_NVCC_JOBS: "2"
 
   qwen3-cuda-clippy:
     if: github.event_name == 'push' || github.event.pull_request.draft == false
@@ -283,20 +283,20 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libibverbs-dev
 
       # Clippy lints only the packages named here; dependencies are compiled, not linted.
-      # openinfer-cupti is out: building it needs CUPTI headers the toolkit above omits.
+      # pegainfer-cupti is out: building it needs CUPTI headers the toolkit above omits.
       - name: Run Qwen3 CUDA Clippy
         run: >-
           cargo clippy --release --locked
-          -p openinfer-server
-          -p openinfer-qwen3
-          -p openinfer-core
-          -p openinfer-kernels
-          -p openinfer-kv-cache
-          -p openinfer-kv-offload
-          -p openinfer-sample
-          -p openinfer-bench
+          -p pegainfer-server
+          -p pegainfer-qwen3
+          -p pegainfer-core
+          -p pegainfer-kernels
+          -p pegainfer-kv-cache
+          -p pegainfer-kv-offload
+          -p pegainfer-sample
+          -p pegainfer-bench
           --all-targets -- -D warnings
         env:
           CUDA_PATH: /usr/local/cuda
-          OPENINFER_CUDA_SM: "80"
-          OPENINFER_NVCC_JOBS: "2"
+          PEGAINFER_CUDA_SM: "80"
+          PEGAINFER_NVCC_JOBS: "2"

@@ -1,11 +1,11 @@
 # Trace backend: Grafana + Tempo.
 #
-# Tempo stores spans and answers TraceQL; Grafana is the UI. openinfer exports
-# over OTLP/gRPC (unchanged Rust side) — point OPENINFER_TRACE_OTLP_ENDPOINT at
+# Tempo stores spans and answers TraceQL; Grafana is the UI. pegainfer exports
+# over OTLP/gRPC (unchanged Rust side) — point PEGAINFER_TRACE_OTLP_ENDPOINT at
 # Tempo's 4317.
 #
 #   docker compose -f deploy/tracing/docker-compose.yml up -d
-#   OPENINFER_TRACE_OTLP_ENDPOINT=http://127.0.0.1:4317 \
+#   PEGAINFER_TRACE_OTLP_ENDPOINT=http://127.0.0.1:4317 \
 #     cargo run --release -- --model-path /path/to/Qwen3-4B
 #   # open http://localhost:3000 → Explore → Tempo → TraceQL, e.g.
 #   #   { name="prefill" && duration > 500ms }
@@ -18,7 +18,7 @@
 services:
   tempo:
     image: grafana/tempo:2.6.1
-    container_name: openinfer-tempo
+    container_name: pegainfer-tempo
     restart: unless-stopped
     command: ["-config.file=/etc/tempo/tempo.yaml"]
     volumes:
@@ -26,12 +26,12 @@ services:
     # Host ports bind to loopback only: this stack is a local inspection tool,
     # and Grafana below allows anonymous access — don't expose it on the LAN.
     ports:
-      - "127.0.0.1:4317:4317"  # OTLP gRPC (openinfer exports here)
+      - "127.0.0.1:4317:4317"  # OTLP gRPC (pegainfer exports here)
       - "127.0.0.1:3200:3200"  # Tempo query API (Grafana talks to this internally)
 
   grafana:
     image: grafana/grafana:11.3.0
-    container_name: openinfer-grafana
+    container_name: pegainfer-grafana
     restart: unless-stopped
     environment:
       GF_AUTH_ANONYMOUS_ENABLED: "true"

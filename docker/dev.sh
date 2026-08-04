@@ -2,9 +2,9 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-image="${OPENINFER_DEV_IMAGE:-openinfer-dev:cu132}"
-container="${OPENINFER_DEV_CONTAINER:-openinfer-dev}"
-cache_root="${OPENINFER_DEV_CACHE:-$HOME/.cache/openinfer-dev}"
+image="${PEGAINFER_DEV_IMAGE:-pegainfer-dev:cu132}"
+container="${PEGAINFER_DEV_CONTAINER:-pegainfer-dev}"
+cache_root="${PEGAINFER_DEV_CACHE:-$HOME/.cache/pegainfer-dev}"
 
 usage() {
   cat <<'EOF'
@@ -15,12 +15,12 @@ Usage:
 
 Environment:
   CUDA_IMAGE              CUDA devel base (default: CUDA 13.2 / Ubuntu 24.04).
-  OPENINFER_DEV_IMAGE     Image tag (default: openinfer-dev:cu132).
-  OPENINFER_DEV_CONTAINER Interactive container name (default: openinfer-dev).
-  OPENINFER_DEV_CACHE     Persistent build-cache directory.
-  OPENINFER_DEV_CACHE_KEY Override the native build-cache namespace.
-  OPENINFER_MODEL_DIR     Read-only model directory mounted at the same path.
-  OPENINFER_CUDA_SM       Forwarded CUDA SM target override.
+  PEGAINFER_DEV_IMAGE     Image tag (default: pegainfer-dev:cu132).
+  PEGAINFER_DEV_CONTAINER Interactive container name (default: pegainfer-dev).
+  PEGAINFER_DEV_CACHE     Persistent build-cache directory.
+  PEGAINFER_DEV_CACHE_KEY Override the native build-cache namespace.
+  PEGAINFER_MODEL_DIR     Read-only model directory mounted at the same path.
+  PEGAINFER_CUDA_SM       Forwarded CUDA SM target override.
   EP_DISABLE_GIN          Forwarded when set; useful on trays without a GIN NIC.
 EOF
 }
@@ -38,11 +38,11 @@ build_image() {
 
 toolkit_id="$(
   docker image inspect \
-    --format '{{ index .Config.Labels "org.openinfer.cuda-image" }}' \
+    --format '{{ index .Config.Labels "org.pegainfer.cuda-image" }}' \
     "$image" 2>/dev/null || true
 )"
 toolkit_id="${toolkit_id:-$image}"
-cache_key="${OPENINFER_DEV_CACHE_KEY:-$(printf '%s' "$toolkit_id" | sed 's/[^A-Za-z0-9_.-]/_/g')}"
+cache_key="${PEGAINFER_DEV_CACHE_KEY:-$(printf '%s' "$toolkit_id" | sed 's/[^A-Za-z0-9_.-]/_/g')}"
 target_cache="$cache_root/target/$cache_key"
 
 docker_args=(
@@ -79,20 +79,20 @@ if [[ -n "${EP_DISABLE_GIN:-}" ]]; then
   docker_args+=(--env "EP_DISABLE_GIN=$EP_DISABLE_GIN")
 fi
 
-if [[ -n "${OPENINFER_CUDA_SM:-}" ]]; then
-  docker_args+=(--env "OPENINFER_CUDA_SM=$OPENINFER_CUDA_SM")
+if [[ -n "${PEGAINFER_CUDA_SM:-}" ]]; then
+  docker_args+=(--env "PEGAINFER_CUDA_SM=$PEGAINFER_CUDA_SM")
 fi
 
-if [[ -n "${OPENINFER_MODEL_DIR:-}" ]]; then
-  [[ "$OPENINFER_MODEL_DIR" = /* ]] || {
-    echo "OPENINFER_MODEL_DIR must be an absolute path" >&2
+if [[ -n "${PEGAINFER_MODEL_DIR:-}" ]]; then
+  [[ "$PEGAINFER_MODEL_DIR" = /* ]] || {
+    echo "PEGAINFER_MODEL_DIR must be an absolute path" >&2
     exit 2
   }
-  [[ -d "$OPENINFER_MODEL_DIR" ]] || {
-    echo "OPENINFER_MODEL_DIR does not exist: $OPENINFER_MODEL_DIR" >&2
+  [[ -d "$PEGAINFER_MODEL_DIR" ]] || {
+    echo "PEGAINFER_MODEL_DIR does not exist: $PEGAINFER_MODEL_DIR" >&2
     exit 2
   }
-  docker_args+=(--volume "$OPENINFER_MODEL_DIR:$OPENINFER_MODEL_DIR:ro")
+  docker_args+=(--volume "$PEGAINFER_MODEL_DIR:$PEGAINFER_MODEL_DIR:ro")
 fi
 
 case "${1:-}" in

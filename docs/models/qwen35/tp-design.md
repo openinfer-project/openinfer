@@ -221,7 +221,7 @@ Use vLLM's `Qwen3NextForCausalLM` / `QwenGatedDeltaNetAttention` as the referenc
 - b/a projections are local-value-head aware; some quantized paths may replicate small projections and slice locally
 - GDR prefill/decode kernels consume local head/state shapes
 
-OpenInfer-specific work remains: worker-owned rank-local recurrent state, `RequestId` lifecycle, local-state slot compaction, `DropRequest` cleanup, and fail-closed kernel-shape validation.
+PegaInfer-specific work remains: worker-owned rank-local recurrent state, `RequestId` lifecycle, local-state slot compaction, `DropRequest` cleanup, and fail-closed kernel-shape validation.
 
 Validation scope:
 
@@ -234,11 +234,11 @@ Validation scope:
 ## References
 
 - `docs/models/qwen3/tp-design.md`
-- `openinfer-qwen3-4b/src/config.rs`
-- `openinfer-qwen3-4b/src/executor.rs`
-- `openinfer-qwen35/src/config.rs`
-- `openinfer-qwen35/src/weights.rs`
-- `openinfer-qwen35/src/recurrent_state.rs`
-- `openinfer-qwen35/src/batch_decode.rs`
+- `pegainfer-qwen3-4b/src/config.rs`
+- `pegainfer-qwen3-4b/src/executor.rs`
+- `pegainfer-qwen35/src/config.rs`
+- `pegainfer-qwen35/src/weights.rs`
+- `pegainfer-qwen35/src/recurrent_state.rs`
+- `pegainfer-qwen35/src/batch_decode.rs`
 - vLLM `Qwen3NextForCausalLM`
 - vLLM `QwenGatedDeltaNetAttention`

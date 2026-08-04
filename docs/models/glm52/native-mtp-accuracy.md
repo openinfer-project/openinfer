@@ -1,10 +1,10 @@
 # GLM5.2 native MTP accuracy and acceptance
 
 > **TL;DR:** The c8 native-MTP acceptance gap was a correctness bug at the target/draft boundary:
-> OpenInfer passed the target's pre-final-norm residual to MTP, while official vLLM passes the
+> PegaInfer passed the target's pre-final-norm residual to MTP, while official vLLM passes the
 > model-returned final-normalized hidden. Using `scratch.final_normed` raises the matched c8 mean
 > accepted length from `1.753` to `3.725` versus official vLLM's `3.786`, and reduces TPOT from
-> `23.44 ms` to `11.31 ms`. A subsequent three-run matched c1 measures OpenInfer at `7.749 ms`
+> `23.44 ms` to `11.31 ms`. A subsequent three-run matched c1 measures PegaInfer at `7.749 ms`
 > versus official vLLM at `8.814 ms`; their proxy round costs are `30.04` and `30.72 ms`, so there
 > is no remaining c1 TPOT deficit. On the selected 251-token target trajectory, mean accepted
 > length changes from `1.000` to `5.795`. Native MTP now also runs on single-node EP4/GB300:
@@ -36,7 +36,7 @@
 - **Plan**:
   1. Choose one deterministic prompt and capture the official vLLM greedy token IDs plus per-step
      target raw hidden, final target logits, and native-MTP intermediate tensors.
-  2. Teacher-force those exact token IDs through the OpenInfer production path and capture the same
+  2. Teacher-force those exact token IDs through the PegaInfer production path and capture the same
      checkpoints, without comparing states after the token streams diverge.
   3. Find the first divergent checkpoint in this order: target raw hidden, MTP prepare/first logits,
      then MTP recycle hidden and layer-78 KV across draft steps 2–5.
@@ -45,7 +45,7 @@
   5. Re-run online accepted-length and c8 TPOT A/B on the same 8×H200 node. Treat an optimization as
      a win only when measured accepted length improves without target-quality regression.
 - **Risks / open questions**:
-  - Official vLLM runs TP8+EP8 while the current OpenInfer path is TP1/DP8+EP8. Target raw hidden can
+  - Official vLLM runs TP8+EP8 while the current PegaInfer path is TP1/DP8+EP8. Target raw hidden can
     differ from collective and accumulation order even when final task quality is healthy.
   - The existing five-row oracle proves MTP front/layer-78 behavior on official vLLM inputs, but
     does not cover a long online teacher-forced trajectory or the production paged-KV recycle path.
@@ -65,7 +65,7 @@
   3. For each selected request, stop at the first differing target token or first differing draft
      token. Compare the raw target hidden supplied to MTP before comparing MTP prepare output,
      first-step logits, recycled normalized hidden, and layer-78 KV for draft steps 2–5.
-  4. Replay official target hidden through the OpenInfer MTP oracle at those proposal-entry states.
+  4. Replay official target hidden through the PegaInfer MTP oracle at those proposal-entry states.
      This intervention separates target-model drift from the MTP forward without requiring the two
      target implementations to remain on the same greedy path.
   5. Classify the aggregate gap by counterfactual: measure how many acceptance decisions recover
@@ -81,8 +81,8 @@
   - Use top-1 regret, target/draft margins, RMS, and p99. Exact equality is not required when the
     selected token and acceptance decision are stable.
 - **Operational risks**:
-  - Official vLLM and OpenInfer consume the same eight GPUs, so they must run sequentially. Compact
-    artifacts must be saved before switching engines, and the clean OpenInfer service must be
+  - Official vLLM and PegaInfer consume the same eight GPUs, so they must run sequentially. Compact
+    artifacts must be saved before switching engines, and the clean PegaInfer service must be
     restored afterward.
   - Dumping full hidden states for `64 × 256` tokens is excessive. Only first-difference states from
     the stratified subset should be retained; aggregate runs keep tokens, counters, and margins.
@@ -91,19 +91,19 @@
 
 ### Matched c1 performance follow-up
 
-- **Question**: Does corrected OpenInfer still trail official vLLM by about `2 ms` at concurrency
-  one, or did the earlier comparison mix OpenInfer c8 (`11.31 ms`) with vLLM c1 (`9.10 ms`)?
+- **Question**: Does corrected PegaInfer still trail official vLLM by about `2 ms` at concurrency
+  one, or did the earlier comparison mix PegaInfer c8 (`11.31 ms`) with vLLM c1 (`9.10 ms`)?
 - **Plan**:
   1. Reuse the retained 64-request random corpus, greedy sampling, 256 output tokens, disabled
      prefix cache, and identical client/version flags. Validate the live model id and benchmark
      client flags before collecting results.
-  2. Run OpenInfer and official vLLM sequentially on the same 8×H200 node at concurrency one,
+  2. Run PegaInfer and official vLLM sequentially on the same 8×H200 node at concurrency one,
      saving benchmark JSON and speculative-acceptance counters for every measured run.
   3. Compare TPOT, accepted length, and `TPOT × accepted length`; only attribute a compute-side
      difference when the matched c1 round costs disagree beyond run-to-run noise.
-  4. Restore the corrected OpenInfer service and health-check it after the official-vLLM run.
+  4. Restore the corrected PegaInfer service and health-check it after the official-vLLM run.
 - **Risks / open questions**:
-  - The official vLLM and OpenInfer topologies differ, so accepted length remains
+  - The official vLLM and PegaInfer topologies differ, so accepted length remains
     content-dependent; round cost is required alongside TPOT.
   - A single c1 run can be distorted by startup and host noise. Use warmup plus repeated measured
     runs and report their spread rather than selecting the best number.
@@ -187,16 +187,16 @@
 
 ### Serving performance and acceptance attribution
 
-- Matched official vLLM and OpenInfer on one 8×H200 node with greedy decoding and fixed output
+- Matched official vLLM and PegaInfer on one 8×H200 node with greedy decoding and fixed output
   length. An exploratory c1 terminal snapshot measured:
 
   | Engine | c1 TPOT | Mean accepted length | TPOT × accepted length |
   | --- | ---: | ---: | ---: |
   | official vLLM native MTP | `9.10 ms` | `3.40` | `30.9 ms` |
-  | OpenInfer native MTP | `15.03 ms` | `2.00` | `30.1 ms` |
+  | PegaInfer native MTP | `15.03 ms` | `2.00` | `30.1 ms` |
 
-- OpenInfer plain c1 TPOT was `18.66 ms`; native MTP therefore helps, but less than vLLM.
-- The OpenInfer accepted-length value is reproducible from eight retained request histograms
+- PegaInfer plain c1 TPOT was `18.66 ms`; native MTP therefore helps, but less than vLLM.
+- The PegaInfer accepted-length value is reproducible from eight retained request histograms
   (`1009` speculative rounds), not an average of per-request averages. The standalone c1 client
   result was not retained, however, so the table is mechanism evidence rather than a regression
   baseline.
@@ -205,14 +205,14 @@
   | Engine | Mean TPOT | Mean accepted length |
   | --- | ---: | ---: |
   | official vLLM native MTP | `16.90 ms` | `3.786` |
-  | OpenInfer before hidden-boundary fix | `23.44 ms` | `1.753` |
-  | OpenInfer after hidden-boundary fix | `11.31 ms` | `3.725` |
+  | PegaInfer before hidden-boundary fix | `23.44 ms` | `1.753` |
+  | PegaInfer after hidden-boundary fix | `11.31 ms` | `3.725` |
 
-  The OpenInfer values are weighted from the final 64 per-request histograms: `9191` rounds before
+  The PegaInfer values are weighted from the final 64 per-request histograms: `9191` rounds before
   the fix and `4346` rounds after it.
 - Result: the corrected A/B confirms that shorter accepted prefixes caused most of the observed
   TPOT gap. `TPOT × accepted length` is `41.10 ms` before and `42.11 ms` after the fix, consistent
-  with unchanged speculative-round cost. The post-fix OpenInfer/vLLM TPOT comparison still
+  with unchanged speculative-round cost. The post-fix PegaInfer/vLLM TPOT comparison still
   includes engine and topology differences; it is not a claim that the MTP round itself is faster.
 
 #### Retained c8 measurement record
@@ -226,12 +226,12 @@
   Raw counters are `4347` proposal rounds, `21735` drafted tokens, and `12109` accepted draft
   tokens. Thus mean accepted length including the target bonus is
   `1 + 12109 / 4347 = 3.785599`.
-- OpenInfer provenance: commit `fd6bd6e0`, benchmark JSON SHA-256
+- PegaInfer provenance: commit `fd6bd6e0`, benchmark JSON SHA-256
   `66fd2d4ea38fa7ceb1429612e35f2f9fce6eed26f35546cfb2da1c0563619760`.
   The aggregate accepted-draft histogram for indices `0..7` is
   `[4564, 3113, 955, 415, 65, 79, 0, 0]`: `9191` rounds and `6923` accepted drafts. Thus mean
   accepted length including the target bonus is `1 + 6923 / 9191 = 1.753237`.
-- Corrected OpenInfer replay: benchmark JSON SHA-256
+- Corrected PegaInfer replay: benchmark JSON SHA-256
   `5e4c3d7219fee985008e6932bdb07c74708b5a39691480259db357e6ece2db55`;
   histogram record SHA-256
   `6c95eb444cbf8296773be94b425d2b83899b47e718f2c42e13dab0a5995fb2ba`.
@@ -246,7 +246,7 @@
   prompt tokens and requests exactly `16384` output tokens.
 - Per-round target traces disprove the earlier working hypothesis that target-trajectory drift
   explains the full acceptance gap. Six requests share at least 32 target tokens across engines.
-  An exploratory capture found one 251-token shared trajectory: before the fix OpenInfer rejects
+  An exploratory capture found one 251-token shared trajectory: before the fix PegaInfer rejects
   every first draft (`251` rounds, mean accepted length `1.000`), while official vLLM reached
   approximately `5.78`. That full official per-request capture was not retained as a durable
   artifact, so the approximate value is diagnostic rather than a regression baseline.
@@ -260,22 +260,22 @@
   | layer-78 raw hidden | `0.7404` | `0.9877` |
   | recycled normalized hidden | `0.7171` | `0.9861` |
 
-- The before-fix target-hidden norm is `281.01`, versus official vLLM's `78.63`. OpenInfer's
+- The before-fix target-hidden norm is `281.01`, versus official vLLM's `78.63`. PegaInfer's
   post-fix norm is `77.32`. This large discontinuity is not attributable to BF16 reduction order.
 - Official vLLM registers `GlmMoeDsaForCausalLM` on its DeepSeek-V2-compatible path. That target
   returns final-RMSNorm hidden states, and the MTP proposer consumes that model return directly.
-  OpenInfer instead selected `scratch.hidden`, the residual before final RMSNorm. The fix changes
+  PegaInfer instead selected `scratch.hidden`, the residual before final RMSNorm. The fix changes
   the source to `scratch.final_normed`; token shifting, layer 78, MTP KV, and the verifier remain
   unchanged.
 - On the selected shared trajectory, the first draft changes from the incorrect token `98863` to
-  official vLLM's `98825`. The corrected OpenInfer run records 44 rounds with accepted-draft
+  official vLLM's `98825`. The corrected PegaInfer run records 44 rounds with accepted-draft
   histogram `[1, 1, 0, 0, 0, 42, 0, 0]`, or mean accepted length `5.795`.
 - The retained short official trace has SHA-256
   `02e97a2f4d23b573cf53b20611840dc098e5f694bfde9284f532bda2c972d999`. Its six captured
   proposal records reject the first two drafts, then fully accept all five drafts in the next four
   records. The ordered checksum-list SHA-256 for the retained official tensor trace is
   `ee07cf72de367ffcb03d543bf8be4ea7ff9bb9bb7fa1d42a08cf1b25ba52461c`.
-  The OpenInfer tensor dumps used for the cosine table were transient, so those tensor metrics are
+  The PegaInfer tensor dumps used for the cosine table were transient, so those tensor metrics are
   diagnostic rather than a standalone reproducible gate.
 - The corrected selected-request response and acceptance log have SHA-256
   `8f5a6663d6ddb10c59458a1f6849fff468150265443398da63aa492d0b3ca3f3` and
@@ -299,20 +299,20 @@
   measured run completed `64/64` requests with `8152` input and `16384` output tokens. One
   readiness probe and two warmup requests preceded each measured run and are excluded from the
   counters below.
-- Both engines ran sequentially on the same 8×H200 node. OpenInfer used TP1/DP8+EP8; official vLLM
+- Both engines ran sequentially on the same 8×H200 node. PegaInfer used TP1/DP8+EP8; official vLLM
   commit `dcfebf93` used TP8+EP8 from its upstream nightly image, with five native-MTP draft tokens.
   Three measured runs per engine give:
 
   | Engine | Mean TPOT | Run-to-run σ | Mean accepted length | TPOT × accepted length | Mean TTFT | Output throughput |
   | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-  | OpenInfer native MTP | `7.749 ms` | `0.003 ms` | `3.8762` | `30.04 ms` | `432.50 ms` | `106.29 tok/s` |
+  | PegaInfer native MTP | `7.749 ms` | `0.003 ms` | `3.8762` | `30.04 ms` | `432.50 ms` | `106.29 tok/s` |
   | official vLLM native MTP | `8.814 ms` | `0.001 ms` | `3.4858` | `30.72 ms` | `232.57 ms` | `103.22 tok/s` |
 
-- Per-run OpenInfer TPOT is `[7.753, 7.746, 7.749] ms`; official vLLM is
-  `[8.815, 8.814, 8.813] ms`. OpenInfer is therefore `1.065 ms` (`12.1%`) lower on matched c1,
-  rather than approximately `2 ms` higher. OpenInfer output throughput is `3.0%` higher, while its
+- Per-run PegaInfer TPOT is `[7.753, 7.746, 7.749] ms`; official vLLM is
+  `[8.815, 8.814, 8.813] ms`. PegaInfer is therefore `1.065 ms` (`12.1%`) lower on matched c1,
+  rather than approximately `2 ms` higher. PegaInfer output throughput is `3.0%` higher, while its
   TTFT is about `200 ms` higher; the result is decode-specific, not an end-to-end latency win.
-- OpenInfer reproduces the same aggregate accepted-draft histogram in all three runs:
+- PegaInfer reproduces the same aggregate accepted-draft histogram in all three runs:
   `[815, 644, 443, 346, 212, 1723, 0, 0]`, or `4183` rounds and `12031` accepted drafts.
   Official vLLM likewise reproduces `4714` rounds and `11718` accepted drafts in each run.
 - The official acceptance counters are retained inside each enhanced benchmark JSON, not in a
@@ -323,16 +323,16 @@
   `spec_decode_acceptance_length`, and per-position rates. Thus `3.485787` is directly auditable as
   `1 + 11718 / 4714` from every retained official JSON; readiness and warmup traffic are outside
   the snapshot window.
-- The proxy round costs differ by only `0.69 ms` (`2.2%`) and favor OpenInfer. Most of the TPOT
-  delta comes from OpenInfer accepting `0.390` more tokens per speculative round on this engine's
+- The proxy round costs differ by only `0.69 ms` (`2.2%`) and favor PegaInfer. Most of the TPOT
+  delta comes from PegaInfer accepting `0.390` more tokens per speculative round on this engine's
   target trajectories. This does not imply identical target text or identical MTP numerics across
   the two topologies.
-- The benchmarked OpenInfer binary was built from `2dd5237e` (native-MTP commits `f35292c1`,
+- The benchmarked PegaInfer binary was built from `2dd5237e` (native-MTP commits `f35292c1`,
   `fd6bd6e0`, `83389e75`, and `2dd5237e` over base `272c2f94`) in the
   release profile. The runtime binary SHA-256 is
   `1a803c63c64377a82d611a1713cbf769b6bee1440c14902561922974c3691f62`. The official-vLLM
   image digest is `sha256:79460a12901891f5e74d7a6ee1259f8aad9aa3b405cc0753534ee4ff6124fd3b`.
-- The ordered checksum-list SHA-256 for the three OpenInfer benchmark JSON files, three OpenInfer
+- The ordered checksum-list SHA-256 for the three PegaInfer benchmark JSON files, three PegaInfer
   acceptance logs, and three official-vLLM benchmark JSON files is
   `a0dbc587ec16816dfae134a0f3f629745d8a6db5375bc09fb306fa4d82f165e9`.
   The benchmark-client binary SHA-256 is
@@ -342,33 +342,33 @@
   the request path. No measured request reached the server in that attempt. The run switched to a
   previously validated upstream-client build, repeated the exact dry-run token totals, passed a
   one-request smoke test on both engines, and then collected the six retained runs above.
-- After measurement, the official-vLLM container was stopped and the corrected OpenInfer service
+- After measurement, the official-vLLM container was stopped and the corrected PegaInfer service
   was restored and health-checked.
 
 ### Pre-fix fixed-prompt comparison
 
 - Used the deterministic prompt `The capital of France is` with greedy decoding. The official
-  trace was captured from vLLM commit `dcfebf93`; OpenInfer ran its normal target, scheduler,
+  trace was captured from vLLM commit `dcfebf93`; PegaInfer ran its normal target, scheduler,
   long-lived MTP KV, and five-step proposal loop.
 - The first proposal is exact:
 
   | Engine | Draft tokens |
   | --- | --- |
   | official vLLM | `[13, 576, 3283, 315, 12089]` |
-  | OpenInfer | `[13, 576, 3283, 315, 12089]` |
+  | PegaInfer | `[13, 576, 3283, 315, 12089]` |
 
-- Repeating the OpenInfer request four times produced the same proposal and output, ruling out
+- Repeating the PegaInfer request four times produced the same proposal and output, ruling out
   request-to-request nondeterminism.
 - The first four rounds that share the same target token trajectory accept:
 
   | Engine | Accepted drafts per round | Mean including target bonus |
   | --- | --- | ---: |
   | official vLLM | `[1, 1, 1, 2]` | `2.25` |
-  | OpenInfer | `[1, 1, 1, 1]` | `2.00` |
+  | PegaInfer | `[1, 1, 1, 1]` | `2.00` |
 
 - The durable proposal record before their round cadence diverges is:
 
-  | Round | official vLLM | OpenInfer |
+  | Round | official vLLM | PegaInfer |
   | ---: | --- | --- |
   | 0 | `[13, 576, 3283, 315, 12089]` | `[13, 576, 3283, 315, 12089]` |
   | 1 | `[504, 279, 6722, 315, 9621]` | `[504, 279, 3283, 315, 12089]` |
@@ -379,11 +379,11 @@
   difference is `6722` versus `3283`; official logits are `18.25` versus `18.00`, and that
   position is already behind a rejected draft, so it cannot change accepted length.
 - The only acceptance-changing difference in the four comparable rounds is official token `220`
-  versus OpenInfer token `264`. In the official BF16 logits, `220` is `18.00` and `264` is
+  versus PegaInfer token `264`. In the official BF16 logits, `220` is `18.00` and `264` is
   `17.25`. The target token stream remains identical through the compared interval; only the
   drafter loses one accepted token.
 - A suspected MTP-step raw-hidden recycle bug was rejected. Official vLLM traces show that each
-  next draft step receives the prior `shared_head`-normalized hidden bit-exactly; OpenInfer already
+  next draft step receives the prior `shared_head`-normalized hidden bit-exactly; PegaInfer already
   feeds the same normalized value.
 - Result: this narrow prompt excluded a token shift, stale recycle hidden, and an obvious MTP
   KV-position error, but did not validate the target-to-MTP input boundary. Its first proposal
@@ -395,14 +395,14 @@
 - Official side: vLLM commit `dcfebf93`, TP8+EP8, `max_tokens=8`; its five rank-0 proposal groups
   contain 25 paired forward/logit records. The ordered checksum-list SHA-256 is
   `cae3e354d39b21f16d207899d8addc3e12f3b14d1cdb4d4cfd893a0533f4778f`.
-- OpenInfer side: commit `fd6bd6e0`, TP1/DP8+EP8, `max_tokens=20` so the short-tail policy exposes
+- PegaInfer side: commit `fd6bd6e0`, TP1/DP8+EP8, `max_tokens=20` so the short-tail policy exposes
   at least four proposal rounds. The request uses temperature `0` and seed `1`.
 - The prompt token IDs are `[6722, 315, 9621, 374, 12089]`. The shared target token trajectory
   through the compared interval is
   `[12089, 13, 31008, 504, 12089, 311, 54831, 374, 220, 101294]`.
 - Official vLLM reports four verified rounds, five accepted drafts, and per-position acceptance
   rates `[1.0, 0.25, 0.0, 0.0, 0.0]`; these counters and the proposal transitions reproduce
-  accepted drafts `[1,1,1,2]`. OpenInfer's four rounds are reproduced directly from the table and
+  accepted drafts `[1,1,1,2]`. PegaInfer's four rounds are reproduced directly from the table and
   the shared target trajectory as `[1,1,1,1]`.
 
 ### Latest-main integration
@@ -420,7 +420,7 @@
 ### How to use aggregate accepted length
 
 - The matched random benchmark uses identical input/output lengths, but official vLLM runs a
-  TP8+EP8 target while OpenInfer runs TP1/DP8+EP8. Their greedy generated texts diverge from the
+  TP8+EP8 target while PegaInfer runs TP1/DP8+EP8. Their greedy generated texts diverge from the
   first request, so each MTP instance is scored on a different output trajectory.
 - Accepted length is strongly content-dependent. Comparing `3.40` to `2.00` therefore describes
   the measured serving systems and suggests one contributor to their TPOT difference, but does
@@ -453,7 +453,7 @@
 - **Lessons learned**:
   - Native-MTP acceptance is itself an accuracy metric even when target-generated answers remain
     correct.
-  - Compare c1 with c1. The earlier apparent `11.31` versus `9.10 ms` gap mixed OpenInfer c8 with
+  - Compare c1 with c1. The earlier apparent `11.31` versus `9.10 ms` gap mixed PegaInfer c8 with
     an exploratory official-vLLM c1 snapshot; matched repeated c1 reverses that conclusion.
   - Cross-engine aggregate acceptance is meaningful only when both engines follow the same target
     token trajectory; identical prompt lengths and sampling flags are insufficient.

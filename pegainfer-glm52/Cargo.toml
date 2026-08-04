@@ -1,0 +1,31 @@
+[package]
+autobenches = false
+edition = "2024"
+license = "Apache-2.0"
+name = "pegainfer-glm52"
+version = "0.1.0"
+
+[dependencies]
+anyhow = { workspace = true }
+bincode = { workspace = true, features = ["serde"] }
+bytesize = { workspace = true }
+crossbeam-channel = { workspace = true }
+cudarc = { workspace = true }
+half = { workspace = true }
+hex = { workspace = true }
+log = { workspace = true }
+memmap2 = { workspace = true }
+pegainfer-core = { workspace = true }
+pegainfer-kernels = { workspace = true, features = ["glm52"] }
+pegainfer-kv-cache = { workspace = true }
+pegainfer-kv-offload = { workspace = true }
+pegainfer-sample = { workspace = true }
+rayon = { workspace = true }
+safetensors = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

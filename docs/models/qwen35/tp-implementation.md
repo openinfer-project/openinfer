@@ -83,7 +83,7 @@ This matches the design contract: TP workers own rank-local CUDA/NCCL execution 
 Rebasing Phase 1 onto current `main` required preserving the TP execution boundary while adopting newer shared contracts:
 
 - Hybrid batch decode now builds `Vec<&mut RecurrentState>` from graph-owned slots before entering the common linear-attention helper. This keeps request state in place while satisfying the helper's mutable-reference slice contract.
-- `openinfer_sample::select_batch` now requires request-local sampling steps. Phase 1 TP still samples one row at a time and has no request-local sampling counter, so it passes step `0` and retains its existing per-row `sample_seed` offset. Do not substitute batch row indices for request-local steps: that would make seeded output depend on batch composition.
+- `pegainfer_sample::select_batch` now requires request-local sampling steps. Phase 1 TP still samples one row at a time and has no request-local sampling counter, so it passes step `0` and retains its existing per-row `sample_seed` offset. Do not substitute batch row indices for request-local steps: that would make seeded output depend on batch composition.
 - Qwen3.5 launch and tests use the current `EngineLoadOptions` surface; the removed `enable_prefill_profile` field is no longer supplied.
 - TP scheduler tests explicitly set the newer `GenerateRequest::data_parallel_rank` field to `None` because Phase 1 is TP-only, not DP.
 - Synthetic TP config/loader fixtures include `tie_word_embeddings`, matching the current `Config35` contract without changing production config loading.
@@ -108,7 +108,7 @@ Phase 1 acceptance coverage:
   - concurrent mixed greedy/sampling requests
   - consumer drop
   - post-drop scheduler health
-- TP2 HTTP serving smoke passes through `openinfer_vllm_frontend::serve`:
+- TP2 HTTP serving smoke passes through `pegainfer_vllm_frontend::serve`:
   - `/v1/models`
   - non-streaming `/v1/completions`
   - streaming `/v1/completions`
@@ -122,7 +122,7 @@ Phase 1 acceptance coverage:
 - Current-main rebase verification passes:
   - formatting check
   - Qwen3.5 release compilation for all test targets
-  - `openinfer-server` release compilation with only the `qwen35` model feature
+  - `pegainfer-server` release compilation with only the `qwen35` model feature
 
 Known validation constraints:
 
@@ -132,9 +132,9 @@ Known validation constraints:
 
 Stable test knobs:
 
-- `OPENINFER_TEST_MODEL_PATH`: real Qwen3.5 weights path for HF, scheduler, and serving tests.
-- `OPENINFER_TEST_TP_DEVICES`: comma-separated TP2 CUDA ordinals. Defaults to `0,1`; examples: `1,2`, `2,3`. TP2 tests require exactly two distinct ordinals.
-- `OPENINFER_TEST_FRONTEND_MODEL_PATH`: optional tokenizer/config metadata path for HTTP serving tests. Defaults to `OPENINFER_TEST_MODEL_PATH` when unset.
+- `PEGAINFER_TEST_MODEL_PATH`: real Qwen3.5 weights path for HF, scheduler, and serving tests.
+- `PEGAINFER_TEST_TP_DEVICES`: comma-separated TP2 CUDA ordinals. Defaults to `0,1`; examples: `1,2`, `2,3`. TP2 tests require exactly two distinct ordinals.
+- `PEGAINFER_TEST_FRONTEND_MODEL_PATH`: optional tokenizer/config metadata path for HTTP serving tests. Defaults to `PEGAINFER_TEST_MODEL_PATH` when unset.
 
 ## Follow-Up Work
 

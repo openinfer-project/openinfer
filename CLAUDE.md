@@ -1,6 +1,6 @@
 This file provides guidance to Coding Agent when working with code in this repository.
 
-## What is openinfer
+## What is PegaInfer
 
 Pure Rust + CUDA LLM inference engine. No PyTorch, no frameworks. OpenAI-compatible `/v1/completions` API.
 
@@ -10,12 +10,12 @@ Every model line is behind a cargo feature; only `qwen3` is a default feature, s
 
 | Model | Crate | Feature flag | Architecture |
 |-------|-------|-------------|-------------|
-| Qwen3-4B / 8B | `openinfer-qwen3` | `qwen3` (default) | Full attention, TP support |
-| Qwen3.5-4B / 9B / 27B | `openinfer-qwen35` | `--features qwen35` (needs build-time Python + Triton) | Hybrid Gated DeltaNet + full attention |
-| DeepSeek-V2-Lite | `openinfer-deepseek-v2-lite` | `--features deepseek-v2-lite` | MoE + EP, 2-GPU |
-| Gemma 4 | `openinfer-gemma4` | `--features gemma4` | Registration only — engine not yet available |
-| Kimi-K2 | `openinfer-kimi-k2` | `--features kimi-k2` | MLA + MoE + Marlin INT4, 8-GPU EP |
-| GLM5.2 | `openinfer-glm52` | `--features glm52` | MLA + MoE + FP8, 8-GPU EP (bring-up) |
+| Qwen3-4B / 8B | `pegainfer-qwen3` | `qwen3` (default) | Full attention, TP support |
+| Qwen3.5-4B / 9B / 27B | `pegainfer-qwen35` | `--features qwen35` (needs build-time Python + Triton) | Hybrid Gated DeltaNet + full attention |
+| DeepSeek-V2-Lite | `pegainfer-deepseek-v2-lite` | `--features deepseek-v2-lite` | MoE + EP, 2-GPU |
+| Gemma 4 | `pegainfer-gemma4` | `--features gemma4` | Registration only — engine not yet available |
+| Kimi-K2 | `pegainfer-kimi-k2` | `--features kimi-k2` | MLA + MoE + Marlin INT4, 8-GPU EP |
+| GLM5.2 | `pegainfer-glm52` | `--features glm52` | MLA + MoE + FP8, 8-GPU EP (bring-up) |
 
 ## Build & Run
 
@@ -35,14 +35,14 @@ cargo run --release --features glm52 -- --model-path models/GLM5.2
 ```
 
 **Key env vars:**
-- `OPENINFER_CUDA_SM` — GPU SM target override when `nvidia-smi` unavailable (e.g. `120` or `120,80`)
-- `OPENINFER_TRITON_PYTHON` — Python with Triton for `qwen35` build-time AOT kernel generation (falls back to `.venv/bin/python`, then `python3`, then `python`)
-- `OPENINFER_TILELANG_PYTHON` — Python with TileLang for the `glm52` sparse-MLA build-time AOT (sm_90a targets only)
-- `OPENINFER_NCCL_ROOT` — NCCL root (>= 2.30.4) for DeepEP shim (`moe` feature)
-- `OPENINFER_FLASHINFER_INCLUDE` — FlashInfer include dir override
-- `OPENINFER_TEST_MODEL_PATH` — override test model path (default: `models/Qwen3-4B`)
-- `OPENINFER_BUILD_TIMING=1` — print per-phase build timings (nvcc, Triton AOT, etc.)
-- `OPENINFER_NVCC_JOBS` — override parallel nvcc job count
+- `PEGAINFER_CUDA_SM` — GPU SM target override when `nvidia-smi` unavailable (e.g. `120` or `120,80`)
+- `PEGAINFER_TRITON_PYTHON` — Python with Triton for `qwen35` build-time AOT kernel generation (falls back to `.venv/bin/python`, then `python3`, then `python`)
+- `PEGAINFER_TILELANG_PYTHON` — Python with TileLang for the `glm52` sparse-MLA build-time AOT (sm_90a targets only)
+- `PEGAINFER_NCCL_ROOT` — NCCL root (>= 2.30.4) for DeepEP shim (`moe` feature)
+- `PEGAINFER_FLASHINFER_INCLUDE` — FlashInfer include dir override
+- `PEGAINFER_TEST_MODEL_PATH` — override test model path (default: `models/Qwen3-4B`)
+- `PEGAINFER_BUILD_TIMING=1` — print per-phase build timings (nvcc, Triton AOT, etc.)
+- `PEGAINFER_NVCC_JOBS` — override parallel nvcc job count
 - `GLM52_DECODE_SLOTS` / `GLM52_MTP_DRAFTS` — glm52 runtime profile: decode slots per rank (default 8, ceiling 32) and MTP draft span (default 5); `slots x (1+drafts)` must fit the 96-row step (validated at launch; MTP only). Throughput ceiling profile: `32` / `2`.
 
 ## Tests
@@ -52,9 +52,9 @@ cargo run --release --features glm52 -- --model-path models/GLM5.2
 cargo test --release --workspace --lib
 
 # Accuracy and integration tests — require GPU + model weights
-cargo test --release -p openinfer-qwen3 --test hf_golden_gate
-OPENINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p openinfer-qwen35 --features qwen35 --test hf_golden_gate
-OPENINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p openinfer-qwen35 --features qwen35 --test e2e_scheduler
+cargo test --release -p pegainfer-qwen3 --test hf_golden_gate
+PEGAINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p pegainfer-qwen35 --features qwen35 --test hf_golden_gate
+PEGAINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p pegainfer-qwen35 --features qwen35 --test e2e_scheduler
 
 # Single test (filter by name)
 cargo test --release --workspace --lib prefix_cache -- --nocapture
@@ -69,13 +69,13 @@ HTTP Request → vLLM frontend → EngineHandle → per-model scheduler/executor
                                                │
               ┌──────────┬─────────────┬───────┼───────────┬──────────┐
               │          │             │       │           │          │
-        openinfer-  openinfer-   openinfer-  openinfer-  openinfer-  ...
+        pegainfer-  pegainfer-   pegainfer-  pegainfer-  pegainfer-  ...
         qwen3       qwen35       dsv2-lite   kimi-k2     glm52
       (full attn) (linear+full) (MoE+EP)   (MLA+MoE)  (MLA+MoE+FP8)
               │          │             │       │           │          │
               └──────────┴─────────────┴───────┼───────────┴──────────┘
                                                │
-                          openinfer-core runtime + openinfer-kernels
+                          pegainfer-core runtime + pegainfer-kernels
                                                │
                                ┌───────────────┼───────────────┐
                                │               │               │
@@ -86,16 +86,16 @@ HTTP Request → vLLM frontend → EngineHandle → per-model scheduler/executor
 
 **Key abstractions:**
 
-- **`openinfer-engine`** — shared request/event contract (`EngineHandle`, `GenerateRequest`, `TokenEvent`) used by the server and model crates. (`openinfer-core::engine` re-exports it.)
+- **`pegainfer-engine`** — shared request/event contract (`EngineHandle`, `GenerateRequest`, `TokenEvent`) used by the server and model crates. (`pegainfer-core::engine` re-exports it.)
 - **Per-model crates** — each model owns config, weights, prefill/decode execution, scheduler, tests, and benches.
-- **`openinfer-core::ops`** — shared GPU operator wrappers used by model crates.
-- **`openinfer-kernels`** — tensor/FFI/kernel build owner for CUDA, cuBLAS, FlashInfer, and Triton AOT. Model-specific kernels live in feature-gated submodules (`kimi_k2`, `glm52`).
+- **`pegainfer-core::ops`** — shared GPU operator wrappers used by model crates.
+- **`pegainfer-kernels`** — tensor/FFI/kernel build owner for CUDA, cuBLAS, FlashInfer, and Triton AOT. Model-specific kernels live in feature-gated submodules (`kimi_k2`, `glm52`).
 - **CUDA Graph** — decode path captured inside model executors with pre-allocated buffers to preserve pointer stability.
-- **KV state** — model schedulers own request state; shared paged-KV primitives live in `openinfer-kv-cache`; host/SSD/RDMA offload bridge in `openinfer-kv-offload`.
+- **KV state** — model schedulers own request state; shared paged-KV primitives live in `pegainfer-kv-cache`; host/SSD/RDMA offload bridge in `pegainfer-kv-offload`.
 
-**Build system**: the virtual workspace root has no package build script. `openinfer-kernels/build.rs` owns CUDA/Triton compilation:
-1. Compiles `openinfer-kernels/csrc/*.cu` with nvcc (auto-detects GPU SM targets)
-2. Feature-gated codegen: `qwen35` runs Triton AOT via `openinfer-kernels/tools/triton/gen_triton_aot.py`; `kimi-k2` adds MLA/MoE/Marlin CUDA; `glm52` adds MLA/MoE/FP8 CUDA plus TileLang sparse-MLA codegen on sm_90a
+**Build system**: the virtual workspace root has no package build script. `pegainfer-kernels/build.rs` owns CUDA/Triton compilation:
+1. Compiles `pegainfer-kernels/csrc/*.cu` with nvcc (auto-detects GPU SM targets)
+2. Feature-gated codegen: `qwen35` runs Triton AOT via `pegainfer-kernels/tools/triton/gen_triton_aot.py`; `kimi-k2` adds MLA/MoE/Marlin CUDA; `glm52` adds MLA/MoE/FP8 CUDA plus TileLang sparse-MLA codegen on sm_90a
 
 ---
 

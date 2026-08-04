@@ -16,7 +16,7 @@
   - `docs/models/glm52/tp4-prefill-only.md` — TP4 prefill currently persists a 576-byte cache row and rejects external P/D.
   - the P/D wire contract is the 656-byte `fp8_ds_mla` row plus the 132-byte index-K sidecar (established by the retired vLLM-prefill path, #657).
 - **Relevant history**:
-  - Existing P/D support validates TP8 vLLM → EP8 OpenInfer, but no TP4 → EP16 path exists.
+  - Existing P/D support validates TP8 vLLM → EP8 PegaInfer, but no TP4 → EP16 path exists.
 - **Plan**:
   1. Create a non-`main` feature branch and make TP4 prefill persist the canonical 656-byte MLA row while retaining its BF16 sparse-prefill execution.
   2. Add one startup `info` record that states topology, MLA backend/layout, page size, bytes per token/page, and MLA/index-K arena counts.
@@ -100,7 +100,7 @@ downloaded cubins):
   when unset: the default 2-channel ring measured ~46 GB/s (8.7 ms per
   16K-row all-reduce); 16–32 channels restore ~1.6 ms.
 
-`OPENINFER_GLM52_PREFILL_PROFILE=1` logs a per-chunk CUDA-event section
+`PEGAINFER_GLM52_PREFILL_PROFILE=1` logs a per-chunk CUDA-event section
 profile (the numbers below).
 
 ## Capacity and prefix cache
