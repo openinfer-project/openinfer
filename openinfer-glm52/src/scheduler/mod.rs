@@ -589,7 +589,28 @@ impl Glm52Engine {
                 return;
             }
         };
-        let native = handoff.filter(|_| !self.prefill_only() && self.drafter.is_mtp());
+        // A handoff this engine cannot restore is an intake rejection, not a
+        // silent downgrade: resolving it as Plain would generate from the
+        // client prompt without the transferred KV or the anchor replay — a
+        // successful-but-wrong continuation that defeats the router's
+        // fallback. Only an MTP decode engine restores native handoffs.
+        let native = match native_handoff_disposition(
+            handoff.is_some(),
+            self.prefill_only(),
+            self.drafter.is_mtp(),
+        ) {
+            NativeHandoffDisposition::Restore => handoff,
+            NativeHandoffDisposition::Plain => None,
+            NativeHandoffDisposition::Reject => {
+                admission::reject(
+                    &req,
+                    "GLM5.2 native P/D handoff requires an MTP decode engine; \
+                     this role cannot restore it"
+                        .to_owned(),
+                );
+                return;
+            }
+        };
 
         // Requests with nothing to resolve (no host tier, prefix cache off,
         // or the prefill-only role, which never restores) go straight to the
@@ -1522,6 +1543,60 @@ impl Glm52Engine {
             let _ = worker.request_shutdown();
         }
         drop(self.workers);
+    }
+}
+
+/// How intake treats a request's native P/D handoff on this engine role.
+///
+/// INVARIANT: a handoff never degrades silently. An engine that cannot
+/// restore it (prefill-only, or a decode role without the MTP drafter) must
+/// reject at intake so the router's fallback fires — queuing the request as
+/// Plain would generate from the client prompt without the transferred KV or
+/// the anchor replay, returning a successful but incorrect continuation.
+#[derive(Debug, Eq, PartialEq)]
+enum NativeHandoffDisposition {
+    Restore,
+    Plain,
+    Reject,
+}
+
+fn native_handoff_disposition(
+    has_handoff: bool,
+    prefill_only: bool,
+    drafter_is_mtp: bool,
+) -> NativeHandoffDisposition {
+    match (has_handoff, prefill_only || !drafter_is_mtp) {
+        (false, _) => NativeHandoffDisposition::Plain,
+        (true, false) => NativeHandoffDisposition::Restore,
+        (true, true) => NativeHandoffDisposition::Reject,
+    }
+}
+
+#[cfg(test)]
+mod native_handoff_disposition_tests {
+    use super::NativeHandoffDisposition;
+    use super::native_handoff_disposition;
+
+    #[test]
+    fn an_unrestorable_handoff_rejects_instead_of_degrading_to_plain() {
+        // prefill-only and non-MTP decode both lack the restore path.
+        assert_eq!(
+            native_handoff_disposition(true, true, true),
+            NativeHandoffDisposition::Reject
+        );
+        assert_eq!(
+            native_handoff_disposition(true, false, false),
+            NativeHandoffDisposition::Reject
+        );
+        assert_eq!(
+            native_handoff_disposition(true, false, true),
+            NativeHandoffDisposition::Restore
+        );
+        // No handoff: role capability is irrelevant, the request is plain.
+        assert_eq!(
+            native_handoff_disposition(false, true, false),
+            NativeHandoffDisposition::Plain
+        );
     }
 }
 
