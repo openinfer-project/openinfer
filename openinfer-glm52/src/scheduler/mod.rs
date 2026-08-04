@@ -635,7 +635,16 @@ impl Glm52Engine {
         self.runtime.spawn(async move {
             let resolved = match native {
                 Some(handoff) => {
-                    match offload::native_pd_resolve(&store, &pool, rank, &req, &handoff).await {
+                    match offload::native_pd_resolve(
+                        &store,
+                        &pool,
+                        rank,
+                        &req,
+                        &handoff,
+                        &req.token_tx,
+                    )
+                    .await
+                    {
                         Ok((kv, cached_tokens, reservation)) => {
                             match offload::native_anchor_plan(&req, &handoff) {
                                 Ok(plan) => offload::Resolved::Native {

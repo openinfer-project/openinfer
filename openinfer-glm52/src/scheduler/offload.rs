@@ -15,6 +15,7 @@ use openinfer_core::engine::GenerateRequest;
 use openinfer_core::engine::KvPrefix;
 use openinfer_kv_store::BlockPool;
 use openinfer_kv_store::CacheScope;
+use openinfer_kv_store::CancelProbe;
 use openinfer_kv_store::KvStore;
 use openinfer_kv_store::LoadReservation;
 use openinfer_kv_store::RequestKv;
@@ -207,12 +208,20 @@ impl Resolved {
 /// the final uncomputed token into normal dangling-token state, and the
 /// remaining lifetime pages are claimed against the pool so the intake
 /// reaches admission already accounting for its full footprint.
+///
+/// Every stage observes `cancel` (the client's token sink): a disconnect
+/// mid-resolve ends the flow at the next wait instead of holding the
+/// restored pages for up to two more resolve deadlines, and the built KV
+/// releases before the terminal error surfaces — except when a keyed-tail
+/// DMA is still in flight, where the KV parks with the detached load (the
+/// abandoned-DMA contract) instead of releasing.
 pub(super) async fn native_pd_resolve(
     store: &KvStore,
     pool: &Arc<BlockPool>,
     rank: usize,
     req: &GenerateRequest,
     handoff: &NativeMtpHandoff,
+    cancel: &dyn CancelProbe,
 ) -> anyhow::Result<(RequestKv, usize, Option<LoadReservation>)> {
     let plan = native_anchor_plan(req, handoff)?;
     anyhow::ensure!(
@@ -248,7 +257,7 @@ pub(super) async fn native_pd_resolve(
             prompt_kv,
             CacheScope::default().cache_salt(cache_salt),
             ResolvePolicy::default().wait_for_full_hit(),
-            &req.token_tx,
+            cancel,
         )
         .await;
     let t_full = t_start.elapsed();
@@ -300,7 +309,7 @@ pub(super) async fn native_pd_resolve(
             .last()
             .expect("tail schedule owns one page");
         match store
-            .resolve_keyed_block(rank, req_id, key, tail_page)
+            .resolve_keyed_block(rank, req_id, key, tail_page, cancel)
             .await
         {
             Ok(()) => {}
@@ -351,12 +360,21 @@ pub(super) async fn native_pd_resolve(
     let reservation = if headroom == 0 {
         None
     } else {
-        Some(
-            store
-                .reserve_headroom(rank, req_id, headroom)
-                .await
-                .context("native P/D lifetime headroom")?,
-        )
+        match store.reserve_headroom(rank, req_id, headroom, cancel).await {
+            Ok(reservation) => Some(reservation),
+            Err(err) => {
+                // Releasing the KV is the transition that frees the restored
+                // pages for a competing restore — run it before the terminal
+                // error surfaces, not at some later drop point.
+                if let Err(release_err) = kv.release() {
+                    log::warn!(
+                        "native P/D headroom failure: KV release failed \
+                         (blocks return via RAII): {release_err:#}"
+                    );
+                }
+                return Err(err.context("native P/D lifetime headroom"));
+            }
+        }
     };
     Ok((kv, cached_tokens, reservation))
 }

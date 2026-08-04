@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use openinfer_engine::engine::KvPrefix;
 use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use crate::BlockPool;
@@ -52,10 +53,10 @@ pub enum KeyedFetchError {
     /// The tier settled (or the load was never submitted): no DMA targets
     /// the destination page, so the caller may free it immediately.
     Settled(anyhow::Error),
-    /// The resolve deadline passed with the load unsettled: a detached task
-    /// still owns a DMA targeting the caller's destination page. The caller
-    /// must move whatever pins that page into `parking` before releasing the
-    /// KV it belongs to.
+    /// The wait was abandoned — deadline expiry or cancellation — with the
+    /// load unsettled: a detached task still owns a DMA targeting the
+    /// caller's destination page. The caller must move whatever pins that
+    /// page into `parking` before releasing the KV it belongs to.
     Abandoned {
         error: anyhow::Error,
         parking: KeyedLoadParking,
@@ -78,10 +79,10 @@ impl KeyedLoadParking {
 }
 
 /// A tier hit whose lease releases on drop unless the caller takes it. The
-/// keyed-query task returns its hit through this guard, which carries the
-/// invariant: a keyed query, once submitted, always settles and always
-/// releases any lease the caller will never consume — a wait abandoned at
-/// the deadline drops the task's output unread, and the drop releases.
+/// detached query task returns its hit through this guard, which carries the
+/// invariant: a query, once submitted, always settles and always releases
+/// any lease the caller will never consume — a wait abandoned at the
+/// deadline drops the task's output unread, and the drop releases.
 struct LeaseGuard {
     tier: Arc<dyn HostTier>,
     hit: Option<LeasedBlocks>,
@@ -107,6 +108,15 @@ impl Drop for LeaseGuard {
             self.tier.release(hit);
         }
     }
+}
+
+/// One tier query's settled outcome as delivered by
+/// [`KvStore::spawn_guarded_query`]'s detached task: [`TierQuery`] with the
+/// hit wrapped in a [`LeaseGuard`].
+enum GuardedQuery {
+    Miss,
+    Loading,
+    Hit(LeaseGuard),
 }
 
 /// Decrements a counter when dropped — tied to the load task's future so the
@@ -140,6 +150,36 @@ impl KvStore {
 
     pub fn stats(&self) -> &KvStoreStats {
         &self.stats
+    }
+
+    /// Run one tier query to settlement in a detached task owning a tier
+    /// clone. Dropping `tier.query`'s future would detach only the observer
+    /// — the tier's work is already submitted and may still settle into a
+    /// lease-carrying hit — so no resolve awaits that future directly: the
+    /// task always observes the settlement, and a hit comes back wrapped in
+    /// a [`LeaseGuard`], which releases the lease unless the caller takes it
+    /// — including a wait abandoned at a deadline, where the task's output
+    /// drops unread. No abandoned query can pin host blocks until the lease
+    /// TTL.
+    fn spawn_guarded_query(
+        &self,
+        tier: &Arc<dyn HostTier>,
+        req_id: &str,
+        block_hashes: Vec<Vec<u8>>,
+        wait_full: bool,
+    ) -> JoinHandle<anyhow::Result<GuardedQuery>> {
+        let tier = Arc::clone(tier);
+        let req_id = req_id.to_string();
+        self.runtime.spawn(async move {
+            match tier.query(&req_id, block_hashes, wait_full).await? {
+                TierQuery::Miss => Ok(GuardedQuery::Miss),
+                TierQuery::Loading => Ok(GuardedQuery::Loading),
+                TierQuery::Hit(hit) => Ok(GuardedQuery::Hit(LeaseGuard {
+                    tier,
+                    hit: Some(hit),
+                })),
+            }
+        })
     }
 
     /// The whole read path. Resolves `prompt_tokens`' cached prefix on
@@ -210,29 +250,39 @@ impl KvStore {
         // prefill while degrading would buy a full recompute for the same
         // wait. The lease is released before every pause (host pins + TTL
         // must not ride out a pool wait; a re-query re-establishes it
-        // instantly from the host tier).
+        // instantly from the host tier). Each query runs detached (see
+        // `spawn_guarded_query`): a wait abandoned at the deadline leaves
+        // the settlement — and the release of a late hit's lease — to the
+        // detached task.
         let deadline = Instant::now() + self.resolve_deadline;
         let (hit, reservation) = loop {
             if cancel.is_cancelled() {
                 self.stats.record_degrade(req_id, DegradeReason::Cancelled);
                 return KvPrefix::none();
             }
-            let query = tokio::time::timeout_at(
-                deadline,
-                tier.query(req_id, host_hashes.clone(), policy.wait_for_full_hit),
+            let query = self.spawn_guarded_query(
+                tier,
+                req_id,
+                host_hashes.clone(),
+                policy.wait_for_full_hit,
             );
-            match query.await {
+            match tokio::time::timeout_at(deadline, query).await {
                 Err(_elapsed) => {
                     self.stats
                         .record_degrade(req_id, DegradeReason::DeadlineExceeded);
                     return finish(probe);
                 }
-                Ok(Err(err)) => {
+                Ok(Err(join_err)) => {
+                    log::warn!("kv-store resolve {req_id}: tier query task failed: {join_err}");
+                    self.stats.record_degrade(req_id, DegradeReason::TierError);
+                    return finish(probe);
+                }
+                Ok(Ok(Err(err))) => {
                     log::warn!("kv-store resolve {req_id}: tier query failed: {err:#}");
                     self.stats.record_degrade(req_id, DegradeReason::TierError);
                     return finish(probe);
                 }
-                Ok(Ok(TierQuery::Miss)) => {
+                Ok(Ok(Ok(GuardedQuery::Miss))) => {
                     // Plain restore: a miss is a cold cache, conclude. Full-
                     // hit mode: the producer's registration may not have
                     // landed yet — keep waiting under the deadline.
@@ -246,7 +296,7 @@ impl KvStore {
                     }
                     tokio::time::sleep(self.requery_interval).await;
                 }
-                Ok(Ok(TierQuery::Loading)) => {
+                Ok(Ok(Ok(GuardedQuery::Loading))) => {
                     if Instant::now() >= deadline {
                         self.stats
                             .record_degrade(req_id, DegradeReason::DeadlineExceeded);
@@ -254,14 +304,14 @@ impl KvStore {
                     }
                     tokio::time::sleep(self.requery_interval).await;
                 }
-                Ok(Ok(TierQuery::Hit(hit))) => {
+                Ok(Ok(Ok(GuardedQuery::Hit(guard)))) => {
                     // The lease is all-or-nothing, so a hit that doesn't fit
-                    // the pool right now is declined (release, not TTL-parked)
-                    // and retried after a pause.
-                    if let Some(reservation) = pool.reserve_loaded_blocks(hit.blocks) {
-                        break (hit, reservation);
+                    // the pool right now is declined (the guard's drop
+                    // releases, not TTL-parked) and retried after a pause.
+                    if let Some(reservation) = pool.reserve_loaded_blocks(guard.blocks()) {
+                        break (guard.take(), reservation);
                     }
-                    tier.release(hit);
+                    drop(guard);
                     if Instant::now() >= deadline {
                         self.stats
                             .record_degrade(req_id, DegradeReason::PoolPressure);
@@ -336,16 +386,25 @@ impl KvStore {
     /// pool allocation, never a read-then-act check, so two concurrent
     /// resolvers can never both pass a claim the pool cannot satisfy twice.
     /// Past the deadline the claim fails terminally, mirroring the
-    /// restore's own pool-pressure contract.
+    /// restore's own pool-pressure contract. `cancel` is observed on every
+    /// iteration: a wait for pages the requester will never consume ends
+    /// promptly instead of riding out the deadline.
     pub async fn reserve_headroom(
         &self,
         rank: usize,
         req_id: &str,
         blocks: usize,
+        cancel: &dyn CancelProbe,
     ) -> anyhow::Result<LoadReservation> {
         let state = self.rank(rank);
         let deadline = Instant::now() + self.resolve_deadline;
         loop {
+            // Checked before the pool draw: pages must never be handed to a
+            // request whose client is already gone.
+            if cancel.is_cancelled() {
+                self.stats.record_degrade(req_id, DegradeReason::Cancelled);
+                anyhow::bail!("headroom claim cancelled by the requester");
+            }
             if let Some(reservation) = state.pool.reserve_loaded_blocks(blocks) {
                 return Ok(reservation);
             }
@@ -515,12 +574,20 @@ impl KvStore {
     /// the error carries a [`KeyedLoadParking`] the caller must move the
     /// destination's pin into, because the destination page belongs to the
     /// caller's scheduled `RequestKv` and the store holds no handle to it.
+    ///
+    /// `cancel` is observed between operations and on every wait tick.
+    /// Before the load is submitted a cancellation is
+    /// [`KeyedFetchError::Settled`] (no DMA exists, the destination page is
+    /// free-able); once the load is in flight a cancelled wait abandons
+    /// exactly like a deadline-expired one — [`KeyedFetchError::Abandoned`],
+    /// same parking contract — because the DMA is live either way.
     pub async fn resolve_keyed_block(
         &self,
         rank: usize,
         req_id: &str,
         key: [u8; 16],
         dst_page_id: i32,
+        cancel: &dyn CancelProbe,
     ) -> Result<(), KeyedFetchError> {
         let state = self.rank(rank);
         let tier = state.tier.as_ref().ok_or_else(|| {
@@ -534,29 +601,17 @@ impl KvStore {
                 "keyed fetch deadline: key never became resident"
             ))
         };
-        // Dropping `tier.query`'s future detaches only the observer — the
-        // tier's work is already submitted and may still settle into a
-        // lease-carrying hit. So each query runs in a task owning the tier:
-        // once submitted it always runs to settlement, and a hit comes back
-        // wrapped in a [`LeaseGuard`], which releases the lease unless the
-        // caller takes it — including a wait abandoned at the deadline,
-        // where the task's output drops unread. No abandoned query can pin
-        // host blocks until the lease TTL.
+        // Queries run detached (see `spawn_guarded_query`): a wait abandoned
+        // at the deadline leaves the settlement — and the release of a late
+        // hit's lease — to the detached task.
         let hit = loop {
-            let query_tier = Arc::clone(tier);
-            let query_req_id = req_id.to_string();
-            let hashes = vec![key.to_vec()];
-            let join = self.runtime.spawn(async move {
-                match query_tier.query(&query_req_id, hashes, true).await {
-                    Ok(TierQuery::Hit(hit)) => Ok(Some(LeaseGuard {
-                        tier: query_tier,
-                        hit: Some(hit),
-                    })),
-                    Ok(TierQuery::Miss | TierQuery::Loading) => Ok(None),
-                    Err(err) => Err(err),
-                }
-            });
-            match tokio::time::timeout_at(deadline, join).await {
+            if cancel.is_cancelled() {
+                return Err(KeyedFetchError::Settled(anyhow::anyhow!(
+                    "keyed fetch cancelled before the tail load was submitted"
+                )));
+            }
+            let query = self.spawn_guarded_query(tier, req_id, vec![key.to_vec()], true);
+            match tokio::time::timeout_at(deadline, query).await {
                 Err(_elapsed) => return Err(expired()),
                 Ok(Err(join_err)) => {
                     return Err(KeyedFetchError::Settled(anyhow::anyhow!(
@@ -566,15 +621,15 @@ impl KvStore {
                 Ok(Ok(Err(err))) => {
                     return Err(KeyedFetchError::Settled(err.context("keyed fetch query")));
                 }
-                Ok(Ok(Ok(Some(guard)))) if guard.blocks() == 1 => break guard.take(),
-                Ok(Ok(Ok(Some(guard)))) => {
+                Ok(Ok(Ok(GuardedQuery::Hit(guard)))) if guard.blocks() == 1 => break guard.take(),
+                Ok(Ok(Ok(GuardedQuery::Hit(guard)))) => {
                     let blocks = guard.blocks();
                     drop(guard);
                     return Err(KeyedFetchError::Settled(anyhow::anyhow!(
                         "keyed fetch resolved {blocks} blocks for one key"
                     )));
                 }
-                Ok(Ok(Ok(None))) => {
+                Ok(Ok(Ok(GuardedQuery::Miss | GuardedQuery::Loading))) => {
                     if Instant::now() >= deadline {
                         return Err(expired());
                     }
@@ -585,13 +640,16 @@ impl KvStore {
 
         // Same bounded-abandonment shape as `resolve_prefix`: a spawned task
         // owns the load future (counted in `loads_pending` for the teardown
-        // barrier), and the deadline abandons only the wait. The task drops
+        // barrier), and only the wait is ever abandoned. The task drops
         // whatever the abandoning caller parks only after the tier settles.
+        // The wait ticks on the requery interval so a client disconnect is
+        // seen mid-load; the DMA is live either way, so a cancelled wait
+        // abandons with the same parking contract as an expired one.
         let load = tier.load(hit, vec![dst_page_id]);
         state.loads_pending.fetch_add(1, Ordering::AcqRel);
         let dec = DecOnDrop(Arc::clone(&state.loads_pending));
         let (park_tx, park_rx) = oneshot::channel::<Box<dyn Any + Send>>();
-        let join = self.runtime.spawn(async move {
+        let mut join = self.runtime.spawn(async move {
             let _dec = dec;
             let result = load.await;
             // The DMA has settled: releasing the parking end now frees any
@@ -600,18 +658,34 @@ impl KvStore {
             drop(park_rx);
             result
         });
-        match tokio::time::timeout_at(deadline, join).await {
-            Ok(Ok(Ok(()))) => Ok(()),
-            Ok(Ok(Err(err))) => Err(KeyedFetchError::Settled(err.context("keyed fetch load"))),
-            Ok(Err(join_err)) => Err(KeyedFetchError::Settled(anyhow::anyhow!(
-                "keyed fetch load task failed: {join_err}"
-            ))),
-            Err(_elapsed) => {
-                self.stats.loads_abandoned.fetch_add(1, Ordering::Relaxed);
-                Err(KeyedFetchError::Abandoned {
-                    error: anyhow::anyhow!("keyed fetch deadline: tail load did not settle"),
-                    parking: KeyedLoadParking(park_tx),
-                })
+        loop {
+            let tick = deadline.min(Instant::now() + self.requery_interval);
+            match tokio::time::timeout_at(tick, &mut join).await {
+                Ok(Ok(Ok(()))) => return Ok(()),
+                Ok(Ok(Err(err))) => {
+                    return Err(KeyedFetchError::Settled(err.context("keyed fetch load")));
+                }
+                Ok(Err(join_err)) => {
+                    return Err(KeyedFetchError::Settled(anyhow::anyhow!(
+                        "keyed fetch load task failed: {join_err}"
+                    )));
+                }
+                Err(_tick) => {
+                    let abandoned = if cancel.is_cancelled() {
+                        Some("keyed fetch cancelled: tail load still in flight")
+                    } else if Instant::now() >= deadline {
+                        Some("keyed fetch deadline: tail load did not settle")
+                    } else {
+                        None
+                    };
+                    if let Some(error) = abandoned {
+                        self.stats.loads_abandoned.fetch_add(1, Ordering::Relaxed);
+                        return Err(KeyedFetchError::Abandoned {
+                            error: anyhow::anyhow!(error),
+                            parking: KeyedLoadParking(park_tx),
+                        });
+                    }
+                }
             }
         }
     }
@@ -661,10 +735,24 @@ mod tests {
     use super::*;
     use crate::BlockPool;
     use crate::KvBlockGuard;
+    use crate::NeverCancelled;
     use crate::tier::HostTier;
     use crate::tier::LeasedBlocks;
     use crate::tier::TierFuture;
     use crate::tier::TierQuery;
+
+    /// Cancelled from observation `after + 1` on — places a client
+    /// disconnect at a chosen stage of a multi-stage resolve.
+    struct CancelledAfter {
+        after: usize,
+        observations: AtomicUsize,
+    }
+
+    impl CancelProbe for CancelledAfter {
+        fn is_cancelled(&self) -> bool {
+            self.observations.fetch_add(1, Ordering::AcqRel) >= self.after
+        }
+    }
 
     /// A tier whose query always hits but whose load stalls until the test
     /// fires `release_load` — the hung-storage-worker shape the keyed-tail
@@ -768,7 +856,11 @@ mod tests {
         }
     }
 
-    fn tier_store(runtime: tokio::runtime::Handle, tier: Arc<dyn HostTier>) -> KvStore {
+    fn tier_store_with_deadline(
+        runtime: tokio::runtime::Handle,
+        tier: Arc<dyn HostTier>,
+        resolve_deadline: Duration,
+    ) -> KvStore {
         let mut ranks = HashMap::new();
         ranks.insert(
             0,
@@ -782,10 +874,14 @@ mod tests {
         KvStore {
             runtime,
             requery_interval: Duration::from_millis(1),
-            resolve_deadline: Duration::from_millis(50),
+            resolve_deadline,
             ranks,
             stats: Arc::new(KvStoreStats::default()),
         }
+    }
+
+    fn tier_store(runtime: tokio::runtime::Handle, tier: Arc<dyn HostTier>) -> KvStore {
+        tier_store_with_deadline(runtime, tier, Duration::from_millis(50))
     }
 
     fn stalled_store(runtime: tokio::runtime::Handle, release_load: Arc<Notify>) -> KvStore {
@@ -805,7 +901,8 @@ mod tests {
         let release_load = Arc::new(Notify::new());
         let store = stalled_store(rt.handle().clone(), Arc::clone(&release_load));
 
-        let outcome = rt.block_on(store.resolve_keyed_block(0, "tail", [7u8; 16], 3));
+        let outcome =
+            rt.block_on(store.resolve_keyed_block(0, "tail", [7u8; 16], 3, &NeverCancelled));
         let Err(KeyedFetchError::Abandoned { parking, .. }) = outcome else {
             panic!("a stalled tail load must abandon at the deadline");
         };
@@ -857,7 +954,8 @@ mod tests {
             }),
         );
 
-        let outcome = rt.block_on(store.resolve_keyed_block(0, "tail", [7u8; 16], 3));
+        let outcome =
+            rt.block_on(store.resolve_keyed_block(0, "tail", [7u8; 16], 3, &NeverCancelled));
         let Err(KeyedFetchError::Settled(err)) = outcome else {
             panic!("a stalled query must fail at the deadline");
         };
@@ -899,11 +997,11 @@ mod tests {
         let free = pool.available_blocks();
 
         let claim = rt
-            .block_on(store.reserve_headroom(0, "claim", free - 1))
+            .block_on(store.reserve_headroom(0, "claim", free - 1, &NeverCancelled))
             .expect("a claim within capacity succeeds");
         assert_eq!(pool.available_blocks(), 1, "the claim left the free pool");
 
-        let denied = rt.block_on(store.reserve_headroom(0, "claim-over", 2));
+        let denied = rt.block_on(store.reserve_headroom(0, "claim-over", 2, &NeverCancelled));
         assert!(
             denied.is_err(),
             "an unsatisfiable claim must fail at the deadline, not hang"
@@ -915,6 +1013,180 @@ mod tests {
             pool.available_blocks(),
             free,
             "a dropped claim returns its pages"
+        );
+    }
+
+    /// The plain-path twin of the keyed-query invariant: `resolve_prefix`'s
+    /// host query abandoned at the deadline leaves settlement to the
+    /// detached task, and a late hit's lease is released — a storage stall
+    /// never pins host blocks until the lease TTL.
+    #[test]
+    fn plain_query_timeout_releases_the_late_hits_lease() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let release_query = Arc::new(Notify::new());
+        let released = Arc::new(AtomicUsize::new(0));
+        let store = tier_store(
+            rt.handle().clone(),
+            Arc::new(StallQueryTier {
+                release_query: Arc::clone(&release_query),
+                released: Arc::clone(&released),
+            }),
+        );
+
+        // One cacheable block past the (empty) GPU hit, so the plain resolve
+        // reaches the host-tier query.
+        let prompt: Vec<u32> = (0..17).collect();
+        let prefix = rt.block_on(store.resolve_prefix(
+            0,
+            "plain",
+            &prompt,
+            crate::CacheScope::default(),
+            crate::ResolvePolicy::default(),
+            &NeverCancelled,
+        ));
+        assert_eq!(prefix.hit_tokens(), 0, "a stalled query degrades to no hit");
+        assert_eq!(store.stats.resolve_degraded.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            released.load(Ordering::Acquire),
+            0,
+            "nothing to release while the query is unsettled"
+        );
+
+        release_query.notify_one();
+        rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while released.load(Ordering::Acquire) == 0 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+        })
+        .expect("the settled query releases the unconsumed lease");
+        assert_eq!(released.load(Ordering::Acquire), 1);
+    }
+
+    /// A client disconnect observed while the keyed-tail load is in flight
+    /// abandons the wait like a deadline expiry — same `Abandoned` variant,
+    /// same parking contract — without riding out the resolve deadline: the
+    /// DMA may still write the destination page, so the parked pin survives
+    /// until the tier settles.
+    #[test]
+    fn keyed_tail_cancellation_abandons_into_the_parking_contract() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let release_load = Arc::new(Notify::new());
+        let store = tier_store_with_deadline(
+            rt.handle().clone(),
+            Arc::new(StallLoadTier {
+                release_load: Arc::clone(&release_load),
+            }),
+            Duration::from_secs(30),
+        );
+
+        // Not yet cancelled at the query stage's single check, cancelled
+        // from the load wait's first tick on.
+        let probe = CancelledAfter {
+            after: 1,
+            observations: AtomicUsize::new(0),
+        };
+        let started = std::time::Instant::now();
+        let outcome = rt.block_on(store.resolve_keyed_block(0, "tail", [7u8; 16], 3, &probe));
+        let Err(KeyedFetchError::Abandoned { error, parking }) = outcome else {
+            panic!("a cancelled in-flight tail load must abandon, not settle");
+        };
+        assert!(
+            format!("{error:#}").contains("cancelled"),
+            "the caller sees the cancellation, not a deadline: {error:#}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the cancelled wait must not ride out the deadline"
+        );
+        assert_eq!(
+            store.rank(0).loads_pending.load(Ordering::Acquire),
+            1,
+            "the detached task still owns the load"
+        );
+        assert_eq!(store.stats.loads_abandoned.load(Ordering::Relaxed), 1);
+
+        let pin = Arc::new(());
+        let watch = Arc::clone(&pin);
+        parking.park(Box::new(pin));
+        assert_eq!(
+            Arc::strong_count(&watch),
+            2,
+            "the parked pin stays alive while the load is unsettled"
+        );
+
+        release_load.notify_one();
+        rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), store.flush_loads(0)).await
+        })
+        .expect("the load settles once the tier releases it");
+        assert_eq!(
+            Arc::strong_count(&watch),
+            1,
+            "the settled load released the parked pin"
+        );
+    }
+
+    /// A cancelled headroom claim fails promptly: no pages are handed to a
+    /// requester whose client is gone, and a wait under pool pressure ends
+    /// at the next probe check instead of riding out the deadline.
+    #[test]
+    fn headroom_claim_cancellation_fails_promptly_and_takes_no_pages() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let store = tier_store_with_deadline(
+            rt.handle().clone(),
+            Arc::new(StallLoadTier {
+                release_load: Arc::new(Notify::new()),
+            }),
+            Duration::from_secs(30),
+        );
+        let pool = Arc::clone(&store.rank(0).pool);
+        let free = pool.available_blocks();
+        let claim = rt
+            .block_on(store.reserve_headroom(0, "holder", free, &NeverCancelled))
+            .expect("a claim within capacity succeeds");
+
+        let cancelled = CancelledAfter {
+            after: 0,
+            observations: AtomicUsize::new(0),
+        };
+        let started = std::time::Instant::now();
+        let denied = rt.block_on(store.reserve_headroom(0, "gone", 1, &cancelled));
+        let Err(err) = denied else {
+            panic!("a cancelled claim under pressure is terminal");
+        };
+        assert!(
+            format!("{err:#}").contains("cancelled"),
+            "the caller sees the cancellation, not pool pressure: {err:#}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the cancelled wait must not ride out the deadline"
+        );
+        assert_eq!(store.stats.resolve_degraded.load(Ordering::Relaxed), 1);
+
+        // Even with capacity free, a cancelled claim never takes pages.
+        drop(claim);
+        let denied = rt.block_on(store.reserve_headroom(0, "gone-too", 1, &cancelled));
+        assert!(
+            denied.is_err(),
+            "pages are never handed to a dead requester"
+        );
+        assert_eq!(
+            pool.available_blocks(),
+            free,
+            "the cancelled claims left the pool untouched"
         );
     }
 }

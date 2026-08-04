@@ -5,6 +5,9 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use openinfer_core::engine::FinishReason;
 use openinfer_core::engine::GenerateRequest;
@@ -13,6 +16,7 @@ use openinfer_core::engine::LoadSnapshot;
 use openinfer_core::engine::TokenSink;
 use openinfer_kv_store::BlockPool;
 use openinfer_kv_store::CacheScope;
+use openinfer_kv_store::CancelProbe;
 use openinfer_kv_store::KvStore;
 use openinfer_kv_store::KvStoreBuilder;
 use openinfer_kv_store::NeverCancelled;
@@ -30,6 +34,7 @@ use super::graph::graph_dump_bucket;
 use super::offload::NativeAnchorPlan;
 use super::offload::NativeMtpHandoff;
 use super::offload::Resolved;
+use super::offload::native_pd_resolve;
 use super::offload::native_pd_tail_len;
 use super::publish_load;
 use super::slot::GLM52_DSPARK_EP8_SPAN_DRAFTS;
@@ -56,6 +61,19 @@ fn plain(req: GenerateRequest) -> Resolved {
     Resolved::Plain {
         req,
         prefix: KvPrefix::none(),
+    }
+}
+
+/// Cancelled from observation `after + 1` on — places the client disconnect
+/// at a chosen stage of the resolver's probe checks.
+struct CancelledAfter {
+    after: usize,
+    observations: AtomicUsize,
+}
+
+impl CancelProbe for CancelledAfter {
+    fn is_cancelled(&self) -> bool {
+        self.observations.fetch_add(1, Ordering::AcqRel) >= self.after
     }
 }
 
@@ -636,6 +654,86 @@ fn a_native_fronts_headroom_claim_counts_as_its_own_hold() {
         "the restore admits against its own claim"
     );
     assert!(pending.is_empty());
+}
+
+#[test]
+fn native_headroom_cancellation_releases_the_restored_kv_promptly() {
+    // A client that disconnects after the full-page restore must not hold
+    // the restored pages while the headroom claim waits out pool pressure
+    // under the 15s resolve deadline: the claim observes the probe each
+    // iteration, fails as cancelled, and the resolver releases the KV
+    // before the terminal error surfaces — the restored pages are claimable
+    // by a competing restore immediately.
+    let pool = Arc::new(BlockPool::new(PAGE, 6));
+    let (store, rt) = test_store(&pool);
+    let salt = super::native_mtp_cache_salt();
+
+    // Producer: seal the committed prefix (2 pages) into the radix under
+    // the native salt, so the tier-less full-page restore is a GPU hit.
+    let committed: Vec<u32> = (0..2 * PAGE as u32).map(|t| 80_000 + t).collect();
+    let mut producer = pool.new_request_with_cache_salt(committed.clone(), 1, Some(salt), None);
+    producer
+        .schedule_prefill(2 * PAGE, &pool)
+        .expect("producer prefill");
+    producer
+        .apply_prefill(90_000, &pool)
+        .expect("producer apply");
+    producer.release().expect("producer release");
+
+    // Pool pressure for the headroom stage: with 3 of the 5 usable pages
+    // held elsewhere and 2 restored, the 2-block lifetime remainder cannot
+    // be claimed while the restore stays resident.
+    let mut blocker = pool.new_request(vec![1; 3 * PAGE], 1, None);
+    blocker
+        .schedule_prefill(3 * PAGE, &pool)
+        .expect("blocker pages");
+
+    let anchor = 70_001u32;
+    let mut prompt = committed.clone();
+    prompt.push(anchor); // manual-v2 shape: committed KV + anchor
+    let committed_len = committed.len();
+    let handoff = NativeMtpHandoff {
+        draft_tokens: [anchor; crate::mtp::GLM52_MTP_DRAFTS],
+        committed_len,
+        arena_count: 101,
+        tail_len: native_pd_tail_len(committed_len),
+        tail_key: Some("00".repeat(16)),
+        anchor_token_id: anchor,
+        anchor_emitted: true,
+    };
+    let req = request(prompt, SamplingParams::default(), 2 * PAGE - 2);
+
+    // Not yet cancelled at the restore stage's single probe check,
+    // cancelled from the headroom wait's first check on — the disconnect
+    // lands between the restore and the claim.
+    let probe = CancelledAfter {
+        after: 1,
+        observations: AtomicUsize::new(0),
+    };
+    let available_before = pool.available_blocks();
+    let started = std::time::Instant::now();
+    let outcome = rt.block_on(native_pd_resolve(&store, &pool, 0, &req, &handoff, &probe));
+    let Err(err) = outcome else {
+        panic!("a cancelled headroom wait is terminal");
+    };
+    assert!(
+        format!("{err:#}").contains("cancelled"),
+        "the failure names the cancellation, not pool pressure: {err:#}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the cancelled wait must not ride out the resolve deadline"
+    );
+    assert_eq!(
+        pool.available_blocks(),
+        available_before,
+        "the restored KV released its pages before the error surfaced"
+    );
+    // The freed pages are exactly what a competing restore was starved of.
+    assert!(
+        pool.reserve_loaded_blocks(2).is_some(),
+        "a competing restore's claim now fits"
+    );
 }
 
 #[test]
