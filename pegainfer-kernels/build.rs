@@ -114,6 +114,88 @@ fn workspace_root() -> PathBuf {
     crate_root().join("..")
 }
 
+/// AOT-export the CuTe DSL tcgen05 fp8 GEMMs and compile the dispatch shim
+/// around them (csrc/glm52/glm52_fp8_dsl_gemm.c). Opt-in via
+/// `PEGAINFER_CUTEDSL_PYTHON` (a Python with torch + nvidia-cutlass-dsl on a
+/// CUDA box); without it the shim compiles as an empty-table stub and the
+/// runtime stays on the CUTLASS route. The exported objects resolve their
+/// `_cuda*` wrapper symbols from the DSL wheel's libcute_dsl_runtime.so —
+/// linked here, needed on LD_LIBRARY_PATH at run time.
+fn build_glm52_cutedsl_fp8_dsl(root: &Path, out_dir: &Path, cuda_include: &Path) {
+    println!("cargo:rerun-if-env-changed=PEGAINFER_CUTEDSL_PYTHON");
+    let shim_c = root.join("csrc/glm52/glm52_fp8_dsl_gemm.c");
+    println!("cargo:rerun-if-changed={}", shim_c.display());
+    let mut shim = cc::Build::new();
+    shim.include(cuda_include)
+        .flag("-std=c11")
+        .warnings(false)
+        .file(&shim_c);
+    if let Ok(python) = std::env::var("PEGAINFER_CUTEDSL_PYTHON") {
+        let script = root.join("tools/cutedsl/export_glm52_fp8_dsl.py");
+        let benches = workspace_root().join("pegainfer-glm52/benches");
+        let gen_dir = out_dir.join("cutedsl_fp8_dsl");
+        fs::create_dir_all(&gen_dir).expect("create the cutedsl gen dir");
+        println!("cargo:rerun-if-changed={}", script.display());
+        for source in [
+            "kernel_lab/units/fp8_gemm_dsl_tc_kernel.py",
+            "kernel_lab/units/fp8_gemm_dsl_tc.py",
+        ] {
+            println!("cargo:rerun-if-changed={}", benches.join(source).display());
+        }
+        let status = time_phase("cutedsl fp8 GEMM export", || {
+            Command::new(&python)
+                .arg(&script)
+                .arg("--benches-dir")
+                .arg(&benches)
+                .arg("--out-dir")
+                .arg(&gen_dir)
+                .status()
+        })
+        .unwrap_or_else(|err| panic!("failed to run {python}: {err}"));
+        assert!(
+            status.success(),
+            "CuTe DSL fp8 GEMM export failed (PEGAINFER_CUTEDSL_PYTHON={python})"
+        );
+        let mut objects: Vec<PathBuf> = fs::read_dir(&gen_dir)
+            .expect("read the cutedsl gen dir")
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                (path.extension().and_then(|e| e.to_str()) == Some("o")).then_some(path)
+            })
+            .collect();
+        objects.sort();
+        assert!(!objects.is_empty(), "cutedsl export produced no objects");
+        let object_count = objects.len();
+        for object in objects {
+            shim.object(object);
+        }
+        shim.define("GLM52_CUTEDSL_AOT", None).include(&gen_dir);
+        let lib_dir_probe = Command::new(&python)
+            .args([
+                "-c",
+                "import cutlass, os; print(os.path.abspath(os.path.join(os.path.dirname(cutlass.__file__), '..', '..', 'lib')))",
+            ])
+            .output()
+            .expect("probe the nvidia-cutlass-dsl lib dir");
+        let lib_dir = String::from_utf8_lossy(&lib_dir_probe.stdout)
+            .trim()
+            .to_string();
+        assert!(
+            Path::new(&lib_dir).join("libcute_dsl_runtime.so").exists(),
+            "libcute_dsl_runtime.so not found under {lib_dir}"
+        );
+        println!("cargo:rustc-link-search=native={lib_dir}");
+        println!("cargo:rustc-link-lib=dylib=cute_dsl_runtime");
+        println!(
+            "cargo:warning=GLM5.2 CuTe DSL fp8 GEMM AOT enabled: {object_count} objects; \
+             libcute_dsl_runtime.so ({lib_dir}) must be on LD_LIBRARY_PATH at run time"
+        );
+    }
+    time_phase("cc glm52_fp8_dsl_gemm", || {
+        shim.compile("glm52_fp8_dsl_gemm");
+    });
+}
+
 fn crate_root() -> PathBuf {
     PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"))
 }
@@ -1338,6 +1420,7 @@ fn main() {
     let qwen35_enabled = cfg!(feature = "qwen35");
     if glm52_enabled {
         generate_glm52_trtllm_fmha_cubins(&crate_root(), &out_dir);
+        build_glm52_cutedsl_fp8_dsl(&crate_root(), &out_dir, &cuda_include);
     }
     println!(
         "cargo:warning=Detected CUDA SM targets: {}",

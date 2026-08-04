@@ -1,3 +1,7 @@
+use std::sync::Once;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+
 use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::ensure;
@@ -8,6 +12,39 @@ use half::bf16;
 
 use crate::ffi;
 use crate::tensor::DeviceContext;
+
+static DSL_GEMM_INIT: Once = Once::new();
+static DSL_GEMM_READY: AtomicBool = AtomicBool::new(false);
+
+/// Whether the CuTe DSL AOT table is loaded and dispatching (after
+/// [`glm52_fp8_dsl_preload`]). False on stub builds and under the kill switch.
+pub fn glm52_fp8_dsl_gemm_ready() -> bool {
+    DSL_GEMM_READY.load(Ordering::Acquire)
+}
+
+/// Load the CuTe DSL AOT GEMM modules (embedded cubins) onto every device.
+/// Must run before any decode-bucket CUDA-graph capture — library load is
+/// illegal mid-capture; the launch entries themselves are capture-safe.
+/// No-op on stub builds (no PEGAINFER_CUTEDSL_PYTHON at compile time) and
+/// under the `GLM52_FP8_DSL=0` kill switch.
+pub fn glm52_fp8_dsl_preload() {
+    DSL_GEMM_INIT.call_once(|| {
+        if std::env::var("GLM52_FP8_DSL").is_ok_and(|v| v == "0") {
+            log::info!("GLM5.2 CuTe DSL fp8 GEMM disabled by GLM52_FP8_DSL=0");
+            return;
+        }
+        if unsafe { ffi::glm52_fp8_dsl_gemm_supported_cuda(64, 16384, 2048) } == 0 {
+            return;
+        }
+        let rc = unsafe { ffi::glm52_fp8_dsl_gemm_load_cuda() };
+        if rc == 0 {
+            DSL_GEMM_READY.store(true, Ordering::Release);
+            log::info!("GLM5.2 CuTe DSL fp8 GEMM AOT loaded; wide-route buckets 16-64 dispatch to tcgen05");
+        } else {
+            log::warn!("GLM5.2 CuTe DSL fp8 GEMM module load failed (rc={rc}); staying on CUTLASS");
+        }
+    });
+}
 
 pub fn glm52_fp8_groupwise_gemm_sm100_launch(
     ctx: &DeviceContext,
@@ -77,6 +114,36 @@ pub fn glm52_fp8_groupwise_gemm_sm100_offset_launch(
     let (output_ptr, _output_guard) = output.device_ptr_mut(&ctx.stream);
     let workspace_bytes = workspace.len();
     let (workspace_ptr, _workspace_guard) = workspace.device_ptr_mut(&ctx.stream);
+    // Exact-(m, n, k) table dispatch to the CuTe DSL tcgen05 AOT twin: only
+    // the four wide-route projection shapes at decode buckets 16-64 hit it
+    // (the 96-row bucket exceeds the kernel's single 64-row M-tile). The
+    // branch is deterministic per bucket, so graph capture and replay agree.
+    if weight_offset == 0
+        && weight_scale_offset == 0
+        && DSL_GEMM_READY.load(Ordering::Acquire)
+        && unsafe { ffi::glm52_fp8_dsl_gemm_supported_cuda(m as i32, n as i32, k as i32) } != 0
+    {
+        let rc = unsafe {
+            ffi::glm52_fp8_dsl_gemm_cuda(
+                activation_ptr as *const u8,
+                activation_scale_ptr as *const f32,
+                weight_ptr as *const u8,
+                weight_scale_ptr as *const u8 as *const f32,
+                output_ptr as *mut ffi::Half,
+                workspace_ptr as *mut u8,
+                workspace_bytes,
+                m as i32,
+                n as i32,
+                k as i32,
+                ctx.stream.cu_stream(),
+            )
+        };
+        ensure!(
+            rc == 0,
+            "GLM5.2 CuTe DSL fp8 GEMM failed (rc={rc}) for [{m}, {n}, {k}]"
+        );
+        return Ok(());
+    }
     let result = unsafe {
         ffi::glm52_fp8_groupwise_gemm_sm100_cuda(
             activation_ptr as *const u8,

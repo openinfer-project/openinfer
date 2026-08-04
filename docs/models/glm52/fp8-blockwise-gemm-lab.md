@@ -77,4 +77,4 @@ This PR ships the fp8 blockwise GEMM line only. The harness's other decode-op fa
 ## Next
 
 - sm_103 residuals: the short-k prologue floor (~2us) — overlap scale preload with the main pipeline; vectorize the epilogue STG (currently 32x 32-bit scalar stores per thread); re-measure round-2 absolutes on a quiet GB300 window.
-- Productization comes before any unit expansion on main: decide the DSL-to-production form (cubin-on-disk + runtime load vs an AOT Rust rewrite) in its own pass.
+- ~~Productization form decision~~ **landed 2026-08-04**: `export_to_c` AOT objects linked into pegainfer-kernels behind `PEGAINFER_CUTEDSL_PYTHON`, exact-(m,n,k) table dispatch inside `glm52_fp8_groupwise_gemm_sm100_offset_launch`, buckets 16-64 (96 = single-M-tile ceiling, stays CUTLASS), `GLM52_FP8_DSL=0` kill switch. Recipe in `kernel-lab-ops.md`; re-measured clean-box deltas 1.4-2.8x (PR #835 thread).

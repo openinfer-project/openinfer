@@ -3570,6 +3570,7 @@ dependencies = [
  "cc",
  "cudarc",
  "half",
+ "log",
  "pegainfer-build",
  "serde",
  "tvm-ffi",

@@ -144,6 +144,36 @@ a type check in `manifest.load_manifest` plus a gate in `__main__._setup`
 plus a latch test in `tests/test_registry.py` (mirror
 `test_tcgen05_units_are_capability_gated`).
 
+## AOT productization (`export_to_c`) — the DSL-to-production recipe
+
+Verified 2026-08-04 on GB300. The DSL ships its own AOT: a `cute.compile`d
+function (`CudaDialectJitCompiledFunction`) has `export_to_c(dir, name)`,
+emitting `<name>.h` + `<name>.o` — the `.o` is PIC host-launch code with the
+cubin embedded, the `.h` exposes `<name>_Kernel_Module_Load` (loads the cubin
+onto every device via cudaLibrary) and `cute_dsl_<name>_wrapper(module, &mA...,
+stream)`. Facts that shape any integration:
+
+- **Shapes are baked in.** The header's tensor structs carry only `void
+  *data`; layout/strides/shape are compile-time. One export per (rows, n, k,
+  config) — which matches glm52's per-bucket decode scratch exactly.
+- **The M-tile is single.** rows>64 compiles without complaint and silently
+  computes only the first 64 rows (measured rel_l2 0.58 = sqrt(1/3) at
+  rows=96). Never export past 64 without a kernel-side M loop; the 96-row
+  bucket stays on CUTLASS.
+- **`libcute_dsl_runtime.so` is a hard link+run dependency.** The exported
+  object calls `_cuda*`-prefixed wrapper symbols resolved from the DSL
+  wheel's `lib/` (self-contained, plain libc). Link with `-lcute_dsl_runtime`
+  and have the dir on `LD_LIBRARY_PATH` at run time.
+- **Graph-capture split.** `Module_Load` is illegal mid-capture (library
+  load); the launch wrapper itself is capture-safe. Load once before the
+  first bucket capture.
+
+The wired-up instance: `pegainfer-kernels/tools/cutedsl/export_glm52_fp8_dsl.py`
+(build-time export + generated dispatch table, content-hash cached) +
+`csrc/glm52/glm52_fp8_dsl_gemm.c` (uniform `(m, n, k)`-keyed entry) + the
+`PEGAINFER_CUTEDSL_PYTHON` gate in build.rs. Numerical gate:
+`pegainfer-kernels/tests/glm52_fp8_dsl_gate.rs`.
+
 ## Timing protocols — which one answers your question
 
 - **Warm (default)**: same buffer set hammered repeatedly; L2-resident
