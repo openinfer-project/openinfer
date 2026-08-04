@@ -724,7 +724,12 @@ impl RequestKv {
     /// request, in logical sequence order.
     pub fn current_page_indices(&self) -> Vec<i32> {
         let mut pages = self.page_indices();
-        pages.truncate(self.inner.seq().kv_position().div_ceil(self.inner.seq().block_size()));
+        pages.truncate(
+            self.inner
+                .seq()
+                .kv_position()
+                .div_ceil(self.inner.seq().block_size()),
+        );
         pages
     }
 
@@ -1246,7 +1251,9 @@ mod tests {
                     let mut rng = 0x9e3779b97f4a7c15u64.wrapping_add(seed);
                     let mut held: Option<LoadReservation> = None;
                     while !stop.load(Ordering::Acquire) {
-                        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                        rng = rng
+                            .wrapping_mul(6364136223846793005)
+                            .wrapping_add(1442695040888963407);
                         let n = (rng >> 33) as usize % 4 + 1;
                         drop(held.take());
                         held = pool.reserve_loaded_blocks(n);
@@ -1260,7 +1267,9 @@ mod tests {
         let mut admitted_rounds = 0u32;
         let mut rng = 0xdeadbeefcafef00du64;
         for round in 0..20_000u32 {
-            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let max_output = 32 + ((rng >> 13) as usize % 4) * 16; // lifetime 3..=6
             let prompt: Vec<u32> = (0..16).map(|i| round.wrapping_mul(31) + i).collect();
             let mut kv = pool.new_request(prompt, max_output, None);
@@ -1272,7 +1281,9 @@ mod tests {
                 .expect("an admitted prefill draw must never fail");
             kv.apply_prefill(70_000, &pool)
                 .expect("apply after a successful schedule");
-            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let decode_steps = (rng >> 33) as usize % (max_output - 4);
             for step in 0..decode_steps {
                 kv.schedule_decode(&pool)
@@ -1288,7 +1299,11 @@ mod tests {
             kv.revert_schedule().unwrap();
             kv.mark_blocks_reset_on_release();
             kv.release().unwrap();
-            assert_eq!(pool.entitled_blocks(), 0, "round {round} leaked entitlement");
+            assert_eq!(
+                pool.entitled_blocks(),
+                0,
+                "round {round} leaked entitlement"
+            );
         }
         stop.store(true, Ordering::Release);
         for t in reservers {

@@ -410,7 +410,9 @@ fn resolved_native(
     producer
         .schedule_prefill(committed.len(), pool)
         .expect("producer prefill");
-    producer.apply_prefill(anchor, pool).expect("producer apply");
+    producer
+        .apply_prefill(anchor, pool)
+        .expect("producer apply");
     producer.pad_to_boundary(pool).expect("producer pad");
     producer.release().expect("producer release");
 
@@ -441,8 +443,7 @@ fn native_admission_rebuilds_the_padded_chain() {
     let pool = Arc::new(BlockPool::new(PAGE, 8));
     let (store, rt) = test_store(&pool);
     let committed: Vec<u32> = (0..(PAGE + 7) as u32).map(|t| 80_000 + t).collect();
-    let (req, prefix, handoff, mut rx) =
-        resolved_native(&pool, &store, &rt, committed, 70_001, 8);
+    let (req, prefix, handoff, mut rx) = resolved_native(&pool, &store, &rt, committed, 70_001, 8);
 
     let mut slots: RankSlots = std::array::from_fn(|_| None);
     let mut pending = VecDeque::from([Resolved::Native {
@@ -484,7 +485,10 @@ fn native_admission_rebuilds_the_padded_chain() {
     ));
     assert!(matches!(
         rx.try_recv(),
-        Ok((_, pegainfer_core::engine::TokenEvent::Token { id: 70_001, .. }))
+        Ok((
+            _,
+            pegainfer_core::engine::TokenEvent::Token { id: 70_001, .. }
+        ))
     ));
 }
 
@@ -571,8 +575,7 @@ fn unaligned_native_credits_full_pages_only() {
     // One spare page backs the boundary destination: the same shape admits.
     let pool = Arc::new(BlockPool::new(PAGE, 4));
     let (store, rt) = test_store(&pool);
-    let (req, prefix, handoff, _rx) =
-        resolved_native(&pool, &store, &rt, committed, 70_001, 8);
+    let (req, prefix, handoff, _rx) = resolved_native(&pool, &store, &rt, committed, 70_001, 8);
     let mut slots: RankSlots = std::array::from_fn(|_| None);
     let mut pending = VecDeque::from([Resolved::Native {
         req,
@@ -646,13 +649,13 @@ fn suppressed_eos_finishes_at_admission_without_a_slot() {
     assert!(matches!(
         rx.try_recv(),
         Ok((
-        _,
-        pegainfer_core::engine::TokenEvent::Finished {
-            finish_reason: FinishReason::Stop,
-            completion_tokens: 1,
-            ..
-        }
-    ))
+            _,
+            pegainfer_core::engine::TokenEvent::Finished {
+                finish_reason: FinishReason::Stop,
+                completion_tokens: 1,
+                ..
+            }
+        ))
     ));
 }
 
@@ -713,13 +716,13 @@ fn suppressed_eos_finishes_behind_a_budget_stalled_front() {
     assert!(matches!(
         rx.try_recv(),
         Ok((
-        _,
-        pegainfer_core::engine::TokenEvent::Finished {
-            finish_reason: FinishReason::Stop,
-            completion_tokens: 1,
-            ..
-        }
-    ))
+            _,
+            pegainfer_core::engine::TokenEvent::Finished {
+                finish_reason: FinishReason::Stop,
+                completion_tokens: 1,
+                ..
+            }
+        ))
     ));
 }
 
@@ -767,18 +770,21 @@ fn anchor_exhausting_max_tokens_finishes_as_length() {
     ));
     assert!(matches!(
         rx.try_recv(),
-        Ok((_, pegainfer_core::engine::TokenEvent::Token { id: 70_001, .. }))
+        Ok((
+            _,
+            pegainfer_core::engine::TokenEvent::Token { id: 70_001, .. }
+        ))
     ));
     assert!(matches!(
         rx.try_recv(),
         Ok((
-        _,
-        pegainfer_core::engine::TokenEvent::Finished {
-            finish_reason: FinishReason::Length,
-            completion_tokens: 1,
-            ..
-        }
-    ))
+            _,
+            pegainfer_core::engine::TokenEvent::Finished {
+                finish_reason: FinishReason::Length,
+                completion_tokens: 1,
+                ..
+            }
+        ))
     ));
 }
 

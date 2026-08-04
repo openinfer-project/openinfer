@@ -245,9 +245,10 @@ pub(super) fn admit_from_queue(
         // never folds into the request's resident set, so counting it would
         // over-admit by one page at exact capacity.
         let (need_blocks, front_held) = match front {
-            Resolved::Plain { req, prefix } => {
-                (admission_lifetime_blocks(req, None), prefix.hit_tokens() / PAGE)
-            }
+            Resolved::Plain { req, prefix } => (
+                admission_lifetime_blocks(req, None),
+                prefix.hit_tokens() / PAGE,
+            ),
             Resolved::Native { req, handoff, .. } => (
                 admission_lifetime_blocks(req, Some(handoff)),
                 handoff.committed_len / PAGE,
@@ -724,5 +725,4 @@ mod tests {
             "plain TP4 prefill does not execute the native-MTP proposal loop"
         );
     }
-
 }

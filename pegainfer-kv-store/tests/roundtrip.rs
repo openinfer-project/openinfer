@@ -145,7 +145,8 @@ async fn pad_and_seal_roundtrips_via_the_padded_chain() {
     let prompt: Vec<u32> = (0..37).map(|i| i % 251).collect();
     let anchor = 251u32;
     let mut kv = rig.pool.new_request(prompt.clone(), 4, None);
-    kv.schedule_prefill(prompt.len(), &rig.pool).expect("schedule");
+    kv.schedule_prefill(prompt.len(), &rig.pool)
+        .expect("schedule");
     kv.apply_prefill(anchor, &rig.pool).expect("apply");
     let pads = kv.pad_to_boundary(&rig.pool).expect("pad");
     assert_eq!(pads, 10, "37 rows + anchor + 10 pads reach the 48 boundary");
@@ -154,7 +155,8 @@ async fn pad_and_seal_roundtrips_via_the_padded_chain() {
         3,
         "the padded page sealed alongside the full pages"
     );
-    rig.store.retire(RANK, kv, SaveCursor::new(), SaveClass::Handoff);
+    rig.store
+        .retire(RANK, kv, SaveCursor::new(), SaveClass::Handoff);
     rig.store.flush_saves(RANK).await.expect("flush");
     rig.pool.evict_inactive();
 

@@ -599,7 +599,13 @@ impl Glm52RankModel {
         let mla_block_bytes = GLM52_FLASHMLA_SPARSE_PAGE_SIZE * self.mla_cache_bytes_per_token;
         let idxk_block_bytes = INDEX_CACHE_BLOCK * (GLM52_INDEX_HEAD_DIM + 4);
         for caches in &mut self.caches {
-            copy_arena_block(&ctx.stream, &mut caches.mla_cache, mla_block_bytes, src, dst)?;
+            copy_arena_block(
+                &ctx.stream,
+                &mut caches.mla_cache,
+                mla_block_bytes,
+                src,
+                dst,
+            )?;
             if let Some(index_k) = &mut caches.index_k_cache {
                 copy_arena_block(&ctx.stream, index_k, idxk_block_bytes, src, dst)?;
             }
