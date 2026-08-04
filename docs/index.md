@@ -214,3 +214,4 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | --- | --- |
 | `conventions/bench-regression.md` | Benchmark regression tracking: one snapshot per model, git-tracked history, TPOT >2% / TTFT >3% thresholds. |
 | `conventions/coding-style.md` | Testing principle: prefer integration tests, don't test what E2E catches. |
+| `conventions/migration-defense.md` | 重写/迁移 PR 红线：旧防御结构（序号/计数/等待/断言/guard）逐条注明接班人——继承、替代、或结构性论证废除；测试断言跟人走。出自 #830 复盘。 |

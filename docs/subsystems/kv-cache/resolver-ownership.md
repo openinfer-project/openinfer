@@ -2,7 +2,7 @@
 
 > **TL;DR:** #830（glm52 迁移 pegainfer-kv-store）八轮评审 18 条 finding 的复盘结论：**plain 路径符合 design.md 的双分配器模型，偏航只在 native P/D 路径**——它把权威级分配（RequestKv 生命周期、keyed tail 装载）放进了 resolver 任务，破坏了"resolve 分配零义务、可让步"的前提；评审补出的 HeadroomLedger 恰是 design.md 明文警告的"第二本账"。后继 PR 的设计：① native full 页改走 radix-first（与 plain 同路，零义务）；② **keyed tail 用 pad-to-boundary 消灭**（save 本就按块粒度运整页 slab，padding 零字节代价，换来 radix 身份 + 失败前置到 admission 之前）；③ 仲裁按 design.md 未决预定形态归位（池内 async reserve + admission 侧 prefetched 抵扣），台账族与 keyed API 族整体删除。#830 冻结为记录，其 20+ 契约测试作为后继的行为验收标准。
 >
-> Status: 设计评审中。前置阅读：`design.md`（尤其「请求管线：线性所有权链」与「池的并发事实」）。
+> Status: 设计评审定稿（含 §五 状态机与 scheduler 结构）。phase-1（kv-store 面，#840）已合入；phase-2（glm52 迁移）实现中。前置阅读：`design.md`（尤其「请求管线：线性所有权链」与「池的并发事实」）。
 
 ## 一、#830 十八条 finding 的归因
 
@@ -56,8 +56,50 @@ resolve task 线性持有 req:probe hold(RAII,零分配)→ guarded tier query(l
 - 后继实现 PR 基于 main 重做(不基于 #830 分支);#830 冻结为设计论证记录。
 - 真机验收:1P1D+router 复刻 #830 迁移时的验收矩阵(GSM8K n200、multi-turn c16 头对头、240/240 零失败)+ c64 全量 trace 回放(#833 战役的 harness 现成)。
 
-## 待讨论(后续逐块)
+## 五、请求状态机与 scheduler 结构(评审已决)
 
-- scheduler 侧:收件箱/admission 在新形态下的结构(native 臂的 padded-match 放哪、bypass 谓词简化后的样子);
-- P 侧 pad-and-seal 的落点(prefill_tp 封存路径)与 handoff 信封变更(committed_len 语义不变,tail_len 字段退役);
-- 迁移防御清单立项(`docs/conventions/`):重写类 PR 必须逐条注明旧防御结构的接班人。
+### 5.1 状态机
+
+```mermaid
+stateDiagram-v2
+    [*] --> INTAKE : 收到 HTTP 请求
+
+    INTAKE --> REJECTED : 参数非法
+    INTAKE --> RESOLVING : 交给 resolver 任务
+
+    RESOLVING --> READY : 缓存就位, 投进收件箱
+    RESOLVING --> DROPPED : 客户端断开
+
+    state "scheduler 视界" as SCHED {
+        READY --> ACTIVE : 分配槽位和显存
+        READY --> READY : 容量不够, 排队等
+    }
+
+    READY --> REJECTED : 要求的缓存没到齐
+    READY --> DROPPED : 客户端断开
+
+    ACTIVE --> RETIRING : 生成结束, KV 开始写回
+
+    RETIRING --> RELEASED : 写回完成, 页归还池子
+
+    RELEASED --> [*]
+    REJECTED --> [*]
+    DROPPED --> [*]
+```
+
+- RESOLVING 无"请求"级分配:产出只是把缓存块填进 radix(公共块)+ 一个防踢 hold。权威分配集中在 READY → ACTIVE 一条边(honor-or-reject,含 output 增长的私有页与槽位;命中前缀只转引用,预算按 prefetched 抵扣)。
+- native 特殊点仅两处:READY → REJECTED(P 页必须全命中,缺页在占槽之前拒,router 兜底);边界页 copy-on-restore 在 worker 首步 prologue 做(~3.3MB D2D;调度线程无 CUDA stream),ACTIVE 内一个 `boundary_copy_pending` 标记承载。
+- 三个出口是请求消亡,不是状态;RETIRING 是唯一允许停放的状态(save 未落定挂在 parked 列表,不占槽)。
+
+### 5.2 容器即状态
+
+scheduler 不设 `state: RequestState` 枚举字段。每个状态就是"请求躺在哪个容器":INTAKE 瞬时在 engine 线程栈上;RESOLVING 由 resolver task 持有(scheduler 无感知);READY 是收件箱条目;ACTIVE 是 slot 表占位;RETIRING 是 parked 列表条目。"状态与所有权一致"由结构保证——请求同一时刻只在一个容器里;status 字段与实际位置是两本账,不设。
+
+### 5.3 随决事项
+
+- `ResolvePolicy` 加 full-pages 开关:现 `resolve_prefix` 的「最后一页不缓存」上限会掐掉 padded 边界页,native 臂需全页解析。phase-2 第一刀,消费者随行。
+- `Resolved::Native` 瘦身为纯元数据(committed_len 等),不再携带任何分配。
+- 池内 async `reserve_blocks` waiters 推迟:resolver 零义务可让步后,原互饿死锁类不存在,admission 侧 prefetched 抵扣已够;design.md 未决条目保持原状。
+- P 侧 pad-and-seal 落 prefill_tp 封存路径;handoff 信封 `tail_len` 字段退役(committed_len 语义不变)。协议 flag-day,P/D 同 PR。
+
+迁移防御清单已立项:见 `docs/conventions/migration-defense.md`。
