@@ -66,7 +66,7 @@ resolve task 线性持有 req:probe hold(RAII,零分配)→ guarded tier query(l
 
 ## 四、验收与迁移
 
-- **行为验收 = #830 的契约测试全集**(互饿不可形成、resolver 不搁浅 active、取消及时释放、lease settle、parking、handoff 拒绝、teardown 泄漏……),机制换、断言不换;keyed 族测试随 API 删除,由 padded 路径的新契约测试接棒(padded 页缺失拒绝、copy-on-restore 对齐组完整性、pad 行不可见)。
+- **行为验收 = #830 的契约测试全集**(互饿不可形成、resolver 不搁浅 active、取消及时释放、lease settle、parking、handoff 拒绝、teardown 泄漏……),机制换、断言不换;keyed 族测试随 API 删除,由 padded 路径的新契约测试接棒(padded 页缺失拒绝、copy-on-restore 对齐组完整性、pad 行不可见)。ledger 性质类测试(互饿、claim-as-hold、strand)断言的对象随 ledger 结构性消失——继承人:互饿/strand 由"admission 边独占权威分配、resolver 零义务"结构保证;claim-as-hold 由 front 自身 hold 计入物理预算的后继测试接棒(`aligned_native_front_admits_against_its_own_hold`);FIFO 卡死由 bypass 后继测试接棒(见 §5.3)。
 - 后继实现 PR 基于 main 重做(不基于 #830 分支);#830 冻结为设计论证记录。
 - 真机验收:1P1D+router 复刻 #830 迁移时的验收矩阵(GSM8K n200、multi-turn c16 头对头、240/240 零失败)+ c64 全量 trace 回放(#833 战役的 harness 现成)。
 
@@ -113,7 +113,8 @@ scheduler 不设 `state: RequestState` 枚举字段。每个状态就是"请求�
 
 - `ResolvePolicy` 加 full-pages 开关:现 `resolve_prefix` 的「最后一页不缓存」上限会掐掉 padded 边界页,native 臂需全页解析。phase-2 第一刀,消费者随行。
 - `Resolved::Native` 瘦身为纯元数据(committed_len 等),不再携带任何分配。
-- 池内 async `reserve_blocks` waiters 推迟:resolver 零义务可让步后,原互饿死锁类不存在,admission 侧 prefetched 抵扣已够;design.md 未决条目保持原状。
+- 池内 async `reserve_blocks` waiters 推迟:resolver 零义务可让步后,原**互饿**死锁类(claim 对 claim)不存在,admission 侧 prefetched 抵扣已够;design.md 未决条目保持原状。
+- **FIFO 卡死类未随 ledger 消失,bypass 以后继形态保留**(实现期发现):队列后方 native 的 prefix hold 钉住 restored 页,唯一释放路径是它自己的 admission——被预算卡死的 front 挡住即永久 stall。Plain hold 可 shed(掉到 inactive 仍可匹配),native hold 不 shed(驱逐 restored 页 = 终局 reject);shed 无果后,预算内能装下的 native 允许有界越过 front(admission.rs bypass 块,契约测试 `budget_stalled_front_lets_a_fitting_native_bypass`)。
 - P 侧 pad-and-seal 落 prefill_tp 封存路径;信封定形见 §2.4,P/D 同 PR 切换。
 
 迁移防御清单已立项:见 `docs/conventions/migration-defense.md`。
