@@ -247,9 +247,9 @@ while let Ok((req, kv_prefix)) = submit_rx.try_recv() {
 
 ## 未决
 
-- `Handoff` 租约的超时回收与释放时机（D fetch 完成即释放 vs admission 断言通过才释放）——防腐层里对 pegaflow lease 语义定。同族未定项（均随 glm52 P/D 迁移落地）：mutable tail page 的保存动词——tail 页未封存、以 SHA-256(committed prompt + anchor) 为 key、携 draft tokens 的 `KvTransfer` 信封；store 的 seal/retire 只认已注册块，尚无「按任意 key 保存一块」的 API。
+- `Handoff` 租约的超时回收与释放时机（D fetch 完成即释放 vs admission 断言通过才释放）——防腐层里对 pegaflow lease 语义定。~~mutable tail page 的保存动词~~ **已定形（见 `resolver-ownership.md`）**：tail 不再需要专用保存动词——P 侧 pad-to-boundary 后按普通块封存（save 本就按块粒度运整页 slab，padding 零字节代价），D 侧按 padded-hash 恢复进 radix + admission 时 copy-on-restore；#830 的 keyed 旁路 API（`seal_keyed`/`resolve_keyed_block`）随之删除。draft tokens 仍走 `KvTransfer` 信封（纯元数据）。
 - miss-breaker（连续冷 miss 停止 park）是跨请求策略，qwen3 迁移时决定放 store 还是 scheduler。同日归属待定：运行时 prefix_cache 开关的收编（resolve 短路 / admission 不 match / release 标记不进 inactive cache）。
-- 仲裁机制归位：骨架期的 `set_admission_floor`（store 侧原子水位）已删——无人消费的水位是臆造接口。回归时建议形态是「admission 自管预算」：resolve 已命中块的抵扣（`prefetched_blocks`）与 reserve 记在 admission 同一本账（qwen3 `reserve_floor` 先例），不恢复独立水位 API。TOCTOU 收口（池内 `async reserve_blocks(n)`，waiters 挂在唯一真相旁）随此一并议——外挂信号量镜像可用量会造第二本账，且块非同质 permit（free vs warm-evictable、分配顺序影响命中率），信号量语义只属于分配器内部。
+- 仲裁机制归位：骨架期的 `set_admission_floor`（store 侧原子水位）已删——无人消费的水位是臆造接口。回归时建议形态是「admission 自管预算」：resolve 已命中块的抵扣（`prefetched_blocks`）与 reserve 记在 admission 同一本账（qwen3 `reserve_floor` 先例），不恢复独立水位 API。TOCTOU 收口（池内 `async reserve_blocks(n)`，waiters 挂在唯一真相旁）随此一并议——外挂信号量镜像可用量会造第二本账，且块非同质 permit（free vs warm-evictable、分配顺序影响命中率），信号量语义只属于分配器内部。**该形态经 #830 评审复盘确认为唯一可行路线**（#830 的 HeadroomLedger 实证了第二本账的补丁螺旋——八轮 18 条 finding，复盘见 `resolver-ownership.md`）；本条的前提是 resolve 分配保持零义务，native P/D 的合规形态同见该文档。
 - resolve 的 key 方案：**vLLM P/D 互通将整体移除**（独立后续 PR；清单：`vllm_compat` 状态机、`VllmBlockHasher`（xxh3_128 CBOR 链）、`miss_wait` 窗口、`page_first` 注册模式及其测试），故不为外部 hasher 抽可插拔 seam；glm52 的 SHA-256 tail key 随 native P/D 迁移以单一消费者定形。
 - repack 钩子（`KvModel::repack`）设计保留、骨架不落：唯一消费者是 glm52 TP4（FlashInfer 576B 执行态 ↔ 656B wire），待 TP4 P/D 互通有真实对端时随消费落地。
 - pegaflow fork 与否：防腐层（crate 内 `HostTier`）稳定运行后再议；`Loading` 的轮询套轮询是第一改造对象。

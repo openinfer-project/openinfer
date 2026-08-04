@@ -119,6 +119,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | Path | TL;DR |
 | --- | --- |
 | `subsystems/kv-cache/design.md` | 异构 KV（full attn / MLA / SWA / linear state）统一为「组 + checkpoint」模型：两类封存语义（paged 原地封 / bounded seal-by-copy）、对齐组、单索引以最稀疏 checkpointer 为准。`pegainfer-kv-store` 收编 qwen3/glm52 手写 offload 编排（resolve/seal/retire），模型侧只声明 `KvModel`。迁移：qwen3 → glm52 D → P/D 租约 → qwen35 bounded。 |
+| `subsystems/kv-cache/resolver-ownership.md` | #830 八轮评审复盘与后继设计：plain 路径合规、偏航在 native P/D 把权威分配放进 resolver（HeadroomLedger 即被警告的第二本账）；定形 radix-first + tail pad-to-boundary（keyed API 族删除、失败前置到 admission 前）、仲裁按池内 async reserve + prefetched 抵扣归位；#830 契约测试全集为后继验收。 |
 
 ## subsystems / runtime
 
