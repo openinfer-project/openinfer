@@ -19,6 +19,7 @@ use kvbm_logical::integrations::ScheduleError;
 use kvbm_logical::manager::BlockManager;
 use kvbm_logical::pools::BlockDuplicationPolicy;
 use kvbm_logical::registry::BlockRegistry;
+use pegainfer_engine::engine::KvPrefix;
 
 /// Logical KV block pool: a `BlockManager` plus the reserved padding block.
 ///
@@ -275,6 +276,13 @@ impl PrefixProbe {
         self.cacheable
     }
 
+    /// Physical page ids of the held blocks, in prefix order. The native
+    /// admission reads the last one as its boundary copy-on-restore source;
+    /// the probe's pins keep it resident until the hold drops.
+    pub fn held_page_ids(&self) -> Vec<i32> {
+        self.held.iter().map(|b| b.block_id() as i32).collect()
+    }
+
     /// Lift the reuse cap to every complete block of the chain
     /// ([`crate::ResolvePolicy::full_pages`]): a pad-aligned handoff chain
     /// never prefills, so its boundary block is part of the required hit.
@@ -318,6 +326,16 @@ impl LoadReservation {
 /// boundary. Both sides of a handoff must derive the identical padded
 /// chain, so this is a store constant, not a caller parameter.
 pub const PAD_TOKEN_ID: u32 = u32::MAX;
+
+/// Page ids pinned by a resolved prefix, in prefix order — empty for
+/// [`KvPrefix::none`] or a hold this store did not mint.
+pub fn resolved_page_ids(prefix: &KvPrefix) -> Vec<i32> {
+    prefix
+        .hold_any()
+        .and_then(|hold| hold.downcast_ref::<PrefixProbe>())
+        .map(PrefixProbe::held_page_ids)
+        .unwrap_or_default()
+}
 
 /// Per-request KV state wrapping `SchedulableSequence`.
 ///

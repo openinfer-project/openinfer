@@ -254,6 +254,12 @@ impl KvPrefix {
     pub fn has_hold(&self) -> bool {
         self.hold.is_some()
     }
+
+    /// The opaque hold, for the store that minted it to downcast. Every
+    /// other crate treats the hold as drop-only.
+    pub fn hold_any(&self) -> Option<&(dyn Any + Send)> {
+        self.hold.as_deref()
+    }
 }
 
 impl fmt::Debug for KvPrefix {
