@@ -33,6 +33,11 @@ static const g52dsl_entry_t *g52dsl_find(int32_t m, int32_t n, int32_t k) {
 }
 
 int32_t glm52_fp8_dsl_gemm_load_cuda(void) {
+    /* The generated Module_Load walks every device; restore the caller's
+     * current device afterwards — EP rank threads allocate on whatever is
+     * current, and a leaked switch lands their buffers on the last device. */
+    int device = 0;
+    cudaError_t device_err = cudaGetDevice(&device);
     (void)cudaGetLastError();
     for (size_t i = 0; i < G52DSL_TABLE_LEN; i++) {
         G52DSL_TABLE[i].load();
@@ -40,7 +45,14 @@ int32_t glm52_fp8_dsl_gemm_load_cuda(void) {
             G52DSL_TABLE[i].red_load();
         }
     }
-    return (int32_t)cudaGetLastError();
+    cudaError_t load_err = cudaGetLastError();
+    if (device_err == cudaSuccess) {
+        cudaError_t restore_err = cudaSetDevice(device);
+        if (load_err == cudaSuccess) {
+            load_err = restore_err;
+        }
+    }
+    return (int32_t)load_err;
 }
 
 int32_t glm52_fp8_dsl_gemm_supported_cuda(int32_t m, int32_t n, int32_t k) {
