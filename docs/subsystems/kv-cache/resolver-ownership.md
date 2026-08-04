@@ -2,7 +2,7 @@
 
 > **TL;DR:** #830（glm52 迁移 pegainfer-kv-store）八轮评审 18 条 finding 的复盘结论：**plain 路径符合 design.md 的双分配器模型，偏航只在 native P/D 路径**——它把权威级分配（RequestKv 生命周期、keyed tail 装载）放进了 resolver 任务，破坏了"resolve 分配零义务、可让步"的前提；评审补出的 HeadroomLedger 恰是 design.md 明文警告的"第二本账"。后继 PR 的设计：① native full 页改走 radix-first（与 plain 同路，零义务）；② **keyed tail 用 pad-to-boundary 消灭**（save 本就按块粒度运整页 slab，padding 零字节代价，换来 radix 身份 + 失败前置到 admission 之前）；③ 仲裁按 design.md 未决预定形态归位（池内 async reserve + admission 侧 prefetched 抵扣），台账族与 keyed API 族整体删除。#830 冻结为记录，其 20+ 契约测试作为后继的行为验收标准。
 >
-> Status: 设计评审定稿（含 §五 状态机与 scheduler 结构）。phase-1（kv-store 面，#840）已合入；phase-2（glm52 迁移）实现中。前置阅读：`design.md`（尤其「请求管线：线性所有权链」与「池的并发事实」）。
+> Last touched: 2026-08。phase-1（kv-store 面，#840）已合入；phase-2（glm52 迁移，#843）已实现并通过集群验收（GSM8K 持平 v2、c256 与 kimicode trace 回放零引擎错误）。前置阅读：`design.md`（尤其「请求管线：线性所有权链」与「池的并发事实」）。
 
 ## 一、#830 十八条 finding 的归因
 

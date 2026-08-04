@@ -153,6 +153,30 @@ pub(super) fn admit_from_queue(
     native_mtp_prefill: bool,
     pending_resets: &mut Vec<usize>,
 ) -> anyhow::Result<()> {
+    // P consumed EOS: nothing to restore, no slot, no KV — finish at intake,
+    // before the slot and budget gates, so a saturated rank never delays a
+    // reply that needs no capacity.
+    pending.retain(|entry| {
+        let Resolved::Native { req, handoff, .. } = entry else {
+            return true;
+        };
+        if handoff.anchor_token_id.is_some() {
+            return true;
+        }
+        let prompt_tokens = req.prompt_tokens.len();
+        let _ = req.token_tx.send(TokenEvent::Scheduled {
+            queued_at_unix_s: req.queued_at_unix_s.unwrap_or_else(unix_now_s),
+            scheduled_at_unix_s: unix_now_s(),
+            prompt_tokens,
+            cached_tokens: 0,
+        });
+        let _ = req.token_tx.send(TokenEvent::Finished {
+            finish_reason: FinishReason::Stop,
+            prompt_tokens,
+            completion_tokens: 1,
+        });
+        false
+    });
     let mut committed: usize = slots
         .iter()
         .flatten()
@@ -384,9 +408,9 @@ pub(super) fn admit_from_queue(
 
 /// Slot a resolved native P/D intake. All authoritative allocation happens
 /// here: build the request KV, re-pin the restored chain, adopt the anchor,
-/// seed the verify state. An anchored finish (EOS on P, client gone, or
-/// max_tokens exhausted by the replayed anchor) leaves the slot empty and
-/// `committed` untouched.
+/// seed the verify state. An anchored finish (client gone, or max_tokens
+/// exhausted by the replayed anchor) leaves the slot empty and `committed`
+/// untouched; EOS-only handoffs never reach here (intake sweep).
 #[allow(clippy::too_many_arguments)]
 fn admit_native(
     rank: usize,
@@ -403,21 +427,9 @@ fn admit_native(
 ) -> anyhow::Result<()> {
     let client_prompt_tokens = req.prompt_tokens.len();
     let queued_at_unix_s = req.queued_at_unix_s.unwrap_or_else(unix_now_s);
-    // P sampled EOS: its one generated token is consumed, nothing to restore.
-    let Some(anchor) = handoff.anchor_token_id else {
-        let _ = req.token_tx.send(TokenEvent::Scheduled {
-            queued_at_unix_s,
-            scheduled_at_unix_s: unix_now_s(),
-            prompt_tokens: client_prompt_tokens,
-            cached_tokens: 0,
-        });
-        let _ = req.token_tx.send(TokenEvent::Finished {
-            finish_reason: FinishReason::Stop,
-            prompt_tokens: client_prompt_tokens,
-            completion_tokens: 1,
-        });
-        return Ok(());
-    };
+    let anchor = handoff
+        .anchor_token_id
+        .context("GLM5.2 EOS-only handoffs finish at the intake sweep, never at a slot")?;
     let _ = req.token_tx.send(TokenEvent::Scheduled {
         queued_at_unix_s,
         scheduled_at_unix_s: unix_now_s(),

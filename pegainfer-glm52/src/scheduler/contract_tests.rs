@@ -579,6 +579,73 @@ fn suppressed_eos_finishes_at_admission_without_a_slot() {
 }
 
 #[test]
+fn suppressed_eos_finishes_behind_a_budget_stalled_front() {
+    // An EOS-only handoff needs no slot and no KV: the intake sweep must
+    // finish it even when the FIFO front is budget-stalled and would
+    // otherwise park the whole queue.
+    let pool = Arc::new(BlockPool::new(PAGE, 4));
+    let (store, _rt) = test_store(&pool);
+    let mut stalled = request(vec![20, 21, 22], SamplingParams::default(), PAGE * 8);
+    let (stalled_tx, _stalled_rx) = TokenSink::standalone();
+    stalled.token_tx = stalled_tx;
+    let handoff = NativeMtpHandoff {
+        fingerprint: super::offload::handoff_fingerprint(),
+        committed_len: 3,
+        anchor_token_id: None,
+        draft_tokens: Vec::new(),
+    };
+    let mut req = request(vec![10, 11, 12], SamplingParams::default(), 8);
+    let (tx, mut rx) = TokenSink::standalone();
+    req.token_tx = tx;
+
+    let mut slots: RankSlots = std::array::from_fn(|_| None);
+    let mut pending = VecDeque::from([
+        Resolved::Plain {
+            req: stalled,
+            prefix: KvPrefix::none(),
+        },
+        Resolved::Native {
+            req,
+            prefix: KvPrefix::none(),
+            handoff,
+        },
+    ]);
+    let mut pending_resets = Vec::new();
+    admit_from_queue(
+        0,
+        &mut pending,
+        &mut slots,
+        &pool,
+        1,
+        &store,
+        true,
+        false,
+        false,
+        &mut pending_resets,
+    )
+    .expect("EOS sweep behind stalled front");
+
+    assert_eq!(pending.len(), 1, "the stalled front stays queued");
+    assert!(matches!(pending.front(), Some(Resolved::Plain { .. })));
+    assert_eq!(slots.iter().flatten().count(), 0, "no slot forms");
+    assert!(matches!(
+        rx.try_recv(),
+        Ok((_, pegainfer_core::engine::TokenEvent::Scheduled { .. }))
+    ));
+    assert!(matches!(
+        rx.try_recv(),
+        Ok((
+        _,
+        pegainfer_core::engine::TokenEvent::Finished {
+            finish_reason: FinishReason::Stop,
+            completion_tokens: 1,
+            ..
+        }
+    ))
+    ));
+}
+
+#[test]
 fn anchor_exhausting_max_tokens_finishes_as_length() {
     // The replayed anchor is the request's whole budget: finish before any
     // restore work — the prefix hold just drops.
