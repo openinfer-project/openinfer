@@ -353,6 +353,21 @@ impl<T: BlockMetadata> RequestSequence<T> {
         completed_block
     }
 
+    /// Complete the trailing partial token block with `pad`, naming only:
+    /// neither `num_input_tokens` nor `generated_tokens` moves, no block is
+    /// staged or allocated. Returns the number of pads appended.
+    pub(crate) fn pad_tail_block(&mut self, pad: Token) -> usize {
+        let block_size = self.sequence.block_size();
+        let mut appended = 0;
+        while !self.sequence.total_tokens().is_multiple_of(block_size) {
+            self.sequence
+                .append_token(pad)
+                .expect("pad append cannot fail below a block boundary");
+            appended += 1;
+        }
+        appended
+    }
+
     /// Reclassify the final input token as the first generated token.
     ///
     /// The token sequence itself is unchanged. This is used when an external

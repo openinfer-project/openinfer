@@ -22,6 +22,7 @@ use common::prompt;
 use common::prompt_aligned;
 use pegainfer_kv_store::CacheScope;
 use pegainfer_kv_store::NeverCancelled;
+use pegainfer_kv_store::PAD_TOKEN_ID;
 use pegainfer_kv_store::PegaflowHost;
 use pegainfer_kv_store::ResolvePolicy;
 use pegainfer_kv_store::SaveClass;
@@ -126,6 +127,56 @@ async fn roundtrip(page_first: bool) {
     }
     drop(prefix);
     req.release().expect("release");
+}
+
+/// The whole pad-and-seal contract: P pads its partial page to the boundary
+/// and seals; the decode side rebuilds the naming chain (prompt + anchor +
+/// pads) from the handoff metadata alone and resolves every page, boundary
+/// included, to a full hit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pad_and_seal_roundtrips_via_the_padded_chain() {
+    let _gpu = gpu_lock().lock().await;
+    let host = PegaflowHost::builder(HOST_POOL_BYTES)
+        .build()
+        .expect("host");
+    let rig = Rig::new("pad_and_seal", host, None);
+
+    // P side: 37 committed rows (2 full pages + 5), a sampled anchor, pads.
+    let prompt: Vec<u32> = (0..37).map(|i| i % 251).collect();
+    let anchor = 251u32;
+    let mut kv = rig.pool.new_request(prompt.clone(), 4, None);
+    kv.schedule_prefill(prompt.len(), &rig.pool).expect("schedule");
+    kv.apply_prefill(anchor, &rig.pool).expect("apply");
+    let pads = kv.pad_to_boundary(&rig.pool).expect("pad");
+    assert_eq!(pads, 10, "37 rows + anchor + 10 pads reach the 48 boundary");
+    assert_eq!(
+        kv.assigned_block_hashes().len(),
+        3,
+        "the padded page sealed alongside the full pages"
+    );
+    rig.store.retire(RANK, kv, SaveCursor::new(), SaveClass::Handoff);
+    rig.store.flush_saves(RANK).await.expect("flush");
+    rig.pool.evict_inactive();
+
+    // D side: the chain derives from committed_len + anchor, nothing else.
+    let mut chain = prompt;
+    chain.push(anchor);
+    chain.resize(3 * BLOCK_TOKENS, PAD_TOKEN_ID);
+    let prefix = rig
+        .store
+        .resolve_prefix(
+            RANK,
+            "d-restore",
+            &chain,
+            CacheScope::default(),
+            ResolvePolicy::default().wait_for_full_hit().full_pages(),
+            &NeverCancelled,
+        )
+        .await;
+    assert_eq!(prefix.hit_tokens(), 3 * BLOCK_TOKENS);
+    assert_eq!(loaded_blocks(&rig), 3);
+    assert_eq!(degraded(&rig), 0);
+    drop(prefix);
 }
 
 /// The boundary block of a pad-aligned chain: the default policy stops one

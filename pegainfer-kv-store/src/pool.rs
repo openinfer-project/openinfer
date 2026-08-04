@@ -314,6 +314,11 @@ impl LoadReservation {
     }
 }
 
+/// Out-of-vocab sentinel filling a handoff naming chain to the page
+/// boundary. Both sides of a handoff must derive the identical padded
+/// chain, so this is a store constant, not a caller parameter.
+pub const PAD_TOKEN_ID: u32 = u32::MAX;
+
 /// Per-request KV state wrapping `SchedulableSequence`.
 ///
 /// Lifecycle: `schedule_prefill → forward over step_page_indices →
@@ -403,6 +408,16 @@ impl RequestKv {
         self.seq
             .apply_prefill(None, &pool.block_manager)
             .map_err(|e| anyhow::anyhow!("apply_prefill_chunk: {e}"))
+    }
+
+    /// Complete the trailing partial block with [`PAD_TOKEN_ID`] and register
+    /// it, so the handoff seal saves it under the padded hash. Naming only:
+    /// no compute, no allocation, `kv_position` untouched. No-op when
+    /// `kv_position` sits on a page boundary. Returns the pads appended.
+    pub fn pad_to_boundary(&mut self, pool: &BlockPool) -> anyhow::Result<usize> {
+        self.seq
+            .pad_tail_block(PAD_TOKEN_ID, &pool.block_manager)
+            .map_err(|e| anyhow::anyhow!("pad_to_boundary: {e}"))
     }
 
     /// Convert the one uncomputed final input token left by an external

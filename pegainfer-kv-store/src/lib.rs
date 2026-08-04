@@ -106,6 +106,7 @@ pub use crate::policy::SaveClass;
 pub use crate::policy::SaveCursor;
 pub use crate::pool::BlockPool;
 pub use crate::pool::KvBlockGuard;
+pub use crate::pool::PAD_TOKEN_ID;
 pub use crate::pool::LoadReservation;
 pub use crate::pool::PrefixProbe;
 pub use crate::pool::RegisteredBlock;
