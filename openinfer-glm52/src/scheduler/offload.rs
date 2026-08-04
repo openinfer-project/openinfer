@@ -16,6 +16,7 @@ use openinfer_core::engine::KvPrefix;
 use openinfer_kv_store::BlockPool;
 use openinfer_kv_store::CacheScope;
 use openinfer_kv_store::KvStore;
+use openinfer_kv_store::LoadReservation;
 use openinfer_kv_store::RequestKv;
 use openinfer_kv_store::ResolvePolicy;
 use serde::Deserialize;
@@ -158,14 +159,22 @@ pub(super) enum Resolved {
         prefix: KvPrefix,
     },
     /// Native-P/D request: the resolver built the COMPLETE `RequestKv`
-    /// (full-page restore + tail install + anchor adoption) — admission only
-    /// budgets and slots it.
+    /// (full-page restore + tail install + anchor adoption) and claimed the
+    /// rest of its lifetime — admission only budgets and slots it.
     Native {
         req: GenerateRequest,
         kv: Box<RequestKv>,
         cached_tokens: usize,
         handoff: NativeMtpHandoff,
         plan: NativeAnchorPlan,
+        /// Lifetime pages beyond the KV's resident restore, claimed
+        /// atomically at resolve and held until the slot handoff. Queued
+        /// restores therefore always account for their FULL lifetime
+        /// against the pool: without the claim, two resident restores
+        /// could jointly exhaust it while each still needs output
+        /// headroom, and no admission predicate could ever pass. `None`
+        /// when the resident pages already cover the lifetime.
+        reservation: Option<LoadReservation>,
     },
     /// Resolution failed terminally (bad envelope, missing checkpoint past
     /// the deadline): admission answers with the standard rejection.
@@ -192,15 +201,17 @@ impl Resolved {
 /// full pages arrive via `resolve_prefix` in full-hit mode (registered into
 /// the radix, so the fresh request's match reuses them), the tail page — a
 /// partial page with no lineage hash — is fetched by its envelope key
-/// straight into the request's own scheduled page, and the anchor converts
-/// the final uncomputed token into normal dangling-token state.
+/// straight into the request's own scheduled page, the anchor converts
+/// the final uncomputed token into normal dangling-token state, and the
+/// remaining lifetime pages are claimed against the pool so the intake
+/// reaches admission already accounting for its full footprint.
 pub(super) async fn native_pd_resolve(
     store: &KvStore,
     pool: &Arc<BlockPool>,
     rank: usize,
     req: &GenerateRequest,
     handoff: &NativeMtpHandoff,
-) -> anyhow::Result<(RequestKv, usize)> {
+) -> anyhow::Result<(RequestKv, usize, Option<LoadReservation>)> {
     let plan = native_anchor_plan(req, handoff)?;
     anyhow::ensure!(
         handoff.tail_len == native_pd_tail_len(handoff.committed_len),
@@ -214,7 +225,14 @@ pub(super) async fn native_pd_resolve(
     );
     let cache_salt = super::native_mtp_cache_salt();
     let full_len = handoff.committed_len - handoff.tail_len;
-    let req_id = req.request_id.as_deref().unwrap_or("native-pd");
+    let req_id_owned;
+    let req_id = match req.request_id.as_deref() {
+        Some(id) => id,
+        None => {
+            req_id_owned = super::anon_resolve_key("native-pd", rank);
+            &req_id_owned
+        }
+    };
     let t_start = std::time::Instant::now();
 
     // Full pages: all-or-nothing against the producer's checkpoint. The
@@ -317,5 +335,23 @@ pub(super) async fn native_pd_resolve(
     );
     kv.adopt_external_prefill_anchor()
         .context("native-MTP P/D anchor adoption")?;
-    Ok((kv, cached_tokens))
+    // The restore's resident pages are only part of the request's
+    // full-lifetime footprint; claim the remainder now, atomically against
+    // the pool. A restore that survived resolution without its lifetime
+    // being claimable could pin the pool against a peer restore in the
+    // same state — a mutual starvation no admission order can break. A
+    // failed claim is terminal like any other restore failure: releasing
+    // this KV is the transition that lets a competing restore proceed.
+    let headroom = kv.lifetime_blocks().saturating_sub(kv.resident_blocks());
+    let reservation = if headroom == 0 {
+        None
+    } else {
+        Some(
+            store
+                .reserve_headroom(rank, req_id, headroom)
+                .await
+                .context("native P/D lifetime headroom")?,
+        )
+    };
+    Ok((kv, cached_tokens, reservation))
 }

@@ -16,6 +16,7 @@ use openinfer_core::engine::unix_now_s;
 use openinfer_kv_store::BlockPool;
 use openinfer_kv_store::KvPrefix;
 use openinfer_kv_store::KvStore;
+use openinfer_kv_store::LoadReservation;
 use openinfer_kv_store::RequestKv;
 use openinfer_kv_store::SaveCursor;
 
@@ -195,9 +196,10 @@ pub(super) fn admit_from_queue(
         // Full-lifetime budget, honor-or-reject. `usable` accounts for the
         // block classes the scheduler knows about; the allocator is the
         // final authority, so add back pages held by active requests and by
-        // the front's own resolution (its restored blocks / built KV are
-        // already out of the free pool) and defer if the physical lifetime
-        // budget is smaller.
+        // the front's own resolution (its restored blocks / built KV — and,
+        // for a Native, its lifetime headroom claim — are already out of
+        // the free pool) and defer if the physical lifetime budget is
+        // smaller.
         let (need_blocks, front_held) = match front {
             Resolved::Plain { req, prefix } => match admission_lifetime_blocks(req, None) {
                 Ok(blocks) => (blocks, prefix.hit_tokens() / PAGE),
@@ -209,7 +211,12 @@ pub(super) fn admit_from_queue(
                     continue;
                 }
             },
-            Resolved::Native { kv, .. } => (kv.lifetime_blocks(), kv.resident_blocks()),
+            Resolved::Native {
+                kv, reservation, ..
+            } => (
+                kv.lifetime_blocks(),
+                kv.resident_blocks() + reservation.as_ref().map_or(0, LoadReservation::len),
+            ),
             Resolved::Failed { .. } => unreachable!("handled above"),
         };
         let active_resident: usize = slots
@@ -253,7 +260,13 @@ pub(super) fn admit_from_queue(
             // the current budget may bypass a budget-stalled front, because
             // admitting it is the only transition that ever frees its pages.
             let bypass = pending.iter().enumerate().skip(1).find_map(|(idx, entry)| {
-                let Resolved::Native { req, kv, .. } = entry else {
+                let Resolved::Native {
+                    req,
+                    kv,
+                    reservation,
+                    ..
+                } = entry
+                else {
                     return None;
                 };
                 if req.token_tx.is_closed() {
@@ -262,10 +275,18 @@ pub(super) fn admit_from_queue(
                 let physical = pool
                     .available_blocks()
                     .saturating_add(active_resident)
-                    .saturating_add(kv.resident_blocks());
+                    .saturating_add(kv.resident_blocks())
+                    .saturating_add(reservation.as_ref().map_or(0, LoadReservation::len));
                 (committed + kv.lifetime_blocks() <= usable.min(physical)).then_some(idx)
             });
             let Some(idx) = bypass else {
+                // No queued Native fits the logical budget either — a
+                // transient defer, never a deadlock: every queued Native
+                // holds its FULL lifetime (resident restore + headroom
+                // claim), so restores can never jointly exhaust the pool
+                // while each still needs output headroom. A restore whose
+                // lifetime could not be claimed failed at resolution
+                // instead of reaching this queue.
                 break;
             };
             let Some(Resolved::Native {
@@ -274,6 +295,7 @@ pub(super) fn admit_from_queue(
                 cached_tokens,
                 handoff,
                 plan,
+                reservation,
             }) = pending.remove(idx)
             else {
                 unreachable!("bypass index selected a Native entry");
@@ -284,6 +306,7 @@ pub(super) fn admit_from_queue(
                 slot,
                 req,
                 kv,
+                reservation,
                 cached_tokens,
                 handoff,
                 plan,
@@ -367,12 +390,14 @@ pub(super) fn admit_from_queue(
                 cached_tokens,
                 handoff,
                 plan,
+                reservation,
             } => {
                 admit_native(
                     rank,
                     slot,
                     req,
                     kv,
+                    reservation,
                     cached_tokens,
                     handoff,
                     plan,
@@ -398,6 +423,7 @@ fn admit_native(
     slot: usize,
     mut req: GenerateRequest,
     kv: Box<RequestKv>,
+    reservation: Option<LoadReservation>,
     cached_tokens: usize,
     handoff: offload::NativeMtpHandoff,
     plan: offload::NativeAnchorPlan,
@@ -407,6 +433,12 @@ fn admit_native(
     pending_resets: &mut Vec<usize>,
     committed: &mut usize,
 ) -> anyhow::Result<()> {
+    // The lifetime headroom claim ends at the slot handoff: from here the
+    // rank's committed-lifetime accounting covers the request's future
+    // pages, and holding the claim through the slot's life would
+    // double-draw the pool (kvbm schedules fresh pages while the claim
+    // pins others).
+    drop(reservation);
     let client_prompt_tokens = req.prompt_tokens.len();
     anyhow::ensure!(
         cached_tokens == handoff.committed_len,

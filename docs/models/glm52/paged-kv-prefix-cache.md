@@ -83,7 +83,13 @@ AND `Σ active lifetimes + new ≤ pool usable`; no rank fits → the request
 stays queued (never mid-decode starvation, never a livelock — an empty rank
 fits any request the length validation admits). The reservation is
 conservative (prefix-shared pages counted per holder): over-reserving can
-only defer admission.
+only defer admission. Native P/D restores extend the contract to resolve
+time: the resolver claims the restored KV's remaining lifetime pages
+atomically against the pool (`KvStore::reserve_headroom`) and the claim
+rides the queued intake until the slot handoff, so two resident restores
+can never jointly exhaust the pool while both still need output headroom —
+a claim the pool cannot satisfy within the resolve deadline fails the
+restore terminally instead.
 
 ### Per-step KV bookkeeping (schedule/apply pairing)
 

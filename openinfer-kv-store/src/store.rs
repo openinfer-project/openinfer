@@ -17,6 +17,7 @@ use crate::CacheScope;
 use crate::CancelProbe;
 use crate::DegradeReason;
 use crate::KvStoreStats;
+use crate::LoadReservation;
 use crate::PrefixProbe;
 use crate::RequestKv;
 use crate::ResolvePolicy;
@@ -320,6 +321,40 @@ impl KvStore {
                     .record_degrade(req_id, DegradeReason::DeadlineExceeded);
                 finish(probe)
             }
+        }
+    }
+
+    /// Atomically claim `blocks` pages from `rank`'s pool, waiting out pool
+    /// pressure under the resolve deadline (the same patience as
+    /// [`Self::resolve_prefix`]'s destination reservation). The native P/D
+    /// resolver claims a restored request's remaining lifetime pages with
+    /// this before the intake reaches its scheduler: a restore whose
+    /// resident pages survive resolution without the rest of its lifetime
+    /// being claimable can combine with a peer restore in the same state to
+    /// exhaust the pool while both still need output headroom — a mutual
+    /// starvation no admission order can break. The claim is one atomic
+    /// pool allocation, never a read-then-act check, so two concurrent
+    /// resolvers can never both pass a claim the pool cannot satisfy twice.
+    /// Past the deadline the claim fails terminally, mirroring the
+    /// restore's own pool-pressure contract.
+    pub async fn reserve_headroom(
+        &self,
+        rank: usize,
+        req_id: &str,
+        blocks: usize,
+    ) -> anyhow::Result<LoadReservation> {
+        let state = self.rank(rank);
+        let deadline = Instant::now() + self.resolve_deadline;
+        loop {
+            if let Some(reservation) = state.pool.reserve_loaded_blocks(blocks) {
+                return Ok(reservation);
+            }
+            if Instant::now() >= deadline {
+                self.stats
+                    .record_degrade(req_id, DegradeReason::PoolPressure);
+                anyhow::bail!("{blocks} headroom blocks never became free before the deadline");
+            }
+            tokio::time::sleep(self.requery_interval).await;
         }
     }
 
@@ -847,5 +882,39 @@ mod tests {
         })
         .expect("the settled query releases the unconsumed lease");
         assert_eq!(released.load(Ordering::Acquire), 1);
+    }
+
+    /// The headroom-claim invariant: a claim is one atomic pool allocation —
+    /// capacity the pool can spare is taken whole, capacity it cannot spare
+    /// within the deadline is a terminal error (never a hang), and a dropped
+    /// claim returns its pages.
+    #[test]
+    fn headroom_claim_takes_atomically_or_fails_at_the_deadline() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let store = stalled_store(rt.handle().clone(), Arc::new(Notify::new()));
+        let pool = Arc::clone(&store.rank(0).pool);
+        let free = pool.available_blocks();
+
+        let claim = rt
+            .block_on(store.reserve_headroom(0, "claim", free - 1))
+            .expect("a claim within capacity succeeds");
+        assert_eq!(pool.available_blocks(), 1, "the claim left the free pool");
+
+        let denied = rt.block_on(store.reserve_headroom(0, "claim-over", 2));
+        assert!(
+            denied.is_err(),
+            "an unsatisfiable claim must fail at the deadline, not hang"
+        );
+        assert_eq!(store.stats.resolve_degraded.load(Ordering::Relaxed), 1);
+
+        drop(claim);
+        assert_eq!(
+            pool.available_blocks(),
+            free,
+            "a dropped claim returns its pages"
+        );
     }
 }

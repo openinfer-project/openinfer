@@ -16,6 +16,7 @@ use openinfer_kv_store::CacheScope;
 use openinfer_kv_store::KvStore;
 use openinfer_kv_store::KvStoreBuilder;
 use openinfer_kv_store::NeverCancelled;
+use openinfer_kv_store::RequestKv;
 use openinfer_kv_store::ResolvePolicy;
 use openinfer_kv_store::SaveCursor;
 use openinfer_sample::SamplingParams;
@@ -382,6 +383,42 @@ fn admission_admits_a_page_aligned_full_hit_at_exact_pool_capacity() {
     assert_eq!(slots.iter().flatten().count(), 1);
 }
 
+/// A resolver-built native restore over `prompt` (committed pages plus the
+/// anchor as its final token — the manual-v2 shape): resident full pages,
+/// the adopted anchor, and the handoff/plan pair `native_pd_resolve` hands
+/// admission. The KV budgets one internal output position beyond
+/// `client_max_tokens` (`native_kv_shape`); the lifetime headroom claim is
+/// the caller's to make, at its own pool pressure.
+fn resident_native_kv(
+    pool: &Arc<BlockPool>,
+    prompt: &[u32],
+    client_max_tokens: usize,
+) -> (Box<RequestKv>, NativeMtpHandoff, NativeAnchorPlan) {
+    let committed_len = prompt.len() - 1;
+    let mut kv = pool.new_request(prompt.to_vec(), client_max_tokens + 1, None);
+    kv.schedule_prefill(committed_len, pool)
+        .expect("native restore chunk");
+    kv.apply_prefill_chunk(pool).expect("native restore apply");
+    kv.adopt_external_prefill_anchor()
+        .expect("native anchor adoption");
+    let anchor = *prompt.last().expect("anchor token");
+    let handoff = NativeMtpHandoff {
+        draft_tokens: [anchor; crate::mtp::GLM52_MTP_DRAFTS],
+        committed_len,
+        arena_count: 101,
+        tail_len: native_pd_tail_len(committed_len),
+        tail_key: Some("00".repeat(16)),
+        anchor_token_id: anchor,
+        anchor_emitted: true,
+    };
+    let plan = NativeAnchorPlan {
+        token: anchor,
+        replay_to_client: false,
+        emitted_by_prefill: true,
+    };
+    (Box::new(kv), handoff, plan)
+}
+
 #[test]
 fn budget_stalled_front_lets_a_fitting_resident_native_bypass() {
     // The FIFO deadlock shape: the front's lifetime cannot fit the pool, the
@@ -401,38 +438,25 @@ fn budget_stalled_front_lets_a_fitting_resident_native_bypass() {
     pending.push_back(plain(front));
 
     // A resolver-built native restore: resident full pages plus the adopted
-    // anchor, exactly what `native_pd_resolve` hands admission.
+    // anchor and its lifetime headroom claim, exactly what
+    // `native_pd_resolve` hands admission.
     let native_prompt: Vec<u32> = (0..(3 * PAGE + 1) as u32).map(|t| 80_000 + t).collect();
-    let mut kv = pool.new_request(native_prompt.clone(), 2, None);
-    kv.schedule_prefill(3 * PAGE, &pool)
-        .expect("native restore chunk");
-    kv.apply_prefill_chunk(&pool).expect("native restore apply");
-    kv.adopt_external_prefill_anchor()
-        .expect("native anchor adoption");
-    let anchor = *native_prompt.last().expect("anchor token");
-    let handoff = NativeMtpHandoff {
-        draft_tokens: [90_001; crate::mtp::GLM52_MTP_DRAFTS],
-        committed_len: 3 * PAGE,
-        arena_count: 101,
-        tail_len: native_pd_tail_len(3 * PAGE),
-        tail_key: Some("00".repeat(16)),
-        anchor_token_id: anchor,
-        anchor_emitted: true,
-    };
-    let plan = NativeAnchorPlan {
-        token: anchor,
-        replay_to_client: false,
-        emitted_by_prefill: true,
-    };
+    let (kv, handoff, plan) = resident_native_kv(&pool, &native_prompt, 1);
+    let headroom = kv.lifetime_blocks() - kv.resident_blocks();
+    let reservation = (headroom > 0).then(|| {
+        pool.reserve_loaded_blocks(headroom)
+            .expect("headroom claim fits")
+    });
     let mut native_req = request(native_prompt, SamplingParams::default(), 1);
     let (native_tx, _native_rx) = TokenSink::standalone();
     native_req.token_tx = native_tx;
     pending.push_back(Resolved::Native {
         req: native_req,
-        kv: Box::new(kv),
+        kv,
         cached_tokens: 3 * PAGE,
         handoff,
         plan,
+        reservation,
     });
     let mut pending_resets = Vec::new();
 
@@ -486,6 +510,132 @@ fn budget_stalled_front_lets_a_fitting_resident_native_bypass() {
     .expect("front admits after the native retires");
     assert!(pending.is_empty());
     assert_eq!(slots.iter().flatten().count(), 1);
+}
+
+#[test]
+fn mutual_native_restore_starvation_cannot_form() {
+    // The two-restore deadlock shape: both resident restores fit the pool
+    // together, but neither request's full lifetime does. Without a
+    // resolve-time lifetime claim both would reach the queue, jointly
+    // exhausting the pool while each still needs output headroom — every
+    // admission predicate (front and bypass alike) credits only the
+    // candidate's OWN pages, so both would stay pinned forever. The atomic
+    // claim makes the state unformable: the second restore's claim fails,
+    // its resolution is terminal, and its release is what lets the first
+    // admit.
+    let pool = Arc::new(BlockPool::new(PAGE, 8));
+    let (store, _rt) = test_store(&pool);
+    let mut slots: RankSlots = std::array::from_fn(|_| None);
+    let mut pending = VecDeque::new();
+
+    let prompt_a: Vec<u32> = (0..(2 * PAGE + 1) as u32).map(|t| 80_000 + t).collect();
+    let (kv_a, handoff_a, plan_a) = resident_native_kv(&pool, &prompt_a, 2 * PAGE - 2);
+    let headroom_a = kv_a.lifetime_blocks() - kv_a.resident_blocks();
+    assert!(headroom_a > 0, "the shape needs unclaimed output headroom");
+    let reservation_a = pool
+        .reserve_loaded_blocks(headroom_a)
+        .expect("the first lifetime claim fits");
+
+    let prompt_b: Vec<u32> = (0..(2 * PAGE + 1) as u32).map(|t| 90_000 + t).collect();
+    let (mut kv_b, _handoff_b, _plan_b) = resident_native_kv(&pool, &prompt_b, 2 * PAGE - 2);
+    let headroom_b = kv_b.lifetime_blocks() - kv_b.resident_blocks();
+    assert!(
+        pool.reserve_loaded_blocks(headroom_b).is_none(),
+        "the second lifetime claim must not form once both restores are resident"
+    );
+    // `native_pd_resolve` turns the failed claim into a terminal resolve
+    // error; the restore's pages release on the resolver's Err path and the
+    // request is rejected — it never reaches the queue.
+    kv_b.release().expect("the failed restore releases");
+
+    let mut req_a = request(prompt_a, SamplingParams::default(), 2 * PAGE - 2);
+    let (tx_a, _rx_a) = TokenSink::standalone();
+    req_a.token_tx = tx_a;
+    pending.push_back(Resolved::Native {
+        req: req_a,
+        kv: kv_a,
+        cached_tokens: 2 * PAGE,
+        handoff: handoff_a,
+        plan: plan_a,
+        reservation: Some(reservation_a),
+    });
+    let mut pending_resets = Vec::new();
+
+    admit_from_queue(
+        0,
+        &mut pending,
+        &mut slots,
+        &pool,
+        7,
+        &store,
+        true,
+        false,
+        false,
+        &mut pending_resets,
+    )
+    .expect("the surviving restore admits");
+
+    assert_eq!(slots.iter().flatten().count(), 1);
+    assert!(pending.is_empty());
+}
+
+#[test]
+fn a_native_fronts_headroom_claim_counts_as_its_own_hold() {
+    // At exact pool capacity the claim's pages are out of the free pool.
+    // They release at this front's own slot handoff, so admission must
+    // credit them as the front's hold — a budget that ignored them would
+    // starve the restore on the very pages claimed to protect it.
+    let pool = Arc::new(BlockPool::new(PAGE, 5));
+    let (store, _rt) = test_store(&pool);
+    let mut slots: RankSlots = std::array::from_fn(|_| None);
+    let mut pending = VecDeque::new();
+
+    let prompt: Vec<u32> = (0..(2 * PAGE + 1) as u32).map(|t| 80_000 + t).collect();
+    let (kv, handoff, plan) = resident_native_kv(&pool, &prompt, 2 * PAGE - 2);
+    let headroom = kv.lifetime_blocks() - kv.resident_blocks();
+    assert!(headroom > 0, "the shape needs unclaimed output headroom");
+    let reservation = pool
+        .reserve_loaded_blocks(headroom)
+        .expect("the claim fits an empty pool");
+    assert_eq!(
+        pool.available_blocks(),
+        0,
+        "resident restore + claim consume the pool exactly"
+    );
+
+    let mut req = request(prompt, SamplingParams::default(), 2 * PAGE - 2);
+    let (tx, _rx) = TokenSink::standalone();
+    req.token_tx = tx;
+    pending.push_back(Resolved::Native {
+        req,
+        kv,
+        cached_tokens: 2 * PAGE,
+        handoff,
+        plan,
+        reservation: Some(reservation),
+    });
+    let mut pending_resets = Vec::new();
+
+    admit_from_queue(
+        0,
+        &mut pending,
+        &mut slots,
+        &pool,
+        4,
+        &store,
+        true,
+        false,
+        false,
+        &mut pending_resets,
+    )
+    .expect("admission at exact capacity");
+
+    assert_eq!(
+        slots.iter().flatten().count(),
+        1,
+        "the restore admits against its own claim"
+    );
+    assert!(pending.is_empty());
 }
 
 /// Drive one request end to end through the engine's exact schedule/apply

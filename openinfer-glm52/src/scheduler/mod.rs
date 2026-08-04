@@ -615,7 +615,7 @@ impl Glm52Engine {
             let resolved = match native {
                 Some(handoff) => {
                     match offload::native_pd_resolve(&store, &pool, rank, &req, &handoff).await {
-                        Ok((kv, cached_tokens)) => {
+                        Ok((kv, cached_tokens, reservation)) => {
                             match offload::native_anchor_plan(&req, &handoff) {
                                 Ok(plan) => offload::Resolved::Native {
                                     req,
@@ -623,6 +623,7 @@ impl Glm52Engine {
                                     cached_tokens,
                                     handoff,
                                     plan,
+                                    reservation,
                                 },
                                 Err(err) => offload::Resolved::Failed {
                                     req,
@@ -645,7 +646,7 @@ impl Glm52Engine {
                     let req_id = match req.request_id.as_deref() {
                         Some(id) => id,
                         None => {
-                            req_id_owned = anon_resolve_key(rank);
+                            req_id_owned = anon_resolve_key("glm52", rank);
                             &req_id_owned
                         }
                     };
@@ -1517,15 +1518,16 @@ fn take_boundary_drafts<'a>(
     if boundary { drafts.next() } else { None }
 }
 
-/// Fallback prefetch key for a resolve whose request carries no id. The host
+/// Fallback prefetch key for a resolve whose request carries no id —
+/// `prefix` names the resolve path (plain restore, native P/D). The host
 /// tier scopes in-flight prefetch state by this key, so it must be unique per
 /// resolve — resolvers run concurrently, and two sharing one key would poll
-/// each other's fetch state. A process-wide sequence keeps every anonymous
-/// resolve distinct across ranks and lifetimes.
-fn anon_resolve_key(rank: usize) -> String {
+/// each other's fetch state. One process-wide sequence keeps every anonymous
+/// resolve distinct across paths, ranks, and lifetimes.
+fn anon_resolve_key(prefix: &str, rank: usize) -> String {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    format!("glm52-r{rank}-{seq}")
+    format!("{prefix}-r{rank}-{seq}")
 }
 
 #[cfg(test)]
@@ -1534,17 +1536,27 @@ mod anon_resolve_key_tests {
 
     #[test]
     fn consecutive_fallback_keys_never_collide() {
-        let first = anon_resolve_key(2);
-        let second = anon_resolve_key(2);
+        let first = anon_resolve_key("glm52", 2);
+        let second = anon_resolve_key("glm52", 2);
         assert!(
             first.starts_with("glm52-r2-"),
-            "the key embeds the rank: {first}"
+            "the key embeds the path and rank: {first}"
         );
         assert_ne!(
             first, second,
             "the tier keys in-flight prefetch state by this string; \
              two resolvers must never share one"
         );
+        // The native P/D path draws from the same sequence: concurrent
+        // anonymous handoffs must not poll each other's prefetch state
+        // either.
+        let native_first = anon_resolve_key("native-pd", 2);
+        let native_second = anon_resolve_key("native-pd", 2);
+        assert!(
+            native_first.starts_with("native-pd-r2-"),
+            "the key embeds the path and rank: {native_first}"
+        );
+        assert_ne!(native_first, native_second);
     }
 }
 
