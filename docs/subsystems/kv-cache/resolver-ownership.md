@@ -27,12 +27,12 @@ resolve task 线性持有 req:probe hold(RAII,零分配)→ guarded tier query(l
 
 **full 页**:D 的恢复就是一次 `wait_for_full_hit` 的 `resolve_prefix`——零义务共享块,admission 断言命中长度并做全部权威分配。resolver 里不再出现 RequestKv。
 
-**tail(committed_len % 64 的半页)**:三不状态(不可封存/无 radix 身份/必须落私页)曾催生 keyed 旁路 API。定形:**P 侧 pad 到页边界,命名链 = `prompt + 纯 pad id`,anchor 不进任何 hash**。
+**tail(committed_len % 64 的半页)**:三不状态(不可封存/无 radix 身份/必须落私页)曾催生 keyed 旁路 API。定形:**P 侧 pad 到页边界,命名链 = P 交接时刻的自然序列 + pad id**——即 `prompt[..committed_len] + anchor + [PAD_TOKEN_ID; …]`(anchor 作为 dangling token 本就在 kvbm 序列上,照抄即是最小机制;整除页时无半块,零 pad,anchor 不进任何页名)。
 
-- P:半页用词表外保留 pad id 补满命名链 → 页封存,正常 Handoff-class save。**零字节代价**:save 按块粒度搬运,半页的 slab 本来就整页在运;padding 只是给垃圾行一个名字,换取 radix 身份。pad id 在词表外 + 既有 `native_mtp_cache_salt` 域隔离:plain 匹配用未 pad 链,天然撞不上 pad 页。committed_len 整除页时零 pad。
-- D resolver:从 `prompt + committed_len` 重建同一条 pad 链(不走线),一次 `resolve_prefix`(`wait_for_full_hit` + `full_pages`)恢复全部页——零义务共享块,resolver 里无 RequestKv。
-- D admission(native 臂):断言全命中;padded 边界页 **copy-on-restore** 拷进请求私页——decode 从 committed_len 处 append 会写进该页,共享块不可写(对齐组全家一起拷:mla+idxk+MTP L78 镜像,~3.3MB D2D,worker 首步 prologue 执行,调度线程无 CUDA stream)。整除时 decode 从新页起笔,无拷贝。attention 被 seq_len 界住,读不到 pad 行。
-- **anchor 移位行:接受碰撞**。MTP 草稿头错一位,其镜像在 `committed_len-1` 的行需要 anchor 的 embedding——共享内容中唯一非 prompt 纯函数的行,声明为已知模糊,不设补救机制。碰撞窗口 = 同 prompt + T>0 采出异 anchor + 旧页存活于任意缓存层(host tier 亦按 hash 去重,存留小时级);伤害仅为受害请求的草稿命中率微损,逐 token 验证兜底,不碰输出正确性。T=0 免疫(anchor 必同);turn-2 复用时该行对真实续写恰好正确(下一 token 即当时的 anchor)。否决项:① D 侧清零——K=0 行以 logit-0 持续稀释此后所有 draft 注意力,每请求都付,比碰撞更贵;② 信封运行真值——逐位无损,但 +1 个 ~KB 数据字段;accept-rate 实测退化时的现成升级路径;③ anchor 进 pad 链——覆盖不了整除情形(污染行在无 pad 槽的满页里)。
+- P:半块用 `PAD_TOKEN_ID` 补满 → 页封存,正常 Handoff-class save。**零字节代价**:save 按块粒度搬运,半页的 slab 本来就整页在运;padding 只是给垃圾行一个名字,换取 radix 身份。pad id 在词表外 + 既有 `native_mtp_cache_salt` 域隔离:plain 匹配用未 pad 链,天然撞不上 pad 页。
+- D resolver:从信封的 `committed_len` + `anchor_token_id` 重建同一条链(不走线),一次 `resolve_prefix`(`wait_for_full_hit` + `full_pages`)恢复全部页——零义务共享块,resolver 里无 RequestKv。
+- D admission(native 臂):断言全命中;padded 边界页 **copy-on-restore** 拷进请求私页——decode 从 committed_len 处 append 会写进该页,共享块不可写(对齐组全家一起拷:mla+idxk+MTP L78 镜像,~3.3MB D2D,worker 首步 prologue 执行,调度线程无 CUDA stream)。整除时 decode 从新页起笔,无拷贝。attention 被 seq_len 界住,读不到 pad 行(anchor 位同理:它在链上有名无 KV,首步 append 写实)。
+- **anchor 移位行:接受碰撞,碰撞面仅整除情形**。MTP 草稿头错一位,其镜像在 `committed_len-1` 的行需要 anchor 的 embedding——共享内容中唯一非 prompt 纯函数的行,声明为已知模糊,不设补救机制。非对齐时该行落在边界页里,页名含 anchor,异 anchor 根本不同名,无碰撞;整除时它在无 pad 的满页里,页名纯 prompt,碰撞窗口 = 同 prompt + T>0 采出异 anchor + 旧页存活于任意缓存层(host tier 亦按 hash 去重,存留小时级)。伤害仅为受害请求的草稿命中率微损,逐 token 验证兜底,不碰输出正确性。T=0 免疫(anchor 必同);turn-2 复用时该行对真实续写恰好正确(下一 token 即当时的 anchor)。否决项:① D 侧清零——K=0 行以 logit-0 持续稀释此后所有 draft 注意力,每请求都付,比碰撞更贵;② 信封运行真值——逐位无损,但 +1 个 ~KB 数据字段;accept-rate 实测退化时的现成升级路径;③ 从链上抠掉 anchor 求"纯 prompt 页名"——多写代码换更大的碰撞面(全情形 vs 仅整除),两头亏。
 - 失败语义:padded 页缺失 = 命中短缺 = **admission 拒绝,发生在占 slot 之前**,router 兜底。(对比曾考虑的"admission 后再取 tail":取回失败发生在 slot 已占之后,15s deadline × slot 数是存储抖动即冻结整 rank 的 DoS 面;及"D 重算尾巴":每请求 ≤63 行 context 挤进 decode 步流,c64 突发时 ~2000 行,违背 PD 分离的 decode 纯度——均否决。)
 - turn-2 prefix 复用终止在最后一个真 full 页,与现状一致,无损失。
 
@@ -49,7 +49,7 @@ resolve task 线性持有 req:probe hold(RAII,零分配)→ guarded tier query(l
 | --- | --- |
 | `fingerprint: String` | 人可读能力清单,如 `"glm52-native-mtp/3/arenas:101/page:64/salt:pages-v2/drafts:N"`;不匹配整串进拒绝日志,自带诊断。吸收 v2 的 `version` + `arena_count`,协议演进 = 改这个串 |
 | `committed_len: usize` | 恢复的锚:admission 预算、pad 链重建、copy-on-restore 偏移、decode 起点 |
-| `anchor_token_id: Option<u32>` | P 采样的首 token:D 的首步输入,且由 D 重放给客户端(router 只播 D 的流)。`None` = P 首采即 EOS——D 不恢复不 decode,直接 Stop 收尾。吸收 v2 的 `anchor_emitted`(其真实语义即 anchor-是否-EOS,名字曾误导) |
+| `anchor_token_id: Option<u32>` | P 采样的首 token:D 的首步输入、pad 链重建的一环(§2.2),且由 D 重放给客户端(router 只播 D 的流)。`None` = P 首采即 EOS——D 不恢复不 decode,直接 Stop 收尾。吸收 v2 的 `anchor_emitted`(其真实语义即 anchor-是否-EOS,名字曾误导) |
 | `draft_tokens: Vec<u32>` | P 的 MTP 草稿,D 首步直接验证 |
 
 退役无接班字段:`tail_len`(几何可由 committed_len 推导,含"整除补整页"怪癖)、`tail_key`(身份走 radix padded-hash)。否决:`boundary_page_hash` 一致性指纹——fingerprint 已挡约定漂移,同版本实现分歧属 bug,过度防御。接受形状唯一化:router 转发原始 prompt token ids、D 重放 anchor;v2 的"manual harness 已拼 anchor"双形状删除。未上线,无兼容窗口约束。
