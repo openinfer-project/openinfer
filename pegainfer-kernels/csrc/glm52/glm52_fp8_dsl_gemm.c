@@ -3,8 +3,8 @@
  * The launchable artifacts (host entry + embedded cubin) are exported at
  * build time by tools/cutedsl/export_glm52_fp8_dsl.py; the generated
  * glm52_fp8_dsl_gen.h wraps them into G52DSL_TABLE, keyed on the exact
- * (m, n, k) of the four wide-route projections per decode bucket. Anything
- * off-table (96-row bucket, prefill shards, MoE banks) stays on the CUTLASS
+ * (m, n, k) of the four wide-route projections per decode bucket (16-96).
+ * Anything off-table (prefill shards, MoE banks) stays on the CUTLASS
  * entry. Without PEGAINFER_CUTEDSL_PYTHON the stub half compiles instead and
  * the Rust side sees an always-empty table.
  *

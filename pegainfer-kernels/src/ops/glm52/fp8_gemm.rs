@@ -40,7 +40,7 @@ pub fn glm52_fp8_dsl_preload() {
         if rc == 0 {
             DSL_GEMM_READY.store(true, Ordering::Release);
             log::info!(
-                "GLM5.2 CuTe DSL fp8 GEMM AOT loaded; wide-route buckets 16-64 dispatch to tcgen05"
+                "GLM5.2 CuTe DSL fp8 GEMM AOT loaded; wide-route buckets 16-96 dispatch to tcgen05"
             );
         } else {
             log::warn!("GLM5.2 CuTe DSL fp8 GEMM module load failed (rc={rc}); staying on CUTLASS");
@@ -117,9 +117,9 @@ pub fn glm52_fp8_groupwise_gemm_sm100_offset_launch(
     let workspace_bytes = workspace.len();
     let (workspace_ptr, _workspace_guard) = workspace.device_ptr_mut(&ctx.stream);
     // Exact-(m, n, k) table dispatch to the CuTe DSL tcgen05 AOT twin: only
-    // the four wide-route projection shapes at decode buckets 16-64 hit it
-    // (the 96-row bucket exceeds the kernel's single 64-row M-tile). The
-    // branch is deterministic per bucket, so graph capture and replay agree.
+    // the four wide-route projection shapes at decode buckets 16-96 hit it.
+    // The branch is deterministic per bucket, so graph capture and replay
+    // agree.
     if weight_offset == 0
         && weight_scale_offset == 0
         && DSL_GEMM_READY.load(Ordering::Acquire)

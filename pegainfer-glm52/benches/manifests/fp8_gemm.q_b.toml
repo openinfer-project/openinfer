@@ -10,7 +10,7 @@ scratch = "32 MiB CUTLASS grouped-scheduler/tensormap workspace carved inside th
 [axes]
 # 4/8 straddle the GEMV<->GEMM crossover; 16/32/48 are the verify-span
 # buckets; 64 is the span-8 x bucket-8 upper probe. All satisfy m%4==0.
-rows = [4, 8, 16, 32, 48, 64]
+rows = [4, 8, 16, 32, 48, 64, 96]
 [shape]
 n = 16384  # q_b [heads*q_head=64*256, q_lora=2048]
 k = 2048

@@ -156,10 +156,11 @@ stream)`. Facts that shape any integration:
 - **Shapes are baked in.** The header's tensor structs carry only `void
   *data`; layout/strides/shape are compile-time. One export per (rows, n, k,
   config) — which matches glm52's per-bucket decode scratch exactly.
-- **The M-tile is single.** rows>64 compiles without complaint and silently
-  computes only the first 64 rows (measured rel_l2 0.58 = sqrt(1/3) at
-  rows=96). Never export past 64 without a kernel-side M loop; the 96-row
-  bucket stays on CUTLASS.
+- **grid.x tiles the rows axis** (64-row M tiles) since the rows-96 step;
+  any m exports. Historical trap worth keeping: before that, rows>64
+  compiled without complaint and silently computed only the first 64 rows
+  (measured rel_l2 0.58 = sqrt(1/3) at rows=96) — a grid formula is the
+  kernel author's contract, the DSL never validates coverage.
 - **`libcute_dsl_runtime.so` is a hard link+run dependency.** The exported
   object calls `_cuda*`-prefixed wrapper symbols resolved from the DSL
   wheel's `lib/` (self-contained, plain libc). Link with `-lcute_dsl_runtime`

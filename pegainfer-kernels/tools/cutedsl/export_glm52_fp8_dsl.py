@@ -9,10 +9,10 @@ per-prefix entries into one uniform dispatch table consumed by
 `csrc/glm52/glm52_fp8_dsl_gemm.c`.
 
 Shapes are compile-time constants in the artifact (the header's tensor structs
-carry only a data pointer), so one entry per (rows, n, k). Rows stop at 64:
-the kernel is a single 64-row M-tile — a rows=96 compile succeeds but silently
-computes only the first 64 rows (verified 2026-08-04, rel_l2 0.58 == sqrt(1/3)
-against the reference). The 96-row bucket stays on CUTLASS.
+carry only a data pointer), so one entry per (rows, n, k). The kernel tiles
+rows in 64-row M tiles (grid.x), so every wide-route decode bucket through 96
+exports; per-rows tile configs come from `tile_cfg` (multi-M-tile shapes drop
+the CTA-starvation compensation the single-tile table carries).
 
 Needs torch + CUDA + nvidia-cutlass-dsl (JIT compiles on the build box) and
 the kernel-lab sources; skips itself via a content hash when nothing changed.
@@ -24,7 +24,7 @@ import json
 import os
 import sys
 
-WIDE_ROUTE_ROWS = [16, 32, 48, 64]
+WIDE_ROUTE_ROWS = [16, 32, 48, 64, 96]
 # (tag, n, k) — the four wide-route projections (docs/models/glm52/
 # fp8-blockwise-gemm-lab.md); tags feed generated symbol names.
 SHAPES = [
@@ -131,7 +131,7 @@ def main() -> None:
     import cuda.bindings.driver as cuda_drv
     import cutlass.cute as cute
     from cutlass.cute.runtime import from_dlpack
-    from kernel_lab.units.fp8_gemm_dsl_tc import DEFAULT_CFG, TILE_CFG
+    from kernel_lab.units.fp8_gemm_dsl_tc import tile_cfg
     from kernel_lab.units.fp8_gemm_dsl_tc_kernel import (
         Fp8BlockwiseGemmTcgen05,
         _SplitKReduce,
@@ -144,9 +144,8 @@ def main() -> None:
     objects = []
     stream = cuda_drv.CUstream(0)
     for tag, n, k in SHAPES:
-        block_n, split_k = TILE_CFG.get((n, k), DEFAULT_CFG)
         for rows in WIDE_ROUTE_ROWS:
-            assert rows <= 64, "single-M-tile kernel: rows>64 silently truncates"
+            block_n, split_k = tile_cfg(rows, n, k)
             name = f"g52dsl_{tag}_r{rows}"
             mA = wrap(
                 torch.zeros(rows, k, dtype=torch.uint8, device="cuda"),

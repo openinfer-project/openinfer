@@ -6,7 +6,7 @@ adapter = "fp8_gemm_groupwise"
 capability = { blackwell_only = true }
 scratch = "32 MiB CUTLASS grouped-scheduler/tensormap workspace carved inside the FFI (fp8.rs FP8_GEMM_WORKSPACE_BYTES); allocated as bench warmup material, never timed"
 [axes]
-rows = [4, 8, 16, 32, 48, 64]
+rows = [4, 8, 16, 32, 48, 64, 96]
 [shape]
 n = 6144   # hidden 6144
 k = 2048   # shared expert intermediate 2048

@@ -23,7 +23,7 @@ EXPECTED_PHASE1_UNITS = {
     "fp8_gemm.shared_gate_up",
     "fp8_gemm.shared_down",
 }
-EXPECTED_ROWS = {4, 8, 16, 32, 48, 64}
+EXPECTED_ROWS = {4, 8, 16, 32, 48, 64, 96}
 
 
 def test_no_torch_leak():

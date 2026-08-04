@@ -6,7 +6,7 @@ adapter = "fp8_gemm_dsl_tc"
 capability = { python_native = true, sm_tcgen05_only = true }
 scratch = "none — TILE_CFG split_k=1 for this shape; the kernel writes bf16 out directly with no partial buffer"
 [axes]
-rows = [4, 8, 16, 32, 48, 64]
+rows = [4, 8, 16, 32, 48, 64, 96]
 [shape]
 n = 16384
 k = 2048

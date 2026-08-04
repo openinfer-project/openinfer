@@ -13,8 +13,9 @@ CUTLASS Sm100BlockwiseScaleConfig<1,128,128,K,K>).
 - A (act):    e4m3 [m, k] row-major (K-major)     SFA: f32 [m, k/128]
 - B (weight): e4m3 [n, k] row-major (K-major, TN) SFB: f32 [n/128, k/128]
 - D (out):    bf16 [m, n] row-major
-- m <= 64 (one 64-row MMA tile covers the rows axis; TMA zero-fills OOB rows
-  on load, epilogue stores are row-predicated), k % 128 == 0, n % 128 == 0.
+- any m (grid.x tiles the rows axis in 64-row MMA tiles; TMA zero-fills OOB
+  rows of the last partial tile on load, epilogue stores are row-predicated),
+  k % 128 == 0, n % 128 == 0.
 
 Structure (stripped-down version of the vendored CUTLASS CuTeDSL example
 `blackwell/blockwise_gemm/blockwise_gemm.py` — persistent tile scheduler,
@@ -201,7 +202,7 @@ class Fp8BlockwiseGemmTcgen05:
         )
 
         grid = (
-            1,
+            cute.ceil_div(cute.size(mD, mode=[0]), self.mma_tiler[0]),
             cute.ceil_div(cute.size(mD, mode=[1]), self.mma_tiler[1]),
             self.split_k,
         )
@@ -258,7 +259,7 @@ class Fp8BlockwiseGemmTcgen05:
         # grid.z is the split-K id (1 when split_k == 1); A/B/SFA/SFB L is
         # always 0, but mD's RestL mode carries the split id for partials.
         split_id = cutlass.Int32(bidz)
-        mma_tile_coord_mnl = (bidx, bidy, split_id)  # grid m extent is 1
+        mma_tile_coord_mnl = (bidx, bidy, split_id)
         # 128-N scale block index of this CTA (block_n in {64, 128} divides a
         # single SFB granularity block).
         nb = (bidy * self.mma_tiler[1]) // 128
@@ -535,6 +536,9 @@ class Fp8BlockwiseGemmTcgen05:
             frag_len = cute.size(tTR_rAcc[0])
 
             m_total = cutlass.Int32(cute.size(mC_mnl, mode=[0]))
+            # Rows this CTA's M tile starts at; smem/identity coords are
+            # tile-local, gmem reads and row predicates need the offset.
+            m_base = cutlass.Int32(bidx) * self.mma_tiler[0]
 
             #
             # Preload this split's SFA/SFB strip into smem (once per CTA);
@@ -550,8 +554,8 @@ class Fp8BlockwiseGemmTcgen05:
                     row = idx // kb_local_cnt
                     kc = idx % kb_local_cnt
                     val = cutlass.Float32(0.0)
-                    if cute.elem_less(row, m_total):
-                        val = mSFA_mkl[row, kb_base + kc, 0]
+                    if cute.elem_less(m_base + row, m_total):
+                        val = mSFA_mkl[m_base + row, kb_base + kc, 0]
                     sSFA[row, kc] = val
             if tidx < kb_local_cnt:
                 sSFB[tidx] = mSFB_nkl[nb, kb_base + tidx, 0]
@@ -614,10 +618,10 @@ class Fp8BlockwiseGemmTcgen05:
                     tTR_rC.store(tTR_final_sub.load().to(self.c_dtype))
                     tTR_cC_sub = tTR_cC[(None, None, None, epi_m, epi_n)]
                     tTR_gC_sub = tTR_gC_all[
-                        (None, None, None, epi_m, epi_n, 0, n_tile, bidz)
+                        (None, None, None, epi_m, epi_n, mma_tile_coord_mnl[0], n_tile, bidz)
                     ]
                     for i in cutlass.range_constexpr(frag_len):
-                        if cute.elem_less(tTR_cC_sub[i][0], m_total):
+                        if cute.elem_less(m_base + tTR_cC_sub[i][0], m_total):
                             tTR_gC_sub[i] = tTR_rC[i]
 
         # Whole-CTA sync before tensor memory dealloc.

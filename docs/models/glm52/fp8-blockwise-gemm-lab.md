@@ -70,6 +70,36 @@ Notes: q_b's apparent +27% regression was disproven by same-session interleaved 
 
 The wide route (rows>8, #812) fires once per projection per layer across 78 layers. GB300 same-protocol rows=64 per-instance deltas: q_b −9.7us, o_proj −27.0, gate_up −11.3, down −3.5 — **−51.4us/layer -> x78 ≈ −4.0 ms/step** as the upper bound. Two realistic discounts: (1) gate_up/down are the shared expert and ride an aux stream overlapped with MoE collectives under the EP layout, so full-hiding folds that part off — **−2.9 ms/step**; (2) the win is **capacity-regime-only** — at c=32/instance (8 rows/rank) the GEMV chain runs and there is zero profit; c>=64/instance (16+ rows/rank) enters the payback zone. Against the ep4 anchor (c=32/n=128 step≈39ms, see `ep4-gb300.md`): in-regime TPOT improvement ≈ **7–10%**; round-2's extra gains can raise that by a few points once re-measured on a quiet window. **Prerequisites unchanged**: cubin export (the DSL's `cute.compile` supports it) + a Rust runtime loader (quack's `cache/jit.py` export_to_c + tvm-ffi load_module is a working reference) + the #812 oracle gate.
 
+## rows=96: M-tiled grid + its own tile configs
+
+The kernel was single-M-tile by grid formula only — `mma_tile_coord_mnl`
+already carried `bidx` — so the 96-row (flagship 32-slot x MTP) bucket cost
+one grid line plus tile-local -> global row offsets in the SFA staging and the
+epilogue predicate/RestM slice. Two findings (GB300, same-session A/B,
+rows=96, median us):
+
+| shape | CUTLASS | DSL, <=64 cfg | DSL, tuned | best cfg | speedup |
+|---|---|---|---|---|---|
+| q_b | 35.63 | 28.14 | 26.54 | (128, sk1) | 1.34x |
+| o_proj | 71.58 | 51.22 | 45.90 | (128, **sk1**) | 1.56x |
+| shared_gate_up | 40.08 | 27.12 | 22.77 | (128, **sk2**) | 1.76x |
+| shared_down | 27.86 | 25.28 | 20.27 | (**128**, sk1) | 1.37x |
+
+- **The <=64 tile configs are wrong at 96**: two M tiles double the CTA count
+  by themselves, the starvation the (tile-N, split-K) knobs compensate for is
+  gone, and every knob flips to a net loss except gate_up's split-K x2 (its
+  per-tile grid is still under half a wave). `TILE_CFG_MULTI_M` in the
+  adapter carries the second regime; `tile_cfg(rows, n, k)` picks.
+- **Why 96 trails the <=64 speedups (1.3-1.8x vs 1.4-2.8x)**: 96 = 64 + 32 —
+  the second tile computes 64 rows for 32 real ones (25% wasted MMA overall),
+  while CUTLASS amortizes its scheduling overhead better at larger m. A
+  48-row-capable M tile (M=48 tcgen05 atom does not exist; would need a
+  64+32 heterogeneous grid) is the only obvious way to close it; not planned.
+
+e2e note: the step bench cannot reach 96 rows (32-slot ceiling, no MTP
+drafter) — 96-bucket e2e waits for an MTP serving A/B; correctness is covered
+by the lab check (8/8 with the 96 axis) and the DSL-vs-CUTLASS gate at m=96.
+
 ## Scope
 
 This PR ships the fp8 blockwise GEMM line only. The harness's other decode-op families (GEMV norms, indexer, router, bookends, shared-expert, quant, MLA) and any non-datacenter-arch kernel variants are deliberately out of scope here.
@@ -77,5 +107,5 @@ This PR ships the fp8 blockwise GEMM line only. The harness's other decode-op fa
 ## Next
 
 - sm_103 residuals: the short-k prologue floor (~2us) — overlap scale preload with the main pipeline; vectorize the epilogue STG (currently 32x 32-bit scalar stores per thread); re-measure round-2 absolutes on a quiet GB300 window.
-- ~~Productization form decision~~ **landed 2026-08-04**: `export_to_c` AOT objects linked into pegainfer-kernels behind `PEGAINFER_CUTEDSL_PYTHON`, exact-(m,n,k) table dispatch inside `glm52_fp8_groupwise_gemm_sm100_offset_launch`, buckets 16-64 (96 = single-M-tile ceiling, stays CUTLASS), `GLM52_FP8_DSL=0` kill switch. Recipe in `kernel-lab-ops.md`; re-measured clean-box kernel deltas 1.4-2.8x (PR #835 thread).
+- ~~Productization form decision~~ **landed 2026-08-04**: `export_to_c` AOT objects linked into pegainfer-kernels behind `PEGAINFER_CUTEDSL_PYTHON`, exact-(m,n,k) table dispatch inside `glm52_fp8_groupwise_gemm_sm100_offset_launch`, buckets 16-96, `GLM52_FP8_DSL=0` kill switch. Recipe in `kernel-lab-ops.md`; re-measured clean-box kernel deltas 1.4-2.8x (PR #835 thread).
 - **e2e measured (glm52_step_bench, EP4 tray03, 2026-08-04, `GLM52_KV_POOL_BLOCKS=18000`)**: whole-step p50 at rank-0 rows 16: 38.32 -> 34.52 ms (**-9.9%**); rows 32: 45.50 -> 41.55 ms (**-8.7%**, 703 -> 770 tok/s); rows 8 (GEMV control): -0.1% = noise. Matches the -7~10% in-regime estimate above. Caveats hit on the way: the step bench needed a pinned pool (the #823 budget-fill's 32-slot arena floor leaves <1 GiB for graph capture in this container) and single-bucket invocations (a pre-existing launch-ahead desync fires at phase drain; measurement rows print before it — also, EP4 placement puts all bench requests on rank 0, so the bucket label maps to rank-0 rows = 4x label; both filed for follow-up).

@@ -21,7 +21,7 @@ CU_GEMM = REPO / "pegainfer-kernels/csrc/glm52/glm52_fp8_gemm.cu"
 FP8_RS = REPO / "pegainfer-glm52/src/fp8.rs"
 
 SYMBOL = "glm52_fp8_groupwise_gemm_sm100_cuda"
-EXPECTED_ROWS = [4, 8, 16, 32, 48, 64]
+EXPECTED_ROWS = [4, 8, 16, 32, 48, 64, 96]
 # unit -> (n, k) — the four whitelisted production projections that anchor
 # the GEMV-register-tile / multi-subtile-mma / fp8-GEMM three-way A/B.
 UNITS = {

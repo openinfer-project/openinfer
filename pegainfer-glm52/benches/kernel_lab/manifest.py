@@ -18,7 +18,7 @@ ADAPTER_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 # #812 verify-span buckets (bucket-6 x span-8 = 48 at full occupancy) and 64
 # is the span-8 x bucket-8 upper probe served by the multi-subtile mma.
 # Anything else must crash at the boundary.
-DECODE_ROWS = (1, 2, 4, 8, 16, 32, 48, 64)
+DECODE_ROWS = (1, 2, 4, 8, 16, 32, 48, 64, 96)
 FP8_BLOCK = 128
 
 

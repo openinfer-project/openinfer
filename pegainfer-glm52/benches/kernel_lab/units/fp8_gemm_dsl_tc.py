@@ -43,7 +43,23 @@ TILE_CFG = {
                                # fixed prologue+reduce overhead exceeds the
                                # CTA-parallelism gain; tile N=64 alone wins)
 }
+# rows > 64 spans multiple 64-row M tiles: the CTA count doubles on its own
+# and the starvation the table above compensates for is gone — split-K and
+# tile-N shrinking flip to net losses (sweep 2026-08-04, rows=96). gate|up
+# keeps split-K x2: its 32-CTA-per-tile grid is still under half a wave.
+TILE_CFG_MULTI_M = {
+    (16384, 2048): (128, 1),
+    (6144, 16384): (128, 1),
+    (4096, 6144): (128, 2),
+    (6144, 2048): (128, 1),
+}
 DEFAULT_CFG = (128, 1)
+MMA_TILE_M = 64
+
+
+def tile_cfg(rows: int, n: int, k: int) -> tuple:
+    table = TILE_CFG if rows <= MMA_TILE_M else TILE_CFG_MULTI_M
+    return table.get((n, k), DEFAULT_CFG)
 
 
 def make_inputs(shape: dict, seed: int) -> dict:
@@ -58,7 +74,7 @@ def run(lib, tensors: dict, shape: dict, stream) -> None:
     # `lib` is unused: the kernel is a DSL JIT executor, not a .so symbol.
     from kernel_lab.units import fp8_gemm_dsl_tc_kernel
 
-    block_n, split_k = TILE_CFG.get((shape["n"], shape["k"]), DEFAULT_CFG)
+    block_n, split_k = tile_cfg(shape["rows"], shape["n"], shape["k"])
     fp8_gemm_dsl_tc_kernel.run_fp8_blockwise_gemm_tc(
         shape["rows"],
         shape["n"],

@@ -1,7 +1,7 @@
 //! Numerical gate for the CuTe DSL tcgen05 AOT fp8 GEMM dispatch.
 //!
-//! Runs every wide-route projection shape at a split-K-free and a split-K
-//! bucket through both routes on identical inputs — the DSL table via
+//! Runs every wide-route projection shape at a split-K-free, a split-K, and
+//! a multi-M-tile bucket through both routes on identical inputs — the DSL table via
 //! `glm52_fp8_groupwise_gemm_sm100_offset_launch` (which dispatches when the
 //! AOT modules are loaded) and CUTLASS via the bank variant (which never
 //! dispatches) — and demands agreement. Both kernels sit within rel_l2
@@ -67,7 +67,7 @@ fn dsl_route_matches_cutlass_on_every_wide_route_shape() {
         (4096, 6144),
         (6144, 2048),
     ] {
-        for m in [16usize, 64] {
+        for m in [16usize, 64, 96] {
             let act = e4m3_bytes(m * k, &mut seed);
             let act_s = scales(m * (k / 128), &mut seed);
             let weight = e4m3_bytes(n * k, &mut seed);

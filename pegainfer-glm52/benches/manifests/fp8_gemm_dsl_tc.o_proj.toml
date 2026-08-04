@@ -6,7 +6,7 @@ adapter = "fp8_gemm_dsl_tc"
 capability = { python_native = true, sm_tcgen05_only = true }
 scratch = "adapter-cached split-K f32 partial tensor (2, rows, n) plus one _SplitKReduce launch (TILE_CFG in units/fp8_gemm_dsl_tc.py); the zeroed allocation is cached per shape, warmup material, never timed"
 [axes]
-rows = [4, 8, 16, 32, 48, 64]
+rows = [4, 8, 16, 32, 48, 64, 96]
 [shape]
 n = 6144
 k = 16384
