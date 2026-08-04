@@ -18,12 +18,19 @@ pub(super) fn publish_load(
     pool: &BlockPool,
     slots: &RankSlots,
     pending: &VecDeque<super::offload::Resolved>,
+    resolving: usize,
 ) {
     let kv_total_blocks = pool.total_blocks() - 1;
     load_tx.send_replace(LoadSnapshot {
         kv_used_blocks: kv_total_blocks.saturating_sub(pool.available_blocks()) as u64,
         kv_total_blocks: kv_total_blocks as u64,
         num_running_reqs: slots.iter().flatten().count() as u64,
-        num_waiting_reqs: pending.len() as u64,
+        // Every admitted-but-not-yet-slotted request counts as waiting for
+        // the whole intake-to-slot window, whether it is still resolving
+        // off-thread or already queued: the engine's drain decrements the
+        // resolver count in the same breath it pushes into the deque, so
+        // the frontend's placement signal never undercounts a rank
+        // mid-resolve and never counts a request twice.
+        num_waiting_reqs: (pending.len() + resolving) as u64,
     });
 }

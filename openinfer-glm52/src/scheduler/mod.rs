@@ -645,7 +645,7 @@ impl Glm52Engine {
                     let req_id = match req.request_id.as_deref() {
                         Some(id) => id,
                         None => {
-                            req_id_owned = format!("glm52-r{rank}");
+                            req_id_owned = anon_resolve_key(rank);
                             &req_id_owned
                         }
                     };
@@ -694,7 +694,13 @@ impl Glm52Engine {
     }
 
     fn publish(&self) {
-        publish_load(&self.load_tx, &self.pool, &self.slots, &self.pending);
+        publish_load(
+            &self.load_tx,
+            &self.pool,
+            &self.slots,
+            &self.pending,
+            self.resolves_inflight(),
+        );
     }
 
     /// One step: submit — schedule each active span's KV (full-lifetime
@@ -1509,6 +1515,37 @@ fn take_boundary_drafts<'a>(
     drafts: &mut std::slice::Iter<'a, [u32; crate::mtp::GLM52_MTP_DRAFTS]>,
 ) -> Option<&'a [u32; crate::mtp::GLM52_MTP_DRAFTS]> {
     if boundary { drafts.next() } else { None }
+}
+
+/// Fallback prefetch key for a resolve whose request carries no id. The host
+/// tier scopes in-flight prefetch state by this key, so it must be unique per
+/// resolve — resolvers run concurrently, and two sharing one key would poll
+/// each other's fetch state. A process-wide sequence keeps every anonymous
+/// resolve distinct across ranks and lifetimes.
+fn anon_resolve_key(rank: usize) -> String {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("glm52-r{rank}-{seq}")
+}
+
+#[cfg(test)]
+mod anon_resolve_key_tests {
+    use super::anon_resolve_key;
+
+    #[test]
+    fn consecutive_fallback_keys_never_collide() {
+        let first = anon_resolve_key(2);
+        let second = anon_resolve_key(2);
+        assert!(
+            first.starts_with("glm52-r2-"),
+            "the key embeds the rank: {first}"
+        );
+        assert_ne!(
+            first, second,
+            "the tier keys in-flight prefetch state by this string; \
+             two resolvers must never share one"
+        );
+    }
 }
 
 /// Partition lineage-hashed native-MTP pages from plain (drafterless) pages:

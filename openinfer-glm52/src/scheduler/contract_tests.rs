@@ -85,13 +85,59 @@ fn load_snapshot_reports_the_ranks_own_state() {
     pending.push_back(plain(request(vec![21], SamplingParams::default(), 4)));
 
     let (load_tx, load_rx) = tokio::sync::watch::channel(LoadSnapshot::default());
-    publish_load(&load_tx, &pool, &slots, &pending);
+    publish_load(&load_tx, &pool, &slots, &pending, 0);
 
     let snapshot = *load_rx.borrow();
     assert_eq!(snapshot.num_running_reqs, 1);
     assert_eq!(snapshot.num_waiting_reqs, 2);
     assert_eq!(snapshot.kv_total_blocks, 7);
     assert_eq!(snapshot.kv_used_blocks, 1);
+}
+
+#[test]
+fn load_snapshot_counts_in_flight_resolves_as_waiting() {
+    // The waiting count covers the whole intake-to-slot window: a request
+    // resolving off-thread (up to the full resolve deadline) is admitted
+    // load, and a snapshot that omitted it would let the frontend route a
+    // burst at a rank that is anything but idle.
+    let pool = Arc::new(BlockPool::new(PAGE, 8));
+    let slots: RankSlots = std::array::from_fn(|_| None);
+    let mut pending = VecDeque::new();
+    let (load_tx, load_rx) = tokio::sync::watch::channel(LoadSnapshot::default());
+
+    // Intake's side: the counter rises before the resolver task spawns,
+    // with the deque still empty.
+    let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    inflight.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    publish_load(
+        &load_tx,
+        &pool,
+        &slots,
+        &pending,
+        inflight.load(std::sync::atomic::Ordering::Acquire),
+    );
+    assert_eq!(
+        load_rx.borrow().num_waiting_reqs,
+        1,
+        "a mid-resolve request is waiting load, not invisible"
+    );
+
+    // The drain's side: the decrement and the deque push happen together,
+    // so the request re-homes without ever double-counting.
+    inflight.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    pending.push_back(plain(request(vec![20], SamplingParams::default(), 4)));
+    publish_load(
+        &load_tx,
+        &pool,
+        &slots,
+        &pending,
+        inflight.load(std::sync::atomic::Ordering::Acquire),
+    );
+    assert_eq!(
+        load_rx.borrow().num_waiting_reqs,
+        1,
+        "moving to the deque keeps the count at one"
+    );
 }
 
 #[test]

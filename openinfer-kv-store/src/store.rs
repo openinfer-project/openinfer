@@ -23,6 +23,7 @@ use crate::ResolvePolicy;
 use crate::SaveClass;
 use crate::SaveCursor;
 use crate::tier::HostTier;
+use crate::tier::LeasedBlocks;
 use crate::tier::TierQuery;
 
 /// One rank's KV surfaces. `pool` is the same logical pool the rank's
@@ -72,6 +73,38 @@ impl KeyedLoadParking {
     /// back and drops here — safe either way, the DMA is over.
     pub fn park(self, pin: Box<dyn Any + Send>) {
         let _ = self.0.send(pin);
+    }
+}
+
+/// A tier hit whose lease releases on drop unless the caller takes it. The
+/// keyed-query task returns its hit through this guard, which carries the
+/// invariant: a keyed query, once submitted, always settles and always
+/// releases any lease the caller will never consume — a wait abandoned at
+/// the deadline drops the task's output unread, and the drop releases.
+struct LeaseGuard {
+    tier: Arc<dyn HostTier>,
+    hit: Option<LeasedBlocks>,
+}
+
+impl LeaseGuard {
+    fn blocks(&self) -> usize {
+        self.hit
+            .as_ref()
+            .expect("guard holds its hit until taken")
+            .blocks
+    }
+
+    /// Consume the guard, taking over the lease (no release on drop).
+    fn take(mut self) -> LeasedBlocks {
+        self.hit.take().expect("guard holds its hit until taken")
+    }
+}
+
+impl Drop for LeaseGuard {
+    fn drop(&mut self) {
+        if let Some(hit) = self.hit.take() {
+            self.tier.release(hit);
+        }
     }
 }
 
@@ -466,23 +499,47 @@ impl KvStore {
                 "keyed fetch deadline: key never became resident"
             ))
         };
+        // Dropping `tier.query`'s future detaches only the observer — the
+        // tier's work is already submitted and may still settle into a
+        // lease-carrying hit. So each query runs in a task owning the tier:
+        // once submitted it always runs to settlement, and a hit comes back
+        // wrapped in a [`LeaseGuard`], which releases the lease unless the
+        // caller takes it — including a wait abandoned at the deadline,
+        // where the task's output drops unread. No abandoned query can pin
+        // host blocks until the lease TTL.
         let hit = loop {
-            let query =
-                tokio::time::timeout_at(deadline, tier.query(req_id, vec![key.to_vec()], true));
-            match query.await {
+            let query_tier = Arc::clone(tier);
+            let query_req_id = req_id.to_string();
+            let hashes = vec![key.to_vec()];
+            let join = self.runtime.spawn(async move {
+                match query_tier.query(&query_req_id, hashes, true).await {
+                    Ok(TierQuery::Hit(hit)) => Ok(Some(LeaseGuard {
+                        tier: query_tier,
+                        hit: Some(hit),
+                    })),
+                    Ok(TierQuery::Miss | TierQuery::Loading) => Ok(None),
+                    Err(err) => Err(err),
+                }
+            });
+            match tokio::time::timeout_at(deadline, join).await {
                 Err(_elapsed) => return Err(expired()),
-                Ok(Err(err)) => {
+                Ok(Err(join_err)) => {
+                    return Err(KeyedFetchError::Settled(anyhow::anyhow!(
+                        "keyed fetch query task failed: {join_err}"
+                    )));
+                }
+                Ok(Ok(Err(err))) => {
                     return Err(KeyedFetchError::Settled(err.context("keyed fetch query")));
                 }
-                Ok(Ok(TierQuery::Hit(hit))) if hit.blocks == 1 => break hit,
-                Ok(Ok(TierQuery::Hit(hit))) => {
-                    let blocks = hit.blocks;
-                    tier.release(hit);
+                Ok(Ok(Ok(Some(guard)))) if guard.blocks() == 1 => break guard.take(),
+                Ok(Ok(Ok(Some(guard)))) => {
+                    let blocks = guard.blocks();
+                    drop(guard);
                     return Err(KeyedFetchError::Settled(anyhow::anyhow!(
                         "keyed fetch resolved {blocks} blocks for one key"
                     )));
                 }
-                Ok(Ok(TierQuery::Miss | TierQuery::Loading)) => {
+                Ok(Ok(Ok(None))) => {
                     if Instant::now() >= deadline {
                         return Err(expired());
                     }
@@ -623,13 +680,66 @@ mod tests {
         }
     }
 
-    fn stalled_store(runtime: tokio::runtime::Handle, release_load: Arc<Notify>) -> KvStore {
+    /// A tier whose query stalls until the test fires `release_query`, then
+    /// answers with a lease-carrying hit — the shape where the caller's
+    /// deadline passes while the tier still owes a settlement. `released`
+    /// counts every lease handed back.
+    struct StallQueryTier {
+        release_query: Arc<Notify>,
+        released: Arc<AtomicUsize>,
+    }
+
+    impl HostTier for StallQueryTier {
+        fn query(
+            &self,
+            _req_id: &str,
+            block_hashes: Vec<Vec<u8>>,
+            _wait_full: bool,
+        ) -> TierFuture<anyhow::Result<TierQuery>> {
+            let release = Arc::clone(&self.release_query);
+            let blocks = block_hashes.len();
+            Box::pin(async move {
+                release.notified().await;
+                Ok(TierQuery::Hit(LeasedBlocks {
+                    blocks,
+                    lease: QueryLeaseId::fresh(),
+                }))
+            })
+        }
+
+        fn load(
+            &self,
+            _hit: LeasedBlocks,
+            _dst_page_ids: Vec<i32>,
+        ) -> TierFuture<anyhow::Result<()>> {
+            Box::pin(std::future::ready(Ok(())))
+        }
+
+        fn release(&self, _hit: LeasedBlocks) {
+            self.released.fetch_add(1, Ordering::AcqRel);
+        }
+
+        fn save(
+            &self,
+            _block_ids: Vec<i32>,
+            _block_hashes: Vec<Vec<u8>>,
+            _guards: Vec<KvBlockGuard>,
+        ) -> TierFuture<anyhow::Result<()>> {
+            Box::pin(std::future::ready(Ok(())))
+        }
+
+        fn flush(&self) -> TierFuture<anyhow::Result<()>> {
+            Box::pin(std::future::ready(Ok(())))
+        }
+    }
+
+    fn tier_store(runtime: tokio::runtime::Handle, tier: Arc<dyn HostTier>) -> KvStore {
         let mut ranks = HashMap::new();
         ranks.insert(
             0,
             RankState {
                 pool: Arc::new(BlockPool::new(16, 8)),
-                tier: Some(Arc::new(StallLoadTier { release_load })),
+                tier: Some(tier),
                 pinned: Arc::new(AtomicUsize::new(0)),
                 loads_pending: Arc::new(AtomicUsize::new(0)),
             },
@@ -641,6 +751,10 @@ mod tests {
             ranks,
             stats: Arc::new(KvStoreStats::default()),
         }
+    }
+
+    fn stalled_store(runtime: tokio::runtime::Handle, release_load: Arc<Notify>) -> KvStore {
+        tier_store(runtime, Arc::new(StallLoadTier { release_load }))
     }
 
     /// The keyed-tail invariant: a stalled load abandons the WAIT at the
@@ -686,5 +800,52 @@ mod tests {
             1,
             "the settled load released the parked pin"
         );
+    }
+
+    /// The keyed-query invariant: a query stalled past the deadline abandons
+    /// only the wait, and when the tier later settles with a hit, the
+    /// detached task releases the lease the caller will never consume — a
+    /// storage stall never pins host blocks until the lease TTL.
+    #[test]
+    fn keyed_query_timeout_releases_the_late_hits_lease() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let release_query = Arc::new(Notify::new());
+        let released = Arc::new(AtomicUsize::new(0));
+        let store = tier_store(
+            rt.handle().clone(),
+            Arc::new(StallQueryTier {
+                release_query: Arc::clone(&release_query),
+                released: Arc::clone(&released),
+            }),
+        );
+
+        let outcome = rt.block_on(store.resolve_keyed_block(0, "tail", [7u8; 16], 3));
+        let Err(KeyedFetchError::Settled(err)) = outcome else {
+            panic!("a stalled query must fail at the deadline");
+        };
+        assert!(
+            format!("{err:#}").contains("deadline"),
+            "the caller sees the deadline error: {err:#}"
+        );
+        assert_eq!(
+            released.load(Ordering::Acquire),
+            0,
+            "nothing to release while the query is unsettled"
+        );
+
+        release_query.notify_one();
+        rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while released.load(Ordering::Acquire) == 0 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+        })
+        .expect("the settled query releases the unconsumed lease");
+        assert_eq!(released.load(Ordering::Acquire), 1);
     }
 }
