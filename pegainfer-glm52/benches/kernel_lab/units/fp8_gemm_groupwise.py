@@ -3,8 +3,8 @@
 Production symbol: `glm52_fp8_groupwise_gemm_sm100_cuda`
 (csrc/glm52/glm52_fp8_gemm.cu — one extern "C" shim over FlashInfer's
 CutlassGroupwiseScaledGEMMSM100<1, 128, 128, ScaleMajorK, MmaSM=2,
-e4m3 -> bf16>; FFI mirror openinfer-kernels/src/ffi/glm52.rs; production call
-openinfer-glm52/src/fp8.rs fp8_linear_large_m_into via the
+e4m3 -> bf16>; FFI mirror pegainfer-kernels/src/ffi/glm52.rs; production call
+pegainfer-glm52/src/fp8.rs fp8_linear_large_m_into via the
 Glm52Fp8GemmScratch wide route — rows past FP8_GEMV_MAX_ROWS = 8, #812).
 
 Four manifests share this adapter, one per whitelisted projection shape that
@@ -37,7 +37,7 @@ from kernel_lab.refs import quant as quant_ref
 
 SYMBOL = "glm52_fp8_groupwise_gemm_sm100_cuda"
 
-# Mirrors openinfer-glm52/src/fp8.rs FP8_GEMM_WORKSPACE_BYTES — the CUTLASS
+# Mirrors pegainfer-glm52/src/fp8.rs FP8_GEMM_WORKSPACE_BYTES — the CUTLASS
 # grouped-scheduler/tensormap workspace the FlashInfer entry carves
 # internally; allocation is bench warmup material, never timed.
 WORKSPACE_BYTES = 32 << 20

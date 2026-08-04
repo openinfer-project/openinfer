@@ -2,10 +2,10 @@
 
 Manifest-driven per-kernel check/bench/compare bench harness for GLM5.2. This
 checkout ships only the fp8 blockwise GEMM wide route (rows > 8, #812). The
-single source of truth for kernels stays `openinfer-kernels/csrc/glm52/*.cu` —
+single source of truth for kernels stays `pegainfer-kernels/csrc/glm52/*.cu` —
 the harness ctypes-dlopens `libglm52_kernel_lab.so`, which
-`openinfer-kernels/build.rs` links from the exact same objects and nvcc flags
-as the production static archive when `OPENINFER_KERNEL_LAB=1` (a default
+`pegainfer-kernels/build.rs` links from the exact same objects and nvcc flags
+as the production static archive when `PEGAINFER_KERNEL_LAB=1` (a default
 build runs zero extra commands), so the thing under test is the production
 SASS.
 
@@ -32,28 +32,28 @@ Unit behavior domain, acceptance numbers, and tuning records live in
 
 ```bash
 # build (run at the repo root; produces target/release/libglm52_kernel_lab.so)
-PYTHONPATH=openinfer-glm52/benches python3 -m kernel_lab build
+PYTHONPATH=pegainfer-glm52/benches python3 -m kernel_lab build
 
 # list (CPU-only, works without torch; doubles as the behavior-domain listing)
-PYTHONPATH=openinfer-glm52/benches python3 -m kernel_lab list
+PYTHONPATH=pegainfer-glm52/benches python3 -m kernel_lab list
 
 # check (torch-reference comparison, PASS/FAIL on the manifest tolerance)
-PYTHONPATH=openinfer-glm52/benches python3 -m kernel_lab check fp8_gemm.q_b --rows 64
+PYTHONPATH=pegainfer-glm52/benches python3 -m kernel_lab check fp8_gemm.q_b --rows 64
 
 # bench (time capacity shapes; --save writes into the baselines/<unit>.json
 # ledger, bucketed by (shape, arch))
-PYTHONPATH=openinfer-glm52/benches python3 -m kernel_lab bench fp8_gemm.q_b --rows 16 --rows 64 --save
+PYTHONPATH=pegainfer-glm52/benches python3 -m kernel_lab bench fp8_gemm.q_b --rows 16 --rows 64 --save
 
 # bench --cold-l2 (quack-style cold-cache protocol: rotate N buffer clones so
 # one sweep moves >= 3x L2; cures the warm-cache artifact of repeatedly
 # hammering one buffer set while it sits in L2 and bandwidth numbers exceed
 # the nominal peak. Mutually exclusive with --save — the ledgers are warm-
 # protocol history and incomparable cold numbers would pollute the baseline.)
-PYTHONPATH=openinfer-glm52/benches python3 -m kernel_lab bench fp8_gemm_dsl_tc.q_b --rows 64 --cold-l2
+PYTHONPATH=pegainfer-glm52/benches python3 -m kernel_lab bench fp8_gemm_dsl_tc.q_b --rows 64 --cold-l2
 
 # compare (delta vs the ledger by default; --baseline-so does same-session
 # interleaved A/B against a saved .so)
-PYTHONPATH=openinfer-glm52/benches python3 -m kernel_lab compare fp8_gemm.q_b --rows 64
+PYTHONPATH=pegainfer-glm52/benches python3 -m kernel_lab compare fp8_gemm.q_b --rows 64
 ```
 
 `--so PATH` — override for check/bench/compare; defaults to
@@ -63,7 +63,7 @@ for a same-session A/B: stash the old .so before editing a kernel, then run
 cancels clock/thermal drift.
 
 Once installed into the repo `.venv`, the `kernel_lab` console script works
-directly: `uv pip install -e openinfer-glm52/benches`.
+directly: `uv pip install -e pegainfer-glm52/benches`.
 
 ## Environment
 
@@ -81,7 +81,7 @@ directly: `uv pip install -e openinfer-glm52/benches`.
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest openinfer-glm52/benches/tests/ -q   # CPU-only, never imports torch
+.venv/bin/python -m pytest pegainfer-glm52/benches/tests/ -q   # CPU-only, never imports torch
 ```
 
 ## Scope

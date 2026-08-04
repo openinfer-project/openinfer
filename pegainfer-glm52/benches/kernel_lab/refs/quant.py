@@ -1,8 +1,8 @@
 """Torch reference + stdlib spec for the GLM5.2 FP8 per-token-group quant twins.
 
 Production kernels (csrc/glm52/glm52_moe_quant.cu; FFI mirror
-openinfer-kernels/src/ffi/glm52.rs:286-304; ops wrapper
-openinfer-kernels/src/ops/glm52/moe_quant.rs), per (row, 128-group):
+pegainfer-kernels/src/ffi/glm52.rs:286-304; ops wrapper
+pegainfer-kernels/src/ops/glm52/moe_quant.rs), per (row, 128-group):
 
 - `glm52_fp8_per_token_group_quant_bf16_cuda` —
   amax = max(|x|) f32, scale = fmaxf(amax, 1e-10) / 448,

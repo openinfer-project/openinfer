@@ -16,9 +16,9 @@ from kernel_lab import loader, manifest  # noqa: E402
 
 MANIFESTS = BENCHES / "manifests"
 REPO = BENCHES.parents[1]
-CU_GEMV = REPO / "openinfer-kernels/csrc/glm52/glm52_moe_gemv.cu"
-CU_GEMM = REPO / "openinfer-kernels/csrc/glm52/glm52_fp8_gemm.cu"
-FP8_RS = REPO / "openinfer-glm52/src/fp8.rs"
+CU_GEMV = REPO / "pegainfer-kernels/csrc/glm52/glm52_moe_gemv.cu"
+CU_GEMM = REPO / "pegainfer-kernels/csrc/glm52/glm52_fp8_gemm.cu"
+FP8_RS = REPO / "pegainfer-glm52/src/fp8.rs"
 
 SYMBOL = "glm52_fp8_groupwise_gemm_sm100_cuda"
 EXPECTED_ROWS = [4, 8, 16, 32, 48, 64]

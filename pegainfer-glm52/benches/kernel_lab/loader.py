@@ -1,10 +1,10 @@
 """ctypes loader for libglm52_kernel_lab.so.
 
-The .so is produced by `openinfer-kernels/build.rs` when OPENINFER_KERNEL_LAB=1
+The .so is produced by `pegainfer-kernels/build.rs` when PEGAINFER_KERNEL_LAB=1
 — the same objects and nvcc flags as the production static archive. This
 module never imports torch; stream/device-pointer helpers take raw ints.
 
-ABI notes (mirror: openinfer-kernels/src/ffi/glm52.rs):
+ABI notes (mirror: pegainfer-kernels/src/ffi/glm52.rs):
 - `Half*` / bf16 device pointers -> `c_void_p` holding `tensor.data_ptr()`;
   bf16 storage travels as raw uint16 bits, the kernel owns the interpretation.
 - `cudaStream_t` -> `c_void_p` holding `torch.cuda.current_stream().cuda_stream`
@@ -46,7 +46,7 @@ class KernelLaunchError(RuntimeError):
 
 
 def repo_root() -> Path:
-    # kernel_lab/ -> benches/ -> openinfer-glm52/ -> repo root
+    # kernel_lab/ -> benches/ -> pegainfer-glm52/ -> repo root
     return Path(__file__).resolve().parents[3]
 
 
@@ -63,7 +63,7 @@ def require_torch():
             "kernel_lab: this command needs PyTorch with CUDA. torch is an "
             "optional, lazily imported dependency — install glm52-kernel-lab "
             "into the repo .venv that already carries the oracle-pinned torch "
-            "(see openinfer-glm52/benches/README.md)."
+            "(see pegainfer-glm52/benches/README.md)."
         ) from exc
     return torch
 
@@ -90,7 +90,7 @@ def load_library(path: str | os.PathLike[str] | None = None) -> ctypes.CDLL:
     if not so.is_file():
         raise SystemExit(
             f"kernel_lab: {so} not found — build it with `kernel_lab build` "
-            "(OPENINFER_KERNEL_LAB=1 cargo build --release -p openinfer-kernels "
+            "(PEGAINFER_KERNEL_LAB=1 cargo build --release -p pegainfer-kernels "
             "--features glm52)"
         )
     try:

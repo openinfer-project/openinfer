@@ -22,7 +22,7 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="kernel_lab", description=__doc__)
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p = sub.add_parser("build", help="OPENINFER_KERNEL_LAB=1 cargo build the .so")
+    p = sub.add_parser("build", help="PEGAINFER_KERNEL_LAB=1 cargo build the .so")
     p.set_defaults(func=_cmd_build)
 
     p = sub.add_parser("list", help="list registered units (CPU-only, no torch)")
@@ -72,8 +72,8 @@ def _bench_args(p) -> None:
 
 def _cmd_build(args) -> int:
     root = loader.repo_root()
-    env = dict(os.environ, OPENINFER_KERNEL_LAB="1")
-    cmd = ["cargo", "build", "--release", "-p", "openinfer-kernels", "--features", "glm52"]
+    env = dict(os.environ, PEGAINFER_KERNEL_LAB="1")
+    cmd = ["cargo", "build", "--release", "-p", "pegainfer-kernels", "--features", "glm52"]
     print("kernel_lab build:", " ".join(cmd), f"(cwd={root})", flush=True)
     rc = subprocess.run(cmd, cwd=root, env=env).returncode
     if rc != 0:

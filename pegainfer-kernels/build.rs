@@ -708,7 +708,7 @@ fn link_deepep_nccl(nccl_root: &Path, out_dir: &Path) {
 }
 
 /// Link the freshly compiled CUDA objects into `libglm52_kernel_lab.so` for
-/// the kernel-lab Python harness (`OPENINFER_KERNEL_LAB=1` only). The objects
+/// the kernel-lab Python harness (`PEGAINFER_KERNEL_LAB=1` only). The objects
 /// are already PIC (every nvcc task adds `--compiler-options -fPIC`), so the
 /// same .o files that feed `libkernels_cuda.a` link into a shared object
 /// without a second compile pass. DeepEP shim objects reference NCCL symbols
@@ -716,7 +716,7 @@ fn link_deepep_nccl(nccl_root: &Path, out_dir: &Path) {
 /// never calls into DeepEP for these units.
 fn link_kernel_lab_shared(
     nvcc: &str,
-    toolkit: &openinfer_build::CudaToolkit,
+    toolkit: &pegainfer_build::CudaToolkit,
     out_dir: &Path,
     obj_files: &[PathBuf],
 ) {
@@ -1758,11 +1758,11 @@ fn main() {
     assert!(status.success(), "ar failed");
 
     // Optional kernel-lab shared object for the Python bench harness
-    // (openinfer-glm52/benches/kernel_lab): the exact production objects —
+    // (pegainfer-glm52/benches/kernel_lab): the exact production objects —
     // same sources, same nvcc flags — linked as a dlopen-able .so. Skipped
-    // entirely unless OPENINFER_KERNEL_LAB is set, so default builds run zero
+    // entirely unless PEGAINFER_KERNEL_LAB is set, so default builds run zero
     // extra commands and zero extra link lines.
-    if std::env::var_os("OPENINFER_KERNEL_LAB").is_some() {
+    if std::env::var_os("PEGAINFER_KERNEL_LAB").is_some() {
         link_kernel_lab_shared(&nvcc, &toolkit, &out_dir, &kernel_lab_objs);
     }
 

@@ -1,6 +1,6 @@
 # kernel_lab ops & maintenance manual
 
-> **TL;DR:** `openinfer-glm52/benches/kernel_lab` is a manifest-driven check/bench/compare harness that measures the production CUDA objects (or python-native CuTe DSL kernels) per unit: TOML manifests are the behavior domain, adapters implement a three-function calling convention around `torch`-lazy imports, `--cold-l2` and `--save` are mutually exclusive protocols, the ledger buckets by `(shape, arch)`, and the CPU-only pytest guards the contract. This doc is for the person who maintains or extends the harness; the fp8 line's numbers live in `fp8-blockwise-gemm-lab.md`.
+> **TL;DR:** `pegainfer-glm52/benches/kernel_lab` is a manifest-driven check/bench/compare harness that measures the production CUDA objects (or python-native CuTe DSL kernels) per unit: TOML manifests are the behavior domain, adapters implement a three-function calling convention around `torch`-lazy imports, `--cold-l2` and `--save` are mutually exclusive protocols, the ledger buckets by `(shape, arch)`, and the CPU-only pytest guards the contract. This doc is for the person who maintains or extends the harness; the fp8 line's numbers live in `fp8-blockwise-gemm-lab.md`.
 
 ## Architecture at a glance
 
@@ -14,7 +14,7 @@ manifests/<unit>.toml            kernel_lab/registry.py        kernel_lab/units/
  kernel_lab/manifest.py            --python_native?--> kernel_lab/loader.py
   load_dir: TOML -> dataclass,                      default so: target/release/libglm52_kernel_lab.so
   name/shape/schema validation                      (build.rs links it from the SAME objects+flags as
-                                                    the production archive when OPENINFER_KERNEL_LAB=1;
+                                                    the production archive when PEGAINFER_KERNEL_LAB=1;
                                                     ctypes, RTLD_LAZY — DeepEP shim NCCL symbols left
                                                     unresolved and never called)
                                                            |
@@ -29,7 +29,7 @@ manifests/<unit>.toml            kernel_lab/registry.py        kernel_lab/units/
                                                     benches/tests/ (CPU-only pytest; never imports torch)
 ```
 
-Command surface (`python3 -m kernel_lab ...`): `build` (env-sets `OPENINFER_KERNEL_LAB=1`
+Command surface (`python3 -m kernel_lab ...`): `build` (env-sets `PEGAINFER_KERNEL_LAB=1`
 and runs the cargo build), `list` (CPU-only, torch-free), `check`
 (torch reference vs kernel, gate on the manifest's `rel_l2`), `bench`
 (`--rows/--warmup/--rounds/--inner/--cold-l2/--save`), `compare`
@@ -57,7 +57,7 @@ Facts worth memorizing before touching anything:
 ## Adding a new CUTLASS (.so-symbol) unit
 
 1. **Kernel side first**: the production symbol must exist in
-   `openinfer-kernels/csrc/glm52/*.cu` and export through the release build;
+   `pegainfer-kernels/csrc/glm52/*.cu` and export through the release build;
    note its ABI (arg order/types) — the adapter drives it raw via ctypes.
 2. **Manifest**: copy an existing TOML (e.g. `manifests/fp8_gemm.q_b.toml`),
    rename to `<unit>.toml`; the file stem must equal the `unit` field and match
@@ -116,7 +116,7 @@ cross-compile needs no matching card):
 # Pre-create the dump dir; a JIT-cache-hit compile dumps nothing, so point
 # the persistent cache somewhere fresh when you want a re-dump.
 mkdir -p /tmp/dsl_dump /tmp/dsl_cache_fresh
-PYTHONPATH=openinfer-glm52/benches \
+PYTHONPATH=pegainfer-glm52/benches \
 CUTE_DSL_ARCH=sm_103a CUTE_DSL_KEEP=ptx,cubin CUTE_DSL_DUMP_DIR=/tmp/dsl_dump \
 CUTE_DSL_CACHE_DIR=/tmp/dsl_cache_fresh \
 .venv/bin/python -c '<invoke the adapter run() once>'
@@ -190,12 +190,12 @@ Recorded pattern from the 2026-08-03 GB300 tray17 session:
    `uv venv --system-site-packages` so it inherits the image's pinned
    torch (that session: 2.11.0+cu130 aarch64), then
    `uv pip install nvidia-cutlass-dsl==4.6.0` (aarch64 wheels exist).
-2. `rsync` the `openinfer-glm52/benches/` snapshot over; DSL `.py` edits are
+2. `rsync` the `pegainfer-glm52/benches/` snapshot over; DSL `.py` edits are
    then edit-rsync-run — no cargo rebuild (python-native units), with the
    `--so` placeholder pointing at a previously built
    `libglm52_kernel_lab.so`.
 3. Building the .so on the tray is plain
-   `OPENINFER_KERNEL_LAB=1 cargo build --release -p openinfer-kernels
+   `PEGAINFER_KERNEL_LAB=1 cargo build --release -p pegainfer-kernels
    --features glm52` (equals `kernel_lab build`); the run-only loop does not
    need it.
 4. Keep one venv per session and document box state (other jobs share
