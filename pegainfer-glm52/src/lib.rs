@@ -445,7 +445,7 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
         ranks.start,
         ranks.end
     );
-    // The (slots, drafts) startup pair must fit the 48-row step budget —
+    // The (slots, drafts) startup pair must fit the step-row budget —
     // an over-committed pair would silently cap verify spans under full
     // occupancy and collapse speculation (#812's original failure mode).
     // Only native MTP rides verify spans; without a drafter every slot is a
@@ -460,6 +460,11 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
         slots * (1 + draft_len) <= model::GLM52_MAX_STEP_ROWS,
         "GLM5.2 GLM52_DECODE_SLOTS={slots} x (1 + GLM52_MTP_DRAFTS={draft_len}) exceeds the \
          {}-row step budget; 32 slots need GLM52_MTP_DRAFTS=2",
+        model::GLM52_MAX_STEP_ROWS
+    );
+    log::info!(
+        "GLM5.2 decode profile: slots={slots} mtp_draft_span={draft_len} ({} of {} step rows)",
+        slots * (1 + draft_len),
         model::GLM52_MAX_STEP_ROWS
     );
     // Probe only the GPUs this process hosts (local ordinals 0..N), not the

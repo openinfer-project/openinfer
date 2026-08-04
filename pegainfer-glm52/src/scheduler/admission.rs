@@ -472,13 +472,14 @@ fn admit_native(
         handoff.committed_len,
     );
     state.seed_native_pd_replayed_anchor();
-    state.set_drafts(
+    let verify_drafts = state.set_drafts(
         handoff.draft_tokens.clone(),
         crate::mtp::glm52_mtp_draft_len(),
     );
     log::info!(
         "GLM5.2 native P/D admitted: rank={rank} slot={slot} \
-         committed_len={} drafts={} boundary_copy={} first_step=verify",
+         committed_len={} envelope_drafts={} verify_drafts={verify_drafts} \
+         boundary_copy={} first_step=verify",
         handoff.committed_len,
         handoff.draft_tokens.len(),
         boundary_copy.is_some(),

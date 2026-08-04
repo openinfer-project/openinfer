@@ -337,9 +337,12 @@ impl Glm52SlotState {
     /// Install the draft lane's proposal for the next verify span, truncated
     /// to the topology's span cap ([`GLM52_DSPARK_EP8_SPAN_DRAFTS`] under EP8,
     /// all of [`GLM52_DSPARK_DRAFTS`] under the mirrored TP span shape).
-    pub(super) fn set_drafts(&mut self, mut drafts: Vec<u32>, span_drafts: usize) {
+    /// Returns the effective draft count after truncating to this engine's
+    /// verify span (envelopes may carry the full fixed-width proposal array).
+    pub(super) fn set_drafts(&mut self, mut drafts: Vec<u32>, span_drafts: usize) -> usize {
         drafts.truncate(span_drafts);
         self.drafts = drafts;
+        self.drafts.len()
     }
 
     /// Fold one step's span of outputs in.
