@@ -531,6 +531,78 @@ fn aligned_native_front_admits_against_its_own_hold() {
 }
 
 #[test]
+fn unaligned_native_credits_full_pages_only() {
+    // An unaligned hold pins full pages PLUS the padded boundary page, but
+    // only the full pages fold into the resident set — the boundary page
+    // stays a pinned copy source and its destination is a fresh private
+    // allocation. Crediting the boundary page would admit into a pool that
+    // cannot back the destination and die at the boundary schedule.
+    let committed: Vec<u32> = (0..(PAGE + 1) as u32).map(|t| 90_000 + t).collect();
+
+    // Exact capacity: the hold owns both resolved pages, nothing is free.
+    // need = 2, credit = 1 full page, physical = 0 + 1 → defer, not fatal.
+    let pool = Arc::new(BlockPool::new(PAGE, 3));
+    let (store, rt) = test_store(&pool);
+    let (req, prefix, handoff, _rx) =
+        resolved_native(&pool, &store, &rt, committed.clone(), 70_001, 8);
+    let mut slots: RankSlots = std::array::from_fn(|_| None);
+    let mut pending = VecDeque::from([Resolved::Native {
+        req,
+        prefix,
+        handoff,
+    }]);
+    let mut pending_resets = Vec::new();
+    admit_from_queue(
+        0,
+        &mut pending,
+        &mut slots,
+        &pool,
+        100,
+        &store,
+        true,
+        false,
+        false,
+        &mut pending_resets,
+    )
+    .expect("a boundary destination the pool cannot back defers, never fails");
+    assert_eq!(pending.len(), 1, "the front waits for a free page");
+    assert_eq!(slots.iter().flatten().count(), 0);
+
+    // One spare page backs the boundary destination: the same shape admits.
+    let pool = Arc::new(BlockPool::new(PAGE, 4));
+    let (store, rt) = test_store(&pool);
+    let (req, prefix, handoff, _rx) =
+        resolved_native(&pool, &store, &rt, committed, 70_001, 8);
+    let mut slots: RankSlots = std::array::from_fn(|_| None);
+    let mut pending = VecDeque::from([Resolved::Native {
+        req,
+        prefix,
+        handoff,
+    }]);
+    let mut pending_resets = Vec::new();
+    admit_from_queue(
+        0,
+        &mut pending,
+        &mut slots,
+        &pool,
+        100,
+        &store,
+        true,
+        false,
+        false,
+        &mut pending_resets,
+    )
+    .expect("one spare page admits the boundary copy");
+    assert!(pending.is_empty());
+    let active = slots.iter().flatten().next().expect("slot formed");
+    assert_eq!(active.kv.kv_position(), PAGE + 1);
+    assert!(
+        active.boundary_copy.is_some(),
+        "an unaligned commit restores through a boundary copy"
+    );
+}
+
+#[test]
 fn suppressed_eos_finishes_at_admission_without_a_slot() {
     let pool = Arc::new(BlockPool::new(PAGE, 4));
     let (store, _rt) = test_store(&pool);

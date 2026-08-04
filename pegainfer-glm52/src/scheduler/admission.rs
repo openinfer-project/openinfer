@@ -240,17 +240,17 @@ pub(super) fn admit_from_queue(
         // final authority, so add back pages held by active requests and by
         // the front's own prefix hold (already out of the free pool) and
         // defer if the physical lifetime budget is smaller.
+        // A native hold credits FULL pages only: an unaligned handoff's
+        // padded boundary page is pinned as the copy-on-restore source and
+        // never folds into the request's resident set, so counting it would
+        // over-admit by one page at exact capacity.
         let (need_blocks, front_held) = match front {
             Resolved::Plain { req, prefix } => {
                 (admission_lifetime_blocks(req, None), prefix.hit_tokens() / PAGE)
             }
-            Resolved::Native {
-                req,
-                prefix,
-                handoff,
-            } => (
+            Resolved::Native { req, handoff, .. } => (
                 admission_lifetime_blocks(req, Some(handoff)),
-                prefix.hit_tokens() / PAGE,
+                handoff.committed_len / PAGE,
             ),
             Resolved::Failed { .. } => unreachable!("handled above"),
         };
@@ -288,12 +288,7 @@ pub(super) fn admit_from_queue(
             // reject). Bounded FIFO exception: admit the first one whose own
             // lifetime fits the current budget.
             let bypass = pending.iter().enumerate().skip(1).find_map(|(idx, entry)| {
-                let Resolved::Native {
-                    req,
-                    prefix,
-                    handoff,
-                } = entry
-                else {
+                let Resolved::Native { req, handoff, .. } = entry else {
                     return None;
                 };
                 if req.token_tx.is_closed() {
@@ -303,7 +298,7 @@ pub(super) fn admit_from_queue(
                 let physical = pool
                     .available_blocks()
                     .saturating_add(active_resident)
-                    .saturating_add(prefix.hit_tokens() / PAGE);
+                    .saturating_add(handoff.committed_len / PAGE);
                 (committed + need <= usable.min(physical)).then_some((idx, need))
             });
             let Some((idx, need_blocks)) = bypass else {
@@ -476,7 +471,9 @@ fn admit_native(
         Some(super::native_mtp_cache_salt()),
         None,
     );
-    if !kv.try_admit(pool, prefix.hit_tokens() / PAGE) {
+    // Credit FULL pages only: an unaligned chain's padded boundary page is
+    // the pinned copy source, never part of the resident set.
+    if !kv.try_admit(pool, handoff.committed_len / PAGE) {
         req.prompt_tokens.pop();
         return Ok(Some(Resolved::Native {
             req,

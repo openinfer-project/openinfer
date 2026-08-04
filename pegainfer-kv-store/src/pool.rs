@@ -40,12 +40,13 @@ pub struct BlockPool {
     /// [`entitlement::EntitledSeq`], consumed by the
     /// [`Self::reserve_loaded_blocks`] floor.
     entitled: Arc<AtomicI64>,
-    /// Serializes every move that trades availability against the floor —
-    /// opportunistic reserves ([`Self::reserve_loaded_blocks`]) and
-    /// entitlement declarations ([`RequestKv::try_admit`]) — so neither can
-    /// dip into pages the other just claimed. Admitted draws never wait on
-    /// this lock.
-    reserve_gate: Mutex<()>,
+    /// Serializes every move that trades availability against the floor:
+    /// opportunistic reserves ([`Self::reserve_loaded_blocks`]), entitlement
+    /// declarations ([`RequestKv::try_admit`]), and admitted draws/returns
+    /// (`EntitledSeq::with_draw` — a returned block and its entitlement
+    /// refund must become visible together, or a reserve lands in between
+    /// and over-commits the pool).
+    reserve_gate: Arc<Mutex<()>>,
 }
 
 impl BlockPool {
@@ -87,7 +88,7 @@ impl BlockPool {
             block_size,
             padding_block_id,
             entitled: Arc::new(AtomicI64::new(0)),
-            reserve_gate: Mutex::new(()),
+            reserve_gate: Arc::new(Mutex::new(())),
         }
     }
 
@@ -165,7 +166,12 @@ impl BlockPool {
             Some(salt_hash),
         );
         RequestKv {
-            inner: entitlement::EntitledSeq::new(seq, Arc::clone(&self.entitled), lifetime_blocks),
+            inner: entitlement::EntitledSeq::new(
+                seq,
+                Arc::clone(&self.entitled),
+                Arc::clone(&self.reserve_gate),
+                lifetime_blocks,
+            ),
             emitted_blocks: 0,
         }
     }
@@ -377,6 +383,7 @@ pub fn resolved_page_ids(prefix: &KvPrefix) -> Vec<i32> {
 /// the raw field is private to this module and the compiler is the enforcer.
 mod entitlement {
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::sync::atomic::AtomicI64;
     use std::sync::atomic::Ordering;
 
@@ -386,6 +393,10 @@ mod entitlement {
         seq: SchedulableSequence<()>,
         /// The owning pool's entitled counter (`BlockPool::entitled`).
         counter: Arc<AtomicI64>,
+        /// The owning pool's reserve gate: an admitted mutation and its
+        /// counter settlement hold it together, so a concurrent reserve
+        /// never sees returned blocks before their entitlement refund.
+        gate: Arc<Mutex<()>>,
         /// Set by [`Self::admit`]; only admitted requests move the counter.
         admitted: bool,
         /// Input-plus-output page capacity, frozen at construction. The
@@ -401,11 +412,13 @@ mod entitlement {
         pub(super) fn new(
             seq: SchedulableSequence<()>,
             counter: Arc<AtomicI64>,
+            gate: Arc<Mutex<()>>,
             lifetime_blocks: usize,
         ) -> Self {
             Self {
                 seq,
                 counter,
+                gate,
                 admitted: false,
                 lifetime_blocks,
             }
@@ -436,17 +449,25 @@ mod entitlement {
         }
 
         /// Run a sequence mutation; the resident delta settles against the
-        /// counter (draws shrink it, returned blocks grow it back).
+        /// counter (draws shrink it, returned blocks grow it back). Admitted
+        /// requests mutate under the reserve gate: a return path
+        /// (revert/rejected drafts) frees blocks inside `f`, and without the
+        /// gate a reserve could take them before the refund lands — the
+        /// entitled floor would then exceed what remains. Unadmitted
+        /// requests settle nothing and skip the lock.
         pub(super) fn with_draw<T>(
             &mut self,
             f: impl FnOnce(&mut SchedulableSequence<()>) -> T,
         ) -> T {
+            if !self.admitted {
+                return f(&mut self.seq);
+            }
+            let gate = Arc::clone(&self.gate);
+            let _gate = gate.lock().expect("reserve gate poisoned");
             let before = self.resident();
             let out = f(&mut self.seq);
-            if self.admitted {
-                self.counter
-                    .fetch_add(before - self.resident(), Ordering::AcqRel);
-            }
+            self.counter
+                .fetch_add(before - self.resident(), Ordering::AcqRel);
             out
         }
 
@@ -1252,13 +1273,19 @@ mod tests {
             kv.apply_prefill(70_000, &pool)
                 .expect("apply after a successful schedule");
             rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            let decode_steps = (rng >> 33) as usize % (max_output - 1);
+            let decode_steps = (rng >> 33) as usize % (max_output - 4);
             for step in 0..decode_steps {
                 kv.schedule_decode(&pool)
                     .expect("an admitted decode draw must never fail");
                 kv.apply_decode(80_000 + step as u32, &pool)
                     .expect("apply after a successful schedule");
             }
+            // The return path: a reverted speculative reservation frees
+            // blocks and refunds entitlement — racing reserves must see
+            // both moves together or the floor over-commits.
+            kv.schedule_speculative(3, &pool)
+                .expect("an admitted speculative draw must never fail");
+            kv.revert_schedule().unwrap();
             kv.mark_blocks_reset_on_release();
             kv.release().unwrap();
             assert_eq!(pool.entitled_blocks(), 0, "round {round} leaked entitlement");
