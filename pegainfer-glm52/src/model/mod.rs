@@ -18,6 +18,8 @@
 //! row count keeps every step's kernel shapes identical within a bucket
 //! (the whole-step CUDA graphs' contract).
 
+use std::sync::Arc;
+
 use anyhow::Context as _;
 use anyhow::Result;
 use anyhow::ensure;
@@ -41,7 +43,7 @@ use pegainfer_kernels::tensor::DeviceContext;
 use pegainfer_kernels::tensor::DeviceMatrix;
 use pegainfer_kernels::tensor::DeviceVec;
 use pegainfer_kernels::tensor::HiddenStatesRef;
-use pegainfer_kv_offload::KvArena;
+use pegainfer_kv_store::ArenaSpec;
 use pegainfer_sample::BatchSamplingRow;
 use pegainfer_sample::BatchSamplingScratch;
 use pegainfer_sample::effectively_greedy;
@@ -285,6 +287,9 @@ pub(crate) struct Glm52StepKv {
     /// index space). Padding rows point into the padding page.
     #[serde(with = "serde_step_rows")]
     pub(crate) slot_mapping: [i64; GLM52_MAX_STEP_ROWS],
+    /// Native P/D boundary restores: `(src, dst)` pool page pairs copied
+    /// across every KV arena before this step's kernels run.
+    pub(crate) boundary_copies: Vec<(i32, i32)>,
 }
 
 /// serde's derive stops at 32-element arrays; the step-row arrays serialize
@@ -540,7 +545,7 @@ impl Glm52RankModel {
     /// block's MLA page and its index-K slice together — an MLA page restored
     /// without its index-K would be silent corruption. The arenas are
     /// contiguous, so a block's stride equals its copy size.
-    pub(crate) fn kv_arenas(&self, stream: &CudaStream) -> Result<Vec<KvArena>> {
+    pub(crate) fn kv_arenas(&self, stream: &CudaStream) -> Result<Vec<ArenaSpec>> {
         let num_blocks = self.pool_blocks;
         let mla_block_bytes = GLM52_FLASHMLA_SPARSE_PAGE_SIZE * self.mla_cache_bytes_per_token;
         let idxk_block_bytes = INDEX_CACHE_BLOCK * (GLM52_INDEX_HEAD_DIM + 4);
@@ -553,13 +558,12 @@ impl Glm52RankModel {
                 caches.mla_cache.len(),
             );
             let (base_ptr, _sync) = caches.mla_cache.device_ptr(stream);
-            arenas.push(KvArena {
-                name: format!("glm52.L{layer}.mla"),
+            arenas.push(contiguous_arena(
+                format!("glm52.L{layer}.mla"),
                 base_ptr,
                 num_blocks,
-                bytes_per_block: mla_block_bytes,
-                block_stride_bytes: mla_block_bytes,
-            });
+                mla_block_bytes,
+            ));
             if let Some(index_k) = &caches.index_k_cache {
                 ensure!(
                     index_k.len() == num_blocks * idxk_block_bytes,
@@ -568,19 +572,42 @@ impl Glm52RankModel {
                     index_k.len(),
                 );
                 let (base_ptr, _sync) = index_k.device_ptr(stream);
-                arenas.push(KvArena {
-                    name: format!("glm52.L{layer}.idxk"),
+                arenas.push(contiguous_arena(
+                    format!("glm52.L{layer}.idxk"),
                     base_ptr,
                     num_blocks,
-                    bytes_per_block: idxk_block_bytes,
-                    block_stride_bytes: idxk_block_bytes,
-                });
+                    idxk_block_bytes,
+                ));
             }
         }
         if let Some(mtp) = &self.mtp {
             arenas.extend(mtp.kv_arenas(stream)?);
         }
         Ok(arenas)
+    }
+
+    /// Native P/D boundary restore: copy one pool page across every KV arena
+    /// [`Self::kv_arenas`] registers — each layer's MLA (+ index-K sidecar)
+    /// and the MTP layer-78 mirrors — from the restored shared page into the
+    /// request's own page.
+    pub(crate) fn copy_kv_page(
+        &mut self,
+        ctx: &DeviceContext,
+        src: usize,
+        dst: usize,
+    ) -> Result<()> {
+        let mla_block_bytes = GLM52_FLASHMLA_SPARSE_PAGE_SIZE * self.mla_cache_bytes_per_token;
+        let idxk_block_bytes = INDEX_CACHE_BLOCK * (GLM52_INDEX_HEAD_DIM + 4);
+        for caches in &mut self.caches {
+            copy_arena_block(&ctx.stream, &mut caches.mla_cache, mla_block_bytes, src, dst)?;
+            if let Some(index_k) = &mut caches.index_k_cache {
+                copy_arena_block(&ctx.stream, index_k, idxk_block_bytes, src, dst)?;
+            }
+        }
+        if let Some(mtp) = &mut self.mtp {
+            mtp.copy_committed_kv_page(ctx, src, dst)?;
+        }
+        Ok(())
     }
 
     /// Phase 1 of the two-phase build: everything NOT sized by the pool
@@ -1226,6 +1253,13 @@ impl Glm52RankModel {
             "GLM5.2 sampling rows cannot ride a launch-ahead step (the speculation feeds the \
              argmax token, not the sampled one)"
         );
+        for &(src, dst) in &kv.boundary_copies {
+            ensure!(
+                !flags.consume,
+                "GLM5.2 boundary copy on a consumed lease step (kernels already enqueued)"
+            );
+            self.copy_kv_page(ctx, src as usize, dst as usize)?;
+        }
         let batch = shape.bucket;
         if flags.consume {
             // Launch-ahead fast path: the engine says this step IS the
@@ -1590,5 +1624,51 @@ mod cache_layout_tests {
         assert_eq!(tp4_prefill, ep_decode);
         assert_eq!(GLM52_FLASHMLA_SPARSE_PAGE_SIZE * tp4_prefill, 41_984);
         assert_eq!(INDEX_CACHE_BLOCK * (GLM52_INDEX_HEAD_DIM + 4), 8_448);
+    }
+}
+
+/// A contiguous cache arena (stride == copy size, one segment) — every
+/// GLM5.2 cache allocation is one flat per-layer buffer, so a block's
+/// strided extent is just its byte size and the arena length covers exactly
+/// `num_blocks` of them.
+/// One page-granular D2D within a contiguous arena. `src` and `dst` never
+/// overlap: the destination is always a freshly allocated private page.
+pub(crate) fn copy_arena_block(
+    stream: &Arc<CudaStream>,
+    arena: &mut CudaSlice<u8>,
+    block_bytes: usize,
+    src: usize,
+    dst: usize,
+) -> Result<()> {
+    ensure!(src != dst, "arena block copy onto itself: page {src}");
+    let split = src.max(dst) * block_bytes;
+    let (mut low, mut high) = arena.split_at_mut(split);
+    if src < dst {
+        let src = low.slice(src * block_bytes..(src + 1) * block_bytes);
+        let mut dst = high.slice_mut(0..block_bytes);
+        stream.memcpy_dtod(&src, &mut dst)?;
+    } else {
+        let src = high.slice(0..block_bytes);
+        let mut dst = low.slice_mut(dst * block_bytes..(dst + 1) * block_bytes);
+        stream.memcpy_dtod(&src, &mut dst)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn contiguous_arena(
+    name: String,
+    base_device_ptr: u64,
+    num_blocks: usize,
+    block_bytes: usize,
+) -> ArenaSpec {
+    ArenaSpec {
+        name,
+        base_device_ptr,
+        size_bytes: num_blocks * block_bytes,
+        num_blocks,
+        segment_bytes: block_bytes,
+        segments: 1,
+        kv_stride_bytes: 0,
+        block_stride_bytes: block_bytes,
     }
 }

@@ -42,6 +42,7 @@ mod weights;
 use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Context as _;
@@ -54,10 +55,13 @@ pub use config::probe_config_json;
 use pegainfer_core::engine::EngineHandle;
 use pegainfer_core::engine::KvCapacity;
 use pegainfer_core::engine::LoadSnapshot;
-use pegainfer_kv_offload::HostConfig;
-use pegainfer_kv_offload::KvArena;
-use pegainfer_kv_offload::OffloadEngine;
-use pegainfer_kv_offload::OffloadHost;
+use pegainfer_kv_store::ArenaSpec;
+use pegainfer_kv_store::BlockPool;
+use pegainfer_kv_store::KvStore;
+use pegainfer_kv_store::KvStoreBuilder;
+use pegainfer_kv_store::OffloadRankSpec;
+use pegainfer_kv_store::P2pConfig;
+use pegainfer_kv_store::PegaflowHost;
 use runner::Glm52PrefillBatch;
 use runner::Glm52RankPlacement;
 use runner::Glm52RankWorker;
@@ -380,7 +384,7 @@ pub struct Glm52KvOffloadOptions {
     pub p2p: Option<Glm52P2pOptions>,
 }
 
-/// Cross-instance P2P KV sharing (see `pegainfer_kv_offload::P2pConfig`).
+/// Cross-instance P2P KV sharing (see `pegainfer_kv_store::P2pConfig`).
 #[derive(Clone, Debug)]
 pub struct Glm52P2pOptions {
     /// MetaServer gRPC address, e.g. `http://10.0.0.100:50056`.
@@ -1005,7 +1009,20 @@ fn start_engine(
             return Err(err);
         }
     };
-    let post_comm_startup = || -> Result<Option<Vec<OffloadEngine>>> {
+    let mirrored_early = moe_topo.uses_tensor_replicated_moe();
+    let local_ranks_early = if mirrored_early {
+        1
+    } else {
+        loaded.workers.len()
+    };
+    // The rank pools are built BEFORE the engines spawn: the store's rank
+    // table freezes at build, and BlockPool is a pure CPU object with no
+    // thread affinity. Each engine and the store share the same Arc.
+    let pools: Vec<Arc<BlockPool>> = (0..local_ranks_early)
+        .map(|_| Arc::new(BlockPool::new(GLM52_MODEL_LEN_ALIGN, pool_blocks)))
+        .collect();
+    let store_runtime = store_runtime_handle();
+    let post_comm_startup = || -> Result<Arc<KvStore>> {
         if prefill_only.is_some() {
             preflight_prefill_kernels(&loaded.workers)?;
         }
@@ -1014,13 +1031,28 @@ fn start_engine(
         }
         ensure_post_build_headroom(&loaded.workers)?;
         let device_ordinals: Vec<usize> = (0..startup.ranks.len()).collect();
-        let offload = kv_offload
-            .map(|opts| build_offload_engines(&opts, rank_arenas, &device_ordinals))
-            .transpose()?;
-        Ok(offload)
+        // A mirrored (TP) topology is one logical rank whose arenas are the
+        // first worker's — the historical layout the wire namespace pins.
+        let store_arenas = if mirrored_early {
+            vec![rank_arenas.into_iter().next().context("TP arenas")?]
+        } else {
+            rank_arenas
+        };
+        build_kv_store(
+            kv_offload.as_ref(),
+            store_arenas,
+            &device_ordinals[..local_ranks_early],
+            &pools,
+            if mirrored_early {
+                0
+            } else {
+                startup.ranks.start
+            },
+            &store_runtime,
+        )
     };
-    let offload = match post_comm_startup() {
-        Ok(started) => started,
+    let store = match post_comm_startup() {
+        Ok(store) => store,
         Err(err) => {
             for worker in &loaded.workers {
                 let _ = worker.request_shutdown();
@@ -1028,7 +1060,6 @@ fn start_engine(
             return Err(err);
         }
     };
-    let logical_ranks = moe_topo.logical_rank_count();
     let kv_total_blocks = pool_blocks - 1;
     // One autonomous engine per LOCAL logical rank (a mirrored topology
     // collapses to a single engine driving every worker). Each engine owns
@@ -1061,23 +1092,10 @@ fn start_engine(
             .map(|worker| vec![worker])
             .collect()
     };
-    let offload_groups: Vec<Option<Vec<OffloadEngine>>> = if mirrored {
-        vec![offload]
-    } else {
-        match offload {
-            Some(engines) => engines
-                .into_iter()
-                .map(|engine| Some(vec![engine]))
-                .collect(),
-            None => (0..local_ranks).map(|_| None).collect(),
-        }
-    };
     let mut submit_txs = Vec::with_capacity(local_ranks);
     let mut startup_rxs = Vec::with_capacity(local_ranks);
     let mut join_handles = Vec::with_capacity(local_ranks);
-    for (engine_index, (engine_workers, engine_offload)) in
-        worker_groups.into_iter().zip(offload_groups).enumerate()
-    {
+    for (engine_index, engine_workers) in worker_groups.into_iter().enumerate() {
         let rank = if mirrored {
             0
         } else {
@@ -1092,11 +1110,12 @@ fn start_engine(
             eos_token_ids: eos_token_ids.clone(),
             drafter: drafter.clone(),
             prefill_chunk_size: prefill_only.map(|prefill| prefill.chunk_size),
-            pool_blocks,
+            pool: Arc::clone(&pools[engine_index]),
+            kv_offload: kv_offload.is_some(),
+            store: Arc::clone(&store),
+            runtime: store_runtime.clone(),
             max_model_len,
             no_prefix_cache,
-            offload: engine_offload,
-            logical_ranks,
             moe_topo,
             load_tx: load_txs[engine_index].clone(),
             graph_dump_request: if engine_index == 0 {
@@ -1293,7 +1312,7 @@ fn build_rank_models(
     rendezvous: Option<&str>,
     floor_blocks: usize,
     post_finish_reserve_bytes: usize,
-) -> Result<(Vec<Vec<KvArena>>, usize)> {
+) -> Result<(Vec<Vec<ArenaSpec>>, usize)> {
     let build_started = Instant::now();
     let prefill_only = prefill_chunk_size.is_some();
     let responses = workers
@@ -1453,39 +1472,56 @@ fn build_rank_models(
 /// The namespace folds the layout facts that make blocks interchange-safe
 /// (per-token packing, page size, layer count); pool capacity deliberately
 /// stays out (a block's bytes don't depend on it).
-fn build_offload_engines(
-    opts: &Glm52KvOffloadOptions,
-    rank_arenas: Vec<Vec<KvArena>>,
+/// Build the process-wide [`KvStore`]: every logical rank's pool, and — with
+/// offload configured — one shared [`PegaflowHost`] plus a per-rank pegaflow
+/// instance registration. All DP ranks share one namespace (replicated
+/// non-expert weights make their KV interchangeable), folding the layout
+/// facts that make blocks interchange-safe.
+fn build_kv_store(
+    opts: Option<&Glm52KvOffloadOptions>,
+    rank_arenas: Vec<Vec<ArenaSpec>>,
     device_ordinals: &[usize],
-) -> Result<Vec<OffloadEngine>> {
+    pools: &[Arc<BlockPool>],
+    ranks_start: usize,
+    runtime: &tokio::runtime::Handle,
+) -> Result<Arc<KvStore>> {
+    // The store's rank table is keyed by GLOBAL logical rank — the engines
+    // query it with `ranks.start + local_index` on a multi-process fleet.
+    let mut builder = KvStoreBuilder::new(runtime.clone());
+    let Some(opts) = opts else {
+        for (local, pool) in pools.iter().enumerate() {
+            builder = builder.rank(ranks_start + local, Arc::clone(pool));
+        }
+        return Ok(Arc::new(builder.build()));
+    };
+
     let mla_page_size = pegainfer_kernels::ops::GLM52_FLASHMLA_SPARSE_PAGE_SIZE;
     let mla_bytes_per_token = rank_arenas
         .first()
         .and_then(|arenas| arenas.iter().find(|arena| is_mla_arena_name(&arena.name)))
         .context("GLM5.2 KV offload has no MLA arena")?
-        .bytes_per_block
+        .segment_bytes
         / mla_page_size;
     ensure!(
         rank_arenas.iter().all(|arenas| arenas
             .iter()
             .filter(|arena| is_mla_arena_name(&arena.name))
-            .all(|arena| arena.bytes_per_block == mla_page_size * mla_bytes_per_token)),
+            .all(|arena| arena.segment_bytes == mla_page_size * mla_bytes_per_token)),
         "GLM5.2 KV offload ranks disagree on MLA cache layout"
     );
-    let host = OffloadHost::new(HostConfig {
-        pinned_pool_bytes: opts.pinned_pool_bytes,
-        use_hugepages: opts.use_hugepages,
-        runtime_threads: 2,
-        p2p: opts
-            .p2p
-            .as_ref()
-            .map(|p2p| pegainfer_kv_offload::P2pConfig {
-                metaserver_addr: p2p.metaserver_addr.clone(),
-                advertise_addr: p2p.advertise_addr.clone(),
-                rdma_nics: p2p.rdma_nics.clone(),
-            }),
-    })
-    .map_err(|err| anyhow::anyhow!("GLM5.2 KV offload host: {err}"))?;
+    let mut host_builder = PegaflowHost::builder(opts.pinned_pool_bytes)
+        .use_hugepages(opts.use_hugepages)
+        .runtime_threads(2);
+    if let Some(p2p) = &opts.p2p {
+        host_builder = host_builder.p2p(P2pConfig {
+            metaserver_addr: p2p.metaserver_addr.clone(),
+            advertise_addr: p2p.advertise_addr.clone(),
+            rdma_nics: p2p.rdma_nics.clone(),
+        });
+    }
+    let host = host_builder
+        .build()
+        .map_err(|err| anyhow::anyhow!("GLM5.2 KV offload host: {err}"))?;
     let native_mtp = rank_arenas
         .first()
         .is_some_and(|arenas| arenas.iter().any(|arena| arena.name == "glm52.L78.mla"));
@@ -1496,35 +1532,63 @@ fn build_offload_engines(
         config::GLM52_INDEX_HEAD_DIM + 4,
         usize::from(native_mtp),
     );
-    let engines = rank_arenas
-        .into_iter()
-        .zip(device_ordinals)
-        .enumerate()
-        .map(|(rank, (arenas, &device_ordinal))| {
-            OffloadEngine::with_arenas_on(
-                std::sync::Arc::clone(&host),
-                format!("glm52-rank{rank}"),
-                &namespace,
-                device_ordinal as i32,
-                &arenas,
-                false,
+    ensure!(
+        rank_arenas.len() == pools.len() && device_ordinals.len() == pools.len(),
+        "GLM5.2 KV offload: {} arena sets, {} pools, {} devices must agree",
+        rank_arenas.len(),
+        pools.len(),
+        device_ordinals.len()
+    );
+    let ranks = rank_arenas.len();
+    let arenas_per_rank = rank_arenas.first().map_or(0, Vec::len);
+    for (local, (arenas, &device_ordinal)) in
+        rank_arenas.into_iter().zip(device_ordinals).enumerate()
+    {
+        let rank = ranks_start + local;
+        builder = builder
+            .rank_with_offload(
+                rank,
+                Arc::clone(&pools[local]),
+                &host,
+                OffloadRankSpec {
+                    instance_id: format!("glm52-rank{rank}"),
+                    namespace: namespace.clone(),
+                    device_id: device_ordinal as i32,
+                    arenas,
+                    page_first: false,
+                },
             )
-            .map_err(|err| anyhow::anyhow!("GLM5.2 KV offload rank {rank} registration: {err}"))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let arenas_per_rank = GLM52_LAYERS
-        + (0..GLM52_LAYERS)
-            .filter(|&layer| config::glm52_layer_has_full_indexer(layer))
-            .count()
-        + usize::from(native_mtp) * 2;
+            .map_err(|err| {
+                anyhow::anyhow!("GLM5.2 KV offload rank {rank} registration: {err:#}")
+            })?;
+    }
     log::info!(
         "GLM5.2 KV offload up: {} pinned host pool (hugepages: {}), namespace {namespace}, \
-         {} rank instances x {arenas_per_rank} arenas",
+         {ranks} rank instances x {arenas_per_rank} arenas",
         ByteSize(opts.pinned_pool_bytes as u64),
         opts.use_hugepages,
-        engines.len(),
     );
-    Ok(engines)
+    Ok(Arc::new(builder.build()))
+}
+
+/// The store's watcher/resolver runtime: the ambient tokio runtime when the
+/// loader runs under one (pegainfer-server's `spawn_blocking` keeps the
+/// context), else a small dedicated runtime living for the process.
+fn store_runtime_handle() -> tokio::runtime::Handle {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        return handle;
+    }
+    static FALLBACK: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    FALLBACK
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("kv-store fallback runtime")
+        })
+        .handle()
+        .clone()
 }
 
 fn is_mla_arena_name(name: &str) -> bool {

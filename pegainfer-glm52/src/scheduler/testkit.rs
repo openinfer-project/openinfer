@@ -2,8 +2,8 @@
 
 use pegainfer_core::engine::FinishReason;
 use pegainfer_core::engine::GenerateRequest;
-use pegainfer_kv_cache::BlockPool;
-use pegainfer_kv_cache::RequestKv;
+use pegainfer_kv_store::BlockPool;
+use pegainfer_kv_store::RequestKv;
 
 use super::PAGE;
 use super::slot::Glm52SlotState;
@@ -18,7 +18,7 @@ pub(super) fn state(prompt: Vec<u32>, max_tokens: usize, ignore_eos: bool) -> Gl
 /// A standalone `RequestKv` for tests that never schedule KV (the pool
 /// is leaked so the kvbm internals outlive the test value).
 pub(super) fn test_kv(prompt: Vec<u32>, max_tokens: usize) -> RequestKv {
-    let pool: &'static BlockPool = Box::leak(Box::new(BlockPool::new(PAGE, 64).unwrap()));
+    let pool: &'static BlockPool = Box::leak(Box::new(BlockPool::new(PAGE, 64)));
     pool.new_request(prompt, max_tokens, None)
 }
 

@@ -17,8 +17,7 @@ log = { workspace = true }
 memmap2 = { workspace = true }
 pegainfer-core = { workspace = true }
 pegainfer-kernels = { workspace = true, features = ["glm52"] }
-pegainfer-kv-cache = { workspace = true }
-pegainfer-kv-offload = { workspace = true }
+pegainfer-kv-store = { workspace = true }
 pegainfer-sample = { workspace = true }
 rayon = { workspace = true }
 safetensors = { workspace = true }

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::Context as _;
 use pegainfer_core::cuda_graph::CudaGraphDumpSummary;
-use pegainfer_kv_cache::BlockPool;
+use pegainfer_kv_store::BlockPool;
 
 use super::plan::padding_step_kv;
 use super::slot::GLM52_PADDING_STEP;

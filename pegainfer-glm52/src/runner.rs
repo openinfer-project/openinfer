@@ -13,7 +13,7 @@ use crossbeam_channel::Sender;
 use crossbeam_channel::bounded;
 use crossbeam_channel::unbounded;
 use pegainfer_core::cuda_graph::CudaGraphDumpSummary;
-use pegainfer_kv_offload::KvArena;
+use pegainfer_kv_store::ArenaSpec;
 
 use crate::dspark::GLM52_DSPARK_DRAFTS;
 use crate::dspark::Glm52DsparkModel;
@@ -229,7 +229,7 @@ enum Glm52RankCommand {
     /// the shared KV offload host.
     FinishKv {
         pool_blocks: usize,
-        resp: Sender<Result<Vec<KvArena>>>,
+        resp: Sender<Result<Vec<ArenaSpec>>>,
     },
     /// Collective: create the DeepEP context (barriers across ranks). Issued
     /// to every rank concurrently, only after all builds succeeded. Under the
@@ -393,7 +393,7 @@ impl Glm52RankWorker {
     pub(crate) fn finish_kv_async(
         &self,
         pool_blocks: usize,
-    ) -> Result<Receiver<Result<Vec<KvArena>>>> {
+    ) -> Result<Receiver<Result<Vec<ArenaSpec>>>> {
         let (resp_tx, resp_rx) = bounded(1);
         self.tx
             .send(Glm52RankCommand::FinishKv {
@@ -742,7 +742,7 @@ impl Glm52RankThreadState {
 
     /// Phase 2: allocate the pool-scaled slabs for the launch-decided count
     /// and assemble the rank runtime.
-    fn finish_kv(&mut self, pool_blocks: usize) -> Result<Vec<KvArena>> {
+    fn finish_kv(&mut self, pool_blocks: usize) -> Result<Vec<ArenaSpec>> {
         let fixed = self
             .fixed
             .take()

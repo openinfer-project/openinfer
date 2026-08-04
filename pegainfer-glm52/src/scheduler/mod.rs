@@ -47,6 +47,8 @@ mod slot;
 mod testkit;
 
 use std::collections::VecDeque;
+use std::sync::Arc;
+use std::time::Duration;
 
 use admission::admit_from_queue;
 use anyhow::Context as _;
@@ -56,12 +58,15 @@ use graph::precapture_step_graphs;
 use load::publish_load;
 use mtp::run_mtp_round;
 use pegainfer_core::engine::GenerateRequest;
+use pegainfer_core::engine::KvPrefix;
 use pegainfer_core::engine::LoadSnapshot;
 use pegainfer_core::engine::SubmittedRequest;
 use pegainfer_core::engine::TokenEvent;
-use pegainfer_kv_cache::BlockPool;
-use pegainfer_kv_cache::RequestKv;
-use pegainfer_kv_offload::OffloadEngine;
+use pegainfer_kv_store::BlockPool;
+use pegainfer_kv_store::KvStore;
+use pegainfer_kv_store::RequestKv;
+use pegainfer_kv_store::SaveClass;
+use pegainfer_kv_store::SaveCursor;
 use pegainfer_sample::mix_seed;
 use plan::collect_sampling_rows;
 use plan::feed_wants;
@@ -69,8 +74,6 @@ use plan::lease_flags;
 use plan::plan_prefill_spans;
 use plan::plan_step_shape;
 use plan::takes_argmax;
-use sha2::Digest as _;
-use sha2::Sha256;
 use slot::GLM52_PADDING_STEP;
 use slot::Glm52SlotState;
 use slot::Glm52StepOutcome;
@@ -142,13 +145,29 @@ mod prefix_cache_policy_tests {
 struct ActiveRequest {
     req: GenerateRequest,
     state: Glm52SlotState,
-    /// Prompt length from the client request. Native P/D v2 appends P's
-    /// anchor internally, but OpenAI usage must still report the original.
+    /// Prompt length from the client request. Native P/D appends P's anchor
+    /// internally, but OpenAI usage must still report the original.
     client_prompt_tokens: usize,
     /// The request's page assignments in the rank's pool. Block RAII: blocks
     /// return to the pool (registered ones as matchable prefix-cache entries)
     /// when this drops or `release()`s.
     kv: RequestKv,
+    /// Save bookkeeping for the store's seal/retire verbs, kept next to the
+    /// KV it tracks.
+    save_cursor: SaveCursor,
+    /// Native P/D only: pending first-step D2D of the restored boundary page
+    /// into the request's private page. Taken by the worker prologue before
+    /// the request's first kernel runs.
+    boundary_copy: Option<BoundaryCopy>,
+}
+
+/// One page-granular D2D across every KV arena, from the restored
+/// padded-name page to the request's own page. `prefix` pins the source
+/// until the copy retires.
+struct BoundaryCopy {
+    src_page: i32,
+    dst_page: i32,
+    _prefix: KvPrefix,
 }
 
 /// Per-rank slot occupancy: `slots[slot]`.
@@ -179,23 +198,22 @@ pub(crate) struct Glm52EngineSpec {
     /// This rank's executors: exactly one under EP, every mirrored worker
     /// under the tensor-replicated topologies.
     pub(crate) workers: Vec<Glm52Worker>,
+    /// The rank's logical pool, shared with the process-wide [`KvStore`]
+    /// (built before spawn — the store's rank table freezes at build).
+    pub(crate) pool: Arc<BlockPool>,
+    /// Whether the rank registered a host tier with the store.
+    pub(crate) kv_offload: bool,
+    /// The process-wide store: resolve/seal/retire and the pinned-pages
+    /// admission debit all go through it.
+    pub(crate) store: Arc<KvStore>,
+    /// Runtime the resolver tasks spawn onto (the same handle the store
+    /// drives its watchers with).
+    pub(crate) runtime: tokio::runtime::Handle,
     pub(crate) eos_token_ids: Vec<u32>,
     pub(crate) drafter: crate::Glm52Drafter,
     pub(crate) prefill_chunk_size: Option<usize>,
     pub(crate) max_model_len: usize,
-    /// The launch-measured pool block count — the scheduler's BlockPool and
-    /// the executor slabs (FinishKv) share this ONE number; carrying it in
-    /// the spec keeps a second launch in the same process from reading a
-    /// stale value through a global.
-    pub(crate) pool_blocks: usize,
     pub(crate) no_prefix_cache: bool,
-    /// This rank's offload engines (several only under a mirrored topology,
-    /// which uses the first — the historical layout); they hold the shared
-    /// pegaflow host, which must outlive every in-flight save.
-    pub(crate) offload: Option<Vec<OffloadEngine>>,
-    /// Fleet-wide logical rank count — the P/D states are sized by it so
-    /// their indexing (and their log lines) keep the global rank numbers.
-    pub(crate) logical_ranks: usize,
     pub(crate) moe_topo: crate::Glm52MoeTopo,
     pub(crate) load_tx: watch::Sender<LoadSnapshot>,
     pub(crate) graph_dump_request: Option<GraphDumpRequest>,
@@ -216,11 +234,19 @@ pub(crate) struct Glm52Engine {
     prefill_chunk_size: Option<usize>,
     max_model_len: usize,
     prefix_cache: bool,
-    offload: Option<Vec<offload::RankOffload>>,
-    native_pd: Option<offload::NativePdState>,
-    /// Plain host-tier restore in flight for this rank's queue front (the
-    /// non-P/D admission leg) — polled at step boundaries, never blocking.
-    host_restore: Option<offload::HostRestoreState>,
+    /// Whether this rank's store registration carries a host tier (drives
+    /// the step-flag hint the planner uses).
+    kv_offload: bool,
+    store: Arc<KvStore>,
+    runtime: tokio::runtime::Handle,
+    /// Resolver channel: intake spawns per-request resolution on the store's
+    /// runtime; completed intakes come back here — `pending` holds only
+    /// scheduler-ready requests.
+    ready_tx: mpsc::UnboundedSender<offload::Resolved>,
+    ready_rx: mpsc::UnboundedReceiver<offload::Resolved>,
+    /// Resolves spawned but not yet drained from `ready_rx` — the engine may
+    /// not exit (or block solely on `submit_rx`) while any are in flight.
+    resolves_inflight: Arc<std::sync::atomic::AtomicUsize>,
     moe_topo: crate::Glm52MoeTopo,
     load_tx: watch::Sender<LoadSnapshot>,
     graph_dump_request: Option<GraphDumpRequest>,
@@ -231,13 +257,13 @@ pub(crate) struct Glm52Engine {
     /// Verify-span draft budget: EP feeds 3 (the measured bucket-4 optimum);
     /// TP4 mirrored topology feeds the drafter's full proposal.
     span_drafts: usize,
-    pool: BlockPool,
+    pool: Arc<BlockPool>,
     table_width: usize,
     /// Pool pages available to requests (total minus the padding page) —
     /// constant for the engine's lifetime.
     usable_blocks: usize,
     slots: RankSlots,
-    pending: VecDeque<GenerateRequest>,
+    pending: VecDeque<offload::Resolved>,
     /// Slot draft states to clear on the next draft round (request left the
     /// slot, or a new one was admitted into it). Flushed with each step's
     /// Draft commands; the handler is idempotent, so duplicates are harmless.
@@ -283,7 +309,6 @@ impl Glm52Engine {
     }
 
     fn new(spec: Glm52EngineSpec) -> anyhow::Result<Self> {
-        let prefill_only = spec.prefill_chunk_size.is_some();
         let mirrored = spec.moe_topo.uses_tensor_replicated_moe();
         debug_assert_eq!(
             spec.workers.len(),
@@ -294,22 +319,12 @@ impl Glm52Engine {
             },
             "one executor per EP rank; every mirrored worker under TP"
         );
-        let offload: Option<Vec<offload::RankOffload>> = spec
-            .offload
-            .map(|engines| engines.into_iter().map(offload::RankOffload::new).collect());
-        let native_pd = (spec.drafter.is_mtp() && offload.is_some() && !prefill_only)
-            .then(|| offload::NativePdState::new(spec.logical_ranks));
-        // One KV page pool for this rank: pool block ids index the rank's
-        // per-layer MLA and index-K arenas directly (the arenas were built
-        // for `glm52_pool_blocks` blocks). Block 0-equivalent is the reserved
-        // padding page. Under mirrored TP the single pool drives every executor — the
-        // mirrored steps write the identical block ids on all 8 arenas.
-        // The prefill-only pool sizes for the full slot count too (it used to
-        // hold exactly one request's lifetime): the prefix cache needs spare
-        // blocks to RETAIN released prefixes across turns, and the headroom
-        // lets admission overlap prefills instead of serializing them. MLA
-        // keeps this cheap (~54 KB/token/rank -> a few GiB at 16K x 8).
-        let pool = BlockPool::new(PAGE, spec.pool_blocks)?;
+        // The pool arrives pre-built (shared with the process-wide KvStore,
+        // whose rank table froze at build); block ids index the rank's
+        // per-layer MLA and index-K arenas directly. Under mirrored TP the
+        // single pool drives every executor — the mirrored steps write the
+        // identical block ids on all arenas.
+        let pool = spec.pool;
         let table_width = glm52_table_width(spec.max_model_len);
         // Prefix matching policy lives in `prefix_cache_enabled`: DSpark is
         // the only drafter that forces it off (aux-hidden captures cannot be
@@ -323,8 +338,7 @@ impl Glm52Engine {
         // FlashInfer proposal cache (unregistered) nor the mirrors on the
         // other three ranks (the H2D lands on one rank's arena) — GPU radix
         // hits have neither problem, so plain prefix matching stays on.
-        let host_restore = (offload.is_some() && prefix_cache && spec.prefill_chunk_size.is_none())
-            .then(offload::HostRestoreState::new);
+        let (ready_tx, ready_rx) = mpsc::unbounded_channel();
         Ok(Self {
             rank: spec.rank,
             submit_rx: spec.submit_rx,
@@ -334,9 +348,12 @@ impl Glm52Engine {
             prefill_chunk_size: spec.prefill_chunk_size,
             max_model_len: spec.max_model_len,
             prefix_cache,
-            offload,
-            native_pd,
-            host_restore,
+            kv_offload: spec.kv_offload,
+            store: spec.store,
+            runtime: spec.runtime,
+            ready_tx,
+            ready_rx,
+            resolves_inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             moe_topo: spec.moe_topo,
             load_tx: spec.load_tx,
             graph_dump_request: spec.graph_dump_request,
@@ -379,7 +396,7 @@ impl Glm52Engine {
         if self.prefill_chunk_size.is_none() {
             precapture_step_graphs(
                 &self.workers,
-                std::slice::from_ref(&self.pool),
+                std::slice::from_ref(self.pool.as_ref()),
                 self.table_width,
                 self.mirrored,
             )?;
@@ -406,9 +423,16 @@ impl Glm52Engine {
             // collective (the free-running contract). A mirrored engine is
             // the sole issuer of its collectives, so it may block while
             // fully idle instead of burning the machine on padding.
-            if self.channel_open && self.all_idle() && self.pending.is_empty() {
+            if self.channel_open
+                && self.all_idle()
+                && self.pending.is_empty()
+                && self.resolves_inflight() == 0
+            {
                 self.publish();
                 if self.mirrored {
+                    // Sole issuer of its collectives: may block while fully
+                    // idle. With zero resolves in flight the only wake-up
+                    // source is the submit channel.
                     match self.submit_rx.blocking_recv() {
                         Some((req, _kv_prefix)) => self.intake(req),
                         None => self.channel_open = false,
@@ -422,7 +446,18 @@ impl Glm52Engine {
                     Err(mpsc::error::TryRecvError::Disconnected) => self.channel_open = false,
                 }
             }
-            if !self.channel_open && self.all_idle() && self.pending.is_empty() {
+            // Drain completed resolutions: the inbox holds only
+            // scheduler-ready requests (no polling, no queue-front parking).
+            while let Ok(resolved) = self.ready_rx.try_recv() {
+                self.resolves_inflight
+                    .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                self.pending.push_back(resolved);
+            }
+            if !self.channel_open
+                && self.all_idle()
+                && self.pending.is_empty()
+                && self.resolves_inflight() == 0
+            {
                 break;
             }
 
@@ -476,7 +511,7 @@ impl Glm52Engine {
                 consume,
                 self.pending.is_empty(),
                 self.drafter.enabled(),
-                self.offload.is_some(),
+                self.kv_offload,
                 !self.deferred_releases.is_empty(),
                 &self.slots,
                 self.max_model_len,
@@ -554,7 +589,126 @@ impl Glm52Engine {
             self.rank,
             req.data_parallel_rank
         );
-        self.pending.push_back(req);
+
+        // A bad handoff envelope is an intake rejection, same as a bad
+        // sampling param — it must not occupy a resolver task.
+        let handoff = match offload::native_mtp_handoff(&req) {
+            Ok(handoff) => handoff,
+            Err(err) => {
+                admission::reject(&req, format!("{err:#}"));
+                return;
+            }
+        };
+        // A handoff this engine cannot restore is an intake rejection, not a
+        // silent downgrade: resolving it as Plain would generate from the
+        // client prompt without the transferred KV or the anchor replay — a
+        // successful-but-wrong continuation that defeats the router's
+        // fallback. Only an MTP decode engine restores native handoffs.
+        let native = match native_handoff_disposition(
+            handoff.is_some(),
+            self.prefill_only(),
+            self.drafter.is_mtp(),
+        ) {
+            NativeHandoffDisposition::Restore => handoff,
+            NativeHandoffDisposition::Plain => None,
+            NativeHandoffDisposition::Reject => {
+                admission::reject(
+                    &req,
+                    "GLM5.2 native P/D handoff requires an MTP decode engine; \
+                     this role cannot restore it"
+                        .to_owned(),
+                );
+                return;
+            }
+        };
+
+        // Requests with nothing to resolve (no host tier, prefix cache off,
+        // or the prefill-only role, which never restores) go straight to the
+        // inbox; everything else resolves off-thread and arrives via
+        // `ready_rx` — the engine loop never waits on storage.
+        let wants_resolve = native.is_some() || (self.prefix_cache && !self.prefill_only());
+        if !wants_resolve {
+            self.pending.push_back(offload::Resolved::Plain {
+                req,
+                prefix: KvPrefix::none(),
+            });
+            return;
+        }
+        let store = Arc::clone(&self.store);
+        let rank = self.rank;
+        let ready_tx = self.ready_tx.clone();
+        let inflight = Arc::clone(&self.resolves_inflight);
+        inflight.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let salt = (self.prefill_chunk_size.is_some() && self.drafter.is_mtp())
+            .then(native_mtp_cache_salt);
+        self.runtime.spawn(async move {
+            let resolved = match native {
+                Some(handoff) => match handoff.anchor_token_id {
+                    // P consumed EOS: nothing to restore or decode — the
+                    // anchored finish happens at admission, no resolve runs.
+                    None => offload::Resolved::Native {
+                        req,
+                        prefix: KvPrefix::none(),
+                        handoff,
+                    },
+                    Some(anchor) => {
+                        match offload::native_pd_resolve(
+                            &store,
+                            rank,
+                            &req,
+                            &handoff,
+                            anchor,
+                            &req.token_tx,
+                        )
+                        .await
+                        {
+                            Ok(prefix) => offload::Resolved::Native {
+                                req,
+                                prefix,
+                                handoff,
+                            },
+                            Err(err) => offload::Resolved::Failed {
+                                req,
+                                message: format!("native P/D resolve: {err:#}"),
+                            },
+                        }
+                    }
+                },
+                None => {
+                    let mut scope = pegainfer_kv_store::CacheScope::default();
+                    if let Some(salt) = salt {
+                        scope = scope.cache_salt(salt);
+                    }
+                    let req_id_owned;
+                    let req_id = match req.request_id.as_deref() {
+                        Some(id) => id,
+                        None => {
+                            req_id_owned = anon_resolve_key("glm52", rank);
+                            &req_id_owned
+                        }
+                    };
+                    let prefix = store
+                        .resolve_prefix(
+                            rank,
+                            req_id,
+                            &req.prompt_tokens,
+                            scope,
+                            pegainfer_kv_store::ResolvePolicy::default(),
+                            &req.token_tx,
+                        )
+                        .await;
+                    offload::Resolved::Plain { req, prefix }
+                }
+            };
+            // The engine counts this send via `resolves_inflight`; if the
+            // receiver is gone the engine already exited and the request's
+            // sink closes with it.
+            let _ = ready_tx.send(resolved);
+        });
+    }
+
+    fn prefill_only(&self) -> bool {
+        self.prefill_chunk_size.is_some()
     }
 
     fn admit(&mut self) -> anyhow::Result<()> {
@@ -564,9 +718,7 @@ impl Glm52Engine {
             &mut self.slots,
             &self.pool,
             self.usable_blocks,
-            self.offload.as_deref().and_then(<[_]>::first),
-            &mut self.native_pd,
-            &mut self.host_restore,
+            &self.store,
             self.prefix_cache,
             self.drafter.enabled(),
             self.prefill_chunk_size.is_some() && self.drafter.is_mtp(),
@@ -574,8 +726,19 @@ impl Glm52Engine {
         )
     }
 
+    fn resolves_inflight(&self) -> usize {
+        self.resolves_inflight
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     fn publish(&self) {
-        publish_load(&self.load_tx, &self.pool, &self.slots, &self.pending);
+        publish_load(
+            &self.load_tx,
+            &self.pool,
+            &self.slots,
+            &self.pending,
+            self.resolves_inflight(),
+        );
     }
 
     /// One step: submit — schedule each active span's KV (full-lifetime
@@ -617,6 +780,7 @@ impl Glm52Engine {
             vec![padding_page; shape.bucket * self.table_width]
         };
         let mut slot_mapping = [padding_page as i64 * PAGE as i64; GLM52_MAX_STEP_ROWS];
+        let mut boundary_copies = Vec::new();
         // Walk the shape's contiguous per-slot runs. Real rows end at
         // `active_rows`; the padding tail keeps the padding defaults (its
         // slot ids are insignificant, #812).
@@ -680,6 +844,17 @@ impl Glm52Engine {
                 ));
             }
             span_kinds[slot_id] = Some(kind);
+            if let Some(copy) = active.boundary_copy.as_ref() {
+                // A consumed lease pre-enqueued its kernels last step — the
+                // copy would order after them. Admission changes the slot
+                // set, which forbids the lease, so this cannot fire.
+                anyhow::ensure!(
+                    !flags.consume,
+                    "GLM5.2 rank {} slot {slot_id} boundary copy cannot ride a leased replay",
+                    self.rank
+                );
+                boundary_copies.push((copy.src_page, copy.dst_page));
+            }
             if !flags.consume {
                 let row_pages = active.kv.step_page_indices(span);
                 for r in row..end {
@@ -695,6 +870,7 @@ impl Glm52Engine {
         let kv = Glm52StepKv {
             pages: pages.into_boxed_slice(),
             slot_mapping,
+            boundary_copies,
         };
         // Logical-to-executor mapping: 1:1 under EP, or this rank's step
         // mirrored onto every worker under the replicated topology
@@ -752,6 +928,12 @@ impl Glm52Engine {
             }
             outputs.truncate(1);
         }
+        // The step replied after its output D2H, so the boundary copies —
+        // enqueued ahead of the kernels on the same stream — have landed;
+        // the holds pinning their source pages can release.
+        for active in self.slots.iter_mut().flatten() {
+            active.boundary_copy = None;
+        }
         Ok((outputs[0], span_kinds, inputs))
     }
 
@@ -772,7 +954,6 @@ impl Glm52Engine {
         Vec<Glm52MtpAppend>,
         Vec<(usize, u32, usize)>,
     )> {
-        let offload = self.offload.as_deref().and_then(<[_]>::first);
         let mut rank_appends = Vec::new();
         let mut mtp_appends = Vec::new();
         let mut rank_proposals = Vec::new();
@@ -880,13 +1061,16 @@ impl Glm52Engine {
                     .state
                     .record_mtp_production_gate(active.req.request_id.as_deref());
                 active.state.log_spec_stats(self.rank, slot_id);
-                // Offload the freshly-sealed blocks BEFORE release: the
-                // hashes and guards come off the still-assigned request
+                // Seal the freshly-registered blocks BEFORE the release:
+                // the hashes and guards come off the still-assigned request
                 // state, and the guards keep the pages pinned through the
                 // async D2H copy.
-                if let Some(offload) = offload {
-                    offload.save_sealed_on_release(&active.kv);
-                }
+                self.store.seal(
+                    self.rank,
+                    &active.kv,
+                    &mut active.save_cursor,
+                    SaveClass::Cacheable,
+                );
                 if self.leased_shape.is_some() {
                     // A speculation for the next step is already on the
                     // device: the slot's row rides the replay (its output
@@ -896,16 +1080,13 @@ impl Glm52Engine {
                     // replay still writes them.
                     self.deferred_releases.push(slot_id);
                 } else {
-                    if let Err(err) = active.kv.release() {
-                        // Blocks still return via assignment RAII when the
-                        // slot drops — the explicit release only failed to
-                        // run from a clean Idle state.
-                        log::warn!(
-                            "GLM5.2 rank {} slot {slot_id} KV release failed \
-                             (blocks return via RAII): {err:#}",
-                            self.rank
-                        );
-                    }
+                    let finished = slot.take().expect("freed slot was active");
+                    self.store.retire(
+                        self.rank,
+                        finished.kv,
+                        finished.save_cursor,
+                        SaveClass::Cacheable,
+                    );
                     if self.drafter.enabled() {
                         self.pending_resets.push(slot_id);
                     }
@@ -952,16 +1133,15 @@ impl Glm52Engine {
     /// the finish.
     fn release_deferred(&mut self) {
         for slot_id in self.deferred_releases.drain(..) {
-            let Some(mut active) = self.slots[slot_id].take() else {
+            let Some(active) = self.slots[slot_id].take() else {
                 continue;
             };
-            if let Err(err) = active.kv.release() {
-                log::warn!(
-                    "GLM5.2 rank {} slot {slot_id} deferred KV release failed \
-                     (blocks return via RAII): {err:#}",
-                    self.rank
-                );
-            }
+            self.store.retire(
+                self.rank,
+                active.kv,
+                active.save_cursor,
+                SaveClass::Cacheable,
+            );
         }
     }
 
@@ -1087,17 +1267,17 @@ impl Glm52Engine {
                 .kv
                 .schedule_prefill(span, pool)
                 .map_err(|err| anyhow::anyhow!("GLM5.2 prefill slot {slot_id} schedule: {err}"))?;
-            let view = active.kv.prefill_view(span);
+            let pages = active.kv.step_page_indices(span);
             for offset in 0..span {
                 let input = active.state.next_input_at(offset);
                 batch.token_ids.push(input.token);
                 batch.positions.push(input.position as u32);
-                let page = view.page_indices()[input.position / PAGE];
+                let page = pages[input.position / PAGE];
                 batch
                     .slot_mapping
                     .push(page as i64 * PAGE as i64 + (input.position % PAGE) as i64);
             }
-            batch.block_ids.extend_from_slice(view.page_indices());
+            batch.block_ids.extend_from_slice(&pages);
             batch.request_slots.push(slot_id);
             batch.request_indptr.push(batch.token_ids.len() as u32);
             batch.block_indptr.push(batch.block_ids.len() as u32);
@@ -1169,7 +1349,6 @@ impl Glm52Engine {
             batch.output_rows.len()
         );
 
-        let offload = self.offload.as_deref().and_then(<[_]>::first);
         let mut boundary_output = outputs[0].target_tokens.iter();
         let mut boundary_drafts = outputs[0].mtp_drafts.iter();
         for (slot_id, span, boundary) in scheduled {
@@ -1189,9 +1368,6 @@ impl Glm52Engine {
             let outcome = active
                 .state
                 .advance_span(&span_outputs, &self.eos_token_ids);
-            // In-flight tail-page save of a finishing P/D handoff; the freed
-            // request's KV parks with it instead of releasing (#799).
-            let mut tail_save = None;
             let freed = match outcome {
                 Glm52StepOutcome::Prefilling => {
                     active.kv.apply_prefill_chunk(pool)?;
@@ -1221,48 +1397,33 @@ impl Glm52Engine {
                     }
                     if !freed && let Some(drafts) = drafts {
                         let committed_len = active.kv.kv_position();
-                        let tail_len = offload::native_pd_tail_len(committed_len);
-                        let tail_key = if tail_len > 0 {
-                            let key = native_mtp_tail_key(
-                                &active.req.prompt_tokens[..committed_len],
-                                committed[0],
-                            );
-                            if let Some(offload) = offload {
-                                match offload.save_native_tail(&active.kv, key) {
-                                    Ok(handle) => tail_save = Some(handle),
-                                    Err(err) => {
-                                        let message =
-                                            format!("GLM5.2 native P/D tail save failed: {err:#}");
-                                        log::warn!("{message}");
-                                        let _ = active.req.token_tx.send(TokenEvent::Error {
-                                            message,
-                                            prompt_tokens,
-                                            completion_tokens: active.state.completion_tokens(),
-                                        });
-                                        freed = true;
-                                    }
-                                }
-                            }
-                            Some(hex::encode(key))
-                        } else {
-                            None
-                        };
+                        // Pad the partial page to the boundary and register
+                        // it under the padded name (no-op on an aligned
+                        // commit): sealed and guarded like any full page —
+                        // the keyed tail path and its parking are gone.
+                        if let Err(err) = active.kv.pad_to_boundary(&self.pool) {
+                            let message =
+                                format!("GLM5.2 native P/D pad-to-boundary failed: {err:#}");
+                            log::warn!("{message}");
+                            let _ = active.req.token_tx.send(TokenEvent::Error {
+                                message,
+                                prompt_tokens,
+                                completion_tokens: active.state.completion_tokens(),
+                            });
+                            freed = true;
+                        }
                         if !freed {
+                            let handoff = offload::NativeMtpHandoff {
+                                fingerprint: offload::handoff_fingerprint(),
+                                committed_len,
+                                anchor_token_id: (emit == 1).then(|| committed[0]),
+                                draft_tokens: drafts.to_vec(),
+                            };
                             let _ = active.req.token_tx.send(TokenEvent::KvTransfer {
-                                params: serde_json::json!({
-                                    "pegainfer_pd": {
-                                        "version": 2,
-                                        "native_mtp": {
-                                            "draft_tokens": drafts,
-                                            "committed_len": committed_len,
-                                            "arena_count": 101,
-                                            "tail_len": tail_len,
-                                            "tail_key": tail_key,
-                                            "anchor_token_id": committed[0],
-                                            "anchor_emitted": emit == 1
-                                        }
-                                    }
-                                }),
+                                params: serde_json::to_value(offload::PegaInferPdEnvelope {
+                                    pegainfer_pd: handoff,
+                                })
+                                .expect("handoff envelope serializes"),
                             });
                         }
                     }
@@ -1280,27 +1441,24 @@ impl Glm52Engine {
                 }
             };
             if freed {
-                if let Some(offload) = offload {
-                    offload.save_sealed_on_release(&active.kv);
-                }
-                let finished = slot.take().expect("freed slot was active");
-                let mut kv = finished.kv;
-                match (tail_save, offload) {
-                    (Some(handle), Some(offload)) => {
-                        // The tail-page D2H may still be reading this KV's
-                        // pages: park the KV with the save instead of
-                        // releasing it (released when the save settles).
-                        offload.detach_tail_save(handle, Box::new(kv));
-                    }
-                    _ => {
-                        if let Err(err) = kv.release() {
-                            log::warn!(
-                                "GLM5.2 rank {} prefill slot {slot_id} KV release failed: {err:#}",
-                                self.rank
-                            );
-                        }
-                    }
-                }
+                // Every sealed page — the padded boundary page included — is
+                // guarded: KvBlockGuards pin the pages through the D2H
+                // independently of the release, so nothing parks. A lost
+                // save surfaces as the consuming D's hit shortfall, which
+                // rejects pre-slot and the router retries against P.
+                let mut finished = slot.take().expect("freed slot was active");
+                self.store.seal(
+                    self.rank,
+                    &finished.kv,
+                    &mut finished.save_cursor,
+                    SaveClass::Cacheable,
+                );
+                self.store.retire(
+                    self.rank,
+                    finished.kv,
+                    finished.save_cursor,
+                    SaveClass::Cacheable,
+                );
             }
         }
         Ok(())
@@ -1329,7 +1487,8 @@ impl Glm52Engine {
                 completion_tokens: active.state.completion_tokens(),
             });
         }
-        for req in self.pending.drain(..) {
+        for resolved in self.pending.drain(..) {
+            let req = resolved.into_request();
             let _ = req.token_tx.send(TokenEvent::Error {
                 message: format!("{err:#}"),
                 prompt_tokens: req.prompt_tokens.len(),
@@ -1346,48 +1505,60 @@ impl Glm52Engine {
     /// the others), so the collective DeepEP destroy barrier pairs across
     /// the fleet.
     fn teardown(mut self) {
-        for req in self.pending.drain(..) {
+        for resolved in self.pending.drain(..) {
+            let req = resolved.into_request();
             let _ = req.token_tx.send(TokenEvent::Error {
                 message: "GLM5.2 engine shut down before the request was scheduled".to_owned(),
                 prompt_tokens: req.prompt_tokens.len(),
                 completion_tokens: 0,
             });
         }
-        // Drain in-flight release saves and drop the offload engines BEFORE
-        // the workers drop the models: the registered arenas' device memory
-        // must outlive every D2H copy (the `with_arenas_on` contract), and
+        // Drain in-flight saves BEFORE the workers drop the models: the
+        // registered arenas' device memory must outlive every D2H copy, and
         // pegaflow's save worker cannot cancel a copy already handed to it.
-        // `flush_saves` is deadline-bounded, so a stuck host tier cannot hang
-        // teardown. Admission loads first: an abandoned restore's H2D can
-        // still be writing arena memory (both barriers are deadline-bounded).
-        // Any rank's engine reaches the shared per-node host for stray query
-        // leases (see `AbandonedOp::live`).
-        let lease_engine = self
-            .offload
-            .as_ref()
-            .and_then(|ranks| ranks.first())
-            .map(|rank| &rank.engine);
-        if let Some(state) = self.host_restore.as_mut() {
-            state.drain_loads(lease_engine);
+        // Bounded: a stuck host tier cannot hang teardown. In-flight
+        // resolves settle inside the store (their holds and reservations
+        // ride detached tasks); the store outlives this engine via its Arc.
+        // Loads first: a resolve abandoned at its deadline leaves a detached
+        // H2D still writing arena memory; the workers must not free the
+        // arenas under it. Then saves (D2H reads the same arenas). Both
+        // barriers deadline-bounded so a hung tier cannot hang teardown.
+        let rank = self.rank;
+        let drained = self.runtime.block_on(async {
+            let loads =
+                tokio::time::timeout(Duration::from_secs(5), self.store.flush_loads(rank)).await;
+            let saves =
+                tokio::time::timeout(Duration::from_secs(5), self.store.flush_saves(rank)).await;
+            (loads.is_ok(), saves.is_ok())
+        });
+        if !drained.0 {
+            log::warn!("GLM5.2 rank {rank} teardown: restore-load drain exceeded its deadline");
         }
-        if let Some(state) = self.native_pd.as_mut() {
-            state.drain_loads(lease_engine);
+        if !drained.1 {
+            log::warn!("GLM5.2 rank {rank} teardown: save flush exceeded its deadline");
         }
-        if let Some(offload) = self.offload.take() {
-            for rank in &offload {
-                rank.drain_tail_saves();
-                rank.engine.flush_saves();
+        match teardown_disposition(drained.0, drained.1) {
+            TeardownDisposition::FreeWorkers => self.shutdown_workers(),
+            TeardownDisposition::LeakWorkers => {
+                log::error!(
+                    "GLM5.2 rank {rank} teardown: a detached DMA may still target this \
+                     rank's registered GPU arenas; leaking the workers (and the model \
+                     arenas they own) for the remainder of the process lifetime instead \
+                     of freeing them under the copy"
+                );
+                std::mem::forget(std::mem::take(&mut self.workers));
             }
-            drop(offload);
         }
-        self.shutdown_workers();
     }
 
     /// The DeepEP context drop is collective: broadcast Shutdown to this
     /// rank's workers BEFORE their Drop joins them — a sequential
     /// shutdown-then-join would leave a worker spinning in the destroy
     /// barrier for ranks that never got the command (until the ~100 s
-    /// device timeout).
+    /// device timeout). Dropping a worker frees its device memory: the
+    /// worker thread owns the rank's model, whose arenas are the registered
+    /// DMA targets for every offload load/save — call this only once both
+    /// teardown drains settled.
     fn shutdown_workers(self) {
         for worker in &self.workers {
             let _ = worker.request_shutdown();
@@ -1396,11 +1567,163 @@ impl Glm52Engine {
     }
 }
 
+/// How intake treats a request's native P/D handoff on this engine role.
+///
+/// INVARIANT: a handoff never degrades silently. An engine that cannot
+/// restore it (prefill-only, or a decode role without the MTP drafter) must
+/// reject at intake so the router's fallback fires — queuing the request as
+/// Plain would generate from the client prompt without the transferred KV or
+/// the anchor replay, returning a successful but incorrect continuation.
+#[derive(Debug, Eq, PartialEq)]
+enum NativeHandoffDisposition {
+    Restore,
+    Plain,
+    Reject,
+}
+
+fn native_handoff_disposition(
+    has_handoff: bool,
+    prefill_only: bool,
+    drafter_is_mtp: bool,
+) -> NativeHandoffDisposition {
+    match (has_handoff, prefill_only || !drafter_is_mtp) {
+        (false, _) => NativeHandoffDisposition::Plain,
+        (true, false) => NativeHandoffDisposition::Restore,
+        (true, true) => NativeHandoffDisposition::Reject,
+    }
+}
+
+#[cfg(test)]
+mod native_handoff_disposition_tests {
+    use super::NativeHandoffDisposition;
+    use super::native_handoff_disposition;
+
+    #[test]
+    fn an_unrestorable_handoff_rejects_instead_of_degrading_to_plain() {
+        // prefill-only and non-MTP decode both lack the restore path.
+        assert_eq!(
+            native_handoff_disposition(true, true, true),
+            NativeHandoffDisposition::Reject
+        );
+        assert_eq!(
+            native_handoff_disposition(true, false, false),
+            NativeHandoffDisposition::Reject
+        );
+        assert_eq!(
+            native_handoff_disposition(true, false, true),
+            NativeHandoffDisposition::Restore
+        );
+        // No handoff: role capability is irrelevant, the request is plain.
+        assert_eq!(
+            native_handoff_disposition(false, true, false),
+            NativeHandoffDisposition::Plain
+        );
+    }
+}
+
+/// What teardown may do with this rank's workers once the bounded DMA
+/// drains have reported.
+///
+/// INVARIANT: an arena a detached DMA may still touch is never returned to
+/// the allocator. The worker threads own the models and their registered
+/// GPU arenas, so dropping a worker frees device memory an unsettled
+/// restore H2D still writes (or a save D2H still reads) — a use-after-free
+/// at teardown. When either drain timed out, the only safe terminal state
+/// short of aborting the process is leaking the workers for the remainder
+/// of the process lifetime: their threads stay parked on their command
+/// channels and the DeepEP destroy barrier is forfeited (peers fail-stop on
+/// their own device timeouts, as they do for any lost rank).
+#[derive(Debug, Eq, PartialEq)]
+enum TeardownDisposition {
+    FreeWorkers,
+    LeakWorkers,
+}
+
+fn teardown_disposition(loads_drained: bool, saves_drained: bool) -> TeardownDisposition {
+    if loads_drained && saves_drained {
+        TeardownDisposition::FreeWorkers
+    } else {
+        TeardownDisposition::LeakWorkers
+    }
+}
+
+#[cfg(test)]
+mod teardown_disposition_tests {
+    use super::TeardownDisposition;
+    use super::teardown_disposition;
+
+    /// Driving the real drain-timeout path needs a GPU engine (the workers
+    /// wrap CUDA executors), so the decision is factored pure and pinned
+    /// here: any unsettled DMA drain must forfeit the worker teardown —
+    /// freeing the arenas under a live copy is never an option.
+    #[test]
+    fn any_unsettled_dma_drain_leaks_the_workers() {
+        assert_eq!(
+            teardown_disposition(true, true),
+            TeardownDisposition::FreeWorkers
+        );
+        assert_eq!(
+            teardown_disposition(false, true),
+            TeardownDisposition::LeakWorkers
+        );
+        assert_eq!(
+            teardown_disposition(true, false),
+            TeardownDisposition::LeakWorkers
+        );
+        assert_eq!(
+            teardown_disposition(false, false),
+            TeardownDisposition::LeakWorkers
+        );
+    }
+}
+
 fn take_boundary_drafts<'a>(
     boundary: bool,
     drafts: &mut std::slice::Iter<'a, [u32; crate::mtp::GLM52_MTP_DRAFTS]>,
 ) -> Option<&'a [u32; crate::mtp::GLM52_MTP_DRAFTS]> {
     if boundary { drafts.next() } else { None }
+}
+
+/// Fallback prefetch key for a resolve whose request carries no id —
+/// `prefix` names the resolve path (plain restore, native P/D). The host
+/// tier scopes in-flight prefetch state by this key, so it must be unique per
+/// resolve — resolvers run concurrently, and two sharing one key would poll
+/// each other's fetch state. One process-wide sequence keeps every anonymous
+/// resolve distinct across paths, ranks, and lifetimes.
+fn anon_resolve_key(prefix: &str, rank: usize) -> String {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{prefix}-r{rank}-{seq}")
+}
+
+#[cfg(test)]
+mod anon_resolve_key_tests {
+    use super::anon_resolve_key;
+
+    #[test]
+    fn consecutive_fallback_keys_never_collide() {
+        let first = anon_resolve_key("glm52", 2);
+        let second = anon_resolve_key("glm52", 2);
+        assert!(
+            first.starts_with("glm52-r2-"),
+            "the key embeds the path and rank: {first}"
+        );
+        assert_ne!(
+            first, second,
+            "the tier keys in-flight prefetch state by this string; \
+             two resolvers must never share one"
+        );
+        // The native P/D path draws from the same sequence: concurrent
+        // anonymous handoffs must not poll each other's prefetch state
+        // either.
+        let native_first = anon_resolve_key("native-pd", 2);
+        let native_second = anon_resolve_key("native-pd", 2);
+        assert!(
+            native_first.starts_with("native-pd-r2-"),
+            "the key embeds the path and rank: {native_first}"
+        );
+        assert_ne!(native_first, native_second);
+    }
 }
 
 /// Partition lineage-hashed native-MTP pages from plain (drafterless) pages:
@@ -1416,35 +1739,17 @@ fn take_boundary_drafts<'a>(
 /// one L78 row whose shifted input came from the other continuation. That
 /// row only feeds draft proposals — target verification rejects any draft it
 /// misleads, so output text is never affected. Same-conversation multi-turn
-/// extensions agree on every shared token and never alias at all; the
-/// anchor-dependent final row always lives in the tail page, which is
-/// excluded from lineage hashing (`native_pd_tail_len` keeps it explicit,
-/// `native_mtp_tail_key` scopes it by prompt + anchor).
+/// extensions agree on every shared token and never alias at all. The
+/// anchor-dependent final MTP row rides the padded boundary page, whose name
+/// binds the anchor when the commit is unaligned; the aligned case accepts a
+/// draft-quality-only collision (resolver-ownership.md §2.2).
 fn native_mtp_cache_salt() -> &'static str {
     "pegainfer-glm52-native-mtp-pages-v2"
 }
 
-fn native_mtp_tail_key(committed_prompt: &[u32], anchor_token: u32) -> [u8; 16] {
-    let mut hasher = Sha256::new();
-    hasher.update(b"pegainfer-glm52-native-mtp-tail-v1");
-    hasher.update((committed_prompt.len() as u64).to_le_bytes());
-    for token in committed_prompt {
-        hasher.update(token.to_le_bytes());
-    }
-    // The final MTP context row is shifted by P's sampled anchor, so the
-    // stored tail is not identified by the prompt alone.
-    hasher.update(anchor_token.to_le_bytes());
-    let digest = hasher.finalize();
-    let mut key = [0_u8; 16];
-    key.copy_from_slice(&digest[..16]);
-    key
-}
-
 #[cfg(test)]
 mod tp_prefill_output_tests {
-    use super::PAGE;
     use super::native_mtp_cache_salt;
-    use super::native_mtp_tail_key;
     use super::take_boundary_drafts;
 
     #[test]
@@ -1458,19 +1763,6 @@ mod tp_prefill_output_tests {
         let _discarded_after_disconnect = take_boundary_drafts(true, &mut drafts);
         assert_eq!(take_boundary_drafts(false, &mut drafts), None);
         assert_eq!(take_boundary_drafts(true, &mut drafts), Some(&proposals[1]));
-    }
-
-    #[test]
-    fn sampled_anchor_is_part_of_the_native_mtp_tail_identity() {
-        let prompt = [1, 2, 3];
-        assert_ne!(
-            native_mtp_tail_key(&prompt, 10),
-            native_mtp_tail_key(&prompt, 11)
-        );
-        assert_eq!(
-            native_mtp_tail_key(&prompt, 10),
-            native_mtp_tail_key(&prompt, 10)
-        );
     }
 
     #[test]
