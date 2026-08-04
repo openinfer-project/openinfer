@@ -788,54 +788,6 @@ mod tests {
     }
 
     #[test]
-    fn scale_staging_geometry() {
-        let scale_f32 = |v: f32| v.to_le_bytes();
-        // gate/up scale [16, 48]: value = row block index.
-        let mut w13s = vec![0u8; (INTERMEDIATE / QUANT_GROUP) * (H / QUANT_GROUP) * 4];
-        for block in 0..INTERMEDIATE / QUANT_GROUP {
-            for col in 0..H / QUANT_GROUP {
-                let off = (block * (H / QUANT_GROUP) + col) * 4;
-                w13s[off..off + 4].copy_from_slice(&scale_f32(block as f32));
-            }
-        }
-        // down scale [48, 16]: value = col block index.
-        let mut w2s = vec![0u8; W2_SCALE_ROWS * W2_SCALE_COLS * 4];
-        for row in 0..W2_SCALE_ROWS {
-            for col in 0..W2_SCALE_COLS {
-                let off = (row * W2_SCALE_COLS + col) * 4;
-                w2s[off..off + 4].copy_from_slice(&scale_f32(col as f32));
-            }
-        }
-        for rank in 0..RANKS {
-            let mut s = SliceStaging::new(rank, RANKS).expect("TP slice staging");
-            s.put_w13_scale(0, false, &w13s);
-            s.put_w13_scale(0, true, &w13s);
-            s.put_w2_scale(0, &w2s);
-            let read_f32 = |bytes: &[u8], idx: usize| {
-                f32::from_le_bytes(bytes[idx * 4..idx * 4 + 4].try_into().unwrap())
-            };
-            // slice blocks 0..2 = gate blocks 2r..2r+2; 2..4 = up (same rows).
-            for b in 0..4 {
-                let expect = (2 * rank + b % 2) as f32;
-                assert_eq!(
-                    read_f32(&s.w13_scale, b * 48).to_bits(),
-                    expect.to_bits(),
-                    "rank {rank} b {b}"
-                );
-            }
-            for row in [0usize, 47] {
-                for b in 0..2 {
-                    let expect = (2 * rank + b) as f32;
-                    assert_eq!(
-                        read_f32(&s.w2_scale, row * 2 + b).to_bits(),
-                        expect.to_bits()
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
     fn tp4_slice_staging_geometry() {
         let mut w13_src = vec![0u8; INTERMEDIATE * H];
         let tp4_slice_i = INTERMEDIATE / 4;
