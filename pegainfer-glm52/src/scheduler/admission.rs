@@ -153,25 +153,41 @@ pub(super) fn admit_from_queue(
     native_mtp_prefill: bool,
     pending_resets: &mut Vec<usize>,
 ) -> anyhow::Result<()> {
-    // P consumed EOS: nothing to restore, no slot, no KV — finish at intake,
-    // before the slot and budget gates, so a saturated rank never delays a
-    // reply that needs no capacity.
+    // Zero-capacity natives finish at intake, before the slot and budget
+    // gates — a saturated rank must never delay a reply that needs no
+    // capacity. Two forms: P consumed EOS (anchor None → Stop), and the
+    // replayed anchor exhausting max_tokens (→ Length); neither restores KV.
     pending.retain(|entry| {
         let Resolved::Native { req, handoff, .. } = entry else {
             return true;
         };
-        if handoff.anchor_token_id.is_some() {
-            return true;
-        }
+        let (anchor, finish_reason) = match handoff.anchor_token_id {
+            None => (None, FinishReason::Stop),
+            Some(anchor) if req.max_tokens == 1 => (Some(anchor), FinishReason::Length),
+            Some(_) => return true,
+        };
         let prompt_tokens = req.prompt_tokens.len();
         let _ = req.token_tx.send(TokenEvent::Scheduled {
             queued_at_unix_s: req.queued_at_unix_s.unwrap_or_else(unix_now_s),
             scheduled_at_unix_s: unix_now_s(),
             prompt_tokens,
-            cached_tokens: 0,
+            cached_tokens: anchor.map_or(0, |_| handoff.committed_len),
         });
+        // P sampled the anchor but never sent it; it reaches the client here.
+        if let Some(anchor) = anchor {
+            if req
+                .token_tx
+                .send(TokenEvent::Token {
+                    id: anchor,
+                    logprob: None,
+                })
+                .is_err()
+            {
+                return false;
+            }
+        }
         let _ = req.token_tx.send(TokenEvent::Finished {
-            finish_reason: FinishReason::Stop,
+            finish_reason,
             prompt_tokens,
             completion_tokens: 1,
         });
@@ -301,7 +317,7 @@ pub(super) fn admit_from_queue(
             else {
                 unreachable!("bypass index selected a Native entry");
             };
-            admit_native(
+            if let Some(deferred) = admit_native(
                 rank,
                 slot,
                 req,
@@ -313,7 +329,10 @@ pub(super) fn admit_from_queue(
                 slots,
                 pending_resets,
                 &mut committed,
-            )?;
+            )? {
+                pending.push_front(deferred);
+                break;
+            }
             continue;
         }
 
@@ -331,9 +350,15 @@ pub(super) fn admit_from_queue(
                 } else {
                     pool.new_request(req.prompt_tokens.clone(), req.max_tokens, None)
                 };
-                // The budget check above honored the full lifetime; entitle it
-                // so background resolves can't reserve into the remainder.
-                kv.admit();
+                // The allocator is the final authority: entitlement is
+                // declared under the reserve gate, atomically with the
+                // physical re-check. A concurrent resolve either sees the
+                // new floor or won these pages first — then the front
+                // defers, holds re-queue intact, and retries next tick.
+                if !kv.try_admit(pool, front_held) {
+                    pending.push_front(Resolved::Plain { req, prefix });
+                    break;
+                }
                 let cached_tokens = if prefix_cache_enabled {
                     match kv.match_and_add_prefix(pool) {
                         Ok(cached) => cached,
@@ -390,7 +415,7 @@ pub(super) fn admit_from_queue(
                 prefix,
                 handoff,
             } => {
-                admit_native(
+                if let Some(deferred) = admit_native(
                     rank,
                     slot,
                     req,
@@ -402,7 +427,10 @@ pub(super) fn admit_from_queue(
                     slots,
                     pending_resets,
                     &mut committed,
-                )?;
+                )? {
+                    pending.push_front(deferred);
+                    break;
+                }
             }
         }
     }
@@ -411,9 +439,13 @@ pub(super) fn admit_from_queue(
 
 /// Slot a resolved native P/D intake. All authoritative allocation happens
 /// here: build the request KV, re-pin the restored chain, adopt the anchor,
-/// seed the verify state. An anchored finish (client gone, or max_tokens
-/// exhausted by the replayed anchor) leaves the slot empty and `committed`
-/// untouched; EOS-only handoffs never reach here (intake sweep).
+/// seed the verify state. A client-gone finish leaves the slot empty and
+/// `committed` untouched; zero-capacity forms (EOS-only, anchored Length)
+/// never reach here (intake sweep).
+///
+/// Entitlement is declared before the first client event, so a lost
+/// `try_admit` race returns `Some(deferred)` with nothing sent — the caller
+/// re-queues and the retry replays cleanly.
 #[allow(clippy::too_many_arguments)]
 fn admit_native(
     rank: usize,
@@ -427,12 +459,31 @@ fn admit_native(
     slots: &mut RankSlots,
     pending_resets: &mut Vec<usize>,
     committed: &mut usize,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<Resolved>> {
     let client_prompt_tokens = req.prompt_tokens.len();
     let queued_at_unix_s = req.queued_at_unix_s.unwrap_or_else(unix_now_s);
     let anchor = handoff
         .anchor_token_id
-        .context("GLM5.2 EOS-only handoffs finish at the intake sweep, never at a slot")?;
+        .context("GLM5.2 zero-capacity handoffs finish at the intake sweep, never at a slot")?;
+    anyhow::ensure!(
+        req.max_tokens > 1,
+        "GLM5.2 anchored-Length handoffs finish at the intake sweep, never at a slot"
+    );
+    req.prompt_tokens.push(anchor);
+    let mut kv = pool.new_request_with_cache_salt(
+        req.prompt_tokens.clone(),
+        req.max_tokens,
+        Some(super::native_mtp_cache_salt()),
+        None,
+    );
+    if !kv.try_admit(pool, prefix.hit_tokens() / PAGE) {
+        req.prompt_tokens.pop();
+        return Ok(Some(Resolved::Native {
+            req,
+            prefix,
+            handoff,
+        }));
+    }
     let _ = req.token_tx.send(TokenEvent::Scheduled {
         queued_at_unix_s,
         scheduled_at_unix_s: unix_now_s(),
@@ -448,26 +499,8 @@ fn admit_native(
         })
         .is_err()
     {
-        return Ok(());
+        return Ok(None);
     }
-    if req.max_tokens == 1 {
-        let _ = req.token_tx.send(TokenEvent::Finished {
-            finish_reason: FinishReason::Length,
-            prompt_tokens: client_prompt_tokens,
-            completion_tokens: 1,
-        });
-        return Ok(());
-    }
-    req.prompt_tokens.push(anchor);
-    let mut kv = pool.new_request_with_cache_salt(
-        req.prompt_tokens.clone(),
-        req.max_tokens,
-        Some(super::native_mtp_cache_salt()),
-        None,
-    );
-    // The budget check honored the full lifetime; entitle it so background
-    // resolves can't reserve into the remainder.
-    kv.admit();
     let boundary_copy = match restore_native_kv(&mut kv, prefix, &handoff, pool) {
         Ok(copy) => copy,
         Err(err) => {
@@ -519,7 +552,7 @@ fn admit_native(
         boundary_copy,
     });
     *committed += need_blocks;
-    Ok(())
+    Ok(None)
 }
 
 /// Rebuild the restored chain under the request's own KV. Full pages match

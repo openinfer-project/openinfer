@@ -40,11 +40,11 @@ resolve task 线性持有 req:probe hold(RAII,零分配)→ guarded tier query(l
 
 phase-2 首版有意只带了 prefetched 抵扣,赌"互饿类结构性消失后仲裁可以再等"——Codex 在 #843 评审抓住了赌输的另一半:后台 resolve 的物理预留能吃掉 active 请求账面承诺的未取页,decode 跨页分配失败即 engine-fatal(49152 上限下池富余 36k 块碰不到;131K 旗舰配置下 committed 逼近池容量,随时触发)。落地形态:
 
-- **`RequestKv::admit()`**:admission 的 honor-or-reject 之后声明权威身份;`entitled` 计数器(池内)= Σ 已 admit 请求的 `lifetime − resident`。
+- **`RequestKv::try_admit()`**:admission 的 honor-or-reject 之后、首个客户端事件之前声明权威身份;`entitled` 计数器(池内)= Σ 已 admit 请求的 `lifetime − resident`。
 - **`EntitledSeq` 唯一门**:`&mut SchedulableSequence` 只能经私有模块的 `with_draw` 取得,块增减在同一调用里按 resident 差值结算——新增取块路径无法绕过记账,编译器背书;release/Drop 退还余量(RAII 兜底)。
 - **reserve 门**:`reserve_loaded_blocks` 改为 `available ≥ count + entitled` 才拿,拿不到走既有 PoolPressure 让步(重试→deadline→拒绝给 router)。零义务原则不变。
 - **不是第二本账**:HeadroomLedger 是 store 外的影子记账靠补丁缝合;`entitled` 在分配器 crate 内、与块移动同步结算、数据源是 RequestKv 自身字段,消费者唯一(reserve 门)。qwen3 scheduler 侧手搓的 `reserve_floor` 是同一不变式的先例,后续可退役到该机制。
-- 残余 TOCTOU:reserve 之间由池内 mutex 串行;admission-vs-reserve 剩单请求级窗口(方向保守),池内 `async reserve_blocks(n)` waiters 仍是终局解、继续推迟。
+- TOCTOU 收口:reserve 与 entitlement 声明共用一把 reserve gate——`try_admit` 在锁内完成物理校验+记账,输了竞态则 admission 无副作用 defer(事件未发、anchor 回退、front 重排队,下 tick 重试)。二轮评审曾指出 check-to-admit 窗口能让 entitled 超过 available(新请求首个 schedule 即 engine-fatal),"方向保守"的最初判断在该方向不成立,故并锁。并发 fuzz(`fuzz_concurrent_reserves_never_starve_admitted_draws`:3 个 reserver 线程 × 2 万轮生命周期)佐证 admitted draw 零失败。池内 `async reserve_blocks(n)` waiters(等待语义)继续推迟。
 
 契约测试:`entitlement_tracks_the_undrained_remainder_through_the_lifecycle`(维护值对重算值逐阶段对账,含 revert 回涨)、`reserve_loaded_blocks_declines_into_the_entitled_floor`、`entitlement_refunds_on_drop_without_release`、`unadmitted_requests_never_move_the_counter`(kv-store);glm52 侧 admission 断言进 `admission_fills_free_slots_from_the_local_queue`。
 

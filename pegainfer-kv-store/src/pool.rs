@@ -40,9 +40,11 @@ pub struct BlockPool {
     /// [`entitlement::EntitledSeq`], consumed by the
     /// [`Self::reserve_loaded_blocks`] floor.
     entitled: Arc<AtomicI64>,
-    /// Serializes opportunistic reserves so two concurrent
-    /// [`Self::reserve_loaded_blocks`] calls cannot jointly dip into the
-    /// entitled floor. Admitted draws never wait on this lock.
+    /// Serializes every move that trades availability against the floor —
+    /// opportunistic reserves ([`Self::reserve_loaded_blocks`]) and
+    /// entitlement declarations ([`RequestKv::try_admit`]) — so neither can
+    /// dip into pages the other just claimed. Admitted draws never wait on
+    /// this lock.
     reserve_gate: Mutex<()>,
 }
 
@@ -97,8 +99,8 @@ impl BlockPool {
         self.block_manager.available_blocks()
     }
 
-    /// Blocks promised to admitted requests ([`RequestKv::admit`]) but not
-    /// yet drawn. [`Self::reserve_loaded_blocks`] keeps this many out of
+    /// Blocks promised to admitted requests ([`RequestKv::try_admit`]) but
+    /// not yet drawn. [`Self::reserve_loaded_blocks`] keeps this many out of
     /// opportunistic reach so an admitted request's page-crossing draw can
     /// never fail.
     pub fn entitled_blocks(&self) -> usize {
@@ -415,8 +417,12 @@ mod entitlement {
         }
 
         /// The un-drawn lifetime remainder this request is owed.
-        fn remaining(&self) -> i64 {
+        pub(super) fn remaining(&self) -> i64 {
             self.lifetime_blocks as i64 - self.resident()
+        }
+
+        pub(super) fn is_admitted(&self) -> bool {
+            self.admitted
         }
 
         /// Declare this request authoritative: from now until retire, the
@@ -491,14 +497,31 @@ pub struct RequestKv {
 }
 
 impl RequestKv {
-    /// Declare this request admission-authoritative: from now until
-    /// release/drop the pool keeps its un-drawn lifetime remainder
-    /// (`lifetime_blocks - resident_blocks`) out of opportunistic
-    /// [`BlockPool::reserve_loaded_blocks`] reach, so a mid-flight
-    /// page-crossing draw can never fail. Admission's honor-or-reject
-    /// budget check must precede this call. Idempotent.
-    pub fn admit(&mut self) {
+    /// Declare this request admission-authoritative — atomically with the
+    /// physical re-check, under the pool's reserve gate. On success the pool
+    /// keeps this request's un-drawn lifetime remainder (`lifetime_blocks -
+    /// resident_blocks`) out of opportunistic
+    /// [`BlockPool::reserve_loaded_blocks`] reach until release/drop, so a
+    /// mid-flight page-crossing draw can never fail.
+    ///
+    /// Returns false without admitting when the pool cannot cover every
+    /// admitted remainder plus this one — i.e. a concurrent reserve won the
+    /// race for these pages between the caller's budget check and this call;
+    /// the caller defers and retries. `credited_blocks` are prefix-held pages
+    /// that fold into this request's resident set on match: already out of
+    /// `available_blocks`, soon to shrink the remainder, so counting them
+    /// avoids a double charge. Idempotent once admitted.
+    pub fn try_admit(&mut self, pool: &BlockPool, credited_blocks: usize) -> bool {
+        if self.inner.is_admitted() {
+            return true;
+        }
+        let _gate = pool.reserve_gate.lock().expect("reserve gate poisoned");
+        let remaining = self.inner.remaining().max(0) as usize;
+        if pool.available_blocks() + credited_blocks < pool.entitled_blocks() + remaining {
+            return false;
+        }
         self.inner.admit();
+        true
     }
 
     // ── Prefix cache ───────────────────────────────────────────────────
@@ -1044,7 +1067,7 @@ mod tests {
         // 32-token prompt + 33 outputs: lifetime = ceil(65/16) = 5.
         let mut kv = pool.new_request((0..32).map(|i| 100 + i).collect(), 33, None);
         assert_eq!(pool.entitled_blocks(), 0, "construction entitles nothing");
-        kv.admit();
+        assert!(kv.try_admit(&pool, 0));
         audit(&pool, &kv, "admit");
 
         kv.schedule_prefill(32, &pool).unwrap();
@@ -1074,7 +1097,7 @@ mod tests {
     fn entitlement_refunds_on_drop_without_release() {
         let pool = BlockPool::new(16, 64);
         let mut kv = pool.new_request(vec![1; 16], 16, None);
-        kv.admit();
+        assert!(kv.try_admit(&pool, 0));
         kv.schedule_prefill(16, &pool).unwrap();
         assert!(pool.entitled_blocks() > 0);
         drop(kv);
@@ -1106,7 +1129,7 @@ mod tests {
 
         // 16-token prompt + 65 outputs: lifetime = ceil(81/16) = 6.
         let mut kv = pool.new_request(vec![1; 16], 65, None);
-        kv.admit();
+        assert!(kv.try_admit(&pool, 0));
         assert_eq!(pool.entitled_blocks(), 6);
 
         assert!(
@@ -1133,6 +1156,122 @@ mod tests {
         assert!(
             pool.reserve_loaded_blocks(7).is_some(),
             "with no admitted requests the whole pool is reservable"
+        );
+    }
+
+    /// Both orders of the admit-vs-reserve race resolve safely under the
+    /// shared gate: whichever move lands second sees the first and yields.
+    #[test]
+    fn try_admit_and_reserve_yield_to_whichever_landed_first() {
+        // 8 blocks minus padding = 7 available; lifetime = ceil(81/16) = 6.
+        let pool = BlockPool::new(16, 8);
+
+        // Reserve first: admission must defer instead of over-committing.
+        let held = pool.reserve_loaded_blocks(2).expect("empty floor");
+        let mut kv = pool.new_request(vec![1; 16], 65, None);
+        assert!(
+            !kv.try_admit(&pool, 0),
+            "5 available cannot cover a remainder of 6"
+        );
+        assert_eq!(pool.entitled_blocks(), 0, "a lost race entitles nothing");
+        drop(held);
+        assert!(kv.try_admit(&pool, 0), "the freed pages admit the retry");
+        assert!(kv.try_admit(&pool, 0), "idempotent once admitted");
+
+        // Admit first: the reserve must decline into the new floor.
+        assert!(pool.reserve_loaded_blocks(2).is_none());
+        kv.release().unwrap();
+    }
+
+    /// Prefix-held pages are already out of `available` and shrink the
+    /// remainder on match — crediting them keeps a cache-hit request
+    /// admittable at exact capacity.
+    #[test]
+    fn try_admit_credits_prefix_held_blocks() {
+        let pool = BlockPool::new(16, 8);
+        let held = pool.reserve_loaded_blocks(2).expect("empty floor");
+        let mut kv = pool.new_request(vec![1; 16], 65, None);
+        assert!(!kv.try_admit(&pool, 0));
+        assert!(
+            kv.try_admit(&pool, 1),
+            "5 available + 1 credited page covers the remainder of 6"
+        );
+        drop(held);
+    }
+
+    /// Concurrency fuzz for the Codex-flagged race: reserver threads hammer
+    /// the pool while a scheduler thread runs admit → draw → release
+    /// lifecycles. The invariant under test is the whole point of the
+    /// mechanism — an admitted request's draw NEVER fails, no matter how the
+    /// reserves interleave — plus counter integrity at the end.
+    #[test]
+    fn fuzz_concurrent_reserves_never_starve_admitted_draws() {
+        use std::sync::atomic::AtomicBool;
+
+        // Small pool for real contention: 16 usable blocks, lifetimes of 5,
+        // reserves of 1..=6.
+        let pool = Arc::new(BlockPool::new(16, 17));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        // Each reserver holds at most one reservation of <=4 blocks and
+        // drops before re-grabbing: peak held = 12 of 16 blocks, so the
+        // smallest requests (lifetime 3) always find room eventually while
+        // the bigger ones exercise the defer path under real contention.
+        let reservers: Vec<_> = (0..3u64)
+            .map(|seed| {
+                let pool = Arc::clone(&pool);
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    let mut rng = 0x9e3779b97f4a7c15u64.wrapping_add(seed);
+                    let mut held: Option<LoadReservation> = None;
+                    while !stop.load(Ordering::Acquire) {
+                        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                        let n = (rng >> 33) as usize % 4 + 1;
+                        drop(held.take());
+                        held = pool.reserve_loaded_blocks(n);
+                    }
+                })
+            })
+            .collect();
+
+        // Scheduler thread (this one): full lifecycles; a deferred admit is
+        // legal, a failed draw after admission never is.
+        let mut admitted_rounds = 0u32;
+        let mut rng = 0xdeadbeefcafef00du64;
+        for round in 0..20_000u32 {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let max_output = 32 + ((rng >> 13) as usize % 4) * 16; // lifetime 3..=6
+            let prompt: Vec<u32> = (0..16).map(|i| round.wrapping_mul(31) + i).collect();
+            let mut kv = pool.new_request(prompt, max_output, None);
+            if !kv.try_admit(&pool, 0) {
+                continue;
+            }
+            admitted_rounds += 1;
+            kv.schedule_prefill(16, &pool)
+                .expect("an admitted prefill draw must never fail");
+            kv.apply_prefill(70_000, &pool)
+                .expect("apply after a successful schedule");
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let decode_steps = (rng >> 33) as usize % (max_output - 1);
+            for step in 0..decode_steps {
+                kv.schedule_decode(&pool)
+                    .expect("an admitted decode draw must never fail");
+                kv.apply_decode(80_000 + step as u32, &pool)
+                    .expect("apply after a successful schedule");
+            }
+            kv.mark_blocks_reset_on_release();
+            kv.release().unwrap();
+            assert_eq!(pool.entitled_blocks(), 0, "round {round} leaked entitlement");
+        }
+        stop.store(true, Ordering::Release);
+        for t in reservers {
+            t.join().unwrap();
+        }
+        assert_eq!(pool.entitled_blocks(), 0);
+        assert!(
+            admitted_rounds > 100,
+            "contention starved admission entirely ({admitted_rounds} rounds) — \
+             the fuzz lost its subject"
         );
     }
 }
