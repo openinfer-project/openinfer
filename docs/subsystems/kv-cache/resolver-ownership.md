@@ -60,7 +60,7 @@ resolve task 线性持有 req:probe hold(RAII,零分配)→ guarded tier query(l
 | --- | --- |
 | **保留** | `LeaseGuard`/`GuardedQuery`/`spawn_guarded_query`;load 的 detach+`flush_loads`;`truncate_held`;mock tier 测试基建;`seal`/`retire`/`flush_saves` 主干 |
 | **删除** | `HeadroomLedger` 族(`assume_active_headroom`/`with_headroom_sync`/`settle_headroom`/`schedule_prefill_resolver` 门)、`reserve_headroom`、store 内 `CancelProbe` 穿针、**keyed 族**(`seal_keyed`/`resolve_keyed_block`/`KeyedFetchError`/`KeyedLoadParking`) |
-| **重塑** | 池内 async reserve(waiters);admission 侧 prefetched 抵扣;P 侧 pad-and-seal(落在 glm52 P 逻辑,store 无新 API) |
+| **重塑** | 池内 async reserve(waiters);admission 侧 prefetched 抵扣;P 侧 pad-and-seal(落在 glm52 P 逻辑)。store 新增两处:`ResolvePolicy::full_pages`(D 侧解析含边界页的 pad 链)与 `RequestKv::pad_to_boundary()` + `pub const PAD_TOKEN_ID: u32 = u32::MAX`(P 侧命名链补齐;无参——pad id 是 P/D 必须逐位一致的命名约定,常量即单一事实源;只动命名链不产生计算,调用后尾块带 immutable guard 走正常 seal,v2 的 `tail_saves` 停放机器随之退役) |
 
 破坏性变更成本:零——`pegainfer-kv-store` 当前唯一消费者是 glm52。
 
