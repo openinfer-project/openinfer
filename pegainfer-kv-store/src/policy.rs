@@ -59,6 +59,7 @@ impl<'a> CacheScope<'a> {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ResolvePolicy {
     pub(crate) wait_for_full_hit: bool,
+    pub(crate) full_pages: bool,
 }
 
 impl ResolvePolicy {
@@ -72,6 +73,17 @@ impl ResolvePolicy {
     #[must_use]
     pub fn wait_for_full_hit(mut self) -> Self {
         self.wait_for_full_hit = true;
+        self
+    }
+
+    /// Resolve every complete page of the chain, boundary page included.
+    /// The default cap excludes the last page (a plain request's final
+    /// chunk must forward to emit a token, so a full-prompt hit is
+    /// unusable); the decode side of a handoff resolves a pad-aligned
+    /// chain it never prefills.
+    #[must_use]
+    pub fn full_pages(mut self) -> Self {
+        self.full_pages = true;
         self
     }
 }

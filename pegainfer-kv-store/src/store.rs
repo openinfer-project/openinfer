@@ -9,7 +9,6 @@ use std::time::Duration;
 
 use pegainfer_engine::engine::KvPrefix;
 use tokio::sync::oneshot;
-use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::task::TaskTracker;
 
@@ -166,11 +165,20 @@ impl KvStore {
         let state = self.rank(rank);
         let pool = &state.pool;
         let block_size = pool.block_size();
-        // The `-1`: matching always leaves at least one prompt token uncached
-        // (the final chunk must forward to emit the first token), so a
-        // full-prompt hit is never usable and the last partial/full block is
-        // outside the reusable prefix.
-        let cacheable_blocks = prompt_tokens.len().saturating_sub(1) / block_size;
+
+        if cancel.is_cancelled() {
+            self.stats.record_degrade(req_id, DegradeReason::Cancelled);
+            return KvPrefix::none();
+        }
+        let mut probe = pool.probe_prefix_with_cache_salt(
+            prompt_tokens.to_vec(),
+            scope.cache_salt,
+            scope.lora_name,
+        );
+        if policy.full_pages {
+            probe.include_final_block();
+        }
+        let cacheable_blocks = probe.cacheable_blocks();
 
         let finish = |mut probe: PrefixProbe| {
             let hit_blocks = probe.held_blocks().min(cacheable_blocks);
@@ -187,15 +195,6 @@ impl KvStore {
             KvPrefix::resolved(hit_blocks * block_size, rank, Box::new(probe))
         };
 
-        if cancel.is_cancelled() {
-            self.stats.record_degrade(req_id, DegradeReason::Cancelled);
-            return KvPrefix::none();
-        }
-        let mut probe = pool.probe_prefix_with_cache_salt(
-            prompt_tokens.to_vec(),
-            scope.cache_salt,
-            scope.lora_name,
-        );
         let host_hashes = probe.cpu_query_hashes();
         let tier = match state.tier.as_ref() {
             Some(tier) if !host_hashes.is_empty() => tier,

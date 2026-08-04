@@ -76,6 +76,14 @@ pub(crate) fn prompt_salted(full_blocks: usize, salt: u32) -> Vec<u32> {
         .collect()
 }
 
+/// A pad-aligned chain: exactly `full_blocks` blocks, no forwarded token —
+/// the shape a P-side pad-and-seal hands to the decode side.
+pub(crate) fn prompt_aligned(full_blocks: usize) -> Vec<u32> {
+    (0..(full_blocks * BLOCK_TOKENS) as u32)
+        .map(|i| i % 251)
+        .collect()
+}
+
 /// Run a request through prefill so it owns `prompt`'s full blocks sealed
 /// (the stand-in for a real scheduler's "seal at block boundary" after the
 /// step synced — the tier's D2H ordering contract).

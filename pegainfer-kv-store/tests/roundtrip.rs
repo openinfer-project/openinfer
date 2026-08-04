@@ -19,6 +19,7 @@ use common::gpu_lock;
 use common::loaded_blocks;
 use common::prefill;
 use common::prompt;
+use common::prompt_aligned;
 use pegainfer_kv_store::CacheScope;
 use pegainfer_kv_store::NeverCancelled;
 use pegainfer_kv_store::PegaflowHost;
@@ -125,6 +126,58 @@ async fn roundtrip(page_first: bool) {
     }
     drop(prefix);
     req.release().expect("release");
+}
+
+/// The boundary block of a pad-aligned chain: the default policy stops one
+/// block short of the chain end, `full_pages` resolves it too — the decode
+/// side of a handoff never prefills, so its boundary block must be part of
+/// the hit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn full_pages_resolves_the_boundary_block() {
+    let _gpu = gpu_lock().lock().await;
+    let host = PegaflowHost::builder(HOST_POOL_BYTES)
+        .build()
+        .expect("host");
+    let rig = Rig::new("full_pages_boundary", host, None);
+    let chain = prompt_aligned(4);
+
+    rig.run_and_retire(&chain, SaveClass::Cacheable);
+    rig.store.flush_saves(RANK).await.expect("flush");
+    rig.pool.evict_inactive();
+
+    let partial = rig
+        .store
+        .resolve_prefix(
+            RANK,
+            "r-default",
+            &chain,
+            CacheScope::default(),
+            ResolvePolicy::default(),
+            &NeverCancelled,
+        )
+        .await;
+    assert_eq!(
+        partial.hit_tokens(),
+        3 * BLOCK_TOKENS,
+        "default cap excludes the boundary block"
+    );
+    drop(partial);
+
+    let full = rig
+        .store
+        .resolve_prefix(
+            RANK,
+            "r-full-pages",
+            &chain,
+            CacheScope::default(),
+            ResolvePolicy::default().wait_for_full_hit().full_pages(),
+            &NeverCancelled,
+        )
+        .await;
+    assert_eq!(full.hit_tokens(), 4 * BLOCK_TOKENS);
+    assert_eq!(loaded_blocks(&rig), 3 + 1, "the boundary block loads too");
+    assert_eq!(degraded(&rig), 0);
+    drop(full);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

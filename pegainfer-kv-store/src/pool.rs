@@ -269,6 +269,18 @@ impl PrefixProbe {
     pub fn truncate_held(&mut self, blocks: usize) {
         self.held.truncate(blocks);
     }
+
+    /// Reuse cap in blocks; see [`Self::include_final_block`].
+    pub(crate) fn cacheable_blocks(&self) -> usize {
+        self.cacheable
+    }
+
+    /// Lift the reuse cap to every complete block of the chain
+    /// ([`crate::ResolvePolicy::full_pages`]): a pad-aligned handoff chain
+    /// never prefills, so its boundary block is part of the required hit.
+    pub(crate) fn include_final_block(&mut self) {
+        self.cacheable = self.seq_hashes.len();
+    }
 }
 
 /// An opaque strong pin on one registered KV block. While held it keeps the
