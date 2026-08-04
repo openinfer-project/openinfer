@@ -312,6 +312,7 @@ pub(super) fn admit_from_queue(
                 plan,
                 need_blocks,
                 drafter_enabled,
+                pool,
                 slots,
                 pending_resets,
                 &mut committed,
@@ -374,6 +375,12 @@ pub(super) fn admit_from_queue(
                      owns lifetime capacity for {}",
                     kv.lifetime_blocks()
                 );
+                // Slot handoff: the request's unallocated lifetime remainder
+                // moves under the pool's active-headroom debt, so resolver
+                // allocations can never strand the pages this admission just
+                // promised (a stranded page fails the request's next
+                // schedule, which is engine-fatal).
+                pool.assume_active_headroom(&mut kv, None);
                 let _ = &mut req;
                 slots[slot] = Some(ActiveRequest {
                     req,
@@ -403,6 +410,7 @@ pub(super) fn admit_from_queue(
                     plan,
                     need_blocks,
                     drafter_enabled,
+                    pool,
                     slots,
                     pending_resets,
                     &mut committed,
@@ -422,23 +430,18 @@ fn admit_native(
     rank: usize,
     slot: usize,
     mut req: GenerateRequest,
-    kv: Box<RequestKv>,
+    mut kv: Box<RequestKv>,
     reservation: Option<LoadReservation>,
     cached_tokens: usize,
     handoff: offload::NativeMtpHandoff,
     plan: offload::NativeAnchorPlan,
     need_blocks: usize,
     drafter_enabled: bool,
+    pool: &Arc<BlockPool>,
     slots: &mut RankSlots,
     pending_resets: &mut Vec<usize>,
     committed: &mut usize,
 ) -> anyhow::Result<()> {
-    // The lifetime headroom claim ends at the slot handoff: from here the
-    // rank's committed-lifetime accounting covers the request's future
-    // pages, and holding the claim through the slot's life would
-    // double-draw the pool (kvbm schedules fresh pages while the claim
-    // pins others).
-    drop(reservation);
     let client_prompt_tokens = req.prompt_tokens.len();
     anyhow::ensure!(
         cached_tokens == handoff.committed_len,
@@ -476,7 +479,8 @@ fn admit_native(
                 completion_tokens: 1,
             });
         }
-        let mut kv = kv;
+        // No slot forms: the claim (still held) and the KV both release
+        // plainly — there is no future page to owe the pool for.
         if let Err(err) = kv.release() {
             log::warn!("GLM5.2 native P/D anchored-finish release: {err:#}");
         }
@@ -511,6 +515,13 @@ fn admit_native(
         "GLM5.2 native admission budget drift: planned {need_blocks}, KV owns {}",
         kv.lifetime_blocks()
     );
+    // Slot handoff: the request's unallocated lifetime remainder moves under
+    // the pool's active-headroom debt, and the resolve-time claim — whose
+    // pages ARE that remainder — dissolves in the same atomic section, so
+    // no resolver can take them in between. The rank's committed-lifetime
+    // bookkeeping stays advisory; the pool's ledger is what a resolver
+    // allocation actually observes.
+    pool.assume_active_headroom(&mut kv, reservation);
     slots[slot] = Some(ActiveRequest {
         req,
         state,

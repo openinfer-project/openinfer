@@ -8,6 +8,11 @@
 //! (`prefill_view`/`decode_view`/`speculative_view`) and the opt-in KV-event
 //! feed (`with_events`); Reservation/Probe do not depend on either.
 
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::MutexGuard;
+use std::sync::PoisonError;
+
 use dynamo_kv_hashing::compute_salt_hash;
 use kvbm_logical::KvbmSequenceHashProvider;
 use kvbm_logical::SequenceHash;
@@ -29,6 +34,37 @@ pub struct BlockPool {
     block_manager: BlockManager<()>,
     block_size: usize,
     padding_block_id: usize,
+    ledger: Arc<HeadroomLedger>,
+}
+
+/// Ledger of every active (slotted) request's unallocated lifetime remainder
+/// — its "headroom debt". The scheduler admits a request against its FULL
+/// lifetime page count, but the pages themselves are allocated step by step;
+/// this ledger is what makes that promise enforceable against resolver tasks
+/// allocating from the same pool.
+///
+/// INVARIANT: at every instant, the free-pool availability a resolver-side
+/// draw may consume is `available_blocks() - debt` — every active request's
+/// unallocated lifetime remainder is excluded from what resolvers can take,
+/// so a resolver can never strand an admitted request's future page (a
+/// stranded page fails that request's next schedule, which serving treats as
+/// engine-fatal). Enforcement is atomic inside the pool: every resolver draw
+/// checks and takes under this lock, and every transition that returns an
+/// active request's pages to the free pool (slot-handoff claim dissolution,
+/// rejected-draft LIFO drops, reverted schedules) raises the debt under the
+/// same lock before the pages become visible. Active requests' own draws are
+/// never gated by the debt — it is their debt — and repay it as they land.
+#[derive(Default)]
+struct HeadroomLedger {
+    debt: Mutex<usize>,
+}
+
+impl HeadroomLedger {
+    fn lock(&self) -> MutexGuard<'_, usize> {
+        // The debt is a plain counter; a panic between lock and unlock left
+        // it usable, and the process is already dying.
+        self.debt.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 impl BlockPool {
@@ -69,6 +105,7 @@ impl BlockPool {
             block_manager,
             block_size,
             padding_block_id,
+            ledger: Arc::default(),
         }
     }
 
@@ -141,7 +178,35 @@ impl BlockPool {
             seq,
             emitted_blocks: 0,
             lifetime_blocks,
+            ledger: Arc::clone(&self.ledger),
+            headroom_share: None,
         }
+    }
+
+    /// Slot handoff: move an admitted request under the [`HeadroomLedger`]'s
+    /// protection. Its unallocated lifetime remainder becomes ledger debt,
+    /// and `claim` — a native restore's resolve-time headroom reservation,
+    /// whose pages ARE that remainder — dissolves under the same lock, so
+    /// its pages re-enter the free pool already debt-covered: no instant
+    /// exists in which a resolver could take them. From here the request's
+    /// own draws repay its debt as they land ([`RequestKv`] keeps the share
+    /// synced to `lifetime - resident`), and any remainder settles when the
+    /// request releases or drops.
+    pub fn assume_active_headroom(&self, kv: &mut RequestKv, claim: Option<LoadReservation>) {
+        debug_assert!(
+            Arc::ptr_eq(&kv.ledger, &self.ledger),
+            "a request assumes headroom debt only on the pool that created it"
+        );
+        debug_assert!(
+            kv.headroom_share.is_none(),
+            "a request assumes the ledger debt once, at its slot handoff"
+        );
+        let mut debt = self.ledger.lock();
+        let share = kv.lifetime_blocks.saturating_sub(kv.resident_blocks());
+        *debt += share;
+        kv.headroom_share = Some(share);
+        drop(claim);
+        drop(debt);
     }
 
     // ── KV-offload prefetch (CPU-tier load before prefill) ─────────────
@@ -190,8 +255,19 @@ impl BlockPool {
     /// prefetch and prefills from scratch). The reservation's
     /// [`LoadReservation::page_ids`] feed the connector's load; on completion
     /// hand it to [`commit_loaded_blocks`](Self::commit_loaded_blocks).
+    ///
+    /// This is a resolver-side draw: it may take only what the free pool
+    /// holds beyond the active-headroom debt (see [`HeadroomLedger`]).
+    /// Check-and-take is one atomic section under the ledger lock, so two
+    /// concurrent resolvers can never both pass a check the net availability
+    /// satisfies only once.
     pub fn reserve_loaded_blocks(&self, count: usize) -> Option<LoadReservation> {
+        let debt = self.ledger.lock();
+        if self.block_manager.available_blocks() < debt.checked_add(count)? {
+            return None;
+        }
         let blocks = self.block_manager.allocate_blocks(count)?;
+        drop(debt);
         Some(LoadReservation { blocks })
     }
 
@@ -325,9 +401,57 @@ pub struct RequestKv {
     /// token still occupies its sequence position and the dangling token at
     /// the end of the sequence still provisions a page beyond it.
     lifetime_blocks: usize,
+    /// The creating pool's [`HeadroomLedger`], kept so release/drop can
+    /// settle this request's share without a pool handle.
+    ledger: Arc<HeadroomLedger>,
+    /// This request's share of the ledger debt: `Some(lifetime - resident)`
+    /// from the slot handoff on (kept in sync by every resident-changing
+    /// mutation), `None` before it — resolver-phase KVs carry no debt.
+    headroom_share: Option<usize>,
 }
 
 impl RequestKv {
+    /// Run a mutation that may change this request's resident block count.
+    /// Pre-handoff requests mutate directly; an active request's mutation
+    /// runs under the ledger lock with the debt resynced to
+    /// `lifetime - resident` in the same atomic section, so pages the
+    /// mutation returns to the free pool (rejected drafts, reverted
+    /// schedules) are never visible to a resolver draw without the debt that
+    /// covers them — and pages it takes repay the request's own debt, never
+    /// gated by it.
+    fn with_headroom_sync<R>(&mut self, f: impl FnOnce(&mut SchedulableSequence<()>) -> R) -> R {
+        let Some(share) = self.headroom_share else {
+            return f(&mut self.seq);
+        };
+        let mut debt = self.ledger.lock();
+        let result = f(&mut self.seq);
+        let resident =
+            self.seq.assigned_blocks() + self.seq.staged_blocks() + self.seq.unassigned_blocks();
+        let target = self.lifetime_blocks.saturating_sub(resident);
+        *debt = debt
+            .checked_sub(share)
+            .expect("the ledger debt always covers each active request's share")
+            + target;
+        self.headroom_share = Some(target);
+        result
+    }
+
+    /// Repay this request's remaining ledger share — end of life: released
+    /// pages are genuinely free, not owed headroom. Idempotent; both
+    /// [`Self::release`] and `Drop` settle.
+    fn settle_headroom(&mut self) {
+        let Some(share) = self.headroom_share.take() else {
+            return;
+        };
+        if share == 0 {
+            return;
+        }
+        let mut debt = self.ledger.lock();
+        *debt = debt
+            .checked_sub(share)
+            .expect("the ledger debt always covers each active request's share");
+    }
+
     // ── Prefix cache ───────────────────────────────────────────────────
 
     /// Match the prompt's full blocks against registered blocks and skip
@@ -356,11 +480,39 @@ impl RequestKv {
         num_tokens: usize,
         pool: &BlockPool,
     ) -> Result<(), ScheduleError> {
-        self.seq.schedule_prefill(num_tokens, &pool.block_manager)
+        self.with_headroom_sync(|seq| seq.schedule_prefill(num_tokens, &pool.block_manager))
+    }
+
+    /// [`Self::schedule_prefill`] for a request that is NOT yet slotted (a
+    /// resolver installing a restore's tail). The allocation is a
+    /// resolver-side draw, so it may only take what the free pool holds
+    /// beyond the active-headroom debt (see [`HeadroomLedger`]) — checked
+    /// under the ledger lock and reverted in the same atomic section if the
+    /// draw dipped into pages owed to active requests.
+    pub fn schedule_prefill_resolver(
+        &mut self,
+        num_tokens: usize,
+        pool: &BlockPool,
+    ) -> Result<(), ScheduleError> {
+        debug_assert!(
+            self.headroom_share.is_none(),
+            "an active request's own draws are never debt-gated"
+        );
+        let debt = self.ledger.lock();
+        let before = self.resident_blocks();
+        self.seq.schedule_prefill(num_tokens, &pool.block_manager)?;
+        let drawn = self.resident_blocks() - before;
+        if drawn > 0 && pool.block_manager.available_blocks() < *debt {
+            self.seq
+                .revert_schedule()
+                .expect("a schedule that just succeeded reverts cleanly");
+            return Err(ScheduleError::AllocationFailed { needed: drawn });
+        }
+        Ok(())
     }
 
     pub fn schedule_decode(&mut self, pool: &BlockPool) -> Result<(), ScheduleError> {
-        self.seq.schedule_decode(&pool.block_manager)
+        self.with_headroom_sync(|seq| seq.schedule_decode(&pool.block_manager))
     }
 
     /// Reserve KV for a speculative verify step covering `num_draft_tokens`
@@ -372,8 +524,9 @@ impl RequestKv {
         num_draft_tokens: usize,
         pool: &BlockPool,
     ) -> Result<(), ScheduleError> {
-        self.seq
-            .schedule_speculative(num_draft_tokens, &pool.block_manager)
+        self.with_headroom_sync(|seq| {
+            seq.schedule_speculative(num_draft_tokens, &pool.block_manager)
+        })
     }
 
     // ── Apply (register blocks, advance position) ──────────────────────
@@ -409,29 +562,31 @@ impl RequestKv {
     }
 
     /// Commit the accepted prefix of a speculative verify step. kvbm keeps the
-    /// `accepted_tokens` KV and LIFO-releases the rejected draft blocks.
+    /// `accepted_tokens` KV and LIFO-releases the rejected draft blocks (an
+    /// active request's ledger debt rises with them, under the same lock).
     pub fn apply_speculative(
         &mut self,
         accepted_tokens: &[u32],
         pool: &BlockPool,
     ) -> anyhow::Result<DecodeOutcome> {
-        self.seq
-            .apply_speculative(accepted_tokens, &pool.block_manager)
+        self.with_headroom_sync(|seq| seq.apply_speculative(accepted_tokens, &pool.block_manager))
             .map_err(|e| anyhow::anyhow!("apply_speculative: {e}"))
     }
 
     /// Undo a scheduled-but-unapplied KV reservation (e.g. a speculative
     /// schedule whose forward or apply failed) and return its blocks to the pool.
     pub fn revert_schedule(&mut self) -> anyhow::Result<()> {
-        self.seq
-            .revert_schedule()
+        self.with_headroom_sync(SchedulableSequence::revert_schedule)
             .map_err(|e| anyhow::anyhow!("revert_schedule: {e}"))
     }
 
     pub fn release(&mut self) -> anyhow::Result<()> {
-        self.seq
+        let result = self
+            .seq
             .release()
-            .map_err(|e| anyhow::anyhow!("release: {e}"))
+            .map_err(|e| anyhow::anyhow!("release: {e}"));
+        self.settle_headroom();
+        result
     }
 
     /// Mark every assigned block's canonical primary to reset on release.
@@ -593,6 +748,16 @@ impl RequestKv {
             .collect();
         self.emitted_blocks = registered;
         new
+    }
+}
+
+impl Drop for RequestKv {
+    fn drop(&mut self) {
+        // The share falls before the sequence's blocks free. In the window
+        // between, the only protection lost is this request's own — and it
+        // has no future draws left to strand; every other active request's
+        // share is still in the ledger.
+        self.settle_headroom();
     }
 }
 
@@ -790,6 +955,98 @@ mod tests {
                 "issue #681 request {round} did not release its KV pages"
             );
         }
+    }
+
+    /// The [`HeadroomLedger`] invariant, pool-level: once a request assumes
+    /// its debt at the slot handoff, resolver draws are capped at
+    /// `available - debt` while the request's own draws stay un-gated and
+    /// repay the debt as they land.
+    #[test]
+    fn resolver_draws_stop_at_the_active_headroom_debt() {
+        let pool = BlockPool::new(16, 8); // 7 usable + padding
+        let mut kv = pool.new_request((0..16).collect(), 32, None);
+        assert_eq!(kv.lifetime_blocks(), 3);
+        kv.schedule_prefill(16, &pool).expect("prefill schedule");
+        pool.assume_active_headroom(&mut kv, None);
+
+        // resident 1, debt 2, available 6: resolvers may take only 4.
+        assert!(
+            pool.reserve_loaded_blocks(5).is_none(),
+            "a draw into the active's unallocated lifetime must be denied"
+        );
+        let taken = pool
+            .reserve_loaded_blocks(4)
+            .expect("the un-owed remainder stays takable");
+        assert!(
+            pool.reserve_loaded_blocks(1).is_none(),
+            "everything left is owed to the active request"
+        );
+
+        // The active's own draws are never gated by its debt — with the
+        // resolver holding 4, exactly the owed 2 remain and must suffice.
+        kv.apply_prefill(99, &pool).expect("prefill apply");
+        while !kv.is_complete() {
+            kv.schedule_decode(&pool)
+                .expect("the active's remaining lifetime is protected");
+            kv.apply_decode(100, &pool).expect("decode apply");
+        }
+        assert_eq!(kv.resident_blocks(), 3);
+
+        drop(taken);
+        kv.release().expect("release");
+        drop(kv);
+        assert!(
+            pool.reserve_loaded_blocks(7).is_some(),
+            "a retired request leaves no residual debt"
+        );
+    }
+
+    /// A request abandoned between handoff and its first draw (client
+    /// disconnect, engine-fatal path) must not leave its share stuck in the
+    /// ledger: drop settles it.
+    #[test]
+    fn an_abandoned_active_requests_debt_settles_on_drop() {
+        let pool = BlockPool::new(16, 8); // 7 usable + padding
+        let mut kv = pool.new_request(vec![1; 16], 32, None);
+        pool.assume_active_headroom(&mut kv, None);
+        assert!(
+            pool.reserve_loaded_blocks(5).is_none(),
+            "7 free minus 3 owed leaves 4"
+        );
+        drop(kv);
+        assert!(
+            pool.reserve_loaded_blocks(7).is_some(),
+            "drop repays the abandoned share"
+        );
+    }
+
+    /// A resolver-phase schedule (the native tail install) is a resolver
+    /// draw too: it must fail — and revert its allocation — rather than dip
+    /// into pages owed to active requests.
+    #[test]
+    fn a_resolver_phase_schedule_cannot_dip_into_the_debt() {
+        let pool = BlockPool::new(16, 4); // 3 usable + padding
+        let mut active = pool.new_request(vec![1; 16], 32, None);
+        pool.assume_active_headroom(&mut active, None); // debt 3 == available
+
+        let mut resolver_kv = pool.new_request(vec![2; 32], 1, None);
+        assert!(
+            resolver_kv.schedule_prefill_resolver(16, &pool).is_err(),
+            "the resolver draw must be denied"
+        );
+        // The denied draw reverted: the active still allocates its whole
+        // lifetime.
+        active.schedule_prefill(16, &pool).expect("active prefill");
+        active.apply_prefill(99, &pool).expect("active apply");
+        while !active.is_complete() {
+            active.schedule_decode(&pool).expect("active decode");
+            active.apply_decode(100, &pool).expect("active apply");
+        }
+
+        drop(active);
+        resolver_kv
+            .schedule_prefill_resolver(16, &pool)
+            .expect("with no debt outstanding the resolver draw proceeds");
     }
 
     /// kvbm's `schedule_decode` allocates the next generation block when the

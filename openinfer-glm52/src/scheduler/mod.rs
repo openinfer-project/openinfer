@@ -1495,19 +1495,89 @@ impl Glm52Engine {
         if !drained.1 {
             log::warn!("GLM5.2 rank {rank} teardown: save flush exceeded its deadline");
         }
-        self.shutdown_workers();
+        match teardown_disposition(drained.0, drained.1) {
+            TeardownDisposition::FreeWorkers => self.shutdown_workers(),
+            TeardownDisposition::LeakWorkers => {
+                log::error!(
+                    "GLM5.2 rank {rank} teardown: a detached DMA may still target this \
+                     rank's registered GPU arenas; leaking the workers (and the model \
+                     arenas they own) for the remainder of the process lifetime instead \
+                     of freeing them under the copy"
+                );
+                std::mem::forget(std::mem::take(&mut self.workers));
+            }
+        }
     }
 
     /// The DeepEP context drop is collective: broadcast Shutdown to this
     /// rank's workers BEFORE their Drop joins them — a sequential
     /// shutdown-then-join would leave a worker spinning in the destroy
     /// barrier for ranks that never got the command (until the ~100 s
-    /// device timeout).
+    /// device timeout). Dropping a worker frees its device memory: the
+    /// worker thread owns the rank's model, whose arenas are the registered
+    /// DMA targets for every offload load/save — call this only once both
+    /// teardown drains settled.
     fn shutdown_workers(self) {
         for worker in &self.workers {
             let _ = worker.request_shutdown();
         }
         drop(self.workers);
+    }
+}
+
+/// What teardown may do with this rank's workers once the bounded DMA
+/// drains have reported.
+///
+/// INVARIANT: an arena a detached DMA may still touch is never returned to
+/// the allocator. The worker threads own the models and their registered
+/// GPU arenas, so dropping a worker frees device memory an unsettled
+/// restore H2D still writes (or a save D2H still reads) — a use-after-free
+/// at teardown. When either drain timed out, the only safe terminal state
+/// short of aborting the process is leaking the workers for the remainder
+/// of the process lifetime: their threads stay parked on their command
+/// channels and the DeepEP destroy barrier is forfeited (peers fail-stop on
+/// their own device timeouts, as they do for any lost rank).
+#[derive(Debug, Eq, PartialEq)]
+enum TeardownDisposition {
+    FreeWorkers,
+    LeakWorkers,
+}
+
+fn teardown_disposition(loads_drained: bool, saves_drained: bool) -> TeardownDisposition {
+    if loads_drained && saves_drained {
+        TeardownDisposition::FreeWorkers
+    } else {
+        TeardownDisposition::LeakWorkers
+    }
+}
+
+#[cfg(test)]
+mod teardown_disposition_tests {
+    use super::TeardownDisposition;
+    use super::teardown_disposition;
+
+    /// Driving the real drain-timeout path needs a GPU engine (the workers
+    /// wrap CUDA executors), so the decision is factored pure and pinned
+    /// here: any unsettled DMA drain must forfeit the worker teardown —
+    /// freeing the arenas under a live copy is never an option.
+    #[test]
+    fn any_unsettled_dma_drain_leaks_the_workers() {
+        assert_eq!(
+            teardown_disposition(true, true),
+            TeardownDisposition::FreeWorkers
+        );
+        assert_eq!(
+            teardown_disposition(false, true),
+            TeardownDisposition::LeakWorkers
+        );
+        assert_eq!(
+            teardown_disposition(true, false),
+            TeardownDisposition::LeakWorkers
+        );
+        assert_eq!(
+            teardown_disposition(false, false),
+            TeardownDisposition::LeakWorkers
+        );
     }
 }
 

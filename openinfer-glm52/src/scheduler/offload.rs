@@ -168,12 +168,14 @@ pub(super) enum Resolved {
         handoff: NativeMtpHandoff,
         plan: NativeAnchorPlan,
         /// Lifetime pages beyond the KV's resident restore, claimed
-        /// atomically at resolve and held until the slot handoff. Queued
-        /// restores therefore always account for their FULL lifetime
-        /// against the pool: without the claim, two resident restores
-        /// could jointly exhaust it while each still needs output
-        /// headroom, and no admission predicate could ever pass. `None`
-        /// when the resident pages already cover the lifetime.
+        /// atomically at resolve and held until the slot handoff, where
+        /// admission dissolves it into the pool's active-headroom debt
+        /// (`BlockPool::assume_active_headroom`). Queued restores therefore
+        /// always account for their FULL lifetime against the pool: without
+        /// the claim, two resident restores could jointly exhaust it while
+        /// each still needs output headroom, and no admission predicate
+        /// could ever pass. `None` when the resident pages already cover
+        /// the lifetime.
         reservation: Option<LoadReservation>,
     },
     /// Resolution failed terminally (bad envelope, missing checkpoint past
@@ -288,7 +290,10 @@ pub(super) async fn native_pd_resolve(
             .as_slice()
             .try_into()
             .map_err(|_| anyhow::anyhow!("native-MTP P/D tail key must be 16 bytes"))?;
-        kv.schedule_prefill(handoff.tail_len, pool)
+        // A resolver-side draw: the tail page may not come out of pages the
+        // pool owes to already-active requests (their unallocated lifetime
+        // remainders), so it goes through the debt-gated schedule.
+        kv.schedule_prefill_resolver(handoff.tail_len, pool)
             .map_err(|err| anyhow::anyhow!("native P/D tail schedule: {err}"))?;
         let tail_page = *kv
             .step_page_indices(handoff.tail_len)

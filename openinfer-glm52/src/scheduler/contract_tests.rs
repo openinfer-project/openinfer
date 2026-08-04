@@ -638,6 +638,107 @@ fn a_native_fronts_headroom_claim_counts_as_its_own_hold() {
     assert!(pending.is_empty());
 }
 
+#[test]
+fn resolver_draws_cannot_strand_an_active_requests_lifetime() {
+    // The stranding shape: a request slots with resident pages plus
+    // unallocated lifetime headroom (its resolve-time claim dissolves into
+    // the pool's active-headroom debt at the handoff), then a competing
+    // resolver restores/claims from the same pool. The pool must cap the
+    // resolver at `available - debt` — atomically, inside the pool — while
+    // the active request's own remaining-lifetime draws stay un-gated: a
+    // stranded page fails the active's next schedule, which serving treats
+    // as engine-fatal.
+    let pool = Arc::new(BlockPool::new(PAGE, 11)); // 10 usable + padding
+    let (store, _rt) = test_store(&pool);
+    let mut slots: RankSlots = std::array::from_fn(|_| None);
+    let mut pending = VecDeque::new();
+
+    // Active: resident 4 pages, lifetime 6 — the claim holds the other 2.
+    let prompt: Vec<u32> = (0..(4 * PAGE + 1) as u32).map(|t| 80_000 + t).collect();
+    let (kv, handoff, plan) = resident_native_kv(&pool, &prompt, 2 * PAGE - 2);
+    assert_eq!(kv.lifetime_blocks(), 6);
+    assert_eq!(kv.resident_blocks(), 4);
+    let reservation = pool
+        .reserve_loaded_blocks(2)
+        .expect("the resolve-time headroom claim fits");
+    let mut req = request(prompt, SamplingParams::default(), 2 * PAGE - 2);
+    let (tx, _rx) = TokenSink::standalone();
+    req.token_tx = tx;
+    pending.push_back(Resolved::Native {
+        req,
+        kv,
+        cached_tokens: 4 * PAGE,
+        handoff,
+        plan,
+        reservation: Some(reservation),
+    });
+    let mut pending_resets = Vec::new();
+    admit_from_queue(
+        0,
+        &mut pending,
+        &mut slots,
+        &pool,
+        10,
+        &store,
+        true,
+        false,
+        false,
+        &mut pending_resets,
+    )
+    .expect("the restore admits");
+    assert_eq!(slots.iter().flatten().count(), 1);
+    assert_eq!(
+        pool.available_blocks(),
+        6,
+        "the dissolved claim's pages are physically free again"
+    );
+
+    // The competing resolver: of the 6 free pages, 2 are the active's owed
+    // remainder — a 5-page restore must be denied, 4 is the bound, and the
+    // remainder is untakable.
+    assert!(
+        pool.reserve_loaded_blocks(5).is_none(),
+        "a resolver draw into the active's future pages must be denied"
+    );
+    let competing = pool
+        .reserve_loaded_blocks(4)
+        .expect("the un-owed remainder stays takable");
+    assert!(
+        pool.reserve_loaded_blocks(1).is_none(),
+        "everything left is owed to the active request"
+    );
+
+    // With the competitor holding its bounded take, the active request
+    // still allocates its entire remaining lifetime.
+    let active = slots
+        .iter_mut()
+        .flatten()
+        .next()
+        .expect("the admitted slot is active");
+    while !active.kv.is_complete() {
+        active
+            .kv
+            .schedule_decode(&pool)
+            .expect("the active's remaining lifetime is protected from resolver draws");
+        active.kv.apply_decode(90_000, &pool).expect("decode apply");
+    }
+    assert_eq!(active.kv.resident_blocks(), 6);
+
+    // Every landed page repaid the debt: once the active retires, the whole
+    // pool is takable again.
+    drop(competing);
+    let mut finished = slots
+        .iter_mut()
+        .find_map(Option::take)
+        .expect("admitted native");
+    finished.kv.release().expect("release");
+    drop(finished);
+    assert!(
+        pool.reserve_loaded_blocks(10).is_some(),
+        "a retired request leaves no residual debt"
+    );
+}
+
 /// Drive one request end to end through the engine's exact schedule/apply
 /// sequence against `pool` — the offline replica of the two engine-fatal
 /// submit-walk assertions (span start == `kv_position`, schedule never fails
