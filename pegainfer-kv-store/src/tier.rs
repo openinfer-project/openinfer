@@ -23,6 +23,10 @@ pub(crate) type TierFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 pub(crate) struct LeasedBlocks {
     pub blocks: usize,
     pub(crate) lease: QueryLeaseId,
+    /// One extra lease per registered mirror device: a load consumes one
+    /// lease per device it lands on, so the pins survive until the LAST
+    /// device's H2D completes.
+    pub(crate) mirror_leases: Vec<QueryLeaseId>,
 }
 
 /// One query's outcome against the host tier.
@@ -99,14 +103,14 @@ use crate::builder::OffloadRankSpec;
 use crate::host::PegaflowHost;
 use crate::pool::KvBlockGuard;
 
-/// Single-GPU, single-executor topology: each store rank registers its arenas
-/// as its own pegaflow instance; multi-shard TP/PP fan-out is not a kv-store
-/// concern here (a model executor that shards one GPU's KV registers one rank
-/// per shard of its own).
+/// Single-executor topology: each store rank registers its arenas as its own
+/// pegaflow instance (a model executor that shards one GPU's KV registers one
+/// rank per shard of its own). Tensor-replicated mirrors join the SAME
+/// instance as extra world members — pegaflow's replica contract, not a TP
+/// split — so `world_size` is derived per registration, while TP stays 1.
 const TP_RANK: usize = 0;
 const PP_RANK: usize = 0;
 const TP_SIZE: usize = 1;
-const WORLD_SIZE: usize = 1;
 
 /// The concrete pegaflow-backed [`HostTier`]: one pegaflow *instance* (the
 /// registration of [`OffloadRankSpec`]'s arenas) over a shared
@@ -116,6 +120,10 @@ pub(crate) struct PegaflowTier {
     host: Arc<PegaflowHost>,
     instance_id: String,
     device_id: i32,
+    /// Tensor-replicated mirror devices; every load fans out to each of them
+    /// (pegaflow replica contract: the primary saves, each device loads into
+    /// its own copy).
+    mirror_devices: Vec<i32>,
     /// Owned per-layer names; load borrows them as `&[&str]`.
     layer_names: Vec<String>,
     /// Handles of in-flight save tasks, drained by `flush`: a save task's
@@ -128,59 +136,91 @@ pub(crate) struct PegaflowTier {
 
 impl PegaflowTier {
     /// Validate the rank's arena geometry and register it with the host
-    /// engine as one pegaflow instance.
+    /// engine as one pegaflow instance: the primary device first (pegaflow's
+    /// first owner is the save side), then every mirror under the same
+    /// instance — identical layer sets collapse to one replica shard, and
+    /// the topology seals once `1 + mirrors` devices have joined.
     pub(crate) fn register(
         host: &Arc<PegaflowHost>,
         spec: OffloadRankSpec,
     ) -> Result<Self, EngineError> {
         validate_arenas(&spec.arenas)?;
-        let n = spec.arenas.len();
-        let mut layer_names = Vec::with_capacity(n);
-        let mut data_ptrs = Vec::with_capacity(n);
-        let mut size_bytes = Vec::with_capacity(n);
-        let mut num_blocks = Vec::with_capacity(n);
-        let mut segment_bytes = Vec::with_capacity(n);
-        let mut kv_stride_bytes = Vec::with_capacity(n);
-        let mut segments = Vec::with_capacity(n);
-        let mut block_stride_bytes = Vec::with_capacity(n);
-        for arena in &spec.arenas {
-            layer_names.push(arena.name.clone());
-            data_ptrs.push(arena.base_device_ptr);
-            size_bytes.push(arena.size_bytes);
-            num_blocks.push(arena.num_blocks);
-            // pegaflow's `bytes_per_block` argument is the per-SEGMENT byte
-            // count, not the whole block's (see ArenaSpec::segment_bytes).
-            segment_bytes.push(arena.segment_bytes);
-            kv_stride_bytes.push(arena.kv_stride_bytes);
-            segments.push(arena.segments);
-            block_stride_bytes.push(arena.block_stride_bytes);
+        for mirror in &spec.mirrors {
+            validate_arenas(&mirror.arenas)?;
+            // A name-set mismatch would not fail registration — pegaflow
+            // would read disjoint sets as a layer SPLIT and route loads to
+            // exactly one device again, silently.
+            let matches = mirror.arenas.len() == spec.arenas.len()
+                && mirror.arenas.iter().zip(&spec.arenas).all(|(m, p)| {
+                    m.name == p.name
+                        && m.num_blocks == p.num_blocks
+                        && m.segment_bytes == p.segment_bytes
+                        && m.segments == p.segments
+                        && m.kv_stride_bytes == p.kv_stride_bytes
+                        && m.block_stride_bytes == p.block_stride_bytes
+                });
+            if !matches {
+                return Err(EngineError::InvalidArgument(format!(
+                    "mirror on device {} does not replicate the primary's \
+                     arena names/geometry",
+                    mirror.device_id
+                )));
+            }
         }
 
-        host.engine().register_context_layer_batch_strided(
-            &spec.instance_id,
-            &spec.namespace,
-            spec.device_id,
-            TP_RANK,
-            PP_RANK,
-            TP_SIZE,
-            WORLD_SIZE,
-            &layer_names,
-            &data_ptrs,
-            &size_bytes,
-            &num_blocks,
-            &segment_bytes,
-            &kv_stride_bytes,
-            &segments,
-            Some(block_stride_bytes.as_slice()),
-            transfer_mode(),
-            spec.page_first,
-        )?;
+        let world_size = 1 + spec.mirrors.len();
+        let devices = std::iter::once((spec.device_id, &spec.arenas))
+            .chain(spec.mirrors.iter().map(|m| (m.device_id, &m.arenas)));
+        for (device_id, arenas) in devices {
+            let n = arenas.len();
+            let mut layer_names = Vec::with_capacity(n);
+            let mut data_ptrs = Vec::with_capacity(n);
+            let mut size_bytes = Vec::with_capacity(n);
+            let mut num_blocks = Vec::with_capacity(n);
+            let mut segment_bytes = Vec::with_capacity(n);
+            let mut kv_stride_bytes = Vec::with_capacity(n);
+            let mut segments = Vec::with_capacity(n);
+            let mut block_stride_bytes = Vec::with_capacity(n);
+            for arena in arenas {
+                layer_names.push(arena.name.clone());
+                data_ptrs.push(arena.base_device_ptr);
+                size_bytes.push(arena.size_bytes);
+                num_blocks.push(arena.num_blocks);
+                // pegaflow's `bytes_per_block` argument is the per-SEGMENT
+                // byte count, not the whole block's (see
+                // ArenaSpec::segment_bytes).
+                segment_bytes.push(arena.segment_bytes);
+                kv_stride_bytes.push(arena.kv_stride_bytes);
+                segments.push(arena.segments);
+                block_stride_bytes.push(arena.block_stride_bytes);
+            }
+            host.engine().register_context_layer_batch_strided(
+                &spec.instance_id,
+                &spec.namespace,
+                device_id,
+                TP_RANK,
+                PP_RANK,
+                TP_SIZE,
+                world_size,
+                &layer_names,
+                &data_ptrs,
+                &size_bytes,
+                &num_blocks,
+                &segment_bytes,
+                &kv_stride_bytes,
+                &segments,
+                Some(block_stride_bytes.as_slice()),
+                transfer_mode(),
+                spec.page_first,
+            )?;
+        }
 
         Ok(Self {
             host: Arc::clone(host),
             instance_id: spec.instance_id,
             device_id: spec.device_id,
-            layer_names,
+            mirror_devices: spec.mirrors.iter().map(|m| m.device_id).collect(),
+            layer_names: spec.arenas.iter().map(|a| a.name.clone()).collect(),
             pending_saves: Mutex::new(Vec::new()),
         })
     }
@@ -288,6 +328,7 @@ impl HostTier for PegaflowTier {
         let engine = Arc::clone(self.host.engine());
         let instance_id = self.instance_id.clone();
         let req_id = req_id.to_string();
+        let mirrors = self.mirror_devices.len();
         let join = self.host.runtime().spawn(async move {
             let status = engine
                 .count_prefix_hit_blocks_with_prefetch(
@@ -306,10 +347,19 @@ impl HostTier for PegaflowTier {
                 PrefetchStatus::Ready { blocks, .. } if blocks.is_empty() => Ok(TierQuery::Miss),
                 PrefetchStatus::Ready { blocks, .. } => {
                     let blocks_len = blocks.len();
+                    // One lease per device the eventual load lands on: a
+                    // load consumes exactly one, so a shared lease would
+                    // unpin the host blocks after the FIRST device's copy.
+                    let mut mirror_leases = Vec::with_capacity(mirrors);
+                    for _ in 0..mirrors {
+                        mirror_leases
+                            .push(engine.create_query_lease(&instance_id, blocks.clone())?);
+                    }
                     let lease = engine.create_query_lease(&instance_id, blocks)?;
                     Ok(TierQuery::Hit(LeasedBlocks {
                         blocks: blocks_len,
                         lease,
+                        mirror_leases,
                     }))
                 }
             }
@@ -327,36 +377,57 @@ impl HostTier for PegaflowTier {
         // construction (the engine rejects a mismatch, consuming the lease
         // either way).
         debug_assert_eq!(dst_page_ids.len(), hit.blocks);
-        let lease = hit.lease;
+        debug_assert_eq!(hit.mirror_leases.len(), self.mirror_devices.len());
         // pegaflow indexes GPU blocks by `usize`; pegainfer carries them as
         // `i32` (its kvbm/CUDA convention). Block ids are slot indices,
         // always non-negative.
         let dst: Vec<usize> = dst_page_ids.into_iter().map(|id| id as usize).collect();
         let layer_refs: Vec<&str> = self.layer_names.iter().map(String::as_str).collect();
-        let loads = [(lease, dst)];
-        // Consumes the lease at submit time: a pre-submit error does NOT hand
-        // it back (the "load consumes the lease" contract), the receiver
-        // resolves when the H2D copy lands.
-        match self.host.engine().batch_load_kv_blocks_multi_layer_inproc(
-            &self.instance_id,
-            TP_RANK,
-            self.device_id,
-            &layer_refs,
-            &loads,
-        ) {
-            Err(e) => Box::pin(std::future::ready(Err(anyhow::Error::new(e)))),
-            Ok(rx) => Box::pin(async move {
+        // Fan the load out to the primary and every mirror device — the same
+        // host blocks land in each device's replica (pegaflow routes by
+        // device_id; block ids are shared across replicas). Each submission
+        // consumes its own lease at submit time: a pre-submit error does NOT
+        // hand it back (the "load consumes the lease" contract), and the
+        // receivers resolve when their H2D copies land. Success requires
+        // every device — a partial landing would leave a mirror attending
+        // over stale pages, the exact corruption this fan-out exists to
+        // prevent.
+        let mut receivers = Vec::with_capacity(1 + self.mirror_devices.len());
+        let devices = std::iter::once((self.device_id, hit.lease))
+            .chain(self.mirror_devices.iter().copied().zip(hit.mirror_leases));
+        for (device_id, lease) in devices {
+            let loads = [(lease, dst.clone())];
+            match self.host.engine().batch_load_kv_blocks_multi_layer_inproc(
+                &self.instance_id,
+                TP_RANK,
+                device_id,
+                &layer_refs,
+                &loads,
+            ) {
+                // Leases already consumed by earlier submissions are gone
+                // either way; in-flight copies to other devices are observed
+                // by nobody, which is safe — commit only follows full success.
+                Err(e) => return Box::pin(std::future::ready(Err(anyhow::Error::new(e)))),
+                Ok(rx) => receivers.push(rx),
+            }
+        }
+        Box::pin(async move {
+            for rx in receivers {
                 rx.await
                     .map_err(|_| {
                         anyhow::anyhow!("pegaflow load worker dropped the completion signal")
                     })?
-                    .map_err(engine_err)
-            }),
-        }
+                    .map_err(engine_err)?;
+            }
+            Ok(())
+        })
     }
 
     fn release(&self, hit: LeasedBlocks) {
         self.host.engine().release_query_lease(&hit.lease);
+        for lease in &hit.mirror_leases {
+            self.host.engine().release_query_lease(lease);
+        }
     }
 
     fn save(

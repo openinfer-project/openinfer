@@ -183,6 +183,7 @@ impl Rig {
                         device_id: 0,
                         arenas: arena_specs,
                         page_first,
+                        mirrors: Vec::new(),
                     },
                 )
                 .expect("rank registration")

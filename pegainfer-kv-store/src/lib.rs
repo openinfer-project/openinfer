@@ -94,6 +94,7 @@ pub use pegainfer_engine::engine::KvPrefix;
 
 pub use crate::builder::ArenaSpec;
 pub use crate::builder::KvStoreBuilder;
+pub use crate::builder::OffloadMirror;
 pub use crate::builder::OffloadRankSpec;
 pub use crate::host::P2pConfig;
 pub use crate::host::PegaflowHost;

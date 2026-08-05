@@ -194,4 +194,22 @@ pub struct OffloadRankSpec {
     /// vLLM connector on MLA models) stores blocks that way — with layer
     /// names and per-layer block bytes identical to the writer's.
     pub page_first: bool,
+    /// Tensor-replicated mirrors of this rank's arenas on other devices.
+    /// Each mirror registers the same layer set from its own device under the
+    /// same instance, entering pegaflow's replica contract: the primary
+    /// (`device_id`) saves, and every tier load lands on the primary AND
+    /// every mirror — a load that reached only one device would leave the
+    /// other TP workers attending over stale pages (openinfer#849, the #847
+    /// review finding). Empty for single-device ranks.
+    pub mirrors: Vec<OffloadMirror>,
+}
+
+/// One tensor-replicated mirror of a rank's arenas: the same layer names and
+/// geometry as the primary, backed by another device's memory.
+pub struct OffloadMirror {
+    /// CUDA device ordinal whose arenas these are.
+    pub device_id: i32,
+    /// The mirror's arenas; names and geometry must match the primary's
+    /// (checked at registration).
+    pub arenas: Vec<ArenaSpec>,
 }

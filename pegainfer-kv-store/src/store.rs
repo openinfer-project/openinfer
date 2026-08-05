@@ -518,6 +518,7 @@ mod tests {
             Box::pin(std::future::ready(Ok(TierQuery::Hit(LeasedBlocks {
                 blocks,
                 lease: QueryLeaseId::fresh(),
+                mirror_leases: Vec::new(),
             }))))
         }
 
@@ -572,6 +573,7 @@ mod tests {
                 Ok(TierQuery::Hit(LeasedBlocks {
                     blocks,
                     lease: QueryLeaseId::fresh(),
+                    mirror_leases: Vec::new(),
                 }))
             })
         }
