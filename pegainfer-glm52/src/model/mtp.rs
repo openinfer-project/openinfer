@@ -96,15 +96,6 @@ pub(super) struct Glm52MtpProposalSeed<'a> {
     pub(super) rows_before: usize,
 }
 
-fn mtp_cache_bytes(
-    topology: crate::Glm52MoeTopo,
-    backend: Glm52MlaBackend,
-) -> (usize, Option<usize>) {
-    let execution = backend.cache_bytes_per_token();
-    let wire =
-        (topology == crate::Glm52MoeTopo::Tp4).then_some(GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN);
-    (execution, wire)
-}
 
 #[cfg(test)]
 mod tests {
@@ -125,11 +116,12 @@ mod tests {
     }
 
     #[test]
-    fn tp4_mtp_keeps_flashinfer_execution_separate_from_pd_wire_layout() {
-        let (execution, wire) =
-            mtp_cache_bytes(crate::Glm52MoeTopo::Tp4, Glm52MlaBackend::FlashInferFp8);
-        assert_eq!(execution, 576);
-        assert_eq!(wire, Some(656));
+    fn tp4_mtp_keeps_flashinfer_execution_separate_from_slab_wire_layout() {
+        // The TP4 proposal executes over a dense 576 B/token FlashInfer
+        // cache while the P/D wire rows commit into the slab's 656 B/token
+        // fp8_ds_mla mirror slices — two layouts, never interchangeable.
+        assert_eq!(Glm52MlaBackend::FlashInferFp8.cache_bytes_per_token(), 576);
+        assert_eq!(GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN, 656);
     }
 
     #[test]
@@ -138,14 +130,14 @@ mod tests {
         let slots = crate::model::glm52_decode_slots();
         let pool = glm52_pool_blocks(cap, slots);
         let scratch_pages = MTP_SCRATCH_PAGES_PER_SLOT * slots;
-        // TP4 charges the dense FlashInfer execution + fp8_ds wire pair for
-        // the whole committed+scratch range; EP charges only its scratch
-        // slab pages (the committed mirrors live inside the page content
-        // already charged by `glm52_arena_bytes`).
+        // TP4 charges the dense FlashInfer execution cache (MLA + index-K
+        // co-allocation) for the whole committed+scratch range; EP charges
+        // only its scratch slab pages. Neither charges the layer-78 wire
+        // mirrors — they live inside the page content already charged by
+        // `glm52_arena_bytes`.
         let dense = (pool + scratch_pages)
-            * (GLM52_FLASHMLA_SPARSE_PAGE_SIZE
-                * (GLM52_FLASHINFER_SPARSE_BYTES_PER_TOKEN + GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN)
-                + 2 * GLM52_KV_PAGE_IDXK_BYTES);
+            * (GLM52_FLASHMLA_SPARSE_PAGE_SIZE * GLM52_FLASHINFER_SPARSE_BYTES_PER_TOKEN
+                + GLM52_KV_PAGE_IDXK_BYTES);
         let ep_scratch = scratch_pages * GLM52_KV_PAGE_STRIDE;
         let tp4 = crate::mtp::glm52_mtp_arena_bytes(cap, pool, crate::Glm52MoeTopo::Tp4)
             .expect("TP4 arena bytes");
@@ -202,10 +194,12 @@ pub(super) struct Glm52MtpDenseKv {
     /// region starts at `index_k_offset` with the tight 8,448-byte stride.
     pub(super) proposal: Glm52KvSlab,
     pub(super) proposal_caches: Glm52LayerCaches,
-    /// P/D wire mirror: decode workers consume fp8_ds_mla at 656 B/token,
-    /// so the producer packs this alongside its FlashInfer execution rows.
-    pub(super) transfer_mla: CudaSlice<u8>,
-    pub(super) transfer_index_k: CudaSlice<u8>,
+    /// The layer-78 mirror slices inside a KV slab page
+    /// (`glm52_page_layout().mtp`). The prefill executor commits the P/D
+    /// wire rows (fp8_ds_mla + index-K) straight into the rank slab at these
+    /// offsets — the slab page is the ONLY registered arena, so KV that
+    /// never reaches it never reaches the decode side (openinfer#850 review).
+    pub(super) slab_caches: Glm52LayerCaches,
 }
 
 pub(super) struct Glm52NativeMtp {
@@ -266,8 +260,9 @@ impl Glm52NativeMtpFixed {
     /// other sizing desyncs the `glm52_mtp_arena_bytes` ledger.
     ///
     /// `offsets` are the layer-78 mirror slices inside a slab page
-    /// (`glm52_page_layout().mtp`); the TP4 dense caches ignore them and
-    /// allocate their own buffers here.
+    /// (`glm52_page_layout().mtp`) — the slab-resident commit target for
+    /// every topology. The TP4 dense caches additionally allocate their own
+    /// FlashInfer execution buffer here.
     pub(super) fn attach_cache(
         mut self,
         ctx: &DeviceContext,
@@ -283,6 +278,10 @@ impl Glm52NativeMtpFixed {
             bucket.sched.set_num_blocks(num_blocks);
             bucket.scratch.idx.set_num_kv_blocks(num_blocks);
         }
+        ensure!(
+            offsets.index_k_offset.is_some(),
+            "GLM5.2 MTP layer 78 page slices are missing the index-K mirror"
+        );
         let kv = if self.dense_kv {
             let mla_bytes =
                 num_blocks * GLM52_FLASHMLA_SPARSE_PAGE_SIZE * GLM52_FLASHINFER_SPARSE_BYTES_PER_TOKEN;
@@ -298,17 +297,9 @@ impl Glm52NativeMtpFixed {
                     mla_offset: 0,
                     index_k_offset: Some(mla_bytes),
                 },
-                transfer_mla: ctx.stream.alloc_zeros::<u8>(
-                    num_blocks * GLM52_FLASHMLA_SPARSE_PAGE_SIZE
-                        * GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN,
-                )?,
-                transfer_index_k: ctx.stream.alloc_zeros::<u8>(idxk_bytes)?,
+                slab_caches: offsets,
             }))
         } else {
-            ensure!(
-                offsets.index_k_offset.is_some(),
-                "GLM5.2 MTP layer 78 page slices are missing the index-K mirror"
-            );
             Glm52MtpKv::Slab(offsets)
         };
         Ok(Glm52NativeMtp {
@@ -341,8 +332,7 @@ impl Glm52NativeMtp {
         Glm52TpPrefillMtpView {
             bookend: &self.bookend,
             layer: &self.layer,
-            transfer_mla: &mut dense.transfer_mla,
-            transfer_index_k: &mut dense.transfer_index_k,
+            slab_caches: dense.slab_caches,
             proposal: &mut dense.proposal,
             proposal_caches: dense.proposal_caches,
         }
@@ -395,8 +385,11 @@ impl Glm52NativeMtp {
         let table_width = glm52_table_width(max_model_len);
         let attention_heads = layer.mla.heads;
         let backend = glm52_select_mla_backend(attention_heads)?;
-        let (cache_bytes_per_token, transfer_bytes_per_token) = mtp_cache_bytes(moe_topo, backend);
-        let dense_kv = transfer_bytes_per_token.is_some();
+        let cache_bytes_per_token = backend.cache_bytes_per_token();
+        // TP4 executes proposals over a dense FlashInfer cache; every
+        // topology commits its layer-78 wire rows into the rank slab's
+        // fp8_ds_mla mirror slices.
+        let dense_kv = moe_topo == crate::Glm52MoeTopo::Tp4;
         // A slab-resident mirror must hold the slab's fp8_ds_mla rows.
         ensure!(
             dense_kv || cache_bytes_per_token == GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN,
@@ -436,13 +429,7 @@ impl Glm52NativeMtp {
         log::info!(
             "GLM5.2 native MTP cache: topology={moe_topo:?} \
              execution_backend={backend:?} execution_bytes/token={cache_bytes_per_token} \
-             wire_layout={} wire_bytes/token={}",
-            if transfer_bytes_per_token.is_some() {
-                "fp8_ds_mla"
-            } else {
-                "execution-native"
-            },
-            transfer_bytes_per_token.unwrap_or(cache_bytes_per_token),
+             wire=slab fp8_ds_mla {GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN} bytes/token",
         );
 
         let tp_moe = match moe_topo {

@@ -296,14 +296,15 @@ pub(crate) struct Glm52TpPrefillExecutor {
 }
 
 /// The TP4 dense layer-78 caches, lent by `model::mtp` for one chunk. The
-/// transfer pair is the fp8_ds_mla P/D wire mirror (dense from slot 0); the
 /// proposal slab is the FlashInfer execution cache (`proposal_caches` maps
-/// its dense MLA region and tight index-K region).
+/// its dense MLA region and tight index-K region); `slab_caches` are the
+/// layer-78 mirror slices of a KV slab page, where the P/D wire rows
+/// (fp8_ds_mla + index-K) commit — the slab is the only registered arena,
+/// so this commit is what the decode side restores.
 pub(crate) struct Glm52TpPrefillMtpView<'a> {
     pub(crate) bookend: &'a Glm52MtpBookendWeights,
     pub(crate) layer: &'a Glm52DecoderLayerWeights,
-    pub(crate) transfer_mla: &'a mut CudaSlice<u8>,
-    pub(crate) transfer_index_k: &'a mut CudaSlice<u8>,
+    pub(crate) slab_caches: Glm52LayerCaches,
     pub(crate) proposal: &'a mut Glm52KvSlab,
     pub(crate) proposal_caches: Glm52LayerCaches,
 }
@@ -695,6 +696,7 @@ impl Glm52TpPrefillExecutor {
                 model.vocab_start,
                 model.sampling_scratch,
                 mtp,
+                model.slab,
                 rows,
                 rows4,
             )?;
@@ -725,6 +727,7 @@ impl Glm52TpPrefillExecutor {
         vocab_start: usize,
         sampling_scratch: &mut BatchSamplingScratch,
         mtp: Glm52TpPrefillMtpView<'_>,
+        slab: &mut Glm52KvSlab,
         rows: usize,
         rows4: usize,
     ) -> Result<Vec<u32>> {
@@ -779,14 +782,16 @@ impl Glm52TpPrefillExecutor {
             &mut self.fp8_gemm,
             &mut self.mla_front,
         )?;
-        let transfer_blocks = mtp.transfer_mla.len() / GLM52_KV_PAGE_MLA_BYTES;
+        // The P/D wire commit: layer-78 fp8_ds_mla rows go straight into the
+        // KV slab's mirror slices — the page is the only registered arena,
+        // so rows that miss it never reach the decode side's restore.
         self.pack_mla_cache(
             ctx,
             &mtp.layer.mla,
-            &mut *mtp.transfer_mla,
-            0,
-            GLM52_KV_PAGE_MLA_BYTES,
-            transfer_blocks,
+            &mut slab.slab,
+            mtp.slab_caches.mla_offset,
+            slab.page_stride,
+            slab.num_blocks,
             rows,
         )?;
         glm52_mla_front_pack_fp8_launch(
@@ -809,9 +814,9 @@ impl Glm52TpPrefillExecutor {
         if !batch.block_ids.is_empty() {
             glm52_prefill_unpack_pages_launch(
                 ctx,
-                &*mtp.transfer_mla,
-                0,
-                GLM52_KV_PAGE_MLA_BYTES,
+                &slab.slab,
+                mtp.slab_caches.mla_offset,
+                slab.page_stride,
                 pegainfer_kernels::ops::GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN,
                 self.block_ids
                     .as_ref()
@@ -849,17 +854,35 @@ impl Glm52TpPrefillExecutor {
             &mut self.carry_slots,
             &mut self.carry_lens,
         )?;
-        // Native MTP disables prefix matching and host-tier restore, so the
-        // wire cache cannot contain restored pages that this mirror overwrites.
-        // TODO: Copy only the committed or newly written page range. Mirroring
-        // the full index-K region costs about 17 MiB per chunk at a 16K cap.
-        let idxk_bytes = mtp.proposal.num_blocks * GLM52_KV_PAGE_IDXK_BYTES;
-        let index_k_region = mtp
-            .proposal
-            .slab
-            .slice(proposal_index_k_offset..proposal_index_k_offset + idxk_bytes);
-        ctx.stream
-            .memcpy_dtod(&index_k_region, &mut *mtp.transfer_index_k)?;
+        // Mirror the chunk's index-K rows from the dense proposal cache into
+        // the KV slab's layer-78 slices — same commit contract as the MLA
+        // pack above. Only the chunk's block table moves (native MTP
+        // disables prefix matching and host-tier restore, so every listed
+        // block is this request's own committed KV).
+        let slab_index_k_offset = mtp
+            .slab_caches
+            .index_k_offset
+            .context("GLM5.2 MTP layer 78 slab slices are missing index-K")?;
+        for &block in &batch.block_ids {
+            let block = block as usize;
+            ensure!(
+                block < mtp.proposal.num_blocks && block < slab.num_blocks,
+                "GLM5.2 MTP index-K commit block {block} outside the caches \
+                 ({} proposal / {} slab pages)",
+                mtp.proposal.num_blocks,
+                slab.num_blocks,
+            );
+            let src_begin = proposal_index_k_offset + block * GLM52_KV_PAGE_IDXK_BYTES;
+            let dst_begin = block * slab.page_stride + slab_index_k_offset;
+            let src = mtp
+                .proposal
+                .slab
+                .slice(src_begin..src_begin + GLM52_KV_PAGE_IDXK_BYTES);
+            let mut dst = slab
+                .slab
+                .slice_mut(dst_begin..dst_begin + GLM52_KV_PAGE_IDXK_BYTES);
+            ctx.stream.memcpy_dtod(&src, &mut dst)?;
+        }
         self.attend_chunk(ctx, &mtp.layer.mla, rows)?;
         fp8_linear_large_m_into(
             ctx,

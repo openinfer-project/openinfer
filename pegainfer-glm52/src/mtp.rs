@@ -63,12 +63,11 @@ pub(crate) fn glm52_mtp_draft_len() -> usize {
 /// Context-scaled device memory the native MTP lane ADDS on top of
 /// `glm52_arena_bytes` (which already charges the layer-78 committed mirrors
 /// inside every slab page): the per-slot proposal scratch (EP: whole slab
-/// pages past the registered pool region; TP4: rows of the dense caches),
-/// TP4's dense FlashInfer execution + fp8_ds_mla wire caches, and one set of
-/// per-bucket indexer logits/block tables. Fixed-size weights and scratch are
-/// accounted by the post-build headroom probe; this function is the exact
-/// monotone term used to derive the context cap before those arenas are
-/// allocated.
+/// pages past the registered pool region; TP4: rows of the dense cache),
+/// TP4's dense FlashInfer execution cache, and one set of per-bucket indexer
+/// logits/block tables. Fixed-size weights and scratch are accounted by the
+/// post-build headroom probe; this function is the exact monotone term used
+/// to derive the context cap before those arenas are allocated.
 pub(crate) fn glm52_mtp_arena_bytes(
     max_model_len: usize,
     pool_blocks: usize,
@@ -81,14 +80,15 @@ pub(crate) fn glm52_mtp_arena_bytes(
         .checked_mul(crate::model::glm52_decode_slots())
         .context("GLM5.2 MTP scratch page count overflow")?;
     let kv = if topology == crate::Glm52MoeTopo::Tp4 {
+        // The dense FlashInfer execution cache (MLA + index-K co-allocation)
+        // alone: the layer-78 wire mirrors commit into the slab pages that
+        // `glm52_arena_bytes` already charges.
         let blocks = pool_blocks
             .checked_add(scratch_pages)
             .context("GLM5.2 MTP dense block count overflow")?;
-        let mla_bytes_per_token = pegainfer_kernels::ops::GLM52_FLASHINFER_SPARSE_BYTES_PER_TOKEN
-            + pegainfer_kernels::ops::GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN;
         let per_block = GLM52_MODEL_LEN_ALIGN
-            .checked_mul(mla_bytes_per_token)
-            .and_then(|v| v.checked_add(2 * crate::model::GLM52_KV_PAGE_IDXK_BYTES))
+            .checked_mul(pegainfer_kernels::ops::GLM52_FLASHINFER_SPARSE_BYTES_PER_TOKEN)
+            .and_then(|v| v.checked_add(crate::model::GLM52_KV_PAGE_IDXK_BYTES))
             .context("GLM5.2 MTP dense page byte count overflow")?;
         blocks
             .checked_mul(per_block)
