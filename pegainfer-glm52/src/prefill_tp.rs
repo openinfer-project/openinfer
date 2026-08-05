@@ -834,6 +834,15 @@ impl Glm52TpPrefillExecutor {
             .proposal_caches
             .index_k_offset
             .context("GLM5.2 MTP layer 78 is missing index-K cache")?;
+        let slab_index_k_offset = mtp
+            .slab_caches
+            .index_k_offset
+            .context("GLM5.2 MTP layer 78 slab slices are missing index-K")?;
+        // The slab's layer-78 slice is the indexer's primary cache: the
+        // chunk's rows commit there (the P/D wire, like the MLA pack above),
+        // and the topk gather sees host-restored prefix rows — the dense
+        // proposal cache is never restored into, so gathering from it would
+        // read zeros for every restored page.
         self.indexer.run_layer(
             ctx,
             indexer,
@@ -841,6 +850,25 @@ impl Glm52TpPrefillExecutor {
             self.mla_front.q_resid.data(),
             &self.cos,
             &self.sin,
+            &mut slab.slab,
+            Glm52IndexerCacheLayout {
+                cache_blocks: slab.num_blocks,
+                cache_block_size: INDEX_CACHE_BLOCK,
+                cache_layer_offset_bytes: slab_index_k_offset,
+                cache_block_stride_bytes: slab.page_stride,
+            },
+            &self.slot_mapping,
+            rows,
+            &mut self.fp8_gemm,
+            &mut self.carry_slots,
+            &mut self.carry_lens,
+        )?;
+        // Row-mirror the same rows into the dense proposal cache for the
+        // proposal-decode rounds. Row-granular on purpose: a block-granular
+        // copy would drag whole pages across and clobber restored slab
+        // content for pages this chunk only partially wrote.
+        self.indexer.commit_k_rows(
+            ctx,
             &mut mtp.proposal.slab,
             Glm52IndexerCacheLayout {
                 cache_blocks: mtp.proposal.num_blocks,
@@ -850,39 +878,7 @@ impl Glm52TpPrefillExecutor {
             },
             &self.slot_mapping,
             rows,
-            &mut self.fp8_gemm,
-            &mut self.carry_slots,
-            &mut self.carry_lens,
         )?;
-        // Mirror the chunk's index-K rows from the dense proposal cache into
-        // the KV slab's layer-78 slices — same commit contract as the MLA
-        // pack above. Only the chunk's block table moves (native MTP
-        // disables prefix matching and host-tier restore, so every listed
-        // block is this request's own committed KV).
-        let slab_index_k_offset = mtp
-            .slab_caches
-            .index_k_offset
-            .context("GLM5.2 MTP layer 78 slab slices are missing index-K")?;
-        for &block in &batch.block_ids {
-            let block = block as usize;
-            ensure!(
-                block < mtp.proposal.num_blocks && block < slab.num_blocks,
-                "GLM5.2 MTP index-K commit block {block} outside the caches \
-                 ({} proposal / {} slab pages)",
-                mtp.proposal.num_blocks,
-                slab.num_blocks,
-            );
-            let src_begin = proposal_index_k_offset + block * GLM52_KV_PAGE_IDXK_BYTES;
-            let dst_begin = block * slab.page_stride + slab_index_k_offset;
-            let src = mtp
-                .proposal
-                .slab
-                .slice(src_begin..src_begin + GLM52_KV_PAGE_IDXK_BYTES);
-            let mut dst = slab
-                .slab
-                .slice_mut(dst_begin..dst_begin + GLM52_KV_PAGE_IDXK_BYTES);
-            ctx.stream.memcpy_dtod(&src, &mut dst)?;
-        }
         self.attend_chunk(ctx, &mtp.layer.mla, rows)?;
         fp8_linear_large_m_into(
             ctx,

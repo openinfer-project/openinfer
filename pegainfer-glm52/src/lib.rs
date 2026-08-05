@@ -1061,6 +1061,7 @@ fn start_engine(
             kv_offload.as_ref(),
             store_arenas,
             store_mirrors,
+            drafter.is_mtp(),
             &device_ordinals[..local_ranks_early],
             &pools,
             if mirrored_early {
@@ -1501,6 +1502,7 @@ fn build_kv_store(
     opts: Option<&Glm52KvOffloadOptions>,
     rank_arenas: Vec<Vec<ArenaSpec>>,
     rank_mirrors: Vec<Vec<OffloadMirror>>,
+    native_mtp: bool,
     device_ordinals: &[usize],
     pools: &[Arc<BlockPool>],
     ranks_start: usize,
@@ -1544,14 +1546,18 @@ fn build_kv_store(
     let host = host_builder
         .build()
         .map_err(|err| anyhow::anyhow!("GLM5.2 KV offload host: {err}"))?;
-    // The stride is the whole layout identity: one page carries every
-    // layer's MLA + index-K slices and the L78 MTP mirrors (drafter or not),
-    // so agreeing on (layer count, token page, stride) is agreeing on every
-    // byte of a block.
+    // The stride is the layout identity: one page carries every layer's MLA
+    // + index-K slices and the L78 MTP mirror slices (drafter or not), so
+    // agreeing on (layer count, token page, stride) is agreeing on every
+    // byte of a block's SHAPE. The mtp flag is the content half: a
+    // drafterless producer reserves the L78 slices but never writes them,
+    // and a native-MTP consumer restoring such a page would propose from
+    // zeros — the two configs must not see each other's blocks.
     let namespace = format!(
-        "pegainfer-glm52-l{GLM52_LAYERS}-p{}-page{}",
+        "pegainfer-glm52-l{GLM52_LAYERS}-p{}-page{}-mtp{}",
         pegainfer_kernels::ops::GLM52_FLASHMLA_SPARSE_PAGE_SIZE,
         crate::model::GLM52_KV_PAGE_STRIDE,
+        usize::from(native_mtp),
     );
     ensure!(
         rank_arenas.len() == pools.len() && device_ordinals.len() == pools.len(),

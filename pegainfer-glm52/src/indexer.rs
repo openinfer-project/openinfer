@@ -847,6 +847,35 @@ impl Glm52IndexerPrefillScratch {
     /// different geometry: the main layers' slab slices (per-layer offset,
     /// page stride) and the TP4 MTP proposal cache (dense index-K region).
     #[allow(clippy::too_many_arguments)]
+    /// Re-commit the chunk's already-quantizable K rows (the `self.k` buffer
+    /// `run_layer` just produced) into a second cache under its own layout.
+    /// Writes exactly `rows` slots — a restored page whose rows are not in
+    /// this chunk is never touched, which is what makes this safe to aim at
+    /// a cache holding host-restored content.
+    pub(crate) fn commit_k_rows(
+        &self,
+        ctx: &DeviceContext,
+        index_k_cache: &mut CudaSlice<u8>,
+        cache_layout: Glm52IndexerCacheLayout,
+        slot_mapping: &CudaSlice<i64>,
+        rows: usize,
+    ) -> Result<()> {
+        ensure!(
+            rows > 0 && rows <= self.chunk_rows,
+            "GLM5.2 indexer K mirror commit before stage_chunk"
+        );
+        glm52_indexer_k_quant_and_cache_launch(
+            ctx,
+            Glm52IndexerCacheInsert {
+                tokens: rows,
+                layout: cache_layout,
+            },
+            &self.k,
+            index_k_cache,
+            slot_mapping,
+        )
+    }
+
     pub(crate) fn run_layer(
         &mut self,
         ctx: &DeviceContext,
