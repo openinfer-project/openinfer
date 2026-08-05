@@ -11,14 +11,19 @@ constexpr int kPage = 64;
 constexpr int kLatent = 576;
 
 __global__ void unpack_pages(const unsigned char* packed, const int* block_ids,
-                             int blocks, int packed_bytes, long long max_slots,
+                             int blocks, int packed_bytes,
+                             long long packed_block_stride, long long max_slots,
                              __nv_bfloat16* unpacked) {
   const int item = blockIdx.x;
   const int block = block_ids[item / kPage];
   const int token = item % kPage;
   const long long slot = static_cast<long long>(block) * kPage + token;
   if (block < 0 || slot >= max_slots) __trap();
-  const unsigned char* src = packed + slot * packed_bytes;
+  // Page-first slab: pages sit packed_block_stride apart (tight layout passes
+  // kPage * packed_bytes). The unpacked buffer stays dense.
+  const unsigned char* src = packed +
+                             static_cast<long long>(block) * packed_block_stride +
+                             static_cast<long long>(token) * packed_bytes;
   __nv_bfloat16* dst = unpacked + slot * kLatent;
   for (int dim = threadIdx.x; dim < kLatent; dim += blockDim.x) {
     if (packed_bytes == 576) {
@@ -40,16 +45,18 @@ __global__ void unpack_pages(const unsigned char* packed, const int* block_ids,
 
 extern "C" CUresult glm52_prefill_unpack_pages_cuda(
     const unsigned char* packed, const int* block_ids, int blocks,
-    int packed_bytes, long long max_slots, __nv_bfloat16* unpacked,
-    CUstream stream) {
+    int packed_bytes, long long packed_block_stride, long long max_slots,
+    __nv_bfloat16* unpacked, CUstream stream) {
   if (!packed || !block_ids || !unpacked || blocks <= 0 ||
-      (packed_bytes != 576 && packed_bytes != 656) || max_slots <= 0) {
+      (packed_bytes != 576 && packed_bytes != 656) || max_slots <= 0 ||
+      packed_block_stride < static_cast<long long>(kPage) * packed_bytes) {
     return CUDA_ERROR_INVALID_VALUE;
   }
   PEGAINFER_FFI_GUARD_BEGIN
   unpack_pages<<<blocks * kPage, 256, 0,
                  reinterpret_cast<cudaStream_t>(stream)>>>(
-      packed, block_ids, blocks, packed_bytes, max_slots, unpacked);
+      packed, block_ids, blocks, packed_bytes, packed_block_stride, max_slots,
+      unpacked);
   return static_cast<CUresult>(cudaGetLastError());
   PEGAINFER_FFI_GUARD_END(CUDA_ERROR_UNKNOWN)
 }

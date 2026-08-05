@@ -94,6 +94,12 @@ pub fn glm52_flashmla_sparse_prefill_launch(
 pub struct Glm52FlashMlaSparseDecode {
     pub batch_size: usize,
     pub num_blocks: usize,
+    /// Byte offset of this layer's first page inside the KV slab the launch
+    /// receives (0 when the cache is a dedicated per-layer arena).
+    pub kv_layer_offset_bytes: usize,
+    /// Byte distance between consecutive pages. The tight per-layer layout is
+    /// `64 * 656`; the page-first slab passes the whole-page stride.
+    pub kv_block_stride_bytes: usize,
     pub topk: usize,
     pub num_sm_parts: usize,
     pub sm_scale: f32,
@@ -110,6 +116,20 @@ impl Glm52FlashMlaSparseDecode {
         ensure!(
             self.num_blocks > 0,
             "GLM5.2 FlashMLA sparse decode num_blocks must be positive"
+        );
+        // The TMA tensormap derives its per-page step from this stride, so it
+        // must stay token-row granular (the shim rejects violations too).
+        ensure!(
+            self.kv_block_stride_bytes
+                >= GLM52_FLASHMLA_SPARSE_PAGE_SIZE * GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN
+                && self
+                    .kv_block_stride_bytes
+                    .is_multiple_of(GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN),
+            "GLM5.2 FlashMLA sparse decode kv_block_stride_bytes {} must be a \
+             multiple of {} covering at least one {}-token page",
+            self.kv_block_stride_bytes,
+            GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN,
+            GLM52_FLASHMLA_SPARSE_PAGE_SIZE
         );
         ensure!(
             self.topk > 0
@@ -138,7 +158,9 @@ impl Glm52FlashMlaSparseDecode {
     }
 
     pub fn packed_kv_cache_len(self) -> usize {
-        self.num_blocks * GLM52_FLASHMLA_SPARSE_PAGE_SIZE * GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN
+        self.kv_layer_offset_bytes
+            + (self.num_blocks - 1) * self.kv_block_stride_bytes
+            + GLM52_FLASHMLA_SPARSE_PAGE_SIZE * GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN
     }
 
     fn topk_indices_len(self) -> usize {
@@ -197,12 +219,17 @@ pub fn glm52_flashmla_sparse_decode_metadata_launch(
     tile_scheduler_metadata: &mut CudaSlice<i32>,
     num_splits: &mut CudaSlice<i32>,
 ) -> Result<()> {
+    // Metadata planning never touches the KV cache; a tight single-block
+    // layout keeps validate() satisfied.
     let contract = Glm52FlashMlaSparseDecode {
         batch_size,
         num_blocks: 1,
         topk,
         num_sm_parts,
         sm_scale: 1.0,
+        kv_layer_offset_bytes: 0,
+        kv_block_stride_bytes: GLM52_FLASHMLA_SPARSE_PAGE_SIZE
+            * GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN,
     };
     contract.validate()?;
     validate_metadata_buffers(contract, tile_scheduler_metadata, num_splits)?;
@@ -252,7 +279,8 @@ pub fn glm52_flashmla_sparse_decode_launch(
     )?;
 
     let (q_ptr, _q_guard) = q.device_ptr(&ctx.stream);
-    let (kv_ptr, _kv_guard) = packed_kv_cache.device_ptr(&ctx.stream);
+    let (kv_base_ptr, _kv_guard) = packed_kv_cache.device_ptr(&ctx.stream);
+    let kv_ptr = kv_base_ptr + contract.kv_layer_offset_bytes as u64;
     let (indices_ptr, _indices_guard) = topk_indices.device_ptr(&ctx.stream);
     let (sched_ptr, _sched_guard) = tile_scheduler_metadata.device_ptr(&ctx.stream);
     let (splits_ptr, _splits_guard) = num_splits.device_ptr(&ctx.stream);
@@ -273,6 +301,7 @@ pub fn glm52_flashmla_sparse_decode_launch(
             o_accum_ptr as *mut f32,
             contract.batch_size as i32,
             contract.num_blocks as i32,
+            contract.kv_block_stride_bytes as i64,
             contract.topk as i32,
             contract.num_sm_parts as i32,
             contract.sm_scale,

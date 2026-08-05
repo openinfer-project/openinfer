@@ -84,11 +84,30 @@ pub(crate) struct Glm52DecoderLayerWeights {
     pub(crate) mlp: Glm52LayerMlp,
 }
 
-/// Per-layer mutable caches: the MLA fp8_ds_mla paged cache (656 B/token) and,
-/// on full-indexer layers, the DeepGEMM-layout index-K cache.
+/// One decoder layer's slice offsets inside a KV slab page: the fp8_ds_mla
+/// MLA slice (64 x 656 B) and, on full-indexer layers, the DeepGEMM-layout
+/// index-K slice (64 x 132 B). Byte offsets address `block * page_stride`
+/// within the owning [`Glm52KvSlab`]; the production offset table comes from
+/// `crate::model::glm52_page_layout`.
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct Glm52LayerCaches {
-    pub(crate) mla_cache: CudaSlice<u8>,
-    pub(crate) index_k_cache: Option<CudaSlice<u8>>,
+    pub(crate) mla_offset: usize,
+    pub(crate) index_k_offset: Option<usize>,
+}
+
+/// A rank's KV slab: one device allocation addressed in `num_blocks` 64-token
+/// pages sitting `page_stride` bytes apart, each page holding every layer's
+/// cache slices for one pool block ([`Glm52LayerCaches`] carries the
+/// offsets). The stride is a multiple of the 656-byte cache token row (the
+/// FlashMLA TMA contract). The allocation carries one page's content of tail
+/// slack past `num_blocks * page_stride`: the kernels-layer extent checks
+/// are conservative (`layer_offset + num_blocks * stride`), and the slack
+/// keeps the highest-offset slices addressable without a per-layer tight
+/// bound.
+pub(crate) struct Glm52KvSlab {
+    pub(crate) slab: CudaSlice<u8>,
+    pub(crate) page_stride: usize,
+    pub(crate) num_blocks: usize,
 }
 
 /// Everything one decode step shares across layers: the token position, the two
@@ -161,7 +180,8 @@ pub(crate) fn glm52_layer_attention_half(
     ctx: &DeviceContext,
     aux: Option<&DeviceContext>,
     w: &Glm52DecoderLayerWeights,
-    caches: &mut Glm52LayerCaches,
+    slab: &mut Glm52KvSlab,
+    caches: Glm52LayerCaches,
     step: &Glm52DecodeStep<'_>,
     s: &mut Glm52DecodeScratch,
     carry_ready: &mut bool,
@@ -197,10 +217,9 @@ pub(crate) fn glm52_layer_attention_half(
     let mut topk_ready = None;
     match &w.indexer {
         Glm52LayerIndexer::Full(indexer) => {
-            let index_k_cache = caches
-                .index_k_cache
-                .as_mut()
-                .context("GLM5.2 full-indexer layer is missing its index-K cache")?;
+            let index_k_offset = caches
+                .index_k_offset
+                .context("GLM5.2 full-indexer layer has no index-K slice in the KV page")?;
             let idx_ctx = if let Some(aux) = aux {
                 let q_ready = ctx.stream.record_event(None)?;
                 aux.stream.wait(&q_ready)?;
@@ -215,7 +234,8 @@ pub(crate) fn glm52_layer_attention_half(
                 &s.mla_front.q_resid,
                 step.idx_cos,
                 step.idx_sin,
-                index_k_cache,
+                &mut slab.slab,
+                index_k_offset,
                 step.slot_mapping,
                 step.block_table,
                 step.seq_lens,
@@ -229,8 +249,8 @@ pub(crate) fn glm52_layer_attention_half(
         }
         Glm52LayerIndexer::Shared => {
             ensure!(
-                caches.index_k_cache.is_none(),
-                "GLM5.2 shared-indexer layer unexpectedly owns an index-K cache"
+                caches.index_k_offset.is_none(),
+                "GLM5.2 shared-indexer layer unexpectedly owns an index-K slice"
             );
         }
     }
@@ -261,7 +281,8 @@ pub(crate) fn glm52_layer_attention_half(
         &s.mla_front,
         step.mla_cos,
         step.mla_sin,
-        &mut caches.mla_cache,
+        &mut slab.slab,
+        caches.mla_offset,
         step.slot_mapping,
         &s.idx.global_slots,
         step.seq_lens,
@@ -358,7 +379,8 @@ pub(crate) fn glm52_layer_finish(
 pub(crate) fn glm52_decoder_layer_forward(
     ctx: &DeviceContext,
     w: &Glm52DecoderLayerWeights,
-    caches: &mut Glm52LayerCaches,
+    slab: &mut Glm52KvSlab,
+    caches: Glm52LayerCaches,
     step: &Glm52DecodeStep<'_>,
     s: &mut Glm52DecodeScratch,
     carry_ready: &mut bool,
@@ -375,7 +397,7 @@ pub(crate) fn glm52_decoder_layer_forward(
         tokens,
         s.layer.normed.data_mut(),
     )?;
-    glm52_layer_attention_half(ctx, None, w, caches, step, s, carry_ready, 0, true, None)?;
+    glm52_layer_attention_half(ctx, None, w, slab, caches, step, s, carry_ready, 0, true, None)?;
     match &w.mlp {
         Glm52LayerMlp::Dense(dense) => glm52_dense_mlp_forward_into(
             ctx,

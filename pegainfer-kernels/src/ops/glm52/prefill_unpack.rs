@@ -13,9 +13,17 @@ use crate::tensor::DeviceContext;
 const PAGE: usize = 64;
 const LATENT: usize = 576;
 
+/// Unpack whole wire pages into the dense bf16 latent buffer. The packed
+/// cache is addressed as `layer_offset + block * block_stride + token *
+/// packed_bytes` — a dedicated arena passes offset 0 and the tight
+/// `64 * packed_bytes` stride; the page-first slab passes its layer offset
+/// and whole-page stride. The unpacked buffer stays dense.
+#[allow(clippy::too_many_arguments)]
 pub fn glm52_prefill_unpack_pages_launch(
     ctx: &DeviceContext,
     packed: &CudaSlice<u8>,
+    packed_layer_offset: usize,
+    packed_block_stride: usize,
     packed_bytes: usize,
     block_ids: &CudaSlice<i32>,
     blocks: usize,
@@ -30,10 +38,14 @@ pub fn glm52_prefill_unpack_pages_launch(
         "GLM5.2 prefill unpack output extent is invalid"
     );
     let max_slots = unpacked.len() / LATENT;
+    let max_blocks = max_slots / 64;
     ensure!(
         unpacked.len() == max_slots * LATENT
             && matches!(packed_bytes, 576 | 656)
-            && packed.len() >= max_slots * packed_bytes,
+            && packed_block_stride >= 64 * packed_bytes
+            && max_blocks > 0
+            && packed.len()
+                >= packed_layer_offset + (max_blocks - 1) * packed_block_stride + 64 * packed_bytes,
         "GLM5.2 prefill unpack cache extents disagree"
     );
     let (packed_ptr, _packed_guard) = packed.device_ptr(&ctx.stream);
@@ -41,10 +53,11 @@ pub fn glm52_prefill_unpack_pages_launch(
     let (out_ptr, _out_guard) = unpacked.device_ptr_mut(&ctx.stream);
     let result = unsafe {
         ffi::glm52_prefill_unpack_pages_cuda(
-            packed_ptr as *const u8,
+            (packed_ptr + packed_layer_offset as u64) as *const u8,
             blocks_ptr as *const i32,
             blocks as i32,
             packed_bytes as i32,
+            packed_block_stride as i64,
             max_slots as i64,
             out_ptr as *mut ffi::Half,
             ctx.stream.cu_stream(),
@@ -80,7 +93,16 @@ mod tests {
         let packed = ctx.stream.clone_htod(&packed)?;
         let blocks = ctx.stream.clone_htod(&[0i32])?;
         let mut unpacked = ctx.stream.alloc_zeros::<bf16>(PAGE * LATENT)?;
-        glm52_prefill_unpack_pages_launch(&ctx, &packed, PACKED_BYTES, &blocks, 1, &mut unpacked)?;
+        glm52_prefill_unpack_pages_launch(
+            &ctx,
+            &packed,
+            0,
+            PAGE * PACKED_BYTES,
+            PACKED_BYTES,
+            &blocks,
+            1,
+            &mut unpacked,
+        )?;
         let unpacked = ctx.stream.clone_dtoh(&unpacked)?;
         for token in 0..PAGE {
             for dim in 0..512 {
@@ -99,7 +121,16 @@ mod tests {
         let packed = ctx.stream.clone_htod(&vec![0x38u8; PAGE * LATENT])?;
         let blocks = ctx.stream.clone_htod(&[0i32])?;
         let mut unpacked = ctx.stream.alloc_zeros::<bf16>(PAGE * LATENT)?;
-        glm52_prefill_unpack_pages_launch(&ctx, &packed, LATENT, &blocks, 1, &mut unpacked)?;
+        glm52_prefill_unpack_pages_launch(
+            &ctx,
+            &packed,
+            0,
+            PAGE * LATENT,
+            LATENT,
+            &blocks,
+            1,
+            &mut unpacked,
+        )?;
         let unpacked = ctx.stream.clone_dtoh(&unpacked)?;
         ensure!(
             unpacked.iter().all(|value| value.to_f32() == 1.0),

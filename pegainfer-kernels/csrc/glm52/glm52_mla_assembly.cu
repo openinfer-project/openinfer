@@ -31,6 +31,7 @@ constexpr int kRopeHalf = 32;     // rope_dim / 2 = cos/sin length used
 constexpr int kQueryDim = kQkNope + kRopeDim;  // 576
 constexpr int kKvLora = 512;      // ckv width
 constexpr int kCacheBytes = 656;  // 512 fp8 + 16 scale + 128 bf16 kpe
+constexpr int kPageTokens = 64;   // FlashMLA sparse page: tokens per pool block
 constexpr int kFlashInferCacheBytes = 576;  // 512 fp8 ckv + 64 fp8 rope(k_pe)
 constexpr int kScaleOffset = 512;
 constexpr int kKpeOffset = 528;
@@ -103,9 +104,9 @@ __global__ void glm52_mla_cache_pack_kernel(
     const __nv_bfloat16* __restrict__ k_pe,      // [T, 64] pre-rope
     const __nv_bfloat16* __restrict__ cos,       // [T, 32]
     const __nv_bfloat16* __restrict__ sin,       // [T, 32]
-    unsigned char* __restrict__ cache,           // [max_slots, 656]
+    unsigned char* __restrict__ cache,           // [max_slots/64 pages, stride]
     const long long* __restrict__ slot_mapping,  // [T] write slots
-    long long max_slots) {
+    long long max_slots, long long block_stride_bytes) {
   // The write slot comes from device memory so the launch is CUDA-graph
   // replayable (a host scalar would bake the capture step's position into
   // the graph). Out-of-window slots trap: a silent modulo/clamp would stomp
@@ -115,8 +116,11 @@ __global__ void glm52_mla_cache_pack_kernel(
   if (slot < 0 || slot >= max_slots) {
     __trap();
   }
+  // Page-first slab: consecutive 64-token pages sit block_stride_bytes apart
+  // (tight layout passes 64 * kCacheBytes and reduces to slot * kCacheBytes).
   unsigned char* __restrict__ cache_token =
-      cache + slot * static_cast<long long>(kCacheBytes);
+      cache + (slot / kPageTokens) * block_stride_bytes +
+      (slot % kPageTokens) * static_cast<long long>(kCacheBytes);
   const unsigned char* ckv_t = ckv_fp8 + (size_t)t * kKvLora;
   const float* scales_t = ckv_scales + (size_t)t * kScaleGroups;
   const __nv_bfloat16* k_pe_t = k_pe + (size_t)t * kRopeDim;
@@ -291,15 +295,18 @@ CUresult glm52_mla_cache_pack_cuda(const unsigned char* ckv_fp8,
                                    const __nv_bfloat16* sin,
                                    unsigned char* cache,
                                    const long long* slot_mapping,
-                                   long long max_slots, int tokens,
+                                   long long max_slots,
+                                   long long block_stride_bytes, int tokens,
                                    cudaStream_t stream) {
   if (ckv_fp8 == nullptr || ckv_scales == nullptr || k_pe == nullptr ||
       cos == nullptr || sin == nullptr || cache == nullptr ||
-      slot_mapping == nullptr || max_slots <= 0 || tokens <= 0) {
+      slot_mapping == nullptr || max_slots <= 0 || tokens <= 0 ||
+      block_stride_bytes < (long long)kPageTokens * kCacheBytes) {
     return CUDA_ERROR_INVALID_VALUE;
   }
   glm52_mla_cache_pack_kernel<<<tokens, 128, 0, stream>>>(
-      ckv_fp8, ckv_scales, k_pe, cos, sin, cache, slot_mapping, max_slots);
+      ckv_fp8, ckv_scales, k_pe, cos, sin, cache, slot_mapping, max_slots,
+      block_stride_bytes);
   return consume_last_cuda_error();
 }
 

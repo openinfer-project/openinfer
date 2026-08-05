@@ -21,6 +21,7 @@ use crate::config::GLM52_VOCAB;
 use crate::dense::glm52_dense_mlp_forward_into;
 use crate::layer::Glm52DecodeStep;
 use crate::layer::Glm52DecoderLayerWeights;
+use crate::layer::Glm52KvSlab;
 use crate::layer::Glm52LayerCaches;
 use crate::layer::Glm52LayerMlp;
 use crate::layer::glm52_layer_attention_half;
@@ -44,7 +45,8 @@ pub(super) fn run_step_body(
     mut ep8: Option<&mut Glm52MoeEpState>,
     mut tp: Option<&mut Glm52MoeTpRank>,
     layers: &[Glm52DecoderLayerWeights],
-    caches: &mut [Glm52LayerCaches],
+    slab: &mut Glm52KvSlab,
+    caches: &[Glm52LayerCaches],
     embed: &DeviceMatrix,
     final_norm: &DeviceVec,
     lm_head: &DeviceMatrix,
@@ -55,6 +57,12 @@ pub(super) fn run_step_body(
     global_tokens: usize,
 ) -> Result<()> {
     let batch = step.mla_sched.batch();
+    ensure!(
+        layers.len() == caches.len(),
+        "GLM5.2 step body layer/cache-offset tables disagree: {} vs {}",
+        layers.len(),
+        caches.len()
+    );
     if let Some(rank) = tp.as_ref()
         && !rank.slices.is_empty()
     {
@@ -74,7 +82,7 @@ pub(super) fn run_step_body(
         s.layer.normed.data_mut(),
     )?;
     let mut carry_ready = false;
-    for (layer, (weights, cache)) in layers.iter().zip(caches.iter_mut()).enumerate() {
+    for (layer, weights) in layers.iter().enumerate() {
         let parity = layer % 2;
         // Attention-TP: a head-sharded layer's o_proj partial crosses the
         // NCCL all-reduce inside the attention half.
@@ -90,7 +98,8 @@ pub(super) fn run_step_body(
             ctx,
             Some(aux),
             weights,
-            cache,
+            slab,
+            caches[layer],
             step,
             s,
             &mut carry_ready,

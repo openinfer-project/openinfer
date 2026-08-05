@@ -242,6 +242,9 @@ fn run_mla_oracle_gate(topk: usize, sm_parts_cap: Option<usize>) -> Result<()> {
     let contract = Glm52FlashMlaSparseDecode {
         batch_size: 1,
         num_blocks: ORACLE_CTX.div_ceil(GLM52_FLASHMLA_SPARSE_PAGE_SIZE),
+        // Dedicated single-layer cache: tight page stride, no layer offset.
+        kv_layer_offset_bytes: 0,
+        kv_block_stride_bytes: crate::model::GLM52_KV_PAGE_MLA_BYTES,
         topk,
         num_sm_parts: sm_parts_cap.map_or(device_sm_parts, |cap| device_sm_parts.min(cap)),
         sm_scale: GLM52_SM_SCALE,

@@ -41,10 +41,14 @@ pub(super) struct PegaInferPdEnvelope {
 }
 
 /// This engine's capability manifest. Any protocol evolution edits this
-/// string; readable on purpose — a mismatch log names the divergence.
+/// string; readable on purpose — a mismatch log names the divergence. The
+/// page stride is the wire-layout identity: one page-first slab page carries
+/// every layer's slices, so two engines agreeing on the stride agree on the
+/// whole per-block byte layout.
 pub(super) fn handoff_fingerprint() -> String {
     format!(
-        "glm52-native-mtp/3/arenas:101/page:{PAGE}/salt:{}/drafts:{}",
+        "glm52-native-mtp/4/page:{}/salt:{}/drafts:{}",
+        crate::model::GLM52_KV_PAGE_STRIDE,
         super::native_mtp_cache_salt(),
         crate::mtp::glm52_mtp_draft_len(),
     )

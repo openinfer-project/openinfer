@@ -63,15 +63,14 @@ use crate::config::glm52_layer_has_full_indexer;
 use crate::indexer::Glm52IndexerScratch;
 use crate::layer::Glm52DecodeStep;
 use crate::layer::Glm52DecoderLayerWeights;
+use crate::layer::Glm52KvSlab;
 use crate::layer::Glm52LayerCaches;
 use crate::mla_decode::Glm52MlaSchedMetadata;
-use crate::mla_decode::glm52_mla_backend_preflight;
 use crate::mla_decode::glm52_select_mla_backend;
 use crate::moe_ep::Glm52MoeEpState;
 use crate::moe_tp::Glm52MoeTpRank;
 use crate::prefill_tp::Glm52TpPrefillExecutor;
 use crate::prefill_tp::Glm52TpPrefillModelView;
-use crate::prefill_tp::Glm52TpPrefillMtpView;
 use crate::scratch::Glm52DecodeScratch;
 use crate::weights::Glm52RankGpuWeights;
 use crate::weights::retype_owned;
@@ -83,6 +82,7 @@ mod step_body;
 use launch_ahead::Glm52SpeculatedStep;
 use mtp::Glm52NativeMtp;
 use mtp::Glm52NativeMtpFixed;
+pub(crate) use mtp::MTP_SCRATCH_PAGES_PER_SLOT;
 use step_body::run_step_body;
 
 /// The compile-time slot-count CEILING: fixed arrays (`RankSlots`,
@@ -136,21 +136,87 @@ pub(crate) fn glm52_table_width(max_model_len: usize) -> usize {
     max_model_len.div_ceil(GLM52_FLASHMLA_SPARSE_PAGE_SIZE)
 }
 
+/// One layer's MLA slice inside a slab page: 64 tokens x 656 B fp8_ds_mla.
+/// Every topology persists this row — prefill-only is a P/D producer whose
+/// wire format IS the EP decode consumer's cache format.
+pub(crate) const GLM52_KV_PAGE_MLA_BYTES: usize =
+    GLM52_FLASHMLA_SPARSE_PAGE_SIZE * GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN;
+/// One full-indexer layer's index-K slice inside a slab page: 64 tokens x
+/// (128 B fp8 key + 4 B f32 scale) in the DeepGEMM interleaved block layout.
+pub(crate) const GLM52_KV_PAGE_IDXK_BYTES: usize = INDEX_CACHE_BLOCK * (GLM52_INDEX_HEAD_DIM + 4);
+/// Bytes of one slab page's content ([`glm52_page_layout`] asserts the sum):
+/// 78 MLA slices + 21 full-indexer index-K slices + the layer-78 MTP
+/// committed mirrors. This is the save/load copy unit — the pad tail up to
+/// [`GLM52_KV_PAGE_STRIDE`] never moves.
+pub(crate) const GLM52_KV_PAGE_CONTENT_BYTES: usize = 3_502_592;
+/// Byte distance between consecutive slab pages: content rounded up to the
+/// 656-byte cache token row (the FlashMLA TMA derives its per-page step from
+/// the stride, so it must stay token-row granular). THE wire-layout identity:
+/// the offload namespace and the native P/D fingerprint both fold it.
+pub(crate) const GLM52_KV_PAGE_STRIDE: usize = 3_503_040;
+
+const _: () = assert!(GLM52_KV_PAGE_STRIDE % GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN == 0);
+const _: () = assert!(
+    GLM52_KV_PAGE_STRIDE >= GLM52_KV_PAGE_CONTENT_BYTES
+        && GLM52_KV_PAGE_STRIDE - GLM52_KV_PAGE_CONTENT_BYTES < GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN
+);
+
+/// The page-first slice map of one slab page: per-layer offsets in layer
+/// order, then the layer-78 MTP committed-mirror slices. A pure function of
+/// the architecture — the ONE construction shared by `finish_kv`, the MTP
+/// attach, and the layout unit test, so the offset table cannot drift from
+/// the wire constants.
+pub(crate) struct Glm52PageLayout {
+    pub(crate) layers: Vec<Glm52LayerCaches>,
+    /// Layer-78 committed mirrors (native MTP): radix hits reuse L78 KV by
+    /// pool page id, so the mirrors ride the same page as the target layers.
+    pub(crate) mtp: Glm52LayerCaches,
+}
+
+pub(crate) fn glm52_page_layout() -> Glm52PageLayout {
+    let mut offset = 0usize;
+    let mut layers = Vec::with_capacity(GLM52_LAYERS);
+    for layer in 0..GLM52_LAYERS {
+        let mla_offset = offset;
+        offset += GLM52_KV_PAGE_MLA_BYTES;
+        let index_k_offset = glm52_layer_has_full_indexer(layer).then(|| {
+            let at = offset;
+            offset += GLM52_KV_PAGE_IDXK_BYTES;
+            at
+        });
+        layers.push(Glm52LayerCaches {
+            mla_offset,
+            index_k_offset,
+        });
+    }
+    let mtp = Glm52LayerCaches {
+        mla_offset: offset,
+        index_k_offset: Some(offset + GLM52_KV_PAGE_MLA_BYTES),
+    };
+    offset += GLM52_KV_PAGE_MLA_BYTES + GLM52_KV_PAGE_IDXK_BYTES;
+    assert_eq!(
+        offset, GLM52_KV_PAGE_CONTENT_BYTES,
+        "GLM5.2 page layout drifted from its wire constant"
+    );
+    Glm52PageLayout { layers, mtp }
+}
+
 pub(crate) fn glm52_arena_bytes(
     max_model_len: usize,
     num_blocks: usize,
     prefill_only: bool,
 ) -> Result<usize> {
-    // Prefill-only is a P/D producer: persist the same fp8_ds_mla row the EP
-    // decode consumer reads, even though TP4's local attention execution uses
-    // a different backend.
-    let cache_bytes_per_token = GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN;
-    let mla = GLM52_LAYERS * num_blocks * GLM52_FLASHMLA_SPARSE_PAGE_SIZE * cache_bytes_per_token;
-    let (table_width, index_layout) = glm52_index_cache_layout(max_model_len, num_blocks);
-    let index_k = (0..GLM52_LAYERS)
-        .filter(|&layer| glm52_layer_has_full_indexer(layer))
-        .count()
-        * index_layout.min_cache_bytes()?;
+    // One page-first slab page per pool block carries every layer's MLA and
+    // index-K slices, MTP committed mirrors included (the page layout is a
+    // wire constant, drafter or not), plus the one-page-content tail slack
+    // `finish_kv` allocates for the kernels' conservative extent checks. The
+    // EP MTP scratch pages extend the slab past the pool and are charged by
+    // `glm52_mtp_arena_bytes`.
+    let slab = num_blocks
+        .checked_mul(GLM52_KV_PAGE_STRIDE)
+        .and_then(|bytes| bytes.checked_add(GLM52_KV_PAGE_CONTENT_BYTES))
+        .context("GLM5.2 KV slab byte count overflow")?;
+    let table_width = glm52_table_width(max_model_len);
     let rope_tables = 2 * max_model_len * GLM52_ROPE_HALF * size_of::<bf16>();
     let bucket_rows: usize = if prefill_only {
         0
@@ -169,22 +235,27 @@ pub(crate) fn glm52_arena_bytes(
     } else {
         0
     };
-    Ok(mla + index_k + rope_tables + indexer_logits + block_tables + prefill_unpacked)
+    Ok(slab + rope_tables + indexer_logits + block_tables + prefill_unpacked)
 }
 
 /// The page-table width and index-K cache layout for a given cap — the ONE
-/// construction shared by the two-phase build and the arena ledger
-/// ([`glm52_arena_bytes`]), so a layout change cannot drift between them.
+/// construction shared by the two-phase build and the TP4 prefill executor,
+/// so a layout change cannot drift between them. The stride is the slab
+/// page stride; `cache_layer_offset_bytes` stays 0 here because one bucket
+/// scratch serves every layer — each launch carries its layer's slice
+/// offset (struct-update at the use site keeps this the single origin of
+/// blocks/size/stride).
 fn glm52_index_cache_layout(
     max_model_len: usize,
     num_blocks: usize,
 ) -> (usize, Glm52IndexerCacheLayout) {
-    // The index-K cache is indexed by the same pool block ids as the MLA
-    // cache, so it holds the same block count.
+    // The index-K slices are indexed by the same pool block ids as the MLA
+    // slices, so the layout holds the same block count.
     let layout = Glm52IndexerCacheLayout {
         cache_blocks: num_blocks,
         cache_block_size: INDEX_CACHE_BLOCK,
-        cache_block_stride_bytes: INDEX_CACHE_BLOCK * (GLM52_INDEX_HEAD_DIM + 4),
+        cache_layer_offset_bytes: 0,
+        cache_block_stride_bytes: GLM52_KV_PAGE_STRIDE,
     };
     (glm52_table_width(max_model_len), layout)
 }
@@ -355,6 +426,10 @@ pub(crate) fn rope_tables(position: usize) -> (Vec<bf16>, Vec<bf16>) {
 /// One DP rank: the full non-expert model plus this rank's expert banks.
 pub(crate) struct Glm52RankModel {
     layers: Vec<Glm52DecoderLayerWeights>,
+    /// The rank's page-first KV slab: `pool_blocks` pages (plus the EP MTP
+    /// scratch pages past them), each holding every layer's cache slices at
+    /// the [`glm52_page_layout`] offsets in `caches`.
+    kv_slab: Glm52KvSlab,
     caches: Vec<Glm52LayerCaches>,
     mtp: Option<Glm52NativeMtp>,
     embed: DeviceMatrix,
@@ -379,9 +454,6 @@ pub(crate) struct Glm52RankModel {
     /// ([`glm52_pool_blocks`]).
     max_model_len: usize,
     pool_blocks: usize,
-    /// Token stride of this rank's MLA arena. FlashMLA fp8_ds_mla uses 656
-    /// bytes; TP4 FlashInfer uses the standard 576-byte E4M3 layout.
-    mla_cache_bytes_per_token: usize,
     /// EP rank count of the launch topology (8 for EP8, 4 for EP4, 1 for the
     /// tensor-replicated topologies): the factor between the per-rank batch
     /// cap and the MoE collectives' protocol-max `global_tokens` bound.
@@ -539,82 +611,51 @@ impl Glm52RankModel {
             .data())
     }
 
-    /// The per-layer cache arenas this rank registers with the KV offload
-    /// tier: one `glm52.L{n}.mla` arena per layer plus a `glm52.L{n}.idxk`
-    /// sidecar on the full-indexer layers, all indexed by the same pool block
-    /// ids. Registering both under one instance makes every save/load move a
-    /// block's MLA page and its index-K slice together — an MLA page restored
-    /// without its index-K would be silent corruption. The arenas are
-    /// contiguous, so a block's stride equals its copy size.
+    /// The single page-granular arena this rank registers with the KV
+    /// offload tier: pool block `b`'s page at `b * page_stride` holds EVERY
+    /// layer's MLA slice, the full-indexer index-K slices, and the layer-78
+    /// MTP committed mirrors — per-layer co-movement is structural, one
+    /// save/load moves a block's whole page. Only the pool region is
+    /// registered: the EP MTP scratch pages past `pool_blocks` hold
+    /// unverified proposal KV and never transfer, and the pad tail
+    /// (stride − content) never moves.
     pub(crate) fn kv_arenas(&self, stream: &CudaStream) -> Result<Vec<ArenaSpec>> {
-        let num_blocks = self.pool_blocks;
-        let mla_block_bytes = GLM52_FLASHMLA_SPARSE_PAGE_SIZE * self.mla_cache_bytes_per_token;
-        let idxk_block_bytes = INDEX_CACHE_BLOCK * (GLM52_INDEX_HEAD_DIM + 4);
-        let mut arenas = Vec::with_capacity(self.caches.len() * 2);
-        for (layer, caches) in self.caches.iter().enumerate() {
-            ensure!(
-                caches.mla_cache.len() == num_blocks * mla_block_bytes,
-                "GLM5.2 layer {layer} MLA arena is {} bytes, expected \
-                 {num_blocks} blocks x {mla_block_bytes}",
-                caches.mla_cache.len(),
-            );
-            let (base_ptr, _sync) = caches.mla_cache.device_ptr(stream);
-            arenas.push(contiguous_arena(
-                format!("glm52.L{layer}.mla"),
-                base_ptr,
-                num_blocks,
-                mla_block_bytes,
-            ));
-            if let Some(index_k) = &caches.index_k_cache {
-                ensure!(
-                    index_k.len() == num_blocks * idxk_block_bytes,
-                    "GLM5.2 layer {layer} index-K arena is {} bytes, expected \
-                     {num_blocks} blocks x {idxk_block_bytes}",
-                    index_k.len(),
-                );
-                let (base_ptr, _sync) = index_k.device_ptr(stream);
-                arenas.push(contiguous_arena(
-                    format!("glm52.L{layer}.idxk"),
-                    base_ptr,
-                    num_blocks,
-                    idxk_block_bytes,
-                ));
-            }
-        }
-        if let Some(mtp) = &self.mtp {
-            arenas.extend(mtp.kv_arenas(stream)?);
-        }
-        Ok(arenas)
+        ensure!(
+            self.kv_slab.num_blocks >= self.pool_blocks
+                && self.kv_slab.page_stride == GLM52_KV_PAGE_STRIDE,
+            "GLM5.2 KV slab geometry drifted from the pool: {} pages x {} stride vs {} pool blocks",
+            self.kv_slab.num_blocks,
+            self.kv_slab.page_stride,
+            self.pool_blocks,
+        );
+        let (base_ptr, _sync) = self.kv_slab.slab.device_ptr(stream);
+        Ok(vec![ArenaSpec {
+            name: "glm52.page".to_owned(),
+            base_device_ptr: base_ptr,
+            size_bytes: self.pool_blocks * GLM52_KV_PAGE_STRIDE,
+            num_blocks: self.pool_blocks,
+            segment_bytes: GLM52_KV_PAGE_CONTENT_BYTES,
+            segments: 1,
+            kv_stride_bytes: 0,
+            block_stride_bytes: GLM52_KV_PAGE_STRIDE,
+        }])
     }
 
-    /// Native P/D boundary restore: copy one pool page across every KV arena
-    /// [`Self::kv_arenas`] registers — each layer's MLA (+ index-K sidecar)
-    /// and the MTP layer-78 mirrors — from the restored shared page into the
-    /// request's own page.
+    /// Native P/D boundary restore: one whole-page D2D from the restored
+    /// shared page into the request's own page — every layer's slices (MTP
+    /// mirrors included) move together by construction.
     pub(crate) fn copy_kv_page(
         &mut self,
         ctx: &DeviceContext,
         src: usize,
         dst: usize,
     ) -> Result<()> {
-        let mla_block_bytes = GLM52_FLASHMLA_SPARSE_PAGE_SIZE * self.mla_cache_bytes_per_token;
-        let idxk_block_bytes = INDEX_CACHE_BLOCK * (GLM52_INDEX_HEAD_DIM + 4);
-        for caches in &mut self.caches {
-            copy_arena_block(
-                &ctx.stream,
-                &mut caches.mla_cache,
-                mla_block_bytes,
-                src,
-                dst,
-            )?;
-            if let Some(index_k) = &mut caches.index_k_cache {
-                copy_arena_block(&ctx.stream, index_k, idxk_block_bytes, src, dst)?;
-            }
-        }
-        if let Some(mtp) = &mut self.mtp {
-            mtp.copy_committed_kv_page(ctx, src, dst)?;
-        }
-        Ok(())
+        ensure!(
+            src < self.pool_blocks && dst < self.pool_blocks,
+            "GLM5.2 boundary copy outside the pool: {src} -> {dst}, {} pool blocks",
+            self.pool_blocks
+        );
+        glm52_copy_page_content(&ctx.stream, &mut self.kv_slab, src, dst)
     }
 
     /// Phase 1 of the two-phase build: everything NOT sized by the pool
@@ -651,25 +692,17 @@ impl Glm52RankModel {
         let mla_backend = glm52_select_mla_backend(mla_heads)?;
         let mla_cache_bytes_per_token =
             glm52_persistent_mla_bytes_per_token(prefill_chunk_size.is_some(), mla_backend);
-        let indexer_arenas = (0..GLM52_LAYERS)
+        let indexer_slices = (0..GLM52_LAYERS)
             .filter(|&layer| glm52_layer_has_full_indexer(layer))
             .count();
         log::info!(
-            "GLM5.2 KV cache: topology={moe_topo:?} backend={mla_backend:?} \
-             page_tokens={} mla_layout={} mla_bytes/token={} mla_bytes/page={} \
-             mla_arenas={} index_k_layout=fp8[64,128]+f32[64] \
-             index_k_bytes/token={} index_k_bytes/page={} index_k_arenas={indexer_arenas}",
+            "GLM5.2 KV cache: topology={moe_topo:?} backend={mla_backend:?} page-first slab \
+             page_tokens={} page_stride={GLM52_KV_PAGE_STRIDE} \
+             page_content={GLM52_KV_PAGE_CONTENT_BYTES} mla_slices={} x {GLM52_KV_PAGE_MLA_BYTES} \
+             index_k_slices={indexer_slices} x {GLM52_KV_PAGE_IDXK_BYTES} \
+             (fp8[64,128]+f32[64]) + L78 mirrors",
             GLM52_FLASHMLA_SPARSE_PAGE_SIZE,
-            if mla_cache_bytes_per_token == GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN {
-                "fp8_ds_mla"
-            } else {
-                "flashinfer_fp8"
-            },
-            mla_cache_bytes_per_token,
-            GLM52_FLASHMLA_SPARSE_PAGE_SIZE * mla_cache_bytes_per_token,
             GLM52_LAYERS,
-            GLM52_INDEX_HEAD_DIM + 4,
-            INDEX_CACHE_BLOCK * (GLM52_INDEX_HEAD_DIM + 4),
         );
         log::info!(
             "GLM5.2 MLA execution: backend={:?} ({} heads/rank, persistent {} bytes/cache token)",
@@ -686,9 +719,14 @@ impl Glm52RankModel {
         // this build; the per-bucket sched/scratch below carry the count only
         // as launch metadata (nothing they allocate scales with it), so they
         // are built against a 1-block placeholder that `finish_kv` rebinds.
+        // The layer offset stays 0 in the bucket-shared contract: one plan
+        // serves all 78 layers, and the attend applies each layer's slab
+        // offset per launch.
         let contract = Glm52FlashMlaSparseDecode {
             batch_size: batch,
             num_blocks: 1,
+            kv_layer_offset_bytes: 0,
+            kv_block_stride_bytes: GLM52_KV_PAGE_STRIDE,
             topk: GLM52_FLASHMLA_SPARSE_TOPK,
             num_sm_parts,
             sm_scale: GLM52_SM_SCALE,
@@ -870,13 +908,7 @@ impl Glm52RankModel {
                         "GLM5.2 prefill-only execution requires a TP topology, got {other:?}"
                     ),
                 };
-                Glm52TpPrefillExecutor::new(
-                    ctx,
-                    table_width,
-                    index_cache_layout,
-                    chunk_rows,
-                    topology,
-                )
+                Glm52TpPrefillExecutor::new(ctx, table_width, chunk_rows, topology)
             })
             .transpose()?;
 
@@ -915,12 +947,13 @@ impl Glm52RankModel {
         })
     }
 
-    /// Phase 2 of the two-phase build: allocate every pool-scaled slab for
-    /// the launch-decided `pool_blocks` — the per-layer MLA/index-K arenas,
-    /// the native-MTP cache, and the prefill unpacked-KV pool — and rebind
-    /// the placeholder cache geometry the fixed buckets carry. The engine's
-    /// `BlockPool` and the arenas here MUST agree on this count: pool block
-    /// ids index the arenas directly.
+    /// Phase 2 of the two-phase build: allocate the pool-scaled slabs for
+    /// the launch-decided `pool_blocks` — the page-first KV slab (plus the
+    /// EP MTP scratch pages past the pool region), the TP4 MTP dense caches,
+    /// and the prefill unpacked-KV pool — and rebind the placeholder cache
+    /// geometry the fixed buckets carry. The engine's `BlockPool` and the
+    /// slab here MUST agree on this count: pool block ids index the slab
+    /// pages directly.
     pub(crate) fn finish_kv(
         ctx: &DeviceContext,
         fixed: Glm52RankModelFixed,
@@ -952,6 +985,16 @@ impl Glm52RankModel {
             mut prefill,
         } = fixed;
         ensure!(pool_blocks > 0, "GLM5.2 KV pool must be non-empty");
+        // The slab page holds fp8_ds_mla rows; a 576-byte FlashInfer
+        // persistent layout has no slab home. TP4 attention runs
+        // prefill-only (its persistent rows are the 656-byte wire format),
+        // so the only config this rejects is the removed TP4 decode role.
+        ensure!(
+            mla_cache_bytes_per_token == GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN,
+            "GLM5.2 page-first KV slab requires the {GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN}-byte \
+             fp8_ds_mla persistent layout, got {mla_cache_bytes_per_token} bytes/token \
+             (backend {mla_backend:?})"
+        );
         let (layout_width, index_cache_layout) =
             glm52_index_cache_layout(max_model_len, pool_blocks);
         ensure!(
@@ -962,23 +1005,29 @@ impl Glm52RankModel {
             bucket.sched.set_num_blocks(pool_blocks);
             bucket.scratch.idx.set_num_kv_blocks(pool_blocks);
         }
-        let mut caches = Vec::with_capacity(layers.len());
-        for layer in 0..layers.len() {
-            caches.push(Glm52LayerCaches {
-                mla_cache: ctx.stream.alloc_zeros::<u8>(
-                    pool_blocks * GLM52_FLASHMLA_SPARSE_PAGE_SIZE * mla_cache_bytes_per_token,
-                )?,
-                index_k_cache: glm52_layer_has_full_indexer(layer)
-                    .then(|| {
-                        ctx.stream
-                            .alloc_zeros::<u8>(index_cache_layout.min_cache_bytes()?)
-                            .map_err(anyhow::Error::from)
-                    })
-                    .transpose()?,
-            });
-        }
+        let page = glm52_page_layout();
+        // EP MTP proposal scratch pages live in the same slab past the pool
+        // region; the TP4 MTP caches are dense side allocations and add no
+        // slab pages.
+        let scratch_blocks = mtp.as_ref().map_or(0, |mtp| {
+            if mtp.slab_resident() {
+                glm52_decode_slots() * mtp::MTP_SCRATCH_PAGES_PER_SLOT
+            } else {
+                0
+            }
+        });
+        let slab_blocks = pool_blocks + scratch_blocks;
+        let slab_bytes = slab_blocks
+            .checked_mul(GLM52_KV_PAGE_STRIDE)
+            .and_then(|bytes| bytes.checked_add(GLM52_KV_PAGE_CONTENT_BYTES))
+            .context("GLM5.2 KV slab byte count overflow")?;
+        let kv_slab = Glm52KvSlab {
+            slab: ctx.stream.alloc_zeros::<u8>(slab_bytes)?,
+            page_stride: GLM52_KV_PAGE_STRIDE,
+            num_blocks: slab_blocks,
+        };
         let mtp = mtp
-            .map(|fixed| fixed.attach_cache(ctx, pool_blocks))
+            .map(|fixed| fixed.attach_cache(ctx, pool_blocks, page.mtp))
             .transpose()?;
         if let Some(prefill) = prefill.as_mut() {
             prefill.attach_kv_pool(
@@ -987,23 +1036,10 @@ impl Glm52RankModel {
                 index_cache_layout,
             )?;
         }
-        // The FlashInfer preflight needs a real cache arena, so it runs here
-        // rather than in build_fixed (decode-only: TP4 prefill has no decode
-        // buckets to warm).
-        if prefill.is_none() && mla_backend == crate::mla_decode::Glm52MlaBackend::FlashInferFp8 {
-            for bucket in &mut buckets {
-                glm52_mla_backend_preflight(
-                    ctx,
-                    &bucket.sched,
-                    &mut bucket.scratch.mla_attend,
-                    &caches[0].mla_cache,
-                )?;
-            }
-            ctx.sync()?;
-        }
         Ok(Self {
             layers,
-            caches,
+            kv_slab,
+            caches: page.layers,
             mtp,
             embed,
             final_norm,
@@ -1014,7 +1050,6 @@ impl Glm52RankModel {
             table_width,
             max_model_len,
             pool_blocks,
-            mla_cache_bytes_per_token,
             ep_ranks,
             slot_mapping,
             seq_lens,
@@ -1057,22 +1092,15 @@ impl Glm52RankModel {
             .decode_lm_head
             .as_ref()
             .context("GLM5.2 TP4 prefill is missing its vocabulary shard")?;
-        let mtp = self.mtp.as_mut().map(|mtp| {
-            let (bookend, layer, transfer_cache, proposal_cache) = mtp.prefill_parts();
-            Glm52TpPrefillMtpView {
-                bookend,
-                layer,
-                transfer_cache,
-                proposal_cache,
-            }
-        });
+        let mtp = self.mtp.as_mut().map(Glm52NativeMtp::prefill_view);
         let mut output = executor.forward(
             ctx,
             batch,
             tp,
             Glm52TpPrefillModelView {
                 layers: &self.layers,
-                caches: &mut self.caches,
+                slab: &mut self.kv_slab,
+                caches: &self.caches,
                 embed: &self.embed,
                 cos_table: &self.cos_table,
                 sin_table: &self.sin_table,
@@ -1152,6 +1180,7 @@ impl Glm52RankModel {
                 &self.lm_head,
                 &self.cos_table,
                 &self.sin_table,
+                &mut self.kv_slab,
                 executor.mtp_target_boundary(),
                 &round,
                 Some(mtp::Glm52MtpProposalSeed {
@@ -1211,6 +1240,7 @@ impl Glm52RankModel {
             &self.lm_head,
             &self.cos_table,
             &self.sin_table,
+            &mut self.kv_slab,
             target_final_normed,
             round,
             None,
@@ -1593,7 +1623,8 @@ impl Glm52RankModel {
                 ep8,
                 tp,
                 &self.layers,
-                &mut self.caches,
+                &mut self.kv_slab,
+                &self.caches,
                 &self.embed,
                 &self.final_norm,
                 decode_lm_head,
@@ -1612,7 +1643,8 @@ impl Glm52RankModel {
                 ep8,
                 tp,
                 &self.layers,
-                &mut self.caches,
+                &mut self.kv_slab,
+                &self.caches,
                 &self.embed,
                 &self.final_norm,
                 decode_lm_head,
@@ -1641,53 +1673,124 @@ mod cache_layout_tests {
 
         assert_eq!(tp4_prefill, 656);
         assert_eq!(tp4_prefill, ep_decode);
-        assert_eq!(GLM52_FLASHMLA_SPARSE_PAGE_SIZE * tp4_prefill, 41_984);
-        assert_eq!(INDEX_CACHE_BLOCK * (GLM52_INDEX_HEAD_DIM + 4), 8_448);
+        assert_eq!(GLM52_KV_PAGE_MLA_BYTES, 41_984);
+        assert_eq!(GLM52_KV_PAGE_IDXK_BYTES, 8_448);
+    }
+
+    #[test]
+    fn page_layout_matches_the_wire_constants() {
+        let layout = glm52_page_layout();
+        assert_eq!(GLM52_KV_PAGE_CONTENT_BYTES, 3_502_592);
+        assert_eq!(GLM52_KV_PAGE_STRIDE, 3_503_040);
+        assert_eq!(
+            GLM52_KV_PAGE_STRIDE,
+            GLM52_KV_PAGE_CONTENT_BYTES.next_multiple_of(GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN)
+        );
+        assert_eq!(layout.layers.len(), GLM52_LAYERS);
+        assert_eq!(
+            layout
+                .layers
+                .iter()
+                .filter(|caches| caches.index_k_offset.is_some())
+                .count(),
+            21
+        );
+        // Slices in declaration order, each 16-byte aligned, none crossing
+        // into the next.
+        let mut expected = 0usize;
+        for caches in layout.layers.iter().chain([&layout.mtp]) {
+            assert_eq!(caches.mla_offset, expected);
+            assert_eq!(caches.mla_offset % 16, 0);
+            expected += GLM52_KV_PAGE_MLA_BYTES;
+            if let Some(index_k_offset) = caches.index_k_offset {
+                assert_eq!(index_k_offset, expected);
+                assert_eq!(index_k_offset % 16, 0);
+                expected += GLM52_KV_PAGE_IDXK_BYTES;
+            }
+        }
+        assert_eq!(expected, GLM52_KV_PAGE_CONTENT_BYTES);
+        assert_eq!(layout.layers[0].mla_offset, 0);
+        assert_eq!(layout.layers[0].index_k_offset, Some(41_984));
+        assert_eq!(
+            layout.mtp.index_k_offset,
+            Some(GLM52_KV_PAGE_CONTENT_BYTES - GLM52_KV_PAGE_IDXK_BYTES)
+        );
     }
 }
 
-/// A contiguous cache arena (stride == copy size, one segment) — every
-/// GLM5.2 cache allocation is one flat per-layer buffer, so a block's
-/// strided extent is just its byte size and the arena length covers exactly
-/// `num_blocks` of them.
-/// One page-granular D2D within a contiguous arena. `src` and `dst` never
-/// overlap: the destination is always a freshly allocated private page.
-pub(crate) fn copy_arena_block(
+/// Single-layer slab for oracle/unit paths: one page = `[MLA slice |
+/// index-K slice]`, stride padded to the 656-byte cache token row the
+/// FlashMLA TMA requires, with the same conservative-extent tail slack as
+/// the production slab.
+#[cfg(test)]
+pub(crate) fn glm52_test_layer_slab(
+    ctx: &DeviceContext,
+    num_blocks: usize,
+) -> Result<(Glm52KvSlab, Glm52LayerCaches)> {
+    let content = GLM52_KV_PAGE_MLA_BYTES + GLM52_KV_PAGE_IDXK_BYTES;
+    let page_stride = content.next_multiple_of(GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN);
+    Ok((
+        Glm52KvSlab {
+            slab: ctx
+                .stream
+                .alloc_zeros::<u8>(num_blocks * page_stride + content)?,
+            page_stride,
+            num_blocks,
+        },
+        Glm52LayerCaches {
+            mla_offset: 0,
+            index_k_offset: Some(GLM52_KV_PAGE_MLA_BYTES),
+        },
+    ))
+}
+
+/// One whole-page D2D within a KV slab: the page CONTENT moves, the pad tail
+/// does not. `src` and `dst` never overlap — the destination is always a
+/// distinct page.
+pub(crate) fn glm52_copy_page_content(
+    stream: &Arc<CudaStream>,
+    slab: &mut Glm52KvSlab,
+    src: usize,
+    dst: usize,
+) -> Result<()> {
+    copy_strided_block(
+        stream,
+        &mut slab.slab,
+        0,
+        slab.page_stride,
+        GLM52_KV_PAGE_CONTENT_BYTES,
+        src,
+        dst,
+    )
+}
+
+/// One block-granular D2D within a strided arena region: block `b` occupies
+/// `copy_bytes` at `region_offset + b * block_stride`.
+pub(crate) fn copy_strided_block(
     stream: &Arc<CudaStream>,
     arena: &mut CudaSlice<u8>,
-    block_bytes: usize,
+    region_offset: usize,
+    block_stride: usize,
+    copy_bytes: usize,
     src: usize,
     dst: usize,
 ) -> Result<()> {
     ensure!(src != dst, "arena block copy onto itself: page {src}");
-    let split = src.max(dst) * block_bytes;
+    ensure!(
+        copy_bytes <= block_stride,
+        "arena block copy of {copy_bytes} bytes exceeds the {block_stride}-byte stride"
+    );
+    let start = |block: usize| region_offset + block * block_stride;
+    let split = start(src.max(dst));
     let (mut low, mut high) = arena.split_at_mut(split);
     if src < dst {
-        let src = low.slice(src * block_bytes..(src + 1) * block_bytes);
-        let mut dst = high.slice_mut(0..block_bytes);
+        let src = low.slice(start(src)..start(src) + copy_bytes);
+        let mut dst = high.slice_mut(0..copy_bytes);
         stream.memcpy_dtod(&src, &mut dst)?;
     } else {
-        let src = high.slice(0..block_bytes);
-        let mut dst = low.slice_mut(dst * block_bytes..(dst + 1) * block_bytes);
+        let src = high.slice(0..copy_bytes);
+        let mut dst = low.slice_mut(start(dst)..start(dst) + copy_bytes);
         stream.memcpy_dtod(&src, &mut dst)?;
     }
     Ok(())
-}
-
-pub(crate) fn contiguous_arena(
-    name: String,
-    base_device_ptr: u64,
-    num_blocks: usize,
-    block_bytes: usize,
-) -> ArenaSpec {
-    ArenaSpec {
-        name,
-        base_device_ptr,
-        size_bytes: num_blocks * block_bytes,
-        num_blocks,
-        segment_bytes: block_bytes,
-        segments: 1,
-        kv_stride_bytes: 0,
-        block_stride_bytes: block_bytes,
-    }
 }

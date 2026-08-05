@@ -2,6 +2,7 @@
 #include <cuda_runtime_api.h>
 
 #include <algorithm>
+#include <climits>
 #include <cstdint>
 #include <exception>
 
@@ -185,12 +186,17 @@ extern "C" CUresult glm52_flashmla_sparse_decode_launch_cuda(
     const void* q, const void* packed_kv_cache, const int* topk_indices,
     const int* tile_scheduler_metadata, const int* num_splits, void* out_latent,
     float* lse, float* lse_accum, float* o_accum, int batch_size,
-    int num_blocks, int topk, int num_sm_parts, float sm_scale,
-    cudaStream_t stream) {
+    int num_blocks, long long kv_block_stride_bytes, int topk, int num_sm_parts,
+    float sm_scale, cudaStream_t stream) {
+  // The TMA tensormap divides the block stride by TMA_K_STRIDE (656 for V32),
+  // so a page-first stride must stay a multiple of the per-token row bytes.
   if (q == nullptr || packed_kv_cache == nullptr || topk_indices == nullptr ||
       tile_scheduler_metadata == nullptr || num_splits == nullptr ||
       out_latent == nullptr || lse == nullptr || lse_accum == nullptr ||
       o_accum == nullptr ||
+      kv_block_stride_bytes < (long long)kPageSize * kBytesPerToken ||
+      kv_block_stride_bytes % kBytesPerToken != 0 ||
+      kv_block_stride_bytes > INT_MAX ||
       !valid_common_shape(batch_size, num_blocks, topk, num_sm_parts)) {
     return CUDA_ERROR_INVALID_VALUE;
   }
@@ -228,7 +234,7 @@ extern "C" CUresult glm52_flashmla_sparse_decode_launch_cuda(
   params.stride_q_b = kSq * kHeads * kQkDim;
   params.stride_q_s_q = kHeads * kQkDim;
   params.stride_q_h_q = kQkDim;
-  params.stride_kv_block = kPageSize * kBytesPerToken;
+  params.stride_kv_block = static_cast<int>(kv_block_stride_bytes);
   params.stride_kv_row = kBytesPerToken;
   params.stride_indices_b = kSq * topk;
   params.stride_indices_s_q = topk;

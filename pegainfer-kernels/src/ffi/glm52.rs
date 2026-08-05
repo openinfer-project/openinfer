@@ -224,6 +224,7 @@ unsafe extern "C" {
         cache: *mut u8,
         slot_mapping: *const i64,
         max_slots: i64,
+        block_stride_bytes: i64,
         tokens: i32,
         stream: CUstream,
     ) -> CUresult;
@@ -410,6 +411,7 @@ unsafe extern "C" {
         block_ids: *const i32,
         blocks: i32,
         packed_bytes: i32,
+        packed_block_stride: i64,
         max_slots: i64,
         unpacked: *mut Half,
         stream: CUstream,

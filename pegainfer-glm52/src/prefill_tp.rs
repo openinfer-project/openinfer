@@ -60,13 +60,17 @@ use crate::fp8::Glm52Fp8GemmScratch;
 use crate::fp8::fp8_linear_large_m_into;
 use crate::indexer::Glm52IndexerPrefillScratch;
 use crate::layer::Glm52DecoderLayerWeights;
+use crate::layer::Glm52KvSlab;
 use crate::layer::Glm52LayerCaches;
 use crate::layer::Glm52LayerIndexer;
 use crate::layer::Glm52LayerMlp;
 use crate::mla_front::Glm52MlaFront;
 use crate::mla_front::Glm52MlaLayerWeights;
 use crate::mla_front::glm52_mla_prefill_front_into;
+use crate::model::GLM52_KV_PAGE_IDXK_BYTES;
+use crate::model::GLM52_KV_PAGE_MLA_BYTES;
 use crate::model::GLM52_MAX_BATCH_PER_RANK;
+use crate::model::INDEX_CACHE_BLOCK;
 use crate::moe_tp::Glm52MoeTpPrefillScratch;
 use crate::moe_tp::Glm52MoeTpRank;
 use crate::moe_tp::Glm52MoeTpState;
@@ -240,6 +244,10 @@ pub(crate) struct Glm52TpPrefillExecutor {
     // and finish_kv — never during serving) ----
     block_ids: Option<CudaSlice<i32>>,
     unpacked_kv: Option<CudaSlice<bf16>>,
+    /// The slab index-K layout (pool block count, page stride, offset 0);
+    /// each full-indexer launch applies its layer's slice offset. The MTP
+    /// proposal path builds its own dense layout instead.
+    index_cache_layout: Option<Glm52IndexerCacheLayout>,
     fp8_gemm: Glm52Fp8GemmScratch,
     attention_v: CudaSlice<bf16>,
     attention_partial: CudaSlice<bf16>,
@@ -287,11 +295,17 @@ pub(crate) struct Glm52TpPrefillExecutor {
     mtp_proposal_boundary: Rows<GLM52_HIDDEN>,
 }
 
+/// The TP4 dense layer-78 caches, lent by `model::mtp` for one chunk. The
+/// transfer pair is the fp8_ds_mla P/D wire mirror (dense from slot 0); the
+/// proposal slab is the FlashInfer execution cache (`proposal_caches` maps
+/// its dense MLA region and tight index-K region).
 pub(crate) struct Glm52TpPrefillMtpView<'a> {
     pub(crate) bookend: &'a Glm52MtpBookendWeights,
     pub(crate) layer: &'a Glm52DecoderLayerWeights,
-    pub(crate) transfer_cache: &'a mut Glm52LayerCaches,
-    pub(crate) proposal_cache: &'a mut Glm52LayerCaches,
+    pub(crate) transfer_mla: &'a mut CudaSlice<u8>,
+    pub(crate) transfer_index_k: &'a mut CudaSlice<u8>,
+    pub(crate) proposal: &'a mut Glm52KvSlab,
+    pub(crate) proposal_caches: Glm52LayerCaches,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -310,7 +324,10 @@ pub(crate) struct Glm52PrefillOutput {
 
 pub(crate) struct Glm52TpPrefillModelView<'a> {
     pub(crate) layers: &'a [Glm52DecoderLayerWeights],
-    pub(crate) caches: &'a mut [Glm52LayerCaches],
+    /// The rank's page-first KV slab; `caches` carries each layer's slice
+    /// offsets inside a page.
+    pub(crate) slab: &'a mut Glm52KvSlab,
+    pub(crate) caches: &'a [Glm52LayerCaches],
     pub(crate) embed: &'a DeviceMatrix,
     pub(crate) cos_table: &'a DeviceMatrix,
     pub(crate) sin_table: &'a DeviceMatrix,
@@ -324,13 +341,12 @@ pub(crate) struct Glm52TpPrefillModelView<'a> {
 
 impl Glm52TpPrefillExecutor {
     /// Build everything EXCEPT the pool-scaled buffers: the KV pool size is
-    /// measured after this returns, so `index_cache_layout` here may carry a
-    /// placeholder block count — [`Self::attach_kv_pool`] installs the real
-    /// one before any forward.
+    /// measured after this returns, and [`Self::attach_kv_pool`] installs
+    /// the pool geometry (block ids, unpacked KV, index-K layout) before any
+    /// forward.
     pub(crate) fn new(
         ctx: &DeviceContext,
         table_width: usize,
-        index_cache_layout: Glm52IndexerCacheLayout,
         chunk_rows: usize,
         topology: pegainfer_kernels::ops::Glm52TpTopology,
     ) -> Result<Self> {
@@ -355,6 +371,7 @@ impl Glm52TpPrefillExecutor {
             slot_mapping: ctx.stream.alloc_zeros::<i64>(chunk)?,
             block_ids: None,
             unpacked_kv: None,
+            index_cache_layout: None,
             fp8_gemm: Glm52Fp8GemmScratch::new(ctx, chunk, GLM52_HIDDEN)?,
             attention_v: ctx.stream.alloc_zeros::<bf16>(chunk * 16 * 256)?,
             attention_partial: ctx.stream.alloc_zeros::<bf16>(chunk * GLM52_HIDDEN)?,
@@ -362,13 +379,7 @@ impl Glm52TpPrefillExecutor {
             mlp_out: ctx.stream.alloc_zeros::<bf16>(chunk * GLM52_HIDDEN)?,
             carry_slots: ctx.stream.alloc_zeros::<i32>(chunk * GLM52_INDEXER_TOPK)?,
             carry_lens: ctx.stream.alloc_zeros::<i32>(chunk)?,
-            indexer: Glm52IndexerPrefillScratch::new(
-                ctx,
-                chunk,
-                PREFILL_ATTN_TILE_ROWS,
-                table_width,
-                index_cache_layout,
-            )?,
+            indexer: Glm52IndexerPrefillScratch::new(ctx, chunk, PREFILL_ATTN_TILE_ROWS, table_width)?,
             query_bf16: ctx.stream.alloc_zeros::<bf16>(attn * 64 * GLM52_KV_A_OUT)?,
             attention_out: ctx
                 .stream
@@ -431,7 +442,7 @@ impl Glm52TpPrefillExecutor {
         self.layout.kv_slots = kv_slots;
         self.block_ids = Some(ctx.stream.alloc_zeros::<i32>(kv_slots.div_ceil(64))?);
         self.unpacked_kv = Some(ctx.stream.alloc_zeros::<bf16>(kv_slots * GLM52_KV_A_OUT)?);
-        self.indexer.set_cache_layout(index_cache_layout);
+        self.index_cache_layout = Some(index_cache_layout);
         Ok(())
     }
 
@@ -485,7 +496,7 @@ impl Glm52TpPrefillExecutor {
         let mut carry_ready = false;
         for layer in 0..model.layers.len() {
             let weights = &model.layers[layer];
-            let cache = &mut model.caches[layer];
+            let cache = model.caches[layer];
 
             let mark = self.profiler.start(ctx)?;
             glm52_mla_prefill_front_into(
@@ -499,15 +510,25 @@ impl Glm52TpPrefillExecutor {
             self.profiler.stop(ctx, "mla_front", mark)?;
 
             let mark = self.profiler.start(ctx)?;
-            self.pack_mla_cache(ctx, &weights.mla, &mut cache.mla_cache, rows)?;
+            self.pack_mla_cache(
+                ctx,
+                &weights.mla,
+                &mut model.slab.slab,
+                cache.mla_offset,
+                model.slab.page_stride,
+                model.slab.num_blocks,
+                rows,
+            )?;
             self.profiler.stop(ctx, "mla_pack_cache", mark)?;
 
             if !batch.block_ids.is_empty() {
                 let mark = self.profiler.start(ctx)?;
                 glm52_prefill_unpack_pages_launch(
                     ctx,
-                    &cache.mla_cache,
-                    cache.mla_cache.len() / self.layout.kv_slots,
+                    &model.slab.slab,
+                    cache.mla_offset,
+                    model.slab.page_stride,
+                    pegainfer_kernels::ops::GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN,
                     self.block_ids
                         .as_ref()
                         .context("GLM5.2 prefill KV pool is not attached")?,
@@ -522,10 +543,13 @@ impl Glm52TpPrefillExecutor {
             match &weights.indexer {
                 Glm52LayerIndexer::Full(indexer) => {
                     let mark = self.profiler.start(ctx)?;
-                    let index_k_cache = cache
-                        .index_k_cache
-                        .as_mut()
-                        .context("GLM5.2 full prefill indexer is missing its cache")?;
+                    let index_k_offset = cache
+                        .index_k_offset
+                        .context("GLM5.2 full prefill indexer is missing its page slice")?;
+                    let mut layout = self
+                        .index_cache_layout
+                        .context("GLM5.2 prefill KV pool is not attached")?;
+                    layout.cache_layer_offset_bytes = index_k_offset;
                     self.indexer.run_layer(
                         ctx,
                         indexer,
@@ -533,7 +557,8 @@ impl Glm52TpPrefillExecutor {
                         self.mla_front.q_resid.data(),
                         &self.cos,
                         &self.sin,
-                        index_k_cache,
+                        &mut model.slab.slab,
+                        layout,
                         &self.slot_mapping,
                         rows,
                         &mut self.fp8_gemm,
@@ -754,7 +779,16 @@ impl Glm52TpPrefillExecutor {
             &mut self.fp8_gemm,
             &mut self.mla_front,
         )?;
-        self.pack_mla_cache(ctx, &mtp.layer.mla, &mut mtp.transfer_cache.mla_cache, rows)?;
+        let transfer_blocks = mtp.transfer_mla.len() / GLM52_KV_PAGE_MLA_BYTES;
+        self.pack_mla_cache(
+            ctx,
+            &mtp.layer.mla,
+            &mut *mtp.transfer_mla,
+            0,
+            GLM52_KV_PAGE_MLA_BYTES,
+            transfer_blocks,
+            rows,
+        )?;
         glm52_mla_front_pack_fp8_launch(
             ctx,
             rows,
@@ -769,13 +803,15 @@ impl Glm52TpPrefillExecutor {
             &self.cos,
             &self.sin,
             &mut self.mtp_flashinfer_query,
-            &mut mtp.proposal_cache.mla_cache,
+            &mut mtp.proposal.slab,
             &self.slot_mapping,
         )?;
         if !batch.block_ids.is_empty() {
             glm52_prefill_unpack_pages_launch(
                 ctx,
-                &mtp.transfer_cache.mla_cache,
+                &*mtp.transfer_mla,
+                0,
+                GLM52_KV_PAGE_MLA_BYTES,
                 pegainfer_kernels::ops::GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN,
                 self.block_ids
                     .as_ref()
@@ -789,10 +825,9 @@ impl Glm52TpPrefillExecutor {
         let Glm52LayerIndexer::Full(indexer) = &mtp.layer.indexer else {
             anyhow::bail!("GLM5.2 MTP layer 78 must own a full indexer")
         };
-        let index_k = mtp
-            .proposal_cache
-            .index_k_cache
-            .as_mut()
+        let proposal_index_k_offset = mtp
+            .proposal_caches
+            .index_k_offset
             .context("GLM5.2 MTP layer 78 is missing index-K cache")?;
         self.indexer.run_layer(
             ctx,
@@ -801,23 +836,30 @@ impl Glm52TpPrefillExecutor {
             self.mla_front.q_resid.data(),
             &self.cos,
             &self.sin,
-            index_k,
+            &mut mtp.proposal.slab,
+            Glm52IndexerCacheLayout {
+                cache_blocks: mtp.proposal.num_blocks,
+                cache_block_size: INDEX_CACHE_BLOCK,
+                cache_layer_offset_bytes: proposal_index_k_offset,
+                cache_block_stride_bytes: GLM52_KV_PAGE_IDXK_BYTES,
+            },
             &self.slot_mapping,
             rows,
             &mut self.fp8_gemm,
             &mut self.carry_slots,
             &mut self.carry_lens,
         )?;
-        let transfer_index_k = mtp
-            .transfer_cache
-            .index_k_cache
-            .as_mut()
-            .context("GLM5.2 MTP transfer layer 78 is missing index-K cache")?;
         // Native MTP disables prefix matching and host-tier restore, so the
         // wire cache cannot contain restored pages that this mirror overwrites.
         // TODO: Copy only the committed or newly written page range. Mirroring
-        // the full index-K buffer costs about 17 MiB per chunk at a 16K cap.
-        ctx.stream.memcpy_dtod(index_k, transfer_index_k)?;
+        // the full index-K region costs about 17 MiB per chunk at a 16K cap.
+        let idxk_bytes = mtp.proposal.num_blocks * GLM52_KV_PAGE_IDXK_BYTES;
+        let index_k_region = mtp
+            .proposal
+            .slab
+            .slice(proposal_index_k_offset..proposal_index_k_offset + idxk_bytes);
+        ctx.stream
+            .memcpy_dtod(&index_k_region, &mut *mtp.transfer_index_k)?;
         self.attend_chunk(ctx, &mtp.layer.mla, rows)?;
         fp8_linear_large_m_into(
             ctx,
@@ -956,13 +998,19 @@ impl Glm52TpPrefillExecutor {
 
     /// Per-layer chunk-scale MLA pack: the w_uk absorb bmm plus the fused
     /// canonical fp8_ds_mla pack that writes this layer's 656-byte KV rows at
-    /// `slot_mapping`. The bf16 attention query is assembled later, per
-    /// attention sub-tile.
+    /// `slot_mapping`, into `packed_cache` at `layer_offset` with
+    /// `block_stride` between pages (the slab passes its page geometry; the
+    /// MTP wire mirror is dense). The bf16 attention query is assembled
+    /// later, per attention sub-tile.
+    #[allow(clippy::too_many_arguments)]
     fn pack_mla_cache(
         &mut self,
         ctx: &DeviceContext,
         weights: &Glm52MlaLayerWeights,
         packed_cache: &mut CudaSlice<u8>,
+        layer_offset: usize,
+        block_stride: usize,
+        num_blocks: usize,
         rows: usize,
     ) -> Result<()> {
         gemm_strided_batched_bf16(
@@ -1003,6 +1051,9 @@ impl Glm52TpPrefillExecutor {
             &self.cos,
             &self.sin,
             packed_cache,
+            layer_offset,
+            block_stride,
+            num_blocks,
             &self.slot_mapping,
         )
     }

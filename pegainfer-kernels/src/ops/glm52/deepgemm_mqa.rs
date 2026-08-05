@@ -23,6 +23,10 @@ pub struct Glm52DeepGemmMqaLogitsShape {
     pub head_dim: usize,
     pub num_kv_blocks: usize,
     pub block_kv: usize,
+    /// Byte offset of this layer's first index-K page inside the cache buffer
+    /// the launch receives (0 for a dedicated per-layer arena; the page-first
+    /// slab passes the layer's slab offset).
+    pub kv_cache_layer_offset_bytes: usize,
     pub kv_cache_stride_bytes: usize,
     pub is_context_lens_2d: bool,
     pub is_varlen: bool,
@@ -158,7 +162,8 @@ pub fn glm52_deepgemm_paged_mqa_logits_launch(
         "GLM5.2 DeepGEMM MQA q too small: have {}, need {q_need}",
         q.len()
     );
-    let kv_need = shape.num_kv_blocks * shape.kv_cache_stride_bytes;
+    let kv_need =
+        shape.kv_cache_layer_offset_bytes + shape.num_kv_blocks * shape.kv_cache_stride_bytes;
     ensure!(
         kv_cache.len() >= kv_need,
         "GLM5.2 DeepGEMM MQA kv_cache too small: have {}, need {kv_need}",
@@ -201,7 +206,8 @@ pub fn glm52_deepgemm_paged_mqa_logits_launch(
     );
 
     let (q_ptr, _q_guard) = q.device_ptr(&ctx.stream);
-    let (kv_ptr, _kv_guard) = kv_cache.device_ptr(&ctx.stream);
+    let (kv_base_ptr, _kv_guard) = kv_cache.device_ptr(&ctx.stream);
+    let kv_ptr = kv_base_ptr + shape.kv_cache_layer_offset_bytes as u64;
     let (w_ptr, _w_guard) = weights.device_ptr(&ctx.stream);
     let (cl_ptr, _cl_guard) = context_lens.device_ptr(&ctx.stream);
     let (logits_ptr, _logits_guard) = logits.device_ptr_mut(&ctx.stream);

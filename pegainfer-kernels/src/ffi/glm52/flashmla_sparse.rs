@@ -42,6 +42,7 @@ unsafe extern "C" {
         o_accum: *mut f32,
         batch_size: i32,
         num_blocks: i32,
+        kv_block_stride_bytes: i64,
         topk: i32,
         num_sm_parts: i32,
         sm_scale: f32,

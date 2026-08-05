@@ -161,9 +161,9 @@ struct ActiveRequest {
     boundary_copy: Option<BoundaryCopy>,
 }
 
-/// One page-granular D2D across every KV arena, from the restored
-/// padded-name page to the request's own page. `prefix` pins the source
-/// until the copy retires.
+/// One whole-page D2D within the KV slab, from the restored padded-name
+/// page to the request's own page (every layer's slices move together by
+/// construction). `prefix` pins the source until the copy retires.
 struct BoundaryCopy {
     src_page: i32,
     dst_page: i32,
@@ -321,9 +321,9 @@ impl Glm52Engine {
         );
         // The pool arrives pre-built (shared with the process-wide KvStore,
         // whose rank table froze at build); block ids index the rank's
-        // per-layer MLA and index-K arenas directly. Under mirrored TP the
-        // single pool drives every executor — the mirrored steps write the
-        // identical block ids on all arenas.
+        // page-first KV slab pages directly. Under mirrored TP the single
+        // pool drives every executor — the mirrored steps write the
+        // identical block ids on every mirror's slab.
         let pool = spec.pool;
         let table_width = glm52_table_width(spec.max_model_len);
         // Prefix matching policy lives in `prefix_cache_enabled`: DSpark is

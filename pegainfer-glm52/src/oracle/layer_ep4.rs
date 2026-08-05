@@ -37,12 +37,10 @@ use super::layer::checked_hidden;
 use super::layer::load_decoder_layer;
 use super::layer::load_rank_expert_bank;
 use super::layer::model_path;
-use crate::config::GLM52_INDEX_HEAD_DIM;
 use crate::config::GLM52_ROPE_HALF;
 use crate::config::GLM52_SM_SCALE;
 use crate::indexer::Glm52IndexerScratch;
 use crate::layer::Glm52DecodeStep;
-use crate::layer::Glm52LayerCaches;
 use crate::layer::Glm52LayerMlp;
 use crate::layer::glm52_layer_attention_half;
 use crate::layer::glm52_layer_finish;
@@ -177,9 +175,15 @@ pub(super) fn run_layer_prefill_ep4(
     let Glm52LayerMlp::MoeEp8(moe) = &w.mlp else {
         anyhow::bail!("ep4 gate requires the MoeEp8 layer weights");
     };
+    // Single-layer slab: one `[MLA | index-K]` page per 64-token block, so
+    // the contract/layout strides are the test slab's page stride.
+    let num_blocks = oracle_ctx.div_ceil(GLM52_FLASHMLA_SPARSE_PAGE_SIZE);
+    let (mut slab, caches) = crate::model::glm52_test_layer_slab(ctx, num_blocks)?;
     let contract = Glm52FlashMlaSparseDecode {
         batch_size: 1,
-        num_blocks: oracle_ctx.div_ceil(GLM52_FLASHMLA_SPARSE_PAGE_SIZE),
+        num_blocks,
+        kv_layer_offset_bytes: 0,
+        kv_block_stride_bytes: slab.page_stride,
         topk: GLM52_FLASHMLA_SPARSE_TOPK,
         num_sm_parts: glm52_flashmla_sparse_decode_num_sm_parts()?,
         sm_scale: GLM52_SM_SCALE,
@@ -188,16 +192,8 @@ pub(super) fn run_layer_prefill_ep4(
     let index_cache_layout = Glm52IndexerCacheLayout {
         cache_blocks: index_blocks,
         cache_block_size: INDEX_CACHE_BLOCK,
-        cache_block_stride_bytes: INDEX_CACHE_BLOCK * (GLM52_INDEX_HEAD_DIM + 4),
-    };
-    let mut caches = Glm52LayerCaches {
-        mla_cache: ctx
-            .stream
-            .alloc_zeros::<u8>(contract.packed_kv_cache_len())?,
-        index_k_cache: Some(
-            ctx.stream
-                .alloc_zeros::<u8>(index_cache_layout.min_cache_bytes()?)?,
-        ),
+        cache_layer_offset_bytes: 0,
+        cache_block_stride_bytes: slab.page_stride,
     };
 
     let block_table_host: Vec<i32> = (0..index_blocks as i32).collect();
@@ -258,7 +254,8 @@ pub(super) fn run_layer_prefill_ep4(
             ctx,
             None,
             w,
-            &mut caches,
+            &mut slab,
+            caches,
             &step,
             &mut scratch,
             &mut carry_ready,

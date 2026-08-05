@@ -7,6 +7,7 @@ use cudarc::driver::DevicePtrMut;
 use half::bf16;
 
 use crate::ffi;
+use crate::ops::glm52::flashmla_sparse::GLM52_FLASHMLA_SPARSE_PAGE_SIZE;
 use crate::tensor::DeviceContext;
 
 const GLM52_MLA_HEADS: usize = 64;
@@ -193,7 +194,10 @@ pub fn glm52_mla_front_pack_fp8_launch(
 }
 
 /// Pack one fp8_ds_mla 656-byte cache token = `[512 e4m3 ckv | 4 f32 group scales
-/// | 64 bf16 rope(k_pe)]` into `cache` at token `slot` (paged cache, stride 656).
+/// | 64 bf16 rope(k_pe)]` into `cache` at token `slot`. The cache is addressed
+/// as `layer_offset + slot/64 * block_stride + slot%64 * 656` — a dedicated
+/// per-layer arena passes offset 0 and the tight `64 * 656` stride; the
+/// page-first slab passes its layer offset and whole-page stride.
 /// `ckv_fp8` + `ckv_scales` come straight from `glm52_fp8_per_token_group_quant`
 /// (amax/448, the cache's own scale convention); `k_pe` is the pre-rope shared
 /// rope-key. Slot starts are 4-byte aligned since 656 % 4 == 0.
@@ -207,6 +211,9 @@ pub fn glm52_mla_cache_pack_launch(
     cos: &CudaSlice<bf16>,
     sin: &CudaSlice<bf16>,
     cache: &mut CudaSlice<u8>,
+    cache_layer_offset: usize,
+    cache_block_stride: usize,
+    cache_num_blocks: usize,
     slot_mapping: &CudaSlice<i64>,
 ) -> Result<()> {
     ensure!(tokens > 0, "GLM5.2 MLA cache pack tokens must be positive");
@@ -239,11 +246,20 @@ pub fn glm52_mla_cache_pack_launch(
     );
     // The slot itself is device data (graph-replayable); the kernel traps on
     // an out-of-window slot. Host-side we can only pin the window size.
-    let max_slots = cache.len() / GLM52_MLA_CACHE_BYTES;
+    let page_bytes = GLM52_FLASHMLA_SPARSE_PAGE_SIZE * GLM52_MLA_CACHE_BYTES;
     ensure!(
-        max_slots > 0,
-        "GLM5.2 MLA cache pack cache smaller than one {GLM52_MLA_CACHE_BYTES}-byte token"
+        cache_num_blocks > 0 && cache_block_stride >= page_bytes,
+        "GLM5.2 MLA cache pack needs a positive block count and a stride \
+         covering one {GLM52_FLASHMLA_SPARSE_PAGE_SIZE}-token page"
     );
+    ensure!(
+        cache.len() >= cache_layer_offset + (cache_num_blocks - 1) * cache_block_stride + page_bytes,
+        "GLM5.2 MLA cache pack cache too small: have {}, need {} \
+         (offset {cache_layer_offset}, stride {cache_block_stride}, blocks {cache_num_blocks})",
+        cache.len(),
+        cache_layer_offset + (cache_num_blocks - 1) * cache_block_stride + page_bytes
+    );
+    let max_slots = cache_num_blocks * GLM52_FLASHMLA_SPARSE_PAGE_SIZE;
     let (fp8_ptr, _g0) = ckv_fp8.device_ptr(&ctx.stream);
     let (scale_ptr, _g1) = ckv_scales.device_ptr(&ctx.stream);
     let (kpe_ptr, _g2) = k_pe.device_ptr(&ctx.stream);
@@ -258,9 +274,10 @@ pub fn glm52_mla_cache_pack_launch(
             kpe_ptr as *const ffi::Half,
             cos_ptr as *const ffi::Half,
             sin_ptr as *const ffi::Half,
-            cache_ptr as *mut u8,
+            (cache_ptr + cache_layer_offset as u64) as *mut u8,
             slot_ptr as *const i64,
             max_slots as i64,
+            cache_block_stride as i64,
             tokens as i32,
             ctx.stream.cu_stream(),
         )

@@ -18,6 +18,10 @@ pub const GLM52_INDEXER_TOPK: usize = 2048;
 pub struct Glm52IndexerCacheLayout {
     pub cache_blocks: usize,
     pub cache_block_size: usize,
+    /// Byte offset of this layer's first index-K page inside the cache buffer
+    /// (0 for a dedicated per-layer arena; the page-first slab passes the
+    /// layer's slab offset).
+    pub cache_layer_offset_bytes: usize,
     pub cache_block_stride_bytes: usize,
 }
 
@@ -48,6 +52,7 @@ impl Glm52IndexerCacheLayout {
         self.validate()?;
         self.cache_blocks
             .checked_mul(self.cache_block_stride_bytes)
+            .and_then(|extent| extent.checked_add(self.cache_layer_offset_bytes))
             .ok_or_else(|| anyhow!("GLM5.2 indexer cache byte size overflow: {self:?}"))
     }
 }
@@ -97,7 +102,8 @@ pub fn glm52_indexer_k_quant_and_cache_launch(
     );
 
     let (k_ptr, _k_guard) = k.device_ptr(&ctx.stream);
-    let (cache_ptr, _cache_guard) = indexer_cache.device_ptr_mut(&ctx.stream);
+    let (cache_base_ptr, _cache_guard) = indexer_cache.device_ptr_mut(&ctx.stream);
+    let cache_ptr = cache_base_ptr + contract.layout.cache_layer_offset_bytes as u64;
     let (slot_ptr, _slot_guard) = slot_mapping.device_ptr(&ctx.stream);
     let result = unsafe {
         ffi::glm52_indexer_k_quant_and_cache_cuda(
@@ -341,6 +347,7 @@ pub fn glm52_indexer_k_gather_launch(
     num_requests: usize,
     table_stride: usize,
     block_size: usize,
+    layer_offset_bytes: usize,
     block_stride_bytes: usize,
     paged_cache: &CudaSlice<u8>,
     block_table: &impl DevicePtr<i32>,
@@ -360,7 +367,8 @@ pub fn glm52_indexer_k_gather_launch(
             && out_offsets.len() >= num_requests,
         "GLM5.2 indexer K gather shape is invalid"
     );
-    let (cache_ptr, _cache_guard) = paged_cache.device_ptr(&ctx.stream);
+    let (cache_base_ptr, _cache_guard) = paged_cache.device_ptr(&ctx.stream);
+    let cache_ptr = cache_base_ptr + layer_offset_bytes as u64;
     let (table_ptr, _table_guard) = block_table.device_ptr(&ctx.stream);
     let (lens_ptr, _lens_guard) = seq_lens.device_ptr(&ctx.stream);
     let (offsets_ptr, _offsets_guard) = out_offsets.device_ptr(&ctx.stream);

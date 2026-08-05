@@ -59,6 +59,7 @@ use pegainfer_kv_store::ArenaSpec;
 use pegainfer_kv_store::BlockPool;
 use pegainfer_kv_store::KvStore;
 use pegainfer_kv_store::KvStoreBuilder;
+use pegainfer_kv_store::OffloadMirror;
 use pegainfer_kv_store::OffloadRankSpec;
 use pegainfer_kv_store::P2pConfig;
 use pegainfer_kv_store::PegaflowHost;
@@ -1036,16 +1037,30 @@ fn start_engine(
         }
         ensure_post_build_headroom(&loaded.workers)?;
         let device_ordinals: Vec<usize> = (0..startup.ranks.len()).collect();
-        // A mirrored (TP) topology is one logical rank whose arenas are the
-        // first worker's — the historical layout the wire namespace pins.
-        let store_arenas = if mirrored_early {
-            vec![rank_arenas.into_iter().next().context("TP arenas")?]
+        // A mirrored (TP) topology is one logical rank: worker 0's arena is
+        // the primary (the save side) and every other worker's is a mirror —
+        // MLA KV is tensor-replicated, so a tier load must land on ALL of
+        // them or ranks 1.. attend over never-written pages and the o_proj
+        // all-reduce merges the garbage identically on every rank (#847).
+        let (store_arenas, store_mirrors) = if mirrored_early {
+            let mut workers = rank_arenas.into_iter();
+            let primary = workers.next().context("TP arenas")?;
+            let mirrors = workers
+                .enumerate()
+                .map(|(index, arenas)| OffloadMirror {
+                    device_id: device_ordinals[1 + index] as i32,
+                    arenas,
+                })
+                .collect();
+            (vec![primary], vec![mirrors])
         } else {
-            rank_arenas
+            let ranks = rank_arenas.len();
+            (rank_arenas, (0..ranks).map(|_| Vec::new()).collect())
         };
         build_kv_store(
             kv_offload.as_ref(),
             store_arenas,
+            store_mirrors,
             &device_ordinals[..local_ranks_early],
             &pools,
             if mirrored_early {
@@ -1485,6 +1500,7 @@ fn build_rank_models(
 fn build_kv_store(
     opts: Option<&Glm52KvOffloadOptions>,
     rank_arenas: Vec<Vec<ArenaSpec>>,
+    rank_mirrors: Vec<Vec<OffloadMirror>>,
     device_ordinals: &[usize],
     pools: &[Arc<BlockPool>],
     ranks_start: usize,
@@ -1500,19 +1516,20 @@ fn build_kv_store(
         return Ok(Arc::new(builder.build()));
     };
 
-    let mla_page_size = pegainfer_kernels::ops::GLM52_FLASHMLA_SPARSE_PAGE_SIZE;
-    let mla_bytes_per_token = rank_arenas
-        .first()
-        .and_then(|arenas| arenas.iter().find(|arena| is_mla_arena_name(&arena.name)))
-        .context("GLM5.2 KV offload has no MLA arena")?
-        .segment_bytes
-        / mla_page_size;
+    // One page-granular arena per rank; the page layout constants ARE the
+    // block byte layout, so the registration only cross-checks that every
+    // rank's arena carries them.
     ensure!(
-        rank_arenas.iter().all(|arenas| arenas
-            .iter()
-            .filter(|arena| is_mla_arena_name(&arena.name))
-            .all(|arena| arena.segment_bytes == mla_page_size * mla_bytes_per_token)),
-        "GLM5.2 KV offload ranks disagree on MLA cache layout"
+        rank_arenas.iter().all(|arenas| {
+            arenas.len() == 1
+                && arenas[0].name == "glm52.page"
+                && arenas[0].segment_bytes == crate::model::GLM52_KV_PAGE_CONTENT_BYTES
+                && arenas[0].block_stride_bytes == crate::model::GLM52_KV_PAGE_STRIDE
+        }),
+        "GLM5.2 KV offload expects one page-first arena per rank \
+         (segment {} B, stride {} B)",
+        crate::model::GLM52_KV_PAGE_CONTENT_BYTES,
+        crate::model::GLM52_KV_PAGE_STRIDE,
     );
     let mut host_builder = PegaflowHost::builder(opts.pinned_pool_bytes)
         .use_hugepages(opts.use_hugepages)
@@ -1527,15 +1544,14 @@ fn build_kv_store(
     let host = host_builder
         .build()
         .map_err(|err| anyhow::anyhow!("GLM5.2 KV offload host: {err}"))?;
-    let native_mtp = rank_arenas
-        .first()
-        .is_some_and(|arenas| arenas.iter().any(|arena| arena.name == "glm52.L78.mla"));
+    // The stride is the whole layout identity: one page carries every
+    // layer's MLA + index-K slices and the L78 MTP mirrors (drafter or not),
+    // so agreeing on (layer count, token page, stride) is agreeing on every
+    // byte of a block.
     let namespace = format!(
-        "pegainfer-glm52-l{GLM52_LAYERS}-p{}-mla{}-idxk{}-mtp{}",
-        mla_page_size,
-        mla_bytes_per_token,
-        config::GLM52_INDEX_HEAD_DIM + 4,
-        usize::from(native_mtp),
+        "pegainfer-glm52-l{GLM52_LAYERS}-p{}-page{}",
+        pegainfer_kernels::ops::GLM52_FLASHMLA_SPARSE_PAGE_SIZE,
+        crate::model::GLM52_KV_PAGE_STRIDE,
     );
     ensure!(
         rank_arenas.len() == pools.len() && device_ordinals.len() == pools.len(),
@@ -1544,10 +1560,20 @@ fn build_kv_store(
         pools.len(),
         device_ordinals.len()
     );
+    ensure!(
+        rank_mirrors.len() == pools.len(),
+        "GLM5.2 KV offload: {} mirror sets for {} pools",
+        rank_mirrors.len(),
+        pools.len()
+    );
     let ranks = rank_arenas.len();
     let arenas_per_rank = rank_arenas.first().map_or(0, Vec::len);
-    for (local, (arenas, &device_ordinal)) in
-        rank_arenas.into_iter().zip(device_ordinals).enumerate()
+    let mirrors_per_rank = rank_mirrors.first().map_or(0, Vec::len);
+    for (local, ((arenas, mirrors), &device_ordinal)) in rank_arenas
+        .into_iter()
+        .zip(rank_mirrors)
+        .zip(device_ordinals)
+        .enumerate()
     {
         let rank = ranks_start + local;
         builder = builder
@@ -1561,6 +1587,7 @@ fn build_kv_store(
                     device_id: device_ordinal as i32,
                     arenas,
                     page_first: false,
+                    mirrors,
                 },
             )
             .map_err(|err| {
@@ -1569,7 +1596,7 @@ fn build_kv_store(
     }
     log::info!(
         "GLM5.2 KV offload up: {} pinned host pool (hugepages: {}), namespace {namespace}, \
-         {ranks} rank instances x {arenas_per_rank} arenas",
+         {ranks} rank instances x {arenas_per_rank} arenas ({mirrors_per_rank} mirrors each)",
         ByteSize(opts.pinned_pool_bytes as u64),
         opts.use_hugepages,
     );
@@ -1594,11 +1621,6 @@ fn store_runtime_handle() -> tokio::runtime::Handle {
         })
         .handle()
         .clone()
-}
-
-fn is_mla_arena_name(name: &str) -> bool {
-    name.rsplit_once('.')
-        .is_some_and(|(_, arena_kind)| arena_kind == "mla")
 }
 
 /// EOS ids from the checkpoint's generation_config.json (`eos_token_id` is a

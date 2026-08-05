@@ -241,6 +241,7 @@ pub(crate) fn glm52_mla_decode_forward(
         cos,
         sin,
         cache,
+        0,
         &slot_mapping,
         topk,
         &seq_lens,
@@ -339,57 +340,15 @@ impl Glm52MlaSchedMetadata {
     }
 }
 
-/// Eagerly load and launch the selected FlashInfer cubin before whole-step
-/// graph capture. Module loading and host-side kernel selection are not valid
-/// capture work; this also fails startup if a decode bucket lacks metadata.
-pub(crate) fn glm52_mla_backend_preflight(
-    ctx: &DeviceContext,
-    sched: &Glm52MlaSchedMetadata,
-    s: &mut Glm52MlaAttendScratch,
-    cache: &CudaSlice<u8>,
-) -> Result<()> {
-    let contract = sched.contract;
-    let heads = s.heads;
-    let (query, latent, workspace) = match (&sched.backend, &mut s.backend) {
-        (Glm52MlaBackendSchedule::FlashMla { .. }, Glm52MlaBackendScratch::Fp8Ds(_)) => {
-            return Ok(());
-        }
-        (Glm52MlaBackendSchedule::FlashInfer, Glm52MlaBackendScratch::FlashInfer(scratch)) => (
-            &mut scratch.query,
-            &mut scratch.latent,
-            &mut scratch.workspace,
-        ),
-        _ => anyhow::bail!("GLM5.2 MLA preflight schedule/scratch backend mismatch"),
-    };
-    let indices = ctx
-        .stream
-        .clone_htod(&vec![0i32; contract.batch_size * contract.topk])?;
-    let seq_lens = ctx.stream.clone_htod(&vec![1i32; contract.batch_size])?;
-    glm52_flashinfer_sparse_mla_fp8_launch(
-        ctx,
-        Glm52FlashInferSparseDecode {
-            batch_size: contract.batch_size,
-            heads,
-            num_blocks: contract.num_blocks,
-            topk: contract.topk,
-            sm_scale: contract.sm_scale,
-        },
-        query,
-        cache,
-        &indices,
-        &seq_lens,
-        latent,
-        workspace,
-    )
-}
-
 /// MLA attend half over the plan's `batch()` rows: consumes the front
 /// projections + the per-row sparse top-k, packs each row's new token into
 /// its paged-cache slot, runs FlashMLA sparse decode, and projects back into
 /// `out[T, 6144]`. Every intermediate lives in the persistent attend scratch
 /// — the chain is allocation-free. `cos`/`sin` carry one `[32]` row per token
 /// (each row sits at its own position); `slot_mapping`/`topk` are `[T]` /
-/// `[T, topk]`.
+/// `[T, topk]`. `kv_layer_offset` is this layer's MLA slice offset inside
+/// `cache` (0 for a dedicated arena); it rides each call because one plan
+/// serves every layer, and the plan's contract carries the block stride.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn glm52_mla_attend_into(
     ctx: &DeviceContext,
@@ -398,6 +357,7 @@ pub(crate) fn glm52_mla_attend_into(
     cos: &CudaSlice<bf16>,
     sin: &CudaSlice<bf16>,
     cache: &mut CudaSlice<u8>,
+    kv_layer_offset: usize,
     slot_mapping: &CudaSlice<i64>,
     topk: &CudaSlice<i32>,
     seq_lens: &CudaSlice<i32>,
@@ -405,7 +365,10 @@ pub(crate) fn glm52_mla_attend_into(
     s: &mut Glm52MlaAttendScratch,
     out: &mut Rows<HIDDEN>,
 ) -> Result<()> {
-    let contract = sched.contract;
+    let contract = Glm52FlashMlaSparseDecode {
+        kv_layer_offset_bytes: kv_layer_offset,
+        ..sched.contract
+    };
     let t = contract.batch_size;
     ensure!(
         w.heads == front.heads && w.heads == s.heads,
@@ -449,7 +412,7 @@ pub(crate) fn glm52_mla_attend_into(
 
     let (latent, latent_token_stride) = match (&sched.backend, &mut s.backend) {
         (
-            schedule @ (Glm52MlaBackendSchedule::FlashMla { .. }),
+            schedule @ Glm52MlaBackendSchedule::FlashMla { .. },
             Glm52MlaBackendScratch::Fp8Ds(scratch),
         ) => {
             glm52_mla_query_assemble_launch(
@@ -488,6 +451,9 @@ pub(crate) fn glm52_mla_attend_into(
                 cos,
                 sin,
                 cache,
+                contract.kv_layer_offset_bytes,
+                contract.kv_block_stride_bytes,
+                contract.num_blocks,
                 slot_mapping,
             )?;
             match (schedule, &mut scratch.attend) {
@@ -519,6 +485,14 @@ pub(crate) fn glm52_mla_attend_into(
             (&scratch.latent, HEADS * KV_LORA)
         }
         (Glm52MlaBackendSchedule::FlashInfer, Glm52MlaBackendScratch::FlashInfer(scratch)) => {
+            // The FlashInfer pack/attend launches address the cache dense
+            // from its base — this backend's cache never rides a strided
+            // slab layout.
+            ensure!(
+                contract.kv_layer_offset_bytes == 0,
+                "GLM5.2 FlashInfer sparse decode requires a dense cache (layer offset {})",
+                contract.kv_layer_offset_bytes
+            );
             // One fused launch: query assemble + kv_a RMSNorm + cache pack
             // (the split/norm were skipped in `glm52_mla_front_rest_into` for
             // this backend — the raw kv_a output is consumed directly).

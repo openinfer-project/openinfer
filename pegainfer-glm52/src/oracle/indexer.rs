@@ -204,6 +204,7 @@ fn indexer_oracle_gate() -> Result<()> {
     let cache_layout = Glm52IndexerCacheLayout {
         cache_blocks,
         cache_block_size: INDEX_CACHE_BLOCK,
+        cache_layer_offset_bytes: 0,
         cache_block_stride_bytes: INDEX_CACHE_BLOCK * (GLM52_INDEX_HEAD_DIM + 4),
     };
     let cache_bytes = cache_layout.min_cache_bytes()?;

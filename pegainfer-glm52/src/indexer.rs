@@ -370,6 +370,7 @@ impl Glm52IndexerScratch {
             head_dim: GLM52_INDEXER_HEAD_DIM,
             num_kv_blocks: cache_layout.cache_blocks,
             block_kv: cache_layout.cache_block_size,
+            kv_cache_layer_offset_bytes: cache_layout.cache_layer_offset_bytes,
             kv_cache_stride_bytes: cache_layout.cache_block_stride_bytes,
             is_context_lens_2d: false,
             is_varlen: false,
@@ -387,10 +388,14 @@ impl Glm52IndexerScratch {
 /// - `q_resid` is the MLA layer's q_a_layernorm output (`[T, 2048]`).
 /// - `hidden` is the step's hidden states (`[T, 6144]`).
 /// - `cos`/`sin` carry one indexer RoPE `[32]` row per token.
-/// - `index_k_cache` is the paged fp8 indexer key cache (mutable — each row's
-///   new k is quantized and written into it at `slot_mapping[row]`). Its
-///   layout is read from the scratch's build-time shape (one source of
-///   truth — a shape/layout mismatch is unrepresentable).
+/// - `index_k_cache` is the buffer holding the paged fp8 indexer key cache
+///   (mutable — each row's new k is quantized and written into it at
+///   `slot_mapping[row]`), with this layer's slice starting at
+///   `index_k_offset` (0 for a dedicated arena; the page-first slab passes
+///   the layer's page offset). Block count and stride come from the
+///   scratch's build-time shape (one source of truth — a shape/layout
+///   mismatch is unrepresentable); the offset rides each call because the
+///   scratch is shared by every layer.
 /// - `block_table` (`[T, block_table_stride]`) / `seq_lens` (`[T]`) describe
 ///   each row's paged KV region for logits + slot conversion.
 ///
@@ -408,19 +413,23 @@ pub(crate) fn glm52_indexer_forward_into(
     cos: &CudaSlice<bf16>,
     sin: &CudaSlice<bf16>,
     index_k_cache: &mut CudaSlice<u8>,
+    index_k_offset: usize,
     slot_mapping: &CudaSlice<i64>,
     block_table: &CudaSlice<i32>,
     seq_lens: &CudaSlice<i32>,
     topk: usize,
     s: &mut Glm52IndexerScratch,
 ) -> Result<()> {
-    let shape = s.shape;
+    let mut shape = s.shape;
+    shape.kv_cache_layer_offset_bytes = index_k_offset;
     let t = shape.batch_size;
     // The paged cache layout the scratch shape was built from
-    // (`Glm52IndexerScratch::paged_mqa_shape` copies these three fields in).
+    // (`Glm52IndexerScratch::paged_mqa_shape` copies block count/size/stride
+    // in), with this call's layer offset applied.
     let cache_layout = Glm52IndexerCacheLayout {
         cache_blocks: shape.num_kv_blocks,
         cache_block_size: shape.block_kv,
+        cache_layer_offset_bytes: index_k_offset,
         cache_block_stride_bytes: shape.kv_cache_stride_bytes,
     };
     // `topk` comes from the attend plan; its 1..=GLM52_INDEXER_TOPK range is
@@ -641,6 +650,7 @@ pub(crate) fn glm52_indexer_forward(
         cos,
         sin,
         index_k_cache,
+        cache_layout.cache_layer_offset_bytes,
         slot_mapping,
         block_table,
         seq_lens,
@@ -674,7 +684,6 @@ pub(crate) struct Glm52IndexerPrefillScratch {
     kv_cap: usize,
     logits_stride: usize,
     table_width: usize,
-    cache_layout: Glm52IndexerCacheLayout,
     // chunk-scale projection intermediates
     q: CudaSlice<bf16>,
     k_raw: CudaSlice<bf16>,
@@ -708,7 +717,6 @@ impl Glm52IndexerPrefillScratch {
         chunk_rows: usize,
         attn_tile: usize,
         table_width: usize,
-        cache_layout: Glm52IndexerCacheLayout,
     ) -> Result<Self> {
         ensure!(
             chunk_rows > 0 && attn_tile > 0 && table_width > 0,
@@ -730,7 +738,6 @@ impl Glm52IndexerPrefillScratch {
             kv_cap,
             logits_stride,
             table_width,
-            cache_layout,
             q: ctx
                 .stream
                 .alloc_zeros::<bf16>(chunk * INDEX_HEADS * INDEX_HEAD_DIM)?,
@@ -761,14 +768,6 @@ impl Glm52IndexerPrefillScratch {
             host_table: vec![0; GLM52_INDEXER_PREFILL_MAX_REQUESTS * table_width],
             host_lens: vec![0; GLM52_INDEXER_PREFILL_MAX_REQUESTS],
         })
-    }
-
-    /// Rebind to the launch-decided index-K cache layout. No buffer here is
-    /// sized by `cache_blocks` (see the compact-K comment in `new`), so a
-    /// scratch built before the measured KV fill only needs the layout the
-    /// forward-time insert/gather launches read.
-    pub(crate) fn set_cache_layout(&mut self, cache_layout: Glm52IndexerCacheLayout) {
-        self.cache_layout = cache_layout;
     }
 
     /// Stage the per-chunk request plan: segment ranges, per-query kv ends,
@@ -844,6 +843,9 @@ impl Glm52IndexerPrefillScratch {
     /// projections, K quant + cache write, paged->compact K gather, then per
     /// request segment the unpaged MQA logits + top-k + LUT slot conversion,
     /// writing straight into the executor's chunk-scale carry.
+    /// `cache_layout` rides each call because one scratch serves caches with
+    /// different geometry: the main layers' slab slices (per-layer offset,
+    /// page stride) and the TP4 MTP proposal cache (dense index-K region).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn run_layer(
         &mut self,
@@ -854,6 +856,7 @@ impl Glm52IndexerPrefillScratch {
         cos: &CudaSlice<bf16>,
         sin: &CudaSlice<bf16>,
         index_k_cache: &mut CudaSlice<u8>,
+        cache_layout: Glm52IndexerCacheLayout,
         slot_mapping: &CudaSlice<i64>,
         rows: usize,
         gemm: &mut Glm52Fp8GemmScratch,
@@ -919,7 +922,7 @@ impl Glm52IndexerPrefillScratch {
             ctx,
             Glm52IndexerCacheInsert {
                 tokens: rows,
-                layout: self.cache_layout,
+                layout: cache_layout,
             },
             &self.k,
             index_k_cache,
@@ -935,8 +938,9 @@ impl Glm52IndexerPrefillScratch {
                 ctx,
                 1,
                 self.table_width,
-                self.cache_layout.cache_block_size,
-                self.cache_layout.cache_block_stride_bytes,
+                cache_layout.cache_block_size,
+                cache_layout.cache_layer_offset_bytes,
+                cache_layout.cache_block_stride_bytes,
                 index_k_cache,
                 &self.gather_table.slice(seg_index * self.table_width..),
                 &self.gather_lens.slice(seg_index..),

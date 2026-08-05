@@ -34,7 +34,6 @@ use pegainfer_kernels::tensor::DeviceVec;
 use pegainfer_kernels::tensor::HiddenStates;
 
 use crate::config::GLM52_HIDDEN;
-use crate::config::GLM52_INDEX_HEAD_DIM;
 use crate::config::GLM52_RMS_EPS;
 use crate::model::GLM52_DECODE_BUCKETS;
 use crate::model::GLM52_MODEL_LEN_ALIGN;
@@ -61,47 +60,44 @@ pub(crate) fn glm52_mtp_draft_len() -> usize {
     })
 }
 
-/// Context-scaled device memory owned by the native MTP lane: one execution
-/// cache, TP4's additional P/D wire cache, and one set of per-bucket indexer
-/// logits/block tables. Fixed-size weights and scratch are accounted by the
-/// post-build headroom probe; this function is the exact monotone term used to
-/// derive the context cap before those arenas are allocated.
+/// Context-scaled device memory the native MTP lane ADDS on top of
+/// `glm52_arena_bytes` (which already charges the layer-78 committed mirrors
+/// inside every slab page): the per-slot proposal scratch (EP: whole slab
+/// pages past the registered pool region; TP4: rows of the dense caches),
+/// TP4's dense FlashInfer execution + fp8_ds_mla wire caches, and one set of
+/// per-bucket indexer logits/block tables. Fixed-size weights and scratch are
+/// accounted by the post-build headroom probe; this function is the exact
+/// monotone term used to derive the context cap before those arenas are
+/// allocated.
 pub(crate) fn glm52_mtp_arena_bytes(
     max_model_len: usize,
     pool_blocks: usize,
     topology: crate::Glm52MoeTopo,
 ) -> Result<usize> {
-    // Two private pages per slot hold unverified proposal KV. Committed
-    // layer-78 rows use the target BlockPool page IDs and are transferable;
+    // The private per-slot pages hold unverified proposal KV. Committed
+    // layer-78 rows ride the target BlockPool page ids and are transferable;
     // scratch pages sit beyond that registered range.
-    let blocks = pool_blocks + 2 * crate::model::glm52_decode_slots();
-    let execution_bytes_per_token = if topology == crate::Glm52MoeTopo::Tp4 {
-        pegainfer_kernels::ops::GLM52_FLASHINFER_SPARSE_BYTES_PER_TOKEN
+    let scratch_pages = crate::model::MTP_SCRATCH_PAGES_PER_SLOT
+        .checked_mul(crate::model::glm52_decode_slots())
+        .context("GLM5.2 MTP scratch page count overflow")?;
+    let kv = if topology == crate::Glm52MoeTopo::Tp4 {
+        let blocks = pool_blocks
+            .checked_add(scratch_pages)
+            .context("GLM5.2 MTP dense block count overflow")?;
+        let mla_bytes_per_token = pegainfer_kernels::ops::GLM52_FLASHINFER_SPARSE_BYTES_PER_TOKEN
+            + pegainfer_kernels::ops::GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN;
+        let per_block = GLM52_MODEL_LEN_ALIGN
+            .checked_mul(mla_bytes_per_token)
+            .and_then(|v| v.checked_add(2 * crate::model::GLM52_KV_PAGE_IDXK_BYTES))
+            .context("GLM5.2 MTP dense page byte count overflow")?;
+        blocks
+            .checked_mul(per_block)
+            .context("GLM5.2 MTP dense cache byte count overflow")?
     } else {
-        pegainfer_kernels::ops::GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN
+        scratch_pages
+            .checked_mul(crate::model::GLM52_KV_PAGE_STRIDE)
+            .context("GLM5.2 MTP slab scratch byte count overflow")?
     };
-    let wire_bytes_per_token = if topology == crate::Glm52MoeTopo::Tp4 {
-        pegainfer_kernels::ops::GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN
-    } else {
-        0
-    };
-    let total_mla_bytes_per_token = execution_bytes_per_token
-        .checked_add(wire_bytes_per_token)
-        .context("GLM5.2 MTP MLA row byte count overflow")?;
-    let mla = blocks
-        .checked_mul(GLM52_MODEL_LEN_ALIGN)
-        .and_then(|v| v.checked_mul(total_mla_bytes_per_token))
-        .context("GLM5.2 MTP MLA arena byte count overflow")?;
-    let index_k_copies = if topology == crate::Glm52MoeTopo::Tp4 {
-        2
-    } else {
-        1
-    };
-    let index_k = blocks
-        .checked_mul(GLM52_MODEL_LEN_ALIGN)
-        .and_then(|v| v.checked_mul(GLM52_INDEX_HEAD_DIM + size_of::<f32>()))
-        .and_then(|v| v.checked_mul(index_k_copies))
-        .context("GLM5.2 MTP index-K arena byte count overflow")?;
     let rows: usize = GLM52_DECODE_BUCKETS.iter().sum();
     let indexer_logits = rows
         .checked_mul(max_model_len.next_multiple_of(256))
@@ -111,8 +107,7 @@ pub(crate) fn glm52_mtp_arena_bytes(
         .checked_mul(max_model_len.div_ceil(GLM52_MODEL_LEN_ALIGN))
         .and_then(|v| v.checked_mul(size_of::<i32>()))
         .context("GLM5.2 MTP block-table byte count overflow")?;
-    mla.checked_add(index_k)
-        .and_then(|v| v.checked_add(indexer_logits))
+    kv.checked_add(indexer_logits)
         .and_then(|v| v.checked_add(block_tables))
         .context("GLM5.2 MTP arena byte count overflow")
 }
