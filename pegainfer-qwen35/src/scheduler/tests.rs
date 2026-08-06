@@ -6,6 +6,16 @@ use pegainfer_core::engine::EpBackend;
 use super::*;
 
 #[test]
+fn prefix_cache_chunking_stops_at_snapshot_boundaries() {
+    let stride = Some(crate::prefix_cache::SNAPSHOT_STRIDE_TOKENS);
+    assert_eq!(clamp_prefill_chunk(0, 900, stride), 256);
+    assert_eq!(clamp_prefill_chunk(256, 644, stride), 256);
+    assert_eq!(clamp_prefill_chunk(512, 388, stride), 256);
+    assert_eq!(clamp_prefill_chunk(768, 132, stride), 132);
+    assert_eq!(clamp_prefill_chunk(0, 900, None), 900);
+}
+
+#[test]
 fn send_rejection_reports_kv_lifetime_request_tokens() {
     let (token_tx, mut token_rx) = TokenSink::standalone();
     let req = SchedulerRequest {
@@ -86,8 +96,8 @@ fn tp_engine_rejects_cuda_graph_before_model_load() {
 fn tp2_scheduler_chunked_prefill_then_decode_smoke() {
     let model_path = std::env::var("PEGAINFER_TEST_MODEL_PATH")
         .unwrap_or_else(|_| "/home/data/mgj/qwen35weights".to_string());
-    let handle =
-        start_tp_with_capacity(&model_path, 42, &[0, 1], 1, 1).expect("start Qwen3.5 TP scheduler");
+    let handle = start_tp_with_capacity(&model_path, 42, &[0, 1], 1, 1, 0)
+        .expect("start Qwen3.5 TP scheduler");
     let (token_tx, mut token_rx) = TokenSink::standalone();
 
     handle

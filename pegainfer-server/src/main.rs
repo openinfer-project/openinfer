@@ -342,6 +342,7 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
                 max_prefill_tokens: args
                     .max_prefill_tokens
                     .unwrap_or(pegainfer_qwen35::DEFAULT_MAX_PREFILL_TOKENS),
+                prefix_cache_mib: args.qwen35_prefix_cache_mib,
             },
             args.qwen35_scheduler_policy.resolve(),
         )

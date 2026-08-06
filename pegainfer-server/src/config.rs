@@ -162,6 +162,11 @@ pub(crate) struct Args {
     #[arg(long, default_value_t = false)]
     pub no_prefix_cache: bool,
 
+    /// Qwen3.5-only fixed GPU budget for recurrent/conv prefix snapshots.
+    /// Zero disables Qwen3.5 prefix matching.
+    #[arg(long, default_value_t = 0)]
+    pub qwen35_prefix_cache_mib: usize,
+
     /// Speculative drafter model path: Qwen3 DFlash/DSpark decoding, or the
     /// GLM5.2 DSpark drafter (greedy AND sampled requests speculate;
     /// per-request accept stats logged). For Qwen3: single-GPU greedy only;
@@ -404,8 +409,10 @@ fn consumed_args(model_type: ModelType) -> &'static [&'static str] {
             "device_ordinal",
             "tp_size",
             "cuda_graph",
+            "no_prefix_cache",
             "max_prefill_tokens",
             "max_batch",
+            "qwen35_prefix_cache_mib",
             "qwen35_scheduler_policy",
         ],
     }
@@ -529,6 +536,12 @@ impl Args {
             {
                 bail!(
                     "--qwen35-scheduler-policy=auto is single-GPU only; Qwen3.5 TP uses the fixed off policy"
+                );
+            }
+            if self.qwen35_prefix_cache_mib > 0 && self.no_prefix_cache {
+                bail!(
+                    "--qwen35-prefix-cache-mib and --no-prefix-cache are contradictory; \
+                     use a positive budget to enable Qwen3.5 prefix reuse or zero to disable it"
                 );
             }
         }
@@ -854,6 +867,48 @@ mod tests {
             err.contains("--max-batch must be in 1..="),
             "unexpected error: {err}"
         );
+    }
+
+    #[cfg(feature = "qwen35")]
+    #[test]
+    fn qwen35_accepts_positive_prefix_cache_budget() {
+        let (args, provided) =
+            parse_with_provided(&["pegainfer", "--qwen35-prefix-cache-mib", "128"]);
+        args.validate(ModelType::Qwen35, &provided)
+            .expect("single-GPU Qwen3.5 should accept a prefix-cache budget");
+        assert_eq!(args.qwen35_prefix_cache_mib, 128);
+    }
+
+    #[cfg(feature = "qwen35")]
+    #[test]
+    fn qwen35_rejects_contradictory_prefix_cache_flags() {
+        let (args, provided) = parse_with_provided(&[
+            "pegainfer",
+            "--qwen35-prefix-cache-mib",
+            "128",
+            "--no-prefix-cache",
+        ]);
+        let err = args
+            .validate(ModelType::Qwen35, &provided)
+            .expect_err("positive Qwen3.5 cache budget must reject --no-prefix-cache")
+            .to_string();
+        assert!(err.contains("contradictory"), "unexpected error: {err}");
+    }
+
+    #[cfg(feature = "qwen35")]
+    #[test]
+    fn qwen35_accepts_prefix_cache_with_tp() {
+        let (args, provided) = parse_with_provided(&[
+            "pegainfer",
+            "--tp-size",
+            "2",
+            "--cuda-graph=false",
+            "--qwen35-prefix-cache-mib",
+            "128",
+        ]);
+        args.validate(ModelType::Qwen35, &provided)
+            .expect("Qwen3.5 TP should accept a prefix-cache budget");
+        assert_eq!(args.qwen35_prefix_cache_mib, 128);
     }
 
     #[test]

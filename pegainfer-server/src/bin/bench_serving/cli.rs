@@ -158,7 +158,7 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = false)]
     pub(crate) cuda_profiler_capture: bool,
 
-    /// Tensor-parallel world size for Kimi-K2
+    /// Tensor-parallel world size for Kimi-K2 and Qwen3.5.
     #[arg(long, default_value_t = 1)]
     pub(crate) tp_size: usize,
 
@@ -181,6 +181,11 @@ pub(crate) struct Cli {
     /// is a valid starvation / negative-control cell.
     #[arg(long, default_value_t = 4)]
     pub(crate) max_batch: usize,
+
+    /// Qwen3.5 fixed GPU budget for recurrent/conv prefix snapshots.
+    /// Zero keeps the cache disabled.
+    #[arg(long, default_value_t = 0)]
+    pub(crate) qwen35_prefix_cache_mib: usize,
 
     /// Qwen3.5 scheduler policy for prefill/decode balancing.
     #[arg(long, value_enum, default_value_t = CliQwen35SchedulerPolicy::Off)]
