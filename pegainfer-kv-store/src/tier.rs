@@ -20,13 +20,14 @@ pub(crate) type TierFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
 /// Leading blocks of a prefix the host tier has resident, pinned by `lease`
 /// until [`HostTier::load`] consumes it or [`HostTier::release`] declines it.
+///
+/// One lease covers every replica device: pegaflow mints it with a consumer
+/// budget of the instance's sealed `world_size`, and each per-device load
+/// consumes one unit — the host pins drop when the last device's copy lands.
+/// This is the same contract the vLLM MLA-TP connector runs in production.
 pub(crate) struct LeasedBlocks {
     pub blocks: usize,
     pub(crate) lease: QueryLeaseId,
-    /// One extra lease per registered mirror device: a load consumes one
-    /// lease per device it lands on, so the pins survive until the LAST
-    /// device's H2D completes.
-    pub(crate) mirror_leases: Vec<QueryLeaseId>,
 }
 
 /// One query's outcome against the host tier.
@@ -328,7 +329,6 @@ impl HostTier for PegaflowTier {
         let engine = Arc::clone(self.host.engine());
         let instance_id = self.instance_id.clone();
         let req_id = req_id.to_string();
-        let mirrors = self.mirror_devices.len();
         let join = self.host.runtime().spawn(async move {
             let status = engine
                 .count_prefix_hit_blocks_with_prefetch(
@@ -347,19 +347,10 @@ impl HostTier for PegaflowTier {
                 PrefetchStatus::Ready { blocks, .. } if blocks.is_empty() => Ok(TierQuery::Miss),
                 PrefetchStatus::Ready { blocks, .. } => {
                     let blocks_len = blocks.len();
-                    // One lease per device the eventual load lands on: a
-                    // load consumes exactly one, so a shared lease would
-                    // unpin the host blocks after the FIRST device's copy.
-                    let mut mirror_leases = Vec::with_capacity(mirrors);
-                    for _ in 0..mirrors {
-                        mirror_leases
-                            .push(engine.create_query_lease(&instance_id, blocks.clone())?);
-                    }
                     let lease = engine.create_query_lease(&instance_id, blocks)?;
                     Ok(TierQuery::Hit(LeasedBlocks {
                         blocks: blocks_len,
                         lease,
-                        mirror_leases,
                     }))
                 }
             }
@@ -377,7 +368,6 @@ impl HostTier for PegaflowTier {
         // construction (the engine rejects a mismatch, consuming the lease
         // either way).
         debug_assert_eq!(dst_page_ids.len(), hit.blocks);
-        debug_assert_eq!(hit.mirror_leases.len(), self.mirror_devices.len());
         // pegaflow indexes GPU blocks by `usize`; pegainfer carries them as
         // `i32` (its kvbm/CUDA convention). Block ids are slot indices,
         // always non-negative.
@@ -385,19 +375,17 @@ impl HostTier for PegaflowTier {
         let layer_refs: Vec<&str> = self.layer_names.iter().map(String::as_str).collect();
         // Fan the load out to the primary and every mirror device — the same
         // host blocks land in each device's replica (pegaflow routes by
-        // device_id; block ids are shared across replicas). Each submission
-        // consumes its own lease at submit time: a pre-submit error does NOT
-        // hand it back (the "load consumes the lease" contract), and the
+        // device_id; block ids are shared across replicas). Every submission
+        // consumes one unit of the shared lease's `world_size` budget; the
         // receivers resolve when their H2D copies land. Success requires
         // every device — a partial landing would leave a mirror attending
         // over stale pages, the exact corruption this fan-out exists to
         // prevent.
         let mut receivers = Vec::with_capacity(1 + self.mirror_devices.len());
         let mut submit_err: Option<anyhow::Error> = None;
-        let devices = std::iter::once((self.device_id, hit.lease))
-            .chain(self.mirror_devices.iter().copied().zip(hit.mirror_leases));
-        for (device_id, lease) in devices {
-            let loads = [(lease, dst.clone())];
+        let devices = std::iter::once(self.device_id).chain(self.mirror_devices.iter().copied());
+        for device_id in devices {
+            let loads = [(hit.lease, dst.clone())];
             match self.host.engine().batch_load_kv_blocks_multi_layer_inproc(
                 &self.instance_id,
                 TP_RANK,
@@ -405,9 +393,7 @@ impl HostTier for PegaflowTier {
                 &layer_refs,
                 &loads,
             ) {
-                // Leases of the unsubmitted remainder are gone either way
-                // (the "load consumes the lease" contract); stop submitting —
-                // commit only follows full success.
+                // Stop submitting — commit only follows full success.
                 Err(e) => {
                     submit_err = Some(anyhow::Error::new(e));
                     break;
@@ -415,6 +401,8 @@ impl HostTier for PegaflowTier {
                 Ok(rx) => receivers.push(rx),
             }
         }
+        let engine = Arc::clone(self.host.engine());
+        let lease = hit.lease;
         Box::pin(async move {
             // Drain every submitted copy before surfacing any error: on error
             // the caller treats the load as settled and drops its
@@ -437,16 +425,18 @@ impl HostTier for PegaflowTier {
             }
             match first_err {
                 None => Ok(()),
-                Some(e) => Err(e),
+                Some(e) => {
+                    // A short submission left lease budget unconsumed; return
+                    // the host pins now instead of waiting out the TTL sweep.
+                    engine.release_query_lease(&lease);
+                    Err(e)
+                }
             }
         })
     }
 
     fn release(&self, hit: LeasedBlocks) {
         self.host.engine().release_query_lease(&hit.lease);
-        for lease in &hit.mirror_leases {
-            self.host.engine().release_query_lease(lease);
-        }
     }
 
     fn save(
