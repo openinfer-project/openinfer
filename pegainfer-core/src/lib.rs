@@ -9,6 +9,7 @@ pub mod logging;
 pub mod ops;
 pub mod page_pool;
 pub mod parallel;
+pub mod rope;
 pub mod sampler;
 pub mod tensor;
 pub mod tracing;
