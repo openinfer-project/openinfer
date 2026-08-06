@@ -1,8 +1,13 @@
 # GLM5.2 P/D native-MTP handoff
 
-> **TL;DR:** TP4 prefill transfers 99 target plus two committed native-MTP
-> arenas and a five-token proposal to EP decode; gates from 89 tokens to 16K
-> restore byte-identically over RDMA with `first_step=verify`. End-to-end
+> **TL;DR:** TP4 prefill transfers the KV prefix and a five-token proposal
+> to EP decode; gates from 89 tokens to 16K restore byte-identically over
+> RDMA with `first_step=verify`. **The wire contract is v4 page-first**
+> (#849/#850): the 101 per-layer arenas of v3 collapsed into one slab arena
+> (`glm52.page`) whose page stride is the whole layout identity —
+> `handoff_fingerprint()` now reads `glm52-native-mtp/4/page:<stride>/...`,
+> and every restore lands as one contiguous copy per block instead of 101
+> fragments (agent-trace A/B: ITL p99 156 → 74 ms, slow iters 57 → 0). End-to-end
 > through a dual-endpoint router (P TP4 + D EP8 across two trays): parity
 > gate byte-exact, GSM8K full 1,276/1,315 strict (0.970) at c32 — parity
 > with the single-instance reference — and random-IO sweeps show the
@@ -114,6 +119,23 @@
     gate.
 
 ## Execution Log
+
+### v4 wire contract: page-first slab replaces the 101-arena registration (2026-08-06, #849/#850)
+
+The per-layer arena registration (99 target + 2 MTP, the v3 contract this
+document was written against) is gone: each rank now registers **one**
+pegaflow arena (`glm52.page`) in which block *b*'s page carries every
+layer's slices at fixed offsets (78 MLA · 656 B + 21 index-K · 132 B + the
+L78 MTP mirrors; content 3,502,592 B, stride 3,503,040 B). The handoff
+fingerprint moved to v4 with the page stride as the layout identity — two
+engines agreeing on the stride agree on the whole per-block byte layout, so
+the `arenas:101/page:64` terms are retired. TP4's tensor-replicated KV is
+expressed as pegaflow replica devices (worker 0 saves, loads fan out under
+one shared query lease with a `world_size` consumer budget — the same
+contract the vLLM MLA-TP connector uses). Restore-side effect measured on
+the agent-trace replay A/B (r20 chunked vs r21 page-first + Direct): ITL
+p99 156 → 74 ms, TPOT p99 84 → 43 ms, slow iters 57 → 0, fragment copies
+2,437 → 0 — every restore is one contiguous copy-engine memcpy per block.
 
 ### P → EP16 handoff gate closed; Slurm bare-metal fleet deployment (2026-07-31)
 

@@ -48,7 +48,10 @@ phase-2 首版有意只带了 prefetched 抵扣,赌"互饿类结构性消失后�
 
 契约测试:`entitlement_tracks_the_undrained_remainder_through_the_lifecycle`(维护值对重算值逐阶段对账,含 revert 回涨)、`reserve_loaded_blocks_declines_into_the_entitled_floor`、`entitlement_refunds_on_drop_without_release`、`unadmitted_requests_never_move_the_counter`(kv-store);glm52 侧 admission 断言进 `admission_fills_free_slots_from_the_local_queue`。
 
-### 2.4 handoff 信封 v3(评审已决)
+### 2.4 handoff 信封(v3 评审定形;现行 v4 = 同结构 + page-first 指纹)
+
+> v4(#849/#850 page-first slab)未改字段集,只改 `fingerprint` 串:101 个逐层 arena 收敛为单一 slab arena 后,wire 布局身份由 **page stride 字节数**表达——两侧 stride 相等即整个 per-block 字节布局相等。现行串形如
+> `"glm52-native-mtp/4/page:3503040/salt:<salt>/drafts:N"`(权威在 `scheduler/offload.rs::handoff_fingerprint()`);v3 的 `arenas:101/page:64` 项随 arena 收敛退役。
 
 划界原则:**prompt 纯函数走 KV 数据面(可共享页),anchor 依赖的续跑状态走信封**。收敛为一个收发两侧共用的 `Serialize + Deserialize` 结构体(v2 是发送侧 `json!` 字面量 + 接收侧独立 `Deserialize` 结构,两边靠字段名字符串耦合):
 
