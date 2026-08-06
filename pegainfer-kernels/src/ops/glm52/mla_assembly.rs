@@ -253,7 +253,8 @@ pub fn glm52_mla_cache_pack_launch(
          covering one {GLM52_FLASHMLA_SPARSE_PAGE_SIZE}-token page"
     );
     ensure!(
-        cache.len() >= cache_layer_offset + (cache_num_blocks - 1) * cache_block_stride + page_bytes,
+        cache.len()
+            >= cache_layer_offset + (cache_num_blocks - 1) * cache_block_stride + page_bytes,
         "GLM5.2 MLA cache pack cache too small: have {}, need {} \
          (offset {cache_layer_offset}, stride {cache_block_stride}, blocks {cache_num_blocks})",
         cache.len(),

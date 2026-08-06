@@ -158,7 +158,8 @@ pub(crate) const GLM52_KV_PAGE_STRIDE: usize = 3_503_040;
 const _: () = assert!(GLM52_KV_PAGE_STRIDE % GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN == 0);
 const _: () = assert!(
     GLM52_KV_PAGE_STRIDE >= GLM52_KV_PAGE_CONTENT_BYTES
-        && GLM52_KV_PAGE_STRIDE - GLM52_KV_PAGE_CONTENT_BYTES < GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN
+        && GLM52_KV_PAGE_STRIDE - GLM52_KV_PAGE_CONTENT_BYTES
+            < GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN
 );
 
 /// The page-first slice map of one slab page: per-layer offsets in layer

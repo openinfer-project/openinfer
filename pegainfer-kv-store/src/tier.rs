@@ -393,6 +393,7 @@ impl HostTier for PegaflowTier {
         // over stale pages, the exact corruption this fan-out exists to
         // prevent.
         let mut receivers = Vec::with_capacity(1 + self.mirror_devices.len());
+        let mut submit_err: Option<anyhow::Error> = None;
         let devices = std::iter::once((self.device_id, hit.lease))
             .chain(self.mirror_devices.iter().copied().zip(hit.mirror_leases));
         for (device_id, lease) in devices {
@@ -404,22 +405,40 @@ impl HostTier for PegaflowTier {
                 &layer_refs,
                 &loads,
             ) {
-                // Leases already consumed by earlier submissions are gone
-                // either way; in-flight copies to other devices are observed
-                // by nobody, which is safe — commit only follows full success.
-                Err(e) => return Box::pin(std::future::ready(Err(anyhow::Error::new(e)))),
+                // Leases of the unsubmitted remainder are gone either way
+                // (the "load consumes the lease" contract); stop submitting —
+                // commit only follows full success.
+                Err(e) => {
+                    submit_err = Some(anyhow::Error::new(e));
+                    break;
+                }
                 Ok(rx) => receivers.push(rx),
             }
         }
         Box::pin(async move {
+            // Drain every submitted copy before surfacing any error: on error
+            // the caller treats the load as settled and drops its
+            // reservation, so a still-in-flight copy would write into pages
+            // the pool may have already re-issued. Only a receiver that has
+            // resolved is known to be done writing.
+            let mut first_err = submit_err;
             for rx in receivers {
-                rx.await
-                    .map_err(|_| {
-                        anyhow::anyhow!("pegaflow load worker dropped the completion signal")
-                    })?
-                    .map_err(engine_err)?;
+                let landed = match rx.await {
+                    Ok(done) => done.map_err(engine_err),
+                    Err(_) => Err(anyhow::anyhow!(
+                        "pegaflow load worker dropped the completion signal"
+                    )),
+                };
+                if let Err(e) = landed
+                    && first_err.is_none()
+                {
+                    first_err = Some(e);
+                }
             }
-            Ok(())
+            match first_err {
+                None => Ok(()),
+                Some(e) => Err(e),
+            }
         })
     }
 

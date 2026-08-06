@@ -380,7 +380,12 @@ impl Glm52TpPrefillExecutor {
             mlp_out: ctx.stream.alloc_zeros::<bf16>(chunk * GLM52_HIDDEN)?,
             carry_slots: ctx.stream.alloc_zeros::<i32>(chunk * GLM52_INDEXER_TOPK)?,
             carry_lens: ctx.stream.alloc_zeros::<i32>(chunk)?,
-            indexer: Glm52IndexerPrefillScratch::new(ctx, chunk, PREFILL_ATTN_TILE_ROWS, table_width)?,
+            indexer: Glm52IndexerPrefillScratch::new(
+                ctx,
+                chunk,
+                PREFILL_ATTN_TILE_ROWS,
+                table_width,
+            )?,
             query_bf16: ctx.stream.alloc_zeros::<bf16>(attn * 64 * GLM52_KV_A_OUT)?,
             attention_out: ctx
                 .stream

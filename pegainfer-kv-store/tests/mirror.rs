@@ -7,6 +7,7 @@
 mod common;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use common::BLOCK_TOKENS;
 use common::HOST_POOL_BYTES;
@@ -33,7 +34,6 @@ use pegainfer_kv_store::PegaflowHost;
 use pegainfer_kv_store::ResolvePolicy;
 use pegainfer_kv_store::SaveClass;
 use pegainfer_kv_store::SaveCursor;
-use std::time::Duration;
 
 /// One device's half of the mirrored rank: the same layer names and geometry
 /// as its peer, backed by this device's own allocations.
@@ -158,7 +158,11 @@ async fn mirror_load_lands_on_every_device() {
         .iter()
         .map(|&(id, _)| id)
         .collect();
-    assert_eq!(saved_ids.len(), 4, "65-token prompt seals its 4 full blocks");
+    assert_eq!(
+        saved_ids.len(),
+        4,
+        "65-token prompt seals its 4 full blocks"
+    );
     primary.stage_block_patterns(&saved_ids);
     store.retire(RANK, kv, SaveCursor::new(), SaveClass::Cacheable);
     store.flush_saves(RANK).await.expect("flush");

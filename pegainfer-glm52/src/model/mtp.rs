@@ -64,9 +64,9 @@ use crate::moe_tp::Glm52MoeTpRank;
 use crate::mtp::GLM52_MTP_DRAFTS;
 use crate::mtp::Glm52MtpBookendWeights;
 use crate::mtp::Glm52MtpScratch;
-use crate::prefill_tp::Glm52TpPrefillMtpView;
 use crate::mtp::glm52_mtp_prepare_into;
 use crate::mtp::glm52_mtp_recycle_into;
+use crate::prefill_tp::Glm52TpPrefillMtpView;
 use crate::rows::Rows;
 use crate::runner::Glm52MtpAppend;
 use crate::runner::Glm52MtpRound;
@@ -95,7 +95,6 @@ pub(super) struct Glm52MtpProposalSeed<'a> {
     /// at its own offset while `draft1` arrives pre-sliced.
     pub(super) rows_before: usize,
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -283,8 +282,9 @@ impl Glm52NativeMtpFixed {
             "GLM5.2 MTP layer 78 page slices are missing the index-K mirror"
         );
         let kv = if self.dense_kv {
-            let mla_bytes =
-                num_blocks * GLM52_FLASHMLA_SPARSE_PAGE_SIZE * GLM52_FLASHINFER_SPARSE_BYTES_PER_TOKEN;
+            let mla_bytes = num_blocks
+                * GLM52_FLASHMLA_SPARSE_PAGE_SIZE
+                * GLM52_FLASHINFER_SPARSE_BYTES_PER_TOKEN;
             let idxk_bytes = num_blocks * GLM52_KV_PAGE_IDXK_BYTES;
             Glm52MtpKv::Dense(Box::new(Glm52MtpDenseKv {
                 proposal: Glm52KvSlab {
@@ -796,7 +796,9 @@ impl Glm52NativeMtp {
         target: usize,
     ) -> Result<()> {
         match &mut self.kv {
-            Glm52MtpKv::Slab(_) => super::glm52_copy_page_content(&ctx.stream, slab, source, target),
+            Glm52MtpKv::Slab(_) => {
+                super::glm52_copy_page_content(&ctx.stream, slab, source, target)
+            }
             Glm52MtpKv::Dense(dense) => {
                 let idxk_offset = dense
                     .proposal_caches

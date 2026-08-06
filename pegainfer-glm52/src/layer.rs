@@ -397,7 +397,19 @@ pub(crate) fn glm52_decoder_layer_forward(
         tokens,
         s.layer.normed.data_mut(),
     )?;
-    glm52_layer_attention_half(ctx, None, w, slab, caches, step, s, carry_ready, 0, true, None)?;
+    glm52_layer_attention_half(
+        ctx,
+        None,
+        w,
+        slab,
+        caches,
+        step,
+        s,
+        carry_ready,
+        0,
+        true,
+        None,
+    )?;
     match &w.mlp {
         Glm52LayerMlp::Dense(dense) => glm52_dense_mlp_forward_into(
             ctx,

@@ -593,7 +593,15 @@ fn run_layer_prefill(
             seq_lens: &seq_lens,
         };
         let mut carry_ready = false;
-        glm52_decoder_layer_forward(ctx, w, &mut slab, caches, &step, &mut scratch, &mut carry_ready)?;
+        glm52_decoder_layer_forward(
+            ctx,
+            w,
+            &mut slab,
+            caches,
+            &step,
+            &mut scratch,
+            &mut carry_ready,
+        )?;
         let out_host = ctx.stream.clone_dtoh(scratch.hidden.data())?;
         outputs.extend(out_host.iter().map(|v| v.to_f32()));
     }
