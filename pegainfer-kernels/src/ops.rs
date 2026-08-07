@@ -30,6 +30,8 @@ pub use attention::paged_attention_batch_decode_via_prefill_hd256_into;
 pub use attention::paged_attention_batch_decode_via_prefill_hd512_into;
 pub use attention::prefill_attention_paged_into;
 pub use attention::qk_norm_partial_rope_batched_decode_hd256_into;
+pub use attention::qk_norm_partial_rope_batched_decode_hd512_into;
+pub use attention::qk_norm_partial_rope_paged_prefill_hd512_into;
 pub use attention::qk_norm_rope_batch_decode_into;
 pub use attention::single_decode_nhd_into;
 pub use attention::single_prefill_hd512_into;
