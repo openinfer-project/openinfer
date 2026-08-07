@@ -59,23 +59,7 @@ cargo test -r -p pegainfer-qwen3 --test hf_golden_gate   # Qwen3-4B logits vs HF
 
 Tests requiring Qwen3-8B are marked `#[ignore]` and won't affect the default flow.
 
-## 5. Benchmark Smoke Test
-
-```bash
-cargo run -r --bin bench_serving -- request --output-len 32 --iters 3 --warmup 1
-```
-
-Expected output (ballpark):
-
-```
-ttft_ms       ~14ms
-steady_tpot   ~10.5ms
-decode_tok_s  ~95 tok/s
-```
-
-If you see numbers in this range, the environment is working.
-
-## 6. Start the HTTP Server
+## 5. Start the HTTP Server
 
 ```bash
 RUST_LOG=info cargo run --release -- --port 8000
@@ -88,6 +72,20 @@ curl -s http://localhost:8000/v1/completions \
   -H "Content-Type: application/json" \
   -d '{"prompt":"Hello","max_tokens":16}' | python3 -m json.tool
 ```
+
+## 6. Benchmark Smoke Test
+
+Benching is HTTP-level (the in-process `bench_serving` bin is retired — it
+bypassed the real serving path). With the server from step 5 still running:
+
+```bash
+python3 scripts/bench_http_serving.py --base-url http://localhost:8000 \
+  --model models/Qwen3-4B --num-requests 8 --concurrency 2 --max-tokens 32
+```
+
+It reports streaming TTFT/ITL/TPOT, request latency, QPS, and error rate. If
+requests complete with zero errors and sane latencies, the environment is
+working. For serious load benching use the external `vllm-bench` client.
 
 ## Supported Models
 
@@ -106,10 +104,11 @@ Server:
 RUST_LOG=info cargo run -r -- --model-path models/Qwen3.5-4B --port 8000
 ```
 
-Benchmark:
+Benchmark (server running with that model):
 
 ```bash
-cargo run -r --bin bench_serving -- --model-path models/Qwen3.5-4B request
+python3 scripts/bench_http_serving.py --base-url http://localhost:8000 \
+  --model models/Qwen3.5-4B --num-requests 8 --concurrency 2 --max-tokens 32
 ```
 
 Accuracy tests live in each model crate:

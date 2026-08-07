@@ -37,11 +37,10 @@ Expected runtime: ~20 minutes cold (Triton AOT + Marlin nvcc dominate); artifact
 
 ## Reading results / gotchas
 
-- `hawk.toml` declares `pegainfer` + `bench_serving` as production targets and a single all-features profile. **Plain bins are not part of the non-production surface** — APIs used only by an undeclared bin get misreported as dead, so add a `[[production]]` entry whenever a new shipped bin appears.
+- `hawk.toml` declares the `pegainfer` bin as the production target and a single all-features profile. **Plain bins are not part of the non-production surface** — APIs used only by an undeclared bin get misreported as dead, so add a `[[production]]` entry whenever a new shipped bin appears.
 - kvbm-logical is a fork of upstream dynamo: whether to act on its findings (~1/3 of the 2026-07 baseline) depends on how much API divergence from upstream is acceptable. Do not batch-process it.
 - `#[macro_export]` macros escape module-visibility reachability: hawk flagged `pegainfer-kernels`' `pub mod forward_pass` as dead, but the `typed_pipeline!` macro it defines is exported crate-wide and used by kimi-k2. Verify macro exports before deleting a flagged module.
-- `pegainfer-engine` is an external boundary: the excluded `pegainfer-dynamo-backend` workspace consumes it by path (e.g. `EngineHandle::load_watch`/`take_kv_events`). hawk cannot see that workspace — cross-check engine findings against `pegainfer-dynamo-*/src` before acting.
-- `--fix` applies visibility reductions mechanically (via `cargo fix`) but only works with a single feature profile. Run it with `--exclude-crate kvbm_logical --exclude-crate pegainfer_engine` here (fork + dynamo boundaries).
+- `--fix` applies visibility reductions mechanically (via `cargo fix`) but only works with a single feature profile. Run it with `--exclude-crate kvbm_logical` here (upstream fork boundary). (The old `pegainfer_engine` exclusion is gone with the crate — the engine contract now lives in `pegainfer-frontend`, fully inside the workspace.)
 - hawk's all-features, all-target compilation doubles as a CI blind-spot detector: the first run here surfaced the three feature-gated compile errors fixed in #741.
 
 ## `--fix` fallout patterns (learned landing #745)
