@@ -341,7 +341,7 @@ NVIDIA Dynamo (the `kvbm/kvbm-logical` crate) retain their original Apache-2.0 h
 ## Star History
 
 <p align="center">
-  <a href="https://star-history.com/#openinfer-project/openinfer&Date">
-    <img src="https://api.star-history.com/svg?repos=openinfer-project/openinfer&type=Date" alt="Star History Chart">
+  <a href="https://star-history.com/#pegainfer-project/pegainfer&Date">
+    <img src="https://api.star-history.com/svg?repos=pegainfer-project/pegainfer&type=Date" alt="Star History Chart">
   </a>
 </p>

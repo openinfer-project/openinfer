@@ -109,7 +109,7 @@ gap — `max` confirms it (459 / 906 / 1408ms ≈ the prefill wall, throttle-che
 below).
 
 p99 stays at baseline as a **measurement artifact**, not architectural immunity.
-**Primary cause (issue [#470](https://github.com/openinfer-project/openinfer/issues/470)):**
+**Primary cause (issue [#470](https://github.com/pegainfer-project/pegainfer/issues/470)):**
 `bench_serving` hardcoded `max_batch=4` for Qwen3.5, so `--bg-concurrency 4` filled
 every slot and the injector could not admit until a background stream died —
 injected prefill never overlapped a full decode batch (`ITL_STEP` `decode_n` never

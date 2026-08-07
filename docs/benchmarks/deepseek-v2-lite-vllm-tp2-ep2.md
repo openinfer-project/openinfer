@@ -4,7 +4,7 @@
 
 **TL;DR**: 2026-06-28 DeepSeek-V2-Lite EP2 run on 2x RTX 5090. HF, PegaInfer host-staged, and PegaInfer NCCL matched exactly on the committed case set; PegaInfer host-staged/NCCL completed direct diagnostics, HTTP pressure, and trace rows. Stock vLLM TP2 and TP2+EP2 failed at server startup on the FlashInfer SM120/CUDA 12.8 path. A separate FlashInfer #3633-equivalent validation completed the vLLM HTTP rows under the same client/workload contract. Treat this as a retained benchmark snapshot and setup-gap record, not a vLLM parity or production serving claim.
 
-Source benchmark for [#279](https://github.com/openinfer-project/openinfer/issues/279) and the DeepSeek-V2-Lite status ledger.
+Source benchmark for [#279](https://github.com/pegainfer-project/pegainfer/issues/279) and the DeepSeek-V2-Lite status ledger.
 
 ## References
 
@@ -18,7 +18,7 @@ Source benchmark for [#279](https://github.com/openinfer-project/openinfer/issue
 
 | Field | Value |
 | --- | --- |
-| Tracking issue | [#279](https://github.com/openinfer-project/openinfer/issues/279) |
+| Tracking issue | [#279](https://github.com/pegainfer-project/pegainfer/issues/279) |
 | Model path | `models/DeepSeek-V2-Lite` |
 | Prompt source | `vllm bench serve --dataset-name random` |
 | HTTP shape | `input_len=64`, `output_len=64`, `num_prompts=32`, `num_warmups=4` |

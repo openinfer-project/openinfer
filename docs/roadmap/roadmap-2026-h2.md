@@ -14,7 +14,7 @@ pegainfer's near-term market is narrow and deliberate: **small-to-mid models, si
 
 ### 1. Website as the product surface
 
-Today the site has three pages of real content while the engine's actual capabilities live scattered in repo docs. The website (openinfer-project/website) becomes the canonical user-facing surface, in the style of [recipes.vllm.ai](https://recipes.vllm.ai/): one verified, copy-pasteable recipe per model line, kept current as flags change.
+Today the site has three pages of real content while the engine's actual capabilities live scattered in repo docs. The website (pegainfer-project/website) becomes the canonical user-facing surface, in the style of [recipes.vllm.ai](https://recipes.vllm.ai/): one verified, copy-pasteable recipe per model line, kept current as flags change.
 
 - **Per-model recipe pages.** For each served line: exact launch command, required hardware, the CLI flags that matter for that model (`--kv-offload`, `--dflash-draft-model-path`, TP flags, …), expected TTFT/TPOT on the tested GPUs, and a benchmark snapshot. Only Qwen3-4B has a page today; Qwen3.5 and DeepSeek-V2-Lite are next. Every command on a page is run before it is committed — same rule as repo docs.
 - **CLI / server reference.** A maintained page for `pegainfer-server` args and env vars (`PEGAINFER_CUDA_SM`, `PEGAINFER_TRITON_PYTHON`, …). This must not rot: once the page exists, a flag change without a website update is an incomplete PR.

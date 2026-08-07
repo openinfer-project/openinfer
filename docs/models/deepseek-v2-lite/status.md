@@ -69,7 +69,7 @@ The current-source #466 aggregate is retained under `artifacts/bench/dsv2-lite/<
 
 ### Retained vLLM TP2/EP2 Matrix
 
-The retained matrix lives in `docs/benchmarks/deepseek-v2-lite-vllm-tp2-ep2.md` and tracks [#279](https://github.com/openinfer-project/openinfer/issues/279). It is the current source for PegaInfer host-staged/NCCL versus vLLM TP2/TP2+EP2 under the `prompt_words=64`, `max_tokens=64`, `num_prompts=32`, `max_concurrency=1/4/8`, `temperature=0`, `ignore_eos=true` HTTP pressure contract. Prompt words are a workload-generator input, not a token count.
+The retained matrix lives in `docs/benchmarks/deepseek-v2-lite-vllm-tp2-ep2.md` and tracks [#279](https://github.com/pegainfer-project/pegainfer/issues/279). It is the current source for PegaInfer host-staged/NCCL versus vLLM TP2/TP2+EP2 under the `prompt_words=64`, `max_tokens=64`, `num_prompts=32`, `max_concurrency=1/4/8`, `temperature=0`, `ignore_eos=true` HTTP pressure contract. Prompt words are a workload-generator input, not a token count.
 
 Latest 2026-06-28 result on 2x RTX 5090:
 
