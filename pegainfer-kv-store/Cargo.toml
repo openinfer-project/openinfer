@@ -15,7 +15,7 @@ cudarc = { workspace = true }
 dynamo-kv-hashing = { workspace = true }
 kvbm-logical = { workspace = true }
 log = { workspace = true }
-pegainfer-engine = { workspace = true }
+pegainfer-frontend = { workspace = true }
 # Embedded in-process: pegaflow-core is the host/SSD/RDMA KV tier behind
 # `host::PegaflowHost` / `tier::PegaflowTier`. Same pin and feature set as
 # pegainfer-kv-offload: default-features=false drops its clashing cuda-12

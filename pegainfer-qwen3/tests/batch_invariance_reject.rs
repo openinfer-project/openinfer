@@ -4,7 +4,7 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-use pegainfer_core::engine::EngineLoadOptions;
+use pegainfer_frontend::engine::EngineLoadOptions;
 use pegainfer_kernels::ops::NumericPolicy;
 use pegainfer_kernels::ops::numeric_policy;
 use pegainfer_kernels::ops::set_numeric_policy;

@@ -8,7 +8,7 @@
 //!   PEGAINFER_TEST_MODEL_PATH=<Qwen3-4B-base> cargo test --release \
 //!     -p pegainfer-qwen3 --test batch_invariance_decode_gemm_graph -- --nocapture
 
-use pegainfer_core::sampler::SamplingParams;
+use pegainfer_frontend::sampler::SamplingParams;
 use pegainfer_kernels::ops::NumericPolicy;
 use pegainfer_kernels::ops::pin_served;
 use pegainfer_kernels::ops::reset_numeric_policy_counters;

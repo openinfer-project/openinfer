@@ -4,8 +4,8 @@ use std::time::Instant;
 use anyhow::Context;
 use anyhow::Result;
 use log::info;
-use pegainfer_engine::engine::EngineHandle;
-use pegainfer_engine::engine::EngineLoadOptions;
+use pegainfer_frontend::engine::EngineHandle;
+use pegainfer_frontend::engine::EngineLoadOptions;
 use tokio::sync::mpsc;
 
 use crate::runtime::DeepSeekV2LiteEp2Generator;

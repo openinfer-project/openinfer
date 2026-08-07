@@ -33,10 +33,10 @@ pub use attribution::SectionSample;
 pub use config::Config;
 use config::SUPPORTED_HIDDEN_SIZE;
 use ep::SUPPORTED_ROUTED_EXPERTS;
-use pegainfer_engine::engine::EngineHandle;
-use pegainfer_engine::engine::EngineLoadOptions;
+use pegainfer_frontend::engine::EngineHandle;
+use pegainfer_frontend::engine::EngineLoadOptions;
 #[cfg(feature = "deepseek-v2-lite")]
-use pegainfer_engine::engine::EpBackend;
+use pegainfer_frontend::engine::EpBackend;
 #[cfg(feature = "deepseek-v2-lite")]
 pub use runtime::BatchedGenerationResult;
 #[cfg(feature = "deepseek-v2-lite")]

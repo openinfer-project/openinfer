@@ -1,4 +1,4 @@
-use pegainfer_engine::engine::FinishReason;
+use pegainfer_frontend::engine::FinishReason;
 
 #[derive(Clone, Debug)]
 pub(super) struct RequestTrace {
@@ -104,7 +104,7 @@ impl RequestTrace {
         active_set_size_at_terminal: usize,
         pending_queue_size_at_terminal: usize,
     ) {
-        self.terminal_unix_s = Some(pegainfer_engine::engine::unix_now_s());
+        self.terminal_unix_s = Some(pegainfer_frontend::engine::unix_now_s());
         self.active_set_size_at_terminal = active_set_size_at_terminal;
         self.pending_queue_size_at_terminal = pending_queue_size_at_terminal;
         self.note_scheduler_state(active_set_size_at_terminal, pending_queue_size_at_terminal);

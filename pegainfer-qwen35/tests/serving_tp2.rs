@@ -7,7 +7,7 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
-use pegainfer_core::engine::EngineLoadOptions;
+use pegainfer_frontend::engine::EngineLoadOptions;
 use reqwest::Client;
 use serde_json::Value;
 use serde_json::json;
@@ -80,7 +80,7 @@ async fn spawn_ready_server(
     let shutdown = CancellationToken::new();
     let server_shutdown = shutdown.clone();
     let mut task = tokio::spawn(async move {
-        pegainfer_vllm_frontend::serve(
+        pegainfer_frontend::vllm::serve(
             std::future::ready(Ok(handle)),
             &frontend_model_path,
             vec![MODEL_NAME.to_string()],

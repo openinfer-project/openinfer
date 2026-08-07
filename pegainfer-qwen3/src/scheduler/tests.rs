@@ -5,9 +5,9 @@ use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::Result;
-use pegainfer_core::engine::EngineControlError;
-use pegainfer_core::engine::LoadLoraAdapterRequest;
-use pegainfer_core::engine::UnloadLoraAdapterRequest;
+use pegainfer_frontend::engine::EngineControlError;
+use pegainfer_frontend::engine::LoadLoraAdapterRequest;
+use pegainfer_frontend::engine::UnloadLoraAdapterRequest;
 use pegainfer_kv_cache::BlockPool;
 
 use super::*;
@@ -743,7 +743,7 @@ fn lifetime_blocks_never_under_reserve_kvbm_peak_draw() {
 /// Engine streams now open with `TokenEvent::Scheduled` (#246); these
 /// tests assert on the token/terminal events, so skip past it.
 fn recv_skipping_scheduled(
-    rx: &mut pegainfer_core::engine::TokenStreamReceiver,
+    rx: &mut pegainfer_frontend::engine::TokenStreamReceiver,
 ) -> Option<TokenEvent> {
     loop {
         match rx.blocking_recv() {
@@ -798,7 +798,10 @@ fn echo_requests_are_never_offered_to_prefetch() {
 fn request(
     prompt_len: usize,
     max_tokens: usize,
-) -> (GenerateRequest, pegainfer_core::engine::TokenStreamReceiver) {
+) -> (
+    GenerateRequest,
+    pegainfer_frontend::engine::TokenStreamReceiver,
+) {
     let (token_tx, token_rx) = TokenSink::standalone();
     (
         GenerateRequest {
@@ -823,7 +826,10 @@ fn request_with_lora(
     prompt_len: usize,
     max_tokens: usize,
     lora_adapter: Option<&str>,
-) -> (GenerateRequest, pegainfer_core::engine::TokenStreamReceiver) {
+) -> (
+    GenerateRequest,
+    pegainfer_frontend::engine::TokenStreamReceiver,
+) {
     let (mut request, token_rx) = request(prompt_len, max_tokens);
     request.lora_adapter = lora_adapter.map(ToString::to_string);
     (request, token_rx)
@@ -974,21 +980,21 @@ fn retiring_multiple_active_requests_tolerates_unsorted_indices() {
                     request_id: RequestId(1),
                     token: 201,
                     logprob: None,
-                    finish_reason: pegainfer_core::engine::FinishReason::Length,
+                    finish_reason: pegainfer_frontend::engine::FinishReason::Length,
                     completion_tokens: 2,
                 },
                 effects::DecodeEffect::EmitAndFinish {
                     request_id: RequestId(10),
                     token: 210,
                     logprob: None,
-                    finish_reason: pegainfer_core::engine::FinishReason::Length,
+                    finish_reason: pegainfer_frontend::engine::FinishReason::Length,
                     completion_tokens: 2,
                 },
                 effects::DecodeEffect::EmitAndFinish {
                     request_id: RequestId(7),
                     token: 207,
                     logprob: None,
-                    finish_reason: pegainfer_core::engine::FinishReason::Length,
+                    finish_reason: pegainfer_frontend::engine::FinishReason::Length,
                     completion_tokens: 2,
                 },
             ],
@@ -1084,7 +1090,7 @@ fn lora_control_waits_until_scheduler_idle() {
 // max-output budget. These were GPU-test-only; the truth table below pins the
 // branch behaviour with the existing FakeExecutor (only is_stop_token matters).
 
-use pegainfer_core::engine::FinishReason;
+use pegainfer_frontend::engine::FinishReason;
 
 use crate::speculative::VerifyRequestResult;
 

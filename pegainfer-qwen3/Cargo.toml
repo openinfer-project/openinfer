@@ -17,6 +17,7 @@ hex = { workspace = true, optional = true }
 log = { workspace = true }
 pegainfer-bench = { workspace = true, optional = true }
 pegainfer-core = { workspace = true }
+pegainfer-frontend = { workspace = true }
 pegainfer-cupti = { workspace = true, optional = true }
 pegainfer-kernels = { workspace = true }
 pegainfer-kv-cache = { workspace = true }

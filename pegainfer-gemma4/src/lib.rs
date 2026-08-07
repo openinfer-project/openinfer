@@ -12,8 +12,8 @@ mod weights;
 use std::path::Path;
 
 use anyhow::Result;
-use pegainfer_engine::engine::EngineHandle;
-use pegainfer_engine::engine::EngineLoadOptions;
+use pegainfer_frontend::engine::EngineHandle;
+use pegainfer_frontend::engine::EngineLoadOptions;
 pub use probe::probe_config_json;
 
 #[cfg(feature = "gemma4")]

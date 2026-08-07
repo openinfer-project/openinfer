@@ -1,8 +1,7 @@
 [workspace]
 default-members = ["pegainfer-server"]
 members = [
-  "pegainfer-engine",
-  "pegainfer-vllm-frontend",
+  "pegainfer-frontend",
   "pegainfer-sim",
   "pegainfer-server",
   "pegainfer-core",
@@ -24,12 +23,6 @@ members = [
   "kvbm/kvbm-logical",
 ]
 resolver = "3"
-
-# pegainfer-dynamo-backend / -frontend are their OWN workspaces (they depend on
-# dynamo-runtime / dynamo-llm). Excluding them keeps that heavy dep tree out of
-# this workspace's `--workspace` build + test graph, so the default pegainfer
-# build stays pure Rust + CUDA with no NATS/etcd/tonic. Build from their own dirs.
-exclude = ["pegainfer-dynamo-backend", "pegainfer-dynamo-frontend"]
 
 # Inherited by dynamo-ported crates that use `edition.workspace = true` etc.
 [workspace.package]
@@ -125,7 +118,7 @@ pegainfer-build = { path = "pegainfer-build" }
 pegainfer-core = { path = "pegainfer-core" }
 pegainfer-cupti = { path = "pegainfer-cupti" }
 pegainfer-deepseek-v2-lite = { path = "pegainfer-deepseek-v2-lite" }
-pegainfer-engine = { path = "pegainfer-engine" }
+pegainfer-frontend = { path = "pegainfer-frontend" }
 pegainfer-gemma4 = { path = "pegainfer-gemma4" }
 pegainfer-glm52 = { path = "pegainfer-glm52" }
 pegainfer-kernels = { path = "pegainfer-kernels" }
@@ -136,7 +129,6 @@ pegainfer-kv-store = { path = "pegainfer-kv-store" }
 pegainfer-qwen3 = { path = "pegainfer-qwen3" }
 pegainfer-qwen35 = { path = "pegainfer-qwen35" }
 pegainfer-sample = { path = "pegainfer-sample" }
-pegainfer-vllm-frontend = { path = "pegainfer-vllm-frontend" }
 opentelemetry = { version = "0.31.0", features = ["trace", "logs"] }
 opentelemetry-appender-tracing = "0.31.0"
 opentelemetry-otlp = { version = "0.31.0", features = [

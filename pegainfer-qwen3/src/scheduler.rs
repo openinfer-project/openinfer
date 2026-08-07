@@ -20,16 +20,16 @@ use anyhow::Result;
 use log::debug;
 use log::info;
 use log::warn;
-use pegainfer_core::engine::EngineCommand;
-use pegainfer_core::engine::EngineControlRequest;
-use pegainfer_core::engine::EngineHandle;
-use pegainfer_core::engine::GenerateRequest;
-use pegainfer_core::engine::KvCapacity;
-use pegainfer_core::engine::LoadSnapshot;
-use pegainfer_core::engine::SubmittedRequest;
-use pegainfer_core::engine::TokenEvent;
-use pegainfer_core::engine::TokenSink;
-use pegainfer_core::sampler::SamplingParams;
+use pegainfer_frontend::engine::EngineCommand;
+use pegainfer_frontend::engine::EngineControlRequest;
+use pegainfer_frontend::engine::EngineHandle;
+use pegainfer_frontend::engine::GenerateRequest;
+use pegainfer_frontend::engine::KvCapacity;
+use pegainfer_frontend::engine::LoadSnapshot;
+use pegainfer_frontend::engine::SubmittedRequest;
+use pegainfer_frontend::engine::TokenEvent;
+use pegainfer_frontend::engine::TokenSink;
+use pegainfer_frontend::sampler::SamplingParams;
 use pegainfer_kernels::ops::NumericPolicy;
 use pegainfer_kernels::ops::numeric_policy;
 use rand::SeedableRng;
@@ -584,7 +584,7 @@ fn scheduler_loop<E>(
                     "decode-overlap: async prefill completed ({} reqs)",
                     pending.len()
                 );
-                let scheduled_at_unix_s = pegainfer_core::engine::unix_now_s();
+                let scheduled_at_unix_s = pegainfer_frontend::engine::unix_now_s();
                 let artifacts = ExecutionArtifacts::Prefill {
                     pending,
                     result: prefill_result,

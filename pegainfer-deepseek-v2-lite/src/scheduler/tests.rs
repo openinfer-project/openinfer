@@ -1,9 +1,9 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicU8;
 
-use pegainfer_engine::engine::RequestAbortReason;
-use pegainfer_engine::engine::RequestTag;
-use pegainfer_engine::sampler::SamplingParams;
+use pegainfer_frontend::engine::RequestAbortReason;
+use pegainfer_frontend::engine::RequestTag;
+use pegainfer_frontend::sampler::SamplingParams;
 use tokio::sync::mpsc;
 
 use super::grouping::DecodePositionGroupPlan;
@@ -18,7 +18,7 @@ fn request(
     max_tokens: usize,
 ) -> (
     PendingRequest,
-    pegainfer_engine::engine::TokenStreamReceiver,
+    pegainfer_frontend::engine::TokenStreamReceiver,
 ) {
     let (token_tx, token_rx) = TokenSink::standalone();
     (
@@ -37,7 +37,7 @@ fn request(
     )
 }
 
-fn recv_event(rx: &mut pegainfer_engine::engine::TokenStreamReceiver) -> TokenEvent {
+fn recv_event(rx: &mut pegainfer_frontend::engine::TokenStreamReceiver) -> TokenEvent {
     rx.try_recv().expect("expected event").1
 }
 

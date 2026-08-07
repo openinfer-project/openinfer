@@ -1,7 +1,7 @@
 use std::path::Path;
 
-use pegainfer_core::engine::EngineLoadOptions;
-use pegainfer_core::engine::EpBackend;
+use pegainfer_frontend::engine::EngineLoadOptions;
+use pegainfer_frontend::engine::EpBackend;
 
 use super::*;
 

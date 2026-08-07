@@ -219,7 +219,7 @@ fn ensure_no_logprobs_tp8(requested: bool) -> Result<()> {
     Ok(())
 }
 
-fn ensure_greedy_tp8(sampling: &pegainfer_core::sampler::SamplingParams) -> Result<()> {
+fn ensure_greedy_tp8(sampling: &pegainfer_frontend::sampler::SamplingParams) -> Result<()> {
     ensure!(
         sampling.is_greedy(),
         "Kimi TP8 path does not support sampling yet: each rank holds a vocab \

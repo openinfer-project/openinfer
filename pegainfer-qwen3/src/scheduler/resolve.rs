@@ -1,4 +1,4 @@
-use pegainfer_core::engine::FinishReason;
+use pegainfer_frontend::engine::FinishReason;
 
 use super::ActiveRequestState;
 use super::PendingRequest;

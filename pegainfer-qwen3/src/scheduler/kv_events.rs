@@ -14,8 +14,8 @@
 use std::collections::HashMap;
 
 use log::warn;
-use pegainfer_core::engine::KvBlockEvent;
-use pegainfer_core::engine::KvStoredBlock;
+use pegainfer_frontend::engine::KvBlockEvent;
+use pegainfer_frontend::engine::KvStoredBlock;
 use pegainfer_kv_cache::KvCacheEvent;
 use pegainfer_kv_cache::RegisteredBlock;
 use tokio::sync::broadcast;

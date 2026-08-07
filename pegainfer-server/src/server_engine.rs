@@ -3,8 +3,8 @@ use std::path::Path;
 
 use anyhow::Context;
 use anyhow::Result;
-pub use pegainfer_core::engine::FinishReason;
-pub use pegainfer_core::engine::TokenLogprob;
+pub use pegainfer_frontend::engine::FinishReason;
+pub use pegainfer_frontend::engine::TokenLogprob;
 
 // ── Model type detection ────────────────────────────────────────────────
 

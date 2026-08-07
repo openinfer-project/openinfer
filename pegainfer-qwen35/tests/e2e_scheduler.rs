@@ -15,15 +15,15 @@ use std::path::Path;
 use std::time::Instant;
 
 use log::info;
-use pegainfer_core::engine::EngineHandle;
-use pegainfer_core::engine::EngineLoadOptions;
-use pegainfer_core::engine::FinishReason;
-use pegainfer_core::engine::GenerateRequest;
-use pegainfer_core::engine::TokenEvent;
-use pegainfer_core::engine::TokenLogprob;
-use pegainfer_core::engine::TokenSink;
-use pegainfer_core::engine::TokenStreamReceiver;
-use pegainfer_core::sampler::SamplingParams;
+use pegainfer_frontend::engine::EngineHandle;
+use pegainfer_frontend::engine::EngineLoadOptions;
+use pegainfer_frontend::engine::FinishReason;
+use pegainfer_frontend::engine::GenerateRequest;
+use pegainfer_frontend::engine::TokenEvent;
+use pegainfer_frontend::engine::TokenLogprob;
+use pegainfer_frontend::engine::TokenSink;
+use pegainfer_frontend::engine::TokenStreamReceiver;
+use pegainfer_frontend::sampler::SamplingParams;
 use vllm_text::tokenizer::DynTokenizer;
 
 mod common;

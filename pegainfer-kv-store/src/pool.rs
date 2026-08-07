@@ -24,7 +24,7 @@ use kvbm_logical::integrations::ScheduleError;
 use kvbm_logical::manager::BlockManager;
 use kvbm_logical::pools::BlockDuplicationPolicy;
 use kvbm_logical::registry::BlockRegistry;
-use pegainfer_engine::engine::KvPrefix;
+use pegainfer_frontend::engine::KvPrefix;
 
 /// Logical KV block pool: a `BlockManager` plus the reserved padding block.
 ///

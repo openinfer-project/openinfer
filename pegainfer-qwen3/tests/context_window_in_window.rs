@@ -22,11 +22,11 @@
 
 use std::path::Path;
 
-use pegainfer_core::engine::EngineLoadOptions;
-use pegainfer_core::engine::GenerateRequest;
-use pegainfer_core::engine::TokenEvent;
-use pegainfer_core::engine::TokenSink;
-use pegainfer_core::sampler::SamplingParams;
+use pegainfer_frontend::engine::EngineLoadOptions;
+use pegainfer_frontend::engine::GenerateRequest;
+use pegainfer_frontend::engine::TokenEvent;
+use pegainfer_frontend::engine::TokenSink;
+use pegainfer_frontend::sampler::SamplingParams;
 
 const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3-4B");
 

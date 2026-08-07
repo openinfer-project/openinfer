@@ -18,6 +18,7 @@ log = { workspace = true }
 memmap2 = { workspace = true }
 pegainfer-bench = { workspace = true }
 pegainfer-core = { workspace = true }
+pegainfer-frontend = { workspace = true }
 pegainfer-kernels = { workspace = true }
 pegainfer-kv-cache = { workspace = true }
 pegainfer-sample = { workspace = true }

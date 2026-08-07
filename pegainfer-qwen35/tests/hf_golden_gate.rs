@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 
-use pegainfer_core::engine::TokenLogprob;
+use pegainfer_frontend::engine::TokenLogprob;
 use pegainfer_qwen35::runtime::DecodePlan;
 use pegainfer_qwen35::runtime::DecodeStepItem;
 use pegainfer_qwen35::runtime::PrefillPlan;

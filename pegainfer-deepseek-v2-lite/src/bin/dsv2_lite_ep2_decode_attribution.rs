@@ -15,7 +15,7 @@ use anyhow::bail;
 use anyhow::ensure;
 use pegainfer_deepseek_v2_lite::DecodeGraphReadinessReport;
 use pegainfer_deepseek_v2_lite::DeepSeekV2LiteEp2Generator;
-use pegainfer_engine::engine::EngineLoadOptions;
+use pegainfer_frontend::engine::EngineLoadOptions;
 use serde_json::Value;
 use serde_json::json;
 use sha2::Digest;

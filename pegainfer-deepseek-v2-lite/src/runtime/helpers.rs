@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use anyhow::bail;
-use pegainfer_engine::engine::FinishReason;
+use pegainfer_frontend::engine::FinishReason;
 use sha2::Digest;
 use sha2::Sha256;
 

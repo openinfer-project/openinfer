@@ -16,6 +16,7 @@ hex = { workspace = true }
 log = { workspace = true }
 memmap2 = { workspace = true }
 pegainfer-core = { workspace = true }
+pegainfer-frontend = { workspace = true }
 pegainfer-kernels = { workspace = true, features = ["glm52"] }
 pegainfer-kv-store = { workspace = true }
 pegainfer-sample = { workspace = true }

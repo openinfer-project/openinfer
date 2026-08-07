@@ -2,7 +2,7 @@
 //! (GEMM-N) and across the pure-decode and unified paths, under Pin and PerToken.
 use std::sync::Mutex;
 
-use pegainfer_core::sampler::SamplingParams;
+use pegainfer_frontend::sampler::SamplingParams;
 use pegainfer_kernels::ops::NumericPolicy;
 use pegainfer_kernels::ops::per_token_served;
 use pegainfer_kernels::ops::pin_served;

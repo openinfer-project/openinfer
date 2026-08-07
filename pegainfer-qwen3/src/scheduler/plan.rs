@@ -94,7 +94,7 @@ pub(super) fn execute_plan(
 ) -> Result<ExecutionArtifacts> {
     match plan {
         ExecutionPlan::Prefill { pending } => {
-            let scheduled_at_unix_s = pegainfer_core::engine::unix_now_s();
+            let scheduled_at_unix_s = pegainfer_frontend::engine::unix_now_s();
             let indices: Vec<usize> = (0..pending.len()).collect();
             let requests = build_prefill_items(&pending, &indices);
             let any_echo = pending.iter().any(|req| req.echo);
@@ -138,7 +138,7 @@ pub(super) fn execute_plan(
             Ok(ExecutionArtifacts::SpeculativeDecode { verify })
         }
         ExecutionPlan::Unified { pending } => {
-            let scheduled_at_unix_s = pegainfer_core::engine::unix_now_s();
+            let scheduled_at_unix_s = pegainfer_frontend::engine::unix_now_s();
             let pending_indices: Vec<usize> = (0..pending.len()).collect();
             let active_indices: Vec<usize> = (0..active.len()).collect();
             let prefill_requests = build_prefill_items(&pending, &pending_indices);
@@ -259,13 +259,13 @@ fn sort_decode_results(results: &mut [crate::executor::DecodeRequestResult]) {
 
 #[cfg(test)]
 mod tests {
-    use pegainfer_core::sampler::SamplingParams;
+    use pegainfer_frontend::sampler::SamplingParams;
 
     use super::*;
     use crate::executor::RequestId;
 
     fn pending() -> PendingRequest {
-        let (token_tx, _rx) = pegainfer_core::engine::TokenSink::standalone();
+        let (token_tx, _rx) = pegainfer_frontend::engine::TokenSink::standalone();
         PendingRequest {
             request_id: RequestId::new(0),
             lora_adapter: None,
@@ -284,7 +284,7 @@ mod tests {
     }
 
     fn active(generated_count: usize, max_tokens: usize) -> ActiveRequestState {
-        let (token_tx, _rx) = pegainfer_core::engine::TokenSink::standalone();
+        let (token_tx, _rx) = pegainfer_frontend::engine::TokenSink::standalone();
         ActiveRequestState {
             request_id: RequestId::new(7),
             lora_adapter: None,

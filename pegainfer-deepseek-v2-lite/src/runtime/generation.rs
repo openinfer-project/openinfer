@@ -6,8 +6,8 @@ use anyhow::Result;
 use anyhow::ensure;
 use log::debug;
 use log::info;
-use pegainfer_engine::engine::EngineLoadOptions;
-use pegainfer_engine::engine::FinishReason;
+use pegainfer_frontend::engine::EngineLoadOptions;
+use pegainfer_frontend::engine::FinishReason;
 
 use super::DeepSeekV2LiteEp2Generator;
 use super::backend::EpBackendRuntime;

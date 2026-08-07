@@ -7,10 +7,10 @@
 use std::collections::HashSet;
 
 use anyhow::Result;
-use pegainfer_core::engine::TokenLogprob;
 use pegainfer_core::kv_pool::KvState;
-use pegainfer_core::sampler::SamplingParams;
 use pegainfer_core::tensor::HiddenStates;
+use pegainfer_frontend::engine::TokenLogprob;
+use pegainfer_frontend::sampler::SamplingParams;
 
 use crate::batch_decode_graph::BatchDecodeGraphState;
 use crate::decode_buffers::BatchDecodeBuffers35;

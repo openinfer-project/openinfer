@@ -18,7 +18,7 @@ use std::thread::{self};
 
 use anyhow::Result;
 use pegainfer_core::kv_pool::KvState;
-use pegainfer_core::sampler::SamplingParams;
+use pegainfer_frontend::sampler::SamplingParams;
 
 use crate::batch_decode_graph::MAX_BATCH;
 use crate::config::TensorParallelConfig;

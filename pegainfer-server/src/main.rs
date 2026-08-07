@@ -10,9 +10,9 @@ use log::info;
 use pegainfer::logging;
 use pegainfer::server_engine::ModelType;
 use pegainfer::server_engine::detect_model_type;
-use pegainfer_core::engine::EngineHandle;
+use pegainfer_frontend::engine::EngineHandle;
 #[cfg(feature = "gemma4")]
-use pegainfer_core::engine::EngineLoadOptions;
+use pegainfer_frontend::engine::EngineLoadOptions;
 #[cfg(feature = "qwen3")]
 use pegainfer_qwen3::Qwen3LaunchOptions;
 #[cfg(feature = "qwen3")]
@@ -94,15 +94,15 @@ async fn main() -> anyhow::Result<()> {
             .context("engine loader thread panicked")??;
         info!("Engine loaded: elapsed_ms={}", start.elapsed().as_millis());
         let max_model_len =
-            pegainfer::vllm_frontend::load_max_model_len(&model_path).unwrap_or(4096);
-        pegainfer::vllm_frontend::serve_model_with_lora_routes(
+            pegainfer_frontend::vllm::load_max_model_len(&model_path).unwrap_or(4096);
+        pegainfer_frontend::vllm::serve_model_with_lora_routes(
             handle,
             model_path.to_string_lossy().into_owned(),
             served_model_name.into_iter().collect(),
             lora_modules,
             port,
             max_model_len,
-            pegainfer::vllm_frontend::shutdown_token_from_ctrl_c(),
+            pegainfer_frontend::vllm::shutdown_token_from_ctrl_c(),
         )
         .await
     } else {
@@ -117,12 +117,12 @@ async fn main() -> anyhow::Result<()> {
                 // The blocking load can't be cancelled, so SIGINT keeps its
                 // default kill behavior until the engine is up; only then
                 // switch to graceful shutdown.
-                pegainfer::vllm_frontend::cancel_token_on_ctrl_c(&shutdown);
+                pegainfer_frontend::vllm::cancel_token_on_ctrl_c(&shutdown);
                 anyhow::Ok(handle)
             }
         };
         if glm52_prefill_only {
-            pegainfer::vllm_frontend::serve_prefill_only_with_engine_count(
+            pegainfer_frontend::vllm::serve_prefill_only_with_engine_count(
                 engine,
                 &model_path,
                 served_model_name.into_iter().collect(),
@@ -133,7 +133,7 @@ async fn main() -> anyhow::Result<()> {
             )
             .await
         } else {
-            pegainfer::vllm_frontend::serve_with_engine_count(
+            pegainfer_frontend::vllm::serve_with_engine_count(
                 engine,
                 &model_path,
                 served_model_name.into_iter().collect(),

@@ -1,7 +1,7 @@
 //! Gate: SplitKv decode batch-invariance. Co-batching A with a longer B moves A's chunk count;
 //! Tuned drifts, Pin/PerToken stay bit-identical.
 
-use pegainfer_core::sampler::SamplingParams;
+use pegainfer_frontend::sampler::SamplingParams;
 use pegainfer_kernels::ops::NumericPolicy;
 use pegainfer_kernels::ops::set_numeric_policy;
 use pegainfer_qwen3::runtime::DecodePlan;

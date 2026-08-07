@@ -15,15 +15,6 @@ use fastrace::Span;
 use fastrace::collector::SpanContext;
 use log::info;
 use log::warn;
-use pegainfer_engine::engine::EngineHandle;
-use pegainfer_engine::engine::FinishReason;
-use pegainfer_engine::engine::GenerateRequest;
-use pegainfer_engine::engine::LoadSnapshot;
-use pegainfer_engine::engine::RequestAbortReason;
-use pegainfer_engine::engine::RequestTag;
-use pegainfer_engine::engine::TokenEvent;
-use pegainfer_engine::engine::TokenSink;
-use pegainfer_engine::engine::TokenStreamReceiver;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -58,11 +49,20 @@ use zeromq::prelude::SocketRecv;
 use zeromq::prelude::SocketSend;
 use zeromq::util::PeerIdentity;
 
-use crate::wire::convert_finish_reason;
-use crate::wire::convert_sampling;
-use crate::wire::lora_adapter_from_sampling_params;
-use crate::wire::requested_logprobs;
-use crate::wire::to_wire_position_logprobs;
+use crate::engine::EngineHandle;
+use crate::engine::FinishReason;
+use crate::engine::GenerateRequest;
+use crate::engine::LoadSnapshot;
+use crate::engine::RequestAbortReason;
+use crate::engine::RequestTag;
+use crate::engine::TokenEvent;
+use crate::engine::TokenSink;
+use crate::engine::TokenStreamReceiver;
+use crate::vllm::wire::convert_finish_reason;
+use crate::vllm::wire::convert_sampling;
+use crate::vllm::wire::lora_adapter_from_sampling_params;
+use crate::vllm::wire::requested_logprobs;
+use crate::vllm::wire::to_wire_position_logprobs;
 
 pub(crate) struct LocalEngineBridge {
     pub(crate) input_address: String,
@@ -341,7 +341,7 @@ impl LocalEngineBridge {
         // Fail loud on sampling parameters the engine cannot honor yet —
         // silently ignoring a requested seed or penalty changes outputs
         // without telling the client.
-        if let Some(unsupported) = crate::wire::unsupported_sampling(&sampling_params) {
+        if let Some(unsupported) = crate::vllm::wire::unsupported_sampling(&sampling_params) {
             warn!("request {request_id} rejected: unsupported sampling params: {unsupported}");
             send_terminal_output(
                 self.engine_index,
@@ -392,7 +392,7 @@ impl LocalEngineBridge {
         // keeps the default (tracing-off) path free of per-request span work,
         // and `from_span` on a noop span yields `None` so the scheduler skips
         // its span work too.
-        let trace_root = if pegainfer_engine::tracing_state::is_enabled() {
+        let trace_root = if crate::tracing_state::is_enabled() {
             Span::root("request", SpanContext::random())
                 .with_property(|| ("request_id", tag.to_string()))
         } else {

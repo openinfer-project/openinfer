@@ -5,7 +5,7 @@
 //! isolated, the path choice is the only thing that can move its decode output across the boundary.
 //! The isolation is asserted, not assumed.
 
-use pegainfer_core::sampler::SamplingParams;
+use pegainfer_frontend::sampler::SamplingParams;
 use pegainfer_kernels::ops::NumericPolicy;
 use pegainfer_kernels::ops::set_numeric_policy;
 use pegainfer_qwen3::runtime::DecodePlan;

@@ -2,7 +2,7 @@
 //! on the same bf16 rows — top-k ids exactly, values within `TOL`. Needs a GPU.
 
 use half::bf16;
-use pegainfer_engine::engine::TokenLogprob;
+use pegainfer_frontend::engine::TokenLogprob;
 use pegainfer_kernels::tensor::DeviceContext;
 use pegainfer_kernels::tensor::HiddenStates;
 use pegainfer_kernels::tensor::StreamOverrideGuard;

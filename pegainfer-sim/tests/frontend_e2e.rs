@@ -6,7 +6,7 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
-use pegainfer_engine::engine::LoadSnapshot;
+use pegainfer_frontend::engine::LoadSnapshot;
 use pegainfer_sim::SimulatedEngineConfig;
 use pegainfer_sim::start_engine;
 use reqwest::Client;
@@ -131,7 +131,7 @@ impl SimServer {
         let model_path_buf = model_dir.path().to_path_buf();
         let mut task = tokio::spawn(async move {
             if enable_lora_routes {
-                pegainfer_vllm_frontend::serve_model_with_lora_routes(
+                pegainfer_frontend::vllm::serve_model_with_lora_routes(
                     engine,
                     model_path,
                     vec![served_model_name],
@@ -142,7 +142,7 @@ impl SimServer {
                 )
                 .await
             } else {
-                pegainfer_vllm_frontend::serve_with_engine_count(
+                pegainfer_frontend::vllm::serve_with_engine_count(
                     std::future::ready(Ok(engine)),
                     &model_path_buf,
                     vec![served_model_name],
@@ -414,7 +414,7 @@ async fn frontend_rejects_engine_partition_mismatch() -> Result<()> {
     let engine = start_engine(SimulatedEngineConfig::new(0.0, 1000.0, 0.0, 1)?);
     let result = tokio::time::timeout(
         Duration::from_secs(10),
-        pegainfer_vllm_frontend::serve_with_engine_count(
+        pegainfer_frontend::vllm::serve_with_engine_count(
             std::future::ready(Ok(engine)),
             model_dir.path(),
             vec![MODEL_NAME.to_string()],

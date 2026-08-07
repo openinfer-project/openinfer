@@ -40,11 +40,11 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use pegainfer_core::engine::EngineHandle;
-use pegainfer_core::engine::GenerateRequest;
-use pegainfer_core::engine::TokenEvent;
-use pegainfer_core::engine::TokenSink;
-use pegainfer_core::sampler::SamplingParams;
+use pegainfer_frontend::engine::EngineHandle;
+use pegainfer_frontend::engine::GenerateRequest;
+use pegainfer_frontend::engine::TokenEvent;
+use pegainfer_frontend::engine::TokenSink;
+use pegainfer_frontend::sampler::SamplingParams;
 use pegainfer_qwen3::DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES;
 use pegainfer_qwen3::DEFAULT_KV_PAGE_SIZE;
 use pegainfer_qwen3::DEFAULT_MAX_PREFILL_TOKENS;

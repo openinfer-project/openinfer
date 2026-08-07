@@ -17,13 +17,13 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::ensure;
 use pegainfer_deepseek_v2_lite::DeepSeekV2LiteEp2Generator;
-use pegainfer_engine::engine::EngineLoadOptions;
-use pegainfer_engine::engine::FinishReason;
-use pegainfer_engine::engine::GenerateRequest;
-use pegainfer_engine::engine::TokenEvent;
-use pegainfer_engine::engine::TokenSink;
-use pegainfer_engine::engine::TokenStreamReceiver;
-use pegainfer_engine::sampler::SamplingParams;
+use pegainfer_frontend::engine::EngineLoadOptions;
+use pegainfer_frontend::engine::FinishReason;
+use pegainfer_frontend::engine::GenerateRequest;
+use pegainfer_frontend::engine::TokenEvent;
+use pegainfer_frontend::engine::TokenSink;
+use pegainfer_frontend::engine::TokenStreamReceiver;
+use pegainfer_frontend::sampler::SamplingParams;
 use serde::Deserialize;
 use sha2::Digest;
 use sha2::Sha256;
@@ -702,7 +702,7 @@ fn run_mixed_serving_generation(model_path: &Path, model_path_label: &str) -> Re
 }
 
 fn run_mixed_serving_position_fallback(
-    handle: &pegainfer_engine::engine::EngineHandle,
+    handle: &pegainfer_frontend::engine::EngineHandle,
     encoded_cases: Vec<(String, Vec<u32>, usize, bool)>,
     expected: &[(String, Vec<u32>, FinishReason)],
     actual: &mut Vec<(String, Vec<u32>, FinishReason)>,
@@ -748,7 +748,7 @@ fn run_mixed_serving_position_fallback(
 }
 
 fn submit_concurrently(
-    handle: &pegainfer_engine::engine::EngineHandle,
+    handle: &pegainfer_frontend::engine::EngineHandle,
     requests: Vec<GenerateRequest>,
 ) -> Result<()> {
     let barrier = Arc::new(Barrier::new(requests.len() + 1));
@@ -774,7 +774,7 @@ fn submit_concurrently(
 }
 
 fn run_mixed_serving_rejection_isolation(
-    handle: &pegainfer_engine::engine::EngineHandle,
+    handle: &pegainfer_frontend::engine::EngineHandle,
     valid_id: &str,
     valid_prompt_tokens: Vec<u32>,
     expected_tokens: &[u32],

@@ -1,12 +1,13 @@
 use anyhow::Result;
 use anyhow::bail;
-use pegainfer_engine::engine::FinishReason;
-use pegainfer_engine::engine::TokenLogprob;
-use pegainfer_engine::sampler::SamplingParams;
 use vllm_engine_core_client::protocol::logprobs::PositionLogprobs;
 use vllm_engine_core_client::protocol::logprobs::TokenLogprob as WireTokenLogprob;
 use vllm_engine_core_client::protocol::output::EngineCoreFinishReason;
 use vllm_engine_core_client::protocol::sampling::EngineCoreSamplingParams;
+
+use crate::engine::FinishReason;
+use crate::engine::TokenLogprob;
+use crate::sampler::SamplingParams;
 
 pub(crate) const LORA_ADAPTER_XARG: &str = "pegainfer_lora_adapter";
 

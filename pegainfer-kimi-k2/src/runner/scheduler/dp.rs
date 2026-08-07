@@ -3,11 +3,11 @@ use crossbeam_channel::Receiver;
 use crossbeam_channel::Sender;
 use crossbeam_channel::bounded;
 use log::error;
-use pegainfer_core::engine::FinishReason;
-use pegainfer_core::engine::GenerateRequest;
-use pegainfer_core::engine::SubmittedRequest;
-use pegainfer_core::engine::TokenEvent;
-use pegainfer_core::engine::TokenSink;
+use pegainfer_frontend::engine::FinishReason;
+use pegainfer_frontend::engine::GenerateRequest;
+use pegainfer_frontend::engine::SubmittedRequest;
+use pegainfer_frontend::engine::TokenEvent;
+use pegainfer_frontend::engine::TokenSink;
 use pegainfer_kv_cache::BlockPool;
 use pegainfer_kv_cache::RequestKv;
 use rand::rngs::StdRng;
@@ -1095,7 +1095,7 @@ fn rank_forward_loop(
 
 #[cfg(test)]
 mod tests {
-    use pegainfer_core::sampler::SamplingParams;
+    use pegainfer_frontend::sampler::SamplingParams;
 
     use super::*;
 

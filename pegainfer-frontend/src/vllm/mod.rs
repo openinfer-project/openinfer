@@ -8,7 +8,6 @@ use anyhow::Result;
 use anyhow::ensure;
 use axum::Router;
 use log::warn;
-use pegainfer_engine::engine::EngineHandle;
 use serde::Deserialize;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
@@ -22,6 +21,8 @@ use vllm_server::DEFAULT_KEEP_ALIVE_TIMEOUT;
 use vllm_server::HttpListenerMode;
 use vllm_server::ParserSelection;
 use vllm_server::RendererSelection;
+
+use crate::engine::EngineHandle;
 
 mod bridge;
 mod lora;

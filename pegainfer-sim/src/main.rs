@@ -53,13 +53,13 @@ async fn main() -> Result<()> {
     )?;
     let handle = start_engine(config);
 
-    pegainfer_vllm_frontend::serve(
+    pegainfer_frontend::vllm::serve(
         std::future::ready(Ok(handle)),
         Path::new(&args.model_id),
         Vec::new(),
         args.port,
         Some(args.max_model_len),
-        pegainfer_vllm_frontend::shutdown_token_from_ctrl_c(),
+        pegainfer_frontend::vllm::shutdown_token_from_ctrl_c(),
     )
     .await
 }

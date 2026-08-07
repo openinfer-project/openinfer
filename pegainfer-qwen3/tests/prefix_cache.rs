@@ -25,8 +25,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use pegainfer_core::engine::TokenLogprob;
-use pegainfer_core::sampler::SamplingParams;
+use pegainfer_frontend::engine::TokenLogprob;
+use pegainfer_frontend::sampler::SamplingParams;
 use pegainfer_qwen3::runtime::DecodePlan;
 use pegainfer_qwen3::runtime::DecodeStepItem;
 use pegainfer_qwen3::runtime::PrefillPlan;

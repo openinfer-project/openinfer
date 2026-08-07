@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use pegainfer_core::parallel::ParallelConfig;
+use pegainfer_frontend::parallel::ParallelConfig;
 
 use crate::runner::affinity::KimiRankThreadPlacementPlan;
 use crate::runner::worker::KimiK2RankPlacement;

@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use pegainfer_engine::engine::FinishReason;
+use pegainfer_frontend::engine::FinishReason;
 use serde::Serialize;
 
 use super::backend::EpBackendKind;

@@ -6,11 +6,11 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use pegainfer_core::engine::FinishReason;
-use pegainfer_core::engine::GenerateRequest;
-use pegainfer_core::engine::KvPrefix;
-use pegainfer_core::engine::LoadSnapshot;
-use pegainfer_core::engine::TokenSink;
+use pegainfer_frontend::engine::FinishReason;
+use pegainfer_frontend::engine::GenerateRequest;
+use pegainfer_frontend::engine::KvPrefix;
+use pegainfer_frontend::engine::LoadSnapshot;
+use pegainfer_frontend::engine::TokenSink;
 use pegainfer_kv_store::BlockPool;
 use pegainfer_kv_store::CacheScope;
 use pegainfer_kv_store::KvStore;
@@ -403,7 +403,7 @@ fn resolved_native(
     GenerateRequest,
     KvPrefix,
     NativeMtpHandoff,
-    pegainfer_core::engine::TokenStreamReceiver,
+    pegainfer_frontend::engine::TokenStreamReceiver,
 ) {
     let salt = super::native_mtp_cache_salt();
     let mut producer = pool.new_request_with_cache_salt(committed.clone(), 2, Some(salt), None);
@@ -481,13 +481,13 @@ fn native_admission_rebuilds_the_padded_chain() {
     assert_ne!(copy.src_page, copy.dst_page);
     assert!(matches!(
         rx.try_recv(),
-        Ok((_, pegainfer_core::engine::TokenEvent::Scheduled { .. }))
+        Ok((_, pegainfer_frontend::engine::TokenEvent::Scheduled { .. }))
     ));
     assert!(matches!(
         rx.try_recv(),
         Ok((
             _,
-            pegainfer_core::engine::TokenEvent::Token { id: 70_001, .. }
+            pegainfer_frontend::engine::TokenEvent::Token { id: 70_001, .. }
         ))
     ));
 }
@@ -644,13 +644,13 @@ fn suppressed_eos_finishes_at_admission_without_a_slot() {
     assert_eq!(slots.iter().flatten().count(), 0, "no slot forms");
     assert!(matches!(
         rx.try_recv(),
-        Ok((_, pegainfer_core::engine::TokenEvent::Scheduled { .. }))
+        Ok((_, pegainfer_frontend::engine::TokenEvent::Scheduled { .. }))
     ));
     assert!(matches!(
         rx.try_recv(),
         Ok((
             _,
-            pegainfer_core::engine::TokenEvent::Finished {
+            pegainfer_frontend::engine::TokenEvent::Finished {
                 finish_reason: FinishReason::Stop,
                 completion_tokens: 1,
                 ..
@@ -711,13 +711,13 @@ fn suppressed_eos_finishes_behind_a_budget_stalled_front() {
     assert_eq!(slots.iter().flatten().count(), 0, "no slot forms");
     assert!(matches!(
         rx.try_recv(),
-        Ok((_, pegainfer_core::engine::TokenEvent::Scheduled { .. }))
+        Ok((_, pegainfer_frontend::engine::TokenEvent::Scheduled { .. }))
     ));
     assert!(matches!(
         rx.try_recv(),
         Ok((
             _,
-            pegainfer_core::engine::TokenEvent::Finished {
+            pegainfer_frontend::engine::TokenEvent::Finished {
                 finish_reason: FinishReason::Stop,
                 completion_tokens: 1,
                 ..
@@ -766,20 +766,20 @@ fn anchor_exhausting_max_tokens_finishes_as_length() {
     assert_eq!(slots.iter().flatten().count(), 0, "no slot forms");
     assert!(matches!(
         rx.try_recv(),
-        Ok((_, pegainfer_core::engine::TokenEvent::Scheduled { .. }))
+        Ok((_, pegainfer_frontend::engine::TokenEvent::Scheduled { .. }))
     ));
     assert!(matches!(
         rx.try_recv(),
         Ok((
             _,
-            pegainfer_core::engine::TokenEvent::Token { id: 70_001, .. }
+            pegainfer_frontend::engine::TokenEvent::Token { id: 70_001, .. }
         ))
     ));
     assert!(matches!(
         rx.try_recv(),
         Ok((
             _,
-            pegainfer_core::engine::TokenEvent::Finished {
+            pegainfer_frontend::engine::TokenEvent::Finished {
                 finish_reason: FinishReason::Length,
                 completion_tokens: 1,
                 ..

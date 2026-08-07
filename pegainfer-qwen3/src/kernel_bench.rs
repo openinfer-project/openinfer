@@ -1181,7 +1181,7 @@ enum DenseBuffers {
     Sampling {
         logits: HiddenStates,
         scratch: pegainfer_sample::SampleScratch,
-        params: Vec<pegainfer_core::sampler::SamplingParams>,
+        params: Vec<pegainfer_frontend::sampler::SamplingParams>,
         seed: u64,
     },
 }
@@ -1330,9 +1330,9 @@ impl DenseCase {
             }
             DenseKernelKind::Sampling { greedy } => {
                 let params = if greedy {
-                    pegainfer_core::sampler::SamplingParams::default()
+                    pegainfer_frontend::sampler::SamplingParams::default()
                 } else {
-                    pegainfer_core::sampler::SamplingParams {
+                    pegainfer_frontend::sampler::SamplingParams {
                         temperature: 0.8,
                         top_k: 50,
                         top_p: 0.9,
@@ -1440,7 +1440,7 @@ impl DenseCase {
                 params,
                 seed,
             } => {
-                let param_refs: Vec<&pegainfer_core::sampler::SamplingParams> =
+                let param_refs: Vec<&pegainfer_frontend::sampler::SamplingParams> =
                     params.iter().collect();
                 let steps = vec![0u64; param_refs.len()];
                 *seed = seed.wrapping_add(1);

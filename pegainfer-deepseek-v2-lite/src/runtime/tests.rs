@@ -1,4 +1,4 @@
-use pegainfer_engine::engine::FinishReason;
+use pegainfer_frontend::engine::FinishReason;
 
 use super::backend::EpBackendKind;
 use super::backend::parse_backend;

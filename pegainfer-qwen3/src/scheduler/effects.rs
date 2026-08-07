@@ -1,7 +1,7 @@
 use log::debug;
-use pegainfer_core::engine::FinishReason;
-use pegainfer_core::engine::TokenLogprob;
-use pegainfer_core::engine::TokenSink;
+use pegainfer_frontend::engine::FinishReason;
+use pegainfer_frontend::engine::TokenLogprob;
+use pegainfer_frontend::engine::TokenSink;
 
 use super::ActiveRequestState;
 use super::PendingRequest;

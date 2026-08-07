@@ -1,7 +1,7 @@
 //! Shared fixtures for the scheduler module tests.
 
-use pegainfer_core::engine::FinishReason;
-use pegainfer_core::engine::GenerateRequest;
+use pegainfer_frontend::engine::FinishReason;
+use pegainfer_frontend::engine::GenerateRequest;
 use pegainfer_kv_store::BlockPool;
 use pegainfer_kv_store::RequestKv;
 
@@ -41,7 +41,7 @@ pub(super) fn request(
     params: pegainfer_sample::SamplingParams,
     max_tokens: usize,
 ) -> GenerateRequest {
-    let (token_tx, _token_rx) = pegainfer_core::engine::TokenSink::standalone();
+    let (token_tx, _token_rx) = pegainfer_frontend::engine::TokenSink::standalone();
     GenerateRequest {
         trace_parent: None,
         request_id: None,

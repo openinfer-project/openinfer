@@ -7,8 +7,8 @@ use clap::CommandFactory;
 use clap::Parser;
 use clap::ValueEnum;
 use pegainfer::server_engine::ModelType;
-use pegainfer::vllm_frontend::LoraModule;
-use pegainfer_core::engine::EpBackend;
+use pegainfer_frontend::engine::EpBackend;
+use pegainfer_frontend::vllm::LoraModule;
 #[cfg(feature = "qwen3")]
 use pegainfer_qwen3::Qwen3LoraOptions;
 

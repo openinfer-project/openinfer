@@ -13,11 +13,11 @@ use bytesize::ByteSize;
 use crossbeam_channel::bounded;
 use log::debug;
 use log::info;
-use pegainfer_core::engine::EngineHandle;
-use pegainfer_core::engine::EngineLoadOptions;
-use pegainfer_core::engine::EpBackend;
-use pegainfer_core::engine::SubmittedRequest;
-use pegainfer_core::parallel::ParallelConfig;
+use pegainfer_frontend::engine::EngineHandle;
+use pegainfer_frontend::engine::EngineLoadOptions;
+use pegainfer_frontend::engine::EpBackend;
+use pegainfer_frontend::engine::SubmittedRequest;
+use pegainfer_frontend::parallel::ParallelConfig;
 use pegainfer_kv_cache::BlockPool;
 use tokio::sync::mpsc;
 

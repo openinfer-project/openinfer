@@ -8,8 +8,8 @@ use cudarc::driver::DevicePtr;
 use cudarc::driver::DevicePtrMut;
 use pegainfer_core::kv_pool::KvLayout;
 use pegainfer_core::kv_pool::KvState;
-use pegainfer_core::sampler::SamplingParams;
 use pegainfer_core::tensor::HiddenStates;
+use pegainfer_frontend::sampler::SamplingParams;
 
 use super::batch_decode_graph::BATCH_BUCKETS;
 use super::batch_decode_graph::BatchDecodeGraphState;

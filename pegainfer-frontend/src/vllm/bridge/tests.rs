@@ -9,11 +9,10 @@
 
 use std::sync::atomic::Ordering;
 
-use pegainfer_engine::engine::FinishReason;
-use pegainfer_engine::engine::RequestAbortReason;
-use pegainfer_engine::engine::TokenLogprob;
-
 use super::*;
+use crate::engine::FinishReason;
+use crate::engine::RequestAbortReason;
+use crate::engine::TokenLogprob;
 
 /// Test harness that exercises the bridge's demux path directly: register
 /// requests, emit tagged events onto the shared channel, drain one ready

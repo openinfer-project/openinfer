@@ -11,10 +11,10 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use pegainfer_core::engine::FinishReason;
-use pegainfer_core::engine::GenerateRequest;
-use pegainfer_core::engine::TokenEvent;
-use pegainfer_core::engine::unix_now_s;
+use pegainfer_frontend::engine::FinishReason;
+use pegainfer_frontend::engine::GenerateRequest;
+use pegainfer_frontend::engine::TokenEvent;
+use pegainfer_frontend::engine::unix_now_s;
 use pegainfer_kv_store::BlockPool;
 use pegainfer_kv_store::KvPrefix;
 use pegainfer_kv_store::KvStore;

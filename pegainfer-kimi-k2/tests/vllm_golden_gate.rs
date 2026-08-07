@@ -55,15 +55,15 @@ use std::path::Path;
 use std::time::Duration;
 use std::time::Instant;
 
-use pegainfer_core::engine::EngineHandle;
-use pegainfer_core::engine::EngineLoadOptions;
-use pegainfer_core::engine::EpBackend;
-use pegainfer_core::engine::TokenEvent;
-use pegainfer_core::engine::TokenLogprob;
-use pegainfer_core::engine::TokenSink;
-use pegainfer_core::engine::TokenStreamReceiver;
-use pegainfer_core::parallel::ParallelConfig;
-use pegainfer_core::sampler::SamplingParams;
+use pegainfer_frontend::engine::EngineHandle;
+use pegainfer_frontend::engine::EngineLoadOptions;
+use pegainfer_frontend::engine::EpBackend;
+use pegainfer_frontend::engine::TokenEvent;
+use pegainfer_frontend::engine::TokenLogprob;
+use pegainfer_frontend::engine::TokenSink;
+use pegainfer_frontend::engine::TokenStreamReceiver;
+use pegainfer_frontend::parallel::ParallelConfig;
+use pegainfer_frontend::sampler::SamplingParams;
 use safetensors::Dtype;
 use safetensors::SafeTensors;
 
@@ -331,7 +331,7 @@ fn submit(
 ) -> PendingRequest {
     let (tx, rx) = TokenSink::standalone();
     engine
-        .submit(pegainfer_core::engine::GenerateRequest {
+        .submit(pegainfer_frontend::engine::GenerateRequest {
             trace_parent: None,
             request_id: Some(label.clone()),
             queued_at_unix_s: None,

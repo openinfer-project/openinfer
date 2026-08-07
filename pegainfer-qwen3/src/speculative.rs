@@ -24,7 +24,7 @@
 //! target distribution; acceptance only decides how many ride one step.
 
 use anyhow::Result;
-use pegainfer_core::sampler::SamplingParams;
+use pegainfer_frontend::sampler::SamplingParams;
 
 use crate::executor::RequestId;
 

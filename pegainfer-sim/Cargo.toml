@@ -11,8 +11,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
-pegainfer-engine = { workspace = true }
-pegainfer-vllm-frontend = { workspace = true }
+pegainfer-frontend = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 
 [dev-dependencies]

@@ -4,11 +4,11 @@ use std::time::UNIX_EPOCH;
 
 use anyhow::Result;
 use anyhow::ensure;
-use pegainfer_engine::engine::EngineHandle;
-use pegainfer_engine::engine::FinishReason;
-use pegainfer_engine::engine::GenerateRequest;
-use pegainfer_engine::engine::TokenEvent;
-use pegainfer_engine::engine::TokenLogprob;
+use pegainfer_frontend::engine::EngineHandle;
+use pegainfer_frontend::engine::FinishReason;
+use pegainfer_frontend::engine::GenerateRequest;
+use pegainfer_frontend::engine::TokenEvent;
+use pegainfer_frontend::engine::TokenLogprob;
 use tokio::sync::mpsc;
 
 #[derive(Clone, Debug)]
@@ -186,8 +186,8 @@ fn now_secs_f64() -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use pegainfer_engine::engine::TokenSink;
-    use pegainfer_engine::sampler::SamplingParams;
+    use pegainfer_frontend::engine::TokenSink;
+    use pegainfer_frontend::sampler::SamplingParams;
 
     use super::*;
 

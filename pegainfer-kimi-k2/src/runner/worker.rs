@@ -21,9 +21,9 @@ use cudarc::nccl::safe::Comm;
 use cudarc::nccl::safe::Id;
 use log::debug;
 use pegainfer_core::cuda_graph::CudaGraphState;
-use pegainfer_core::engine::TokenLogprob;
 #[cfg(feature = "kernel-call-trace")]
 use pegainfer_core::ops::call_trace;
+use pegainfer_frontend::engine::TokenLogprob;
 use pegainfer_kernels::ops::KIMI_K2_LOCAL_EXPERTS;
 use pegainfer_kernels::ops::KIMI_K2_MLA_KV_A_OUT;
 use pegainfer_kernels::ops::KIMI_K2_MLA_KV_LORA_RANK;
@@ -187,7 +187,7 @@ pub(super) struct KimiRankWeightLoadReport {
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct KimiRowOptions {
     pub(crate) logprobs: usize,
-    pub(crate) sampling: pegainfer_core::sampler::SamplingParams,
+    pub(crate) sampling: pegainfer_frontend::sampler::SamplingParams,
 }
 
 #[derive(Clone, Debug, PartialEq)]

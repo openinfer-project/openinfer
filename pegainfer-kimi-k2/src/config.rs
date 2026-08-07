@@ -407,8 +407,8 @@ impl KimiK2ParallelShape {
     }
 
     #[must_use]
-    pub(crate) fn parallel_config(&self) -> pegainfer_core::parallel::ParallelConfig {
-        pegainfer_core::parallel::ParallelConfig::new(self.tp_world, self.dp_world)
+    pub(crate) fn parallel_config(&self) -> pegainfer_frontend::parallel::ParallelConfig {
+        pegainfer_frontend::parallel::ParallelConfig::new(self.tp_world, self.dp_world)
     }
 }
 

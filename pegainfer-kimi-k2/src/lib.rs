@@ -14,10 +14,10 @@
 use std::path::Path;
 
 use anyhow::Result;
-use pegainfer_core::engine::EngineHandle;
-use pegainfer_core::engine::EngineLoadOptions;
+use pegainfer_frontend::engine::EngineHandle;
+use pegainfer_frontend::engine::EngineLoadOptions;
 #[cfg(feature = "kimi-k2")]
-use pegainfer_core::engine::EpBackend;
+use pegainfer_frontend::engine::EpBackend;
 
 #[cfg(feature = "kimi-k2")]
 pub mod batch_decode_trace;
@@ -62,7 +62,7 @@ pub struct KimiLaunchOptions {
 #[cfg(feature = "kimi-k2")]
 pub fn launch(model_path: &Path, options: KimiLaunchOptions) -> Result<EngineHandle> {
     use log::info;
-    use pegainfer_core::parallel::ParallelConfig;
+    use pegainfer_frontend::parallel::ParallelConfig;
 
     anyhow::ensure!(
         options.tp_size > 0 && options.dp_size > 0,

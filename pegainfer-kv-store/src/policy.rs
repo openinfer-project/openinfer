@@ -1,7 +1,7 @@
 //! The caller-facing vocabulary of the store: cancellation, cache scoping,
 //! per-request read policy, and save bookkeeping.
 
-use pegainfer_engine::engine::TokenSink;
+use pegainfer_frontend::engine::TokenSink;
 use tokio::sync::oneshot;
 
 /// Whether the request wants the resolve abandoned. Implemented by the

@@ -1,15 +1,15 @@
 [package]
 edition = "2024"
 license = "Apache-2.0"
-name = "pegainfer-vllm-frontend"
+name = "pegainfer-frontend"
 version = "0.1.0"
 
 [dependencies]
 anyhow = { workspace = true }
 axum = { workspace = true }
+clap = { workspace = true }
 fastrace = { workspace = true }
 log = { workspace = true }
-pegainfer-engine = { workspace = true }
 rmp-serde = { workspace = true }
 rmpv = { workspace = true }
 serde = { workspace = true }
@@ -21,6 +21,9 @@ uuid = { workspace = true, features = ["v4"] }
 vllm-engine-core-client = { workspace = true }
 vllm-server = { workspace = true }
 zeromq = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
 
 [lints]
 workspace = true

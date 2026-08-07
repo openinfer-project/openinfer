@@ -26,9 +26,9 @@ use std::path::Path;
 use anyhow::Result;
 use anyhow::anyhow;
 pub use config::probe_config_json;
-use pegainfer_core::engine::EngineHandle;
-use pegainfer_core::engine::EngineLoadOptions;
-use pegainfer_core::engine::EpBackend;
+use pegainfer_frontend::engine::EngineHandle;
+use pegainfer_frontend::engine::EngineLoadOptions;
+use pegainfer_frontend::engine::EpBackend;
 pub use scheduler::DEFAULT_MAX_PREFILL_TOKENS;
 
 /// Maximum supported Qwen3.5 decode scheduler slots.
@@ -217,8 +217,8 @@ pub fn start_engine_with_capacity_and_policy(
 mod tests {
     use std::path::Path;
 
-    use pegainfer_core::engine::EngineLoadOptions;
-    use pegainfer_core::engine::EpBackend;
+    use pegainfer_frontend::engine::EngineLoadOptions;
+    use pegainfer_frontend::engine::EpBackend;
 
     use super::Qwen35LaunchOptions;
     use super::Qwen35SchedulerPolicy;

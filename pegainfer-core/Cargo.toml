@@ -19,7 +19,7 @@ memmap2 = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 opentelemetry_sdk = { workspace = true }
-pegainfer-engine = { workspace = true }
+pegainfer-frontend = { workspace = true }
 pegainfer-kernels = { workspace = true }
 parking_lot = { workspace = true }
 rayon = { workspace = true }

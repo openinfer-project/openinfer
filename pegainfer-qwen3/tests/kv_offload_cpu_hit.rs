@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use pegainfer_core::sampler::SamplingParams;
+use pegainfer_frontend::sampler::SamplingParams;
 use pegainfer_qwen3::Qwen3LoraOptions;
 use pegainfer_qwen3::Qwen3OffloadOptions;
 use pegainfer_qwen3::runtime::PrefillPlan;

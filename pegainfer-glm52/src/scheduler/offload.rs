@@ -9,8 +9,8 @@
 //! admission, never here.
 
 use anyhow::Context as _;
-use pegainfer_core::engine::GenerateRequest;
-use pegainfer_core::engine::KvPrefix;
+use pegainfer_frontend::engine::GenerateRequest;
+use pegainfer_frontend::engine::KvPrefix;
 use pegainfer_kv_store::CacheScope;
 use pegainfer_kv_store::CancelProbe;
 use pegainfer_kv_store::KvStore;

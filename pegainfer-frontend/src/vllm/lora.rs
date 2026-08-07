@@ -18,16 +18,16 @@ use axum::response::IntoResponse;
 use axum::response::Response;
 use axum::routing::get;
 use axum::routing::post;
-use pegainfer_engine::engine::EngineControlError;
-use pegainfer_engine::engine::EngineHandle;
-use pegainfer_engine::engine::LoadLoraAdapterRequest;
-use pegainfer_engine::engine::UnloadLoraAdapterRequest;
 use serde::Deserialize;
 use serde::Serialize;
 use tokio::sync::RwLock;
 use tower::ServiceExt;
 
-use crate::wire::LORA_ADAPTER_XARG;
+use crate::engine::EngineControlError;
+use crate::engine::EngineHandle;
+use crate::engine::LoadLoraAdapterRequest;
+use crate::engine::UnloadLoraAdapterRequest;
+use crate::vllm::wire::LORA_ADAPTER_XARG;
 
 const LORA_ROUTE_BODY_LIMIT: usize = 128 * 1024 * 1024;
 
@@ -366,10 +366,10 @@ async fn lora_models_response(
 
 #[cfg(test)]
 mod tests {
-    use pegainfer_engine::engine::SubmittedRequest;
     use tokio::sync::mpsc;
 
     use super::*;
+    use crate::engine::SubmittedRequest;
 
     fn route_state(handle: EngineHandle) -> LoraRouteState {
         LoraRouteState {

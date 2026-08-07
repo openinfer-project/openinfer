@@ -6,7 +6,7 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
-use pegainfer_core::sampler::SamplingParams;
+use pegainfer_frontend::sampler::SamplingParams;
 use pegainfer_qwen3::runtime::DecodePlan;
 use pegainfer_qwen3::runtime::DecodeStepItem;
 use pegainfer_qwen3::runtime::PrefillPlan;

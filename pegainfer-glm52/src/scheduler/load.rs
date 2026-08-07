@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 
-use pegainfer_core::engine::LoadSnapshot;
+use pegainfer_frontend::engine::LoadSnapshot;
 use pegainfer_kv_store::BlockPool;
 use tokio::sync::watch;
 

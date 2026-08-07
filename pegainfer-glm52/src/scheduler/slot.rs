@@ -3,7 +3,7 @@
 //! [`Glm52SlotState::next_input_at`]) and what a step's span of outputs means
 //! ([`Glm52SlotState::advance_span`]).
 
-use pegainfer_core::engine::FinishReason;
+use pegainfer_frontend::engine::FinishReason;
 
 use crate::dspark::GLM52_DSPARK_DRAFTS;
 use crate::dspark::accept_prefix_match;

@@ -29,8 +29,8 @@ use anyhow::anyhow;
 use anyhow::ensure;
 use cudarc::driver::CudaSlice;
 use cudarc::driver::PinnedHostSlice;
-use pegainfer_engine::engine::TokenLogprob;
-pub use pegainfer_engine::sampler::SamplingParams;
+use pegainfer_frontend::engine::TokenLogprob;
+pub use pegainfer_frontend::sampler::SamplingParams;
 /// Low-level batched sampling, re-exported so a model that must drive its own
 /// greedy path still reaches the single sampler entry rather than dipping into
 /// `pegainfer-kernels` directly — e.g. Kimi-K2 (see the module docs).

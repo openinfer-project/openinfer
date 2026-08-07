@@ -52,9 +52,9 @@ use bytesize::ByteSize;
 pub(crate) use config::GLM52_LAYERS;
 pub(crate) use config::GLM52_ROUTED_EXPERTS;
 pub use config::probe_config_json;
-use pegainfer_core::engine::EngineHandle;
-use pegainfer_core::engine::KvCapacity;
-use pegainfer_core::engine::LoadSnapshot;
+use pegainfer_frontend::engine::EngineHandle;
+use pegainfer_frontend::engine::KvCapacity;
+use pegainfer_frontend::engine::LoadSnapshot;
 use pegainfer_kv_store::ArenaSpec;
 use pegainfer_kv_store::BlockPool;
 use pegainfer_kv_store::KvStore;
@@ -1169,7 +1169,7 @@ fn start_engine(
     // healthy engines exit their loops and shut their workers down
     // concurrently, then join them.
     let abort_engines =
-        |submit_txs: Vec<mpsc::UnboundedSender<pegainfer_core::engine::SubmittedRequest>>,
+        |submit_txs: Vec<mpsc::UnboundedSender<pegainfer_frontend::engine::SubmittedRequest>>,
          join_handles: Vec<std::thread::JoinHandle<()>>| {
             drop(submit_txs);
             for handle in join_handles {

@@ -90,7 +90,7 @@ mod stats;
 mod store;
 mod tier;
 
-pub use pegainfer_engine::engine::KvPrefix;
+pub use pegainfer_frontend::engine::KvPrefix;
 
 pub use crate::builder::ArenaSpec;
 pub use crate::builder::KvStoreBuilder;

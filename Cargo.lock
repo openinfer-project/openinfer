@@ -3473,7 +3473,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "parking_lot",
- "pegainfer-engine",
+ "pegainfer-frontend",
  "pegainfer-kernels",
  "rayon",
  "safetensors",
@@ -3502,7 +3502,7 @@ dependencies = [
  "memmap2",
  "nvtx",
  "pegainfer-core",
- "pegainfer-engine",
+ "pegainfer-frontend",
  "pegainfer-kernels",
  "safetensors",
  "serde",
@@ -3514,14 +3514,25 @@ dependencies = [
 ]
 
 [[package]]
-name = "pegainfer-engine"
+name = "pegainfer-frontend"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
  "fastrace",
  "log",
+ "rmp-serde",
+ "rmpv",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-util",
+ "tower",
+ "uuid",
+ "vllm-engine-core-client",
+ "vllm-server",
+ "zeromq",
 ]
 
 [[package]]
@@ -3532,7 +3543,7 @@ dependencies = [
  "cudarc",
  "log",
  "pegainfer-core",
- "pegainfer-engine",
+ "pegainfer-frontend",
  "safetensors",
  "serde_json",
  "sha2 0.11.0",
@@ -3556,6 +3567,7 @@ dependencies = [
  "log",
  "memmap2",
  "pegainfer-core",
+ "pegainfer-frontend",
  "pegainfer-kernels",
  "pegainfer-kv-store",
  "pegainfer-sample",
@@ -3595,6 +3607,7 @@ dependencies = [
  "memmap2",
  "pegainfer-bench",
  "pegainfer-core",
+ "pegainfer-frontend",
  "pegainfer-kernels",
  "pegainfer-kv-cache",
  "pegainfer-sample",
@@ -3643,7 +3656,7 @@ dependencies = [
  "libc",
  "log",
  "pegaflow-core",
- "pegainfer-engine",
+ "pegainfer-frontend",
  "tempfile",
  "tokio",
  "tokio-stream",
@@ -3666,6 +3679,7 @@ dependencies = [
  "pegainfer-bench",
  "pegainfer-core",
  "pegainfer-cupti",
+ "pegainfer-frontend",
  "pegainfer-kernels",
  "pegainfer-kv-cache",
  "pegainfer-kv-offload",
@@ -3692,9 +3706,9 @@ dependencies = [
  "half",
  "log",
  "pegainfer-core",
+ "pegainfer-frontend",
  "pegainfer-kernels",
  "pegainfer-sample",
- "pegainfer-vllm-frontend",
  "rand 0.10.1",
  "reqwest",
  "safetensors",
@@ -3715,7 +3729,7 @@ dependencies = [
  "criterion 0.8.2",
  "cudarc",
  "half",
- "pegainfer-engine",
+ "pegainfer-frontend",
  "pegainfer-kernels",
 ]
 
@@ -3725,25 +3739,21 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "comfy-table",
- "cudarc",
  "log",
  "pegainfer-core",
  "pegainfer-deepseek-v2-lite",
+ "pegainfer-frontend",
  "pegainfer-gemma4",
  "pegainfer-glm52",
  "pegainfer-kimi-k2",
  "pegainfer-qwen3",
  "pegainfer-qwen35",
- "pegainfer-vllm-frontend",
- "rand 0.10.1",
  "serde",
  "serde_json",
  "tempfile",
  "tikv-jemallocator",
  "tokio",
  "tokio-util",
- "vllm-text",
 ]
 
 [[package]]
@@ -3752,35 +3762,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "pegainfer-engine",
- "pegainfer-vllm-frontend",
+ "pegainfer-frontend",
  "reqwest",
  "serde_json",
  "tempfile",
  "tokio",
  "tokio-util",
-]
-
-[[package]]
-name = "pegainfer-vllm-frontend"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "fastrace",
- "log",
- "pegainfer-engine",
- "rmp-serde",
- "rmpv",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
- "tower",
- "uuid",
- "vllm-engine-core-client",
- "vllm-server",
- "zeromq",
 ]
 
 [[package]]

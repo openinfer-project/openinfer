@@ -8,9 +8,9 @@
 use std::collections::HashMap;
 
 use anyhow::Result;
-use pegainfer_core::sampler::SamplingParams;
 use pegainfer_core::tensor::DeviceContext;
 use pegainfer_core::tensor::HiddenStates;
+use pegainfer_frontend::sampler::SamplingParams;
 
 use super::LocalQwen3Lane;
 use super::PrefillStepItem;

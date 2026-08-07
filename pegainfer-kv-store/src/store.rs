@@ -7,7 +7,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use pegainfer_engine::engine::KvPrefix;
+use pegainfer_frontend::engine::KvPrefix;
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 use tokio_util::task::TaskTracker;

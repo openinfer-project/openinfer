@@ -18,9 +18,9 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use pegainfer_core::engine::LoadLoraAdapterRequest;
-use pegainfer_core::engine::TokenLogprob;
-use pegainfer_core::sampler::SamplingParams;
+use pegainfer_frontend::engine::LoadLoraAdapterRequest;
+use pegainfer_frontend::engine::TokenLogprob;
+use pegainfer_frontend::sampler::SamplingParams;
 use pegainfer_qwen3::lora_fixtures::FixtureTensor;
 use pegainfer_qwen3::lora_fixtures::{self as fixtures};
 use pegainfer_qwen3::runtime::DecodePlan;

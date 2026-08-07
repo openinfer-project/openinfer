@@ -12,11 +12,11 @@ use lifecycle::preflight_prefill_candidate;
 use lifecycle::send_scheduled;
 use lifecycle::validate_kv_capacity;
 use log::error;
-use pegainfer_core::engine::FinishReason;
-use pegainfer_core::engine::GenerateRequest;
-use pegainfer_core::engine::SubmittedRequest;
-use pegainfer_core::engine::TokenEvent;
-use pegainfer_core::engine::TokenSink;
+use pegainfer_frontend::engine::FinishReason;
+use pegainfer_frontend::engine::GenerateRequest;
+use pegainfer_frontend::engine::SubmittedRequest;
+use pegainfer_frontend::engine::TokenEvent;
+use pegainfer_frontend::engine::TokenSink;
 use pegainfer_kv_cache::BlockPool;
 use pegainfer_kv_cache::RequestKv;
 use tokio::sync::mpsc;
@@ -624,7 +624,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
 
-    use pegainfer_core::sampler::SamplingParams;
+    use pegainfer_frontend::sampler::SamplingParams;
 
     use super::*;
     use crate::runner::worker::KimiOneTokenForwardReport;
@@ -763,7 +763,10 @@ mod tests {
     fn request_with_channel(
         prompt_tokens: Vec<u32>,
         max_tokens: usize,
-    ) -> (GenerateRequest, pegainfer_core::engine::TokenStreamReceiver) {
+    ) -> (
+        GenerateRequest,
+        pegainfer_frontend::engine::TokenStreamReceiver,
+    ) {
         let (token_tx, token_rx) = TokenSink::standalone();
         let req = GenerateRequest {
             trace_parent: None,
