@@ -157,6 +157,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 
 | Path | TL;DR |
 | --- | --- |
+| `subsystems/frontend/frontend-architecture.md` | `pegainfer-frontend` owns everything north of the model schedulers: engine contract (ex `pegainfer-engine`), `vllm` protocol stack (ex `pegainfer-vllm-frontend`), `ModelLine` dispatch trait. Event-sequence contract documented. Next: onboard qwen3 as first `ModelLine`; then prototype a `dynamo` in-process stack. |
 | `subsystems/frontend/simulated-inference-engine.md` | CPU-only simulated model crate for vLLM/OpenAI frontend and `vllm bench serve` validation without CUDA, real model weights, or real-model performance claims. |
 | `subsystems/frontend/cpu-profiling-baseline.md` | Frontend CPU profiling baseline using `pegainfer-sim` with fixed TTFT=5ms/TPOT=12ms: 200 req / concurrency=16 shows ~150ms TTFT overhead (no dominant hotspot), heap allocation ~10%, stream polling ~7.5%, IPC ~1%; reproducible benchmark command and perf evidence documented. |
 | `subsystems/frontend/startup-time.md` | Qwen3-4B warm startup-to-ready: frontend tokenizer load runs concurrently with the engine load (HTTP still binds only after the engine registers); mmap teardown is paid at the end of load since #377; pinned-staging upload (2026-07) cuts warm ready 5.22s → 4.66s on sm_89, and the remaining floor is the engine's own post-load startup work. |
@@ -221,6 +222,6 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 
 | Path | TL;DR |
 | --- | --- |
-| `conventions/bench-regression.md` | Benchmark regression tracking: one snapshot per model, git-tracked history, TPOT >2% / TTFT >3% thresholds. |
+| `conventions/bench-regression.md` | **Retired 2026-08**: in-process `bench_serving` snapshot gate deleted with the frontend consolidation; HTTP-based benching (`scripts/bench_http_serving.py`, vllm-bench) replaces it. Doc keeps the conventions (per-GPU snapshots, p50-only thresholds) for a future rebuilt gate. |
 | `conventions/coding-style.md` | Testing principle: prefer integration tests, don't test what E2E catches. |
 | `conventions/migration-defense.md` | 重写/迁移 PR 红线：旧防御结构（序号/计数/等待/断言/guard）逐条注明接班人——继承、替代、或结构性论证废除；测试断言跟人走。出自 #830 复盘。 |

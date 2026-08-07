@@ -86,7 +86,7 @@ HTTP Request → vLLM frontend → EngineHandle → per-model scheduler/executor
 
 **Key abstractions:**
 
-- **`pegainfer-engine`** — shared request/event contract (`EngineHandle`, `GenerateRequest`, `TokenEvent`) used by the server and model crates. (`pegainfer-core::engine` re-exports it.)
+- **`pegainfer-frontend`** — the serving frontend: the engine request/event contract (`pegainfer_frontend::engine` — `EngineHandle`, `GenerateRequest`, `TokenEvent`) plus the protocol stacks on top of it (`vllm` module today, `dynamo` planned) and the `ModelLine` dispatch trait. Model crates implement against the contract; the server binary does pure dispatch.
 - **Per-model crates** — each model owns config, weights, prefill/decode execution, scheduler, tests, and benches.
 - **`pegainfer-core::ops`** — shared GPU operator wrappers used by model crates.
 - **`pegainfer-kernels`** — tensor/FFI/kernel build owner for CUDA, cuBLAS, FlashInfer, and Triton AOT. Model-specific kernels live in feature-gated submodules (`kimi_k2`, `glm52`).
