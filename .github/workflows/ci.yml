@@ -98,9 +98,7 @@ jobs:
         include:
           - package: pegainfer-build
             needs_protobuf: false
-          - package: pegainfer-engine
-            needs_protobuf: false
-          - package: pegainfer-vllm-frontend
+          - package: pegainfer-frontend
             needs_protobuf: true
           - package: pegainfer-sim
             needs_protobuf: true
@@ -162,8 +160,7 @@ jobs:
         run: >-
           cargo clippy --release --locked
           -p pegainfer-build
-          -p pegainfer-engine
-          -p pegainfer-vllm-frontend
+          -p pegainfer-frontend
           -p pegainfer-sim
           -p kvbm-logical
           --all-targets -- -D warnings
