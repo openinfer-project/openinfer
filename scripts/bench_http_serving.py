@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """OpenAI-compatible HTTP serving benchmark for pegainfer.
 
-The harness intentionally talks to /v1/completions over HTTP instead of using
-the in-process bench_serving binary. It records streaming TTFT/ITL/TPOT,
+The harness talks to /v1/completions over HTTP so it measures the real
+serving path (frontend + bridge + engine). It records streaming TTFT/ITL/TPOT,
 request latency, QPS, error rate, timeout rate, and deterministic output hashes.
 """
 

@@ -32,3 +32,31 @@ impl ModelLine for DeepSeekV2LiteLine {
         crate::launch(ctx.model_path, ctx.shared.cuda_graph)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn probe_rejects_foreign_model_type() {
+        let config = serde_json::json!({"model_type": "qwen3"});
+        let reason = MODEL_LINE.probe(&config).unwrap_err();
+        assert!(reason.contains("deepseek_v2"), "{reason}");
+    }
+
+    #[test]
+    fn probe_rejects_non_lite_shape_with_the_real_reason() {
+        // model_type matches but the shape gate fails: the reason must name
+        // the shape mismatch, not claim a foreign model_type.
+        let config = serde_json::json!({
+            "model_type": "deepseek_v2",
+            "n_routed_experts": 1,
+            "hidden_size": 1
+        });
+        let reason = MODEL_LINE.probe(&config).unwrap_err();
+        assert!(
+            reason.contains("unsupported DeepSeek-V2 config"),
+            "{reason}"
+        );
+    }
+}

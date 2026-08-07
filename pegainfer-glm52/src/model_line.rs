@@ -230,7 +230,7 @@ impl ModelLine for Glm52Line {
         use anyhow::Context;
         let cli = cli(ctx);
         let shared = ctx.shared;
-        let moe_topo: Glm52MoeTopo = cli.moe_topo.parse().context("--moe-topo")?;
+        let moe_topo = moe_topo(&cli)?;
         let drafter = if cli.glm52_native_mtp {
             Glm52Drafter::NativeMtp
         } else if let Some(path) = &shared.dflash_draft_model_path {

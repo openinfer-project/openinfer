@@ -309,15 +309,39 @@ pub struct ModelLineRegistry {
 }
 
 impl ModelLineRegistry {
+    /// Panics when two lines define the same exclusive flag, or when a line's
+    /// exclusive flag collides with a [`SharedArgs`] id — clap would only
+    /// catch either in debug builds, at `build_command` time, with a less
+    /// helpful message. A collision is a programmer error in a model crate,
+    /// so failing at registry construction (server startup) is correct.
     pub fn new(lines: Vec<&'static dyn ModelLine>) -> Self {
+        let shared_ids: BTreeSet<String> = SharedArgs::augment_args(clap::Command::new("probe"))
+            .get_arguments()
+            .map(|arg| arg.get_id().to_string())
+            .collect();
+        let mut claimed_by: std::collections::BTreeMap<String, &'static str> =
+            std::collections::BTreeMap::new();
         let entries = lines
             .into_iter()
             .map(|line| {
-                let own_ids = line
+                let own_ids: BTreeSet<String> = line
                     .augment_cli(clap::Command::new("probe"))
                     .get_arguments()
                     .map(|arg| arg.get_id().to_string())
                     .collect();
+                for id in &own_ids {
+                    assert!(
+                        !shared_ids.contains(id),
+                        "model line {} defines flag id {id:?}, which is a SharedArgs flag",
+                        line.name()
+                    );
+                    if let Some(previous) = claimed_by.insert(id.clone(), line.name()) {
+                        panic!(
+                            "model lines {previous} and {} both define flag id {id:?}",
+                            line.name()
+                        );
+                    }
+                }
                 LineEntry { line, own_ids }
             })
             .collect();
@@ -449,4 +473,192 @@ pub fn parse_for_line(
     registry.validate_provided(line, &provided, &cmd)?;
     shared.validate(&provided)?;
     Ok((shared, matches, provided))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal line for registry tests: claims one `model_type` string and
+    /// optionally defines one exclusive flag.
+    struct StubLine {
+        name: &'static str,
+        claims: &'static str,
+        flag: Option<(&'static str, &'static str)>, // (id, long)
+    }
+
+    impl ModelLine for StubLine {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn probe(&self, config: &serde_json::Value) -> Result<(), String> {
+            let model_type = config.get("model_type").and_then(serde_json::Value::as_str);
+            if model_type == Some(self.claims) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "model_type {model_type:?} is not {:?}",
+                    self.claims
+                ))
+            }
+        }
+
+        fn augment_cli(&self, cmd: clap::Command) -> clap::Command {
+            match self.flag {
+                Some((id, long)) => cmd.arg(clap::Arg::new(id).long(long).num_args(0)),
+                None => cmd,
+            }
+        }
+
+        fn consumed_shared_args(&self) -> &'static [&'static str] {
+            &["tp_size"]
+        }
+
+        fn launch(&self, _ctx: &LaunchContext<'_>) -> anyhow::Result<EngineHandle> {
+            unreachable!("registry tests never launch")
+        }
+    }
+
+    static LINE_A: StubLine = StubLine {
+        name: "LineA",
+        claims: "model_a",
+        flag: Some(("line_a_flag", "line-a-flag")),
+    };
+    static LINE_B: StubLine = StubLine {
+        name: "LineB",
+        claims: "model_b",
+        flag: Some(("line_b_flag", "line-b-flag")),
+    };
+    static LINE_B_TWIN: StubLine = StubLine {
+        name: "LineBTwin",
+        claims: "model_b",
+        flag: None,
+    };
+    static LINE_SHARED_COLLISION: StubLine = StubLine {
+        name: "LineSharedCollision",
+        claims: "model_c",
+        flag: Some(("tp_size", "tp-size-again")),
+    };
+    static LINE_A_COPYCAT: StubLine = StubLine {
+        name: "LineACopycat",
+        claims: "model_d",
+        flag: Some(("line_a_flag", "line-a-flag")),
+    };
+
+    fn registry() -> ModelLineRegistry {
+        ModelLineRegistry::new(vec![&LINE_A, &LINE_B])
+    }
+
+    #[test]
+    fn detect_finds_the_unique_claimant() {
+        let config = serde_json::json!({"model_type": "model_b"});
+        let line = registry().detect(&config).expect("model_b should detect");
+        assert_eq!(line.name(), "LineB");
+    }
+
+    #[test]
+    fn detect_conflict_names_both_lines() {
+        let registry = ModelLineRegistry::new(vec![&LINE_B, &LINE_B_TWIN]);
+        let config = serde_json::json!({"model_type": "model_b"});
+        let error = registry
+            .detect(&config)
+            .map(ModelLine::name)
+            .expect_err("two claimants");
+        assert!(matches!(error, DetectError::Conflict { .. }));
+        let message = error.to_string();
+        assert!(
+            message.contains("LineB") && message.contains("LineBTwin"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn detect_no_match_renders_identity_fields_verbatim() {
+        // Non-string identity fields must render as-is, not as `missing`.
+        let config = serde_json::json!({"model_type": 123, "architectures": "Foo"});
+        let error = registry()
+            .detect(&config)
+            .map(ModelLine::name)
+            .expect_err("nothing claims this");
+        let message = error.to_string();
+        assert!(message.contains("model_type=123"), "{message}");
+        assert!(message.contains("architectures=\"Foo\""), "{message}");
+        assert!(
+            message.contains("LineA") && message.contains("LineB"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn detect_no_match_reports_missing_fields() {
+        let error = registry()
+            .detect(&serde_json::json!({}))
+            .map(ModelLine::name)
+            .expect_err("empty config");
+        assert!(error.to_string().contains("model_type=missing"));
+    }
+
+    #[test]
+    fn validate_provided_allows_core_shared_and_own_flags() {
+        let registry = registry();
+        let cmd = registry.build_command(clap::Command::new("test"));
+        let provided: BTreeSet<String> = ["port", "tp_size", "line_a_flag"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        registry
+            .validate_provided(&LINE_A, &provided, &cmd)
+            .expect("core + consumed shared + own flags all pass");
+    }
+
+    #[test]
+    fn validate_provided_rejects_another_lines_flag_by_long_name() {
+        let registry = registry();
+        let cmd = registry.build_command(clap::Command::new("test"));
+        let provided: BTreeSet<String> = [String::from("line_b_flag")].into_iter().collect();
+        let error = registry
+            .validate_provided(&LINE_A, &provided, &cmd)
+            .expect_err("LineB's flag must be rejected for LineA");
+        assert!(matches!(error, CliError::UnconsumedFlag { .. }));
+        assert_eq!(error.to_string(), "--line-b-flag is not used by LineA");
+    }
+
+    #[test]
+    fn validate_provided_rejects_unconsumed_shared_flag() {
+        let registry = registry();
+        let cmd = registry.build_command(clap::Command::new("test"));
+        let provided: BTreeSet<String> = [String::from("kv_offload")].into_iter().collect();
+        let error = registry
+            .validate_provided(&LINE_A, &provided, &cmd)
+            .expect_err("a shared flag outside consumed_shared_args must be rejected");
+        assert_eq!(error.to_string(), "--kv-offload is not used by LineA");
+    }
+
+    #[test]
+    #[should_panic(expected = "both define flag id")]
+    fn registry_rejects_duplicate_exclusive_flag_ids() {
+        let _ = ModelLineRegistry::new(vec![&LINE_A, &LINE_A_COPYCAT]);
+    }
+
+    #[test]
+    #[should_panic(expected = "which is a SharedArgs flag")]
+    fn registry_rejects_shared_flag_collisions() {
+        let _ = ModelLineRegistry::new(vec![&LINE_SHARED_COLLISION]);
+    }
+
+    #[test]
+    fn provided_args_reports_only_explicitly_set_flags() {
+        let registry = registry();
+        let cmd = registry.build_command(clap::Command::new("test"));
+        let matches = cmd
+            .clone()
+            .try_get_matches_from(["test", "--tp-size", "2", "--line-a-flag"])
+            .expect("parse");
+        let provided = provided_args(&matches, &cmd);
+        assert!(provided.contains("tp_size"));
+        assert!(provided.contains("line_a_flag"));
+        // Defaulted flags (e.g. --port) must not count as provided.
+        assert!(!provided.contains("port"));
+    }
 }

@@ -49,3 +49,37 @@ impl ModelLine for Gemma4Line {
         crate::start_engine(ctx.model_path, EngineLoadOptions::default())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn probe_accepts_12b_unified_identity() {
+        let config: serde_json::Value = serde_json::from_str(
+            r#"{"model_type":"gemma4_unified","architectures":["Gemma4UnifiedForConditionalGeneration"],"text_config":{"model_type":"gemma4_unified_text","head_dim":256,"global_head_dim":512,"sliding_window":1024,"attention_k_eq_v":true,"num_kv_shared_layers":0,"hidden_activation":"gelu_pytorch_tanh","enable_moe_block":false,"layer_types":["sliding_attention","sliding_attention","sliding_attention","sliding_attention","sliding_attention","full_attention","sliding_attention","sliding_attention","sliding_attention","sliding_attention","sliding_attention","full_attention"]}}"#,
+        )
+        .expect("fixture json");
+        MODEL_LINE.probe(&config).expect("12B unified should probe");
+    }
+
+    #[test]
+    fn probe_accepts_26b_moe_identity() {
+        let config: serde_json::Value = serde_json::from_str(
+            r#"{"model_type":"gemma4","architectures":["Gemma4ForConditionalGeneration"],"text_config":{"model_type":"gemma4_text","head_dim":256,"global_head_dim":512,"sliding_window":1024,"attention_k_eq_v":true,"num_kv_shared_layers":0,"hidden_activation":"gelu_pytorch_tanh","enable_moe_block":true,"num_experts":128,"top_k_experts":8,"moe_intermediate_size":704,"intermediate_size":2112,"layer_types":["sliding_attention","sliding_attention","sliding_attention","sliding_attention","sliding_attention","full_attention","sliding_attention","sliding_attention","sliding_attention","sliding_attention","sliding_attention","full_attention"]}}"#,
+        )
+        .expect("fixture json");
+        MODEL_LINE.probe(&config).expect("26B MoE should probe");
+    }
+
+    #[test]
+    fn probe_rejects_previous_generation_gemma3() {
+        let config = serde_json::json!({
+            "model_type": "gemma3",
+            "architectures": ["Gemma3ForConditionalGeneration"],
+            "text_config": {"model_type": "gemma3_text"}
+        });
+        let reason = MODEL_LINE.probe(&config).unwrap_err();
+        assert!(reason.contains("gemma3"), "{reason}");
+    }
+}

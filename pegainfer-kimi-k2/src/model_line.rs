@@ -87,3 +87,28 @@ impl ModelLine for KimiK2Line {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn probe_rejects_foreign_model_type() {
+        let config = serde_json::json!({"model_type": "qwen3"});
+        let reason = MODEL_LINE.probe(&config).unwrap_err();
+        assert!(reason.contains("Kimi-K2"), "{reason}");
+    }
+
+    #[test]
+    fn probe_accepts_text_config_identity_gate() {
+        // Identity via text_config.model_type passes the gate; the shape
+        // probe then reports what's missing rather than a foreign identity.
+        let config = serde_json::json!({"text_config": {"model_type": "kimi_k2"}});
+        if let Err(reason) = MODEL_LINE.probe(&config) {
+            assert!(
+                !reason.contains("is not a Kimi-K2 identity"),
+                "gate should have passed: {reason}"
+            );
+        }
+    }
+}

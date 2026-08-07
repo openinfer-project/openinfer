@@ -2,7 +2,7 @@
 
 Iteration loop (line doc docs/models/glm52/fp8-blockwise-gemm-lab.md): edit
 .cu -> `kernel_lab build` -> `check` -> `bench` -> `compare`; the top gate is
-a same-session glm52_step_bench A/B.
+a same-session end-to-end serving A/B (vllm-bench over HTTP).
 """
 from __future__ import annotations
 

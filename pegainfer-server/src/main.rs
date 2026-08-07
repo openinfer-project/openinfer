@@ -40,6 +40,10 @@ fn model_lines() -> Vec<&'static dyn ModelLine> {
 
 /// When no compiled-in line claims the config but the identity belongs to a
 /// known family, tell the user which feature to rebuild with.
+///
+/// The identity strings here must stay in sync with each line's `probe`
+/// gate: this table exists precisely because the line (and its probe) is
+/// compiled out, so the duplication cannot be derived away.
 fn feature_gate_hint(config: &serde_json::Value) -> Option<String> {
     let model_type = config
         .get("model_type")
@@ -240,4 +244,38 @@ async fn main() -> anyhow::Result<()> {
     serve_result?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(not(feature = "glm52"))]
+    #[test]
+    fn hint_names_the_feature_for_a_known_but_uncompiled_family() {
+        let config = serde_json::json!({"model_type": "glm_moe_dsa"});
+        let hint = feature_gate_hint(&config).expect("glm52 identity should hint");
+        assert!(hint.contains("--features glm52"), "{hint}");
+    }
+
+    #[cfg(not(feature = "gemma4"))]
+    #[test]
+    fn hint_matches_text_config_identities() {
+        let config = serde_json::json!({"text_config": {"model_type": "gemma4_unified_text"}});
+        let hint = feature_gate_hint(&config).expect("gemma4 text identity should hint");
+        assert!(hint.contains("--features gemma4"), "{hint}");
+    }
+
+    #[cfg(feature = "qwen3")]
+    #[test]
+    fn hint_is_silent_for_a_compiled_family() {
+        let config = serde_json::json!({"model_type": "qwen3"});
+        assert!(feature_gate_hint(&config).is_none());
+    }
+
+    #[test]
+    fn hint_is_silent_for_an_unknown_family() {
+        let config = serde_json::json!({"model_type": "frobnicate_lm"});
+        assert!(feature_gate_hint(&config).is_none());
+    }
 }
