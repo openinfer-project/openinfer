@@ -224,8 +224,8 @@ because reported prompt-token totals differ on the longer prompts.
 ```mermaid
 flowchart TB
     api["HTTP / OpenAI-compatible /v1/completions"]
-    frontend["pegainfer-server<br/>pegainfer-vllm-frontend"]
-    runtime["EngineHandle / GenerateRequest / TokenEvent<br/>pegainfer-engine contract · pegainfer-core runtime"]
+    frontend["pegainfer-server dispatch<br/>pegainfer-frontend (vllm stack)"]
+    runtime["EngineHandle / GenerateRequest / TokenEvent<br/>pegainfer-frontend contract · pegainfer-core runtime"]
 
     api --> frontend
     frontend --> runtime

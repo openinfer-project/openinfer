@@ -17,7 +17,7 @@ pegainfer-frontend
 ├── sampler.rs         # SamplingParams
 ├── parallel.rs        # ParallelConfig
 ├── tracing_state.rs   # global tracing on/off flag (frontend + schedulers both read it)
-├── model_line.rs      # ModelLine trait + ModelLineRegistry (dispatch seam, unused yet)
+├── model_line.rs      # ModelLine trait + ModelLineRegistry + SharedArgs (dispatch seam)
 └── vllm/              # protocol stack #1: vLLM EngineCore impersonation over ZMQ
     ├── mod.rs         #   serve_* entry points, vllm_server::Config assembly
     ├── bridge.rs      #   LocalEngineBridge: handshake, intake, burst demux, stats
@@ -81,4 +81,4 @@ All six lines are onboarded. `pegainfer-server/src/main.rs` is the whole server:
 
 ## Next step
 
-Onboard **qwen3** as the first `ModelLine` implementation (pilot for killing the `load_engine` match and the `consumed_args` table), then prototype the `dynamo` module and bench it against `vllm`.
+Prototype the `dynamo` in-process protocol stack (`EngineConfig::InProcessTokens`, resurrecting the deleted `convert.rs` translation logic from git history) as a second module beside `vllm`, then run a vllm-bench A/B to decide the default.
