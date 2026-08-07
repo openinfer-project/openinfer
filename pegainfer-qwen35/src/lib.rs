@@ -14,6 +14,7 @@ mod logprobs;
 mod ops;
 mod prefill;
 pub mod prefill_buffers;
+mod prefix_cache;
 pub(crate) mod recurrent;
 pub(crate) mod recurrent_state;
 mod scheduler;
@@ -83,6 +84,7 @@ pub fn start_engine(
         max_batch,
         max_prefill_tokens,
         Qwen35SchedulerPolicy::Off,
+        0,
     )
 }
 
@@ -96,6 +98,9 @@ pub struct Qwen35LaunchOptions {
     pub cuda_graph: bool,
     pub max_batch: usize,
     pub max_prefill_tokens: usize,
+    /// Fixed GPU budget for joint recurrent/conv prefix snapshots.
+    /// Zero keeps Qwen3.5 prefix matching disabled.
+    pub prefix_cache_mib: usize,
 }
 
 impl Qwen35LaunchOptions {
@@ -128,6 +133,7 @@ pub fn launch_with_options_and_policy(
         options.max_batch,
         options.max_prefill_tokens,
         scheduler_policy,
+        options.prefix_cache_mib,
     )
 }
 
@@ -143,6 +149,7 @@ pub fn start_engine_with_capacity(
         max_batch,
         max_prefill_tokens,
         Qwen35SchedulerPolicy::Off,
+        0,
     )
 }
 
@@ -152,6 +159,7 @@ pub fn start_engine_with_capacity_and_policy(
     max_batch: usize,
     max_prefill_tokens: usize,
     scheduler_policy: Qwen35SchedulerPolicy,
+    prefix_cache_mib: usize,
 ) -> Result<EngineHandle> {
     anyhow::ensure!(
         (1..=MAX_DECODE_BATCH).contains(&max_batch),
@@ -163,6 +171,9 @@ pub fn start_engine_with_capacity_and_policy(
         seed,
         ..
     } = options;
+    let prefix_snapshot_bytes = prefix_cache_mib
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| anyhow!("Qwen3.5 prefix-cache MiB budget overflows usize"))?;
     if device_ordinals.len() > 1 {
         if scheduler_policy == Qwen35SchedulerPolicy::Auto {
             return Err(anyhow!(
@@ -183,6 +194,7 @@ pub fn start_engine_with_capacity_and_policy(
             &device_ordinals,
             max_batch,
             max_prefill_tokens,
+            prefix_snapshot_bytes,
         );
     }
 
@@ -203,7 +215,12 @@ pub fn start_engine_with_capacity_and_policy(
     let model_path = model_path
         .to_str()
         .ok_or_else(|| anyhow!("model path must be valid UTF-8"))?;
-    let model = weights::Qwen35Model::from_safetensors(model_path, device_ordinal, max_batch)?;
+    let model = weights::Qwen35Model::from_safetensors(
+        model_path,
+        device_ordinal,
+        max_batch,
+        prefix_snapshot_bytes,
+    )?;
     scheduler::start_with_capacity_and_policy(
         model,
         seed,
@@ -232,6 +249,7 @@ mod tests {
             cuda_graph: false,
             max_batch: 1,
             max_prefill_tokens: 1,
+            prefix_cache_mib: 0,
         };
 
         let err = options.device_ordinals().unwrap_err().to_string();
@@ -257,6 +275,7 @@ mod tests {
             1,
             1,
             Qwen35SchedulerPolicy::Auto,
+            0,
         )
         .err()
         .expect("scheduler policy validation should reject TP launch")

@@ -525,7 +525,12 @@ fn run(g: &Golden, ex: &mut Qwen35Executor, seqs: &[usize], batched: bool) -> (S
     (stats, fingerprint)
 }
 
-fn run_tp(g: &Golden, ex: &Qwen35TpExecutor, seqs: &[usize], batched: bool) -> (Stats, Vec<f32>) {
+fn run_tp(
+    g: &Golden,
+    ex: &mut Qwen35TpExecutor,
+    seqs: &[usize],
+    batched: bool,
+) -> (Stats, Vec<f32>) {
     let mut stats = Stats::default();
     let mut fingerprint = Vec::new();
     let mut fold = |stats: &mut Stats, seq, pos, pega: &[(u32, f32)]| {
@@ -862,17 +867,17 @@ fn pega_logprobs_match_hf_golden_within_qwen35_tolerance_tp2() {
     report_fixture_shape(&golden);
     let all: Vec<usize> = (0..golden.num_seqs).collect();
 
-    let ex = build_tp2_executor(&model_path);
-    let (stats, fp1) = run_tp(&golden, &ex, &all, false);
+    let mut ex = build_tp2_executor(&model_path);
+    let (stats, fp1) = run_tp(&golden, &mut ex, &all, false);
     report_and_assert("TP2 sequential eager", &stats);
-    let (_, fp2) = run_tp(&golden, &ex, &all, false);
+    let (_, fp2) = run_tp(&golden, &mut ex, &all, false);
     assert_eq!(
         fp1, fp2,
         "TP2 sequential Qwen3.5 replay must reproduce identical logprobs"
     );
 
     let batched_n = all.len().min(MAX_EXECUTOR_BATCH);
-    let (batched, _) = run_tp(&golden, &ex, &all[..batched_n], true);
+    let (batched, _) = run_tp(&golden, &mut ex, &all[..batched_n], true);
     report_and_assert("TP2 batched eager", &batched);
 }
 
@@ -891,10 +896,10 @@ fn pega_logprobs_match_hf_long_golden_within_qwen35_tolerance_tp2() {
     report_fixture_shape(&golden);
     let all: Vec<usize> = (0..golden.num_seqs).collect();
 
-    let ex = build_tp2_executor(&model_path);
-    let (stats, fp1) = run_tp(&golden, &ex, &all, false);
+    let mut ex = build_tp2_executor(&model_path);
+    let (stats, fp1) = run_tp(&golden, &mut ex, &all, false);
     report_and_assert("TP2 long sequential eager", &stats);
-    let (_, fp2) = run_tp(&golden, &ex, &all, false);
+    let (_, fp2) = run_tp(&golden, &mut ex, &all, false);
     assert_eq!(
         fp1, fp2,
         "TP2 long sequential Qwen3.5 replay must reproduce identical logprobs"

@@ -2,9 +2,9 @@
 
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
-use pegainfer_core::kv_pool::KvState;
 use pegainfer_core::tensor::DeviceContext;
 use pegainfer_core::tensor::HiddenStates;
+use pegainfer_kv_cache::KvView;
 
 use super::config::Config35;
 use super::config::TensorParallelConfig;
@@ -151,15 +151,15 @@ impl BatchDecodeBuffers35 {
 
     /// Sync paged attention metadata to GPU.
     ///
-    /// `padded_bs` >= `kv_states.len()`: padding slots (if any) point to the
+    /// `padded_bs` >= `views.len()`: padding slots (if any) point to the
     /// reserved padding page with seq_len=1 so FlashInfer accesses valid memory.
-    pub(crate) fn sync_paged_meta(
+    pub(crate) fn sync_paged_views(
         &mut self,
         ctx: &DeviceContext,
-        kv_states: &[&KvState],
+        views: &[KvView],
         padded_bs: usize,
     ) -> Result<()> {
-        let real_bs = kv_states.len();
+        let real_bs = views.len();
         debug_assert!(padded_bs >= real_bs);
 
         let mut all_page_indices = Vec::new();
@@ -167,12 +167,11 @@ impl BatchDecodeBuffers35 {
         let mut last_page_lens = Vec::with_capacity(padded_bs);
         let mut chunk_sizes = Vec::with_capacity(padded_bs);
 
-        for kv in kv_states {
-            let pages = kv.page_indices_i32();
-            all_page_indices.extend_from_slice(&pages);
+        for view in views {
+            all_page_indices.extend_from_slice(view.page_indices());
             indptr.push(all_page_indices.len() as i32);
-            last_page_lens.push(kv.last_page_len() as i32);
-            chunk_sizes.push(kv.seq_len() as i32);
+            last_page_lens.push(view.last_page_len() as i32);
+            chunk_sizes.push(view.seq_len() as i32);
         }
 
         // Padding slots: 1 page (the padding page), seq_len=1, last_page_len=1.

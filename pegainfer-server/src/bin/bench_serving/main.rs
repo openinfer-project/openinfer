@@ -114,6 +114,23 @@ fn validate_qwen35_max_batch(model_type: ModelType, max_batch: usize) -> Result<
     Ok(())
 }
 
+fn validate_qwen35_parallel(model_type: ModelType, tp_size: usize, cuda_graph: bool) -> Result<()> {
+    #[cfg(feature = "qwen35")]
+    if matches!(model_type, ModelType::Qwen35) {
+        anyhow::ensure!(tp_size > 0, "--tp-size must be positive");
+        if tp_size > 1 {
+            anyhow::ensure!(
+                !cuda_graph,
+                "Qwen3.5 TP benchmark requires --cuda-graph=false"
+            );
+        }
+        return Ok(());
+    }
+    #[cfg(not(feature = "qwen35"))]
+    let _ = (model_type, tp_size, cuda_graph);
+    Ok(())
+}
+
 fn dispatch(
     cli: &Cli,
     model_type: ModelType,
@@ -161,6 +178,7 @@ fn main() -> Result<()> {
     debug!("Detected model type: {:?}", model_type);
     validate_qwen35_scheduler_policy(model_type, cli.qwen35_scheduler_policy)?;
     validate_qwen35_max_batch(model_type, cli.max_batch)?;
+    validate_qwen35_parallel(model_type, cli.tp_size, cli.cuda_graph)?;
     let load_start = Instant::now();
 
     // Shared tail for every scheduler-backed model: load the tokenizer, stamp
@@ -265,17 +283,16 @@ fn main() -> Result<()> {
                 .max_prefill_tokens
                 .filter(|&v| v > 0)
                 .unwrap_or(pegainfer_qwen35::DEFAULT_MAX_PREFILL_TOKENS);
-            let handle = pegainfer_qwen35::start_engine_with_capacity_and_policy(
+            let handle = pegainfer_qwen35::launch_with_options_and_policy(
                 Path::new(&cli.model_path),
-                EngineLoadOptions {
-                    enable_cuda_graph: cli.cuda_graph,
-                    device_ordinals: vec![0],
-                    parallel_config: None,
-                    ep_backend: EpBackend::Nccl,
-                    seed: command_seed(&cli),
+                pegainfer_qwen35::Qwen35LaunchOptions {
+                    device_ordinal: 0,
+                    tp_size: cli.tp_size,
+                    cuda_graph: cli.cuda_graph,
+                    max_batch: cli.max_batch,
+                    max_prefill_tokens,
+                    prefix_cache_mib: cli.qwen35_prefix_cache_mib,
                 },
-                cli.max_batch,
-                max_prefill_tokens,
                 cli.qwen35_scheduler_policy.resolve(),
             )?;
             finish(handle, cli.cuda_graph)
