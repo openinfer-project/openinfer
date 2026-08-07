@@ -25,6 +25,8 @@ pub(crate) mod config;
 #[cfg(feature = "kernel-report")]
 pub mod kernel_report;
 #[cfg(feature = "kimi-k2")]
+pub mod model_line;
+#[cfg(feature = "kimi-k2")]
 mod runner;
 #[cfg(feature = "kimi-k2")]
 mod typed_scratch;

@@ -6,10 +6,6 @@ license = "Apache-2.0"
 name = "pegainfer-server"
 version = "0.1.0"
 
-[lib]
-name = "pegainfer"
-path = "src/lib.rs"
-
 [[bin]]
 name = "pegainfer"
 path = "src/main.rs"
@@ -26,7 +22,6 @@ pegainfer-glm52 = { workspace = true, optional = true }
 pegainfer-kimi-k2 = { workspace = true, optional = true }
 pegainfer-qwen3 = { workspace = true, optional = true }
 pegainfer-qwen35 = { workspace = true, optional = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-util = { workspace = true }
@@ -50,6 +45,3 @@ qwen35 = ["dep:pegainfer-qwen35", "pegainfer-qwen35/qwen35"]
 
 [lints]
 workspace = true
-
-[dev-dependencies]
-tempfile = { workspace = true }

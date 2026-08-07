@@ -11,6 +11,7 @@ mod decode_buffers;
 mod executor;
 mod ffi;
 mod logprobs;
+pub mod model_line;
 mod ops;
 mod prefill;
 pub mod prefill_buffers;

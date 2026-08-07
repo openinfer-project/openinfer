@@ -7,7 +7,7 @@ version = "0.1.0"
 
 [dependencies]
 anyhow = { workspace = true }
-clap = { workspace = true, optional = true }
+clap = { workspace = true }
 comfy-table = { workspace = true, optional = true }
 crossbeam-channel = { workspace = true }
 cudarc = { workspace = true }
@@ -17,8 +17,8 @@ hex = { workspace = true, optional = true }
 log = { workspace = true }
 pegainfer-bench = { workspace = true, optional = true }
 pegainfer-core = { workspace = true }
-pegainfer-frontend = { workspace = true }
 pegainfer-cupti = { workspace = true, optional = true }
+pegainfer-frontend = { workspace = true }
 pegainfer-kernels = { workspace = true }
 pegainfer-kv-cache = { workspace = true }
 pegainfer-kv-offload = { workspace = true }
@@ -34,7 +34,6 @@ toml = { workspace = true, optional = true }
 [features]
 kernel-call-trace = ["pegainfer-core/kernel-call-trace"]
 kernel-report = [
-  "dep:clap",
   "dep:comfy-table",
   "dep:hex",
   "dep:pegainfer-bench",

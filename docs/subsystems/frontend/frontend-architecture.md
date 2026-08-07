@@ -1,6 +1,6 @@
 # Frontend architecture: pegainfer-frontend and the engine boundary
 
-**TL;DR:** One crate — `pegainfer-frontend` — now owns everything north of the model schedulers: the engine request/event contract (formerly `pegainfer-engine`), the vLLM protocol stack (formerly `pegainfer-vllm-frontend`, now the `vllm` module), and the `ModelLine` dispatch trait. The old crates and both `pegainfer-dynamo-*` workspaces are deleted. The trait is not consumed yet; **next step: onboard qwen3 as the first `ModelLine` implementation**, then evaluate a `dynamo` module as a second protocol stack.
+**TL;DR:** One crate — `pegainfer-frontend` — owns everything north of the model schedulers: the engine request/event contract (formerly `pegainfer-engine`), the vLLM protocol stack (formerly `pegainfer-vllm-frontend`, now the `vllm` module), and the `ModelLine` dispatch trait. All six model lines implement `ModelLine` in their own crates; `pegainfer-server` is a ~250-line pure-dispatch binary (the `ModelType` enum, `detect_model_type`, the `load_engine` match, and the `consumed_args` table are gone). **Next step: prototype a `dynamo` module as a second protocol stack.**
 
 Last touched: 2026-08
 
@@ -50,17 +50,18 @@ Both existing translators (vllm `wire.rs`; and dynamo `convert.rs`, now deleted 
 
 ## ModelLine: what a new model provides
 
-`model_line.rs` defines the dispatch seam. A model crate implements:
+`model_line.rs` defines the dispatch seam. A model crate implements `ModelLine` (each crate has a `model_line.rs` exporting `pub static MODEL_LINE`):
 
-- `name()` — family name for logs/`--help`.
-- `probe(config_json)` — claim or reject the model directory; exactly one registered line must claim it.
-- `augment_cli(cmd)` — the line's own CLI section. The registry diffs the command to learn which arg ids belong to the line, so consumed-args validation needs no separate table.
-- `scheduler_partition_count(matches)` — partition count derivable from CLI alone, because the HTTP frontend registers one engine identity per partition *while the engine is still loading* (checked post-launch against `EngineHandle::scheduler_partition_count`).
-- `launch(ctx, matches)` — spawn scheduler threads, attach handle metadata (`with_kv_capacity`, `with_load_watch(es)`, `with_kv_events`), return the handle.
+- `name()` — family name for logs and errors.
+- `probe(config_json) -> Result<(), String>` — claim or reject the model directory by its identity fields plus the crate's `probe_config_json`; exactly one registered line must claim a config.
+- `augment_cli(cmd)` — the line's *exclusive* CLI section (a private `#[derive(clap::Args)]` struct). The registry diffs the command before/after to learn which arg ids belong to the line, so ownership needs no separate table. Flags shared by several lines (`--tp-size`, `--kv-offload`, …) live in `SharedArgs` in the frontend; a line opts into each via `consumed_shared_args()`.
+- `validate(ctx, provided) -> Result<(), CliError>` — the line's cross-flag rules (e.g. GLM5.2's topology/dp/tp matrix, Qwen3's batch-invariant exclusions). Runs after the registry's consume-or-reject pass.
+- `serve_plan(ctx) -> Result<ServePlan, CliError>` — what the HTTP frontend must know *before the engine finishes loading*: scheduler partition count (one engine identity per partition is registered during load; checked post-launch against `EngineHandle::scheduler_partition_count`), prefill-only mode, and LoRA route enablement.
+- `launch(ctx) -> anyhow::Result<EngineHandle>` — assemble the crate's option struct from `SharedArgs` + its own flags, spawn scheduler threads, attach handle metadata, return the handle.
 
-The server binary holds a feature-gated `ModelLineRegistry` and does pure dispatch. This replaces today's four hand-edited sites in `pegainfer-server` (`ModelType` enum + `detect_model_type` + `load_engine` match + `consumed_args` table) and un-leaks model option types (`Glm52MoeTopo`, `Qwen3OffloadOptions`, …) from `config.rs`.
+Errors at this boundary are typed (`thiserror`): `DetectError::{NoMatch, Conflict}` — the server branches on `NoMatch` to append a "rebuild with --features X" hint — and `CliError::{UnconsumedFlag, Rule}`. `launch` stays `anyhow`: its failures are deep context chains nobody branches on.
 
-**Status: the trait is defined but nothing implements it yet.** `pegainfer-server` still uses the old match-based dispatch. Onboarding qwen3 is the pilot: implement `ModelLine` in `pegainfer-qwen3`, move its args out of `config.rs`, convert its `load_engine` arm, and let the remaining models follow the proven pattern.
+All six lines are onboarded. `pegainfer-server/src/main.rs` is the whole server: build registry → merged clap command → detect from config.json → validate (registry consume-or-reject, `SharedArgs::validate`, line rules) → `serve_plan` → `launch` on a blocking thread → pick the serve path (LoRA / prefill-only / normal) from the plan. Adding a model line = write `model_line.rs` in the crate + one registry entry + one Cargo feature.
 
 ## Protocol stacks
 

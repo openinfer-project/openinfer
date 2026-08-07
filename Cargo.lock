@@ -3526,6 +3526,7 @@ dependencies = [
  "rmpv",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-util",
  "tower",
@@ -3560,6 +3561,7 @@ dependencies = [
  "anyhow",
  "bincode",
  "bytesize",
+ "clap",
  "crossbeam-channel",
  "cudarc",
  "half",
@@ -3701,6 +3703,7 @@ name = "pegainfer-qwen35"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "clap",
  "criterion 0.8.2",
  "cudarc",
  "half",
@@ -3748,9 +3751,7 @@ dependencies = [
  "pegainfer-kimi-k2",
  "pegainfer-qwen3",
  "pegainfer-qwen35",
- "serde",
  "serde_json",
- "tempfile",
  "tikv-jemallocator",
  "tokio",
  "tokio-util",

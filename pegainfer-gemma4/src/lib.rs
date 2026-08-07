@@ -4,6 +4,7 @@
 mod config;
 #[cfg(any(feature = "gemma4", test))]
 mod manifest;
+pub mod model_line;
 mod probe;
 #[cfg(feature = "gemma4")]
 #[expect(dead_code, reason = "no consumer until the executor lands")]

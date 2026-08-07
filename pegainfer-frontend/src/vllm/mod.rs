@@ -36,6 +36,7 @@ pub use lora::LoraModule;
 use lora::load_startup_lora_modules;
 use lora::lora_openai_routes;
 use lora::lora_routes;
+pub use lora::parse_lora_modules_arg;
 
 #[derive(Debug, Deserialize)]
 struct ModelLenConfig {

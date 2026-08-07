@@ -68,6 +68,60 @@ pub struct LoraModule {
     pub path: PathBuf,
 }
 
+/// CLI parser for `--lora-modules`: vLLM-style `name=path`, a JSON object,
+/// or a single-entry JSON list with `name` and `path`.
+pub fn parse_lora_modules_arg(value: &str) -> Result<LoraModule, String> {
+    if let Some((name, path)) = value.split_once('=') {
+        return parse_lora_module_fields(name, path);
+    }
+    let json: serde_json::Value =
+        serde_json::from_str(value).map_err(|error| format!("invalid --lora-modules: {error}"))?;
+    match json {
+        serde_json::Value::Object(map) => parse_lora_module_json(&map),
+        serde_json::Value::Array(entries) if entries.len() == 1 => {
+            let Some(serde_json::Value::Object(map)) = entries.first() else {
+                return Err("--lora-modules JSON list entries must be objects".to_string());
+            };
+            parse_lora_module_json(map)
+        }
+        serde_json::Value::Array(_) => Err(
+            "pass multiple --lora-modules values instead of one JSON list with multiple entries"
+                .to_string(),
+        ),
+        _ => Err(
+            "--lora-modules must be `name=path`, a JSON object, or a single-entry JSON list"
+                .to_string(),
+        ),
+    }
+}
+
+fn parse_lora_module_json(
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> Result<LoraModule, String> {
+    let name = map
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "--lora-modules JSON object requires string field `name`".to_string())?;
+    let path = map
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "--lora-modules JSON object requires string field `path`".to_string())?;
+    parse_lora_module_fields(name, path)
+}
+
+fn parse_lora_module_fields(name: &str, path: &str) -> Result<LoraModule, String> {
+    if name.is_empty() {
+        return Err("--lora-modules name must not be empty".to_string());
+    }
+    if path.is_empty() {
+        return Err("--lora-modules path must not be empty".to_string());
+    }
+    Ok(LoraModule {
+        name: name.to_string(),
+        path: PathBuf::from(path),
+    })
+}
+
 #[derive(Debug, Serialize)]
 struct ErrorBody {
     error: String,

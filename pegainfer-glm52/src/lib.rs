@@ -24,6 +24,7 @@ mod layer;
 mod mla_decode;
 mod mla_front;
 mod model;
+pub mod model_line;
 mod moe_decode;
 mod moe_ep;
 mod moe_ep8;

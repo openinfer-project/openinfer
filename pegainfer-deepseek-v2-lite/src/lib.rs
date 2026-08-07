@@ -10,6 +10,7 @@ mod ep;
 mod host_ops;
 #[cfg(feature = "deepseek-v2-lite")]
 mod model;
+pub mod model_line;
 #[cfg(feature = "deepseek-v2-lite")]
 mod nccl_backend;
 #[cfg(feature = "deepseek-v2-lite")]

@@ -1,5 +1,4 @@
 use std::any::Any;
-use std::error::Error;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -127,26 +126,15 @@ pub enum EngineCommand {
     Control(EngineControlRequest),
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq, thiserror::Error)]
 pub enum EngineControlError {
+    #[error("{0}")]
     Unsupported(&'static str),
+    #[error("engine control channel closed")]
     ChannelClosed,
+    #[error("engine control operation failed: {0}")]
     OperationFailed(String),
 }
-
-impl fmt::Display for EngineControlError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Unsupported(message) => f.write_str(message),
-            Self::ChannelClosed => f.write_str("engine control channel closed"),
-            Self::OperationFailed(message) => {
-                write!(f, "engine control operation failed: {message}")
-            }
-        }
-    }
-}
-
-impl Error for EngineControlError {}
 
 pub type EngineControlResult<T> = std::result::Result<T, EngineControlError>;
 
