@@ -45,6 +45,12 @@ fn model_lines() -> Vec<&'static dyn ModelLine> {
 /// gate: this table exists precisely because the line (and its probe) is
 /// compiled out, so the duplication cannot be derived away.
 fn feature_gate_hint(config: &serde_json::Value) -> Option<String> {
+    struct Family {
+        feature: &'static str,
+        model_types: &'static [&'static str],
+        text_model_types: &'static [&'static str],
+        compiled: bool,
+    }
     let model_type = config
         .get("model_type")
         .and_then(serde_json::Value::as_str)
@@ -54,12 +60,6 @@ fn feature_gate_hint(config: &serde_json::Value) -> Option<String> {
         .and_then(|text| text.get("model_type"))
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
-    struct Family {
-        feature: &'static str,
-        model_types: &'static [&'static str],
-        text_model_types: &'static [&'static str],
-        compiled: bool,
-    }
     let families = [
         Family {
             feature: "deepseek-v2-lite",
