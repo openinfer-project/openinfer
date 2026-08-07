@@ -13,6 +13,10 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
 
+pub use crate::metrics::LoadSnapshot;
+pub use crate::metrics::MAX_SPEC_TOKENS;
+pub use crate::metrics::SpecDecodeCounters;
+pub use crate::metrics::SpecWidthUnsupported;
 use crate::parallel::ParallelConfig;
 use crate::sampler::SamplingParams;
 
@@ -434,24 +438,6 @@ impl KvCapacity {
     pub fn blocks_for(self, tokens: usize) -> usize {
         tokens.div_ceil(self.block_size.max(1))
     }
-}
-
-/// Live KV-cache occupancy the scheduler republishes after every step.
-///
-/// `kv_used_blocks` is the load signal an out-of-band consumer (e.g. a Dynamo
-/// KV router) scores against; `kv_total_blocks` is the engine's whole-pool
-/// capacity (the same number advertised as the servable ceiling), so the
-/// consumer can derive fractional usage without a second query. Carried over a
-/// [`watch`] channel: the scheduler is the sole writer and never blocks on a
-/// reader, and a reader only ever sees the latest snapshot.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct LoadSnapshot {
-    pub kv_used_blocks: u64,
-    pub kv_total_blocks: u64,
-    /// Requests currently occupying a decode/prefill slot.
-    pub num_running_reqs: u64,
-    /// Requests admitted but not yet running (KV pressure, prefetch wait).
-    pub num_waiting_reqs: u64,
 }
 
 /// One full KV block that just became reusable from this engine's prefix cache.
