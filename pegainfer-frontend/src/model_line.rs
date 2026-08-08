@@ -10,16 +10,8 @@
 //! crate and adding the instance to the registry in the server binary. No
 //! other server edits: argument routing, consume-or-reject validation, and
 //! config detection all derive from the trait.
-//!
-//! CLI arguments split in two:
-//!
-//! - [`SharedArgs`] — flags several lines read (`--tp-size`, `--kv-offload`,
-//!   …). A line opts into each via [`ModelLine::consumed_shared_args`];
-//!   setting a shared flag the detected line doesn't consume is an error.
-//! - Line-exclusive flags — added by [`ModelLine::augment_cli`]. The registry
-//!   diffs the command before/after augmentation to learn which ids belong to
-//!   which line, so ownership needs no separate declaration.
 
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::path::PathBuf;
@@ -73,6 +65,9 @@ impl CliError {
 
 /// Flags accepted for every model line regardless of detected type.
 pub const CORE_ARGS: &[&str] = &["model_path", "served_model_name", "port"];
+
+/// A source argument id and the argument ids it requires.
+pub type ArgRequirement = (&'static str, &'static [&'static str]);
 
 const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3-4B");
 
@@ -135,14 +130,14 @@ pub struct SharedArgs {
 
     /// Host pinned-memory pool size for the KV offload tier, in GiB. pegaflow
     /// allocates the whole pool up front, so RSS reflects this at startup.
-    #[arg(long, default_value_t = 8.0, value_parser = parse_offload_gib, requires = "kv_offload")]
+    #[arg(long, default_value_t = 8.0, value_parser = parse_offload_gib)]
     pub kv_offload_host_gib: f64,
 
     /// Back the KV offload pool with 2 MiB hugepages. The box must hold a
     /// reservation covering the pool (`HugePages_Total` in /proc/meminfo;
     /// `echo N > /proc/sys/vm/nr_hugepages` as root) — allocation fails at
     /// startup otherwise.
-    #[arg(long, default_value_t = false, requires = "kv_offload")]
+    #[arg(long, default_value_t = false)]
     pub kv_offload_hugepages: bool,
 
     /// Join the cross-instance KV P2P mesh: pegaflow MetaServer gRPC address
@@ -150,18 +145,18 @@ pub struct SharedArgs {
     /// missing prefixes are pulled from peer instances over RDMA — the P/D
     /// disaggregation data plane. Requires --kv-offload, --kv-p2p-advertise-addr
     /// and --kv-p2p-nics.
-    #[arg(long, requires_all = ["kv_offload", "kv_p2p_advertise_addr", "kv_p2p_nics"])]
+    #[arg(long)]
     pub kv_p2p_metaserver_addr: Option<String>,
 
     /// This instance's routable IP:port for KV P2P — a literal socket address
     /// (it is also the embedded transfer-service bind address, so hostnames
     /// are rejected at startup). Peers dial it for RDMA handshakes and block
     /// queries. Must be reachable by every peer; not 0.0.0.0.
-    #[arg(long, requires = "kv_p2p_metaserver_addr")]
+    #[arg(long)]
     pub kv_p2p_advertise_addr: Option<String>,
 
     /// RDMA NIC device names for KV P2P (e.g. `mlx5_0`), comma-separated.
-    #[arg(long, value_delimiter = ',', requires = "kv_p2p_metaserver_addr")]
+    #[arg(long, value_delimiter = ',')]
     pub kv_p2p_nics: Vec<String>,
 
     /// vLLM-style no-prefix-cache. Without --kv-offload it disables prefix
@@ -185,6 +180,17 @@ pub struct SharedArgs {
     #[arg(long)]
     pub max_prefill_tokens: Option<usize>,
 }
+
+const SHARED_ARG_REQUIREMENTS: &[ArgRequirement] = &[
+    ("kv_offload_host_gib", &["kv_offload"]),
+    ("kv_offload_hugepages", &["kv_offload"]),
+    (
+        "kv_p2p_metaserver_addr",
+        &["kv_offload", "kv_p2p_advertise_addr", "kv_p2p_nics"],
+    ),
+    ("kv_p2p_advertise_addr", &["kv_p2p_metaserver_addr"]),
+    ("kv_p2p_nics", &["kv_p2p_metaserver_addr"]),
+];
 
 impl SharedArgs {
     /// Interactions between shared flags that hold for every consumer.
@@ -274,9 +280,14 @@ pub trait ModelLine: Send + Sync {
         &[]
     }
 
-    /// Cross-flag rules beyond clap's `requires`: interactions between this
-    /// line's flags and the shared set. Runs after the registry's
-    /// consume-or-reject pass.
+    /// Unconditional requirements from this line's flags. Declare them here,
+    /// not in Clap attributes, so release builds validate every referenced id.
+    fn arg_requirements(&self) -> &'static [ArgRequirement] {
+        &[]
+    }
+
+    /// Cross-flag rules beyond [`ModelLine::arg_requirements`]. Runs after the
+    /// registry's consume-or-reject pass.
     fn validate(
         &self,
         _ctx: &LaunchContext<'_>,
@@ -299,53 +310,167 @@ pub trait ModelLine: Send + Sync {
 
 struct LineEntry {
     line: &'static dyn ModelLine,
-    /// Arg ids this line's `augment_cli` adds, learned by diffing.
     own_ids: BTreeSet<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ArgOwner {
+    Shared,
+    Line(&'static str),
+}
+
+impl std::fmt::Display for ArgOwner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Shared => f.write_str("SharedArgs"),
+            Self::Line(name) => write!(f, "model line {name}"),
+        }
+    }
+}
+
+#[derive(Default)]
+struct RegistryClaims {
+    ids: BTreeMap<String, ArgOwner>,
+    spellings: BTreeMap<String, ArgOwner>,
+}
+
+impl RegistryClaims {
+    fn register_command(&mut self, command: &clap::Command, owner: ArgOwner) -> BTreeSet<String> {
+        command
+            .get_arguments()
+            .map(|arg| self.register_arg(arg, owner))
+            .collect()
+    }
+
+    fn register_arg(&mut self, arg: &clap::Arg, owner: ArgOwner) -> String {
+        let id = arg.get_id().to_string();
+        self.claim_id(id.clone(), owner);
+        for long in arg
+            .get_long()
+            .into_iter()
+            .chain(arg.get_all_aliases().into_iter().flatten())
+        {
+            self.claim_spelling(format!("--{long}"), owner);
+        }
+        for short in arg
+            .get_short()
+            .into_iter()
+            .chain(arg.get_all_short_aliases().into_iter().flatten())
+        {
+            self.claim_spelling(format!("-{short}"), owner);
+        }
+        id
+    }
+
+    fn claim_id(&mut self, id: String, owner: ArgOwner) {
+        if let Some(previous) = self.ids.get(&id) {
+            if *previous == ArgOwner::Shared {
+                if let ArgOwner::Line(name) = owner {
+                    panic!(
+                        "model line {name} redeclares SharedArgs flag id {id:?}; list it in consumed_shared_args instead"
+                    );
+                }
+            }
+            panic!("{previous} and {owner} both define flag id {id:?}");
+        }
+        self.ids.insert(id, owner);
+    }
+
+    fn claim_spelling(&mut self, spelling: String, owner: ArgOwner) {
+        if let Some(previous) = self.spellings.get(&spelling) {
+            panic!("{previous} and {owner} both define CLI spelling {spelling:?}");
+        }
+        self.spellings.insert(spelling, owner);
+    }
+
+    fn is_shared_id(&self, id: &str) -> bool {
+        self.ids.get(id) == Some(&ArgOwner::Shared)
+    }
+
+    fn validate_requirement(&self, owner: ArgOwner, source: &str, targets: &[&str]) {
+        assert!(
+            self.ids.get(source) == Some(&owner),
+            "{owner} declares requirements for unowned flag id {source:?}"
+        );
+        for &target in targets {
+            assert!(source != target, "flag id {source:?} cannot require itself");
+            let target_owner = self.ids.get(target);
+            assert!(
+                target_owner == Some(&ArgOwner::Shared) || target_owner == Some(&owner),
+                "{owner} flag id {source:?} requires unknown or foreign argument id {target:?}"
+            );
+        }
+    }
+}
+
+fn register_line(
+    line: &'static dyn ModelLine,
+    owner: ArgOwner,
+    claims: &mut RegistryClaims,
+) -> LineEntry {
+    for id in line.consumed_shared_args() {
+        assert!(
+            claims.is_shared_id(id),
+            "model line {} consumes unknown SharedArgs flag id {id:?}",
+            line.name()
+        );
+    }
+    let command = line.augment_cli(clap::Command::new("probe"));
+    let own_ids = claims.register_command(&command, owner);
+    LineEntry { line, own_ids }
 }
 
 /// The server binary's fixed list of compiled-in model lines.
 pub struct ModelLineRegistry {
     entries: Vec<LineEntry>,
+    requirements: BTreeMap<&'static str, &'static [&'static str]>,
 }
 
 impl ModelLineRegistry {
-    /// Panics when two lines define the same exclusive flag, or when a line's
-    /// exclusive flag collides with a [`SharedArgs`] id — clap would only
-    /// catch either in debug builds, at `build_command` time, with a less
-    /// helpful message. A collision is a programmer error in a model crate,
-    /// so failing at registry construction (server startup) is correct.
+    /// Validates CLI ownership explicitly because Clap's equivalent schema
+    /// assertions are disabled in release builds.
     pub fn new(lines: Vec<&'static dyn ModelLine>) -> Self {
-        let shared_ids: BTreeSet<String> = SharedArgs::augment_args(clap::Command::new("probe"))
-            .get_arguments()
-            .map(|arg| arg.get_id().to_string())
-            .collect();
-        let mut claimed_by: std::collections::BTreeMap<String, &'static str> =
-            std::collections::BTreeMap::new();
-        let entries = lines
-            .into_iter()
-            .map(|line| {
-                let own_ids: BTreeSet<String> = line
-                    .augment_cli(clap::Command::new("probe"))
-                    .get_arguments()
-                    .map(|arg| arg.get_id().to_string())
-                    .collect();
-                for id in &own_ids {
-                    assert!(
-                        !shared_ids.contains(id),
-                        "model line {} defines flag id {id:?}, which is a SharedArgs flag",
-                        line.name()
-                    );
-                    if let Some(previous) = claimed_by.insert(id.clone(), line.name()) {
-                        panic!(
-                            "model lines {previous} and {} both define flag id {id:?}",
-                            line.name()
-                        );
-                    }
-                }
-                LineEntry { line, own_ids }
-            })
-            .collect();
-        Self { entries }
+        let shared_cmd = SharedArgs::augment_args(clap::Command::new("probe"));
+        let mut claims = RegistryClaims::default();
+        claims.register_command(&shared_cmd, ArgOwner::Shared);
+        for id in CORE_ARGS {
+            assert!(
+                claims.is_shared_id(id),
+                "CORE_ARGS contains unknown SharedArgs flag id {id:?}"
+            );
+        }
+        let mut pending_requirements = SHARED_ARG_REQUIREMENTS
+            .iter()
+            .map(|&(source, targets)| (ArgOwner::Shared, source, targets))
+            .collect::<Vec<_>>();
+        let mut entries = Vec::with_capacity(lines.len());
+        let mut line_names = BTreeSet::new();
+        for line in lines {
+            let name = line.name();
+            assert!(
+                line_names.insert(name),
+                "duplicate model line name {name:?}"
+            );
+            let owner = ArgOwner::Line(name);
+            entries.push(register_line(line, owner, &mut claims));
+            pending_requirements.extend(
+                line.arg_requirements()
+                    .iter()
+                    .map(|&(source, targets)| (owner, source, targets)),
+            );
+        }
+        let mut requirements = BTreeMap::new();
+        for (owner, source, targets) in pending_requirements {
+            claims.validate_requirement(owner, source, targets);
+            assert!(
+                requirements.insert(source, targets).is_none(),
+                "{owner} declares requirements more than once for flag id {source:?}"
+            );
+        }
+        Self {
+            entries,
+            requirements,
+        }
     }
 
     /// The full server command: shared flags plus every line's exclusive
@@ -355,7 +480,13 @@ impl ModelLineRegistry {
         for entry in &self.entries {
             cmd = entry.line.augment_cli(cmd);
         }
-        cmd
+        // `mut_arg` re-appends each source and would reorder `--help`.
+        cmd.mut_args(|arg| {
+            let Some(targets) = self.requirements.get(arg.get_id().as_str()) else {
+                return arg;
+            };
+            arg.requires_all(targets.iter().copied())
+        })
     }
 
     /// Find the unique line that claims this `config.json`. On
@@ -479,12 +610,28 @@ pub fn parse_for_line(
 mod tests {
     use super::*;
 
-    /// A minimal line for registry tests: claims one `model_type` string and
-    /// optionally defines one exclusive flag.
     struct StubLine {
         name: &'static str,
         claims: &'static str,
-        flag: Option<(&'static str, &'static str)>, // (id, long)
+        augment: Option<fn(clap::Command) -> clap::Command>,
+        consumed: &'static [&'static str],
+        requirements: &'static [ArgRequirement],
+    }
+
+    impl StubLine {
+        const fn new(
+            name: &'static str,
+            claims: &'static str,
+            augment: Option<fn(clap::Command) -> clap::Command>,
+        ) -> Self {
+            Self {
+                name,
+                claims,
+                augment,
+                consumed: &["tp_size"],
+                requirements: &[],
+            }
+        }
     }
 
     impl ModelLine for StubLine {
@@ -505,14 +652,18 @@ mod tests {
         }
 
         fn augment_cli(&self, cmd: clap::Command) -> clap::Command {
-            match self.flag {
-                Some((id, long)) => cmd.arg(clap::Arg::new(id).long(long).num_args(0)),
+            match self.augment {
+                Some(augment) => augment(cmd),
                 None => cmd,
             }
         }
 
         fn consumed_shared_args(&self) -> &'static [&'static str] {
-            &["tp_size"]
+            self.consumed
+        }
+
+        fn arg_requirements(&self) -> &'static [ArgRequirement] {
+            self.requirements
         }
 
         fn launch(&self, _ctx: &LaunchContext<'_>) -> anyhow::Result<EngineHandle> {
@@ -520,30 +671,96 @@ mod tests {
         }
     }
 
-    static LINE_A: StubLine = StubLine {
-        name: "LineA",
-        claims: "model_a",
-        flag: Some(("line_a_flag", "line-a-flag")),
+    static LINE_A: StubLine = StubLine::new(
+        "LineA",
+        "model_a",
+        Some(|cmd| {
+            cmd.arg(
+                clap::Arg::new("line_a_flag")
+                    .long("line-a-flag")
+                    .num_args(0),
+            )
+        }),
+    );
+    static LINE_B: StubLine = StubLine::new(
+        "LineB",
+        "model_b",
+        Some(|cmd| {
+            cmd.arg(
+                clap::Arg::new("line_b_flag")
+                    .long("line-b-flag")
+                    .num_args(0),
+            )
+        }),
+    );
+    static LINE_B_TWIN: StubLine = StubLine::new("LineBTwin", "model_b", None);
+    static LINE_SHARED_COLLISION: StubLine = StubLine::new(
+        "LineSharedCollision",
+        "model_c",
+        Some(|cmd| cmd.arg(clap::Arg::new("tp_size").long("tp-size-again").num_args(0))),
+    );
+    static LINE_A_COPYCAT: StubLine = StubLine::new(
+        "LineACopycat",
+        "model_d",
+        Some(|cmd| {
+            cmd.arg(
+                clap::Arg::new("line_a_flag")
+                    .long("line-a-flag-copy")
+                    .num_args(0),
+            )
+        }),
+    );
+    static LINE_LONG_COPYCAT: StubLine = StubLine::new(
+        "LineLongCopycat",
+        "model_e",
+        Some(|cmd| {
+            cmd.arg(
+                clap::Arg::new("different_id")
+                    .long("line-a-flag")
+                    .num_args(0),
+            )
+        }),
+    );
+    static LINE_UNKNOWN_SHARED: StubLine = StubLine {
+        consumed: &["not_a_shared_arg"],
+        ..StubLine::new("LineUnknownShared", "model_f", None)
     };
-    static LINE_B: StubLine = StubLine {
-        name: "LineB",
-        claims: "model_b",
-        flag: Some(("line_b_flag", "line-b-flag")),
-    };
-    static LINE_B_TWIN: StubLine = StubLine {
-        name: "LineBTwin",
-        claims: "model_b",
-        flag: None,
-    };
-    static LINE_SHARED_COLLISION: StubLine = StubLine {
-        name: "LineSharedCollision",
-        claims: "model_c",
-        flag: Some(("tp_size", "tp-size-again")),
-    };
-    static LINE_A_COPYCAT: StubLine = StubLine {
-        name: "LineACopycat",
-        claims: "model_d",
-        flag: Some(("line_a_flag", "line-a-flag")),
+    static LINE_SHARED_ALIAS: StubLine = StubLine::new(
+        "LineSharedAlias",
+        "model_g",
+        Some(|cmd| {
+            cmd.arg(
+                clap::Arg::new("shared_alias")
+                    .long("shared-alias")
+                    .alias("tp-size")
+                    .num_args(0),
+            )
+        }),
+    );
+    static LINE_SHORT_A: StubLine = StubLine::new(
+        "LineShortA",
+        "model_h",
+        Some(|cmd| cmd.arg(clap::Arg::new("short_a").short('q').num_args(0))),
+    );
+    static LINE_SHORT_ALIAS: StubLine = StubLine::new(
+        "LineShortAlias",
+        "model_i",
+        Some(|cmd| {
+            cmd.arg(
+                clap::Arg::new("short_alias")
+                    .short('r')
+                    .short_alias('q')
+                    .num_args(0),
+            )
+        }),
+    );
+    static LINE_DANGLING_REQUIREMENT: StubLine = StubLine {
+        requirements: &[("trigger", &["missing_target"])],
+        ..StubLine::new(
+            "LineDanglingRequirement",
+            "model_j",
+            Some(|cmd| cmd.arg(clap::Arg::new("trigger").long("trigger").num_args(0))),
+        )
     };
 
     fn registry() -> ModelLineRegistry {
@@ -575,7 +792,6 @@ mod tests {
 
     #[test]
     fn detect_no_match_renders_identity_fields_verbatim() {
-        // Non-string identity fields must render as-is, not as `missing`.
         let config = serde_json::json!({"model_type": 123, "architectures": "Foo"});
         let error = registry()
             .detect(&config)
@@ -642,9 +858,43 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "which is a SharedArgs flag")]
-    fn registry_rejects_shared_flag_collisions() {
+    #[should_panic(expected = "both define CLI spelling \"--line-a-flag\"")]
+    fn registry_rejects_duplicate_exclusive_flag_spellings() {
+        let _ = ModelLineRegistry::new(vec![&LINE_A, &LINE_LONG_COPYCAT]);
+    }
+
+    #[test]
+    #[should_panic(expected = "list it in consumed_shared_args instead")]
+    fn registry_rejects_shared_flag_id_collisions() {
         let _ = ModelLineRegistry::new(vec![&LINE_SHARED_COLLISION]);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "SharedArgs and model line LineSharedAlias both define CLI spelling \"--tp-size\""
+    )]
+    fn registry_rejects_shared_flag_alias_collisions() {
+        let _ = ModelLineRegistry::new(vec![&LINE_SHARED_ALIAS]);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "model line LineShortA and model line LineShortAlias both define CLI spelling \"-q\""
+    )]
+    fn registry_rejects_short_alias_collisions() {
+        let _ = ModelLineRegistry::new(vec![&LINE_SHORT_A, &LINE_SHORT_ALIAS]);
+    }
+
+    #[test]
+    #[should_panic(expected = "consumes unknown SharedArgs flag id \"not_a_shared_arg\"")]
+    fn registry_rejects_unknown_consumed_shared_arg() {
+        let _ = ModelLineRegistry::new(vec![&LINE_UNKNOWN_SHARED]);
+    }
+
+    #[test]
+    #[should_panic(expected = "requires unknown or foreign argument id")]
+    fn registry_rejects_unknown_requirement_target() {
+        let _ = ModelLineRegistry::new(vec![&LINE_DANGLING_REQUIREMENT]);
     }
 
     #[test]
@@ -658,7 +908,6 @@ mod tests {
         let provided = provided_args(&matches, &cmd);
         assert!(provided.contains("tp_size"));
         assert!(provided.contains("line_a_flag"));
-        // Defaulted flags (e.g. --port) must not count as provided.
         assert!(!provided.contains("port"));
     }
 }

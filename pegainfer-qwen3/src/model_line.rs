@@ -7,6 +7,7 @@ use std::collections::BTreeSet;
 use clap::Args as ClapArgs;
 use clap::FromArgMatches;
 use pegainfer_frontend::engine::EngineHandle;
+use pegainfer_frontend::model_line::ArgRequirement;
 use pegainfer_frontend::model_line::CliError;
 use pegainfer_frontend::model_line::LaunchContext;
 use pegainfer_frontend::model_line::ModelLine;
@@ -53,7 +54,7 @@ struct Qwen3Cli {
     /// MetaServer registration) before its final token event, so this
     /// instance's HTTP response doubles as the KV-ready signal a router can
     /// act on. Leave off on decode instances.
-    #[arg(long, default_value_t = false, requires = "kv_p2p_metaserver_addr")]
+    #[arg(long, default_value_t = false)]
     kv_p2p_flush_on_finish: bool,
 
     /// P/D decode role with a vLLM prefill peer: the shared PYTHONHASHSEED
@@ -62,7 +63,7 @@ struct Qwen3Cli {
     /// --prefix-caching-hash-algo xxhash_cbor) and makes a cold request wait
     /// out the producer's registration tail instead of prefilling locally.
     /// Requires --kv-pd-vllm-namespace and the P2P mesh flags.
-    #[arg(long, value_parser = parse_pythonhashseed, requires_all = ["kv_p2p_metaserver_addr", "kv_pd_vllm_namespace"])]
+    #[arg(long, value_parser = parse_pythonhashseed)]
     kv_pd_vllm_seed: Option<String>,
 
     /// The vLLM prefill peer's pegaflow-connector namespace (an 8-hex digest
@@ -70,14 +71,14 @@ struct Qwen3Cli {
     /// address the same content domain. The digest carries no model identity:
     /// pointing a decode node at a different model's namespace (same
     /// tokenizer, same geometry class) silently cross-loads foreign KV.
-    #[arg(long, value_parser = parse_pegaflow_namespace, requires = "kv_pd_vllm_seed")]
+    #[arg(long, value_parser = parse_pegaflow_namespace)]
     kv_pd_vllm_namespace: Option<String>,
 
     /// Zero-hit wait window for --kv-pd-vllm-seed mode, in milliseconds: how
     /// long a cold request keeps re-querying before giving up on the expected
     /// remote KV and prefilling locally. Must stay below the executor's 15s
     /// remote-fetch deadline (enforced at startup).
-    #[arg(long, default_value_t = 5000, requires = "kv_pd_vllm_seed")]
+    #[arg(long, default_value_t = 5000)]
     kv_pd_miss_wait_ms: u64,
 
     /// Fraction of total GPU memory the Qwen3 instance may use. The KV cache is
@@ -178,6 +179,18 @@ impl ModelLine for Qwen3Line {
             "no_prefix_cache",
             "max_prefill_tokens",
             "dflash_draft_model_path",
+        ]
+    }
+
+    fn arg_requirements(&self) -> &'static [ArgRequirement] {
+        &[
+            ("kv_p2p_flush_on_finish", &["kv_p2p_metaserver_addr"]),
+            (
+                "kv_pd_vllm_seed",
+                &["kv_p2p_metaserver_addr", "kv_pd_vllm_namespace"],
+            ),
+            ("kv_pd_vllm_namespace", &["kv_pd_vllm_seed"]),
+            ("kv_pd_miss_wait_ms", &["kv_pd_vllm_seed"]),
         ]
     }
 
