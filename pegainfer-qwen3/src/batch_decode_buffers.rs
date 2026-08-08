@@ -26,6 +26,7 @@ pub(crate) const BATCH_BUCKETS: &[usize] = &[
     1, 2, 4, 8, 16, 20, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152,
     160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256,
 ];
+
 const DECODE_ATTENTION_PATH_COUNT: usize = 2;
 // Split-KV decode attention: the non-partitioned kernel issues one CTA per
 // (request x kv-head), starving SMs at small batch. The path is therefore
