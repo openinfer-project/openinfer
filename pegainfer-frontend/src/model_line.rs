@@ -76,6 +76,19 @@ pub const CORE_ARGS: &[&str] = &["model_path", "served_model_name", "port"];
 
 const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3-4B");
 
+/// Shared CLI selector for model lines that can overlap prefill and decode.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, clap::ValueEnum)]
+pub enum CliDecodeOverlap {
+    /// One stream; prefill and decode serialize.
+    #[default]
+    Off,
+    /// Two CUDA streams sharing all SMs.
+    Stream,
+    /// Green Context SM partition (SM-pinned streams).
+    #[value(name = "green-ctx")]
+    GreenCtx,
+}
+
 // CLI flags shared by more than one model line. Each line declares the
 // subset it reads via `ModelLine::consumed_shared_args`; providing a flag
 // outside that subset fails validation with a per-line error.
@@ -184,6 +197,16 @@ pub struct SharedArgs {
     /// their own crate defaults.
     #[arg(long)]
     pub max_prefill_tokens: Option<usize>,
+
+    /// How prefill and decode share the GPU. Qwen3 supports `off`, `stream`,
+    /// and `green-ctx`; Qwen3.5 supports `off` and `stream`.
+    #[arg(long, value_enum, default_value_t = CliDecodeOverlap::Off)]
+    pub decode_overlap: CliDecodeOverlap,
+
+    /// Percent of SMs pinned to decode in `--decode-overlap green-ctx` (the rest
+    /// go to prefill); rejected if set in any other mode.
+    #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..=99))]
+    pub decode_sm_pct: u32,
 }
 
 impl SharedArgs {
@@ -198,6 +221,11 @@ impl SharedArgs {
         if provided.contains("device_ordinal") && self.tp_size > 1 {
             return Err(CliError::rule(
                 "--device-ordinal is ignored under tensor parallelism; tp_size>1 uses devices 0..tp_size",
+            ));
+        }
+        if provided.contains("decode_sm_pct") && self.decode_overlap != CliDecodeOverlap::GreenCtx {
+            return Err(CliError::rule(
+                "--decode-sm-pct only applies with --decode-overlap=green-ctx",
             ));
         }
         Ok(())

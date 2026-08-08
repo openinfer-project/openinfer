@@ -6,6 +6,7 @@
 
 mod plan;
 
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::mpsc as std_mpsc;
 use std::thread;
@@ -14,6 +15,9 @@ use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
 use anyhow::Result;
+use cudarc::driver::CudaEvent;
+use cudarc::driver::CudaStream;
+use cudarc::driver::sys;
 use log::debug;
 use log::info;
 use log::warn;
@@ -48,6 +52,7 @@ use self::plan::max_kv_tokens;
 use self::plan::plan_prefill_chunks;
 use self::plan::prefilling_future_pages;
 use self::plan::slot_for_new_request;
+use crate::Qwen35DecodeOverlap;
 use crate::Qwen35SchedulerPolicy;
 use crate::batch_decode_graph::BatchDecodeGraphState;
 use crate::executor::DecodeRequestResult;
@@ -111,12 +116,12 @@ pub const DEFAULT_MAX_PREFILL_TOKENS: usize = 1024;
 
 /// Env-gated per-step ITL diagnostics (issue #470). When `PEGAINFER_ITL_DEBUG`
 /// is set, the scheduler emits one `ITL_STEP` line per executed step, tagging
-/// the plan kind, the *actual* prefill-chunk token count run this step, the
-/// number of active decode rows frozen behind it, and the CPU wall-time the
-/// step took. This lets the mixed-load bench attribute a background decode
-/// stall to the specific steps that truly ran a prefill chunk, instead of the
-/// coarse `[submit, last-token]` injection window that spans every step of a
-/// long chunked prefill. Off by default: no cost on the normal bench path.
+/// the plan kind, the *actual* prefill-chunk token count associated with the
+/// action, the active decode width, and the CPU wall-time. This lets the
+/// mixed-load bench separate serial Unified stalls from overlap launch,
+/// decode, completion, and wait actions instead of relying on the coarse
+/// `[submit, last-token]` injection window. Off by default: no cost on the
+/// normal bench path.
 fn itl_debug_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("PEGAINFER_ITL_DEBUG").is_some())
@@ -127,6 +132,32 @@ fn itl_debug_enabled() -> bool {
 fn itl_debug_mono_us() -> u128 {
     static ORIGIN: OnceLock<Instant> = OnceLock::new();
     ORIGIN.get_or_init(Instant::now).elapsed().as_micros()
+}
+
+fn log_itl_step(
+    step_start: Option<Instant>,
+    plan: &str,
+    prefill_tokens: usize,
+    prefill_reqs: usize,
+    decode_n: usize,
+) {
+    let Some(step_start) = step_start else {
+        return;
+    };
+    let dur_us = step_start.elapsed().as_micros();
+    let epoch_us = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_micros());
+    info!(
+        "ITL_STEP mono_us={} epoch_us={} plan={} prefill_tok={} prefill_reqs={} decode_n={} dur_us={}",
+        itl_debug_mono_us(),
+        epoch_us,
+        plan,
+        prefill_tokens,
+        prefill_reqs,
+        decode_n,
+        dur_us
+    );
 }
 
 // ── Entry point ─────────────────────────────────────────────────────────
@@ -143,6 +174,7 @@ pub fn start_with_capacity(
         max_batch,
         max_prefill_tokens,
         Qwen35SchedulerPolicy::Off,
+        Qwen35DecodeOverlap::Off,
     )
 }
 
@@ -152,6 +184,7 @@ pub(crate) fn start_with_capacity_and_policy(
     max_batch: usize,
     max_prefill_tokens: usize,
     scheduler_policy: Qwen35SchedulerPolicy,
+    decode_overlap: Qwen35DecodeOverlap,
 ) -> Result<SchedulerHandle> {
     assert!(
         max_prefill_tokens > 0,
@@ -167,7 +200,7 @@ pub(crate) fn start_with_capacity_and_policy(
         total_blocks,
         block_size,
     );
-    let backend = SingleGpuBackend::new(model, max_batch)?;
+    let backend = SingleGpuBackend::new(model, max_batch, decode_overlap)?;
 
     let (submit_tx, submit_rx) = mpsc::unbounded_channel();
     let (startup_tx, startup_rx) = std_mpsc::channel();
@@ -271,6 +304,7 @@ pub(crate) fn start_tp_with_capacity(
 struct SingleGpuBackend {
     model: Qwen35Model,
     graph_state: BatchDecodeGraphState,
+    prefill_stream: Option<Arc<CudaStream>>,
 }
 
 // One instance per scheduler; the size asymmetry costs nothing here.
@@ -280,17 +314,87 @@ enum SchedulerBackend {
     Tp(TpSchedulerBackend),
 }
 
+struct AsyncPrefillOutput {
+    logits: Option<HiddenStates>,
+    done: CudaEvent,
+    stream: Arc<CudaStream>,
+    completed: bool,
+}
+
+impl AsyncPrefillOutput {
+    fn is_ready(&mut self) -> bool {
+        match unsafe { sys::cuEventQuery(self.done.cu_event()) } {
+            sys::CUresult::CUDA_SUCCESS => {
+                self.completed = true;
+                true
+            }
+            sys::CUresult::CUDA_ERROR_NOT_READY => false,
+            err => fatal_cuda_lifecycle(&format!(
+                "query Qwen3.5 async prefill event failed: {err:?}"
+            )),
+        }
+    }
+
+    fn into_logits(mut self) -> HiddenStates {
+        if !self.completed {
+            if let Err(err) = self.done.synchronize() {
+                fatal_cuda_lifecycle(&format!("wait for Qwen3.5 async prefill failed: {err}"));
+            }
+            self.completed = true;
+        }
+        self.logits
+            .take()
+            .expect("async prefill logits must be consumed exactly once")
+    }
+}
+
+impl Drop for AsyncPrefillOutput {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        if let Err(err) = self.stream.synchronize() {
+            fatal_cuda_lifecycle(&format!(
+                "drain Qwen3.5 async prefill during cleanup failed: {err}"
+            ));
+        }
+    }
+}
+
+fn fatal_cuda_lifecycle(message: &str) -> ! {
+    log::error!("FATAL: {message}; aborting before CUDA-referenced state is released");
+    std::process::abort();
+}
+
 struct TpSchedulerBackend {
     executor: Qwen35TpExecutor,
     next_request_id: u64,
 }
 
 impl SingleGpuBackend {
-    fn new(model: Qwen35Model, max_batch: usize) -> Result<Self> {
+    fn new(
+        model: Qwen35Model,
+        max_batch: usize,
+        decode_overlap: Qwen35DecodeOverlap,
+    ) -> Result<Self> {
         anyhow::ensure!(max_batch > 0, "Qwen3.5 max_batch must be > 0");
         let graph_capacity = crate::batch_decode_graph::bucket_for(max_batch);
         let graph_state = model.create_batch_decode_graph_state_with_capacity(graph_capacity)?;
-        Ok(Self { model, graph_state })
+        let prefill_stream = match decode_overlap {
+            Qwen35DecodeOverlap::Off => None,
+            Qwen35DecodeOverlap::SharedSm => Some(
+                model
+                    .device_ctx()
+                    .ctx
+                    .new_stream()
+                    .map_err(|err| anyhow::anyhow!("create Qwen3.5 prefill stream: {err}"))?,
+            ),
+        };
+        Ok(Self {
+            model,
+            graph_state,
+            prefill_stream,
+        })
     }
 
     fn model(&self) -> &Qwen35Model {
@@ -338,6 +442,63 @@ impl SingleGpuBackend {
         let mut rec_refs: Vec<&mut RecurrentState> = recs.iter_mut().collect();
         self.model
             .batch_prefill_logits(&window_refs, kvs, &mut rec_refs)
+    }
+
+    fn overlap_enabled(&self) -> bool {
+        self.prefill_stream.is_some()
+    }
+
+    fn launch_async_prefill(&mut self, chunk: &mut ScheduledChunk) -> Result<AsyncPrefillOutput> {
+        let prefill_stream = self
+            .prefill_stream
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Qwen3.5 decode overlap is disabled"))?;
+
+        // Request KV/recurrent state was allocated on the model stream. Order
+        // those producers before the prefill stream without blocking the host.
+        prefill_stream
+            .join(&self.model.device_ctx().stream)
+            .map_err(|err| anyhow::anyhow!("join Qwen3.5 prefill stream: {err}"))?;
+
+        let window_refs: Vec<&[u32]> = chunk.windows.iter().map(Vec::as_slice).collect();
+        let ScheduledChunkBackendState::Single { kvs, recs } = &mut chunk.backend_state else {
+            anyhow::bail!("single-GPU async prefill received TP chunk state");
+        };
+        let mut rec_refs: Vec<&mut RecurrentState> = recs.iter_mut().collect();
+        let logits = match self.model.batch_prefill_logits_on_stream(
+            Arc::clone(&prefill_stream),
+            &window_refs,
+            kvs,
+            &mut rec_refs,
+        ) {
+            Ok(logits) => logits,
+            Err(err) => {
+                if let Err(sync_err) = prefill_stream.synchronize() {
+                    fatal_cuda_lifecycle(&format!(
+                        "Qwen3.5 async prefill failed ({err}); stream drain failed: {sync_err}"
+                    ));
+                }
+                return Err(err);
+            }
+        };
+        let done = match prefill_stream.record_event(None) {
+            Ok(done) => done,
+            Err(err) => {
+                if let Err(sync_err) = prefill_stream.synchronize() {
+                    fatal_cuda_lifecycle(&format!(
+                        "record Qwen3.5 async prefill event failed ({err}); stream drain failed: {sync_err}"
+                    ));
+                }
+                return Err(anyhow::anyhow!("record Qwen3.5 async prefill event: {err}"));
+            }
+        };
+        Ok(AsyncPrefillOutput {
+            logits: Some(logits),
+            done,
+            stream: prefill_stream,
+            completed: false,
+        })
     }
 
     fn unified_step(
@@ -389,7 +550,7 @@ impl SingleGpuBackend {
         &mut self,
         pending: &[SchedulerRequest],
         logits: &HiddenStates,
-        rng: &mut StdRng,
+        sample_seed: u64,
     ) -> Result<(Vec<u32>, Vec<Option<TokenLogprob>>)> {
         debug_assert_eq!(
             logits.seq_len,
@@ -400,7 +561,6 @@ impl SingleGpuBackend {
         let cpu_logits =
             snapshot_requested_logprobs(self.model.device_ctx(), logits, &requested_logprobs)?;
         let params_refs: Vec<&SamplingParams> = pending.iter().map(|r| &r.params).collect();
-        let sample_seed = rand::RngExt::random(rng);
         let tokens = self.model.select_tokens_from_logits_varied(
             logits,
             &mut self.graph_state.buffers,
@@ -427,7 +587,7 @@ impl SingleGpuBackend {
     fn sample_decode_logits(
         &mut self,
         active: &[ActiveRequest35],
-        rng: &mut StdRng,
+        sample_seed: u64,
     ) -> Result<(Vec<u32>, Vec<Option<TokenLogprob>>)> {
         let requested_logprobs: Vec<usize> = active.iter().map(|r| r.logprobs).collect();
         let cpu_logits = snapshot_requested_logprobs(
@@ -436,7 +596,6 @@ impl SingleGpuBackend {
             &requested_logprobs,
         )?;
         let params_refs: Vec<&SamplingParams> = active.iter().map(|r| &r.params).collect();
-        let sample_seed = rand::RngExt::random(rng);
         let tokens = self.model.select_tokens_batch_varied(
             &mut self.graph_state.buffers,
             &params_refs,
@@ -833,6 +992,7 @@ fn publish_load(
     backend: &SchedulerBackend,
     active: &[ActiveRequest35],
     prefilling: &[PrefillingRequest35],
+    inflight_prefill_reqs: usize,
     num_waiting_reqs: usize,
 ) {
     let kv_total_blocks = backend.capacity_pages_for_requests() as u64;
@@ -840,9 +1000,18 @@ fn publish_load(
         kv_used_blocks: kv_total_blocks
             .saturating_sub(backend.available_pages(active, prefilling) as u64),
         kv_total_blocks,
-        num_running_reqs: (active.len() + prefilling.len()) as u64,
+        num_running_reqs: (active.len() + prefilling.len() + inflight_prefill_reqs) as u64,
         num_waiting_reqs: num_waiting_reqs as u64,
     });
+}
+
+fn should_block_on_submit(
+    active_empty: bool,
+    prefilling_empty: bool,
+    pending_empty: bool,
+    inflight_prefill: bool,
+) -> bool {
+    active_empty && prefilling_empty && pending_empty && !inflight_prefill
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -858,6 +1027,7 @@ fn scheduler_loop(
     let mut active: Vec<ActiveRequest35> = Vec::new();
     let mut deferred: Vec<SchedulerRequest> = Vec::new();
     let mut prefilling: Vec<PrefillingRequest35> = Vec::new();
+    let mut inflight_prefill: Option<InflightPrefill> = None;
     let max_batch = backend.max_batch();
 
     info!("scheduler ready (max_batch={})", max_batch);
@@ -866,7 +1036,46 @@ fn scheduler_loop(
         // Publish the settled state between scheduler steps. If the prior step
         // retired its final requests, their KV pages have already returned via
         // RAII, so this snapshot reaches idle before the channel blocks below.
-        publish_load(&load_tx, &backend, &active, &prefilling, deferred.len());
+        publish_load(
+            &load_tx,
+            &backend,
+            &active,
+            &prefilling,
+            inflight_prefill
+                .as_ref()
+                .map_or(0, |prefill| prefill.chunk.reqs.len()),
+            deferred.len(),
+        );
+
+        if inflight_prefill
+            .as_mut()
+            .is_some_and(|prefill| prefill.output.is_ready())
+        {
+            let (prefill_tokens, prefill_reqs) =
+                inflight_prefill.as_ref().map_or((0, 0), |prefill| {
+                    (
+                        prefill.chunk.windows.iter().map(Vec::len).sum(),
+                        prefill.chunk.reqs.len(),
+                    )
+                });
+            let decode_n = active.len();
+            let step_start = itl_debug_enabled().then(Instant::now);
+            finish_async_prefill(
+                &mut backend,
+                &mut active,
+                &mut prefilling,
+                inflight_prefill
+                    .take()
+                    .expect("ready async prefill must still be present"),
+            );
+            log_itl_step(
+                step_start,
+                "overlap_complete",
+                prefill_tokens,
+                prefill_reqs,
+                decode_n,
+            );
+        }
 
         // 1. Drain all pending requests (deferred from last iteration + channel)
         let mut pending = std::mem::take(&mut deferred);
@@ -876,7 +1085,12 @@ fn scheduler_loop(
 
         // 2. Nothing in flight (no decode, no in-progress prefill) and nothing
         //    pending → block until a request arrives.
-        if active.is_empty() && prefilling.is_empty() && pending.is_empty() {
+        if should_block_on_submit(
+            active.is_empty(),
+            prefilling.is_empty(),
+            pending.is_empty(),
+            inflight_prefill.is_some(),
+        ) {
             if let Some((req, _kv_prefix)) = submit_rx.blocking_recv() {
                 pending.push(req);
             } else {
@@ -886,6 +1100,44 @@ fn scheduler_loop(
             while let Ok((req, _kv_prefix)) = submit_rx.try_recv() {
                 pending.push(req);
             }
+        }
+
+        // One async prefill owns its scheduled request state. Do not admit or
+        // launch a second chunk until it resolves. Active decode keeps moving;
+        // if it retires first, wait on the event instead of blocking on submit.
+        if inflight_prefill.is_some() {
+            deferred = pending;
+            let itl_step_start = itl_debug_enabled().then(Instant::now);
+            let (itl_prefill_tokens, itl_prefill_reqs) =
+                inflight_prefill.as_ref().map_or((0, 0), |prefill| {
+                    (
+                        prefill.chunk.windows.iter().map(Vec::len).sum(),
+                        prefill.chunk.reqs.len(),
+                    )
+                });
+            let itl_decode_n = active.len();
+            let itl_plan_kind = if active.is_empty() {
+                finish_async_prefill(
+                    &mut backend,
+                    &mut active,
+                    &mut prefilling,
+                    inflight_prefill
+                        .take()
+                        .expect("async prefill must be present before blocking wait"),
+                );
+                "overlap_wait"
+            } else {
+                decode_step(&mut backend, &mut active, &mut rng);
+                "overlap_decode"
+            };
+            log_itl_step(
+                itl_step_start,
+                itl_plan_kind,
+                itl_prefill_tokens,
+                itl_prefill_reqs,
+                itl_decode_n,
+            );
+            continue;
         }
 
         // 3. Admit new prompts. In-flight prefills reserve their promotion slot
@@ -994,19 +1246,35 @@ fn scheduler_loop(
         };
         if let Some(plan) = plan {
             let itl_plan_kind = match &plan {
+                ExecutionPlan::Unified { .. } if matches!(&backend, SchedulerBackend::Single(single) if single.overlap_enabled()) => {
+                    "overlap_launch"
+                }
                 ExecutionPlan::Unified { .. } => "unified",
                 ExecutionPlan::Prefill { .. } => "prefill",
                 ExecutionPlan::Decode => "decode",
             };
             let itl_step_start = itl_debug.then(Instant::now);
             match plan {
-                ExecutionPlan::Unified { pending } => unified_step_sched(
-                    &mut backend,
-                    &mut active,
-                    pending,
-                    &mut prefilling,
-                    &mut rng,
-                ),
+                ExecutionPlan::Unified { pending } => {
+                    if matches!(&backend, SchedulerBackend::Single(single) if single.overlap_enabled())
+                    {
+                        launch_overlap_step(
+                            &mut backend,
+                            &mut active,
+                            pending,
+                            &mut inflight_prefill,
+                            &mut rng,
+                        );
+                    } else {
+                        unified_step_sched(
+                            &mut backend,
+                            &mut active,
+                            pending,
+                            &mut prefilling,
+                            &mut rng,
+                        );
+                    }
+                }
                 ExecutionPlan::Prefill { pending } => prefill_batch(
                     &mut backend,
                     &mut active,
@@ -1018,27 +1286,13 @@ fn scheduler_loop(
                     decode_step(&mut backend, &mut active, &mut rng);
                 }
             }
-            if let Some(step_start) = itl_step_start {
-                // A `unified`/`prefill` step with prefill_tok>0 is the only kind
-                // that freezes active decodes behind real prefill work; a
-                // `decode` step (prefill_tok=0) is a genuine steady gap. dur_us
-                // is the CPU wall-time of the step, i.e. the per-step stall the
-                // active decodes actually eat this tick.
-                let dur_us = step_start.elapsed().as_micros();
-                let epoch_us = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map_or(0, |d| d.as_micros());
-                info!(
-                    "ITL_STEP mono_us={} epoch_us={} plan={} prefill_tok={} prefill_reqs={} decode_n={} dur_us={}",
-                    itl_debug_mono_us(),
-                    epoch_us,
-                    itl_plan_kind,
-                    itl_prefill_tokens,
-                    itl_prefill_reqs,
-                    itl_decode_n,
-                    dur_us
-                );
-            }
+            log_itl_step(
+                itl_step_start,
+                itl_plan_kind,
+                itl_prefill_tokens,
+                itl_prefill_reqs,
+                itl_decode_n,
+            );
         }
     }
 }
@@ -1099,7 +1353,8 @@ fn prefill_batch(
                     return;
                 }
             };
-            match single.sample_prefill_logits(&chunk.reqs, &logits, rng) {
+            let prefill_sample_seed = rand::RngExt::random(rng);
+            match single.sample_prefill_logits(&chunk.reqs, &logits, prefill_sample_seed) {
                 Ok(v) => v,
                 Err(e) => {
                     warn!("prefill sampling failed: {e}");
@@ -1120,6 +1375,63 @@ fn prefill_batch(
     };
 
     promote_or_requeue(backend, active, prefilling, chunk, &tokens, &logprobs_vec);
+}
+
+fn launch_overlap_step(
+    backend: &mut SchedulerBackend,
+    active: &mut Vec<ActiveRequest35>,
+    scheduled: Vec<PrefillingRequest35>,
+    inflight_prefill: &mut Option<InflightPrefill>,
+    rng: &mut StdRng,
+) {
+    debug_assert!(inflight_prefill.is_none());
+    let mut chunk = ScheduledChunk::from(scheduled);
+    let decode_seed = rand::RngExt::random(rng);
+    let prefill_seed = rand::RngExt::random(rng);
+    let output = match backend {
+        SchedulerBackend::Single(single) => single.launch_async_prefill(&mut chunk),
+        SchedulerBackend::Tp(_) => unreachable!("Qwen3.5 TP cannot launch async prefill"),
+    };
+    match output {
+        Ok(output) => {
+            *inflight_prefill = Some(InflightPrefill {
+                chunk,
+                output,
+                sample_seed: prefill_seed,
+            });
+        }
+        Err(err) => {
+            warn!("async prefill launch failed: {err}");
+            fail_chunk(chunk, &err.to_string());
+        }
+    }
+    decode_step_with_seed(backend, active, decode_seed);
+}
+
+fn finish_async_prefill(
+    backend: &mut SchedulerBackend,
+    active: &mut Vec<ActiveRequest35>,
+    prefilling: &mut Vec<PrefillingRequest35>,
+    inflight: InflightPrefill,
+) {
+    let InflightPrefill {
+        chunk,
+        output,
+        sample_seed,
+    } = inflight;
+    let logits = output.into_logits();
+    let SchedulerBackend::Single(single) = backend else {
+        unreachable!("Qwen3.5 TP cannot finish async prefill");
+    };
+    let (tokens, logprobs) = match single.sample_prefill_logits(&chunk.reqs, &logits, sample_seed) {
+        Ok(result) => result,
+        Err(err) => {
+            warn!("async prefill sampling failed: {err}");
+            fail_chunk(chunk, &err.to_string());
+            return;
+        }
+    };
+    promote_or_requeue(single, active, prefilling, chunk, &tokens, &logprobs);
 }
 
 // ── Unified step (prefill chunk + decode in one forward pass) ──────────────
@@ -1165,11 +1477,13 @@ fn unified_step_sched(
             return;
         }
     };
+    let decode_seed = rand::RngExt::random(rng);
+    let prefill_seed = rand::RngExt::random(rng);
 
     // Process decode results FIRST (it may retire requests and free graph slots
     // that promotion then fills densely).
     if output.decoded {
-        process_decode_logits(backend, active, rng);
+        process_decode_logits(backend, active, decode_seed);
     }
 
     let prefill_logits = output
@@ -1177,7 +1491,7 @@ fn unified_step_sched(
         .as_ref()
         .expect("scheduled prefill chunk must return prefill logits");
     let (tokens, logprobs_vec) =
-        match backend.sample_prefill_logits(&chunk.reqs, prefill_logits, rng) {
+        match backend.sample_prefill_logits(&chunk.reqs, prefill_logits, prefill_seed) {
             Ok(v) => v,
             Err(e) => {
                 warn!("unified prefill sampling failed: {e}");
@@ -1196,7 +1510,22 @@ fn decode_step(
     active: &mut Vec<ActiveRequest35>,
     rng: &mut StdRng,
 ) {
-    let sample_seed = rand::RngExt::random(rng);
+    // Preserve the historical scheduler RNG sequence: TP consumes the first
+    // seed, while single-GPU decode consumed a second seed inside sampling.
+    let first_seed = rand::RngExt::random(rng);
+    let sample_seed = if matches!(backend, SchedulerBackend::Single(_)) {
+        rand::RngExt::random(rng)
+    } else {
+        first_seed
+    };
+    decode_step_with_seed(backend, active, sample_seed);
+}
+
+fn decode_step_with_seed(
+    backend: &mut SchedulerBackend,
+    active: &mut Vec<ActiveRequest35>,
+    sample_seed: u64,
+) {
     let (tokens, logprobs_vec) = match backend {
         SchedulerBackend::Single(single) => {
             if let Err(e) = single.decode_graph(active) {
@@ -1212,7 +1541,7 @@ fn decode_step(
                 return;
             }
             // Snapshot logits to CPU BEFORE sampling (sampling may modify bufs.logits)
-            match single.sample_decode_logits(active, rng) {
+            match single.sample_decode_logits(active, sample_seed) {
                 Ok(v) => v,
                 Err(e) => {
                     warn!("decode sampling/logprobs error: {e}");
@@ -1256,9 +1585,9 @@ fn decode_step(
 fn process_decode_logits(
     backend: &mut SingleGpuBackend,
     active: &mut Vec<ActiveRequest35>,
-    rng: &mut StdRng,
+    sample_seed: u64,
 ) {
-    let (tokens, logprobs_vec) = match backend.sample_decode_logits(active, rng) {
+    let (tokens, logprobs_vec) = match backend.sample_decode_logits(active, sample_seed) {
         Ok(v) => v,
         Err(e) => {
             warn!("decode sampling/logprobs error: {e}");
@@ -1410,6 +1739,14 @@ struct ScheduledChunk {
     ends: Vec<usize>,
     /// This step's chunked token slice per request
     windows: Vec<Vec<u32>>,
+}
+
+struct InflightPrefill {
+    // Fields drop in declaration order. Drain the stream before request state
+    // can return KV pages or release recurrent/convolution buffers on unwind.
+    output: AsyncPrefillOutput,
+    chunk: ScheduledChunk,
+    sample_seed: u64,
 }
 
 enum ScheduledChunkBackendState {

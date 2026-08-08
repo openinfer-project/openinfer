@@ -62,6 +62,14 @@ fn tp_scheduler_uses_eager_only_plan() {
 }
 
 #[test]
+fn inflight_prefill_waits_instead_of_parking_after_last_decode_retires() {
+    assert!(
+        !should_block_on_submit(true, true, true, true),
+        "an in-flight prefill must keep the scheduler off submit_rx.blocking_recv()"
+    );
+}
+
+#[test]
 fn tp_engine_rejects_cuda_graph_before_model_load() {
     let err = match crate::start_engine_with_capacity(
         Path::new("unused"),

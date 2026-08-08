@@ -9,9 +9,14 @@
 //!   2. `batch_decode_graph` for existing decode requests (CUDA Graph for
 //!      compiled GQA groups; eager prefill fallback for uncompiled ones).
 
+use std::sync::Arc;
+
 use anyhow::Result;
+use cudarc::driver::CudaStream;
+use pegainfer_core::engine::panic_message;
 use pegainfer_core::kv_pool::KvState;
 use pegainfer_core::tensor::HiddenStates;
+use pegainfer_kernels::tensor::StreamOverrideGuard;
 
 use super::batch_decode_graph::BatchDecodeGraphState;
 use super::recurrent_state::RecurrentState;
@@ -52,6 +57,33 @@ impl Qwen35Model {
             last_hiddens.push(last_hidden);
         }
         self.batch_last_hidden_logits(&last_hiddens)
+    }
+
+    /// Run the complete prefill path on `stream`, including allocations, copies,
+    /// kernels, and stream-ordered frees. The model is scheduler-thread owned, so
+    /// the temporary context swap cannot race another host caller.
+    pub(crate) fn batch_prefill_logits_on_stream(
+        &mut self,
+        stream: Arc<CudaStream>,
+        prompts: &[&[u32]],
+        kv_states: &mut [KvState],
+        recurrent_states: &mut [&mut RecurrentState],
+    ) -> Result<HiddenStates> {
+        let cu_stream = stream.cu_stream();
+        let original_stream = std::mem::replace(&mut self.ctx.stream, stream);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _stream_override = unsafe { StreamOverrideGuard::activate_prefill(cu_stream) };
+            self.batch_prefill_logits(prompts, kv_states, recurrent_states)
+        }));
+        self.ctx.stream = original_stream;
+
+        match result {
+            Ok(result) => result,
+            Err(panic) => anyhow::bail!(
+                "Qwen3.5 async prefill panicked: {}",
+                panic_message(panic.as_ref())
+            ),
+        }
     }
 
     /// Unified step: prefill new requests and decode existing requests in one call.
